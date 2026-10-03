@@ -5,6 +5,8 @@
   </picture>
 </p>
 
+UNDER CONSTRUCTION - the toolchain and deployment automation is being polished right now, check back in a week or so and Dado should be live.
+
 Dado is a programming language with dialects for systems programming, scripting and GPU
 programming. The dialects share a single syntax tree and one compiler, and the compiler generates
 the glue between them. Systems code compiles to C11, which any C compiler can build into a native
