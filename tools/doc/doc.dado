@@ -1,0 +1,626 @@
+// tools/doc — documentation scanned out of the code that implements it.
+//
+// **The argument for this shape, and it is the whole design.** Language
+// documentation goes stale because it lives somewhere the person changing the
+// feature is not. Put it in a comment block beside the code and the agent
+// changing `has` is already in the file the sentence about `has` is in. That
+// does not eliminate drift — a comment saying *"`is` is equality only"* will
+// not update itself when `is` grows — but it reduces the distance from
+// "another directory" to "four lines up", and the checks that catch the rest
+// are a separate checkpoint's job.
+//
+// **The scanner is linear and parses nothing.** Two things follow from that
+// and both were the reason:
+//
+//   * it works on a file that does not compile, so a half-finished feature
+//     still documents itself and a syntax error does not take the
+//     documentation build down with it;
+//   * Rust and Dado spell a line comment the same way, so **one scanner reads
+//     the compiler, the standard library and anybody else's code**. There is
+//     nothing language-specific in here. It never sees a declaration.
+//
+// The price is stated rather than hidden: a line beginning with the marker
+// inside a multi-line string literal is a block, because nothing here knows
+// what a string literal is. That is the same trade in the other direction.
+//
+// ## The block, and its one knob
+//
+// A block is a run of consecutive lines whose first non-space text is `//@`.
+// The **first** line's payload names the destination slot and, optionally, an
+// integer that orders it within that slot. Every later line is markdown,
+// verbatim.
+//
+//     //@ types/tuples 30
+//     //@ ### Arrays
+//     //@
+//     //@ An array is a tuple whose slots share a type.
+//
+// **One knob and not a vocabulary**, deliberately. Blocks arrive in the order
+// somebody implemented things and have to land in the order somebody reads
+// them, so an ordering control is the one thing the format cannot do without.
+// Everything else a richer annotation language would buy — titles, levels,
+// cross-references — is markdown's job and is already in the body. A second
+// knob is a second thing to specify, to check and to get wrong.
+//
+// The order defaults to **0** and ties break by file then line, so a tree with
+// no orders at all still generates the same bytes every run. Leave gaps when
+// you number: inserting between 10 and 11 means renumbering, and the format
+// cannot help with that.
+//
+// ## The record stream
+//
+// `scan` writes records and `weave` reads them, rather than one pass doing
+// both, because **the checks that make this honest have to read records** —
+// whether every word a block names exists, whether a slot is filled, whether
+// coverage went down. A pass that went straight from source to markdown would
+// leave them re-implementing the scanner.
+//
+//     #dadodoc 1
+//     @block <slot> <order> <lines> <file>:<line>
+//     <line>
+//     ... exactly <lines> of them
+//
+// **The line count is in the header so nothing needs a terminator**, and
+// therefore nothing needs escaping: a body line that reads `@block` or `@end`
+// is data like any other. A terminator would have needed an escape, and an
+// escape is a thing a body can be silently mangled by.
+package doc
+
+import "core:fmt"
+import "core:io"
+import "core:os/fs"
+import "core:slices"
+import "core:strings"
+import "core:mem"
+import "core:mem/libc"
+
+// The marker. Three bytes with no meaning in Rust and no meaning in Dado, and
+// `@` is already this language's annotation sigil, so a reader meeting `//@`
+// for the first time guesses right.
+//
+// It is matched at the **start** of a trimmed line and never in the middle,
+// which is what keeps this file from scanning itself: the declaration above
+// contains the three bytes and is not a block.
+public const string8 MARKER = "//@"
+
+// The first line of a record stream. A version rather than a bare magic,
+// because the format will gain a field and a reader that cannot say which
+// version it is holding has to guess.
+public const string8 STREAM_HEADER = "#dadodoc 1"
+
+// A slot declaration in a spine, on a line of its own. It is an HTML comment
+// so that a spine renders as ordinary markdown wherever somebody opens it,
+// with the declarations invisible rather than showing as stray text.
+public const string8 SLOT_OPEN = "<!--@"
+public const string8 SLOT_CLOSE = "-->"
+
+//@ doc/record 10
+//@ ### What a block becomes
+//@
+//@ One record per block: where it came from, where it is going, and the
+//@ markdown itself. `file` and `line` are carried so that a generated
+//@ document can point a reader back at the code the sentence describes —
+//@ which is the only citation this project allows, because the code is
+//@ what a reader can check.
+public type Record: (string8 slot, i32 order, string8 file, i32 line, string8 body)
+
+// ── the pieces `core:strings` does not have ─────────────────────────────────
+
+// A multi-byte search. `strings.index_of` takes a `char8`, so a needle longer
+// than a byte has no library call and this is the loop every caller would
+// otherwise write.
+public i32 find_sub(string8 hay, string8 needle):
+    i64 n = #len(hay)
+    i64 m = #len(needle)
+    if m == 0:
+        return 0
+    i32 i = 0
+    for i + m <= n:
+        if strings.starts_with(strings.rest(hay, i), needle):
+            return i
+        i += 1
+    return -1
+
+// A non-negative decimal, and whether it was one. `core:strings/parse` has
+// `to_i32`, and it takes a `cstring` — so using it would cost an allocation
+// per number. It is also `atoi`'s contract, which cannot distinguish `0` from
+// *not a number*, and that is exactly the distinction the caller needs.
+public (i32 value, bool ok) to_int(string8 s):
+    i64 n = #len(s)
+    if n == 0:
+        return (0, false)
+    i32 acc = 0
+    i32 i = 0
+    for i < n:
+        char8 c = s[i]
+        if c < '0' || c > '9':
+            return (0, false)
+        acc = acc * 10 + i32(c - '0')
+        i += 1
+    return (acc, true)
+
+// The slot name and its order, off a block's first line. An absent order is
+// 0 rather than an error: the knob is optional and a tree that never turns it
+// is still ordered, by file and line.
+public (string8 slot, i32 order) head_of(string8 first):
+    string8 t = strings.trim(first)
+    i64 cut = strings.index_of(t, ' ')
+    if cut < 0:
+        return (t, 0)
+    string8 name = strings.substring(t, 0, cut)
+    string8 rest = strings.trim(strings.rest(t, cut + 1))
+    (i32 n, bool ok) = to_int(rest)
+    if !ok:
+        return (name, 0)
+    return (name, n)
+
+// ── reading a file ──────────────────────────────────────────────────────────
+
+// The whole file, into bytes owned by `alloc`. There is no read-the-lot call
+// in `core:io`, so it is a size and a read; a short read is honoured rather
+// than trusted, because `fs.bytes` and the read can disagree if somebody is
+// writing the file underneath.
+public ref []char8 slurp(cstring path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 size = fs.bytes(path)
+    if size < 0:
+        size = 0
+    ref []char8 buf = #make([]char8, size, alloc)
+    ^io.FILE f = io.open_read(path)
+    if !io.opened(f):
+        _ = #resize(buf, 0)
+        return buf
+    i64 got = io.read_bytes(f, buf[:])
+    _ = io.close(f)
+    if got < size:
+        _ = #resize(buf, got)
+    return buf
+
+//@ doc/lines 20
+//@ ### Lines
+//@
+//@ Splitting a string into lines is a hand-written loop here, because
+//@ `core:strings` has no `split` and a scanner cannot do without one. A
+//@ trailing carriage return is dropped, so a file written on Windows scans
+//@ to the same records as the same file written anywhere else.
+
+// **A text ending in a newline has a phantom final line, and this is the one
+// place that fact is written down.** `line_at` cannot tell the empty line
+// after a trailing newline from a real empty last line — the two are the same
+// bytes — so every caller that *writes* what it reads has to decline the
+// phantom, or it emits a blank line nobody wrote. Callers that only *inspect*
+// lines do not care, because they skip empty ones anyway.
+public bool phantom_end(string8 line, i64 next):
+    return next < 0 && #len(line) == 0
+
+// `text`'s line at and after `at`, and where the next one starts. `next` is
+// negative at the end, which is how a caller's loop knows to stop — a count
+// would have been a second thing to keep right.
+public (string8 line, i64 next) line_at(string8 text, i64 at):
+    string8 rest = strings.rest(text, at)
+    i64 cut = strings.index_of(rest, '\n')
+    if cut < 0:
+        return (strings.trim_right_cr(rest), 0 - 1)
+    return (strings.trim_right_cr(strings.substring(rest, 0, cut)), at + cut + 1)
+
+// ── the scanner ─────────────────────────────────────────────────────────────
+
+// Every block in one file's text, appended to `out`.
+//
+// **`out` is a `^ref []Record` and not a `ref []Record`**, which is ERR0813's
+// rule rather than a style: a `ref` parameter is the callee's own copy of the
+// handle, so growing it grows nothing the caller can see. The pointer is what
+// reaches the caller's handle.
+public void scan_text(string8 text, string8 file, ^ref []Record out, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 at = 0
+    i32 no = 0
+    bool inside = false
+    string8 slot = ""
+    i32 order = 0
+    i32 start = 0
+    ref []char8 body = #make([]char8, 0, alloc)
+    for:
+        (string8 raw, i64 next) = line_at(text, at)
+        no += 1
+        string8 line = strings.trim(raw)
+        if strings.starts_with(line, MARKER):
+            string8 marker = MARKER
+            string8 tail = strings.rest(line, #len(marker))
+            // One space after the marker is the marker's, not the body's.
+            // Anything past that is the author's indentation and is kept,
+            // because markdown is whitespace-sensitive and a code fence
+            // inside a block would not survive being trimmed.
+            if strings.starts_with(tail, " "):
+                tail = strings.rest(tail, 1)
+            if !inside:
+                inside = true
+                start = no
+                (string8 named, i32 ord) = head_of(tail)
+                // **The slot has to be copied and the body does not**, and
+                // getting that backwards is a use-after-free the unsanitized
+                // build does not show. `head_of` returns a `substring` of the
+                // line, which is a view into the file's buffer — and `walk`
+                // frees that buffer as soon as this returns, so a record
+                // holding the view holds freed memory. The body is already a
+                // copy, because it is built byte by byte into `alloc`.
+                //
+                // Measured: without this, `doc bare` over this very package
+                // printed the right document and AddressSanitizer reported
+                // `heap-use-after-free` in `strings.compare`, reached from
+                // the sort. Right answer, wrong program.
+                ref []char8 owned = #format(named, alloc)
+                slot = owned
+                order = ord
+                body = #make([]char8, 0, alloc)
+            else:
+                for c in tail:
+                    _ = #append(body, c)
+                _ = #append(body, '\n')
+        else if inside:
+            inside = false
+            string8 b = body
+            _ = #append(out^, (slot, order, file, start, b))
+        if next < 0:
+            break
+        at = next
+    if inside:
+        string8 b = body
+        _ = #append(out^, (slot, order, file, start, b))
+
+// Every block under `dir`, recursively, for files whose name ends in `suffix`.
+//
+// `suffix` is a parameter and not a constant because **the scanner is not
+// about Dado**: `.rs` reads the compiler and `.dado` reads the library, with the
+// same code and no branch.
+//
+// `files` counts what was read rather than what was found, for the reason
+// stated at the increment it increments.
+public void walk(string8 dir, string8 suffix, ^ref []Record out, ^i32 files,
+                 (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    // **This used to be its own recursion and is now `fs.walk`'s**, which is
+    // the row that put a walk in the library. What it had written by hand —
+    // the `#format` join, the `clone_to_cstring` crossing and the two
+    // `#delete`s, at every level — was one of the three copies in this tree
+    // that the measurement counted. Two behaviours came with the move and both
+    // were already this function's: hidden entries are skipped, for the reason
+    // it stated (*"a `.git` is not documentation and walking one is the
+    // difference between a second and a minute"*), and a symlinked directory
+    // is listed and not entered, which this version did not check for and
+    // would have looped on.
+    fs.Listing tree = fs.walk(dir, alloc)
+    for e in tree.entries:
+        if e.is_dir || !strings.ends_with(e.path, suffix):
+            continue
+        ref []char8 pc = strings.clone_to_cstring(e.path, alloc)
+        ref []char8 text = slurp(cstring(pc), libc.allocator())
+        string8 t = text
+        scan_text(t, e.path, out, alloc)
+        #delete(text)
+        #delete(pc)
+        // Counted here, where a file is **read**, and not from the records
+        // afterwards. A walk that read 151 files and found no block in any
+        // of them must report 151 and not 0 — the population is the thing
+        // worth printing, and a count derived from the records can only
+        // ever describe the files that already answered.
+        files^ += 1
+    fs.release(tree)
+
+// ── ordering ────────────────────────────────────────────────────────────────
+
+// Slot, then order, then file, then line. **Every tie is broken**, so two runs
+// over one tree produce the same bytes — which is what lets a generated
+// document be compared against a committed one at all.
+public bool before(Record x, Record y):
+    if strings.compare(x.slot, y.slot) != 0:
+        return strings.before(x.slot, y.slot)
+    if x.order != y.order:
+        return x.order < y.order
+    if strings.compare(x.file, y.file) != 0:
+        return strings.before(x.file, y.file)
+    return x.line < y.line
+
+public void sort(ref []Record rs):
+    slices.sort(rs[:], before)
+
+// ── the record stream ───────────────────────────────────────────────────────
+
+// How many lines `body` holds. A body always ends in a newline, so the count
+// is the number of newlines in it.
+private i64 line_count(string8 body):
+    return strings.count_byte(body, '\n')
+
+public bool write_records(cstring path, ref []Record rs, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ^io.FILE f = io.open_write(path)
+    if !io.opened(f):
+        return false
+    ref []char8 head = #format(STREAM_HEADER, "\n", alloc)
+    _ = io.write_bytes(f, head[:])
+    #delete(head)
+    for r in rs:
+        ref []char8 h = #format("@block ", r.slot, " ", r.order, " ",
+                                line_count(r.body), " ", r.file, ":", r.line, "\n", alloc)
+        _ = io.write_bytes(f, h[:])
+        #delete(h)
+        ref []char8 b = #format(r.body, alloc)
+        _ = io.write_bytes(f, b[:])
+        #delete(b)
+    _ = io.close(f)
+    return true
+
+// A record stream back into records. `text` is the whole file; the records
+// borrow from it, so it has to outlive them.
+//
+// A header this cannot read is a **refusal**, not a skip: a reader that
+// ignored what it did not recognise would report zero records over a file full
+// of them, which is the one failure a generator cannot survive.
+public (bool ok, string8 why) read_records(string8 text, ^ref []Record out, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 at = 0
+    (string8 first, i64 next) = line_at(text, at)
+    if strings.trim(first) != STREAM_HEADER:
+        return (false, "this is not a record stream: its first line is not the header")
+    if next < 0:
+        return (true, "")
+    at = next
+    for:
+        (string8 line, i64 after) = line_at(text, at)
+        string8 trimmed = strings.trim(line)
+        if #len(trimmed) == 0 && after < 0:
+            break
+        // **A repeated header is a concatenation, and streams concatenate.**
+        // Two trees are scanned separately — the compiler's Rust and the
+        // library's Dado — and checked together, and `cat` is the obvious way
+        // to combine them. Refusing the second header would make that the one
+        // thing a caller cannot do with a format that is otherwise plain text.
+        if strings.trim(line) == STREAM_HEADER:
+            if after < 0:
+                break
+            at = after
+            continue
+        if !strings.starts_with(line, "@block "):
+            return (false, "expected a block header")
+        string8 rest = strings.rest(line, 7)
+        (string8 slot, i64 c1) = word_of(rest)
+        if c1 < 0:
+            return (false, "a block header with no order")
+        (string8 ords, i64 c2) = word_of(strings.rest(rest, c1))
+        if c2 < 0:
+            return (false, "a block header with no line count")
+        string8 tail2 = strings.rest(rest, c1 + c2)
+        (string8 cnts, i64 c3) = word_of(tail2)
+        if c3 < 0:
+            return (false, "a block header with no location")
+        string8 loc = strings.rest(tail2, c3)
+        (i32 order, bool ok1) = to_int(ords)
+        (i32 count, bool ok2) = to_int(cnts)
+        if !ok1 || !ok2:
+            return (false, "a block header whose order or line count is not a number")
+        (string8 file, i32 line_no) = split_location(loc)
+        if after < 0:
+            return (false, "a block header with no body")
+        at = after
+        ref []char8 body = #make([]char8, 0, alloc)
+        i32 taken = 0
+        for taken < count:
+            (string8 bl, i64 nxt) = line_at(text, at)
+            for c in bl:
+                _ = #append(body, c)
+            _ = #append(body, '\n')
+            taken += 1
+            if nxt < 0:
+                at = #len(text)
+                break
+            at = nxt
+        string8 b = body
+        _ = #append(out^, (slot, order, file, line_no, b))
+        if at >= #len(text):
+            break
+    return (true, "")
+
+// The first space-delimited word of `s`, and how far past it to continue.
+// `next` is negative when there is no space, which is how a header with a
+// missing field is caught rather than read as a short one.
+private (string8 word, i64 next) word_of(string8 s):
+    i64 cut = strings.index_of(s, ' ')
+    if cut < 0:
+        return (s, 0 - 1)
+    return (strings.substring(s, 0, cut), cut + 1)
+
+// `path:line` apart. The **last** colon, not the first, because a path may
+// hold one and a line number may not.
+private (string8 file, i32 line) split_location(string8 loc):
+    string8 t = strings.trim(loc)
+    i64 cut = strings.last_index_of(t, ':')
+    if cut < 0:
+        return (t, 0)
+    (i32 n, bool ok) = to_int(strings.rest(t, cut + 1))
+    if !ok:
+        return (t, 0)
+    return (strings.substring(t, 0, cut), n)
+
+// ── the generator ───────────────────────────────────────────────────────────
+
+//@ doc/spine 30
+//@ ### The spine
+//@
+//@ A spine is hand-written markdown that declares where the blocks go. It
+//@ carries the arc — why everything is a tuple before what a tuple does —
+//@ and the blocks fill the gaps it leaves.
+//@
+//@ A slot is declared on a line of its own as an HTML comment, so a spine
+//@ renders as ordinary markdown anywhere somebody opens it:
+//@
+//@     <!--@ types/tuples -->
+//@
+//@ Without a spine the narrative becomes as many fragments as there are
+//@ blocks, in whatever order the tree happened to be walked, which is how a
+//@ tour dies.
+
+// The slot a spine line declares, or the empty string if it declares none.
+public string8 slot_declared(string8 line):
+    string8 t = strings.trim(line)
+    if !strings.starts_with(t, SLOT_OPEN):
+        return ""
+    if !strings.ends_with(t, SLOT_CLOSE):
+        return ""
+    string8 open = SLOT_OPEN
+    string8 close = SLOT_CLOSE
+    i64 inner_len = #len(t) - #len(open) - #len(close)
+    if inner_len <= 0:
+        return ""
+    return strings.trim(strings.substring(t, #len(open), inner_len))
+
+// Write every record whose slot is `slot`, in the order they are already in.
+private i32 pour(^io.FILE f, ref []Record rs, string8 slot, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i32 poured = 0
+    for r in rs:
+        if r.slot != slot:
+            continue
+        ref []char8 b = #format(r.body, "\n", alloc)
+        _ = io.write_bytes(f, b[:])
+        #delete(b)
+        poured += 1
+    return poured
+
+// Every slot a spine declares, in the order declared, appended to `out`.
+//
+// The slot check needs this as a **list** rather than as a count, because the
+// two failures it looks for are named rather than numbered: a slot nothing
+// filled is a documented feature that does not exist, and a block whose
+// destination no spine declares is a feature nobody wove in. A reader given
+// "3 slots, 2 filled" has to go and find which.
+public void declared_slots(string8 spine, ^ref []string8 out, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 at = 0
+    for:
+        (string8 line, i64 next) = line_at(spine, at)
+        string8 slot = slot_declared(line)
+        if #len(slot) > 0:
+            ref []char8 owned = #format(slot, alloc)
+            string8 kept = owned
+            _ = #append(out^, kept)
+        if next < 0:
+            break
+        at = next
+
+// Slots the spine declares **more than once**, each named once.
+//
+// **A repeated declaration pours the slot's blocks twice**, silently, into one
+// document — and the only thing that showed it was the arithmetic in the
+// report: *24 of 22 block(s) poured*. Measured, by writing the mistake while
+// laying out the procedures section of this project's own spine.
+//
+// That is the failure shape this whole tool is arranged against: a document
+// that is wrong in a way nothing refuses. So it is a refusal now, beside the
+// other two, and for the same reason — computed before a byte is written.
+public void repeated(ref []string8 slots, ^ref []string8 out, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i32 i = 0
+    for i < #len(slots):
+        i32 j = 0
+        bool earlier = false
+        for j < i:
+            if slots[j] == slots[i]:
+                earlier = true
+                break
+            j += 1
+        // Named once however many times it repeats: the finding is the slot,
+        // not the count, and a slot written three times is one mistake.
+        if earlier:
+            bool said = false
+            for name in out^:
+                if name == slots[i]:
+                    said = true
+                    break
+            if !said:
+                _ = #append(out^, slots[i])
+        i += 1
+
+// Slots the spine declares that no record fills.
+public void unfilled(ref []string8 slots, ref []Record rs, ^ref []string8 out,
+                     (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    for slot in slots:
+        bool found = false
+        for r in rs:
+            if r.slot == slot:
+                found = true
+                break
+        if !found:
+            _ = #append(out^, slot)
+
+// Slots records carry that the spine declares nowhere, each named once.
+public void orphans(ref []string8 slots, ref []Record rs, ^ref []string8 out,
+                    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    string8 last = ""
+    for r in rs:
+        if r.slot == last:
+            continue
+        last = r.slot
+        bool declared = false
+        for slot in slots:
+            if slot == r.slot:
+                declared = true
+                break
+        if !declared:
+            _ = #append(out^, r.slot)
+
+// A spine plus records into one document. Returns how many slots were
+// declared and how many blocks were poured into them, which is the pair
+// CP-2's slot check is built on: a slot nothing filled and a block no slot
+// wanted are both real and neither is visible from one number.
+public (i32 slots, i32 poured, bool ok) weave(string8 spine, cstring out,
+                                              ref []Record rs, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ^io.FILE f = io.open_write(out)
+    if !io.opened(f):
+        return (0, 0, false)
+    i32 slots = 0
+    i32 poured = 0
+    i64 at = 0
+    for:
+        (string8 line, i64 next) = line_at(spine, at)
+        string8 slot = slot_declared(line)
+        if #len(slot) > 0:
+            slots += 1
+            poured += pour(f, rs, slot, alloc)
+        else:
+            ref []char8 l = #format(line, "\n", alloc)
+            _ = io.write_bytes(f, l[:])
+            #delete(l)
+        if next < 0:
+            break
+        at = next
+    _ = io.close(f)
+    return (slots, poured, true)
+
+// Every record, every slot, in sorted order, with no spine at all.
+//
+// This is what `dado doc` over somebody else's package produces. **A spine is
+// not required of a stranger** — they have not written one and should not have
+// to before they see anything — so the slots become headings and the order is
+// the sort order.
+public (i32 blocks, bool ok) bare(cstring out, string8 title, ref []Record rs,
+                                  (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ^io.FILE f = io.open_write(out)
+    if !io.opened(f):
+        return (0, false)
+    ref []char8 head = #format("# ", title, "\n\n", alloc)
+    _ = io.write_bytes(f, head[:])
+    #delete(head)
+    string8 last = ""
+    i32 blocks = 0
+    for r in rs:
+        if r.slot != last:
+            last = r.slot
+            ref []char8 h = #format("## ", r.slot, "\n\n", alloc)
+            _ = io.write_bytes(f, h[:])
+            #delete(h)
+        ref []char8 b = #format(r.body, "\n", alloc)
+        _ = io.write_bytes(f, b[:])
+        #delete(b)
+        blocks += 1
+    _ = io.close(f)
+    return (blocks, true)
+
+// ── reporting ───────────────────────────────────────────────────────────────
+
+// Printed on every run, green included. **A population nobody prints is a
+// population nobody re-examines**, and a generator that walked no files at all
+// looks exactly like one that found nothing to document.
+public void report(string8 what, i32 files, i32 blocks):
+    fmt.println(what, ": ", files, " file(s) read, ", blocks, " block(s) found")

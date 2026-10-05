@@ -1,0 +1,688 @@
+// vendor:tui — decoding what a terminal sends, and deciding who gets it.
+//
+// The tuibox port matched raw byte prefixes: `bind("\x1b[A", up)`. That is the
+// terminal's vocabulary, not a program's, and it puts the burden of knowing
+// that Home is `\x1b[H` on one terminal and `\x1bOH` on another onto every
+// caller. Here the decoder produces a **key event** and a program names it:
+//
+//     if tui.key("ctrl+s"): save()
+//     if tui.key("up"):     move(0 - 1)
+//
+// ── who gets the key ───────────────────────────────────────────────────────
+//
+// One rule, stated so it is predictable:
+//
+// > **A focused text-entry widget claims plain characters and the editing
+// > keys. Everything else — function keys, `ctrl+`/`alt+` combos, `esc`, `tab`
+// > — stays global and reaches `key`.**
+//
+// So typing `q` into a filter box does not quit the program, and `ctrl+s`
+// saves while you are typing. Focus itself is automatic: Tab and Shift-Tab
+// walk the focusable widgets in declaration order, Enter and Space activate,
+// arrows navigate inside a list, and Esc leaves the innermost overlay. No
+// program writes any of that.
+package tui
+
+import "core:chars"
+import "core:fmt"
+import "core:strings"
+
+// ── key codes ──────────────────────────────────────────────────────────────
+//
+// A key is a code point when it is text, and one of these when it is not. They
+// sit above the last Unicode plane, so the two can share one number without a
+// tag and a `switch` over both is one `switch`.
+
+private const u32 K_BASE = 0x200000
+
+const u32 K_NONE = 0
+const u32 K_ENTER = K_BASE + 1
+const u32 K_TAB = K_BASE + 2
+const u32 K_ESC = K_BASE + 3
+const u32 K_BKSP = K_BASE + 4
+const u32 K_DEL = K_BASE + 5
+const u32 K_INS = K_BASE + 6
+const u32 K_HOME = K_BASE + 7
+const u32 K_END = K_BASE + 8
+const u32 K_PGUP = K_BASE + 9
+const u32 K_PGDN = K_BASE + 10
+const u32 K_UP = K_BASE + 11
+const u32 K_DOWN = K_BASE + 12
+const u32 K_LEFT = K_BASE + 13
+const u32 K_RIGHT = K_BASE + 14
+const u32 K_F1 = K_BASE + 20        // F1..F12 are K_F1 + n
+
+distinct enum u32 Mod: (
+    NONE = 0,
+    SHIFT = 1,
+    ALT = 2,
+    CTRL = 4,
+)
+
+type KeyEvent: (u32 code, Mod mods)
+
+private bool is_text_key(u32 code):
+    return code < K_BASE
+
+private bool is_editing_key(u32 code):
+    if code == K_BKSP || code == K_DEL: return true
+    if code == K_LEFT || code == K_RIGHT: return true
+    return code == K_HOME || code == K_END
+
+// ── per-frame input state ──────────────────────────────────────────────────
+
+private const i32 MAX_KEYS = 64
+private const i32 INPUT_CAP = 1024
+
+private type InBuf: [INPUT_CAP]char8
+
+private InBuf g_in
+private [MAX_KEYS]KeyEvent g_key
+private [MAX_KEYS]bool g_key_used
+private i32 g_nkey
+
+private i32 g_mx = 0 - 1
+private i32 g_my = 0 - 1
+private bool g_mdown
+private bool g_mpress          // a press happened this frame
+private bool g_mrelease        // a release happened this frame
+private i32 g_mbutton
+private i32 g_wheel
+private bool g_paste_mode
+
+// Set by any widget that wants another frame soon: a spinner, a blinking
+// caret, a toast counting down. Cleared at the top of every frame, so a widget
+// that stops animating stops costing anything on the very next one.
+private bool g_animating
+
+void animate():
+    g_animating = true
+
+// ── polling ────────────────────────────────────────────────────────────────
+
+private i32 g_keys_decoded
+private i32 g_bytes_read
+
+// Diagnostics for the pty harness: how many bytes the decoder has been handed
+// and how many key events came out of them. A test that cannot tell "the byte
+// never arrived" from "the byte decoded to nothing" cannot localise a decoder
+// bug, and those are the two failures that look identical from outside.
+(i32 bytes, i32 keys) input_counters():
+    return (g_bytes_read, g_keys_decoded)
+
+private void push_key(u32 code, Mod mods):
+    g_keys_decoded = g_keys_decoded + 1
+    if g_nkey >= MAX_KEYS: return
+    g_key[g_nkey] = (code, mods)
+    g_key_used[g_nkey] = false
+    g_nkey = g_nkey + 1
+
+// Wait up to `timeout_ms` for input and decode whatever arrives. One read can
+// carry several messages — a press and its release, a drag's many motions, a
+// mouse report sitting next to a keystroke — so the buffer is walked to the
+// end and every message is decoded. Handling only the first (as the port did)
+// drops the rest, which shows up as a press whose release never arrives: the
+// widget stays latched and the next click lands on the wrong one.
+private void poll(i32 timeout_ms):
+    i32 n = tty_read(rawptr(&g_in), INPUT_CAP, timeout_ms)
+    if n == 0:
+        g_ended = true
+        return
+    if n < 0: return
+    g_bytes_read = g_bytes_read + n
+    g_dirty = true
+    g_wheel = 0
+    g_mpress = false
+    g_mrelease = false
+    decode_run(n)
+
+private void decode_run(i32 n):
+    i32 i = 0
+    for i < n:
+        char8 c = g_in[i]
+        if c == '\x1b' && i + 1 < n:
+            i = decode_escape(i, n)
+        else if c == '\x1b':
+            push_key(K_ESC, Mod.NONE)
+            i = i + 1
+        else:
+            i = decode_plain(i, n)
+
+// A byte that is not the start of an escape sequence.
+private i32 decode_plain(i32 i, i32 n):
+    char8 c = g_in[i]
+    u32 b = u32(c)
+
+    if b == 13 || b == 10:
+        push_key(K_ENTER, Mod.NONE)
+        return i + 1
+    if b == 9:
+        push_key(K_TAB, Mod.NONE)
+        return i + 1
+    if b == 127 || b == 8:
+        push_key(K_BKSP, Mod.NONE)
+        return i + 1
+    // A C0 control is the letter it is Ctrl of. 1 is ctrl+a, 26 is ctrl+z.
+    if b < 32:
+        push_key(b + 96, Mod.CTRL)
+        return i + 1
+
+    // Text. Decode the whole UTF-8 sequence, so a multi-byte character is one
+    // key event rather than four.
+    string8 run = string8(g_in[i..<n])
+    (char32 cp, i32 size) = chars.decode(run, 0)
+    if size == 0: return i + 1
+    push_key(u32(cp), Mod.NONE)
+    return i + size
+
+// `\x1b` and what follows it.
+private i32 decode_escape(i32 i, i32 n):
+    char8 c1 = g_in[i + 1]
+
+    // SS3 — `\x1bO` plus one letter. What a terminal in application cursor
+    // mode sends for the arrows and the first four function keys.
+    if c1 == 'O' && i + 2 < n:
+        u32 code = ss3_code(g_in[i + 2])
+        if code != K_NONE: push_key(code, Mod.NONE)
+        return i + 3
+
+    if c1 == '[':
+        // SGR-1006 mouse: `\x1b[<b;x;yM` or `m`.
+        if i + 2 < n && g_in[i + 2] == '<':
+            return decode_mouse(i, n)
+        return decode_csi(i, n)
+
+    // `alt+<key>` is ESC followed by the key, which is how every terminal that
+    // is not sending a proper modifier report spells it.
+    i32 after = decode_plain(i + 1, n)
+    if g_nkey > 0:
+        g_key[g_nkey - 1].mods = g_key[g_nkey - 1].mods | Mod.ALT
+    return after
+
+private u32 ss3_code(char8 c):
+    if c == 'A': return K_UP
+    if c == 'B': return K_DOWN
+    if c == 'C': return K_RIGHT
+    if c == 'D': return K_LEFT
+    if c == 'H': return K_HOME
+    if c == 'F': return K_END
+    if c == 'P': return K_F1
+    if c == 'Q': return K_F1 + 1
+    if c == 'R': return K_F1 + 2
+    if c == 'S': return K_F1 + 3
+    return K_NONE
+
+// A CSI sequence: `\x1b[` then parameters then a final byte. The modifier form
+// is `\x1b[1;5A` — a second parameter of 1 + a bitmask, which is where
+// `ctrl+up` and `shift+home` come from.
+private i32 decode_csi(i32 i, i32 n):
+    i32 at = i + 2
+    [8]i32 p
+    i32 np = 0
+    i32 cur = 0
+    bool any = false
+    char8 fin = '\0'
+    for at < n:
+        char8 c = g_in[at]
+        if c >= '0' && c <= '9':
+            cur = (cur * 10) + (i32(c) - i32('0'))
+            any = true
+            at = at + 1
+        else if c == ';':
+            if np < 8:
+                p[np] = cur
+                np = np + 1
+            cur = 0
+            any = false
+            at = at + 1
+        else:
+            fin = c
+            if np < 8 && any:
+                p[np] = cur
+                np = np + 1
+            at = at + 1
+            break
+    if fin == '\0': return at
+
+    Mod mods = Mod.NONE
+    if np >= 2: mods = csi_mods(p[1])
+
+    // Bracketed paste. The content between the markers is text, however many
+    // control bytes are in it — which is the whole point of the mode.
+    if fin == '~' && np >= 1 && p[0] == 200:
+        g_paste_mode = true
+        return at
+    if fin == '~' && np >= 1 && p[0] == 201:
+        g_paste_mode = false
+        return at
+
+    if fin == '~' && np >= 1:
+        u32 code = tilde_code(p[0])
+        if code != K_NONE: push_key(code, mods)
+        return at
+
+    // Shift-Tab is `CSI Z` and carries no modifier parameter — the `Z` *is*
+    // the modifier. Every other key spells shift as a parameter, which is why
+    // this one needs a line of its own.
+    if fin == 'Z':
+        push_key(K_TAB, Mod.SHIFT)
+        return at
+
+    u32 code = ss3_code(fin)
+    if code != K_NONE: push_key(code, mods)
+    return at
+
+private Mod csi_mods(i32 v):
+    i32 bits = v - 1
+    Mod m = Mod.NONE
+    if (bits & 1) != 0: m = m | Mod.SHIFT
+    if (bits & 2) != 0: m = m | Mod.ALT
+    if (bits & 4) != 0: m = m | Mod.CTRL
+    return m
+
+private u32 tilde_code(i32 v):
+    if v == 1: return K_HOME
+    if v == 2: return K_INS
+    if v == 3: return K_DEL
+    if v == 4: return K_END
+    if v == 5: return K_PGUP
+    if v == 6: return K_PGDN
+    if v == 7: return K_HOME
+    if v == 8: return K_END
+    if v == 11: return K_F1
+    if v == 12: return K_F1 + 1
+    if v == 13: return K_F1 + 2
+    if v == 14: return K_F1 + 3
+    if v == 15: return K_F1 + 4
+    if v == 17: return K_F1 + 5
+    if v == 18: return K_F1 + 6
+    if v == 19: return K_F1 + 7
+    if v == 20: return K_F1 + 8
+    if v == 21: return K_F1 + 9
+    if v == 23: return K_F1 + 10
+    if v == 24: return K_F1 + 11
+    return K_NONE
+
+// SGR-1006: `\x1b[<b;x;y` then `M` for a press and `m` for a release.
+private i32 decode_mouse(i32 i, i32 n):
+    i32 at = i + 3
+    [3]i32 vals
+    i32 nv = 0
+    i32 cur = 0
+    char8 fin = '\0'
+    for at < n:
+        char8 c = g_in[at]
+        if c >= '0' && c <= '9':
+            cur = (cur * 10) + (i32(c) - i32('0'))
+            at = at + 1
+        else if c == ';':
+            if nv < 3:
+                vals[nv] = cur
+                nv = nv + 1
+            cur = 0
+            at = at + 1
+        else:
+            fin = c
+            if nv < 3:
+                vals[nv] = cur
+                nv = nv + 1
+            at = at + 1
+            break
+    if nv < 3: return at
+
+    i32 b = vals[0]
+    // The terminal numbers its cells from one; the grid numbers from zero, and
+    // that conversion happens here and in the compositor and nowhere else.
+    g_mx = vals[1] - 1
+    g_my = vals[2] - 1
+
+    // Bit 6 says "this is the wheel" and bit 0 picks the direction.
+    if (b & 64) != 0:
+        if (b & 1) == 0: g_wheel = g_wheel - 3
+        else: g_wheel = g_wheel + 3
+        return at
+
+    bool down = fin == 'M'
+    // Bit 5 is motion: a drag if a button is held, a hover if not. Either way
+    // the position moved and nothing was pressed.
+    if (b & 32) != 0: return at
+
+    g_mbutton = b & 3
+    if down && !g_mdown: g_mpress = true
+    if !down && g_mdown: g_mrelease = true
+    g_mdown = down
+    return at
+
+// ── asking about keys ──────────────────────────────────────────────────────
+
+// Parse `"ctrl+shift+f5"` into a code and a modifier set. Zero or more of
+// `ctrl+`, `alt+`, `shift+`, then a name.
+private (u32 code, Mod mods, bool ok) parse_spec(string8 spec):
+    Mod mods = Mod.NONE
+    string8 rest = spec
+    for:
+        (string8 head, string8 tail, bool found) = strings.split_first(rest, "+")
+        if !found: break
+        if #len(tail) == 0: break            // a bare "+" is the plus key
+        if same_fold(head, "ctrl") || same_fold(head, "control"):
+            mods = mods | Mod.CTRL
+        else if same_fold(head, "alt") || same_fold(head, "meta") || same_fold(head, "opt"):
+            mods = mods | Mod.ALT
+        else if same_fold(head, "shift"):
+            mods = mods | Mod.SHIFT
+        else:
+            return (K_NONE, mods, false)
+        rest = tail
+
+    u32 code = named_code(rest)
+    if code != K_NONE: return (code, mods, true)
+    (char32 cp, i32 size) = chars.decode(rest, 0)
+    if size == 0 || size != i32(#len(rest)): return (K_NONE, mods, false)
+    return (u32(cp), mods, true)
+
+private bool same_fold(string8 a, string8 b):
+    if #len(a) != #len(b): return false
+    for i in 0..<i32(#len(a)):
+        if chars.lower(a[i]) != chars.lower(b[i]): return false
+    return true
+
+private u32 named_code(string8 s):
+    if same_fold(s, "enter") || same_fold(s, "return"): return K_ENTER
+    if same_fold(s, "tab"): return K_TAB
+    if same_fold(s, "esc") || same_fold(s, "escape"): return K_ESC
+    if same_fold(s, "bksp") || same_fold(s, "backspace"): return K_BKSP
+    if same_fold(s, "del") || same_fold(s, "delete"): return K_DEL
+    if same_fold(s, "ins") || same_fold(s, "insert"): return K_INS
+    if same_fold(s, "home"): return K_HOME
+    if same_fold(s, "end"): return K_END
+    if same_fold(s, "pgup") || same_fold(s, "pageup"): return K_PGUP
+    if same_fold(s, "pgdn") || same_fold(s, "pagedown"): return K_PGDN
+    if same_fold(s, "up"): return K_UP
+    if same_fold(s, "down"): return K_DOWN
+    if same_fold(s, "left"): return K_LEFT
+    if same_fold(s, "right"): return K_RIGHT
+    if same_fold(s, "space"): return 32
+    if #len(s) >= 2 && (s[0] == 'f' || s[0] == 'F'):
+        i32 num = 0
+        bool digits = true
+        for i in 1..<i32(#len(s)):
+            if s[i] < '0' || s[i] > '9':
+                digits = false
+                break
+            num = (num * 10) + (i32(s[i]) - i32('0'))
+        if digits && num >= 1 && num <= 12: return K_F1 + u32(num - 1)
+    return K_NONE
+
+// Was this key pressed on this frame? Consumes it, so two widgets cannot both
+// answer to one keystroke, and so a global binding does not also fire while a
+// line edit is swallowing text.
+bool key(string8 spec):
+    if !input_reaches_here(): return false
+    (u32 code, Mod mods, bool ok) = parse_spec(spec)
+    if !ok: return false
+    // The claiming rule. A focused text-entry widget owns plain characters and
+    // the editing keys; everything else stays global. So `key("q")` answers
+    // false while a line edit has focus, and `key("ctrl+s")` still answers.
+    //
+    // The authority is **last frame's** answer, not this frame's, because a
+    // global binding is often written before the widget that has focus has been
+    // placed — and a rule that depended on statement order would be a rule
+    // nobody could predict.
+    if g_text_capture && mods == Mod.NONE:
+        if is_text_key(code) || is_editing_key(code): return false
+    return take_key(code, mods)
+
+// `key`, without the claiming rule. This is what the widget doing the claiming
+// uses: a focused line edit asks for `left` and `bksp` through here, because
+// the rule that keeps those away from everybody else must not keep them away
+// from the one widget they were claimed *for*.
+private bool own_key(string8 spec):
+    if !input_reaches_here(): return false
+    (u32 code, Mod mods, bool ok) = parse_spec(spec)
+    if !ok: return false
+    return take_key(code, mods)
+
+private bool take_key(u32 code, Mod mods):
+    for i in 0..<g_nkey:
+        if g_key_used[i]: continue
+        if g_key[i].code != code: continue
+        if g_key[i].mods != mods: continue
+        g_key_used[i] = true
+        return true
+    return false
+
+// Whether any unconsumed key event is waiting. What a text widget asks before
+// walking the queue.
+private bool any_key():
+    for i in 0..<g_nkey:
+        if !g_key_used[i]: return true
+    return false
+
+// The printable characters typed this frame, in order, as a `string` from the
+// frame arena. A text widget with focus calls this; nothing else should, since
+// it consumes what it returns.
+string8 typed():
+    if !input_reaches_here(): return ""
+    ref []char8 run = #make([]char8, 0, mem)
+    if run == nil: return ""
+    Sink into = fmt.to_run(&run)
+    for i in 0..<g_nkey:
+        if g_key_used[i]: continue
+        KeyEvent e = g_key[i]
+        if !is_text_key(e.code): continue
+        if e.mods != Mod.NONE: continue
+        if e.code < 32: continue
+        g_key_used[i] = true
+        [4]char8 buf
+        i32 w = chars.encode(char32(e.code), buf[:], 0)
+        if w > 0: _ = fmt.put_bytes(buf[0..<w], into)
+    // The lend `ref []char8` -> `string` applies on assignment and at a
+    // parameter, but not at a `return` — so it is spelled with a binding.
+    string8 out = run
+    return out
+
+// ── the mouse ──────────────────────────────────────────────────────────────
+
+(i32 x, i32 y) mouse():
+    return (g_mx, g_my)
+
+bool mouse_down():
+    return g_mdown
+
+// Did a press land inside `r` this frame? The hit test every clickable widget
+// in the library is built on, and the reason none of them register anything.
+bool clicked_in(Rect r):
+    if !g_mpress: return false
+    if !input_reaches_here(): return false
+    return holds(r, g_mx, g_my)
+
+bool hovering(Rect r):
+    if g_mx < 0: return false
+    if !input_reaches_here(): return false
+    return holds(r, g_mx, g_my)
+
+// How far the wheel turned this frame, in lines. Negative is up.
+i32 wheel():
+    return g_wheel
+
+private i32 take_wheel_in(Rect r):
+    if g_wheel == 0: return 0
+    if !input_reaches_here(): return 0
+    if !holds(r, g_mx, g_my): return 0
+    i32 v = g_wheel
+    g_wheel = 0
+    return v
+
+// ── focus ──────────────────────────────────────────────────────────────────
+//
+// Focusable widgets register themselves as they are placed, so the tab order
+// *is* the declaration order and no program maintains one. The move happens
+// after the frame, when the whole order is known — which is what lets Tab work
+// on the first frame a widget exists.
+
+private const i32 MAX_FOCUS = 256
+private [MAX_FOCUS]u32 g_focusable
+private i32 g_nfocus
+private u32 g_focus
+private bool g_focus_text       // being computed this frame
+private bool g_text_capture     // last frame's answer, which is the one in force
+
+// ── overlays and who gets input ────────────────────────────────────────────
+//
+// An overlay is drawn last so it lands on top, but it has to take input
+// *first* — and the widgets under it already ran. The answer is the same one
+// the claiming rule uses: **last frame's** state is what is in force. A modal
+// that was up when the previous frame ended suppresses input for everything
+// outside an overlay in this one.
+//
+// The cost is a single frame at the moment a modal opens, during which a click
+// aimed at the modal would still reach what is behind it. The modal is not
+// drawn yet on that frame either, so there is nothing to aim at — which is why
+// this is invisible rather than merely cheap.
+private bool g_overlay_open       // an overlay was opened this frame
+private bool g_overlay_active     // ...last frame, which is what gates input
+private bool g_in_overlay         // the code running right now is inside one
+private bool g_adopt_focus        // the next focusable to register takes the keyboard
+
+private void mark_overlay():
+    g_overlay_open = true
+    // Take effect **now**, not next frame. The gate is normally last frame's
+    // answer because an overlay is drawn after the widgets it covers — but from
+    // the moment it is drawn, everything still to come this frame is behind it.
+    g_overlay_active = true
+
+// Hand the keyboard to the next focusable that registers.
+//
+// A modal that opens without focus loses the first keystroke after it: nothing
+// inside it holds focus, so the character reaches no widget at all and the user
+// types one letter into nowhere. This is what makes a palette usable on the
+// keystroke that opened it rather than the one after.
+private void adopt_focus():
+    g_adopt_focus = true
+
+private void enter_overlay():
+    g_in_overlay = true
+
+private void leave_overlay():
+    g_in_overlay = false
+
+// Whether a widget here may take input at all. Everything outside an overlay
+// is inert while one is up.
+private bool input_reaches_here():
+    if !g_overlay_active: return true
+    return g_in_overlay
+
+// Whether an overlay is up, for a program that wants to say so.
+bool overlay_up():
+    return g_overlay_active
+
+private void register_focus(u32 id, bool eats_text):
+    // A widget behind a modal is not in the tab order either: Tab must not walk
+    // out from under the thing that has the keyboard.
+    if !input_reaches_here(): return
+    if g_adopt_focus:
+        g_adopt_focus = false
+        g_focus = id
+    if g_nfocus >= MAX_FOCUS: return
+    g_focusable[g_nfocus] = id
+    g_nfocus = g_nfocus + 1
+    if g_focus == id: g_focus_text = eats_text
+
+bool has_focus(u32 id):
+    return g_focus == id
+
+private void take_focus(u32 id):
+    g_focus = id
+
+// Whether the focused widget is swallowing plain characters right now. A
+// global `key("q")` asks this before claiming a letter, which is the whole of
+// the claiming rule.
+private bool text_capture():
+    return g_focus_text
+
+private void move_focus(i32 by):
+    if g_nfocus == 0: return
+    // Focus is resolved *after* the frame body, because the tab order is not
+    // known until every focusable has registered. So a Tab that lands here has
+    // already missed the frame it was pressed on, and the next one has to be
+    // drawn or the ring appears one keystroke behind the key.
+    g_dirty = true
+    i32 at = 0 - 1
+    for i in 0..<g_nfocus:
+        if g_focusable[i] == g_focus:
+            at = i
+            break
+    if at < 0:
+        g_focus = g_focusable[0]
+        return
+    i32 next = at + by
+    if next < 0: next = g_nfocus - 1
+    if next >= g_nfocus: next = 0
+    g_focus = g_focusable[next]
+
+// Called once, after the frame body has run and every focusable has
+// registered. Tab is resolved here rather than during the frame because the
+// order is not known until the end of it.
+private void settle_input():
+    if take_key(K_TAB, Mod.NONE): move_focus(1)
+    else if take_key(K_TAB, Mod.SHIFT): move_focus(0 - 1)
+    g_nkey = 0
+    g_nfocus = 0
+    g_text_capture = g_focus_text
+    g_focus_text = false
+    g_overlay_active = g_overlay_open
+    g_mpress = false
+    g_mrelease = false
+    g_wheel = 0
+
+// ── bindings and the hints bar ─────────────────────────────────────────────
+//
+// Every `bind` registers a `(key, description)` pair for this frame, and
+// `hints()` renders them along the footer. **A program that binds its keys
+// gets its own help bar for free**, and it can never drift from the bindings,
+// because it is generated from them.
+
+type Action: void()
+
+private const i32 MAX_HINTS = 32
+private [MAX_HINTS]string8 g_hint_key
+private [MAX_HINTS]string8 g_hint_what
+private i32 g_nhints
+
+private void reset_hints():
+    g_nhints = 0
+    g_animating = false
+    g_overlay_open = false
+    g_in_overlay = false
+    g_adopt_focus = false
+
+// Advertise a key in the hints bar **without claiming it**.
+//
+// For a key some widget already handles — Enter on a focused list, say. `bind`
+// would consume it, and a binding that eats the key it is describing is worse
+// than no help text at all.
+void hint(string8 spec, string8 describe):
+    if g_nhints >= MAX_HINTS || #len(describe) == 0: return
+    g_hint_key[g_nhints] = spec
+    g_hint_what[g_nhints] = describe
+    g_nhints = g_nhints + 1
+
+// Run `f` when `spec` is pressed, and show it in the hints bar. `describe` may
+// be empty, which registers the key without advertising it.
+void bind(string8 spec, string8 describe, Action f):
+    if g_nhints < MAX_HINTS && #len(describe) > 0:
+        g_hint_key[g_nhints] = spec
+        g_hint_what[g_nhints] = describe
+        g_nhints = g_nhints + 1
+    if key(spec):
+        if f != nil: f()
+
+// Forget the button. A release that arrived while the terminal was handed
+// over (`shell_out`, Ctrl-Z) went to the other program, or was discarded
+// when raw mode came back, so a button still marked down would turn the
+// next press into no press at all — a click after the editor returned did
+// nothing, until a second one.
+private void forget_mouse():
+    g_mdown = false
+    g_mpress = false
+    g_mrelease = false

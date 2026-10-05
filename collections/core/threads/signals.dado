@@ -1,0 +1,257 @@
+// Handing values between threads with signals: the patterns, as documentation
+// blocks whose samples the gate compiles.
+//
+// A signal is the language's own mailbox — `#signal`, `#emit`, `#drain` — so
+// it needs nothing from this package but the thread to emit from. The blocks
+// below are the patterns chapter of the signals guide at the repository's
+// root, woven by `dado doc` from this directory and a spine; each sample is its
+// own package and compiles under `--library --strict`. This file declares
+// nothing.
+package threads
+
+//@ signals/fan-in 10
+//@ ### Fan-in from workers
+//@
+//@ Every worker emits into one queue; one thread drains it. A worker that
+//@ finds the queue full retries — the consumer is behind, and it catches up
+//@ at its next walk — so nothing is lost and no worker blocks on a lock.
+//@
+//@ ```dado
+//@ package fan_in
+//@
+//@ import "core:threads"
+//@
+//@ const i32 WORKERS = 4
+//@
+//@ #signal(64) done(i32 worker, i64 value)
+//@
+//@ i32 next_id = 0
+//@
+//@ rawptr work(rawptr arg):
+//@     i32 me = threads.atomic_fetch_add(&next_id, 1)
+//@     for job in 0..<100:
+//@         i64 value = i64(me) * 1000 + i64(job)
+//@         for:
+//@             try #emit(done, me, value) else:
+//@                 continue
+//@             break
+//@     return nil
+//@
+//@ i64 run():
+//@     [4]rawptr pool
+//@     for i in 0..<WORKERS:
+//@         pool[i] = threads.spawn(work, nil)
+//@     i64 total = 0
+//@     i32 seen = 0
+//@     for seen < WORKERS * 100:
+//@         for worker, value in #drain(done):
+//@             total += value
+//@             seen += 1
+//@     for i in 0..<WORKERS:
+//@         _ = threads.join(pool[i])
+//@     return total
+//@ ```
+
+//@ signals/per-frame 10
+//@ ### Per-frame input
+//@
+//@ An input backend emits events as they happen, on its own thread; the frame
+//@ drains them at one point, before it updates. A frame that must bound its
+//@ work takes at most a budget with `#drain(sig, n)` and leaves the rest
+//@ queued for the next frame, in order.
+//@
+//@ ```dado
+//@ package per_frame
+//@
+//@ #signal(256) key(i32 code, bool down)
+//@
+//@ i32 dropped = 0
+//@
+//@ void on_key(i32 code, bool down):
+//@     try #emit(key, code, down) else:
+//@         dropped += 1
+//@
+//@ i32 frame(^[512]bool held):
+//@     i32 handled = 0
+//@     for code, down in #drain(key, 64):
+//@         held[code & 511] = down
+//@         handled += 1
+//@     return handled
+//@ ```
+
+//@ signals/jobs 10
+//@ ### Results from `core:jobs`
+//@
+//@ A job emits what it computed instead of writing into an array the caller
+//@ polls: the result carries its own index, the caller drains after the
+//@ barrier, and a result that arrives is complete — the `#emit` published it.
+//@ Size the queue for the chunks in flight, or let a job retry.
+//@
+//@ ```dado
+//@ package job_results
+//@
+//@ import "core:jobs"
+//@
+//@ #signal(64) partial(i32 begin, i64 sum)
+//@
+//@ void sum_chunk(^jobs.JobArgs a):
+//@     i64 s = 0
+//@     for i in a.begin..<a.end:
+//@         s += i64(i)
+//@     for:
+//@         try #emit(partial, a.begin, s) else:
+//@             continue
+//@         break
+//@
+//@ i64 total(^jobs.Scheduler s, i32 n):
+//@     jobs.parallel_for(s, n, 256, sum_chunk, nil)
+//@     i64 t = 0
+//@     for begin, sum in #drain(partial):
+//@         t += sum
+//@     return t
+//@ ```
+//@
+//@ The drain after the fork-join is complete only when every chunk fits in the
+//@ queue at once: here 64 chunks of 256, so `n` up to 16384. Past that, drain
+//@ while the batch runs, or use a bigger queue.
+
+//@ signals/request-response 10
+//@ ### Request and response: two signals
+//@
+//@ A signal is one-way, so a question and its answer are two: the server
+//@ consumes requests, the client consumes responses, and each has exactly one
+//@ consumer. The request carries an id the response echoes, because answers
+//@ need not come back in the order questions went out.
+//@
+//@ ```dado
+//@ package ask
+//@
+//@ #signal(32) request(i32 id, i32 x)
+//@ #signal(32) response(i32 id, i32 y)
+//@
+//@ // The server's thread: answer everything asked so far.
+//@ void serve():
+//@     for id, x in #drain(request):
+//@         for:
+//@             try #emit(response, id, x * x) else:
+//@                 continue
+//@             break
+//@
+//@ // The client's thread: ask, and later collect what has been answered.
+//@ bool ask(i32 id, i32 x):
+//@     try #emit(request, id, x) else:
+//@         return false
+//@     return true
+//@
+//@ i32 collect(^[32]i32 answers):
+//@     i32 n = 0
+//@     for id, y in #drain(response):
+//@         answers[id & 31] = y
+//@         n += 1
+//@     return n
+//@ ```
+//@
+//@ The server's retry is safe because it drains one signal and emits into the
+//@ other. Retrying an `#emit` into the queue a walk is draining, from inside
+//@ that walk, never succeeds: see back-pressure.
+
+//@ signals/latest 10
+//@ ### Coalesced state: `latest`
+//@
+//@ For state where only the newest value matters — a window size, a setting, a
+//@ target position — `#signal(latest)` holds one value. An `#emit` replaces
+//@ what nobody took and cannot fail; the consumer's walk yields the newest
+//@ value once, or nothing when there is nothing new.
+//@
+//@ ```dado
+//@ package coalesce
+//@
+//@ #signal(latest) target(f32 x, f32 y)
+//@
+//@ void track(f32 x, f32 y):
+//@     #emit(target, x, y)
+//@
+//@ (f32, f32) follow(f32 at_x, f32 at_y):
+//@     f32 x = at_x
+//@     f32 y = at_y
+//@     for tx, ty in #drain(target):
+//@         x = tx
+//@         y = ty
+//@     return (x, y)
+//@ ```
+
+//@ signals/hand-off 10
+//@ ### Handing consumption to another thread: `#release`
+//@
+//@ A signal has one consumer at a time, and a debug build fixes it at the
+//@ first walk. A program that moves the consuming to another thread — a
+//@ loader that drains until the scene is up and then hands over to the frame
+//@ thread — says so with `#release(sig)` where the first thread is done:
+//@ the next thread to walk the signal becomes its consumer. It is a consumer
+//@ statement, written on its own line and never inside a walk of the same
+//@ signal. With assertions it clears the owner word after checking this
+//@ thread holds it; with `--no-assert` it compiles to nothing. Nothing makes
+//@ the two threads take turns: the program orders them, as with `threads.join`
+//@ below, and a walk that overlaps another thread's still traps.
+//@
+//@ ```dado
+//@ package hand_off
+//@
+//@ import "core:threads"
+//@
+//@ #signal(16) scene(i32 part)
+//@
+//@ i32 loaded = 0
+//@
+//@ rawptr frames(rawptr arg):
+//@     for part in #drain(scene):
+//@         loaded += part
+//@     return nil
+//@
+//@ i32 load():
+//@     for part in #drain(scene):
+//@         loaded += part
+//@     #release(scene)
+//@     rawptr t = threads.spawn(frames, nil)
+//@     _ = threads.join(t)
+//@     return loaded
+//@ ```
+
+//@ signals/back-pressure 10
+//@ ### Back-pressure on a full queue
+//@
+//@ A queue never drops and never blocks, so a full one hands the decision to
+//@ the producer, in the `else` of its `try #emit`. There are three honest
+//@ answers: **drop and count** (input nobody will miss), **keep it and try
+//@ again later** (work that must arrive: hold it in the producer and retry on
+//@ the next tick, as below), and **retry now** (a worker whose consumer is
+//@ another thread that is draining — the fan-in above).
+//@
+//@ ```dado
+//@ package pressure
+//@
+//@ #signal(16) sample(i32 seq, f64 value)
+//@
+//@ type Pending: (bool held, i32 seq, f64 value, i32 dropped)
+//@
+//@ // Called once per tick. The held sample goes first, so none overtakes
+//@ // another; while it cannot go, the new one is dropped and counted.
+//@ void tick(^Pending p, i32 seq, f64 value):
+//@     if p.held:
+//@         try #emit(sample, p.seq, p.value) else:
+//@             p.dropped += 1
+//@             return
+//@         p.held = false
+//@     try #emit(sample, seq, value) else:
+//@         p.held = true
+//@         p.seq = seq
+//@         p.value = value
+//@ ```
+//@
+//@ **Full includes what a walk has taken and not yet committed.** A `#drain`
+//@ commits when its loop ends, so while the walk runs the entries it has
+//@ yielded still count against the capacity. A consumer that emits into the
+//@ queue it is draining, from inside that walk, and retries until the `#emit`
+//@ succeeds, spins forever: the room it waits for appears only when its own
+//@ loop ends. Emit into another signal, or keep the message and emit after the
+//@ loop.

@@ -1,0 +1,213 @@
+// The toolchain this driver belongs to: found once at start, then asked.
+//
+// `start` finds the layout from this program's own path and reads
+// `defaults`; after it, `setting` answers a `defaults` value, `dadoc` the
+// compiler (looked for the first time it is needed), `collections` where
+// `core:` resolves, and `compiler` the C compiler a build uses.
+//
+// The environment overrides three of these, as it always has: `DADO_DADOC`
+// names the compiler (and must run: an override that quietly fell back would
+// build with a compiler nobody asked for), `DADO_COLLECTIONS` the collections
+// and `DADO_BUILD_DIR` the build directory.
+package driver
+
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+private string8 g_exe = ""
+private Layout g_layout
+private ref []Setting g_settings
+private string8 g_defaults_path = ""
+private string8 g_dadoc = ""
+private bool g_dadoc_found
+
+Layout layout():
+    return g_layout
+
+string8 executable():
+    return g_exe
+
+string8 root():
+    return g_layout.root
+
+// Find the toolchain, and read its `defaults`. Ends the process, naming the
+// repair, when either cannot be done.
+void start():
+    try string8 exe = os.executable_path() else code:
+        die(txt(#format("cannot tell where this program is (", os.message(code), "), so the toolchain beside it cannot be found.\n  Run dado from an install or a checkout of the repository.")))
+        quit 1
+    g_exe = exe
+    g_layout = locate(dir_of(exe))
+    if !g_layout.found:
+        die(txt(#format("cannot find the toolchain this program belongs to: no directory above\n    ", exe, "\n  holds collections/core (a checkout of the repository) or src/collections/core\n  (an install). Run the dado that was built in, or installed with, a toolchain.")))
+    g_defaults_path = join3(g_layout.root, "tools", join2("dado", "defaults"))
+    try ref []char8 text = fs.read_file(g_defaults_path) else code:
+        die(txt(#format("cannot read the toolchain's settings at ", g_defaults_path, ": ", os.message(code), ".\n  The toolchain is incomplete: restore the file from the repository, or reinstall.")))
+        quit 1
+    (ref []Setting parsed, bool ok, string8 why) = parse_defaults(txt(text))
+    if !ok:
+        die(txt(#format(g_defaults_path, ": ", why, ".\n  Every setting is one NAME=\"value\" line; restore the file from the repository.")))
+    g_settings = parsed
+    if g_layout.kind == "install": keep_caches_inside()
+
+// An install keeps everything it makes inside its own folder, so that
+// `dado uninstall`, which deletes the folder, leaves the home directory as it
+// found it: zig's caches and the script engine's archives go under `cache/`.
+// Each is a default; a variable already set is left alone.
+private void keep_caches_inside():
+    string8 cache = join2(g_layout.install, "cache")
+    default_env("ZIG_GLOBAL_CACHE_DIR", join2(cache, "zig-global"))
+    default_env("ZIG_LOCAL_CACHE_DIR", join2(cache, "zig-local"))
+    default_env("DADO_QJS_CACHE", join2(cache, "quickjs"))
+
+// The value of `name` in `defaults`. A name the file does not have ends the
+// process: a reader never falls back to a default of its own.
+string8 setting(string8 name):
+    (string8 v, bool found) = setting_in(g_settings[:], name)
+    if !found:
+        die(txt(#format(g_defaults_path, " has no ", name, " line, and this driver needs it.\n  The file and the driver are from different versions: rebuild the driver, or restore the file.")))
+    return v
+
+// Where `import "core:x"` resolves.
+string8 collections():
+    (string8 over, bool set) = env("DADO_COLLECTIONS")
+    if set: return over
+    return join2(g_layout.root, "collections")
+
+// The build directory `clean` empties, and the one a build uses when
+// `DADO_BUILD_DIR` is set.
+string8 build_dir():
+    (string8 over, bool set) = env("DADO_BUILD_DIR")
+    if set: return over
+    // An install's checkout stays exactly the repository's, so `dado update`
+    // can tell the collections were not edited: what it builds goes beside it.
+    if g_layout.kind == "install": return join2(g_layout.install, "build")
+    return join2(g_layout.root, "build")
+
+// Where `dado-lsp` is: beside `dadoc` at the top of an install, under `bin/`
+// in a checkout. Reported, not checked.
+string8 lsp_path():
+    if g_layout.kind == "install":
+        return join2(g_layout.install, exe_name("dado-lsp"))
+    return join3(g_layout.root, "bin", exe_name("dado-lsp"))
+
+// `name` as this system names a program file: `.exe` on Windows.
+string8 exe_name(string8 name):
+    when #OS == #WINDOWS:
+        return txt(#format(name, ".exe"))
+    else:
+        return name
+
+// ── dadoc ───────────────────────────────────────────────────────────────────
+
+// Whether `p` is a compiler this machine can run. Being there and executable
+// does not answer that — a `dadoc` built for another system is both — so it
+// is asked for its version, which reads and writes nothing.
+bool dadoc_runs(string8 p):
+    ref []char8 c = strings.clone_to_cstring(p, #default)
+    if !fs.executable(cstring(c)): return false
+    Command v = command(p)
+    add(&v, "--version")
+    return succeeds(v)
+
+// The places `dadoc` is looked for, in order: in an install the one at its
+// top; in a checkout `defaults`' `DADOC_CANDIDATES`, each with `$ROOT`
+// replaced by the root (and on Windows each also with `.exe`).
+ref []string8 dadoc_candidates():
+    ref []string8 out = #make([]string8, 0)
+    if g_layout.kind == "install":
+        _ = #append(out, join2(g_layout.install, exe_name("dadoc")))
+        return out
+    for line in lines_of(with_root(setting("DADOC_CANDIDATES"), g_layout.root)):
+        when #OS == #WINDOWS:
+            _ = #append(out, txt(#format(line, ".exe")))
+        _ = #append(out, line)
+    return out
+
+// The compiler `where` reports: `DADO_DADOC` if it runs, else the first
+// candidate that runs, else "".
+string8 find_dadoc():
+    (string8 over, bool set) = env("DADO_DADOC")
+    if set:
+        if dadoc_runs(over): return over
+        return ""
+    for c in dadoc_candidates():
+        if dadoc_runs(c): return c
+    return ""
+
+// The compiler a command uses. Ends the process, saying what was looked for
+// and how to get one, when there is none that runs.
+string8 dadoc():
+    if g_dadoc_found: return g_dadoc
+    (string8 over, bool set) = env("DADO_DADOC")
+    if set:
+        if !dadoc_runs(over):
+            die(txt(#format("DADO_DADOC names a compiler that will not run here:\n\n    ", over, "\n\n  It is set explicitly, so this driver does not look anywhere else — an\n  override that quietly fell back would build with a compiler nobody asked\n  for. Unset it to search the toolchain, or point it at a working binary.")))
+        g_dadoc = over
+        g_dadoc_found = true
+        return g_dadoc
+    ref []string8 candidates = dadoc_candidates()
+    strings.Builder looked = strings.builder(256)
+    strings.Builder unrunnable = strings.builder(64)
+    for c in candidates:
+        if dadoc_runs(c):
+            g_dadoc = c
+            g_dadoc_found = true
+            return g_dadoc
+        _ = strings.append(&looked, txt(#format("    ", c, "\n")))
+        if exists(c):
+            _ = strings.append(&unrunnable, txt(#format("\n    ", c)))
+    string8 build_it = "Build one for this machine:  ./dado_build.sh"
+    if g_layout.kind == "install":
+        build_it = "Reinstall the toolchain for this machine (dadoc bootstrap)"
+    string8 cannot = strings.text(unrunnable)
+    if #len(cannot) > 0:
+        die(txt(#format("a Dado compiler is here, and this machine cannot run it:", strings.text(unrunnable), "\n\n  It exists and is executable, so it was almost certainly built for another\n  operating system or another architecture — a toolchain unpacked or copied\n  from a different machine. `file` on it will say which.\n\n  ", build_it, "\n  Or point at one you have:    DADO_DADOC=/path/to/dadoc dado ...\n\n  Looked in, in order:\n", strings.text(looked))))
+    die(txt(#format("the Dado compiler is not built.\n\n  ", build_it, "\n\n  Looked in, in order:\n\n", strings.text(looked), "\n  A `dadoc` on your PATH is deliberately **not** one of them: its collections\n  would be somewhere else, and `import \"core:strings\"` has to mean the same\n  thing to you, to this driver and to the compiler. Set DADO_DADOC to use one\n  anyway.")))
+    return ""
+
+// ── the C compiler ──────────────────────────────────────────────────────────
+
+private bool g_cc_warned
+
+// The C compiler a build uses: `--cc`'s program when `given` is not empty,
+// otherwise the pinned zig (see `cc.dado`). Not found is an answer here,
+// with the reason in `why`; a build that needs one dies with it.
+Compiler compiler(string8 given, bool quiet = false):
+    if #len(given) > 0:
+        return given_compiler(given)
+    if !quiet && !g_cc_warned:
+        (string8 cc, bool set) = env("CC")
+        if set:
+            g_cc_warned = true
+            warn(txt(#format("CC=", cc, " is ignored: dado compiles with the pinned zig (`zig cc`).\n  Pass --cc <program> to use another C compiler.")))
+    (string8 target, bool _) = env("ZIG_TARGET")
+    string8 pin_path = join2(g_layout.root, "ZIG_PIN")
+    string8 version = ""
+    try ref []char8 pin = fs.read_file(pin_path) else:
+        return no_compiler(txt(#format("no C compiler: --cc was not given, and the zig this toolchain is pinned to\n  is named nowhere (", pin_path, " cannot be read).\n  Pass --cc <program>, e.g. --cc clang, or restore ZIG_PIN.")))
+    version = pinned_zig(txt(pin))
+    if g_layout.kind == "install":
+        string8 zig = join3(g_layout.install, "zig", join2(version, exe_name("zig")))
+        if is_file(zig):
+            return zig_compiler(zig, target)
+        return no_compiler(txt(#format("no C compiler: --cc was not given, and the pinned zig ", version, " is not at\n    ", zig, "\n  Reinstall the toolchain (dadoc bootstrap downloads it), or pass --cc <program>,\n  e.g. --cc clang.")))
+    string8 zig = on_path(exe_name("zig"))
+    if #len(zig) == 0:
+        return no_compiler(txt(#format("no C compiler: --cc was not given, and there is no zig on PATH.\n  This toolchain compiles with zig ", version, " (ZIG_PIN): install it from\n  https://ziglang.org/download/ and put it on PATH, or pass --cc <program>,\n  e.g. --cc clang.")))
+    Command ask = command(zig)
+    add(&ask, "version")
+    string8 has = first_line(ask, true)
+    if has != version:
+        return no_compiler(txt(#format("no C compiler: --cc was not given, and the zig on PATH (", zig, ")\n  is version ", has, ", where this toolchain is pinned to ", version, " (ZIG_PIN).\n  Install zig ", version, " from https://ziglang.org/download/, or pass --cc <program>,\n  e.g. --cc clang.")))
+    return zig_compiler(zig, target)
+
+// `compiler`, ending the process when there is none.
+Compiler need_compiler(string8 given):
+    Compiler c = compiler(given)
+    if !c.found: die(c.why)
+    string8 program = on_path(c.words[0])
+    if #len(program) == 0:
+        die(txt(#format("--cc names `", c.words[0], "`, which is neither a program on PATH nor a file that runs.\n  Install it, or name a compiler that is there, e.g. --cc clang.")))
+    return c

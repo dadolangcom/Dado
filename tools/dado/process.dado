@@ -1,0 +1,320 @@
+// Running the programs a build is made of: `dadoc`, the C compiler, the
+// program built, and the probes that ask a compiler what it can do.
+//
+// **Every command is an argument list, never a shell line**, so a path with a
+// space or a quote in it is one argument and nothing else. `core:os/proc`
+// starts each one: `exec` when it should talk to the terminal directly, and a
+// `Duplex` when its output is read or thrown away.
+//
+// **Standard output is flushed before every child starts**, so this
+// program's own lines and the child's arrive in the order they were made.
+//
+// Exit statuses are the shell's: a program that returned is its status, one a
+// signal ended is 128 plus the signal, and one that could not be started is
+// 127, as `sh` reports a command it cannot run.
+package driver
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+
+// Whether `-v` was given: each command is echoed before it runs.
+private bool g_verbose
+
+void set_verbose(bool on):
+    g_verbose = on
+
+bool verbose():
+    return g_verbose
+
+// ── colour, and the three kinds of line ─────────────────────────────────────
+
+// The escape sequences, each empty when this run does not colour
+// (`colour.dado` decides: `--color`, `NO_COLOR`, a terminal). `g_red` is
+// the brand's copper and `g_dim` its slate; `g_yellow`, a warning's, is
+// bold, as the compiler writes one.
+private string8 g_bold = ""
+private string8 g_red = ""
+private string8 g_green = ""
+private string8 g_dim = ""
+private string8 g_yellow = ""
+private string8 g_reset = ""
+private bool g_colour_asked
+
+private void colour():
+    if g_colour_asked: return
+    g_colour_asked = true
+    g_bold = ""
+    g_red = ""
+    g_green = ""
+    g_dim = ""
+    g_yellow = ""
+    g_reset = ""
+    if colour_on():
+        bool deep = colour_deep()
+        g_bold = "\x1b[1m"
+        g_red = copper_escape(deep)
+        g_green = "\x1b[32m"
+        g_dim = slate_escape(deep)
+        g_yellow = "\x1b[1m"
+        g_reset = "\x1b[0m"
+
+// Decide again at the next line: `--color` was read after a line may
+// already have been written.
+void recolour():
+    g_colour_asked = false
+
+// A line of the driver's own framing, in bold: `dadoc  corpus/tour`.
+void say(string8 line):
+    colour()
+    fmt.println(g_bold, line, g_reset)
+
+// A framing line whose first word is green: `built <path>`, `ok <name>`.
+void say_green(string8 word, string8 rest):
+    colour()
+    fmt.println(g_bold, g_green, word, g_reset, rest, g_reset)
+
+// A line in dim: where each artifact went.
+void note(string8 line):
+    colour()
+    fmt.println(g_dim, line, g_reset)
+
+// `warning: <text>` on standard error.
+void warn(string8 text):
+    colour()
+    _ = io.flush(io.stdout())
+    fmt.writeln(io.stderr_sink(), g_yellow, "warning:", g_reset, " ", text)
+
+// `error: <text>` on standard error, and the process ends with status 1.
+void die(string8 text):
+    colour()
+    _ = io.flush(io.stdout())
+    fmt.writeln(io.stderr_sink(), g_red, "error:", g_reset, " ", text)
+    _ = io.flush(io.stderr())
+    os.quit_with(1)
+
+// The dim `---` that brackets a program's own output under `run`.
+void rule():
+    colour()
+    fmt.println(g_dim, "---", g_reset)
+
+// ── commands ────────────────────────────────────────────────────────────────
+
+// An argument list being assembled, and whether `-v` echoes it.
+type Command:
+    ref []string8 words
+    bool echoed
+
+Command command(string8 program):
+    ref []string8 w = #make([]string8, 0)
+    _ = #append(w, program)
+    Command c
+    c.words = w
+    c.echoed = true
+    return c
+
+Command command_of([]string8 words):
+    ref []string8 all = #make([]string8, 0)
+    for w in words:
+        _ = #append(all, w)
+    Command c
+    c.words = all
+    c.echoed = true
+    return c
+
+void add(^Command c, string8 word):
+    _ = #append(c.words, word)
+
+// Every word of `words`, in order.
+void add_all(^Command c, []string8 words):
+    for w in words:
+        _ = #append(c.words, w)
+
+// Each whitespace-separated word of `text`: a flag list from `defaults` or
+// from the environment, which the shell would have split the same way.
+void add_split(^Command c, string8 text):
+    for w in words_of(text):
+        _ = #append(c.words, w)
+
+// The command as one line, words separated by a space, for `-v` and for
+// messages.
+string8 shown(Command c):
+    ref []char8 j = strings.join(c.words[:], " ")
+    return txt(j)
+
+private ref []cstring c_argv(Command c):
+    ref []cstring out = #make([]cstring, 0)
+    for w in c.words:
+        ref []char8 z = strings.clone_to_cstring(w, #default)
+        _ = #append(out, cstring(z))
+    return out
+
+private void echo(Command c):
+    if g_verbose && c.echoed:
+        note(txt(#format("  $ ", shown(c))))
+
+// The shell's reading of a `(exited, status)` pair.
+private i32 shell_status(bool exited, i32 status):
+    if exited: return status
+    if status < 0 && status != 0 - 1: return 128 - status
+    return 127
+
+// Run `c` with this process's own standard streams, and answer its status.
+i32 run(Command c):
+    echo(c)
+    return run_quietly(c)
+
+// `run`, not echoed even under `-v`.
+i32 run_quietly(Command c):
+    if #len(c.words) > proc.ARG_CAP:
+        die(txt(#format("a command of ", #len(c.words), " words is more than the ", proc.ARG_CAP, " this driver can start: ", c.words[0])))
+    _ = io.flush(io.stdout())
+    _ = io.flush(io.stderr())
+    ref []cstring argv = c_argv(c)
+    (bool exited, i32 status) = proc.exec(argv[:])
+    return shell_status(exited, status)
+
+// What a command printed on standard output, and how it ended.
+type Captured:
+    i32 status
+    ref []char8 out
+    bool started
+
+// Run `c`, reading its standard output; its standard error goes to this
+// process's own unless `quiet`, when it is thrown away. `input`, when not
+// empty, is written to its standard input.
+Captured capture(Command c, bool quiet, string8 input = ""):
+    i32 errors = proc.ERRORS_DISCARD if quiet else proc.ERRORS_INHERIT
+    return capture_with(c, errors, input)
+
+// `capture`, with standard error folded into what is read, as `2>&1`.
+Captured capture_merged(Command c):
+    return capture_with(c, proc.ERRORS_MERGE, "")
+
+private Captured capture_with(Command c, i32 errors, string8 input):
+    Captured r
+    r.status = 127
+    r.out = #make([]char8, 0)
+    r.started = false
+    if #len(c.words) > proc.ARG_CAP: return r
+    _ = io.flush(io.stdout())
+    _ = io.flush(io.stderr())
+    ref []cstring argv = c_argv(c)
+    proc.Duplex d = proc.duplex(argv[:], errors)
+    if !proc.started(d): return r
+    r.started = true
+    []char8 bytes = strings.bytes(input)
+    i64 sent = 0
+    if #len(bytes) == 0:
+        _ = proc.close_input(&d)
+    [16384]char8 chunk
+    for:
+        if sent < #len(bytes):
+            i32 n = proc.send(&d, bytes[sent..<#len(bytes)], 10)
+            if n == proc.BROKE:
+                sent = #len(bytes)
+            else if n > 0:
+                sent += i64(n)
+            if sent >= #len(bytes):
+                _ = proc.close_input(&d)
+        i32 got = proc.receive(&d, chunk[:], 10 if sent < #len(bytes) else 0 - 1)
+        if got == proc.DRAINED || got == proc.BROKE:
+            break
+        if got > 0:
+            for i in 0..<got:
+                _ = #append(r.out, chunk[i])
+    proc.release(&d)
+    (bool done, bool exited, i32 status) = proc.finish(&d, 0 - 1)
+    if done:
+        r.status = shell_status(exited, status)
+    return r
+
+// The first line `c` prints, trimmed; empty when it fails or says nothing.
+string8 first_line(Command c, bool quiet):
+    Captured r = capture(c, quiet)
+    if !r.started || r.status != 0: return ""
+    string8 out = r.out
+    (string8 l, string8 _, bool _) = strings.line(out)
+    return strings.trim(l)
+
+// Whether `c` starts and exits 0, everything it prints thrown away.
+bool succeeds(Command c):
+    Captured r = capture(c, true)
+    return r.started && r.status == 0
+
+// Whether `c` starts and exits 0 within `limit_ms`, everything it prints
+// thrown away. `hung` is true when it was still running at the limit; it is
+// killed then, and its process tree with it.
+(bool ok, bool hung) succeeds_within(Command c, i32 limit_ms):
+    if #len(c.words) > proc.ARG_CAP: return (false, false)
+    ref []cstring argv = c_argv(c)
+    proc.Duplex d = proc.duplex(argv[:], proc.ERRORS_DISCARD)
+    if !proc.started(d): return (false, false)
+    proc.release(&d)
+    (bool done, bool exited, i32 status) = proc.finish(&d, limit_ms)
+    if !done:
+        _ = proc.stop(&d, 0)
+        return (false, true)
+    return (shell_status(exited, status) == 0, false)
+
+// ── signals, for the program `run` starts ───────────────────────────────────
+//
+// Reading a child's output through a `Duplex` sets `SIGPIPE` to ignored in
+// this process, and an ignored signal survives `exec`: the program `run`
+// starts would inherit it, and a `run … | head` would no longer stop it. So
+// the default is put back just before that program starts.
+when #OS == #WINDOWS:
+    void default_sigpipe():
+        return
+else:
+    private type SigHandler: void(i32)
+
+    private foreign sig "signal.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        const i32 SIGPIPE
+        const SigHandler SIG_DFL
+        SigHandler signal(i32 signum, SigHandler handler)
+
+    void default_sigpipe():
+        _ = sig.signal(sig.SIGPIPE, sig.SIG_DFL)
+
+// ── finding a program ───────────────────────────────────────────────────────
+
+when #OS == #WINDOWS:
+    private const char8 PATH_LIST = ';'
+else:
+    private const char8 PATH_LIST = ':'
+
+// The file `name` runs as when looked up on `PATH`, or "" when no directory
+// on it holds one. A name with a separator in it is not looked up: it is
+// answered as written when it is a file that runs.
+string8 on_path(string8 name):
+    if strings.has_byte(name, '/') || strings.has_byte(name, '\\'):
+        if runs_as_written(name): return name
+        return ""
+    (string8 dirs, bool set) = env("PATH")
+    if !set: return ""
+    string8 rest = dirs
+    for:
+        (string8 d, string8 tail, bool more) = split_byte(rest, PATH_LIST)
+        if #len(d) > 0:
+            string8 candidate = join2(d, name)
+            if runs_as_written(candidate): return candidate
+            when #OS == #WINDOWS:
+                string8 exe = txt(#format(candidate, ".exe"))
+                if runs_as_written(exe): return exe
+        if !more: break
+        rest = tail
+    return ""
+
+private bool runs_as_written(string8 p):
+    ref []char8 c = strings.clone_to_cstring(p, #default)
+    return fs.executable(cstring(c))
+
+// `s` cut at the first `sep`.
+(string8 head, string8 rest, bool found) split_byte(string8 s, char8 sep):
+    i64 at = strings.index_of(s, sep)
+    if at < 0: return (s, s[#len(s)..<#len(s)], false)
+    return (s[0..<at], s[at + 1..<#len(s)], true)

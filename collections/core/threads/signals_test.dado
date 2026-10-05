@@ -1,0 +1,204 @@
+@test
+// Signals across threads: many producers, one consumer.
+//
+// Producers spawned here `#emit` numbered messages into a queue far smaller
+// than what they send, retrying when it is full; the consumer — this thread —
+// walks it every way the language has: `#drain` whole, `#drain(sig, n)`, a
+// walk left by `break`, a walk left by `return`, a walk a failure passes out
+// of, `#peek`, and the discard statement. Every message is checked against the
+// sequence its producer sent it in: each producer's messages arrive in order,
+// none is lost and none is seen twice. `latest` is checked against the same
+// rule a register obeys — a producer's value never goes backwards — and a
+// `ref` travels from the thread that allocated it to the one that frees it.
+// Run it under `./dado test --sanitize=thread` as well as the default, and under
+// LSan: nothing here leaks by the signal's hand.
+package threads
+
+const i32 SIG_PRODUCERS = 3
+const i32 SIG_PER_PRODUCER = 20000
+const i32 SIG_REFS = 2000
+const i32 SIG_FAILED = 3
+
+#signal(16) sig_fifo(i32 producer, i32 seq)
+#signal(latest) sig_newest(i32 producer, i32 value)
+#signal(8) sig_owned(i32 seq, ref []i32 values)
+
+// Which producer a spawned thread is: handed out once each, atomically.
+private i32 sig_ids = 0
+
+// The consumer's view of each producer: the sequence number it expects next.
+private [3]i32 sig_next
+
+// How many messages the consumer has taken, and how many it saw twice or out
+// of order — which is to say, how many were wrong.
+private i32 sig_taken = 0
+private i32 sig_wrong = 0
+
+rawptr sig_producer(rawptr arg):
+    i32 me = atomic_fetch_add(&sig_ids, 1)
+    for seq in 0..<SIG_PER_PRODUCER:
+        // Full is the rule, not a race: the consumer is behind, so try again.
+        for:
+            try #emit(sig_fifo, me, seq) else:
+                continue
+            break
+    return nil
+
+rawptr sig_latest_producer(rawptr arg):
+    i32 me = atomic_fetch_add(&sig_ids, 1)
+    for v in 1..=SIG_PER_PRODUCER:
+        #emit(sig_newest, me, v)
+    return nil
+
+rawptr sig_ref_producer(rawptr arg):
+    for seq in 0..<SIG_REFS:
+        ref []i32 values = #make([]i32, 4)
+        for i in 0..<4:
+            values[i] = seq * 4 + i
+        for:
+            try #emit(sig_owned, seq, values) else:
+                continue
+            break
+    return nil
+
+// One message, checked against its producer's sequence.
+private void sig_take(i32 producer, i32 seq):
+    if producer < 0 || producer >= SIG_PRODUCERS:
+        sig_wrong += 1
+        return
+    if seq != sig_next[producer]:
+        sig_wrong += 1
+    sig_next[producer] = seq + 1
+    sig_taken += 1
+
+// A walk left by `return`: the entry whose body began is consumed.
+private i32 sig_take_one():
+    for producer, seq in #drain(sig_fifo):
+        sig_take(producer, seq)
+        return 1
+    return 0
+
+// A walk a failure passes out of: what it walked is consumed, and nothing
+// after the failing entry is.
+private !void sig_take_until_odd():
+    for producer, seq in #drain(sig_fifo):
+        sig_take(producer, seq)
+        if seq % 2 == 1:
+            fail SIG_FAILED
+    return
+
+// Every way to walk, in turn, until every message has arrived.
+private void sig_consume():
+    i32 want = SIG_PRODUCERS * SIG_PER_PRODUCER
+    i32 round = 0
+    for sig_taken < want:
+        round += 1
+        switch round % 6:
+            case 0:
+                for producer, seq in #drain(sig_fifo):
+                    sig_take(producer, seq)
+            case 1:
+                for producer, seq in #drain(sig_fifo, 5):
+                    sig_take(producer, seq)
+            case 2:
+                i32 walked = 0
+                for producer, seq in #drain(sig_fifo):
+                    sig_take(producer, seq)
+                    walked += 1
+                    if walked == 3:
+                        break
+            case 3:
+                _ = sig_take_one()
+            case 4:
+                try sig_take_until_odd() else code:
+                    if code != SIG_FAILED:
+                        sig_wrong += 1
+            else:
+                // A look consumes nothing: what it saw is still queued, in
+                // order, for the next round's walk.
+                for producer, seq in #peek(sig_fifo):
+                    if producer >= 0 && producer < SIG_PRODUCERS && seq < sig_next[producer]:
+                        sig_wrong += 1
+
+private bool sig_fifo_round():
+    bool ok = true
+    sig_ids = 0
+    [3]rawptr ts
+    for i in 0..<SIG_PRODUCERS:
+        ts[i] = spawn(sig_producer, nil)
+        ok = #expect(ts[i] != nil, "spawn ", i) && ok
+    sig_consume()
+    for i in 0..<SIG_PRODUCERS:
+        _ = join(ts[i])
+    ok = #expect(sig_wrong == 0, sig_wrong, " messages out of order, lost or seen twice") && ok
+    ok = #expect(sig_taken == SIG_PRODUCERS * SIG_PER_PRODUCER, "took ", sig_taken) && ok
+    for i in 0..<SIG_PRODUCERS:
+        ok = #expect(sig_next[i] == SIG_PER_PRODUCER, "producer ", i, " stopped at ", sig_next[i]) && ok
+    ok = #expect(#len(sig_fifo) == 0, "left queued: ", #len(sig_fifo)) && ok
+    return ok
+
+// `latest` across two producers: whatever the consumer sees of one producer
+// never goes backwards, and the last value of each arrives.
+private bool sig_latest_round():
+    bool ok = true
+    sig_ids = 0
+    [2]i32 seen
+    rawptr a = spawn(sig_latest_producer, nil)
+    rawptr b = spawn(sig_latest_producer, nil)
+    i32 backwards = 0
+    for seen[0] < SIG_PER_PRODUCER || seen[1] < SIG_PER_PRODUCER:
+        for producer, value in #drain(sig_newest):
+            if producer >= 0 && producer < 2:
+                if value < seen[producer]:
+                    backwards += 1
+                seen[producer] = value
+        if atomic_load(&sig_ids) == 2 && #len(sig_newest) == 0:
+            // Both started; once both have finished, what is left is taken
+            // by the next walk or never came.
+            if join(a) && join(b):
+                a = nil
+                b = nil
+                for producer, value in #drain(sig_newest):
+                    if producer >= 0 && producer < 2:
+                        seen[producer] = value
+                break
+    if a != nil:
+        _ = join(a)
+    if b != nil:
+        _ = join(b)
+    ok = #expect(backwards == 0, backwards, " values went backwards") && ok
+    // Superseded writes are the rule, so only one producer's last value is
+    // certain to be the one left standing; the other's may have been replaced.
+    ok = #expect(seen[0] == SIG_PER_PRODUCER || seen[1] == SIG_PER_PRODUCER, "last values ", seen[0], " and ", seen[1]) && ok
+    return ok
+
+// A `ref` allocated on one thread and freed on another; the ones still
+// queued at the end are dropped by the discard statement, which frees them.
+private bool sig_ref_round():
+    bool ok = true
+    rawptr t = spawn(sig_ref_producer, nil)
+    i32 next = 0
+    i32 wrong = 0
+    for next < SIG_REFS - 4:
+        for seq, values in #drain(sig_owned):
+            if seq != next || values[0] != seq * 4 || values[3] != seq * 4 + 3:
+                wrong += 1
+            next = seq + 1
+            #delete(values)
+    _ = join(t)
+    for seq, values in #peek(sig_owned):
+        // Under `#peek` the `ref` binds as the view it lends: read, not kept.
+        if values[1] != seq * 4 + 1:
+            wrong += 1
+    #drain(sig_owned)
+    ok = #expect(wrong == 0, wrong, " owned messages were wrong") && ok
+    ok = #expect(#len(sig_owned) == 0, "left queued: ", #len(sig_owned)) && ok
+    return ok
+
+i32 test():
+    bool ok = sig_fifo_round()
+    ok = sig_latest_round() && ok
+    ok = sig_ref_round() && ok
+    if ok:
+        return 0
+    return 1

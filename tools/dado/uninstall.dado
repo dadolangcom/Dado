@@ -1,0 +1,261 @@
+// `dado uninstall`: take back every change the install made outside its
+// folder, last first, then delete the folder.
+//
+//     dado uninstall                   asks first, on a terminal
+//     dado uninstall --yes             no question; needed without a terminal
+//
+// The changes are the journal's (`journal.dado`). Each is undone only while
+// it is still the install's: a link that still points into the install, the
+// exact PATH entry it added (that entry alone; no older PATH is put back), an
+// extension or plugin it installed, a directory it made that is empty again.
+// Anything since changed or reused by someone else stays, with a line saying
+// so. Each reversal looks before it acts, so an install that was stopped
+// half-way uninstalls the same way, and an uninstall that was stopped can
+// simply be run again.
+//
+// **When a change cannot be undone** (an editor's command fails), the folder
+// is kept with its journal, so the next `dado uninstall` can finish the job
+// once the cause is fixed.
+//
+// **Windows cannot delete a running program**, and `dado.exe` is running: the
+// folder is deleted by a small batch file in the temp folder, started on its
+// own, which waits for this process to end, deletes the folder, then itself.
+package driver
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+// How one reversal went: `undone`, `gone` (nothing there to undo), `kept`
+// (there, and no longer ours) or `failed`, and the line that says so.
+type Undo:
+    string8 outcome
+    string8 said
+
+private Undo undo(string8 outcome, string8 said):
+    Undo u
+    u.outcome = outcome
+    u.said = said
+    return u
+
+// Whether the link text `target` points into `install`.
+bool points_into(string8 target, string8 install):
+    if #len(install) == 0: return false
+    if target == install: return true
+    return strings.starts_with(target, txt(#format(install, "/"))) || strings.starts_with(target, txt(#format(install, "\\")))
+
+private string8 field(Record r, i64 i):
+    if i < #len(r.fields): return r.fields[i]
+    return ""
+
+// Undo the change `r` records, if it is there and still ours.
+Undo reverse_record(string8 install, Record r):
+    if r.kind == "mkdir": return undo_mkdir(field(r, 0))
+    if r.kind == "symlink": return undo_symlink(install, field(r, 0))
+    if r.kind == "winpath": return undo_winpath(field(r, 0))
+    if r.kind == "vscode": return undo_vscode(field(r, 0), field(r, 1))
+    if r.kind == "claude-plugin": return undo_claude(field(r, 0), field(r, 1))
+    if r.kind == "file": return undo_file(field(r, 0), field(r, 1))
+    if r.kind == "block": return undo_block(field(r, 0), field(r, 1))
+    return undo("kept", txt(#format("this dado does not know how to undo a `", r.kind, "` record, so it was left: ", r.line)))
+
+private Undo undo_mkdir(string8 dir):
+    if !exists(dir) && !is_link(dir): return undo("gone", txt(#format(dir, " is already gone")))
+    if is_link(dir) || !is_dir(dir): return undo("kept", txt(#format(dir, " is no longer the directory dado made, so it stays")))
+    try fs.remove_dir(dir) else code:
+        if code == os.NOT_EMPTY || code == os.EXISTS:
+            return undo("kept", txt(#format(dir, " has things of yours in it, so it stays")))
+        return undo("failed", txt(#format("cannot remove ", dir, ": ", os.message(code))))
+    return undo("undone", txt(#format("removed ", dir)))
+
+private Undo undo_symlink(string8 install, string8 link):
+    if !is_link(link):
+        if exists(link): return undo("kept", txt(#format(link, " is no longer a link dado made, so it stays")))
+        return undo("gone", txt(#format(link, " is already gone")))
+    string8 now = link_target(link)
+    if !points_into(now, install):
+        return undo("kept", txt(#format(link, " now links to ", now, ", not into this install, so it stays")))
+    try fs.remove_file(link) else code:
+        return undo("failed", txt(#format("cannot remove ", link, ": ", os.message(code))))
+    return undo("undone", txt(#format("removed ", link)))
+
+private Undo undo_winpath(string8 entry):
+    (string8 value, bool ok) = read_user_path()
+    if !ok:
+        return undo("failed", txt(#format("PowerShell did not say what your PATH is, so ", entry, " could not be taken out of it.\n  Take it out yourself (Settings, *Edit environment variables for your account*), then run dado uninstall again.")))
+    (string8 left, bool removed) = without_path_entry(value, entry)
+    if !removed: return undo("gone", txt(#format(entry, " is not on your PATH")))
+    if !write_user_path(left):
+        return undo("failed", txt(#format("PowerShell did not change your PATH: take ", entry, " out of it yourself,\n  then run dado uninstall again.")))
+    return undo("undone", txt(#format("took ", entry, " out of your PATH")))
+
+private Undo undo_vscode(string8 cli, string8 id):
+    if !is_executable(cli): return undo("gone", txt(#format(cli, " is gone, and the extension with it")))
+    (ref []string8 exts, bool ok) = installed_extensions(cli)
+    if !ok:
+        return undo("failed", txt(#format(cli, " --list-extensions did not answer, so ", id, " was not removed.\n  Remove it yourself (", cli, " --uninstall-extension ", id, "), then run dado uninstall again.")))
+    (string8 _, bool has) = extension_version(exts[:], id)
+    if !has: return undo("gone", txt(#format(id, " is not in ", cli)))
+    Command c = editor_command(cli)
+    add(&c, "--uninstall-extension")
+    add(&c, id)
+    Captured r = capture_merged(c)
+    if !r.started || r.status != 0:
+        return undo("failed", txt(#format(shown(c), " failed: ", last_lines(txt(r.out), 2))))
+    return undo("undone", txt(#format("removed ", id, " from ", cli)))
+
+private Undo undo_claude(string8 plugin, string8 market):
+    string8 claude = on_path(exe_name("claude"))
+    if #len(claude) == 0:
+        if claude_has_plugin():
+            return undo("kept", txt(#format("Claude Code still lists ", plugin, ", and `claude` is not on PATH to remove it:\n  claude plugin uninstall ", plugin, " && claude plugin marketplace remove ", market)))
+        return undo("gone", "Claude Code is gone, and the plugin with it")
+    bool had_plugin = claude_has_plugin()
+    bool had_market = claude_has_marketplace(market)
+    if !had_plugin && !had_market:
+        return undo("gone", txt(#format("Claude Code has neither ", plugin, " nor its marketplace")))
+    if had_plugin:
+        Command u = command(claude)
+        add(&u, "plugin")
+        add(&u, "uninstall")
+        add(&u, plugin)
+        Captured r = capture_merged(u)
+        if !r.started || r.status != 0:
+            return undo("failed", txt(#format(shown(u), " failed: ", last_lines(txt(r.out), 2))))
+    if !had_market:
+        return undo("undone", txt(#format("removed ", plugin, " from Claude Code")))
+    Command m = command(claude)
+    add(&m, "plugin")
+    add(&m, "marketplace")
+    add(&m, "remove")
+    add(&m, market)
+    Captured r2 = capture_merged(m)
+    if !r2.started || r2.status != 0:
+        return undo("failed", txt(#format(shown(m), " failed: ", last_lines(txt(r2.out), 2))))
+    return undo("undone", txt(#format("removed ", plugin, " and its marketplace from Claude Code")))
+
+// Whether Claude Code knows the marketplace `name`, read from its own record
+// of them, as `claude_has_plugin` reads its plugins.
+private bool claude_has_marketplace(string8 name):
+    string8 dir = ""
+    (string8 over, bool set) = env("CLAUDE_CONFIG_DIR")
+    if set:
+        dir = over
+    else:
+        string8 home = home_or_empty()
+        if #len(home) == 0: return false
+        dir = join2(home, ".claude")
+    return strings.contains(read_or_empty(join3(dir, "plugins", "known_marketplaces.json")), txt(#format("\"", name, "\"")))
+
+private Undo undo_file(string8 p, string8 sha):
+    if !exists(p): return undo("gone", txt(#format(p, " is already gone")))
+    if sha256_of(read_or_empty(p)) != sha:
+        return undo("kept", txt(#format(p, " was changed since dado wrote it, so it stays")))
+    try fs.remove_file(p) else code:
+        return undo("failed", txt(#format("cannot remove ", p, ": ", os.message(code))))
+    return undo("undone", txt(#format("removed ", p)))
+
+private Undo undo_block(string8 p, string8 sha):
+    if !exists(p): return undo("gone", txt(#format(p, " is gone")))
+    (string8 left, string8 outcome) = without_block(read_or_empty(p), sha)
+    if outcome == "absent": return undo("gone", txt(#format("dado's block is not in ", p)))
+    if outcome == "changed":
+        return undo("kept", txt(#format("the block dado added to ", p, " was changed since, so it stays;\n  delete it yourself if you no longer want it")))
+    try fs.write_file(p, left) else code:
+        return undo("failed", txt(#format("cannot rewrite ", p, ": ", os.message(code))))
+    return undo("undone", txt(#format("took dado's block out of ", p)))
+
+// Undo each of `plan`, a line each; answers how many failed.
+private i64 undo_all(string8 install, []Record plan):
+    i64 failed = 0
+    for r in plan:
+        Undo u = reverse_record(install, r)
+        if u.outcome == "undone":
+            say_green("undone", txt(#format(" ", u.said)))
+        else if u.outcome == "gone":
+            note(txt(#format("gone   ", u.said)))
+        else if u.outcome == "kept":
+            warn(u.said)
+        else:
+            warn(u.said)
+            failed += 1
+    return failed
+
+// `dado editors --remove`: undo what install set up in editors.
+i32 remove_editors(string8 install):
+    ref []Record records = read_journal(install)
+    ref []Record plan = reversal_plan(records[:])
+    ref []Record only = #make([]Record, 0)
+    for r in plan:
+        if r.kind == "vscode" || r.kind == "claude-plugin": _ = #append(only, r)
+    if #len(only) == 0:
+        say("dado set up no editor from this install")
+        return 0
+    if undo_all(install, only[:]) > 0: return 1
+    return 0
+
+// Whether `dir` looks like an install this driver may delete: `dadoc` at its
+// top, its checkout and its journal beside it. Asked before deleting, so a
+// layout found somewhere unexpected is never what goes.
+private bool looks_installed(string8 dir):
+    return is_file(join2(dir, exe_name("dadoc"))) && is_dir(join3(dir, "src", "collections")) && is_file(journal_path(dir))
+
+i32 uninstall_command(bool yes):
+    Layout l = layout()
+    if l.kind != "install":
+        die(txt(#format("dado uninstall removes an install, and this is a checkout of the repository\n  (", l.root, "). Delete the checkout yourself if you no longer want it.")))
+    string8 install = l.install
+    if !looks_installed(install):
+        die(txt(#format(install, " does not hold dadoc, src/ and install.journal together, so it is not\n  deleted. Delete it yourself if it is the install you mean to remove.")))
+    ref []Record records = read_journal(install)
+    ref []Record plan = reversal_plan(records[:])
+    if !yes:
+        if !(os.is_terminal(0) && os.is_terminal(1)):
+            die("dado uninstall deletes the install and undoes its changes, and there is no terminal\n  to ask first. Run it with --yes to go ahead.")
+        fmt.print("Remove Dado from ", install, ", and undo the ", #len(plan), " change", "" if #len(plan) == 1 else "s", " it made outside it? [y/N] ")
+        _ = io.flush(io.stdout())
+        [64]char8 buf
+        (i64 n, bool got) = io.read_line_into(io.stdin(), buf[:])
+        string8 answer = string8(buf[0..<n])
+        string8 a = lowered(strings.trim(answer))
+        if !got || (a != "y" && a != "yes"):
+            say("nothing was removed")
+            return 0
+    if !journal_done(records[:]):
+        note("the install did not run to its end: undoing what its journal records")
+    if undo_all(install, plan[:]) > 0:
+        warn(txt(#format("some changes could not be undone (above). The install is kept, with its journal,\n  so `dado uninstall` can finish once they are fixed: ", install)))
+        return 1
+    return delete_install(install)
+
+when #OS == #WINDOWS:
+    private i32 delete_install(string8 install):
+        ref []char8 tmp = os.temp_dir()
+        string8 pid = txt(#format(os.pid()))
+        string8 script = join2(txt(tmp), txt(#format("dado-uninstall-", pid, ".cmd")))
+        string8 body = txt(#format("@echo off\r\n:wait\r\ntasklist /fi \"PID eq ", pid, "\" 2>nul | find \" ", pid, " \" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\nrmdir /s /q \"", install, "\"\r\ndel \"%~f0\"\r\n"))
+        try fs.write_file(script, body) else code:
+            warn(txt(#format("cannot write the helper that deletes the install (", script, ": ", os.message(code), ").\n  Every change outside it is undone; delete ", install, " yourself.")))
+            return 1
+        Command c = command("cmd")
+        add(&c, "/c")
+        add(&c, "start")
+        add(&c, "")
+        add(&c, "/min")
+        add(&c, "cmd")
+        add(&c, "/c")
+        add(&c, script)
+        if run_quietly(c) != 0:
+            warn(txt(#format("cannot start the helper that deletes the install. Every change outside it is undone;\n  delete ", install, " yourself once this window is closed.")))
+            return 1
+        say(txt(#format("Dado is uninstalled; ", install, " is deleted as soon as this program ends.")))
+        return 0
+else:
+    private i32 delete_install(string8 install):
+        try fs.remove_all(install) else code:
+            warn(txt(#format("cannot delete ", install, ": ", os.message(code), ".\n  Every change outside it is undone; delete it yourself.")))
+            return 1
+        say(txt(#format("Dado is uninstalled: ", install, " is deleted.")))
+        return 0

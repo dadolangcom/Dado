@@ -1,0 +1,226 @@
+// app:ui — modality: a subtree that owns the keyboard and the mouse while it
+// is open.
+//
+// **A modal is a node, and a stack of them.** `modal_open(c)` pushes `c` and
+// remembers which node had focus; `modal_close(c)` pops `c` (and any modal
+// opened after it) and gives that node focus back. The top of the stack is
+// the modal in force (`modal`). While one is in force:
+//
+//   - **focus stays inside it.** `set_focus` refuses a node outside its
+//     subtree, and `focus_next`/`focus_prev` walk its subtree alone,
+//     wrapping inside it. Opening one moves focus to its first focusable
+//     node in view (tree order) when focus is not already inside; with none,
+//     focus is cleared, and keys go to the modal itself;
+//   - **keys go to it** (`dispatch`): a key or text event starts at the
+//     focused node and climbs no higher than the modal; Tab and Shift+Tab
+//     that nothing inside took move focus within it; everything else it
+//     leaves is swallowed — answered as handled, so it is not even kept for
+//     the program as unhandled. A quit request, a resize and a focus change
+//     are not keys and are dispatched as ever;
+//   - **the mouse outside it is swallowed.** An event whose target (the
+//     captured node, or the node under the pointer) is not inside the modal
+//     reaches nobody; a press among them emits `outside_pressed` on the modal
+//     — **swallowed, and the modal told**, rather than closed here, so that
+//     a dialog that must not close on a stray click (a prompt with unsaved
+//     text) stays open, and one that should (a palette) closes itself from
+//     the signal. The cursor over anything outside is the default arrow.
+//     Opening a modal ends any capture held outside it, so a drag in
+//     progress cannot keep reporting to what is now under it.
+//
+// **Closing restores focus exactly**: to the node that had it when the modal
+// opened, when that node is still live, focusable and in view — and when it
+// is not, to nothing, rather than to a guess. A modal that is closed from
+// under the stack's top closes every modal above it, and focus goes to what
+// the lowest of them remembered.
+//
+// **A modal that stops being one releases the modality.** A modal node that
+// is removed, or hidden (itself or an ancestor), is popped as if closed: the
+// check runs after every `remove` and every hide (`modal_prune`), and again
+// whenever the stack's top is read, so no path leaves the keyboard held by a
+// node nobody can see. A modal below the top that goes stale is popped when
+// it becomes the top.
+//
+// Every entry point is total over a bad handle: opening one does nothing,
+// closing one closes nothing, and neither answers anything but false.
+package ui
+
+import "app:input"
+
+private type ModalEntry: (Control node, Control restore)
+
+private ref []ModalEntry g_modals
+private i32              g_nmodals
+private i32              g_sig_outside = -1
+// Events a modal swallowed, ever: keys it left and mouse events outside it.
+// Read by the tests.
+private i64              g_modal_swallowed
+
+// Push `c` as the modal in force, remembering the focused node, and move
+// focus inside it (see the package comment). Does nothing for a dead handle,
+// a node out of view, a node already on the stack, while `update` runs, or
+// when the stack cannot grow.
+void modal_open(Control c):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_IDLE || !g_nodes[i].in_view:
+        return
+    for k in 0..<g_nmodals:
+        if g_modals[k].node == c:
+            return
+    capture_alloc()
+    if g_modals == nil:
+        g_modals = #make([]ModalEntry, 4, g_alloc)
+        if g_modals == nil:
+            return
+        g_nmodals = 0
+    if g_nmodals >= i32(#len(g_modals)):
+        if !#resize(g_modals, i64(g_nmodals) * 2):
+            return
+    Control was = focused()
+    g_modals[g_nmodals].node = c
+    g_modals[g_nmodals].restore = was
+    g_nmodals = g_nmodals + 1
+    if g_capture >= 0 && !in_subtree(g_capture, i):
+        g_capture = -1
+        g_capture_auto = false
+    if g_focus < 0 || !in_subtree(g_focus, i):
+        i32 f = first_focusable(i)
+        if f >= 0:
+            set_focus(handle(f))
+        else:
+            set_focus(NIL)
+
+// Pop `c` and every modal above it, and give focus back to what the lowest
+// of them remembered (see the package comment). Does nothing for a node that
+// is not on the stack.
+void modal_close(Control c):
+    if c == NIL:
+        return
+    for k in 0..<g_nmodals:
+        if g_modals[k].node == c:
+            pop_to(i32(k))
+            return
+
+// The modal in force, `NIL` for none.
+Control modal():
+    i32 m = modal_index()
+    if m < 0:
+        return NIL
+    return handle(m)
+
+// How many modals are on the stack, stale ones below the top included.
+i32 modal_depth():
+    modal_prune()
+    return g_nmodals
+
+// Whether `c` is on the modal stack.
+bool is_modal(Control c):
+    if c == NIL:
+        return false
+    for k in 0..<g_nmodals:
+        if g_modals[k].node == c:
+            return true
+    return false
+
+// Emitted on the modal when a mouse press lands outside it.
+i32 outside_pressed_signal():
+    if g_sig_outside < 0:
+        g_sig_outside = signal("outside_pressed")
+    return g_sig_outside
+
+void on_outside_pressed(Control c, SignalFn fn, rawptr ctx):
+    connect(c, outside_pressed_signal(), fn, ctx)
+
+// Events swallowed by modals since the program began.
+i64 modal_swallowed():
+    return g_modal_swallowed
+
+// ── Inside the package ─────────────────────────────────────────────────────
+
+// The slot of the modal in force, -1 for none; stale entries on top popped
+// first.
+private i32 modal_index():
+    if g_nmodals <= 0:
+        return -1
+    modal_prune()
+    if g_nmodals <= 0:
+        return -1
+    return index(g_modals[g_nmodals - 1].node)
+
+// Pop every entry on top whose node is dead or out of view, restoring the
+// focus each remembered. Nothing while a removal is tearing a subtree down:
+// `remove` calls this when it is done.
+private void modal_prune():
+    if g_phase == PHASE_REMOVE || g_phase == PHASE_PAINT:
+        return
+    for g_nmodals > 0:
+        i32 i = index(g_modals[g_nmodals - 1].node)
+        if i >= 0 && g_nodes[i].in_view:
+            return
+        pop_to(g_nmodals - 1)
+
+// Pop entries `k` and above, then restore the focus entry `k` remembered, so
+// the confinement it is checked against is the stack's below it.
+private void pop_to(i32 k):
+    Control back = g_modals[k].restore
+    for j in k..<g_nmodals:
+        g_modals[j].node = NIL
+        g_modals[j].restore = NIL
+    g_nmodals = k
+    i32 r = index(back)
+    if r >= 0 && g_nodes[r].takes_focus && g_nodes[r].in_view:
+        set_focus(back)
+        if focused() == back:
+            return
+    // Nothing to go back to, or what there was is outside a modal still
+    // open below: that modal's first focusable node, or nothing.
+    i32 m = modal_index()
+    i32 f = -1
+    if m >= 0:
+        f = first_focusable(m)
+    if f >= 0:
+        set_focus(handle(f))
+    else:
+        set_focus(NIL)
+
+// The first focusable node in view in `top`'s subtree, in tree order; -1 for
+// none.
+private i32 first_focusable(i32 top):
+    i32 at = top
+    for at >= 0:
+        if g_nodes[at].in_view && g_nodes[at].takes_focus:
+            return at
+        at = order_next(at, top)
+    return -1
+
+// A key or text event while modal `m` is in force; see `dispatch`.
+private bool modal_key(i32 m, input.Event e):
+    Control from = focused()
+    if !valid(from) || !in_subtree(index(from), m):
+        from = handle(m)
+    (bool handled, Control by) = bubble(from, e, m)
+    _ = by
+    if handled:
+        return true
+    u32 chord = u32(input.Modifier.Ctrl) | u32(input.Modifier.Super) | u32(input.Modifier.Alt)
+    if input.is_key_press(e) && e.code == i32(input.Keycode.Tab) && (e.mods & chord) == 0:
+        if (e.mods & u32(input.Modifier.Shift)) != 0:
+            _ = focus_prev()
+        else:
+            _ = focus_next()
+        return true
+    g_modal_swallowed = g_modal_swallowed + 1
+    return true
+
+// A mouse event outside modal `m`: swallowed; a press tells the modal.
+private bool modal_outside(i32 m, input.MouseKind k):
+    g_modal_swallowed = g_modal_swallowed + 1
+    if k == input.MouseKind.Press:
+        _ = emit(handle(m), outside_pressed_signal())
+    return true
+
+// Forget the stack without restoring anything: `reset` calls it.
+private void modal_reset():
+    if g_modals != nil:
+        #delete(g_modals)
+        g_modals = nil
+    g_nmodals = 0

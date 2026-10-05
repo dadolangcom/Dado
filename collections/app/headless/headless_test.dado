@@ -1,0 +1,521 @@
+@test
+// app:headless unit test.
+//
+// The whole package is a loop, so the test is runs of that loop asking
+// different questions of it:
+//
+//   * **the lifecycle, the honest capability set, and a real `dt`** — ready/
+//     process/shutdown fire in order, the frame barrier ticks, the frame
+//     budget stops a program that never asks to stop, and exactly `Threads` is
+//     advertised (that last one is what catches a future edit adding a
+//     capability the package still cannot honour, which is the specific way
+//     `app:graphical` went wrong);
+//   * **the runtime brings the world up** — `app:draw` is ready and the root
+//     canvas is live from the first line of `ready`, with no `draw.init` and
+//     no `canvas_create` written anywhere in this file;
+//   * **the runtime owns the allocators** — a bare `#make` lands in the
+//     persistent arena inside `ready` and in the per-frame temp arena inside
+//     `process`, `app:draw`'s own pools land in the persistent one, the temp
+//     arena is empty at the top of every frame, and both of an author's two
+//     opt-outs (`using app.allocator():` and `enter_temp`/`close_temp`) do what
+//     they say;
+//   * **the runtime ends the input frame** — `clear_edges` once per frame,
+//     counted, and separately observed end to end through `app:input`'s own
+//     edges and levels;
+//   * **a failing hook stops the loop and `run` reports its code**;
+//   * **a program that quits first beats the budget**, and `hit_max_frames()`
+//     tells the two endings apart.
+//
+// **Why the quit-first run is last and there is only one of it.**
+// `app:app`'s quitting flag is set-only — `quit()` sets it, nothing clears it,
+// and adding an `unquit()` to suit a test would be the test steering the
+// design. So a `run` that ends in `app.quit()` poisons every later `run` in
+// the same process: the loop's own condition would refuse to enter. Exactly
+// one section here ends that way and it is the last one.
+//
+// **The failure section is not in that category and that is the point of it
+// being where it is.** A hook's failure also stops the loop, through
+// `app.quitting()`, but the flag behind it is `app:app`'s own and `run` clears
+// it on entry — so a failing run does not poison the next, and the section
+// after it is an ordinary one. The budget section can likewise come first only
+// because the budget deliberately does *not* go through `app.quit()` (see
+// `run_loop`).
+//
+// The backend is installed through the package's own privates rather than
+// through `new(...)`, for the same reason the terminal backend's test did: a
+// bare `new(...)` inside package `headless` is ERR0805 for one milestone longer
+// (every surviving builtin is spelled `#new`, but the bare spelling stays
+// retired). External callers write `hl.new(...)` and are unaffected. `install`
+// below is therefore what `new` does, minus the name it throws away — and with
+// one slot swapped for a counter, which is the only way to ask *how often* the
+// input barrier ran rather than merely whether it did.
+package headless
+
+import "app:app"
+import "app:draw"
+import "app:input"
+import "core:time"
+import "core:mem/arena"
+import "core:mem/libc"
+
+private i32  g_ticks
+private bool g_ready_ran
+private bool g_shutdown_ran
+private f32  g_dt_total
+private i32  g_quit_at
+
+// The facade surface's own counters. `ht_draw` exists because this backend has
+// a draw hook slot: it records into the same root canvas a windowed program
+// would, and the counting render walks what it recorded.
+private i32 g_draws
+private i32 g_alt_ticks
+
+// What the world looked like from inside `ready` — asked there rather than
+// after `run`, because `teardown` tears `app:draw` down again.
+private bool g_draw_ready_in_ready
+private bool g_draw_headless_in_ready
+private bool g_canvas_live_in_ready
+private bool g_canvas_live_in_process
+private i32  g_commands_after_render
+
+// The input barrier, counted by the slot below.
+private i32 g_edge_clears
+
+!void ht_ready():
+    g_ready_ran = true
+    g_draw_ready_in_ready = draw.ready()
+    g_draw_headless_in_ready = draw.headless()
+    g_canvas_live_in_ready = draw.canvas_valid(canvas())
+
+!void ht_shutdown(): g_shutdown_ran = true
+!void ht_draw():     g_draws = g_draws + 1
+
+// The replacement handed to the second `hook` call, counted separately from
+// `ht_process` so that "the named parameter took" and "the omitted ones were
+// left alone" are two assertions rather than one.
+!void ht_process_alt(f32 dt):
+    _ = dt
+    g_alt_ticks = g_alt_ticks + 1
+
+!void ht_process(f32 dt):
+    g_ticks = g_ticks + 1
+    g_dt_total = g_dt_total + dt
+    g_canvas_live_in_process = draw.canvas_valid(canvas())
+    if g_quit_at > 0 && g_ticks >= g_quit_at:
+        app.quit()
+
+// A counting wrapper over the package's real `_end_input`, so that the slot
+// under test is the one the facade installs and the count is still available.
+private void ht_end_input():
+    g_edge_clears = g_edge_clears + 1
+    _end_input()
+
+private void install(i32 max_frames):
+    g_max_frames = max_frames
+    g_frames = 0
+    g_hit_max = false
+    app.set_backend((nil,                      // data
+                     run_loop,                 // run
+                     begin_frame,              // begin_frame
+                     end_frame,                // end_frame
+                     app.caps(app.Capability.Threads),
+                     _surface_up,              // surface_up
+                     _surface_down,            // surface_down
+                     _render,                  // render
+                     ht_end_input,             // end_input — counted
+                     input.deliver))           // deliver
+
+// ── the ambient allocator ───────────────────────────────────────────────────
+//
+// The runtime's claim is that a program writes no allocator anywhere and its
+// allocations land in the right one of two arenas, chosen by how often the hook
+// runs. Measured with an arena installed as the **persistent** allocator:
+//
+//   * it is empty before `run` and holding bytes by the time `ready` runs —
+//     which is `app:draw`'s own pools, allocated on the runtime's behalf under
+//     the runtime's `using`, from a `draw.init_headless()` that names no
+//     allocator anywhere;
+//   * a bare `#make` in `ready` grows it and leaves the temp arena alone;
+//   * a bare `#make` in `process` does the opposite;
+//   * `using app.allocator():` written inside `process` takes it back, which is
+//     the one line an author writes when something has to outlive the frame;
+//   * `enter_temp` / `close_temp` around a large transient leaves the temp
+//     arena where it started.
+
+private arena.Arena g_probe
+private bool g_probe_ready
+private u64  g_probe_at_ready         // bytes in the probe when `ready` ran
+private bool g_ambient_made
+private bool g_ambient_landed
+private bool g_ready_missed_temp
+private bool g_proc_in_temp
+private bool g_proc_missed_probe
+private bool g_override_landed
+private bool g_checkpoint_rolled
+private u64  g_temp_after
+private u64  g_temp_at_top
+private i32  g_probe_ticks
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) probe_alloc():
+    if !g_probe_ready:
+        g_probe = arena.over(libc.allocator())
+        g_probe_ready = true
+    return arena.allocator(&g_probe)
+
+!void hp_ready():
+    // `_surface_up` has already run, under the runtime's `using`.
+    g_probe_at_ready = arena.used(g_probe)
+    u64 before = arena.used(g_probe)
+    u64 t_before = temp_used()
+    ref []i32 xs = #make([]i32, 64)          // no allocator written anywhere
+    g_ambient_made = xs != nil
+    g_ambient_landed = arena.used(g_probe) > before
+    g_ready_missed_temp = temp_used() == t_before
+
+!void hp_process(f32 dt):
+    _ = dt
+    g_probe_ticks = g_probe_ticks + 1
+    if g_probe_ticks == 2:
+        g_temp_at_top = temp_used()
+
+    u64 p_before = arena.used(g_probe)
+    u64 t_before = temp_used()
+    ref []i32 s = #make([]i32, 128)          // no allocator written anywhere
+    _ = s
+    g_proc_in_temp = temp_used() > t_before
+    g_proc_missed_probe = arena.used(g_probe) == p_before
+
+    u64 p2 = arena.used(g_probe)
+    using allocator():
+        ref []i32 keep = #make([]i32, 32)
+        _ = keep
+    g_override_landed = arena.used(g_probe) > p2
+
+    u64 mark = temp_used()
+    using enter_temp():
+        ref []i32 big = #make([]i32, 4096)
+        _ = big
+    _ = close_temp()
+    g_checkpoint_rolled = temp_used() == mark
+
+    g_temp_after = temp_used()
+
+// ── the input frame, end to end ─────────────────────────────────────────────
+//
+// The counter above answers *how often*. This answers *what it did*: a press
+// pushed on frame 1 is an edge on frame 1 and is gone on frame 2, and the
+// **level** survives — which is `clear_edges`'s contract and the thing a
+// careless "clear everything" would break without changing any count.
+
+const i32 PROBE_KEY = 87                 // 'W'
+
+private bool g_edge_on_1
+private bool g_edge_on_2
+private bool g_level_on_2
+private i32  g_in_ticks
+
+!void hi_process(f32 dt):
+    _ = dt
+    g_in_ticks = g_in_ticks + 1
+    if g_in_ticks == 1:
+        input.push_key(PROBE_KEY)
+        g_edge_on_1 = input.key_pressed(PROBE_KEY)
+    if g_in_ticks == 2:
+        g_edge_on_2 = input.key_pressed(PROBE_KEY)
+        g_level_on_2 = input.key_down(PROBE_KEY)
+
+// ── a hook that fails ───────────────────────────────────────────────────────
+
+const i32 HE_PROCESS = 41
+
+private i32 g_f_ticks
+private i32 g_f_after
+
+!void hf_process(f32 dt):
+    _ = dt
+    g_f_ticks = g_f_ticks + 1
+    if g_f_ticks == 2:
+        fail HE_PROCESS
+    if g_f_ticks > 2:
+        g_f_after = g_f_after + 1
+
+i32 test():
+    bool ok = true
+
+    app.on_ready(ht_ready)
+    app.on_process(ht_process)
+    app.on_shutdown(ht_shutdown)
+
+    // ── lifecycle, capabilities, a real dt, and the budget backstop ─────────
+
+    install(5)
+    g_quit_at = 0                    // this run never calls app.quit() itself
+    f64 started = time.now()
+    try app.run() else code:
+        ok = #expect(false, "the budget run failed with ", code) && ok
+    f64 elapsed = time.since(started)
+
+    ok = #expect(g_ready_ran, "ready ran") && ok
+    ok = #expect(g_shutdown_ran, "shutdown ran") && ok
+    ok = #expect(g_ticks == 5, "budget run ticked ", g_ticks, " times, want 5") && ok
+    ok = #expect(frames() == 5, "frames() = ", frames()) && ok
+    ok = #expect(hit_max_frames(), "hit_max_frames() should be true after a budget stop") && ok
+
+    // ── the runtime brought the world up ────────────────────────────────────
+    //
+    // Nothing in this file calls `draw.init`, `draw.init_headless` or
+    // `draw.canvas_create`. The runtime did, in `_surface_up`, before `ready`.
+
+    ok = #expect(g_draw_ready_in_ready,
+                 "app:draw was up by the first line of `ready` — the runtime ",
+                 "brought it up, nothing here did") && ok
+    ok = #expect(g_draw_headless_in_ready,
+                 "and it is the counting server, not the GPU one") && ok
+    ok = #expect(g_canvas_live_in_ready,
+                 "the root canvas exists in `ready`") && ok
+    ok = #expect(g_canvas_live_in_process,
+                 "and is still the same live canvas in `process`") && ok
+    ok = #expect(!draw.ready(),
+                 "and `teardown` took it back down again") && ok
+
+    // ── the input frame ends exactly once per frame ─────────────────────────
+
+    ok = #expect(g_edge_clears == 5,
+                 "the input frame ended ", g_edge_clears, " times over ",
+                 frames(), " frames — once per frame, at one end of it") && ok
+
+    ok = #expect(app.supports(app.Capability.Threads), "Threads advertised") && ok
+    ok = #expect(!app.supports(app.Capability.Input), "Input not advertised") && ok
+    ok = #expect(!app.supports(app.Capability.VectorDraw), "VectorDraw not advertised") && ok
+    ok = #expect(!app.supports(app.Capability.Windowing), "Windowing not advertised") && ok
+    ok = #expect(!app.supports(app.Capability.Audio), "Audio not advertised") && ok
+    ok = #expect(!app.supports(app.Capability.Clipboard), "Clipboard not advertised") && ok
+
+    // `dt` is a real monotonic delta, not a constant. Asserted loosely in both
+    // directions: five frames at the default 16ms target must sum to something
+    // positive, and never to more than the wall-clock interval the whole `run`
+    // took — a fixed constant `dt`, or one read off `time.unix` instead of
+    // `time.now`, fails the second. A tighter bound would be asserting the
+    // scheduler's punctuality, which is not this package's promise;
+    // `time.nap`'s own doc comment says it may return early.
+    ok = #expect(g_dt_total > 0.0, "summed dt was ", g_dt_total, " — dt is not moving") && ok
+    ok = #expect(f64(g_dt_total) <= elapsed + 0.001,
+                 "summed dt ", g_dt_total, " exceeds the wall clock ", elapsed) && ok
+
+    // ── the facade surface: `init` refuses a budget that is not one ─────────
+    //
+    // `0` means no cap and a positive count is a count; a negative number is
+    // neither, and would otherwise pass `run_loop`'s `g_max_frames > 0` test
+    // and behave as "no cap" — a program that thought it had set a deadline and
+    // has set nothing. This is the one condition `init` can actually report,
+    // and the whole of what its `!` carries.
+
+    i32 refused = 0
+    try init("a budget that is not one", -1) else code:
+        refused = code
+    ok = #expect(refused == E_FRAME_BUDGET,
+                 "init(name, -1) failed with ", refused, ", want ",
+                 E_FRAME_BUDGET) && ok
+    ok = #expect(frames() == 5 && hit_max_frames(),
+                 "a refused init installed nothing and disturbed nothing: ",
+                 "frames() = ", frames()) && ok
+
+    // ── `hook` sets what it names, through the facade ───────────────────────
+    //
+    // Written all-named, which is how it is meant to be written: `ready`,
+    // `draw` and `shutdown` are all `!void()` and therefore one type, so a
+    // positional call here could swap two of them and compile. See `app:app`'s
+    // `hook` section.
+    //
+    // This run goes through the real `init` rather than `install`, so the
+    // `end_input` slot is the facade's own uncounted `_end_input` — which is
+    // what the end-to-end input section below observes instead of counting.
+
+    set_frame_time(0)
+    g_ticks = 0
+    g_draws = 0
+    g_ready_ran = false
+    g_shutdown_ran = false
+    g_quit_at = 0
+    hook(ready: ht_ready, process: ht_process, draw: ht_draw,
+         shutdown: ht_shutdown)
+    try init("hooked", 3) else code:
+        ok = #expect(false, "init(name, 3) failed with ", code) && ok
+    try run() else code:
+        ok = #expect(false, "the hooked run failed with ", code) && ok
+
+    ok = #expect(g_ready_ran, "hook's ready ran") && ok
+    ok = #expect(g_shutdown_ran, "hook's shutdown ran") && ok
+    ok = #expect(g_ticks == 3, "hook's process ran ", g_ticks, " times") && ok
+    ok = #expect(g_draws == 3,
+                 "hook's draw ran ", g_draws,
+                 " times — a headless draw hook records into the counting ",
+                 "canvas") && ok
+    ok = #expect(g_canvas_live_in_ready && g_canvas_live_in_process,
+                 "the real `init` path brings the surface up too, not just ",
+                 "this file's `install`") && ok
+
+    // ── an omitted parameter leaves that hook exactly as it was ─────────────
+
+    g_ticks = 0
+    g_draws = 0
+    g_alt_ticks = 0
+    g_ready_ran = false
+    g_shutdown_ran = false
+    hook(process: ht_process_alt)
+    try init("rehooked", 2) else code:
+        ok = #expect(false, "init(name, 2) failed with ", code) && ok
+    try run() else code:
+        ok = #expect(false, "the rehooked run failed with ", code) && ok
+
+    ok = #expect(g_alt_ticks == 2,
+                 "the named parameter took: the replacement ran ", g_alt_ticks,
+                 " times") && ok
+    ok = #expect(g_ticks == 0,
+                 "the replaced process hook ran ", g_ticks,
+                 " times after being replaced") && ok
+    ok = #expect(g_ready_ran, "an omitted `ready` kept its hook") && ok
+    ok = #expect(g_shutdown_ran, "an omitted `shutdown` kept its hook") && ok
+    ok = #expect(g_draws == 2,
+                 "an omitted `draw` kept its hook: ran ", g_draws, " times") && ok
+
+    // ── the input frame, observed rather than counted ───────────────────────
+    //
+    // Through the real `init`/`run` path, so what is under test is the slot the
+    // facade installs. A press pushed on frame 1 is an edge on frame 1, is gone
+    // on frame 2, and the level it set is still there.
+
+    hook(ready: ht_ready, process: hi_process, draw: ht_draw,
+         shutdown: ht_shutdown)
+    g_in_ticks = 0
+    input.clear_keys()
+    try init("input frame", 3) else code:
+        ok = #expect(false, "init(name, 3) failed with ", code) && ok
+    try run() else code:
+        ok = #expect(false, "the input run failed with ", code) && ok
+
+    ok = #expect(g_edge_on_1,
+                 "a press pushed inside frame 1 is an edge inside frame 1") && ok
+    ok = #expect(!g_edge_on_2,
+                 "and the runtime dropped it before frame 2 — nothing in this ",
+                 "file called clear_edges") && ok
+    ok = #expect(g_level_on_2,
+                 "but the level survived: clear_edges clears edges, not keys") && ok
+    input.clear_keys()
+
+    // ── the ambient allocator, and the per-frame scratch ────────────────────
+
+    set_allocator(probe_alloc())
+    hook(ready: hp_ready, process: hp_process, draw: ht_draw,
+         shutdown: ht_shutdown)
+    g_probe_ticks = 0
+    try init("allocators", 2) else code:
+        ok = #expect(false, "init(name, 2) failed with ", code) && ok
+    try run() else code:
+        ok = #expect(false, "the allocator run failed with ", code) && ok
+
+    ok = #expect(g_probe_at_ready > 0,
+                 "app:draw's own pools landed in the runtime's persistent ",
+                 "allocator: the probe arena held ", g_probe_at_ready,
+                 " bytes by `ready`, and draw.init_headless names no allocator") && ok
+    ok = #expect(g_ambient_made,
+                 "a bare #make inside a hook answered a live reference") && ok
+    ok = #expect(g_ambient_landed,
+                 "a bare #make in `ready` landed in the persistent allocator ",
+                 "— a hook that runs once allocates for the life of the program") && ok
+    ok = #expect(g_ready_missed_temp,
+                 "and it did NOT land in the temp arena") && ok
+    ok = #expect(g_proc_in_temp,
+                 "a bare #make in `process` landed in the temp arena — a hook ",
+                 "that runs every frame allocates for the life of the frame") && ok
+    ok = #expect(g_proc_missed_probe,
+                 "and it did NOT land in the persistent allocator") && ok
+    ok = #expect(g_override_landed,
+                 "`using app.allocator():` inside `process` takes the ambient ",
+                 "back — explicit > using > ambient") && ok
+    ok = #expect(g_checkpoint_rolled,
+                 "enter_temp/close_temp around a 16 KB transient left the temp ",
+                 "arena exactly where it started") && ok
+    ok = #expect(temp_depth() == 0,
+                 "every temp frame the hooks opened is closed: depth is ",
+                 temp_depth()) && ok
+    ok = #expect(g_temp_after > 0,
+                 "a frame that allocated is holding ", g_temp_after,
+                 " temp bytes at the end of it") && ok
+    ok = #expect(g_temp_at_top == 0,
+                 "the temp arena is empty at the top of every frame; frame 2 ",
+                 "started with ", g_temp_at_top, " bytes") && ok
+
+    set_allocator(libc.allocator())
+
+    // ── a failing hook stops the loop and `run` reports its code ────────────
+    //
+    // The budget is 50 and the hook fails on frame 2, so "the loop stopped" is
+    // the difference between `frames()` reading 2 and reading 50.
+
+    hook(ready: ht_ready, process: hf_process, draw: ht_draw,
+         shutdown: ht_shutdown)
+    g_f_ticks = 0
+    g_f_after = 0
+    g_shutdown_ran = false
+    try init("a hook that fails", 50) else code:
+        ok = #expect(false, "init(name, 50) failed with ", code) && ok
+    i32 got = 0
+    try run() else code:
+        got = code
+    ok = #expect(got == HE_PROCESS,
+                 "a hook that failed with ", HE_PROCESS, " reached main as ",
+                 got) && ok
+    ok = #expect(frames() == 2,
+                 "the loop stopped on the failing frame: ", frames(),
+                 " of a possible 50") && ok
+    ok = #expect(g_f_after == 0,
+                 "no hook ran after the failing frame; ", g_f_after, " did") && ok
+    ok = #expect(g_shutdown_ran,
+                 "the shutdown hook still ran on a failing exit — a release ",
+                 "path that only runs when nothing went wrong is not one") && ok
+    ok = #expect(!hit_max_frames(),
+                 "a failure is not a budget stop") && ok
+
+    // And the next run starts clean, because `run` clears the failure flag —
+    // which `quit()` deliberately does not do, and is why the section below is
+    // last and this one is not.
+
+    hook(ready: ht_ready, process: ht_process, draw: ht_draw,
+         shutdown: ht_shutdown)
+    g_ticks = 0
+    g_quit_at = 0
+    try init("after the failure", 2) else code:
+        ok = #expect(false, "init(name, 2) failed with ", code) && ok
+    try run() else code:
+        ok = #expect(false, "the run after a failing run failed with ", code) && ok
+    ok = #expect(g_ticks == 2,
+                 "a run after a failing run starts clean: ticked ", g_ticks) && ok
+    ok = #expect(!app.failed(), "the failure flag was cleared by the next run") && ok
+
+    // ── a program that quits first beats the budget ─────────────────────────
+
+    g_ticks = 0
+    g_dt_total = 0.0
+    g_quit_at = 2
+    g_edge_clears = 0
+    install(100)
+    set_frame_time(0)                // flat out: the ending, not the clock, is under test
+    try app.run() else code:
+        ok = #expect(false, "the quit-first run failed with ", code) && ok
+
+    ok = #expect(g_ticks == 2, "quit-first run ticked ", g_ticks, " times, want 2") && ok
+    ok = #expect(frames() == 2, "frames() after the quit-first run = ", frames()) && ok
+    ok = #expect(!hit_max_frames(), "the program quit first — the budget was not hit") && ok
+    ok = #expect(g_dt_total >= 0.0, "dt stayed sane at frame_ms=0: ", g_dt_total) && ok
+    ok = #expect(g_edge_clears == 2,
+                 "the input frame ended once per frame here too: ",
+                 g_edge_clears, " for ", frames(), " frames") && ok
+
+    set_frame_time(16)
+    if g_probe_ready:
+        arena.destroy(&g_probe)
+
+    if ok:
+        return 0
+    return 1

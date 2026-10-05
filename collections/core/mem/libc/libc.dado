@@ -1,0 +1,155 @@
+// core:mem/libc — C's heap behind the `Allocator` interface.
+//
+//     import "core:mem"
+//     import "core:mem/libc"
+//
+//     mem.Allocator a = libc.allocator()
+//
+// This is the escape hatch shipped as the **reference implementation** of
+// the interface, and that is deliberate: a systems language that quietly
+// disapproves of its own escape hatch is a systems language people work
+// around. The back door is the front door.
+//
+// It is what `#default` holds at depth 0 on a hosted target.
+//
+// ## What it does with each mode
+//
+//     Alloc     malloc, then zero — allocation always zeroes, and `calloc` does
+//               it in one call but is a fourth C function for one mode
+//     Resize    realloc, which is the one thing an allocator can do that a
+//               caller cannot synthesize: it grows a block **in place** when
+//               the heap has adjacent space
+//     Free      free
+//     FreeAll   **unimplemented**, returns `nil`
+//
+// `FreeAll` returning `nil` is not a stub to be filled in later. C's heap has
+// no notion of "everything this allocator handed out", so there is nothing to
+// release; the interface drops `Query_Features` because trying and getting
+// `nil` answers the question a query would have asked. The contrast with
+// `core:mem/bump`, whose `FreeAll` is the whole point of the allocator, is
+// what makes the pair of them exercise the interface rather than agree with
+// each other.
+//
+// Using `realloc` is an optimization, **not a dependency**: this could have
+// been malloc-copy-free, and nothing in the interface requires C's heap to
+// exist.
+package libc
+
+import "core:mem"
+
+// A byte count is `u64` in Dado, and `size_t` is `#c.size_t`: the same width
+// on every target Dado supports and not the same type — `u64` is `uint64_t`,
+// which is `unsigned long long` on Darwin where `size_t` is `unsigned long` —
+// and the emitter asserts each restated signature's C type, so the
+// restatement says `size_t` and the calls convert. These hand back a `rawptr`
+// (`void *`), which converts to and from any `^T`.
+//
+// **On the web** there is no `<stdlib.h>`, and C's heap is the runtime the
+// compiler emits into a `#WEB` program, which defines these three by their C
+// names and prototypes over linear memory; its `dado/web.h` is where they are
+// restated from.
+when #OS == #WEB:
+    private foreign "dado/web.h":
+        rawptr malloc(#c.size_t nbytes)
+        rawptr realloc(rawptr ptr, #c.size_t nbytes)
+        void free(rawptr ptr)
+
+else:
+    private foreign "stdlib.h":
+        rawptr malloc(#c.size_t nbytes)
+        rawptr realloc(rawptr ptr, #c.size_t nbytes)
+        void free(rawptr ptr)
+
+// The allocator. A value, not a singleton: it is two words and copying it
+// copies two words, which is exactly what `alloc_id` interning is for
+// on the compiler's side of the boundary.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator():
+    return (dispatch, nil)
+
+// C's heap as a declaration that takes `mem.Allocator` on, for code that
+// wants an implementer rather than the two words: its `data()` is what
+// `allocator()` answers. The heap is its own state, so the one slot is
+// unused.
+type Heap using mem.Allocator:
+    u8 unused,
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+        return (dispatch, nil)
+
+// The procedure. `data` is unused — C's heap is its own state — and is in the
+// signature because every allocator's is.
+private rawptr dispatch(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            return zeroed(malloc(#c.size_t(nbytes)), nbytes)
+        case mem.AllocatorMode.Resize:
+            // `realloc(nil, n)` is `malloc(n)` in C99, so the nil case needs no
+            // arm of its own — but the **zeroing** does, because `realloc`
+            // leaves the grown tail uninitialised and allocation always zeroes.
+            //
+            // `nbytes == 0` needs an arm of its own too, and this one is a bug
+            // fix rather than a policy choice.
+            // C99 §7.20.3.4 leaves `realloc(p, 0)` implementation-defined and C23
+            // made it undefined; glibc 2.39 **frees `p` and returns NULL**, so
+            // without the clamp this arm returns nil, `resize` reports FAILURE,
+            // and the caller is left holding a freed pointer with its old length
+            // intact — measured as an ASan `double-free` on the caller's `delete`
+            // and `heap-use-after-free` on any read.
+            //
+            // The clamp is not invented here. It is what the compiler itself
+            // emits for the root context's heap — `dado_rt__heap` writes
+            // `realloc(old, size ? (size_t)size : 1)` (`layout` (`dado_emit_c`)) —
+            // and what `core:mem/heap` writes in both its `make` and its `resize`
+            // (`if c < 1: c = 1`). This package advertises itself above as the
+            // *reference implementation of the interface*, so at `n == 0` it was
+            // the one implementation of three disagreeing with the compiler, and
+            // the compiler is the specification. One byte is
+            // allocated rather than zero, which keeps the handle valid and
+            // distinguishable from the nil that means failure.
+            if nbytes == 0:
+                nbytes = 1
+            rawptr fresh = realloc(old, #c.size_t(nbytes))
+            if fresh == nil:
+                return nil
+            if nbytes > old_size:
+                zero_range(fresh, old_size, nbytes)
+            return fresh
+        case mem.AllocatorMode.Free:
+            free(old)
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            // Unimplemented, and permanently: see the header.
+            return nil
+        else:
+            return nil
+
+// ── Zeroing ──────────────────────────────────────────────────────────────────
+//
+// **Allocation is zeroed**, because `i32 a` is zero and a heap `T` that
+// was not would make that rule conditional on where the storage came from.
+//
+// Written as a Dado loop over a `[]u8` taken across the block — a window over a
+// bare pointer, which is how a language with no pointer arithmetic addresses
+// raw bytes. There used to be no such form and the loop went through an
+// over-typed `^[65536]u8`, which put a **64 KiB ceiling on C's heap** — an
+// allocation above it was released and reported as a failure rather than handed
+// back holding whatever `malloc` had lying around. That ceiling is gone with
+// the spelling that caused it: the window is `nbytes` long
+// because `nbytes` is what was allocated.
+
+private rawptr zeroed(rawptr p, u64 nbytes):
+    if p == nil:
+        return nil
+    zero_range(p, 0, nbytes)
+    return p
+
+// Zero `[from, to)` of the block at `p`. Split out because `Resize` zeroes only
+// the tail it grew into, and `Alloc` zeroes all of it.
+private void zero_range(rawptr p, u64 from, u64 to):
+    if p == nil || to <= from:
+        return
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[i64(from)..<i64(to)]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        span[i] = 0
+    return

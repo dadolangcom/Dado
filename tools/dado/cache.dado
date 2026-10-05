@@ -1,0 +1,357 @@
+// What `dado test` keeps between passes, under `<build>/.dado-cache`.
+//
+// **The same packages are tested again and again** — under gcc and clang,
+// sanitized and not — and most of what a pass does is the last pass's work
+// over again: the transpile, the test's own C, and the vendored libraries'
+// bodies (sokol, stb_truetype) that every test reaching them compiles. Measured
+// on a 2-core box with gcc 13.3.0 and clang 18.1.3, one `collections/app/ui`
+// test under gcc `-O2` was 1.8 s user for `dadoc`, 3.7 s for its own C and
+// 5.2 s for the vendored bodies. Three caches answer that, all keyed by what
+// decides their content and nothing looser, all safe to delete at any time:
+//
+//   * `emit/` — one `dadoc` run per test per argument list: the C (`prog.c`),
+//     the build manifest (`build`) and the implementation unit (`impl.c`,
+//     when `dadoc` split one out), reused while `key` matches. See `emit_key`.
+//   * `impl/` — one object per implementation unit per compiler per flag set.
+//   * `obj/` — one object per test's own C, the same way. The link and the
+//     run happen every time: a test's result is what the binary does.
+//
+// **A key that cannot be taken is a miss**, never a guess: a directory or file
+// that cannot be read, a preprocessor that fails. When the `dadoc` binary
+// itself cannot be read, the caches are off for the run and `dado test` does
+// what it did without them: one unit per test, transpiled every pass.
+//
+// The layout and the keys are the bash driver's, so the two can share a
+// build directory; the slot names and the digests' text differ, so they do
+// not share entries.
+package driver
+
+import "core:hash"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "core:time"
+
+// ── the digest ──────────────────────────────────────────────────────────────
+
+// One SHA-256 over a list of items, each **length-framed** (eight bytes of
+// little-endian length, then the bytes) so no two lists hash alike: `a`,`bc`
+// and `ab`,`c` are different keys. `ok` goes false at the first item that
+// cannot be read, and a digest that is not ok has no answer.
+type Digest:
+    hash.Sha256 h
+    bool ok
+
+Digest digest():
+    Digest d
+    d.h = hash.sha256_init()
+    d.ok = true
+    return d
+
+private void put_length(^Digest d, i64 n):
+    [8]u8 b
+    u64 v = u64(n)
+    for i in 0..<8:
+        b[i] = u8((v >> u64(8 * i)) & 0xFF)
+    d.h.update(b[:])
+
+// An item: `text`'s bytes.
+void put_text(^Digest d, string8 text):
+    put_length(d, #len(text))
+    d.h.update_text(text)
+
+// An item: the bytes of the file at `p`.
+void put_file(^Digest d, string8 p):
+    try ref []char8 bytes = fs.read_file(p) else:
+        d.ok = false
+        return
+    put_text(d, txt(bytes))
+
+// An item: `text` with every occurrence of `unsaid` taken out, framed by the
+// length of what is left. Nothing is taken out when `unsaid` is empty.
+void put_unsaid(^Digest d, string8 text, string8 unsaid):
+    if #len(unsaid) == 0:
+        put_text(d, text)
+        return
+    i64 n = #len(text)
+    string8 rest = text
+    for:
+        (string8 _, string8 tail, bool found) = strings.split_first(rest, unsaid)
+        if !found: break
+        n -= #len(unsaid)
+        rest = tail
+    put_length(d, n)
+    rest = text
+    for:
+        (string8 head, string8 tail, bool found) = strings.split_first(rest, unsaid)
+        d.h.update_text(head)
+        if !found: break
+        rest = tail
+
+// The items a package directory is to `dadoc`: `%<dir>` itself, then in
+// byte order of name each `*.dado` and `*.dados` file's name and bytes (a
+// `.dados` script is a source of the package like any `.dado`) and each
+// `*.c` file's name — `dadoc` reads those names and never those bodies.
+void put_dir(^Digest d, string8 dir):
+    put_text(d, txt(#format("%", dir)))
+    ref []char8 dc = strings.clone_to_cstring(dir, #default)
+    ^fs.Dir h = fs.open(cstring(dc))
+    if !fs.opened(h):
+        d.ok = false
+        return
+    ref []string8 names = #make([]string8, 0)
+    for:
+        (cstring name, bool more) = fs.next(h)
+        if !more: break
+        string8 n = string8(name)
+        if n == "." || n == "..": continue
+        if is_source(n) || strings.ends_with(n, ".c"):
+            ref []char8 own = #format(n)
+            _ = #append(names, txt(own))
+    fs.close(h)
+    sort_bytes(names[:])
+    for n in names:
+        put_text(d, n)
+        if is_source(n): put_file(d, join2(dir, n))
+
+private bool is_source(string8 name):
+    return strings.ends_with(name, ".dado") || strings.ends_with(name, ".dados")
+
+// The digest as 64 hex digits, or "" when an item could not be read.
+string8 finish_digest(^Digest d):
+    hash.Sha256Digest out = d.h.finish()
+    if !d.ok: return ""
+    return txt(hash.sha256_hex(out))
+
+// ── emit/ ───────────────────────────────────────────────────────────────────
+
+// Where one `dadoc` argument list's outputs live: `<cache>/emit/<name>`.
+//
+// **Per argument list and not per test**, because gcc and clang answer
+// `-dumpmachine` differently (`x86_64-linux-gnu`, `x86_64-pc-linux-gnu`), so
+// the two compilers' passes ask `dadoc` two questions and would evict each
+// other from one slot every pass. The name is the first 16 hex digits of the
+// list's digest: a collision would only make two lists share a slot and
+// re-transpile each other, because `emit_key`, which decides, is the whole
+// digest.
+string8 emit_slot(string8 cache, []string8 args):
+    return join3(cache, "emit", slot_name(args))
+
+string8 slot_name([]string8 args):
+    Digest d = digest()
+    for a in args:
+        put_text(&d, a)
+    string8 full = finish_digest(&d)
+    if #len(full) < 16: return full
+    return full[0..<16]
+
+// The `include` directories of a build manifest, in order: each line's text
+// after `include `, exactly as written.
+ref []string8 included_dirs(string8 manifest):
+    ref []string8 out = #make([]string8, 0)
+    string8 rest = manifest
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        if strings.starts_with(l, "include ") && #len(l) > 8:
+            _ = #append(out, l[8..<#len(l)])
+        if !more: break
+        rest = tail
+    return out
+
+// What a slot's C was transpiled from: this `dadoc` (`dadoc_id`, the digest
+// of its bytes), the argument list, and every package directory the slot's
+// own manifest says the compilation loaded. "" when any of it cannot be read.
+//
+// **The directory list is the stored one, and that is sound**: `dadoc` reads
+// nothing but the `.dado`/`.dados` files of the packages it loads (and the
+// names of their `.c` files), so a change that would make it load a different
+// set is an edit to an `import` in a file of a package it already loaded —
+// which is in this digest. What it does not cover is a file changed *while*
+// that one `dadoc` ran; `test_command` refuses to store a key then.
+string8 emit_key(string8 dadoc_id, []string8 args, string8 manifest):
+    Digest d = digest()
+    put_text(&d, dadoc_id)
+    for a in args:
+        put_text(&d, a)
+    for dir in included_dirs(manifest):
+        put_dir(&d, dir)
+    return finish_digest(&d)
+
+// Whether `slot` already holds this argument list's answer for the sources
+// as they are now.
+bool emit_fresh(string8 slot, string8 dadoc_id, []string8 args):
+    if #len(dadoc_id) == 0: return false
+    string8 key_file = join2(slot, "key")
+    if !is_file(key_file) || !is_file(join2(slot, "prog.c")) || !is_file(join2(slot, "build")):
+        return false
+    try ref []char8 manifest = fs.read_file(join2(slot, "build")) else:
+        return false
+    string8 key = emit_key(dadoc_id, args, txt(manifest))
+    if #len(key) == 0: return false
+    return strings.trim(read_or_empty(key_file)) == key
+
+// Whether a `.dado` or `.dados` file in one of the manifest's directories
+// changed after `mark` (nanoseconds), or cannot be asked: then the C may be
+// the old text's, and must not be stored under the new text's key.
+bool sources_moved(string8 manifest, i64 mark):
+    for dir in included_dirs(manifest):
+        if !is_dir(dir): continue
+        ref []char8 dc = strings.clone_to_cstring(dir, #default)
+        ^fs.Dir h = fs.open(cstring(dc))
+        if !fs.opened(h): return true
+        bool moved = false
+        for:
+            (cstring name, bool more) = fs.next(h)
+            if !more: break
+            string8 n = string8(name)
+            if !is_source(n): continue
+            try i64 t = fs.mtime(join2(dir, n)) else:
+                moved = true
+                break
+            if t > mark:
+                moved = true
+                break
+        fs.close(h)
+        if moved: return true
+    return false
+
+// ── impl/ and obj/ ──────────────────────────────────────────────────────────
+
+// What the object caches call this C compiler: the program its first word
+// runs as, every word, and what `--version` prints.
+string8 compiler_identity(Compiler cc):
+    Command v = command_of(cc.words[:])
+    add(&v, "--version")
+    Captured r = capture(v, true)
+    string8 said = ""
+    if r.started && r.status == 0: said = strings.trim_right(txt(r.out))
+    return txt(#format(on_path(cc.words[0]), " ", shown(command_of(cc.words[:])), " ", said))
+
+// One compile's flags and where its object goes.
+type ObjectJob:
+    string8 cache           // `<build>/.dado-cache`
+    string8 sub             // `impl` or `obj`
+    bool unsay              // take the unit's own path out of the key
+    string8 cc_id
+    Command flags           // the compiler and every flag before the `-I`s
+    ref []string8 includes  // the `-I` list, `DADO_CFLAGS` on its tail
+    string8 unit
+
+// The object `j.unit` compiles to, compiled only if no earlier test, package
+// or pass already has. `ok` false when the compile failed, and `temporary`
+// when the key could not be taken and the object is this run's alone, for
+// the caller to remove once it has linked.
+//
+// **The key is the preprocessed unit**, `cc -E` with the exact flags (about
+// 0.1 s), plus the compiler's identity and the flags themselves. The
+// preprocessed text is every header byte the object is made of, the switches
+// and configuration macros as they were defined, and — through its line
+// markers — which header each `#include` found, so a changed vendored header,
+// a changed `define`, a changed `-I` order, `-O`, `-g` or a sanitizer all make
+// a different key. `DADO_CFLAGS` is keyed by its text as well, because it
+// rides on the tail of the `-I` list and a flag such as `-fno-strict-aliasing`
+// changes the object without changing one token; the `-I` list itself is
+// left to the line markers, since it differs from test to test and the
+// markers say what it found. `-Werror` is among the flags, so an object is
+// only ever stored by a compile that was warning-clean.
+//
+// For `impl/` the unit's own path is taken out of the text: it is the test's
+// slot, differs per test, and names nothing the object depends on — which is
+// what lets every test that reaches sokol share one object. For `obj/` it
+// stays: it names the object's debug information, and two slots never share
+// an object.
+//
+// One compile at a time per object, since two passes over one package run
+// side by side: making the directory `<obj>.lock` is the lock, holding the
+// holder's pid, and is removed when the object is in place; a waiter that
+// finds the holder gone takes it over.
+//
+// The bash driver also sets the object's time on every use, so a sweep of
+// week-old entries keeps what is still used; `core:os/fs` has no call that
+// sets a file's times, so here an object's age is when it was made.
+(string8 obj, bool ok, bool temporary) cached_object(^ObjectJob j):
+    Command e = command_of(j.flags.words[:])
+    add_all(&e, j.includes[:])
+    add(&e, "-E")
+    add(&e, j.unit)
+    if verbose(): note(txt(#format("  $ ", shown(e))))
+    Captured pre = capture(e, false)
+    string8 key = ""
+    if pre.started && pre.status == 0:
+        Digest d = digest()
+        put_text(&d, j.cc_id)
+        ref []string8 fw = #make([]string8, 0)
+        for i in 1..<#len(j.flags.words):
+            _ = #append(fw, j.flags.words[i])
+        ref []char8 flag_text = strings.join(fw[:], " ")
+        put_text(&d, txt(flag_text))
+        (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+        put_text(&d, user_cflags)
+        put_unsaid(&d, txt(pre.out), j.unit if j.unsay else "")
+        key = finish_digest(&d)
+    if #len(key) == 0:
+        // No key, so nothing is stored: compiled for this run alone.
+        string8 own = txt(#format(j.unit, ".", os.pid(), ".o"))
+        if run(compile_to(j, own)) != 0:
+            remove_quietly(own)
+            return ("", false, false)
+        return (own, true, true)
+
+    string8 dir = join2(j.cache, j.sub)
+    _ = fs.make_dirs(dir, #default)
+    string8 obj = join2(dir, txt(#format(key, ".o")))
+    string8 lock = txt(#format(obj, ".lock"))
+    ref []char8 lockc = strings.clone_to_cstring(lock, #default)
+    i64 waited = 0
+    for !is_file(obj):
+        if fs.make_dir(cstring(lockc)):
+            write_quietly(join2(lock, "pid"), txt(#format(os.pid(), "\n")))
+            string8 tmp = txt(#format(obj, ".", os.pid()))
+            if run(compile_to(j, tmp)) == 0:
+                try fs.rename(tmp, obj) else:
+                    remove_quietly(tmp)
+                    remove_tree_quietly(lock)
+                    return ("", false, false)
+                remove_tree_quietly(lock)
+                break
+            remove_quietly(tmp)
+            remove_tree_quietly(lock)
+            return ("", false, false)
+        // Held. Wait while the holder is alive; take over if it is not.
+        (i64 holder, bool known) = decimal(strings.trim(read_or_empty(join2(lock, "pid"))))
+        if known && !holder_alive(holder):
+            remove_tree_quietly(lock)
+            continue
+        waited += 1
+        if waited > 3000:
+            remove_tree_quietly(lock)
+            continue
+        time.nap(100)
+    return (obj, true, false)
+
+// `text` written to `p`, or nothing when it cannot be.
+void write_quietly(string8 p, string8 text):
+    try fs.write_file(p, text) else:
+        return
+
+// The command that compiles `j.unit` to `object`.
+private Command compile_to(^ObjectJob j, string8 object):
+    Command c = command_of(j.flags.words[:])
+    add_all(&c, j.includes[:])
+    add(&c, "-c")
+    add(&c, j.unit)
+    add(&c, "-o")
+    add(&c, object)
+    return c
+
+// Whether process `pid` is still running. Windows has no `kill(pid, 0)`, so
+// a holder there is waited for until the 300 s limit takes the lock over.
+when #OS == #WINDOWS:
+    private bool holder_alive(i64 pid):
+        return true
+else:
+    private foreign lk "signal.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        i32 kill(i32 pid, i32 sig)
+
+    private bool holder_alive(i64 pid):
+        return lk.kill(i32(pid), 0) == 0

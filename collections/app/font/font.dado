@@ -1,0 +1,1866 @@
+// `app:font` — a glyph atlas and the metrics a layout engine needs.
+//
+//     import "app/font"
+//
+//     (font.Font f, bool from_disk) = font.load_file(font.default_path(), 16.0)
+//     defer font.destroy(&f)
+//
+//     font.Glyph g = font.glyph(&f, 'A')
+//     f32 wide = font.measure(&f, "hello, world")
+//
+// Three things a text view asks for that a `measure` cannot: where the tab
+// stops are, which byte the mouse landed on, and where an underline goes.
+//
+//     font.Tabs t = font.tabs(4.0 * font.cell_width(&f), 4)
+//     f32 caret = font.advance_to(&f, line, cursor_byte, t)
+//     (i64 at, i32 col) = font.index_at_x(&f, line, mouse_x, t)
+//     (f32 pos, f32 thick, bool real) = font.underline(&f)
+//
+// **What this package answers is *where the ink is*, and nothing about how it
+// reaches a screen.** It rasterises a TrueType face into one RGBA8 image and
+// reports, per codepoint, the rectangle of that image the glyph occupies, the
+// offset from the pen to that rectangle, and how far the pen then moves. A
+// drawing surface turns those into two triangles; this package never sees one,
+// which is why it has no dependency on `app:draw` and can be tested with no
+// GPU and no window.
+//
+// ## Every texel is white and the coverage is the alpha
+//
+// `(255, 255, 255, coverage)`, and the three colour bytes are not padding.
+// `sokol_gp`'s stock shader is `texture(tex, uv) * color`: a white texel hands
+// the tint's rgb back unchanged and an alpha texel scales the tint's alpha, so
+// the product is `vec4(tint.rgb, tint.a * coverage)` — which is exactly what
+// `app:draw`'s A8 fragment computed, and it now computes it with no shader at
+// all. That fragment was carried as three source strings chosen off
+// `sg_query_backend()` — GLSL 4.10, GLSL ES 3.00 and MSL — of which one is
+// pixel-verified, one has never been compiled by any machine in this tree, and
+// three further backends had no string at all. This format deletes the reason
+// every one of them existed.
+//
+// **It costs four times the memory and that is the whole of the cost.** The
+// fallback face at 16 px packs a 256x256 atlas, so 64 kB becomes 256 kB; the
+// ceiling — width 128, height `MAX_ATLAS_H` — was 512 kB and is 2 MB. Nothing
+// else moves: the boxes, the packer, the metrics and the two counters are what
+// they were.
+//
+// **The unwritten texel is `(255, 255, 255, 0)` and not four zeroes.** A
+// transparent *black* texel fringes dark wherever a bilinear sample straddles
+// the edge of a box, because what the sample interpolates towards is black; a
+// transparent *white* one cannot, because what it interpolates towards is the
+// colour the tint already is. That is the single easiest thing to get wrong
+// here, so `pack` fills the whole image that way before anything is inked and
+// `grow_atlas` fills the rows it adds the same way.
+//
+// ### Why the rasteriser writes somewhere else first
+//
+// `stbtt_MakeCodepointBitmap` and `stbtt_MakeGlyphBitmap` write **one coverage
+// byte per pixel at a byte stride**. No argument makes them skip three bytes
+// and there is no second entry point that writes four, so nothing stb offers
+// can write into an RGBA image. A glyph is therefore rasterised into a
+// **per-font scratch buffer** — one, allocated once at load, sized to the
+// largest box this face can produce at this scale from
+// `stbtt_GetFontBoundingBox` — and expanded from there into the atlas.
+//
+// The alternative considered was a full-size A8 shadow of the atlas, expanded
+// wholesale at upload time. That holds `atlas_w * atlas_h` more bytes for the
+// life of the `Font`, and it re-expands the whole image where the scratch
+// expands only the box that changed. Measured on DejaVu Sans Mono at 32 px: the
+// atlas is 256x512, so the shadow would be **128 kB** and the scratch — the
+// face's own bounding box at this scale — is 37 by 40, **1480 bytes**. The
+// fallback face allocates neither, because its blitter writes texels directly
+// and never reaches stb at all.
+//
+// ## The two sources, behind one type
+//
+// A `Font` comes from one of two places and a caller cannot tell which without
+// asking `source`:
+//
+//   * **`Source.TrueType`** — `stb_truetype` rasterised the outlines of a real
+//     `.ttf` or `.ttc`. Kerning is real, the face may be proportional, and the
+//     metrics are the face's own.
+//   * **`Source.Fallback`** — the 8x8 monochrome ASCII bitmap compiled into
+//     this file as `FALLBACK_BITS`, scaled up by an integer factor. Always
+//     available, needs no file, no allocator luck and no font on the machine.
+//
+// Both fill the same `Font`, so **every function below works on either** and a
+// program that only ever draws text does not branch. That is the whole point
+// of the fallback: a text editor on a machine with no fonts still shows its
+// buffer.
+//
+// ## Ownership
+//
+// `load` **copies** the bytes it is handed. `stbtt_fontinfo` holds a pointer
+// into the font file and this package keeps it alive for kerning, so a `Font`
+// that borrowed the caller's buffer would answer `measure` out of freed memory
+// the moment that buffer went away. One copy at load, freed by `destroy`.
+//
+// ## Where a `Font`'s memory comes from
+//
+// **No factory here takes an allocator.** `load`, `load_file` and `fallback`
+// allocate to the ambient one, so where a face lands is a sentence the caller
+// writes once, at the call, and never threads through its own signatures:
+//
+//     Font f = fallback(16.0)                              // the caller's default
+//     Font f = fallback(16.0) using arena.allocator(&a)    // the face lives in `a`
+//
+// This used to be an `Allocator` parameter on all three, which put the choice
+// in the callee's parameter list and made every intermediate function carry a
+// value it had no use for. `using` reaches the whole dynamic extent, so one
+// word at the outermost call places the copied `.ttf` bytes, the
+// `stbtt_fontinfo`, the dense glyph table, the scratch box and the atlas
+// image alike.
+//
+// **`Font.alloc` survives, and it is not there so `destroy` can free.**
+// Freeing never needed it — `#delete` uses the allocator the `ref` already
+// carries, so every line of `destroy` works with the slot gone. It is there
+// because a `Font` keeps allocating *after* it is loaded, and nowhere near the
+// load: `add_codepoint` mints the sparse `extra_cp`/`extra` pair on the first
+// non-ASCII codepoint anybody measures, and `grow_atlas` remakes `pixels` when
+// a shelf runs out. Both happen at a draw, under whatever ambient the drawing
+// code is standing in. Reading the ambient once, at load, is what keeps a
+// face's later growth in the same place as the face — and a glyph added from
+// inside a scratch frame out of an arena that is about to roll back.
+//
+// ## Coordinates and signs, stated once
+//
+// Pixels, y **down**, the pen on the baseline — `stb_truetype`'s convention,
+// not inverted, because inverting it here would put the one place the two
+// disagree inside a package that cannot test the difference.
+//
+//   * `ascent` is **positive**: pixels from the baseline up to the top of the
+//     face.
+//   * `descent` is **negative**: pixels from the baseline down to the bottom.
+//     That is `stbtt_GetFontVMetrics`' own sign and this package does not
+//     "fix" it, because a caller that adds `ascent - descent` and a caller
+//     that adds `ascent + descent` must not both look right.
+//   * `Glyph.bearing_y` is the offset from the baseline to the **top** of the
+//     glyph's box, so it is negative for anything that rises above the
+//     baseline — which is nearly everything.
+//   * `Glyph.bearing_x` is the offset from the pen to the **left** of the box.
+//
+// ## Codepoints outside ASCII, and how one gets added
+//
+// `load` packs **32..126** densely. `add_codepoint` packs anything else, one
+// at a time, from the shelf packer's retained cursor — so an atlas grows to fit
+// the text a program actually meets rather than to fit Unicode.
+//
+// **The hard part is not the packing, it is telling the drawing surface.** A
+// rasterised glyph is bytes in `pixels`; the GPU holds a copy made at upload
+// time, and nothing in this package may know that. The answer is a
+// **monotonic generation counter** — `atlas_generation` — bumped by anything
+// that writes a pixel. A consumer keeps its own last-seen number and re-uploads
+// when the two differ.
+//
+//     if font.atlas_generation(&f) != g_uploaded:
+//         _ = draw.texture_update(g_atlas, font.atlas_pixels(&f))
+//         g_uploaded = font.atlas_generation(&f)
+//
+// The three candidates and why this one:
+//
+//   * **A callback** puts an arbitrary consumer inside this package's call
+//     stack at rasterise time. That is a layering inversion — `app:font`
+//     compiles against no drawing surface, which is the claim the package
+//     exists to make — and it fires at the worst moment: sokol allows one
+//     update per image per frame, and `add_codepoint` is naturally called from
+//     the middle of a paint pass.
+//   * **A `flush` that reports and clears** is a *one-shot*. Two consumers of
+//     one face — a UI backend and a client's own overlay — cannot both learn,
+//     because whichever asks first consumes the fact. That is a defect that
+//     appears only in the program that has two consumers, which is the worst
+//     time to find it.
+//   * **A counter** is a value with no owner. It can be read any number of
+//     times by any number of consumers, each keeping its own watermark; it
+//     costs one `i32`; and each consumer chooses *when* to compare, which is
+//     what makes it fit sokol's once-per-frame rule instead of fighting it.
+//
+// ## The atlas never moves, and grows only when it is asked to
+//
+// **`add_codepoint` never grows.** When the shelf runs out of room it answers
+// `false` and the codepoint keeps answering `.notdef`, exactly as before — a
+// grow is a texture the drawing surface has to *remake*, and no consumer
+// expects one in the middle of a paint pass. Who asks is the caller, and when
+// is between frames:
+//
+//     if !font.add_codepoint(&f, cp):
+//         if font.grow_atlas(&f):
+//             _ = font.add_codepoint(&f, cp)
+//
+// `grow_atlas` doubles the height and keeps the width. Every glyph therefore
+// stays on the pixel it was already on and the image is *copied*, not
+// re-rasterised — and because a `Glyph` carries a **pixel** rectangle and
+// nothing normalised, **no `Glyph` this package has handed out is stale after a
+// grow.** A box at `(px, py)` of `pw` by `ph` is at `(px, py)` of `pw` by `ph`,
+// and a pixel source rectangle is what `sgp_draw_textured_rect` takes, so
+// nothing divides by a denominator that moved.
+//
+// **That was not always so, and the repair it needed is worth recording rather
+// than quietly deleting.** While a `Glyph` carried `u0`/`v0`/`u1`/`v1`, `v` was
+// `py / atlas_h`, so a grow staled every glyph ever handed out in `v` alone —
+// invisible to a caller, and drawn as the right ink at half the right height. A
+// `rewindow` pass walked all 96 dense slots and every sparse one to repair it,
+// and the invariant "a `Glyph` is valid for the life of the `Font`" had to be
+// narrowed to "until the next `grow_atlas`". Pixel rectangles gave the
+// invariant back whole, and `rewindow` went with the hazard it existed for.
+//
+// **Two things a grow does still cost, and neither is a `Glyph`:**
+//
+//   * `atlas_pixels` is a **borrow**, and the grow is a `#resize` that may move
+//     the block. A `[]u8` taken before a grow points at freed memory after one.
+//     Ask again — every consumer already does, because the run it wants is the
+//     one it is about to upload.
+//   * the texture's **shape** changes, so a consumer owes its drawing surface a
+//     destroy and a remake rather than an update. That is `atlas_resizes`, and
+//     the next section is the whole argument for why it is a second counter.
+//
+// ### Why a grow does not bump `atlas_generation`
+//
+// This is the whole of what keeps a grow from silently corrupting a texture, so
+// it is stated here rather than left for a consumer to work out.
+//
+// `atlas_generation` means *the pixels changed — update the texture in place*.
+// An in-place update uploads the texture's **own** byte count; a grown atlas is
+// longer than that. `app:draw`'s `texture_update` guards the run it is handed
+// with `<` rather than `!=` (`collections/app/draw/device.dado`), so an oversized
+// run **passes the guard, is truncated to the old size, and answers `true` — on
+// the GPU and on the headless surface alike**. A grow that announced itself
+// through `atlas_generation` would hand every consumer already written a silent
+// half-upload and a screenful of garbage.
+//
+// So it does not. **`grow_atlas` leaves `atlas_generation` exactly where it
+// was** and bumps `atlas_resizes` instead — a second watermark meaning *the
+// atlas has a different shape; destroy the texture and make a new one*. A
+// consumer written before growth existed watches `atlas_generation`, never
+// calls `grow_atlas`, and cannot reach any of this. A consumer that grows
+// watches both, and the resize is tested first:
+//
+//     if font.atlas_resizes(&f) != g_resized:
+//         draw.texture_free(g_atlas)
+//         (i32 w, i32 h) = font.atlas_size(&f)
+//         g_atlas = draw.texture_create(w, h, font.atlas_pixels(&f))
+//         g_resized = font.atlas_resizes(&f)
+//         g_uploaded = font.atlas_generation(&f)
+//     else if font.atlas_generation(&f) != g_uploaded:
+//         _ = draw.texture_update(g_atlas, font.atlas_pixels(&f))
+//         g_uploaded = font.atlas_generation(&f)
+//
+// `draw.texture_create` and not `draw.texture_a8`: there is no A8 texture any
+// more, because there is no A8 shader any more. Every texture `app:draw` holds
+// is RGBA8 and this atlas is handed over as the RGBA8 run it is.
+//
+// ### The ceiling
+//
+// The height doubles and stops at `MAX_ATLAS_H`. Past it `grow_atlas` answers
+// `false` and changes nothing at all — `add_codepoint` keeps answering `false`
+// and `glyph` keeps answering `.notdef`, which is what a program had before
+// growth existed, some doublings later. There is no unbounded case.
+package font
+
+import "core:mem"
+import "core:io"
+import "core:os/fs"
+import "core:chars"
+import "core:strings"
+import "vendor:stb/stb_truetype"
+
+// ── the surface ───────────────────────────────────────────────────────────
+
+// Where a `Font`'s pixels came from. A caller that must know — to warn, to
+// pick a different size, to disable ligatures it will never get — asks; a
+// caller that only draws does not.
+enum Source: (Fallback, TrueType)
+
+// The first and last codepoints `load` packs densely. Everything between them
+// is present; `glyph` answers `present == false` for a codepoint the face does
+// not have, which is not the same as one outside this block.
+const char32 FIRST = ' '
+const char32 LAST = '~'
+private const i32 DENSE = 95      // LAST - FIRST + 1
+
+// The dense run has one slot past the ASCII block, and it holds `.notdef`. It
+// is packed, rasterised and measured exactly like a glyph, because it *is* one:
+// the whole point of `.notdef` is that a client which draws what it is handed
+// is correct without knowing there was anything to handle.
+private const i32 NOTDEF = 95
+private const i32 SLOTS = 96
+
+// One padding pixel between packed boxes and around the edge, so a bilinear
+// sample at a glyph's border cannot reach its neighbour's ink.
+private const i32 PAD = 1
+
+// Bytes per texel. Named rather than written as a 4 wherever an index is
+// computed, because every one of those is the same fact and a file that spells
+// it several ways is a file where one of them can be changed alone.
+private const i64 BPP = 4
+
+// The reserved fully-opaque block. It sits at the atlas origin, before the
+// packer's first shelf, so no glyph can ever be placed against it.
+//
+// **What stops a quad drawn over it from fringing is `solid_src`'s zero extent,
+// not this size** — and that is worth stating because the plausible belief is
+// the other way round. Measured on GLCORE under software Mesa, over a 64×32
+// quad, counting pixels that are not exactly the tint:
+//
+//     source rect   block   wrong pixels
+//     a point       1×1     0 of 2048
+//     a point       6×6     0 of 2048
+//     the block     1×1     2048 of 2048   (corners read 67 where 255 belongs)
+//     the block     6×6     644 of 2048
+//
+// The measurement was made with uv windows and it carries over unchanged,
+// because `sgp_draw_textured_rect` divides a pixel source rect by the image
+// size and hands the sampler the same two numbers. A source rect with *any*
+// extent interpolates across the quad and reaches the padding at its corners
+// however large the block is; a rect of zero extent cannot, whatever the quad's
+// size, because every fragment resolves to the same texel. So the degeneracy is
+// the guard. The block is margin around it — six squared means a sample would
+// have to drift three whole texels before it found anything but an opaque white
+// — and it costs 144 bytes of RGBA8.
+private const i32 SOLID = 6
+
+// A codepoint's place in the atlas, and how to set it down.
+//
+// `px,py` is the top-left corner **in atlas pixels** and `pw,ph` the extent,
+// which is the source rectangle `sgp_draw_textured_rect` takes. There is no
+// normalised form of it here and there was one until this package stopped
+// needing one: four `f32`s divided by the atlas size, which cost a division per
+// glyph at pack time, staled on every `grow_atlas`, and needed a repair pass to
+// unstale. A pixel rectangle is invariant under a grow and is what the one
+// consumer wanted all along.
+//
+// A blank glyph — a space, or anything the face draws no ink for — has
+// `pw == 0 && ph == 0` and a **nonzero `advance`**. That pair is the whole
+// definition of blank and there is no separate flag for it.
+//
+// `present` is about the *codepoint*, not about the box: a codepoint this atlas
+// does not have answers the `.notdef` glyph, which has a real box and a real
+// advance and `present == false`. So *blank* and *missing* are two different
+// things and neither is inferable from the other.
+type Glyph: (
+    i32 px, i32 py,
+    i32 pw, i32 ph,
+    f32 bearing_x, f32 bearing_y,
+    f32 advance,
+    bool present,
+)
+
+// A rasterised face: one RGBA8 image, the boxes cut out of it, and the
+// vertical metrics that space one line from the next.
+type Font: (
+    // Where this face's memory comes from: the ambient as it stood when the
+    // face was loaded. Kept for the growth that happens later — `add_codepoint`
+    // and `grow_atlas` — and read by nothing that frees. See "Where a `Font`'s
+    // memory comes from" in the package doc comment.
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc,
+    Source source,
+
+    // `atlas_w * atlas_h * BPP` bytes, every texel `(255, 255, 255, coverage)`.
+    ref []u8 pixels,
+    i32 atlas_w, i32 atlas_h,
+
+    // Where stb rasterises, one glyph at a time, before `expand` widens it into
+    // `pixels`. One box, sized at load to the largest this face can produce;
+    // nil on a fallback face, which inks texels directly and never calls stb.
+    // See the package comment for why this exists at all.
+    ref []u8 scratch,
+
+    ref []Glyph dense,
+    ref []char32 extra_cp,
+    ref []Glyph extra,
+    i32 extra_used,
+
+    // The shelf packer's cursor, retained. See the package comment.
+    i32 shelf_x, i32 shelf_y, i32 shelf_h,
+
+    // Bumped by anything that writes a pixel. See the package comment: this is
+    // the whole of how a drawing surface learns the atlas changed.
+    i32 generation,
+
+    // Bumped only by `grow_atlas`, and deliberately not by anything that writes
+    // a pixel. See the package comment: `generation` means *update the texture*
+    // and this one means *remake it*, and conflating them is a truncated upload
+    // that reports success.
+    i32 resizes,
+
+    f32 pixel_height,
+    f32 ascent_px, f32 descent_px, f32 line_gap_px,
+    f32 scale,
+    bool monospace,
+
+    // The metrics a text view asks for that the vertical trio cannot answer.
+    // `cell_px` is the nominal advance of one character cell; `cap_px` and
+    // `xh_px` are measured off this atlas's own ink; the underline pair is read
+    // out of the face's `post` table, and `ul_real` says whether it was there.
+    f32 cell_px, f32 cap_px, f32 xh_px,
+    f32 ul_pos_px, f32 ul_thick_px, bool ul_real,
+
+    // The TrueType source, kept alive because `stbtt_fontinfo` points into it
+    // and `measure` asks it for kerning. Both are nil for a fallback font.
+    // `ttf_at` is where this face begins inside those bytes — 0 for a plain
+    // `.ttf`, and the entry `stbtt_GetFontOffsetForIndex` found for a `.ttc`.
+    ref []u8 ttf,
+    i32 ttf_at,
+    ref stb_truetype.stbtt_fontinfo info,
+)
+
+// ── loading ───────────────────────────────────────────────────────────────
+
+// The tallest face this package makes, in pixels: 16384, taller than any
+// display. **Every pixel height is held to `1 ..= MAX_PIXEL_HEIGHT` on the way
+// in**, NaN reading as 1, because everything below converts it to an integer —
+// a bitmap scale, a shelf reserve, a scratch side, a `.notdef` box — and does
+// arithmetic on the result. A float becoming an integer saturates, so an
+// absurd height used to reach `8 * i32(2^31 - 1)` in `fallback`, which is an
+// `i32` overflow and a trap, and a NaN one passed the old `< 1.0` guard. With
+// the hold, each of those conversions is of a value provably in range.
+private const f32 MAX_PIXEL_HEIGHT = 16384.0
+
+private f32 held_pixel_height(f32 pixel_height):
+    if !(pixel_height >= 1.0):
+        return 1.0
+    if pixel_height > MAX_PIXEL_HEIGHT:
+        return MAX_PIXEL_HEIGHT
+    return pixel_height
+
+// `floor`, in `f32` and without `core:math`'s `f64` round trip, for the tab
+// stop in `cell_at`. It converts only a value whose integer part an `i32`
+// holds: at 2^23 and past it every `f32` is already a whole number, so it is
+// its own floor, and NaN is NaN.
+private f32 floor_f(f32 x):
+    if !(x > -8388608.0 && x < 8388608.0):
+        return x
+    f32 t = f32(i32(x))
+    if t > x:
+        t = t - 1.0
+    return t
+
+// Rasterise `ttf_bytes` at `pixel_height` and answer the atlas.
+//
+// **Never fails into an unusable value**: bytes that are not a font, a font
+// with no glyphs, or an allocator that cannot supply the atlas all answer the
+// built-in fallback at the same pixel height, and `source` says so. There is
+// no half-built `Font` and nothing here returns nil.
+//
+// `.ttc` collections work: the offset of face 0 comes from
+// `stbtt_GetFontOffsetForIndex`, which reads the `ttcf` tag, and a plain
+// `.ttf` answers 0 from the same call. So one path serves both and there is no
+// extension sniffing anywhere in this package.
+//
+// It takes no allocator: everything it mints comes from the ambient one, so
+// `load(bytes, 16.0) using a` puts the whole face in `a`. See "Where a
+// `Font`'s memory comes from" in the package doc comment.
+Font load([]u8 ttf_bytes, f32 pixel_height):
+    f32 ph = held_pixel_height(pixel_height)
+
+    i64 n = #len(ttf_bytes)
+    if n <= 0:
+        return fallback(ph)
+
+    ref []u8 own = #make([]u8, n)
+    if own == nil:
+        return fallback(ph)
+    i64 zero = 0
+    for i in zero..<n:
+        own[i] = ttf_bytes[i]
+
+    ref stb_truetype.stbtt_fontinfo info = #new(stb_truetype.stbtt_fontinfo)
+    if info == nil:
+        #delete(own)
+        return fallback(ph)
+
+    i32 offset = stb_truetype.stbtt_GetFontOffsetForIndex(&own[0], 0)
+    if offset < 0:
+        #delete(info)
+        #delete(own)
+        return fallback(ph)
+
+    if stb_truetype.stbtt_InitFont(info, &own[0], offset) == 0:
+        #delete(info)
+        #delete(own)
+        return fallback(ph)
+
+    Font f
+    f.alloc = #default
+    f.source = Source.TrueType
+    f.pixel_height = ph
+    f.ttf = own
+    f.ttf_at = offset
+    f.info = info
+    f.scale = stb_truetype.stbtt_ScaleForPixelHeight(info, ph)
+
+    i32 asc = 0
+    i32 desc = 0
+    i32 gap = 0
+    stb_truetype.stbtt_GetFontVMetrics(info, &asc, &desc, &gap)
+    f.ascent_px = f32(asc) * f.scale
+    f.descent_px = f32(desc) * f.scale
+    f.line_gap_px = f32(gap) * f.scale
+
+    f.dense = #make([]Glyph, i64(SLOTS))
+    if f.dense == nil:
+        #delete(info)
+        #delete(own)
+        return fallback(ph)
+
+    // Where every glyph of this face is rasterised before it is widened into
+    // the atlas. stb writes one coverage byte per pixel and the atlas holds
+    // four, so there is no way to rasterise straight into it. See the package
+    // comment.
+    f.scratch = make_scratch(&f)
+    if f.scratch == nil:
+        #delete(f.dense)
+        #delete(info)
+        #delete(own)
+        return fallback(ph)
+
+    // Pass one: the boxes and the horizontal metrics, no pixels yet.
+    for idx in 0..<DENSE:
+        i32 cp = i32(FIRST) + idx
+        i32 gi = stb_truetype.stbtt_FindGlyphIndex(info, cp)
+        ^Glyph g = &f.dense[i64(idx)]
+        glyph_metrics(&f, gi, g)
+        g.present = gi != 0
+
+    f.cell_px = nominal_cell(&f)
+
+    // `.notdef` is glyph index 0 by definition of the format, so a face that
+    // has one is asked for it rather than being second-guessed. A face whose
+    // glyph 0 is empty — and there are such faces — gets a box drawn here, in
+    // `ink_notdef`, and the box needs a placement, which is why its extent is
+    // decided before the pack rather than after it.
+    ^Glyph nd = &f.dense[i64(NOTDEF)]
+    glyph_metrics(&f, 0, nd)
+    nd.present = false
+    if nd.pw <= 0 || nd.ph <= 0:
+        synth_notdef(&f, nd)
+    if nd.advance <= 0.0:
+        nd.advance = f.cell_px
+
+    // Pass two: choose an atlas, reserve the solid block, place every box on a
+    // shelf.
+    if !pack(&f):
+        #delete(f.dense)
+        #delete(info)
+        #delete(own)
+        return fallback(ph)
+
+    // Pass three: ink, each glyph through the scratch and out into the atlas.
+    for idx in 0..<DENSE:
+        ^Glyph g = &f.dense[i64(idx)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        i32 cp = i32(FIRST) + idx
+        ink_codepoint(&f, g, cp)
+    ink_notdef(&f, nd, 0)
+
+    f.monospace = all_advances_equal(&f)
+    measure_heights(&f)
+    read_underline(&f)
+    return f
+
+// The same, reading the file itself.
+//
+// **Answers `(Font, bool)` and the `Font` is always usable.** `ok` is false
+// when `path` could not be read or was not a font, and the `Font` is then the
+// fallback — so a caller that ignores the flag still draws text, and a caller
+// that wants to complain has something true to complain about. Returning only
+// a `Font` would have hidden a missing file behind a font that looks
+// deliberate; returning only a `bool` and a nil `Font` would have made every
+// call site branch before it could draw. This is the pair that makes both
+// callers honest, and `source` says the same thing a second way for a `Font`
+// that has been passed on.
+//
+// No allocator, for `load`'s reason: the ambient places the face, and the two
+// buffers this borrows on the way — the C path string and the file's bytes —
+// go to the same place and are given back before it returns.
+(Font f, bool ok) load_file(string8 path, f32 pixel_height):
+    f32 ph = held_pixel_height(pixel_height)
+
+    if path == "":
+        return (fallback(ph), false)
+
+    // `core:strings` still spells its allocator out, so the ambient is handed
+    // over by name here. `#default` *is* the ambient, so this is the same
+    // placement every other line in this function gets, written where a
+    // signature that is not this package's insists on one.
+    ref []char8 cpath = strings.clone_to_cstring(path, #default)
+    if cpath == nil:
+        return (fallback(ph), false)
+
+    (ref []u8 bytes, bool read_ok) = read_all(cstring(cpath))
+    #delete(cpath)
+    if !read_ok:
+        return (fallback(ph), false)
+
+    Font f = load(bytes[..<#len(bytes)], ph)
+    #delete(bytes)
+    if f.source != Source.TrueType:
+        return (f, false)
+    return (f, true)
+
+// The built-in 8x8 bitmap, at the nearest whole multiple of 8 that does not
+// exceed `pixel_height` (and never smaller than 8, nor larger than 16384 — the
+// hold every entry point applies). It is exposed rather than private because
+// a program that *wants* the pixel font — a debug overlay, a deliberate look —
+// should not have to fail a file read to get one.
+//
+// No allocator, for `load`'s reason — and `load` calls this on every path it
+// gives up on, so the two agree about where a face lands without either of
+// them naming a place.
+Font fallback(f32 pixel_height):
+    i32 s = i32(held_pixel_height(pixel_height) / 8.0)
+    if s < 1:
+        s = 1
+
+    Font f
+    f.alloc = #default
+    f.source = Source.Fallback
+    i32 cell = 8 * s
+    f.pixel_height = f32(cell)
+    f.scale = f32(s)
+    f.monospace = true
+    // The bitmap's baseline sits under row 6: rows 6 and 7 are where every
+    // descender in the face lives ('g', 'p', 'q', 'y', ','), and nothing rises
+    // above row 0. So six rows up and two rows down, exactly.
+    i32 up = 6 * s
+    i32 down = 2 * s
+    f.ascent_px = f32(up)
+    f.descent_px = -f32(down)
+    f.line_gap_px = 0.0
+
+    f.dense = #make([]Glyph, i64(SLOTS))
+    if f.dense == nil:
+        return f
+
+    for idx in 0..<DENSE:
+        u64 bits = FALLBACK_BITS[i64(idx)]
+        (i32 c0, i32 r0, i32 c1, i32 r1, bool inked) = ink_box(bits)
+        ^Glyph g = &f.dense[i64(idx)]
+        g.present = true
+        g.advance = f32(cell)
+        if !inked:
+            g.pw = 0
+            g.ph = 0
+            g.bearing_x = 0.0
+            g.bearing_y = 0.0
+            continue
+        g.pw = (c1 - c0 + 1) * s
+        g.ph = (r1 - r0 + 1) * s
+        i32 bx = c0 * s
+        i32 by = (r0 - 6) * s
+        g.bearing_x = f32(bx)
+        g.bearing_y = f32(by)
+
+    f.cell_px = f32(cell)
+
+    // The bitmap has 95 glyphs and no 96th, so its `.notdef` is drawn rather
+    // than found. Nothing is lost: a bitmap face has no `.notdef` to be
+    // faithful to.
+    ^Glyph nd = &f.dense[i64(NOTDEF)]
+    synth_notdef(&f, nd)
+    nd.present = false
+    nd.advance = f32(cell)
+
+    if !pack(&f):
+        #delete(f.dense)
+        f.dense = nil
+        return f
+
+    for idx in 0..<DENSE:
+        ^Glyph g = &f.dense[i64(idx)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        u64 bits = FALLBACK_BITS[i64(idx)]
+        (i32 c0, i32 r0, i32 _, i32 _, bool inked) = ink_box(bits)
+        if !inked:
+            continue
+        blit(&f, g, bits, c0, r0, s)
+    ink_notdef(&f, nd, s)
+
+    measure_heights(&f)
+    read_underline(&f)
+    return f
+
+// Give back everything a `Font` owns. Safe on a fallback (there is no `.ttf`
+// and no `stbtt_fontinfo` to release) and safe twice, because every field it
+// frees it also nils.
+void destroy(^Font f):
+    if f == nil:
+        return
+    if f.pixels != nil:
+        #delete(f.pixels)
+        f.pixels = nil
+    if f.scratch != nil:
+        #delete(f.scratch)
+        f.scratch = nil
+    if f.dense != nil:
+        #delete(f.dense)
+        f.dense = nil
+    if f.extra != nil:
+        #delete(f.extra)
+        f.extra = nil
+    if f.extra_cp != nil:
+        #delete(f.extra_cp)
+        f.extra_cp = nil
+    if f.info != nil:
+        #delete(f.info)
+        f.info = nil
+    if f.ttf != nil:
+        #delete(f.ttf)
+        f.ttf = nil
+    f.atlas_w = 0
+    f.atlas_h = 0
+    f.extra_used = 0
+
+// ── asking about glyphs ───────────────────────────────────────────────────
+
+// Where `cp` lives.
+//
+// **A codepoint this atlas does not have answers `.notdef`** — a real box with
+// a real advance, `present == false`. That is what makes the naive client
+// correct: a program that draws what it is handed and adds the advance it is
+// given puts a visible box on the screen and keeps its columns honest, instead
+// of drawing nothing and advancing nothing, which collapses a run of unknown
+// text to zero width and makes every caret column after it a lie.
+//
+// A client that wants to do something smarter still can: `present` is honest,
+// and `notdef` names the same glyph so a caller can compare.
+Glyph glyph(^Font f, char32 cp):
+    Glyph none
+    if f == nil || f.dense == nil:
+        return none
+    if cp >= FIRST && cp <= LAST:
+        Glyph g = f.dense[i64(cp) - i64(FIRST)]
+        if g.present:
+            return g
+        return f.dense[i64(NOTDEF)]
+    for i in 0..<f.extra_used:
+        if f.extra_cp[i64(i)] == cp:
+            return f.extra[i64(i)]
+    return f.dense[i64(NOTDEF)]
+
+// The glyph every unknown codepoint answers. `present` is false and everything
+// else is real.
+Glyph notdef(^Font f):
+    Glyph none
+    if f == nil || f.dense == nil:
+        return none
+    return f.dense[i64(NOTDEF)]
+
+// Whether this atlas has `cp` itself, as opposed to answering `.notdef` for it.
+bool has(^Font f, char32 cp):
+    return glyph(f, cp).present
+
+// The advance width of `s`, with kerning where the face has any.
+//
+// **Characters, not bytes.** The walk decodes UTF-8, so a multi-byte sequence
+// measures as one character — the `.notdef` box's advance while the atlas has
+// not packed it, and the glyph's own once `add_codepoint` has. Walking bytes
+// was the older behaviour and it is why a text view could not use this
+// function: a three-byte sequence measured as three unknown bytes, which is
+// three boxes wide on screen and one character wide to a caret.
+f32 measure(^Font f, string8 s):
+    return measure_tabbed(f, s, no_tabs())
+
+// ── measuring the way a text view measures ────────────────────────────────
+//
+// **Every x position in a text view is the same walk**: where to put a glyph,
+// where the caret is, how wide a selection quad is, which character the mouse
+// hit, how far to scroll horizontally. `measure` answers one of those and a
+// client that needs the other four writes the walk itself — which is what
+// happened, five times, in one editor, because `measure` has nowhere to put a
+// tab stop and no way to ask about a byte offset.
+//
+// So the walk is here, once, as a primitive and three folds over it.
+//
+//     font.Tabs t = font.tabs(4.0 * font.cell_width(&f), 4)
+//     f32 caret  = font.advance_to(&f, line, cursor_byte, t)
+//     i32 column = font.column_to(&f, line, cursor_byte, t)
+//     (i64 at, i32 col) = font.index_at_x(&f, line, mouse_x, t)
+//
+// A tab advances to the next multiple of `Tabs.width` **measured from the start
+// of the run**, which is the only definition that works on a proportional face;
+// on a monospace face with `width == n * cell_width` it is exactly the familiar
+// every-n-columns stop. `Tabs.columns` is the same stop counted in characters,
+// which is what a status line's *Col* is and what nothing in pixels can answer.
+
+// Where the tab stops are: `width` in pixels and `columns` in characters. Both
+// zero — `no_tabs()` — makes a tab an ordinary character, drawn as `.notdef`
+// like any other codepoint the atlas has no glyph for.
+type Tabs: (f32 width, i32 columns)
+
+// The tab stops a text view usually wants: `width` pixels and `columns`
+// characters apart.
+Tabs tabs(f32 width, i32 columns):
+    return (width, columns)
+
+// No tab stops at all.
+Tabs no_tabs():
+    Tabs t
+    return t
+
+// One character of a run, and everything a walk needs to take a step.
+//
+// `nbytes` is how many bytes the character took, so a walk is `at += nbytes`
+// and a size of zero means the end. `columns` is how many character columns it
+// used — one for anything but a tab. `tab` says which it was, because a client
+// that draws a run must not put `.notdef` where it advanced to a stop.
+type Cell: (char32 cp, i32 nbytes, f32 advance, i32 columns, bool tab)
+
+// The character of `s` beginning at byte `at`, as it lands when `pen` pixels
+// and `column` characters of the run are already behind it.
+//
+// **`pen` and `column` are relative to the run's origin**, not to the screen: a
+// tab stop is defined against the start of the line and nothing else.
+//
+// Kerning is *not* in `advance`, because kerning is a property of a pair and
+// this answers about one character. The folds below apply it; a client writing
+// its own loop calls `kern` between steps, which is what `app:text` does.
+Cell cell_at(^Font f, string8 s, i64 at, f32 pen, i32 column, Tabs t):
+    Cell none
+    i64 n = #len(s)
+    if f == nil || at < 0 || at >= n:
+        return none
+    (char32 cp, i32 taken) = chars.decode(s, i32(at))
+    if taken <= 0:
+        return none
+    if cp == '\t' && t.width > 0.0:
+        f32 next = (floor_f(pen / t.width) + 1.0) * t.width
+        i32 cols = 1
+        if t.columns > 0:
+            cols = t.columns - (column % t.columns)
+        return (cp, taken, next - pen, cols, true)
+    return (cp, taken, glyph(f, cp).advance, 1, false)
+
+// The pen x of byte offset `upto`, measured from the run's origin. An offset
+// past the end answers the whole run's width, which is what a caret at the end
+// of a line wants.
+f32 advance_to(^Font f, string8 s, i64 upto, Tabs t):
+    if f == nil:
+        return 0.0
+    f32 pen = 0.0
+    i32 col = 0
+    i64 i = 0
+    i64 n = #len(s)
+    for i < n && i < upto:
+        Cell c = cell_at(f, s, i, pen, col, t)
+        if c.nbytes <= 0:
+            break
+        pen = pen + c.advance
+        col = col + c.columns
+        i64 next = i + i64(c.nbytes)
+        if next < n && next <= upto && !c.tab:
+            (char32 nc, i32 _) = chars.decode(s, i32(next))
+            pen = pen + kern(f, c.cp, nc)
+        i = next
+    return pen
+
+// The character column of byte offset `upto` — what a status line calls *Col*.
+i32 column_to(^Font f, string8 s, i64 upto, Tabs t):
+    if f == nil:
+        return 0
+    f32 pen = 0.0
+    i32 col = 0
+    i64 i = 0
+    i64 n = #len(s)
+    for i < n && i < upto:
+        Cell c = cell_at(f, s, i, pen, col, t)
+        if c.nbytes <= 0:
+            break
+        pen = pen + c.advance
+        col = col + c.columns
+        i = i + i64(c.nbytes)
+    return col
+
+// The character `want` pixels along the run lands on, rounded to the nearer
+// boundary — a caret and a mouse click are the same question and this is it.
+// Answers the byte offset and the column, because a client that hit-tests
+// almost always wants to report the column too.
+(i64 at, i32 column) index_at_x(^Font f, string8 s, f32 want, Tabs t):
+    if f == nil:
+        return (0, 0)
+    f32 pen = 0.0
+    i32 col = 0
+    i64 i = 0
+    i64 n = #len(s)
+    for i < n:
+        Cell c = cell_at(f, s, i, pen, col, t)
+        if c.nbytes <= 0:
+            break
+        if want < pen + c.advance * 0.5:
+            return (i, col)
+        pen = pen + c.advance
+        col = col + c.columns
+        i = i + i64(c.nbytes)
+    return (i, col)
+
+// The advance width of the whole run with tab stops applied. `measure` is this
+// with no tab stops.
+f32 measure_tabbed(^Font f, string8 s, Tabs t):
+    return advance_to(f, s, #len(s) + 1, t)
+
+// The kerning adjustment between two codepoints, in pixels. Zero for a
+// fallback font, which has no kerning table and would be lying to invent one.
+f32 kern(^Font f, char32 a, char32 b):
+    if f == nil || f.info == nil:
+        return 0.0
+    i32 k = stb_truetype.stbtt_GetCodepointKernAdvance(f.info, i32(a), i32(b))
+    return f32(k) * f.scale
+
+// ── vertical metrics ──────────────────────────────────────────────────────
+
+// Baseline to baseline: `ascent - descent + line_gap`, with `descent`
+// negative, which is why this is a subtraction.
+f32 line_height(^Font f):
+    if f == nil:
+        return 0.0
+    return f.ascent_px - f.descent_px + f.line_gap_px
+
+// Pixels above the baseline. Positive.
+f32 ascent(^Font f):
+    if f == nil:
+        return 0.0
+    return f.ascent_px
+
+// Pixels below the baseline. **Negative** — see the package comment.
+f32 descent(^Font f):
+    if f == nil:
+        return 0.0
+    return f.descent_px
+
+// The size this face was rasterised at.
+f32 pixel_height(^Font f):
+    if f == nil:
+        return 0.0
+    return f.pixel_height
+
+// Whether every glyph in the dense block advances the same distance. A layout
+// engine that can take a fast path for a fixed grid asks this rather than
+// guessing from the file name.
+bool monospace(^Font f):
+    if f == nil:
+        return false
+    return f.monospace
+
+// The nominal width of one character cell: the advance of `'0'`, or of a space
+// where the face draws no digit.
+//
+// **On a monospace face this is *the* cell** and every glyph advances by it —
+// which is the number a client was taking as `glyph(' ').advance`. On a
+// proportional face it is a nominal cell and nothing more: it is what a tab
+// stop and a `.notdef` box are sized against, and it is not the width of
+// anything you draw.
+f32 cell_width(^Font f):
+    if f == nil:
+        return 0.0
+    return f.cell_px
+
+// Pixels from the baseline to the top of a capital letter, measured off this
+// atlas's `H`. Positive. Zero for a face that draws no `H`.
+f32 cap_height(^Font f):
+    if f == nil:
+        return 0.0
+    return f.cap_px
+
+// Pixels from the baseline to the top of a lowercase `x`, measured off this
+// atlas's `x`. Positive. Zero for a face that draws no `x`.
+f32 x_height(^Font f):
+    if f == nil:
+        return 0.0
+    return f.xh_px
+
+// Where to draw an underline, and how thick.
+//
+// `position` is pixels **below the baseline, positive down** — this package's
+// own y-down convention, not the face's y-up one — so an underline under a run
+// whose baseline is at `b` is a fill at `b + position` of `thickness` high.
+//
+// `from_face` is false when the pair was derived rather than read out of the
+// face's `post` table: the built-in bitmap has no tables, and a real face may
+// have no `post`. A derived pair is a reasonable guess and it draws fine; the
+// flag is there so a program that cares can say so rather than a program that
+// does not care having to.
+(f32 position, f32 thickness, bool from_face) underline(^Font f):
+    if f == nil:
+        return (0.0, 0.0, false)
+    return (f.ul_pos_px, f.ul_thick_px, f.ul_real)
+
+// ── the atlas ─────────────────────────────────────────────────────────────
+
+// The image: RGBA8, row-major, four bytes per texel, stride `atlas_w * 4`.
+// Every texel is `(255, 255, 255, coverage)` — see the package comment for why
+// the three colour bytes are not padding and why an untouched texel is white
+// rather than black.
+//
+// **A borrow, and `grow_atlas` ends it as surely as `destroy` does.** The grow
+// is a `realloc`, which may move the image, so a `[]u8` taken from here before
+// a grow points at freed memory afterwards. Ask again after one; every consumer
+// already does, because the run it wants is the one it is about to upload.
+[]u8 atlas_pixels(^Font f):
+    []u8 nothing
+    if f == nil || f.pixels == nil:
+        return nothing
+    return f.pixels[..<i64(f.atlas_w) * i64(f.atlas_h) * BPP]
+
+(i32 w, i32 h) atlas_size(^Font f):
+    if f == nil:
+        return (0, 0)
+    return (f.atlas_w, f.atlas_h)
+
+// How many times this atlas's pixels have changed. Zero for a `Font` that
+// never packed. The atlas never moves, so a consumer that uploaded at
+// generation `g` and reads a different number needs `texture_update` and
+// nothing more — **as long as it also watches `atlas_resizes`**, which is the
+// one thing that can make the atlas a different size.
+//
+// **`grow_atlas` deliberately does not touch this counter.** That is what makes
+// a consumer which watches only this one unable to issue an update its texture
+// is too small to hold, which `app:draw` would accept and truncate. See the
+// package comment for the whole of that argument, and for why this is a counter
+// and not a callback or a flush.
+i32 atlas_generation(^Font f):
+    if f == nil:
+        return 0
+    return f.generation
+
+// How many times this atlas has changed **shape**. Zero for a `Font` that has
+// never grown, which is every `Font` until something calls `grow_atlas`.
+//
+// A consumer that uploaded at shape `r` and reads a different number owes its
+// drawing surface a **destroy and a remake**, not an update: `atlas_pixels` is
+// now longer than the texture holds, and `app:draw`'s `texture_update` accepts
+// an over-long run, truncates it and answers `true`. The two counters are two
+// different instructions and that is the entire reason there are two.
+i32 atlas_resizes(^Font f):
+    if f == nil:
+        return 0
+    return f.resizes
+
+// The tallest atlas this package will grow to. **This is the bound, and there
+// is one.**
+//
+// 4096 because it is already the packer's ceiling on the *width* ladder, so the
+// two dimensions share one number rather than each carrying its own; and
+// because a drawing surface that cannot hold a texture 4096 tall could not have
+// held the widest atlas `pack` already produces without growing at all. Past it
+// `grow_atlas` answers `false` and nothing moves.
+//
+// At the width a monospace UI actually gets — 128 — the ceiling is
+// 128 x 4096 x 4 = **2 MB** of RGBA8, where the same atlas was 512 kB while
+// this package held one coverage byte per pixel. The ceiling counted in
+// *codepoints* is
+// not a constant and cannot be one: it is however many boxes the shelf walk
+// fits, which depends on the face and the pixel height. Measure it; do not
+// quote it.
+private const i32 MAX_ATLAS_H = 4096
+
+// Double the atlas's height, keeping its width. Answers whether it grew.
+//
+// **Nothing here grows by itself** — `add_codepoint` answers `false` and stops.
+// This is the verb a caller reaches for when it would rather have the codepoint
+// than the refusal, and calling it is a decision about a frame boundary rather
+// than about a glyph. See the package comment for the loop and for when it is
+// safe.
+//
+// The width does not change, so no box moves, nothing is re-rasterised and
+// **every `Glyph` already handed out stays correct**: a `Glyph` carries a pixel
+// rectangle and a pixel rectangle is invariant under a grow. This verb used to
+// spend that invariant — `v0`/`v1` divided by `atlas_h` — and a `rewindow` pass
+// walked every glyph to repair them. Both are gone; the package comment records
+// what they were for.
+//
+// What the grow does still spend is the **borrow**: the image is `#resize`d and
+// the new rows filled, so a `[]u8` taken from `atlas_pixels` before this call is
+// dangling after it and a caller that kept one asks again.
+//
+// **The new rows are `(255, 255, 255, 0)`, not four zeroes.** Four zeroes is a
+// transparent *black*, and a sample that straddles the boundary between a
+// glyph's edge and a black-transparent neighbour interpolates towards black and
+// fringes dark. Filling white costs the same stores and cannot.
+//
+// `atlas_generation` does **not** move. `atlas_resizes` does. A consumer that
+// confuses the two gets a truncated upload and a `true` from its drawing
+// surface; that is the whole reason for the second counter and it is argued in
+// the package comment.
+//
+// Answers `false`, having changed nothing, when the atlas is already at
+// `MAX_ATLAS_H`, when there is no atlas to grow, or when the allocator refused
+// the larger image. A `false` is never a broken `Font`: every caller may retry
+// `add_codepoint` and get the same `.notdef` it had.
+bool grow_atlas(^Font f):
+    if f == nil || f.pixels == nil || f.dense == nil:
+        return false
+    if f.atlas_w < 1 || f.atlas_h < 1:
+        return false
+    if f.atlas_h > MAX_ATLAS_H / 2:
+        return false
+    i32 nh = f.atlas_h * 2
+
+    i64 old_n = i64(f.atlas_w) * i64(f.atlas_h)
+    i64 new_n = i64(f.atlas_w) * i64(nh)
+    if !#resize(f.pixels, new_n * BPP):
+        return false
+    clear_texels(f, old_n, new_n)
+
+    // Only past the point of no failure is the size published, so a refused
+    // `#resize` leaves a `Font` whose every field still describes the atlas it
+    // still has.
+    f.atlas_h = nh
+    f.resizes = f.resizes + 1
+    return true
+
+// ── the solid texel ───────────────────────────────────────────────────────
+
+// A fully-opaque point inside the atlas, as a **zero-extent source rectangle**
+// in atlas pixels, ready to hand to a textured-quad call.
+//
+// **This is what makes a rule, a caret, an underline, a selection quad or a
+// replacement box cost nothing.** `app:draw` breaks a batch on a texture
+// change, so a run of glyphs with a box drawn between two of them is three
+// draw calls, and a screen of them is one call per box — measured, on a real
+// client: a file that needed replacement boxes went from 3 draw calls to 20,
+// and came back to 9 only by splitting the line painter into an atlas pass and
+// a white pass over the same lines. Every mixed-content renderer had to be
+// written that way and nothing said so. With this, a rectangle drawn over the
+// atlas rides in the glyph batch and the whole class of problem is gone.
+//
+// **`w` and `h` are zero, and that is the whole mechanism rather than a
+// tidiness.** A source rectangle with any extent at all interpolates across the
+// quad and reaches the block's transparent padding at its corners, which is a
+// visible fringe — measured, every pixel of a 64×32 quad wrong and its corners
+// reading 67 where 255 belongs, and 644 of 2048 still wrong with the block six
+// texels square. A rectangle of zero extent cannot, whatever the quad's size,
+// because every fragment resolves to the same texel. See `SOLID` for all four
+// measurements.
+//
+// **This is why `solid_box` is not this function.** `solid_box` answers the
+// block's rectangle — `(PAD, PAD, SOLID, SOLID)` — and that is exactly the
+// measured failing case: a six-by-six source rect is a source rect with extent.
+// The two functions differ by the one property that matters and the names say
+// which is which.
+//
+// Every texel of the atlas is white with the coverage in alpha, and
+// `sokol_gp`'s stock shader is `texture(tex, uv) * color`, so an opaque white
+// texel gives back exactly the tint — including its alpha, so a
+// half-transparent tint blends like any other quad.
+//
+//     (f32 sx, f32 sy, f32 sw, f32 sh) = font.solid_src(&f)
+//     draw.texture_rect_region(item, atlas, (x, y, w, h), (sx, sy, sw, sh), colour)
+//
+// Answers all zeroes for a `Font` with no atlas, which names the atlas's own
+// top-left padding pixel — transparent, so a caller that skipped the check
+// draws nothing rather than something wrong.
+(f32 x, f32 y, f32 w, f32 h) solid_src(^Font f):
+    if f == nil || f.pixels == nil || f.atlas_w < 1 || f.atlas_h < 1:
+        return (0.0, 0.0, 0.0, 0.0)
+    f32 cx = f32(PAD) + f32(SOLID) * 0.5
+    f32 cy = f32(PAD) + f32(SOLID) * 0.5
+    return (cx, cy, 0.0, 0.0)
+
+// The reserved block's pixel rectangle. A test looks at this; **a drawing
+// client wants `solid_src`** and this rectangle is the measured wrong answer
+// for it — six texels of extent is 644 wrong pixels of a 64×32 quad.
+(i32 x, i32 y, i32 w, i32 h) solid_box(^Font f):
+    if f == nil || f.pixels == nil:
+        return (0, 0, 0, 0)
+    return (PAD, PAD, SOLID, SOLID)
+
+// ── adding a codepoint ────────────────────────────────────────────────────
+
+// Rasterise `cp` into the first free space on the atlas's retained shelf and
+// remember it, so `glyph` and `measure` answer it from then on.
+//
+// Answers **true when `cp` is available afterwards** — including when it
+// already was, so a caller may ask unconditionally per character and pay one
+// lookup. False means the codepoint keeps answering `.notdef`, for one of three
+// reasons, none of which is an error a caller can repair:
+//
+//   * this is a fallback face, which has 95 glyphs compiled into it and no
+//     outlines to rasterise from;
+//   * the face does not have `cp` — `stbtt_FindGlyphIndex` answered 0, which is
+//     `.notdef`, and packing the face's own `.notdef` under a second name would
+//     be a lie that `present` could not undo;
+//   * the atlas has no room left — and this function does not grow it. A caller
+//     that would rather have the codepoint than the refusal calls `grow_atlas`
+//     and asks again; the package comment has the loop and says when it is
+//     safe to run.
+//
+// On success `atlas_generation` has moved and the drawing surface owes the
+// texture an update **before its next frame**.
+bool add_codepoint(^Font f, char32 cp):
+    if f == nil || f.dense == nil || f.pixels == nil:
+        return false
+    if glyph(f, cp).present:
+        return true
+    if f.source != Source.TrueType || f.info == nil:
+        return false
+
+    i32 gi = stb_truetype.stbtt_FindGlyphIndex(f.info, i32(cp))
+    if gi == 0:
+        return false
+
+    Glyph g
+    glyph_metrics(f, gi, &g)
+    g.present = true
+    if g.pw > 0 && g.ph > 0:
+        i32 px = 0
+        i32 py = 0
+        if !shelf_place(f, g.pw, g.ph, &px, &py):
+            return false
+        g.px = px
+        g.py = py
+
+    if !remember(f, cp, g):
+        return false
+
+    if g.pw > 0 && g.ph > 0:
+        ink_glyph(f, &g, gi)
+    f.generation = f.generation + 1
+    return true
+
+// Grow the sparse pair by one. The two runs are grown together and
+// `extra_used` is only moved once both took, so a failed `#append` cannot leave
+// a codepoint pointing at a glyph that was never written.
+private bool remember(^Font f, char32 cp, Glyph g):
+    if f.extra_cp == nil:
+        f.extra_cp = #make([]char32, 0, f.alloc)
+        f.extra = #make([]Glyph, 0, f.alloc)
+        if f.extra_cp == nil || f.extra == nil:
+            return false
+    if !#append(f.extra_cp, cp):
+        return false
+    if !#append(f.extra, g):
+        return false
+    f.extra_used = f.extra_used + 1
+    return true
+
+// How many codepoints have been added past the dense block.
+i32 added(^Font f):
+    if f == nil:
+        return 0
+    return f.extra_used
+
+// ── font discovery ────────────────────────────────────────────────────────
+
+// A monospace face this platform is likely to have, or `""` where there is
+// nothing worth guessing.
+//
+// **A guess, and the signature says so by pairing with `load_file`'s `bool`.**
+// This package does not stat the path and does not walk a font directory: a
+// path that is wrong costs one failed open and the fallback, which is cheaper
+// than a search that is wrong in a different way on every distribution. A
+// program that has a real font picker passes its answer to `load_file` and
+// never calls this.
+//
+// Verified 2026-09-06 in the Linux container this was written in:
+// `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf` exists.
+// **The macOS path is unverified** — there is no Mac here — and it is
+// `SFNSMono.ttf` rather than `Menlo.ttc` only because it is the one Apple
+// ships as a plain `.ttf`; `load` reads either, because
+// `stbtt_GetFontOffsetForIndex` resolves a `ttcf` collection and a bare `.ttf`
+// through the same call.
+string8 default_path():
+    when #OS == #DARWIN:
+        return "/System/Library/Fonts/SFNSMono.ttf"
+    else when #OS == #WINDOWS:
+        return "C:\\Windows\\Fonts\\consola.ttf"
+    else when #OS == #LINUX || #OS == #FREEBSD:
+        return "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    else:
+        return ""
+
+// ── the packer ────────────────────────────────────────────────────────────
+
+// **Shelf (row) packing, in codepoint order, with no sort.**
+//
+// A cursor walks left to right along the current shelf. When the next box does
+// not fit before the right edge, the cursor drops to a new shelf whose top is
+// one pixel below the tallest box the previous shelf held. `PAD` pixels sit
+// between boxes and around the edge.
+//
+// The width is chosen **first**: the smallest of 128, 256, 512, 1024, 2048,
+// 4096 for which the simulated pack is no taller than it is wide. The height
+// is then the next power of two at or above the height actually used, which is
+// what leaves the slack a later codepoint packs into.
+//
+// Sorting by height would waste less — this wastes the difference between each
+// box and the tallest on its shelf — but a sort would reorder the glyphs, and
+// the ASCII block packed in codepoint order puts the capitals on one shelf and
+// the lowercase on the next, which is worth more when reading a dump of the
+// atlas by eye than the few percent a sort recovers. Say so rather than
+// discovering it.
+private bool pack(^Font f):
+    i32 width = 128
+    i32 used_h = 0
+    for:
+        used_h = simulate(f, width)
+        if used_h > 0 && used_h <= width:
+            break
+        if width >= 4096:
+            if used_h <= 0:
+                return false
+            break
+        width = width * 2
+
+    i32 height = 1
+    for:
+        if height >= used_h:
+            break
+        height = height * 2
+
+    // **The slack is deliberate and it is what `add_codepoint` packs into.**
+    // Rounding the used height up to a power of two leaves *some* room only by
+    // luck — a pack that finishes one row under a power of two leaves one row —
+    // so if the rounding did not buy at least one more shelf's worth, take the
+    // next power of two. One doubling of an RGBA8 atlas is cheap (a 512-wide,
+    // 512-tall atlas costs 1 MB more, where the same doubling cost 256 kB while
+    // this package held one byte per pixel) and it is the difference between a
+    // font that can
+    // learn a codepoint and one that answers `.notdef` forever.
+    if height - used_h < shelf_reserve(f):
+        height = height * 2
+
+    f.atlas_w = width
+    f.atlas_h = height
+    f.pixels = #make([]u8, i64(width) * i64(height) * BPP, f.alloc)
+    if f.pixels == nil:
+        f.atlas_w = 0
+        f.atlas_h = 0
+        return false
+    // White everywhere, alpha zero — **not** the zeroes `#make` already wrote.
+    // A transparent black texel fringes dark where a sample straddles a box's
+    // edge; the package comment has the whole of that argument.
+    i64 zero = 0
+    clear_texels(f, zero, i64(width) * i64(height))
+    fill_solid(f)
+
+    // The real pass, with the same walk `simulate` just made, writing the
+    // placements and leaving the cursor where it stopped. It starts *past* the
+    // reserved solid block, which is why the first shelf begins at `SOLID`
+    // pixels tall and `PAD + SOLID + PAD` across.
+    i32 x = PAD + SOLID + PAD
+    i32 y = PAD
+    i32 shelf = SOLID
+    for idx in 0..<SLOTS:
+        ^Glyph g = &f.dense[i64(idx)]
+        if g.pw <= 0 || g.ph <= 0:
+            g.px = 0
+            g.py = 0
+            continue
+        if x + g.pw + PAD > width:
+            x = PAD
+            y = y + shelf + PAD
+            shelf = 0
+        g.px = x
+        g.py = y
+        x = x + g.pw + PAD
+        if g.ph > shelf:
+            shelf = g.ph
+
+    f.shelf_x = x
+    f.shelf_y = y
+    f.shelf_h = shelf
+    f.generation = 1
+    return true
+
+// The height the shelf walk would use at `width`, or 0 when a single box is
+// wider than the whole atlas — which is what makes the caller's ladder step up
+// rather than pack an unplaceable glyph at x = PAD and let it run off the
+// right edge.
+private i32 simulate(^Font f, i32 width):
+    i32 x = PAD + SOLID + PAD
+    i32 y = PAD
+    i32 shelf = SOLID
+    for idx in 0..<SLOTS:
+        ^Glyph g = &f.dense[i64(idx)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        if g.pw + 2 * PAD > width:
+            return 0
+        if x + g.pw + PAD > width:
+            x = PAD
+            y = y + shelf + PAD
+            shelf = 0
+        x = x + g.pw + PAD
+        if g.ph > shelf:
+            shelf = g.ph
+    return y + shelf + PAD
+
+// How much free height below the packed block is worth having: **four shelves
+// of this face**, and the number is four because it was measured.
+//
+// The power-of-two rounding alone leaves whatever it happens to leave, and what
+// it happens to leave swings wildly with the size. Measured on DejaVu Sans Mono
+// with the rounding alone, counting how many further codepoints
+// `add_codepoint` took before the shelf ran out: **12 px → 110, 16 px → 46,
+// 18 px → 126, 24 px → 171, 32 px → 95.** Forty-six at 16 px — the size a UI
+// actually runs at — is barely Latin-1, and nothing about the size predicts it.
+// One more doubling costs one more atlas, which at that size is 128 kB of
+// RGBA8 — four times the 32 kB it cost as alpha-8, and still the cheapest thing
+// in sight next to a face that answers `.notdef` forever.
+// With this reserve the same five are **110, 180, 126, 171, 241**: the two that
+// were thin doubled, the three that already had room did not, and the worst
+// case stopped being a coin toss.
+private i32 shelf_reserve(^Font f):
+    i32 want = 4 * (i32(f.pixel_height) + 2 * PAD)
+    if want < 8:
+        return 8
+    return want
+
+// Write the reserved fully-opaque block. Called once, right after the atlas is
+// cleared and before any glyph is inked, so nothing can be packed over it.
+private void fill_solid(^Font f):
+    for y in 0..<SOLID:
+        i64 row = i64(PAD + y) * i64(f.atlas_w)
+        for x in 0..<SOLID:
+            i64 at = (row + i64(PAD + x)) * BPP
+            f.pixels[at] = 255
+            f.pixels[at + 1] = 255
+            f.pixels[at + 2] = 255
+            f.pixels[at + 3] = 255
+
+// Place one box on the retained shelf, or answer false when the atlas has no
+// room left. This is the same walk `pack` makes, one box at a time, and it is
+// what makes the cursor worth retaining.
+private bool shelf_place(^Font f, i32 w, i32 h, ^i32 out_x, ^i32 out_y):
+    i32 x = f.shelf_x
+    i32 y = f.shelf_y
+    i32 shelf = f.shelf_h
+    if w + 2 * PAD > f.atlas_w:
+        return false
+    if x + w + PAD > f.atlas_w:
+        x = PAD
+        y = y + shelf + PAD
+        shelf = 0
+    if y + h + PAD > f.atlas_h:
+        return false
+    out_x^ = x
+    out_y^ = y
+    f.shelf_x = x + w + PAD
+    f.shelf_y = y
+    if h > shelf:
+        shelf = h
+    f.shelf_h = shelf
+    return true
+
+// ── the image, and the scratch stb makes it necessary ─────────────────────
+
+// Fill texels `from` up to `upto` — **texel indices, not byte offsets** — with
+// the untouched texel: white, alpha zero.
+//
+// **Not four zeroes**, and this is the one place in the package where that
+// mistake would be invisible. Four zeroes is a transparent *black*: a bilinear
+// sample that straddles a glyph's edge interpolates towards the colour beside
+// it, so black-transparent padding darkens every border in the atlas and
+// white-transparent padding cannot. The difference is only visible on a screen,
+// which is the worst place to find it, so the fill is written once here and
+// every caller goes through it.
+private void clear_texels(^Font f, i64 from, i64 upto):
+    for i in from..<upto:
+        i64 at = i * BPP
+        f.pixels[at] = 255
+        f.pixels[at + 1] = 255
+        f.pixels[at + 2] = 255
+        f.pixels[at + 3] = 0
+
+// The scratch this face rasterises through, sized to the largest coverage box
+// it can produce.
+//
+// `stbtt_GetFontBoundingBox` is the union of every outline in the face, in
+// design units, so scaling it bounds every box `stbtt_GetGlyphBitmapBox` can
+// answer. Two pixels of slack on each axis cover stb's own rounding, which
+// floors the low edge of a box and ceils the high one and so can answer a box a
+// pixel larger than the scaled extent in each direction.
+//
+// A floor of one cell squared, because a face whose `head` table understates
+// its own outlines would otherwise get a scratch too small for its first glyph
+// — and `fit_scratch` is the second guard for exactly that.
+private ref []u8 make_scratch(^Font f):
+    i32 x0 = 0
+    i32 y0 = 0
+    i32 x1 = 0
+    i32 y1 = 0
+    stb_truetype.stbtt_GetFontBoundingBox(f.info, &x0, &y0, &x1, &y1)
+    i64 w = i64(f32(x1 - x0) * f.scale) + 2
+    i64 h = i64(f32(y1 - y0) * f.scale) + 2
+    i64 floor = i64(f.pixel_height) + 2
+    if w < floor:
+        w = floor
+    if h < floor:
+        h = floor
+    return #make([]u8, w * h, f.alloc)
+
+// Make sure the scratch holds a `w` by `h` coverage box, growing it where the
+// face's own bounding box did not bound it.
+//
+// A font file that understates its bounding box is a file, not a hypothesis,
+// and a rasteriser writing past its buffer because one lied is not a failure
+// mode worth having. This costs one comparison per glyph and answers `false`
+// only when the allocator refuses, in which case the glyph is left blank rather
+// than written somewhere it does not belong.
+//
+// **The `#resize` has never fired here.** Making it answer `false` instead —
+// so that a glyph too large for the initial sizing draws nothing — leaves the
+// whole suite green, over the dense ASCII block at two sizes, `.notdef`, and
+// the two-hundred-odd codepoints `add_codepoint` takes on DejaVu Sans Mono
+// before the shelf runs out. So this is a guard against a file, not a path the
+// packing relies on.
+private bool fit_scratch(^Font f, i32 w, i32 h):
+    if f.scratch == nil:
+        return false
+    i64 want = i64(w) * i64(h)
+    if #len(f.scratch) >= want:
+        return true
+    return #resize(f.scratch, want)
+
+// Clear the `w` by `h` box at the front of the scratch.
+//
+// stb's rasteriser writes a whole scanline for every row of the box it is
+// given, so in principle nothing stale survives — but the scratch is reused by
+// every glyph of the face, so a byte it did not write is the *previous* glyph's
+// ink showing through this one, and "in principle" is a claim about an internal
+// of a vendored header that this package cannot test. `w * h` stores against a
+// rasterisation that costs far more than that is the cheaper side of the trade.
+private void zero_scratch(^Font f, i32 w, i32 h):
+    i64 n = i64(w) * i64(h)
+    i64 zero = 0
+    for i in zero..<n:
+        f.scratch[i] = 0
+
+// Widen a `w` by `h` coverage box from the front of the scratch into the atlas
+// at `(px, py)`: white, with the coverage byte in alpha.
+private void expand(^Font f, i32 px, i32 py, i32 w, i32 h):
+    for y in 0..<h:
+        i64 src = i64(y) * i64(w)
+        i64 dst = (i64(py + y) * i64(f.atlas_w) + i64(px)) * BPP
+        for x in 0..<w:
+            i64 at = dst + i64(x) * BPP
+            f.pixels[at] = 255
+            f.pixels[at + 1] = 255
+            f.pixels[at + 2] = 255
+            f.pixels[at + 3] = f.scratch[src + i64(x)]
+
+// Rasterise a codepoint through the scratch and into `g`'s packed box.
+private void ink_codepoint(^Font f, ^Glyph g, i32 cp):
+    if !fit_scratch(f, g.pw, g.ph):
+        return
+    zero_scratch(f, g.pw, g.ph)
+    stb_truetype.stbtt_MakeCodepointBitmap(f.info, &f.scratch[0], g.pw, g.ph, g.pw,
+                                           f.scale, f.scale, cp)
+    expand(f, g.px, g.py, g.pw, g.ph)
+
+// The same for a glyph index, which is how `add_codepoint` and the face's own
+// `.notdef` reach the rasteriser. The stride handed to stb is `g.pw` — the
+// scratch's own width — where it used to be `atlas_w`, and that substitution is
+// the whole of what the scratch changes at these two call sites.
+private void ink_glyph(^Font f, ^Glyph g, i32 gi):
+    if !fit_scratch(f, g.pw, g.ph):
+        return
+    zero_scratch(f, g.pw, g.ph)
+    stb_truetype.stbtt_MakeGlyphBitmap(f.info, &f.scratch[0], g.pw, g.ph, g.pw,
+                                       f.scale, f.scale, gi)
+    expand(f, g.px, g.py, g.pw, g.ph)
+
+// ── glyph metrics, `.notdef`, and the heights a text view wants ───────────
+
+// Fill `g`'s box, bearings and advance from glyph index `gi` of a TrueType
+// face. The one place `stbtt`'s glyph-index half is called; every other call in
+// this package goes through a codepoint.
+private void glyph_metrics(^Font f, i32 gi, ^Glyph g):
+    i32 x0 = 0
+    i32 y0 = 0
+    i32 x1 = 0
+    i32 y1 = 0
+    stb_truetype.stbtt_GetGlyphBitmapBox(f.info, gi, f.scale, f.scale, &x0, &y0, &x1, &y1)
+    i32 adv = 0
+    i32 lsb = 0
+    stb_truetype.stbtt_GetGlyphHMetrics(f.info, gi, &adv, &lsb)
+    g.pw = x1 - x0
+    g.ph = y1 - y0
+    if g.pw < 0: g.pw = 0
+    if g.ph < 0: g.ph = 0
+    g.bearing_x = f32(x0)
+    g.bearing_y = f32(y0)
+    g.advance = f32(adv) * f.scale
+
+// The nominal width of one character cell. `'0'` rather than `'M'` or the
+// widest advance in the face, because a digit is the character a monospace face
+// is designed around and a proportional face's digits are near its average; a
+// maximum would make a tab stop absurd on any face with a wide `W`.
+private f32 nominal_cell(^Font f):
+    f32 z = f.dense[i64('0') - i64(FIRST)].advance
+    if z > 0.0:
+        return z
+    f32 sp = f.dense[i64(' ') - i64(FIRST)].advance
+    if sp > 0.0:
+        return sp
+    return f.pixel_height * 0.5
+
+// The box a drawn `.notdef` occupies: a rectangle a bit narrower than the cell,
+// standing on the baseline and rising to about cap height, which is what every
+// face's own `.notdef` looks like.
+private void synth_notdef(^Font f, ^Glyph g):
+    i32 w = i32(f.cell_px) - 2
+    if w < 3:
+        w = 3
+    i32 h = i32(f.ascent_px * 0.72)
+    if h < 4:
+        h = 4
+    g.pw = w
+    g.ph = h
+    g.bearing_x = 1.0
+    g.bearing_y = 0.0 - f32(h)
+
+// Ink `.notdef` into its packed box. A TrueType face draws its own glyph 0;
+// anything else — a face whose glyph 0 is empty, and the built-in bitmap, which
+// has no glyph 0 at all — gets a hollow rectangle whose border is `s` pixels,
+// where `s` is the bitmap's integer scale and 1 for a real face.
+private void ink_notdef(^Font f, ^Glyph g, i32 s):
+    if g.pw <= 0 || g.ph <= 0:
+        return
+    if f.info != nil && stb_truetype.stbtt_IsGlyphEmpty(f.info, 0) == 0:
+        ink_glyph(f, g, 0)
+        return
+    i32 t = s
+    if t < 1:
+        t = 1
+    if t * 2 >= g.pw || t * 2 >= g.ph:
+        t = 1
+    // Only the alpha byte is written: the three colour bytes are already 255,
+    // put there by `clear_texels` before anything was packed, and every texel of
+    // this atlas keeps them.
+    for y in 0..<g.ph:
+        i64 row = i64(g.py + y) * i64(f.atlas_w)
+        bool edge_row = y < t || y >= g.ph - t
+        for x in 0..<g.pw:
+            if edge_row || x < t || x >= g.pw - t:
+                f.pixels[(row + i64(g.px + x)) * BPP + 3] = 255
+
+// Cap height and x-height, **measured off this atlas's own ink** rather than
+// read out of `OS/2`.
+//
+// The face's `sCapHeight` and `sxHeight` exist only from `OS/2` version 2, so
+// half the faces on a machine do not carry them and `stbtt` exposes no way to
+// reach the table anyway (`stbtt__find_table` is `static`, and
+// `stbtt_GetFontVMetricsOS2` answers the typographic *vertical* trio and
+// nothing else). The top of the rasterised `H` box **is** the cap height in
+// pixels and the top of the `x` box **is** the x-height, exactly, for this
+// rasterisation — which is the number a caller wants, since it is placing a
+// rule against ink it can see. It also answers for the built-in bitmap, which
+// has no tables at all.
+private void measure_heights(^Font f):
+    f.cap_px = 0.0
+    f.xh_px = 0.0
+    Glyph h = f.dense[i64('H') - i64(FIRST)]
+    if h.ph > 0:
+        f.cap_px = 0.0 - h.bearing_y
+    Glyph x = f.dense[i64('x') - i64(FIRST)]
+    if x.ph > 0:
+        f.xh_px = 0.0 - x.bearing_y
+
+// The four bytes of `post` that say where an underline goes, read straight out
+// of the font file this package already keeps a copy of.
+//
+// **`stbtt` cannot answer this and there is no binding to add.**
+// `stbtt__find_table` is `static` in the header, so the table directory is not
+// reachable from outside — but the directory is eleven lines of big-endian
+// arithmetic and `Font` already owns the bytes and the offset this face starts
+// at, so it is read here rather than gone without.
+//
+// A face with no `post` table, and the built-in bitmap, get a derived pair and
+// `ul_real` says so: one third of the way to the descender, one fourteenth of
+// the pixel height thick and never thinner than a pixel. That is a guess and it
+// is labelled as one.
+private void read_underline(^Font f):
+    f.ul_real = false
+    f.ul_pos_px = (0.0 - f.descent_px) * 0.33
+    f.ul_thick_px = f.pixel_height / 14.0
+    if f.ul_thick_px < 1.0:
+        f.ul_thick_px = 1.0
+    if f.ttf == nil:
+        return
+    (i64 at, i64 n, bool found) = find_table(f, "post")
+    if !found || n < 12:
+        return
+    // `underlinePosition` is an FWORD in the face's y-up design units, so a
+    // value below the baseline is negative there and positive here.
+    f32 pos = f32(be_i16(f, at + 8)) * f.scale
+    f32 thick = f32(be_i16(f, at + 10)) * f.scale
+    if thick <= 0.0:
+        return
+    f.ul_pos_px = 0.0 - pos
+    f.ul_thick_px = thick
+    f.ul_real = true
+
+// Find a table in this face's sfnt directory. `tag` is its four-character name.
+private (i64 at, i64 nbytes, bool found) find_table(^Font f, string8 tag):
+    i64 start = i64(f.ttf_at)
+    i64 total = #len(f.ttf)
+    if start < 0 || start + 12 > total || #len(tag) != 4:
+        return (0, 0, false)
+    i64 ntables = i64(be_u16(f, start + 4))
+    i64 dir = start + 12
+    if dir + ntables * 16 > total:
+        return (0, 0, false)
+    i64 zero = 0
+    for i in zero..<ntables:
+        i64 rec = dir + i * 16
+        bool same = true
+        for k in zero..<i64(4):
+            if f.ttf[rec + k] != u8(tag[k]):
+                same = false
+        if !same:
+            continue
+        i64 at = i64(be_u32(f, rec + 8))
+        i64 n = i64(be_u32(f, rec + 12))
+        if at < 0 || n < 0 || at + n > total:
+            return (0, 0, false)
+        return (at, n, true)
+    return (0, 0, false)
+
+private u32 be_u16(^Font f, i64 at):
+    return (u32(f.ttf[at]) << 8) | u32(f.ttf[at + 1])
+
+private i32 be_i16(^Font f, i64 at):
+    i32 v = i32(be_u16(f, at))
+    if v >= 0x8000:
+        return v - 0x10000
+    return v
+
+private u32 be_u32(^Font f, i64 at):
+    return (be_u16(f, at) << 16) | be_u16(f, at + 2)
+
+// ── the built-in bitmap ───────────────────────────────────────────────────
+
+// The tightest box of set bits in one 8x8 glyph, and whether there were any.
+// Columns and rows are inclusive.
+private (i32 c0, i32 r0, i32 c1, i32 r1, bool inked) ink_box(u64 bits):
+    i32 c0 = 8
+    i32 r0 = 8
+    i32 c1 = -1
+    i32 r1 = -1
+    for r in 0..<8:
+        u64 row = (bits >> u64(8 * r)) & 0xFF
+        if row == 0:
+            continue
+        if r < r0: r0 = r
+        if r > r1: r1 = r
+        for c in 0..<8:
+            if (row >> u64(c)) & 1 != 0:
+                if c < c0: c0 = c
+                if c > c1: c1 = c
+    if c1 < 0:
+        return (0, 0, 0, 0, false)
+    return (c0, r0, c1, r1, true)
+
+// Draw one 8x8 glyph into the atlas at `g`'s placement, scaled `s` times in
+// both directions. Coverage is 0 or 255: this is a bitmap font and an
+// intermediate value would be a lie about an edge nothing measured.
+//
+// **No scratch, and no stb.** The fallback face's source is a bit per pixel in
+// a `u64`, so this writes the alpha byte of each set bit's texel straight into
+// the atlas; the three colour bytes are already 255 and stay so. The scratch
+// exists for stb's byte-stride rasteriser and nothing else needs it.
+private void blit(^Font f, ^Glyph g, u64 bits, i32 c0, i32 r0, i32 s):
+    for yy in 0..<g.ph:
+        i32 srow = r0 + yy / s
+        u64 row = (bits >> u64(8 * srow)) & 0xFF
+        i64 base = i64(g.py + yy) * i64(f.atlas_w) + i64(g.px)
+        for xx in 0..<g.pw:
+            i32 scol = c0 + xx / s
+            if (row >> u64(scol)) & 1 != 0:
+                f.pixels[(base + i64(xx)) * BPP + 3] = 255
+
+// ── odds ──────────────────────────────────────────────────────────────────
+
+private bool all_advances_equal(^Font f):
+    if f.dense == nil:
+        return false
+    f32 first = f.dense[0].advance
+    for i in 1..<DENSE:
+        f32 a = f.dense[i64(i)].advance
+        f32 d = a - first
+        if d < 0.0:
+            d = -d
+        if d > 0.01:
+            return false
+    return true
+
+// Read a whole file. `nil` and `false` when it cannot be opened or is empty.
+//
+// The two windows are the `char8`/`u8` boundary and nothing more interesting:
+// `io.read_bytes` fills a `[]char8` and `stb_truetype` wants a `^u8`, both
+// `uint8_t` in C and two shapes in Dado, so the buffer is allocated once as
+// `[]u8` and handed to `io` through a `Chars` window over the same address.
+private type Chars: ^char8
+
+private (ref []u8 bytes, bool ok) read_all(cstring path):
+    ref []u8 nothing
+    i64 n = fs.bytes(path)
+    if n <= 0:
+        return (nothing, false)
+
+    ^io.FILE stream = io.open_read(path)
+    if !io.opened(stream):
+        return (nothing, false)
+
+    ref []u8 buf = #make([]u8, n)
+    if buf == nil:
+        _ = io.close(stream)
+        return (nothing, false)
+
+    Chars c = Chars(rawptr(&buf[0]))
+    i64 got = io.read_bytes(stream, c[0..<n])
+    _ = io.close(stream)
+    if got != n:
+        #delete(buf)
+        return (nothing, false)
+    return (buf, true)
+
+// ── the fallback face ─────────────────────────────────────────────────────
+
+// **`font8x8_basic` by Daniel Hepper — Public Domain.**
+//
+// From <https://github.com/dhepper/font8x8>, itself derived from Marcel
+// Sondaar's `font8x8.h` and the public-domain IBM PC BIOS VGA fonts. The
+// upstream header states *"License: Public Domain"* on both its own work and
+// what it is based on, so there is nothing to attach a licence file to and
+// nothing this package has to ask of a program that links it. The provenance
+// is written here because a font with no provenance is the one thing in a
+// repository nobody can check later.
+//
+// **One `u64` per glyph, not eight bytes**, because 8 rows x 8 columns is
+// exactly 64 bits and a 95-element table of integers is a literal a human can
+// read past; 760 separate bytes is not. Row `r` is `(bits >> 8*r) & 0xFF`, and
+// within a row **bit 0 is the leftmost column** — the upstream file's bit
+// order, kept rather than reversed, so a byte here can be compared against the
+// upstream table without a transform in the way.
+//
+// Codepoints 32..126 inclusive, in order. The upstream table covers 0..127;
+// the control codes and DEL are dropped because there is no glyph to draw for
+// them and a blank in the atlas is indistinguishable from a missing one.
+const [95]u64 FALLBACK_BITS = [
+    0x0000000000000000, 0x00180018183C3C18, 0x0000000000003636, 0x0036367F367F3636,   // ' !"#'
+    0x000C1F301E033E0C, 0x0063660C18336300, 0x006E333B6E1C361C, 0x0000000000030606,   // "$%&'"
+    0x00180C0606060C18, 0x00060C1818180C06, 0x0000663CFF3C6600, 0x00000C0C3F0C0C00,   // '()*+'
+    0x060C0C0000000000, 0x000000003F000000, 0x000C0C0000000000, 0x000103060C183060,   // ',-./'
+    0x003E676F7B73633E, 0x003F0C0C0C0C0E0C, 0x003F33061C30331E, 0x001E33301C30331E,   // '0123'
+    0x0078307F33363C38, 0x001E3330301F033F, 0x001E33331F03061C, 0x000C0C0C1830333F,   // '4567'
+    0x001E33331E33331E, 0x000E18303E33331E, 0x000C0C00000C0C00, 0x060C0C00000C0C00,   // '89:;'
+    0x00180C0603060C18, 0x00003F00003F0000, 0x00060C1830180C06, 0x000C000C1830331E,   // '<=>?'
+    0x001E037B7B7B633E, 0x0033333F33331E0C, 0x003F66663E66663F, 0x003C66030303663C,   // '@ABC'
+    0x001F36666666361F, 0x007F46161E16467F, 0x000F06161E16467F, 0x007C66730303663C,   // 'DEFG'
+    0x003333333F333333, 0x001E0C0C0C0C0C1E, 0x001E333330303078, 0x006766361E366667,   // 'HIJK'
+    0x007F66460606060F, 0x0063636B7F7F7763, 0x006363737B6F6763, 0x001C36636363361C,   // 'LMNO'
+    0x000F06063E66663F, 0x00381E3B3333331E, 0x006766363E66663F, 0x001E33380E07331E,   // 'PQRS'
+    0x001E0C0C0C0C2D3F, 0x003F333333333333, 0x000C1E3333333333, 0x0063777F6B636363,   // 'TUVW'
+    0x0063361C1C366363, 0x001E0C0C1E333333, 0x007F664C1831637F, 0x001E06060606061E,   // 'XYZ['
+    0x00406030180C0603, 0x001E18181818181E, 0x0000000063361C08, 0xFF00000000000000,   // '\\]^_'
+    0x0000000000180C0C, 0x006E333E301E0000, 0x003B66663E060607, 0x001E3303331E0000,   // '`abc'
+    0x006E33333E303038, 0x001E033F331E0000, 0x000F06060F06361C, 0x1F303E33336E0000,   // 'defg'
+    0x006766666E360607, 0x001E0C0C0C0E000C, 0x1E33333030300030, 0x0067361E36660607,   // 'hijk'
+    0x001E0C0C0C0C0C0E, 0x00636B7F7F330000, 0x00333333331F0000, 0x001E3333331E0000,   // 'lmno'
+    0x0F063E66663B0000, 0x78303E33336E0000, 0x000F06666E3B0000, 0x001F301E033E0000,   // 'pqrs'
+    0x00182C0C0C3E0C08, 0x006E333333330000, 0x000C1E3333330000, 0x00367F7F6B630000,   // 'tuvw'
+    0x0063361C36630000, 0x1F303E3333330000, 0x003F260C193F0000, 0x00380C0C070C0C38,   // 'xyz{'
+    0x0018181800181818, 0x00070C0C380C0C07, 0x0000000000003B6E   // '|}~'
+]

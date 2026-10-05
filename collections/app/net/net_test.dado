@@ -1,0 +1,244 @@
+@test
+// app:net — proof the peer-id table, the RPC id-framing, and the poll drain
+// all work together over a real loopback exchange, one layer above
+// `core:net`'s own end-to-end test (which proves the byte-level exchange;
+// this proves the `app` opinion on top: small `i32` peer ids instead of
+// pointers, and `poll` handing back `(id, peer, bytes)`).
+//
+// `app:net` is a package-level singleton (one `Host` per process, mirroring
+// the app itself), so a single test binary cannot run a real two-role
+// exchange through *two* `appnet` instances — there is only one. Instead
+// this test plays each of `appnet`'s two roles in turn against a `core:net`
+// host driven **by hand**, standing in for "the other process": Part A puts
+// `appnet` in the server role against a hand-rolled `core:net` client; Part
+// B puts it in the client role against a hand-rolled `core:net` server.
+// Between them every line of `listen`/`dial`/`rpc`/`poll` runs for real.
+// Loopback ports 17774/17775 — distinct from `core:net`'s own 17772 and
+// `vendor:enet`'s 17771, so none of the four tests ever collide.
+package appnet
+
+import corenet "core:net"
+
+const i32 MSG_HELLO     = 1
+const i32 MSG_WORLD     = 2
+const i32 MSG_BROADCAST = 3
+
+private bool bytes_equal([]u8 a, []u8 b, i32 n):
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return false
+    return true
+
+// A hand-rolled equivalent of `pack_id`/`unpack_id` (both `private` to
+// `net.dado`) — this is "the other process," which only ever sees bytes on
+// the wire, never this package's own internals.
+private void far_pack_id([]u8 out, i32 id):
+    u32 v = u32(id)
+    out[0] = u8(v & 255)
+    out[1] = u8((v >> 8) & 255)
+    out[2] = u8((v >> 16) & 255)
+    out[3] = u8((v >> 24) & 255)
+
+private i32 far_unpack_id([]u8 b):
+    u32 v = u32(b[0]) | (u32(b[1]) << 8) | (u32(b[2]) << 16) | (u32(b[3]) << 24)
+    return i32(v)
+
+i32 test():
+    bool ok = true
+
+    // ── a server refuses to also dial out ────────────────────────────────
+    ok = #expect(listen(17774, 4), "listen(17774) — port busy?") && ok
+    if !ok:
+        return 1
+    ok = #expect(is_server(), "is_server() after listen") && ok
+    i32 refused = dial("127.0.0.1", 17774)
+    ok = #expect(refused == -1, "dial() while already a server must fail, got ", refused) && ok
+
+    // ═══════════════════════ Part A: appnet as SERVER ═══════════════════
+    // The far side is a hand-rolled core:net client (corenet.init() already ran
+    // via this package's own listen() above — ENet's own init is
+    // process-wide, so the far side does not call it again).
+    corenet.Host far = corenet.host_client(1)
+    ok = #expect(corenet.host_valid(far), "far: host_client(1)") && ok
+    if !ok:
+        return 1
+    corenet.Peer far_peer = corenet.connect(far, "127.0.0.1", 17774)
+    ok = #expect(far_peer != nil, "far: connect(127.0.0.1, 17774)") && ok
+
+    i32 srv_side_peer = -1   // this package's id for the far client
+    bool far_connected = false
+    i32 rounds = 0
+    for rounds < 100 && (srv_side_peer == -1 || !far_connected):
+        [4]NetEvent evs
+        i32 n = poll(evs[:])
+        for i in 0..<n:
+            if evs[i].kind == NetEventKind.Connect:
+                srv_side_peer = evs[i].peer
+        corenet.Event fev = corenet.poll(far, 10, #default)
+        if fev.kind == corenet.Kind.Connect:
+            far_connected = true
+        rounds = rounds + 1
+    ok = #expect(srv_side_peer != -1, "appnet (server) saw Kind.Connect within 1s") && ok
+    ok = #expect(far_connected, "far client saw its own Connect within 1s") && ok
+    ok = #expect(peer_count() == 1, "peer_count() == 1 after one connect, got ", peer_count()) && ok
+
+    // far -> appnet: a hand-framed RPC packet, decoded by this package's poll
+    [5]u8 hello = [104, 101, 108, 108, 111]   // "hello"
+    [9]u8 far_frame
+    far_pack_id(far_frame[0..<4], MSG_HELLO)
+    for i in 0..<5:
+        far_frame[4 + i] = hello[i]
+    bool far_sent = corenet.send(far_peer, corenet.Class.Reliable, far_frame[:])
+    ok = #expect(far_sent, "far: send(Reliable)") && ok
+    corenet.flush(far)
+
+    bool got_hello = false
+    rounds = 0
+    for rounds < 100 && !got_hello:
+        [4]NetEvent evs
+        i32 n = poll(evs[:])
+        for i in 0..<n:
+            if evs[i].kind == NetEventKind.Rpc:
+                got_hello = true
+                ok = #expect(evs[i].peer == srv_side_peer, "hello arrived from the registered peer id") && ok
+                ok = #expect(evs[i].id == MSG_HELLO, "hello id round-tripped, got ", evs[i].id) && ok
+                ok = #expect(#len(evs[i].data) == 5, "hello payload length round-tripped, got ", #len(evs[i].data)) && ok
+                ok = #expect(bytes_equal(evs[i].data, hello[:], 5), "hello payload bytes round-tripped exactly") && ok
+        corenet.poll(far, 10, #default)
+        rounds = rounds + 1
+    ok = #expect(got_hello, "appnet (server) saw the Rpc event within 1s") && ok
+
+    // appnet -> far: a real rpc() call, decoded by hand on the far side
+    [5]u8 world = [119, 111, 114, 108, 100]   // "world"
+    bool sent_ok = rpc(srv_side_peer, MSG_WORLD, world[:], corenet.Class.Reliable)
+    ok = #expect(sent_ok, "rpc(srv_side_peer, MSG_WORLD) queued") && ok
+    flush()
+
+    bool got_world = false
+    rounds = 0
+    [4]NetEvent svc
+    for rounds < 100 && !got_world:
+        poll(svc[:])   // service appnet's own host so its send actually goes out
+        corenet.Event fev = corenet.poll(far, 10, #default)
+        if fev.kind == corenet.Kind.Receive:
+            got_world = true
+            ok = #expect(#len(fev.data) == 9, "world frame length round-tripped, got ", #len(fev.data)) && ok
+            ok = #expect(far_unpack_id(fev.data[0..<4]) == MSG_WORLD, "world id round-tripped") && ok
+            ok = #expect(bytes_equal(fev.data[4..<9], world[:], 5), "world payload bytes round-tripped exactly") && ok
+            #delete(fev.data)
+        rounds = rounds + 1
+    ok = #expect(got_world, "far client saw the Rpc reply within 1s") && ok
+
+    // broadcast from appnet (one peer, but exercises the -1 path)
+    [4]u8 bcast = [98, 99, 97, 115]   // "bcas"
+    rpc(-1, MSG_BROADCAST, bcast[:], corenet.Class.Reliable)
+    flush()
+    bool got_bcast = false
+    rounds = 0
+    for rounds < 100 && !got_bcast:
+        poll(svc[:])
+        corenet.Event fev = corenet.poll(far, 10, #default)
+        if fev.kind == corenet.Kind.Receive:
+            got_bcast = true
+            ok = #expect(far_unpack_id(fev.data[0..<4]) == MSG_BROADCAST, "broadcast id round-tripped") && ok
+            #delete(fev.data)
+        rounds = rounds + 1
+    ok = #expect(got_bcast, "far client saw the broadcast within 1s") && ok
+
+    // disconnect, both sides drained
+    ok = #expect(disconnect_peer(srv_side_peer), "disconnect_peer(srv_side_peer)") && ok
+    bool appnet_saw_disc = false
+    rounds = 0
+    for rounds < 60 && !appnet_saw_disc:
+        [4]NetEvent evs
+        i32 n = poll(evs[:])
+        for i in 0..<n:
+            if evs[i].kind == NetEventKind.Disconnect && evs[i].peer == srv_side_peer:
+                appnet_saw_disc = true
+        corenet.poll(far, 10, #default)
+        rounds = rounds + 1
+    ok = #expect(appnet_saw_disc, "appnet (server) saw Kind.Disconnect within 600ms") && ok
+    ok = #expect(peer_count() == 0, "peer_count() == 0 after disconnect, got ", peer_count()) && ok
+
+    corenet.host_destroy(far)
+    close()
+    ok = #expect(!is_open(), "close() clears is_open() (Part A)") && ok
+
+    // ═══════════════════════ Part B: appnet as CLIENT ═══════════════════
+    // The far side is now a hand-rolled core:net server. Part A's close()
+    // called corenet.shutdown(); dial() below re-inits (POSIX enet_initialize
+    // is a plain `return 0`, so repeat init/deinit pairs are inert — see
+    // this task's Progress log for the citation).
+    corenet.Peer far_srv_peer = nil
+    corenet.Host far_srv = corenet.host_server(17775, 2)
+    ok = #expect(corenet.host_valid(far_srv), "far: host_server(17775) — port busy?") && ok
+    if !ok:
+        return 1
+
+    i32 cli_side_peer = dial("127.0.0.1", 17775)
+    ok = #expect(cli_side_peer != -1, "dial(127.0.0.1, 17775)") && ok
+    ok = #expect(!is_server(), "is_server() is false after dial()") && ok
+
+    bool cli_connected = false
+    rounds = 0
+    for rounds < 100 && (!cli_connected || far_srv_peer == nil):
+        [4]NetEvent evs
+        i32 n = poll(evs[:])
+        for i in 0..<n:
+            if evs[i].kind == NetEventKind.Connect && evs[i].peer == cli_side_peer:
+                cli_connected = true
+        corenet.Event fev = corenet.poll(far_srv, 10, #default)
+        if fev.kind == corenet.Kind.Connect:
+            far_srv_peer = fev.peer
+        rounds = rounds + 1
+    ok = #expect(cli_connected, "appnet (client) saw its own Kind.Connect within 1s") && ok
+    ok = #expect(far_srv_peer != nil, "far server saw a Connect within 1s") && ok
+
+    // appnet (client) -> far server
+    sent_ok = rpc(cli_side_peer, MSG_HELLO, hello[:], corenet.Class.Reliable)
+    ok = #expect(sent_ok, "rpc(cli_side_peer, MSG_HELLO) queued") && ok
+    flush()
+
+    got_hello = false
+    rounds = 0
+    for rounds < 100 && !got_hello:
+        poll(svc[:])
+        corenet.Event fev = corenet.poll(far_srv, 10, #default)
+        if fev.kind == corenet.Kind.Receive:
+            got_hello = true
+            ok = #expect(far_unpack_id(fev.data[0..<4]) == MSG_HELLO, "client->server hello id round-tripped") && ok
+            ok = #expect(bytes_equal(fev.data[4..<9], hello[:], 5), "client->server hello payload round-tripped") && ok
+            #delete(fev.data)
+        rounds = rounds + 1
+    ok = #expect(got_hello, "far server saw the client's Rpc within 1s") && ok
+
+    // far server -> appnet (client)
+    [9]u8 far_frame2
+    far_pack_id(far_frame2[0..<4], MSG_WORLD)
+    for i in 0..<5:
+        far_frame2[4 + i] = world[i]
+    corenet.send(far_srv_peer, corenet.Class.Reliable, far_frame2[:])
+    corenet.flush(far_srv)
+
+    got_world = false
+    rounds = 0
+    for rounds < 100 && !got_world:
+        [4]NetEvent evs
+        i32 n = poll(evs[:])
+        for i in 0..<n:
+            if evs[i].kind == NetEventKind.Rpc:
+                got_world = true
+                ok = #expect(evs[i].peer == cli_side_peer, "server->client reply arrived from the registered peer") && ok
+                ok = #expect(evs[i].id == MSG_WORLD, "server->client reply id round-tripped") && ok
+                ok = #expect(bytes_equal(evs[i].data, world[:], 5), "server->client reply payload round-tripped") && ok
+        corenet.poll(far_srv, 10, #default)
+        rounds = rounds + 1
+    ok = #expect(got_world, "appnet (client) saw the server's Rpc within 1s") && ok
+
+    corenet.host_destroy(far_srv)
+    close()
+    ok = #expect(!is_open(), "close() clears is_open() (Part B)") && ok
+
+    if ok:
+        return 0
+    return 1

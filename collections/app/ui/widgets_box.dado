@@ -1,0 +1,1090 @@
+// app:ui — the boxes: `HBox`, `CenterBox`, `GridBox`, `ScrollBox`, and the
+// two split boxes `HSplitBox` and `VSplitBox`. (`VBox` and `MarginBox` are in
+// layout.dado, with the gathering every box here uses.)
+//
+// Every box follows the rule the VBox set: its hooks gather the children's
+// minimums and expand flags (`gather`) and hand them to a pure helper that
+// takes everything as arguments — `hbox_arrange`, `center_rect`,
+// `gridbox_arrange`, `scroll_box_child`, `split_extents` — so the arithmetic is
+// tested with no tree. A box with no paint hook draws nothing: where its
+// children do not cover it, its cells are whatever its parent painted.
+//
+// ── Splits ─────────────────────────────────────────────────────────────────
+//
+// A split box lays its first two children side by side (`hsplit_box`) or one
+// above the other (`vsplit_box`) with a **grab handle** one cell thick between
+// them — a column in an hsplit, a row in a vsplit — drawn in `SplitTheme`'s
+// look. Children after the second get an empty rectangle.
+//
+// **The position is a ratio.** The split stores the first child's share as a
+// fraction `num / den` of the extent the two children share (the box's extent
+// less the handle), and derives cells from it on every arrange, rounded to the
+// nearest cell; so a window resize keeps the proportion. `split_set_first`
+// takes cells and stores them as the fraction of the extent the last arrange
+// saw (before any arrange, as cells to be turned into that fraction by the
+// first one), and `split_first` reads the cells the last arrange gave.
+//
+// **Minimums.** Each side is kept at least its child's minimum along the axis.
+// When the box is too small for both, **the first child gives way first**: the
+// second keeps its minimum (or everything, if even that does not fit) and the
+// first takes what is left. The box's own minimum is both minimums plus the
+// handle, so this only happens when the box's parent cannot give it that.
+//
+// **Collapse.** A hidden child gives all the room to the other, with no
+// handle, so a split shows one pane; showing it again brings back the ratio.
+//
+// **The mouse.** A left press on the handle captures the mouse (`capture`)
+// and drags it: each motion puts the handle under the pointer, held to the
+// minimums, and emits `split_moved` when the first child's cells changed. Two
+// presses on the handle within `DOUBLE_CLICK_S` reset the ratio to 1/2 (and
+// emit). The drag ends with the capture: at the release, at a motion with no
+// button held, or with anything else that ends the capture — the window
+// losing focus, the split hidden — as the split's next mouse event finds. The cursor over the handle, and anywhere during a drag, is
+// `CURSOR_RESIZE_EW` for an hsplit and `CURSOR_RESIZE_NS` for a vsplit. The
+// handle takes its hot look while dragged and while the pointer is over it as
+// the split's own mouse events see it; there are no leave events, so a pointer
+// that jumps from the handle clean out of the split in one motion leaves the
+// look lit until the split next sees the mouse.
+package ui
+
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+import "core:math"
+
+// ── HBox ───────────────────────────────────────────────────────────────────
+//
+// The VBox turned on its side: children left to right in child order, each as
+// tall as the box, by the same rule along columns.
+
+// An HBox's minimum: the sum of the children's columns and the tallest
+// child's rows. Negative entries count as zero.
+cell.CellPoint hbox_minimum([]cell.CellPoint mins):
+    i32 cols = 0
+    i32 rows = 0
+    for m in mins:
+        if m.col > 0:
+            cols = cols + m.col
+        if m.row > rows:
+            rows = m.row
+    cell.CellPoint p = (cols, rows)
+    return p
+
+// Fill `out[k]` with child `k`'s rectangle inside `inside`, for `k` below the
+// shortest of the three runs; answers the columns used, at most `inside.cols`.
+// Each child gets its minimum columns; columns left over are shared equally
+// among the children that expand (`expand[k]`), the remainder one each to the
+// first expanders in order; in a shortage, minimums in order until the
+// columns run out and zero after.
+i32 hbox_arrange(cell.CellRect inside, []cell.CellPoint mins, []bool expand, []cell.CellRect out):
+    return axis_arrange(inside, mins, expand, out, true)
+
+// ── CenterBox ──────────────────────────────────────────────────────────────
+//
+// Every child centred in the box at its minimum size, or at the box's full
+// extent on an axis it expands along; the box's minimum is the largest child
+// minimum on each axis.
+
+// A child of minimum `min` centred in `r`: its minimum on each axis, cut to
+// `r`, or all of `r` on an axis it fills; an odd leftover puts the extra cell
+// after the child. Negative extents read as zero.
+cell.CellRect center_rect(cell.CellRect r, cell.CellPoint min, bool fill_h, bool fill_v):
+    i32 rc = clamp0(r.cols)
+    i32 rr = clamp0(r.rows)
+    i32 w = clamp0(min.col)
+    i32 h = clamp0(min.row)
+    if fill_h || w > rc:
+        w = rc
+    if fill_v || h > rr:
+        h = rr
+    return cell.rect(r.col + (rc - w) / 2, r.row + (rr - h) / 2, w, h)
+
+// ── GridBox ────────────────────────────────────────────────────────────────
+//
+// Children in rows of `columns`, left to right and then down. A column is as
+// wide as its widest child's minimum and a row as tall as its tallest; a
+// column grows when any child in it expands horizontally, a row when any child
+// in it expands vertically, and the leftover and a shortage are shared out by
+// the stack rule. Each child fills its cell.
+
+// One column or one row of a grid box: its extent, and whether it takes a
+// share of leftover room.
+type GridTrack: (i32 extent, bool grow)
+
+// Fill `cols[0..<columns]` and `rows[0..<n]` from the children's minimums and
+// expand flags (`n` the children laid out: the shortest of the three runs), and
+// answer the number of rows, `ceil(n / columns)`. Answers -1, filling nothing,
+// when `columns` is below one or either track run is too short. Negative
+// minimums count as zero.
+i32 gridbox_tracks([]cell.CellPoint mins, []bool eh, []bool ev, i32 columns, []GridTrack cols, []GridTrack rows):
+    i32 n = i32(#len(mins))
+    if i32(#len(eh)) < n:
+        n = i32(#len(eh))
+    if i32(#len(ev)) < n:
+        n = i32(#len(ev))
+    if columns < 1:
+        return -1
+    i32 nrows = (n + columns - 1) / columns
+    if i32(#len(cols)) < columns || i32(#len(rows)) < nrows:
+        return -1
+    for k in 0..<columns:
+        cols[k].extent = 0
+        cols[k].grow = false
+    for k in 0..<nrows:
+        rows[k].extent = 0
+        rows[k].grow = false
+    for k in 0..<n:
+        i32 c = i32(k) % columns
+        i32 r = i32(k) / columns
+        if mins[k].col > cols[c].extent:
+            cols[c].extent = mins[k].col
+        if mins[k].row > rows[r].extent:
+            rows[r].extent = mins[k].row
+        if eh[k]:
+            cols[c].grow = true
+        if ev[k]:
+            rows[r].grow = true
+    return nrows
+
+// The extents of a run of tracks summed, saturating.
+i32 gridbox_sum([]GridTrack t):
+    i64 sum = 0
+    for k in 0..<#len(t):
+        if t[k].extent > 0:
+            sum = sum + i64(t[k].extent)
+    if sum > 2147483647:
+        return 2147483647
+    return i32(sum)
+
+// Rewrite each track's extent as its share of `avail` by the stack rule (see
+// `vbox_arrange`); answers the extent used.
+i32 gridbox_share([]GridTrack t, i32 avail):
+    i32 room = clamp0(avail)
+    i32 sum = 0
+    i32 growers = 0
+    for k in 0..<#len(t):
+        sum = sum + clamp0(t[k].extent)
+        if t[k].grow:
+            growers = growers + 1
+    i32 share = 0
+    i32 extra = 0
+    if room > sum && growers > 0:
+        share = (room - sum) / growers
+        extra = (room - sum) % growers
+    i32 left = room
+    i32 seen = 0
+    for k in 0..<#len(t):
+        i32 e = clamp0(t[k].extent)
+        if t[k].grow:
+            e = e + share
+            if seen < extra:
+                e = e + 1
+            seen = seen + 1
+        if e > left:
+            e = left
+        t[k].extent = e
+        left = left - e
+    return room - left
+
+// Lay `n` children (the shortest of `mins`, `eh`, `ev` and `out`) out in
+// `inside` in rows of `columns`, using `cols` and `rows` as the track runs;
+// answers false, filling nothing, when `columns` is below one or a run is too
+// short for the tracks.
+bool gridbox_arrange(cell.CellRect inside, i32 columns, []cell.CellPoint mins, []bool eh, []bool ev, []GridTrack cols, []GridTrack rows, []cell.CellRect out):
+    i32 n = i32(#len(mins))
+    if i32(#len(out)) < n:
+        n = i32(#len(out))
+    if i32(#len(eh)) < n:
+        n = i32(#len(eh))
+    if i32(#len(ev)) < n:
+        n = i32(#len(ev))
+    i32 nrows = gridbox_tracks(mins[0..<n], eh[0..<n], ev[0..<n], columns, cols, rows)
+    if nrows < 0:
+        return false
+    _ = gridbox_share(cols[0..<columns], inside.cols)
+    _ = gridbox_share(rows[0..<nrows], inside.rows)
+    i32 y = inside.row
+    for r in 0..<nrows:
+        i32 x = inside.col
+        for c in 0..<columns:
+            i32 k = i32(r) * columns + i32(c)
+            if k < n:
+                out[k] = cell.rect(x, y, cols[c].extent, rows[r].extent)
+            x = x + cols[c].extent
+        y = y + rows[r].extent
+    return true
+
+// ── ScrollBox ──────────────────────────────────────────────────────────────
+//
+// One child, taller than the box, scrolled by **whole rows** and clipped to
+// the box: the child is given the box's width and the larger of its minimum
+// rows and the box's, and is placed `top` rows above the box's top edge; the
+// tree clips its paint and its hit-map claims to the box. There is no pixel
+// smoothness yet — a wheel notch moves `WHEEL_LINES` rows and a trackpad's
+// fraction of a line moves at least one row, as `input.wheel_delta` rounds it.
+// Keys that bubble up from a focused descendant scroll it too: Up and Down a
+// row, PageUp and PageDown the box's rows less one, Home and End the ends. The
+// box's minimum is the child's columns by one row (none, for a child of no
+// rows). Children after the first get an empty rectangle.
+
+// The largest `top`: the child's last row on the box's bottom row, zero when
+// it fits.
+i32 scroll_box_max(i32 content_rows, i32 view_rows):
+    i32 over = content_rows - clamp0(view_rows)
+    if over < 0:
+        return 0
+    return over
+
+// The child's rectangle for a box of rectangle `area`, a child minimum of `content_rows`
+// and a first visible row `top` (clamped to `[0, scroll_box_max]`).
+cell.CellRect scroll_box_child(cell.CellRect area, i32 content_rows, i32 top):
+    i32 rows = clamp0(content_rows)
+    if rows < clamp0(area.rows):
+        rows = clamp0(area.rows)
+    i32 t = top
+    i32 max = scroll_box_max(clamp0(content_rows), area.rows)
+    if t > max:
+        t = max
+    if t < 0:
+        t = 0
+    return cell.rect(area.col, area.row - t, clamp0(area.cols), rows)
+
+// A scroll box's minimum from its child's.
+cell.CellPoint scroll_box_minimum(cell.CellPoint child):
+    i32 rows = clamp0(child.row)
+    if rows > 1:
+        rows = 1
+    cell.CellPoint p = (clamp0(child.col), rows)
+    return p
+
+// ── Splits ─────────────────────────────────────────────────────────────────
+
+// How the split's extent along its axis is shared: the first child's, the
+// handle's and the second's, for a box `total` cells long, children of minimum
+// `min_a` and `min_b` along the axis, a ratio `num / den` (a `den` of zero or
+// less reads as 1/2; the ratio is held to `[0, 1]`), and which children are
+// shown. The three always sum to `total` (zero or more). See the package
+// comment for the rule; with one child shown it takes everything and there is
+// no handle, with none there is nothing.
+(i32 first, i32 handle, i32 second) split_extents(i32 total, i32 min_a, i32 min_b, i32 num, i32 den, bool show_a, bool show_b):
+    i32 t = clamp0(total)
+    if !show_a && !show_b:
+        return (0, 0, 0)
+    if !show_b:
+        return (t, 0, 0)
+    if !show_a:
+        return (0, 0, t)
+    if t == 0:
+        return (0, 0, 0)
+    i32 avail = t - 1
+    i64 n = i64(num)
+    i64 d = i64(den)
+    if d <= 0:
+        n = 1
+        d = 2
+    if n < 0:
+        n = 0
+    if n > d:
+        n = d
+    i32 want = i32((2 * n * i64(avail) + d) / (2 * d))
+    i32 hi = avail - clamp0(min_b)
+    if hi < 0:
+        hi = 0
+    i32 lo = clamp0(min_a)
+    i32 first = want
+    if lo > hi:
+        first = hi
+    else if first < lo:
+        first = lo
+    else if first > hi:
+        first = hi
+    return (first, 1, avail - first)
+
+// The rectangles of the first child, the handle and the second child inside
+// `r` for extents from `split_extents`: side by side in an hsplit (`vertical`
+// false), stacked in a vsplit.
+(cell.CellRect a, cell.CellRect h, cell.CellRect b) split_rects(cell.CellRect r, bool vertical, i32 first, i32 handle, i32 second):
+    if vertical:
+        return (cell.rect(r.col, r.row, r.cols, first), cell.rect(r.col, r.row + first, r.cols, handle), cell.rect(r.col, r.row + first + handle, r.cols, second))
+    return (cell.rect(r.col, r.row, first, r.rows), cell.rect(r.col + first, r.row, handle, r.rows), cell.rect(r.col + first + handle, r.row, second, r.rows))
+
+// A split's minimum: the two children's minimums and the handle along the
+// axis, the larger across; a hidden child counts for nothing, handle included.
+cell.CellPoint split_minimum(cell.CellPoint a, cell.CellPoint b, bool vertical, bool show_a, bool show_b):
+    cell.CellPoint pa = (0, 0)
+    cell.CellPoint pb = (0, 0)
+    if show_a:
+        pa.col = clamp0(a.col)
+        pa.row = clamp0(a.row)
+    if show_b:
+        pb.col = clamp0(b.col)
+        pb.row = clamp0(b.row)
+    i32 handle = 0
+    if show_a && show_b:
+        handle = 1
+    if vertical:
+        cell.CellPoint v = (math.max(pa.col, pb.col), pa.row + pb.row + handle)
+        return v
+    cell.CellPoint h = (pa.col + pb.col + handle, math.max(pa.row, pb.row))
+    return h
+
+// ── The kinds ──────────────────────────────────────────────────────────────
+
+private Kind g_hbox_kind = NO_KIND
+private Kind g_center_kind = NO_KIND
+private Kind g_gridbox_kind = NO_KIND
+private Kind g_scroll_kind = NO_KIND
+private Kind g_split_kind = NO_KIND
+
+private i32 g_sig_split_moved = -1
+
+// Track runs for grid boxes, grown to the most columns and rows seen.
+private ref []GridTrack g_track_cols
+private ref []GridTrack g_track_rows
+
+private type GridBoxState: (i32 columns, i32 laid)
+private type GridBoxPtr: ^GridBoxState
+
+private type ScrollState: (i32 top, i32 content_rows, i32 view_rows)
+private type ScrollPtr: ^ScrollState
+
+// `num / den` the ratio (`den` zero: `num` is cells, not yet a ratio); `first`
+// and `avail` what the last arrange gave the first child and shared between
+// the two; `handle` the handle's rectangle then, empty when there is none.
+private type SplitState: (
+    bool          vertical,
+    i32           num,
+    i32           den,
+    i32           first,
+    i32           avail,
+    cell.CellRect handle,
+    bool          dragging,
+    bool          hot,
+    bool          has_press,
+    f64           press_t,
+)
+private type SplitPtr: ^SplitState
+
+private Kind hbox_kind():
+    if !kind_ok(g_hbox_kind):
+        Hooks h
+        h.measure = hbox_measure_hook
+        h.arrange = hbox_arrange_hook
+        g_hbox_kind = register_kind("hbox", h)
+    return g_hbox_kind
+
+private Kind center_kind():
+    if !kind_ok(g_center_kind):
+        Hooks h
+        h.measure = center_measure_hook
+        h.arrange = center_arrange_hook
+        g_center_kind = register_kind("center_box", h)
+    return g_center_kind
+
+private Kind gridbox_kind():
+    if !kind_ok(g_gridbox_kind):
+        Hooks h
+        h.measure = gridbox_measure_hook
+        h.arrange = gridbox_arrange_hook
+        g_gridbox_kind = register_kind("grid_box", h)
+    return g_gridbox_kind
+
+private Kind scroll_kind():
+    if !kind_ok(g_scroll_kind):
+        Hooks h
+        h.measure = scroll_measure_hook
+        h.arrange = scroll_arrange_hook
+        h.input = scroll_input_hook
+        g_scroll_kind = register_kind("scroll_box", h)
+    return g_scroll_kind
+
+private Kind split_kind():
+    if !kind_ok(g_split_kind):
+        Hooks h
+        h.measure = split_measure_hook
+        h.arrange = split_arrange_hook
+        h.paint = split_paint_hook
+        h.input = split_input_hook
+        h.cursor = split_cursor_hook
+        g_split_kind = register_kind("split_box", h)
+    return g_split_kind
+
+// ── HBox and CenterBox hooks ───────────────────────────────────────────────
+
+private cell.CellPoint hbox_measure_hook(Control c, rawptr st):
+    _ = st
+    i32 n = gather(c)
+    if n <= 0:
+        return zero_point()
+    return hbox_minimum(g_mins[0..<n])
+
+// As the VBox's: the children tile columns `[left, left + used)` at full
+// height, and the box repaints the columns they left when `used` shrank.
+private void hbox_arrange_hook(Control c, rawptr st, cell.CellRect r):
+    _ = st
+    i32 n = gather(c)
+    if n <= 0:
+        return
+    i32 before = 0
+    Control ch = first_child(c)
+    for valid(ch):
+        before = before + rect(ch).cols
+        ch = next_sibling(ch)
+    i32 used = hbox_arrange(r, g_mins[0..<n], g_expand_h[0..<n], g_out[0..<n])
+    i32 k = 0
+    ch = first_child(c)
+    for valid(ch) && k < n:
+        set_rect(ch, g_out[k])
+        k = k + 1
+        ch = next_sibling(ch)
+    if used < before:
+        mark_paint(c)
+
+private cell.CellPoint center_measure_hook(Control c, rawptr st):
+    _ = st
+    i32 n = gather(c)
+    if n < 0:
+        n = 0
+    return margin_minimum(g_mins[0..<n], 0, 0, 0, 0)
+
+// A child smaller than the box leaves cells around it that only the box's
+// parent paints; the box has no paint of its own.
+private void center_arrange_hook(Control c, rawptr st, cell.CellRect r):
+    _ = st
+    Control ch = first_child(c)
+    for valid(ch):
+        set_rect(ch, center_rect(r, minimum(ch), expands_h(ch), expands_v(ch)))
+        ch = next_sibling(ch)
+
+// ── GridBox hooks ──────────────────────────────────────────────────────────
+
+private bool tracks(i32 columns, i32 rows):
+    capture_alloc()
+    i32 wc = math.max(columns, 8)
+    i32 wr = math.max(rows, 8)
+    if g_track_cols == nil:
+        g_track_cols = #make([]GridTrack, wc, g_alloc)
+        g_track_rows = #make([]GridTrack, wr, g_alloc)
+        if g_track_cols == nil || g_track_rows == nil:
+            g_track_cols = nil
+            g_track_rows = nil
+            return false
+    if i32(#len(g_track_cols)) < columns && !#resize(g_track_cols, wc):
+        return false
+    if i32(#len(g_track_rows)) < rows && !#resize(g_track_rows, wr):
+        return false
+    return true
+
+private cell.CellPoint gridbox_measure_hook(Control c, rawptr st):
+    ^GridBoxState s = GridBoxPtr(st)
+    i32 n = gather(c)
+    if n <= 0 || s.columns < 1:
+        return zero_point()
+    i32 nrows = (n + s.columns - 1) / s.columns
+    if !tracks(s.columns, nrows):
+        return zero_point()
+    i32 got = gridbox_tracks(g_mins[0..<n], g_expand_h[0..<n], g_expand[0..<n], s.columns, g_track_cols[:], g_track_rows[:])
+    if got < 0:
+        return zero_point()
+    cell.CellPoint p = (gridbox_sum(g_track_cols[0..<s.columns]), gridbox_sum(g_track_rows[0..<got]))
+    return p
+
+// The box repaints when it lays out fewer children than it did, or its tracks
+// shrank: either can leave cells no child covers.
+private void gridbox_arrange_hook(Control c, rawptr st, cell.CellRect r):
+    ^GridBoxState s = GridBoxPtr(st)
+    i32 n = gather(c)
+    if n <= 0 || s.columns < 1:
+        return
+    i32 nrows = (n + s.columns - 1) / s.columns
+    if !tracks(s.columns, nrows):
+        return
+    i64 before = 0
+    Control ch = first_child(c)
+    for valid(ch):
+        before = before + i64(rect(ch).cols) * i64(rect(ch).rows)
+        ch = next_sibling(ch)
+    if !gridbox_arrange(r, s.columns, g_mins[0..<n], g_expand_h[0..<n], g_expand[0..<n], g_track_cols[:], g_track_rows[:], g_out[0..<n]):
+        return
+    i64 after = 0
+    i32 k = 0
+    ch = first_child(c)
+    for valid(ch) && k < n:
+        set_rect(ch, g_out[k])
+        if is_visible(ch):
+            after = after + i64(g_out[k].cols) * i64(g_out[k].rows)
+        k = k + 1
+        ch = next_sibling(ch)
+    if after < before:
+        mark_paint(c)
+
+// ── ScrollBox hooks ────────────────────────────────────────────────────────
+
+private cell.CellPoint scroll_measure_hook(Control c, rawptr st):
+    _ = st
+    return scroll_box_minimum(minimum(first_child(c)))
+
+private void scroll_arrange_hook(Control c, rawptr st, cell.CellRect r):
+    ^ScrollState s = ScrollPtr(st)
+    Control ch = first_child(c)
+    if !valid(ch):
+        return
+    cell.CellPoint m = minimum(ch)
+    s.content_rows = clamp0(m.row)
+    s.view_rows = clamp0(r.rows)
+    i32 max = scroll_box_max(s.content_rows, s.view_rows)
+    if s.top > max:
+        s.top = max
+    if s.top < 0:
+        s.top = 0
+    set_rect(ch, scroll_box_child(r, s.content_rows, s.top))
+    Control more = next_sibling(ch)
+    for valid(more):
+        set_rect(more, cell.rect(r.col, r.row, 0, 0))
+        more = next_sibling(more)
+
+private bool scroll_input_hook(Control c, rawptr st, input.Event e):
+    ^ScrollState s = ScrollPtr(st)
+    i32 max = scroll_box_max(s.content_rows, s.view_rows)
+    i32 wheel = input.wheel_delta(e)
+    if wheel != 0:
+        if max <= 0:
+            return false
+        _ = scroll_box_scroll_by(c, wheel * WHEEL_LINES)
+        return true
+    if !input.is_key_press(e) || max <= 0:
+        return false
+    i32 page = s.view_rows - 1
+    if page < 1:
+        page = 1
+    i32 k = e.code
+    if k == i32(input.Keycode.Down):
+        return scroll_box_scroll_by(c, 1)
+    if k == i32(input.Keycode.Up):
+        return scroll_box_scroll_by(c, -1)
+    if k == i32(input.Keycode.PageDown):
+        return scroll_box_scroll_by(c, page)
+    if k == i32(input.Keycode.PageUp):
+        return scroll_box_scroll_by(c, 0 - page)
+    if k == i32(input.Keycode.Home):
+        return scroll_box_scroll_to(c, 0)
+    if k == i32(input.Keycode.End):
+        return scroll_box_scroll_to(c, max)
+    return false
+
+// ── Split hooks ────────────────────────────────────────────────────────────
+
+// The first two children, each `NIL` when missing.
+private (Control a, Control b) split_pair(Control c):
+    Control a = first_child(c)
+    Control b = next_sibling(a)
+    return (a, b)
+
+private cell.CellPoint split_measure_hook(Control c, rawptr st):
+    ^SplitState s = SplitPtr(st)
+    (Control a, Control b) = split_pair(c)
+    return split_minimum(minimum(a), minimum(b), s.vertical, is_visible(a), is_visible(b))
+
+private i32 axis_of(cell.CellPoint p, bool vertical):
+    if vertical:
+        return p.row
+    return p.col
+
+private void split_arrange_hook(Control c, rawptr st, cell.CellRect r):
+    ^SplitState s = SplitPtr(st)
+    (Control a, Control b) = split_pair(c)
+    bool sa = is_visible(a)
+    bool sb = is_visible(b)
+    i32 total = r.cols
+    if s.vertical:
+        total = r.rows
+    total = clamp0(total)
+    i32 avail = clamp0(total - 1)
+    // Cells set before any arrange become a ratio of the first extent seen.
+    if s.den <= 0 && avail > 0 && s.num >= 0:
+        s.den = avail
+        if s.num > avail:
+            s.num = avail
+    i32 den = s.den
+    if den <= 0:
+        den = 0
+    (i32 f, i32 hd, i32 sc) = split_extents(total, axis_of(minimum(a), s.vertical), axis_of(minimum(b), s.vertical), s.num, den, sa, sb)
+    (cell.CellRect ra, cell.CellRect rh, cell.CellRect rb) = split_rects(r, s.vertical, f, hd, sc)
+    set_rect(a, ra)
+    set_rect(b, rb)
+    Control more = next_sibling(b)
+    for valid(more):
+        set_rect(more, cell.rect(r.col, r.row, 0, 0))
+        more = next_sibling(more)
+    s.first = f
+    if sa && sb:
+        s.avail = avail
+    if rh != s.handle:
+        // The handle moved, appeared or went: its old cells are a child's
+        // now and its new ones were a child's, so the split repaints.
+        s.handle = rh
+        mark_paint(c)
+
+private void split_paint_hook(Control c, rawptr st, cell.CellRect clip):
+    ^SplitState s = SplitPtr(st)
+    (Control a, Control b) = split_pair(c)
+    if !is_visible(a) && !is_visible(b):
+        [4]u8 bg = theme_window_bg()
+        grid.fill(clip, bg, bg)
+        return
+    cell.CellRect h = cell.intersect(s.handle, clip)
+    if cell.is_empty(h):
+        return
+    SplitTheme t = theme_split()
+    CellLook look = t.handle
+    if s.hot || s.dragging:
+        look = t.hot
+    grid.clip(h)
+    defer grid.unclip()
+    grid.fill(h, look.fg, look.bg)
+    string8 rule = "\xE2\x94\x82"
+    if s.vertical:
+        rule = "\xE2\x94\x80"
+    for row in h.row..<h.row + h.rows:
+        for col in h.col..<h.col + h.cols:
+            _ = grid.text(col, row, rule, 1, look.fg, look.bg)
+
+private void split_set_hot(Control c, ^SplitState s, bool hot):
+    if s.hot == hot:
+        return
+    s.hot = hot
+    mark_paint(c)
+
+// Put the handle under cell `p`, held to the minimums; emits when the first
+// child's cells change.
+private void split_drag_to(Control c, ^SplitState s, cell.CellPoint p):
+    cell.CellRect r = rect(c)
+    (Control a, Control b) = split_pair(c)
+    i32 total = r.cols
+    i32 want = p.col - r.col
+    if s.vertical:
+        total = r.rows
+        want = p.row - r.row
+    i32 avail = clamp0(total - 1)
+    if avail <= 0:
+        return
+    (i32 f, i32 hd, i32 sc) = split_extents(total, axis_of(minimum(a), s.vertical), axis_of(minimum(b), s.vertical), clamp0(want), avail, true, true)
+    _ = hd
+    _ = sc
+    if f == s.first && s.den == avail && s.num == f:
+        return
+    s.num = f
+    s.den = avail
+    mark_layout(c)
+    if f != s.first:
+        s.first = f
+        _ = emit(c, split_moved_signal())
+
+private bool split_input_hook(Control c, rawptr st, input.Event e):
+    ^SplitState s = SplitPtr(st)
+    input.MouseKind mk = input.mouse_kind(e)
+    if mk == input.MouseKind.None || mk == input.MouseKind.Wheel:
+        return false
+    cell.CellPoint p = event_cell(e)
+    bool on = cell.contains(s.handle, p.col, p.row)
+    // A capture that ended with no release seen here (the window lost focus,
+    // the split was hidden) ended the drag with it; a motion reaching the
+    // split later through a child must not move the handle.
+    if s.dragging && captured() != c:
+        split_end_drag(c, s, on)
+    if mk == input.MouseKind.Press:
+        if input.mouse_button(e) != 0 || !on:
+            return false
+        f64 now = edit_now()
+        f64 gap = now - s.press_t
+        if s.has_press && gap >= 0.0 && gap < DOUBLE_CLICK_S:
+            s.has_press = false
+            s.dragging = false
+            split_set_ratio(c, 1, 2)
+            if s.first != split_half(c, s):
+                s.first = split_half(c, s)
+                _ = emit(c, split_moved_signal())
+            return true
+        s.has_press = true
+        s.press_t = now
+        s.dragging = true
+        split_set_hot(c, s, true)
+        capture(c)
+        return true
+    if mk == input.MouseKind.Motion:
+        if s.dragging:
+            if !input.button_held(e, 0):
+                split_end_drag(c, s, on)
+                return true
+            split_drag_to(c, s, p)
+            return true
+        split_set_hot(c, s, on)
+        return false
+    if mk == input.MouseKind.Release && s.dragging:
+        split_end_drag(c, s, on)
+        return true
+    return false
+
+// The first child's cells at 1/2, as the next arrange will give them.
+private i32 split_half(Control c, ^SplitState s):
+    cell.CellRect r = rect(c)
+    (Control a, Control b) = split_pair(c)
+    i32 total = r.cols
+    if s.vertical:
+        total = r.rows
+    (i32 f, i32 hd, i32 sc) = split_extents(total, axis_of(minimum(a), s.vertical), axis_of(minimum(b), s.vertical), 1, 2, is_visible(a), is_visible(b))
+    _ = hd
+    _ = sc
+    return f
+
+private void split_end_drag(Control c, ^SplitState s, bool on):
+    s.dragging = false
+    if captured() == c:
+        release()
+    s.hot = on
+    mark_paint(c)
+
+private i32 split_cursor_hook(Control c, rawptr st, cell.CellPoint p):
+    ^SplitState s = SplitPtr(st)
+    bool dragging = s.dragging && captured() == c
+    if !dragging && !cell.contains(s.handle, p.col, p.row):
+        return CURSOR_INHERIT
+    if s.vertical:
+        return CURSOR_RESIZE_NS
+    return CURSOR_RESIZE_EW
+
+// ── Constructors and the rest of the surface ───────────────────────────────
+
+// A horizontal box under `parent` (under the root for `NIL`); `NIL` wherever
+// `create` would answer it.
+Control hbox(Control parent):
+    return create(hbox_kind(), parent, nil)
+
+// A centring box under `parent`; `NIL` wherever `create` would answer it.
+Control center_box(Control parent):
+    return create(center_kind(), parent, nil)
+
+// A grid box of `columns` columns (at least one) under `parent`; `NIL`
+// wherever `create` would answer it.
+Control grid_box(Control parent, i32 columns):
+    Control c = create_owned(gridbox_kind(), parent, i64(#size(GridBoxState)))
+    if !valid(c):
+        return NIL
+    ^GridBoxState s = GridBoxPtr(state(c))
+    s.columns = math.max(columns, 1)
+    return c
+
+// Change a grid box's column count (at least one) and mark it for layout.
+// Does nothing to anything else, or while `update` runs.
+void grid_box_set_columns(Control c, i32 columns):
+    if kind(c) != g_gridbox_kind || state(c) == nil || g_phase != PHASE_IDLE:
+        return
+    ^GridBoxState s = GridBoxPtr(state(c))
+    s.columns = math.max(columns, 1)
+    mark_layout(c)
+
+// A grid box's column count; zero for anything else.
+i32 grid_box_columns(Control c):
+    if kind(c) != g_gridbox_kind || state(c) == nil:
+        return 0
+    return GridBoxPtr(state(c)).columns
+
+// A scroll box under `parent`, scrolled to the top; its first child is the
+// content. `NIL` wherever `create` would answer it.
+Control scroll_box(Control parent):
+    return create_owned(scroll_kind(), parent, i64(#size(ScrollState)))
+
+private bool is_scroll(Control c):
+    return kind(c) == g_scroll_kind && state(c) != nil
+
+// Scroll so row `top` of the content is the box's first, clamped to the range
+// the last arrange allows; relayouts and answers true when that moved it.
+// False, doing nothing, for anything that is not a scroll box, or while
+// `update` runs.
+bool scroll_box_scroll_to(Control c, i32 top):
+    if !is_scroll(c) || g_phase != PHASE_IDLE:
+        return false
+    ^ScrollState s = ScrollPtr(state(c))
+    i32 t = top
+    i32 max = scroll_box_max(s.content_rows, s.view_rows)
+    if t > max:
+        t = max
+    if t < 0:
+        t = 0
+    if t == s.top:
+        return false
+    s.top = t
+    mark_layout(c)
+    return true
+
+// `scroll_box_scroll_to` the current top plus `rows` (negative is up).
+bool scroll_box_scroll_by(Control c, i32 rows):
+    if !is_scroll(c):
+        return false
+    i64 t = i64(ScrollPtr(state(c)).top) + i64(rows)
+    if t > 2147483647:
+        t = 2147483647
+    if t < 0:
+        t = 0
+    return scroll_box_scroll_to(c, i32(t))
+
+// The content row at the box's top, and the largest it can be, as the last
+// arrange saw them; zeros for anything that is not a scroll box.
+(i32 top, i32 max) scroll_box_position(Control c):
+    if !is_scroll(c):
+        return (0, 0)
+    ^ScrollState s = ScrollPtr(state(c))
+    return (s.top, scroll_box_max(s.content_rows, s.view_rows))
+
+// Children side by side, a one-column handle between: the first on the left.
+// Starts at 1/2. `NIL` wherever `create` would answer it.
+Control hsplit_box(Control parent):
+    return split_make(parent, false)
+
+// Children one above the other, a one-row handle between: the first on top.
+// Starts at 1/2. `NIL` wherever `create` would answer it.
+Control vsplit_box(Control parent):
+    return split_make(parent, true)
+
+private Control split_make(Control parent, bool vertical):
+    Control c = create_owned(split_kind(), parent, i64(#size(SplitState)))
+    if !valid(c):
+        return NIL
+    ^SplitState s = SplitPtr(state(c))
+    s.vertical = vertical
+    s.num = 1
+    s.den = 2
+    s.handle = cell.rect(0, 0, 0, 0)
+    return c
+
+private bool is_split(Control c):
+    return kind(c) == g_split_kind && state(c) != nil
+
+// Whether `c` is a live vsplit (children stacked); false for an hsplit and for
+// anything that is not a split.
+bool split_is_vertical(Control c):
+    return is_split(c) && SplitPtr(state(c)).vertical
+
+// Emitted when a drag or a double-click on the handle changed the first
+// child's cells. Not emitted for a change made by a call.
+i32 split_moved_signal():
+    if g_sig_split_moved < 0:
+        g_sig_split_moved = signal("split_moved")
+    return g_sig_split_moved
+
+// Connect to `split_moved_signal` on `c`.
+void on_split_moved(Control c, SignalFn fn, rawptr ctx):
+    connect(c, split_moved_signal(), fn, ctx)
+
+// The first child's extent along the axis, in cells, as the last arrange gave
+// it; zero before any arrange and for anything that is not a split.
+i32 split_first(Control c):
+    if !is_split(c):
+        return 0
+    return SplitPtr(state(c)).first
+
+// Give the first child `cells` along the axis (clamped at zero), kept from now
+// on as that fraction of the extent the two children share: the one the last
+// arrange saw, or, before any, the first one's. The minimums still hold it.
+// Marks the split for layout. Does nothing to anything else, or while `update`
+// runs.
+void split_set_first(Control c, i32 cells):
+    if !is_split(c) || g_phase != PHASE_IDLE:
+        return
+    ^SplitState s = SplitPtr(state(c))
+    i32 n = clamp0(cells)
+    if s.avail > 0:
+        if n > s.avail:
+            n = s.avail
+        s.num = n
+        s.den = s.avail
+    else:
+        s.num = n
+        s.den = 0
+    mark_layout(c)
+
+// Set the ratio to `num / den`, held to `[0, 1]`; a `den` of zero or less is
+// 1/2. Marks the split for layout. Does nothing to anything else, or while
+// `update` runs.
+void split_set_ratio(Control c, i32 num, i32 den):
+    if !is_split(c) || g_phase != PHASE_IDLE:
+        return
+    ^SplitState s = SplitPtr(state(c))
+    if den <= 0:
+        s.num = 1
+        s.den = 2
+    else:
+        s.num = num
+        if s.num < 0:
+            s.num = 0
+        if s.num > den:
+            s.num = den
+        s.den = den
+    mark_layout(c)
+
+// The ratio as stored: `(num, den)`. `den` is zero while it is still cells set
+// before any arrange (`num` then is those cells); `(0, 0)` for anything that is
+// not a split.
+(i32 num, i32 den) split_ratio(Control c):
+    if !is_split(c):
+        return (0, 0)
+    ^SplitState s = SplitPtr(state(c))
+    return (s.num, s.den)
+
+// The handle's rectangle as the last arrange placed it; empty when a child is
+// hidden or missing, and for anything that is not a split.
+cell.CellRect split_handle_rect(Control c):
+    if !is_split(c):
+        return cell.rect(0, 0, 0, 0)
+    return SplitPtr(state(c)).handle
+
+// Whether the handle is being dragged, and whether it shows its hot look.
+(bool dragging, bool hot) split_handle_state(Control c):
+    if !is_split(c):
+        return (false, false)
+    ^SplitState s = SplitPtr(state(c))
+    return (s.dragging, s.hot || s.dragging)
+
+// ── Stack ──────────────────────────────────────────────────────────────────
+//
+// **The box overlays live in.** Every child of a stack gets the stack's whole
+// rectangle, one over another in child order — except a child given an
+// anchor (`set_anchor`), which gets a rectangle of its own placed against the
+// stack's edges or centre (`anchor_rect`): a find bar at the top right of an
+// editor, a palette in the middle of the window. An anchored child is not in
+// the stack's minimum, which is the largest minimum of the others, so an
+// overlay never makes what it floats over any bigger.
+//
+// A stack paints nothing, as every box here. An anchored child that paints
+// into the stack's own layer covers the cells of the children before it and
+// is covered by those after, in the order they paint, and the cells it leaves
+// when it goes are the other children's to repaint; one given a layer of its
+// own (`set_layer`, or a `popup`, which takes one) floats above them, and
+// opening and closing it repaints nothing under it (`set_visible`).
+
+// Where a stack puts an anchored child: the nine anchors, a row of three for
+// each of top, middle and bottom. `ANCHOR_NONE` is no anchor: fill the stack.
+const i32 ANCHOR_NONE         = -1
+const i32 ANCHOR_TOP_LEFT     = 0
+const i32 ANCHOR_TOP          = 1
+const i32 ANCHOR_TOP_RIGHT    = 2
+const i32 ANCHOR_LEFT         = 3
+const i32 ANCHOR_CENTER       = 4
+const i32 ANCHOR_RIGHT        = 5
+const i32 ANCHOR_BOTTOM_LEFT  = 6
+const i32 ANCHOR_BOTTOM       = 7
+const i32 ANCHOR_BOTTOM_RIGHT = 8
+
+// The rectangle of `size` (columns, rows) placed by `anchor` in `r`, inset
+// `inset.col` columns from the anchored side edge and `inset.row` rows from
+// the anchored top or bottom edge (a centred axis moves by the inset instead,
+// right and down); cut to `r` on every side, so it never leaves it. An anchor
+// out of range is the top left. Negative extents and insets read as zero.
+// Pure.
+cell.CellRect anchor_rect(cell.CellRect r, cell.CellPoint size, i32 anchor, cell.CellPoint inset):
+    i32 rc = clamp0(r.cols)
+    i32 rr = clamp0(r.rows)
+    i32 w = clamp0(size.col)
+    i32 h = clamp0(size.row)
+    if w > rc:
+        w = rc
+    if h > rr:
+        h = rr
+    i32 a = anchor
+    if a < 0 || a > ANCHOR_BOTTOM_RIGHT:
+        a = ANCHOR_TOP_LEFT
+    i32 ic = clamp0(inset.col)
+    i32 ir = clamp0(inset.row)
+    i32 x = ic
+    if a % 3 == 1:
+        x = (rc - w) / 2 + ic
+    else if a % 3 == 2:
+        x = rc - w - ic
+    i32 y = ir
+    if a / 3 == 1:
+        y = (rr - h) / 2 + ir
+    else if a / 3 == 2:
+        y = rr - h - ir
+    if x > rc - w:
+        x = rc - w
+    if y > rr - h:
+        y = rr - h
+    if x < 0:
+        x = 0
+    if y < 0:
+        y = 0
+    return cell.rect(r.col + x, r.row + y, w, h)
+
+private Kind g_stackbox_kind = NO_KIND
+
+private Kind stack_kind():
+    if !kind_ok(g_stackbox_kind):
+        Hooks h
+        h.measure = stack_measure_hook
+        h.arrange = stack_arrange_hook
+        g_stackbox_kind = register_kind("stack", h)
+    return g_stackbox_kind
+
+private cell.CellPoint stack_measure_hook(Control c, rawptr st):
+    _ = st
+    i32 cols = 0
+    i32 rows = 0
+    Control ch = first_child(c)
+    for valid(ch):
+        if anchor_of(ch) == ANCHOR_NONE:
+            cell.CellPoint m = minimum(ch)
+            cols = math.max(cols, m.col)
+            rows = math.max(rows, m.row)
+        ch = next_sibling(ch)
+    cell.CellPoint p = (cols, rows)
+    return p
+
+private void stack_arrange_hook(Control c, rawptr st, cell.CellRect r):
+    _ = st
+    Control ch = first_child(c)
+    for valid(ch):
+        i32 i = index(ch)
+        if g_nodes[i].anchor == ANCHOR_NONE:
+            set_rect(ch, r)
+        else:
+            // The node's own minimum, which `minimum` would answer as zero for
+            // a hidden node; a hidden child's rect is set by the walk anyway.
+            cell.CellPoint want = g_nodes[i].anchor_size
+            if want.col <= 0:
+                want.col = g_nodes[i].min_size.col
+            if want.row <= 0:
+                want.row = g_nodes[i].min_size.row
+            set_rect(ch, anchor_rect(r, want, g_nodes[i].anchor, g_nodes[i].anchor_off))
+        ch = next_sibling(ch)
+
+// A stack under `parent` (under the root for `NIL`); `NIL` wherever `create`
+// would answer it.
+Control stack(Control parent):
+    return create(stack_kind(), parent, nil)
+
+// Anchor `c` in the stack it is a child of (see `anchor_rect`): `anchor` one
+// of the `ANCHOR_*`, `ANCHOR_NONE` to fill the stack again; a size of `cols`
+// x `rows` cells, where an extent of zero or less is the node's own minimum
+// on that axis; inset `dcol` columns and `drow` rows from the anchored edges.
+// Kept on the node, read only by a stack, and marks it for layout. Does
+// nothing to a dead handle or while `update` runs.
+void set_anchor(Control c, i32 anchor, i32 cols, i32 rows, i32 dcol, i32 drow):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_IDLE:
+        return
+    i32 a = anchor
+    if a < ANCHOR_NONE || a > ANCHOR_BOTTOM_RIGHT:
+        a = ANCHOR_NONE
+    g_nodes[i].anchor = a
+    cell.CellPoint size = (cols, rows)
+    cell.CellPoint off = (clamp0(dcol), clamp0(drow))
+    g_nodes[i].anchor_size = size
+    g_nodes[i].anchor_off = off
+    layout_up(i)
+
+// `c`'s anchor; `ANCHOR_NONE` for none and for a dead handle.
+i32 anchor_of(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return ANCHOR_NONE
+    return g_nodes[i].anchor

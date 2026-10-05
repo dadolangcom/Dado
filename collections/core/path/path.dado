@@ -1,0 +1,791 @@
+// core:path — the lexical algebra of file paths: join, clean, split, base,
+// dir, ext, volume, is_abs, abs, rel and glob match.
+//
+// **Tier N W H. Script class S.** Pure: no function here asks the operating
+// system anything — not the working directory, not whether a file exists,
+// not where a link points. That is why `abs` takes the directory to resolve
+// against (`core:os/fs` answers the working directory) and why `rel` refuses
+// what only the file system could answer. So the package builds and runs
+// freestanding, on the web and hosted, and answers the same on every host
+// for the same target.
+//
+// **The separator follows the target.** Built for Windows (`#OS ==
+// #WINDOWS`) every function keeps Windows' rules; built for anything else,
+// POSIX's:
+//
+// * **POSIX.** `/` separates; `\` is an ordinary byte of a name. A path is
+//   absolute when it starts with `/`.
+// * **Windows.** `\` and `/` both separate on input, and `\` is what is
+//   written. A path may start with a **volume**, which no function cleans
+//   away or splits: a drive letter (`C:`), a UNC share (`\\server\share`), or
+//   a device path (`\\.\COM1`, `\\?\C:`, `\??\C:`, `\\.\UNC\server\share`).
+//   A path is absolute when it has a UNC or device volume, or a drive letter
+//   followed by a separator. `C:foo` is relative to the current directory
+//   *of drive C* and `\foo` to the root of the current drive; neither is
+//   absolute. Volume names compare without regard to ASCII case.
+//
+// **The rules follow Go's `path/filepath`** (Clean, Join, Split, Base, Dir,
+// Ext, IsAbs, Rel, Match and VolumeName), and its own test tables, both
+// styles, are this package's tests. Where the answers differ, on purpose:
+//
+// * `volume` answers a window into the path as written, where `VolumeName`
+//   rewrites `/` to `\`; its length is the same.
+// * Windows' `match` treats `/` and `\` alike, as every other function here
+//   does: `*` and `?` cross neither, and a separator in the pattern matches
+//   either one in the name. Go's compares the bytes, so on Windows its `*`
+//   crosses a `/`.
+// * `match` reports a malformed pattern even when an earlier part of it has
+//   already failed to match; Go's answers `false` without looking further.
+// * Windows' names are compared with ASCII case folding, where Go folds all
+//   of Unicode. Windows' own rule is its volume's upcase table, which no
+//   pure function can read; ASCII is the part every volume agrees on.
+// * `abs` is lexical (Go's calls the OS). Windows' drive-relative `C:foo`
+//   resolves against the base when the base is on drive C, and against
+//   `C:\` otherwise: the per-drive current directories Windows keeps are
+//   process state.
+// * Reserved device names (`NUL`, `CON`, `COM1`, …) are ordinary names.
+//
+// **How the tests reach Windows' rules on Linux, and POSIX's on Windows.**
+// Every algorithm is written once, over a private `Style`, and the public
+// functions pass the target's. The tests are files of this package, so they
+// call the private `_in` forms with each `Style` and test both rule sets on
+// every host. The public surface stays one set of functions with no style
+// parameter, which is the promise worth keeping; a public `Style` can be
+// added later without changing anything here.
+//
+// **Allocation.** What makes new text (`join`, `clean`, `dir`, `abs`,
+// `rel`) answers a `ref []char8` on the ambient allocator, `nil` when the
+// allocation fails; under a `using` arena nothing needs freeing, and
+// outside one the caller `#delete`s it. What only cuts (`split`, `base`,
+// `ext`, `volume`) answers windows into its argument and allocates nothing.
+// Lengths and indices are `i64`.
+//
+// **Error codes.** `rel` and `match` are failable; `message(code)` answers a
+// sentence for each code:
+//
+// * `BAD_PATTERN` — `match`'s pattern is malformed.
+// * `DIFFERENT_ROOTS` — `rel`'s paths are on different volumes, or one is
+//   rooted and the other is not.
+// * `UNCLIMBABLE` — `rel`'s base climbs out through `..` further than the
+//   target, so the way back down needs the file system.
+//
+// **Thread-safety.** No package state: every function is safe to call from
+// any number of threads at once.
+package path
+
+// ── the public surface ────────────────────────────────────────────────────
+
+// `match`'s code: the pattern is malformed — a `[` with no `]`, an empty
+// class, a range with no end, or (POSIX) a `\` with nothing after it.
+public const i32 BAD_PATTERN = 1
+
+// `rel`'s code: the two paths have no common root — different volumes, or
+// one rooted and the other not.
+public const i32 DIFFERENT_ROOTS = 2
+
+// `rel`'s code: the base reaches further up through `..` than the target,
+// and only the file system knows the names it climbed through.
+public const i32 UNCLIMBABLE = 3
+
+// A sentence for each of this package's codes, and one for any other.
+public string8 message(i32 code):
+    if code == BAD_PATTERN:
+        return "the glob pattern is malformed: a `[` with no `]`, an empty class, a range with no end, or a trailing escape"
+    if code == DIFFERENT_ROOTS:
+        return "the paths have no common root: they are on different volumes, or one is rooted and the other is not"
+    if code == UNCLIMBABLE:
+        return "the base climbs through `..` above the target, so the relative path needs the file system to find"
+    return "not a code of core:path"
+
+when #OS == #WINDOWS:
+    // The separator this target writes.
+    public const char8 SEPARATOR = '\\'
+    private const Style TARGET = Style.Windows
+else:
+    // The separator this target writes.
+    public const char8 SEPARATOR = '/'
+    private const Style TARGET = Style.Posix
+
+// Whether `c` separates path elements on this target: `/`, and on Windows
+// `\` as well.
+public bool is_separator(char8 c):
+    return is_sep(c, TARGET)
+
+// The parts joined by the separator, then cleaned. Empty parts are skipped;
+// no part at all, or only empty ones, is the empty path. On Windows a part
+// after a drive letter alone joins without a separator, so `join("C:",
+// "a")` is `C:a`, as Windows means it.
+public ref []char8 join(..string8 parts):
+    return join_in(parts, TARGET)
+
+// The shortest path naming what `p` names, by lexical processing alone:
+// separators run together become one, `.` elements go, an element and the
+// `..` after it go, a `..` at the root goes, and a trailing separator goes
+// unless the path is the root. The empty path cleans to `.`. A Windows
+// volume is kept as written, its separators turned to `\`.
+public ref []char8 clean(string8 p):
+    return clean_in(p, TARGET)
+
+// `p` cut after its last separator: `dir` keeps that separator, `file` is
+// what follows. `dir` + `file` is `p`. A volume is never split.
+public (string8 dir, string8 file) split(string8 p):
+    return split_in(p, TARGET)
+
+// The last element, trailing separators ignored. `.` for the empty path, and
+// the separator for a path of separators only.
+public string8 base(string8 p):
+    return base_in(p, TARGET)
+
+// Everything but the last element, cleaned. `.` for a path with no
+// directory part.
+public ref []char8 dir(string8 p):
+    return dir_in(p, TARGET)
+
+// The extension: from the last `.` of the last element to its end, `.`
+// included. Empty when that element has no `.`.
+public string8 ext(string8 p):
+    return ext_in(p, TARGET)
+
+// The leading volume: on Windows `C:`, `\\server\share`, `\\.\COM1`, …, as
+// the path writes it; empty when there is none, and always empty on POSIX.
+public string8 volume(string8 p):
+    return p[0..<volume_len(p, TARGET)]
+
+// Whether `p` is absolute: it names the same file whatever the current
+// directory and drive.
+public bool is_abs(string8 p):
+    return is_abs_in(p, TARGET)
+
+// `p` made absolute against `from`, cleaned. An absolute `p` is only
+// cleaned; a relative one is joined to `from`, which is the directory the
+// caller resolves against — the working directory, usually. On Windows a
+// rooted `\x` takes `from`'s volume, and a drive-relative `C:x` is resolved
+// against `from` when `from` is on drive C and against `C:\` otherwise.
+// The result is absolute when `from` is.
+public ref []char8 abs(string8 p, string8 from):
+    return abs_in(p, from, TARGET)
+
+// The path that names `to` when joined to `from`, by lexical processing
+// alone: `join(from, rel(from, to))` cleans to `clean(to)`. Fails with
+// `DIFFERENT_ROOTS` or `UNCLIMBABLE` (see `message`). An allocation that
+// fails is not a failure of the paths: it answers `nil`, as the other
+// functions here do.
+public !ref([]char8) rel(string8 from, string8 to):
+    try ref []char8 r = rel_in(from, to, TARGET)
+    return r
+
+// Whether the whole of `name` matches the glob `pattern`:
+//
+// * `*` — any run of bytes holding no separator;
+// * `?` — one character (a UTF-8 sequence), not a separator;
+// * `[abc]`, `[a-z]`, `[^a-z]` — one character in, or not in, the class;
+// * `\c` — the byte `c` itself, on POSIX only (on Windows `\` separates);
+// * anything else — itself.
+//
+// Fails with `BAD_PATTERN` when the pattern is malformed, which is
+// reported whether or not the name would have matched.
+public !bool match(string8 pattern, string8 name):
+    try bool m = match_in(pattern, name, TARGET)
+    return m
+
+// ── the two rule sets ─────────────────────────────────────────────────────
+
+private enum i32 Style: (Posix, Windows)
+
+private bool is_sep(char8 c, Style st):
+    return c == '/' || (st == Style.Windows && c == '\\')
+
+private char8 sep_of(Style st):
+    if st == Style.Windows:
+        return '\\'
+    return '/'
+
+private char8 upper(char8 c):
+    if c >= 'a' && c <= 'z':
+        return c - 32
+    return c
+
+// Two names equal as this style compares them: bytes on POSIX, ASCII case
+// folded on Windows, and on Windows any separator equal to any other.
+private bool same(string8 a, string8 b, Style st):
+    if #len(a) != #len(b):
+        return false
+    for i in 0..<#len(a):
+        if st == Style.Windows:
+            if is_sep(a[i], st) && is_sep(b[i], st):
+                continue
+            if upper(a[i]) != upper(b[i]):
+                return false
+        else:
+            if a[i] != b[i]:
+                return false
+    return true
+
+// Whether `s` starts with `prefix` as a whole element: case folded, any
+// separator for any separator, and the byte after the prefix (if any) a
+// separator.
+private bool has_prefix_fold(string8 s, string8 prefix, Style st):
+    i64 n = #len(prefix)
+    if #len(s) < n:
+        return false
+    if !same(s[0..<n], prefix, st):
+        return false
+    if #len(s) > n && !is_sep(s[n], st):
+        return false
+    return true
+
+// Where a UNC volume ends: after the host and the share, counting
+// separators from `from`.
+private i64 unc_len(string8 p, i64 from, Style st):
+    i64 count = 0
+    for i in from..<#len(p):
+        if is_sep(p[i], st):
+            count += 1
+            if count == 2:
+                return i
+    return #len(p)
+
+// The length of `p`'s leading volume name; 0 on POSIX and for a path with
+// none.
+private i64 volume_len(string8 p, Style st):
+    if st != Style.Windows:
+        return 0
+    i64 n = #len(p)
+    if n >= 2 && p[1] == ':':
+        return 2
+    if n == 0 || !is_sep(p[0], st):
+        return 0
+    if has_prefix_fold(p, "\\\\.\\UNC", st):
+        return unc_len(p, 8, st)
+    if has_prefix_fold(p, "\\\\.", st) || has_prefix_fold(p, "\\\\?", st) || has_prefix_fold(p, "\\??", st):
+        if n == 3:
+            return 3
+        // The element after the device prefix is part of the volume, so
+        // `\\?\C:\` keeps its root.
+        for i in 4..<n:
+            if is_sep(p[i], st):
+                return i
+        return n
+    if n >= 2 && is_sep(p[1], st):
+        return unc_len(p, 2, st)
+    return 0
+
+// `s`'s bytes into `out` at `at`, each separator written as this style's.
+private void put_slashed(ref []char8 out, i64 at, string8 s, Style st):
+    for i in 0..<#len(s):
+        if is_sep(s[i], st):
+            out[at + i] = sep_of(st)
+        else:
+            out[at + i] = s[i]
+
+private ref []char8 copy_slashed(string8 s, string8 tail, Style st):
+    ref []char8 out = #make([]char8, #len(s) + #len(tail))
+    if out == nil:
+        return out
+    put_slashed(out, 0, s, st)
+    for i in 0..<#len(tail):
+        out[#len(s) + i] = tail[i]
+    return out
+
+// The cleaned element writer: bytes go into `buf`, and `diverged` records
+// whether what was written ever differed from the input at the same place,
+// which is when Windows' cleaning must guard the result's first element.
+private type Writer:
+    []char8 buf
+    string8 src
+    i64 w
+    bool diverged
+
+    void put(^self, char8 c):
+        if !self.diverged && (self.w >= #len(self.src) || self.src[self.w] != c):
+            self.diverged = true
+        self.buf[self.w] = c
+        self.w += 1
+
+private ref []char8 clean_in(string8 p, Style st):
+    i64 vl = volume_len(p, st)
+    i64 n = #len(p) - vl
+    string8 rest = p[vl..<#len(p)]
+    if n == 0:
+        // A volume and nothing else: a UNC share stays as it is, with its
+        // separators turned, and a drive gets `.`, its current directory.
+        // The drive is written exactly as given, as Go writes it, even in
+        // the odd case of a "drive" that is a separator (`/:`).
+        if vl > 1 && is_sep(p[0], st) && is_sep(p[1], st):
+            return copy_slashed(p, "", st)
+        return #format(p, ".")
+    // Room for the volume, a two-byte guard and the cleaned rest, which is
+    // never longer than `rest`.
+    ref []char8 out = #make([]char8, vl + 2 + n)
+    if out == nil:
+        return out
+    i64 body = vl + 2
+    char8 sep = sep_of(st)
+    bool rooted = is_sep(rest[0], st)
+    Writer o = (out[body..<(body + n)], rest, 0, false)
+    i64 r = 0
+    i64 dotdot = 0
+    if rooted:
+        o.put(sep)
+        r = 1
+        dotdot = 1
+    for r < n:
+        if is_sep(rest[r], st):
+            r += 1
+        else if rest[r] == '.' && (r + 1 == n || is_sep(rest[r + 1], st)):
+            r += 1
+        else if rest[r] == '.' && r + 1 < n && rest[r + 1] == '.' && (r + 2 == n || is_sep(rest[r + 2], st)):
+            r += 2
+            if o.w > dotdot:
+                o.w -= 1
+                for o.w > dotdot && !is_sep(o.buf[o.w], st):
+                    o.w -= 1
+            else if !rooted:
+                if o.w > 0:
+                    o.put(sep)
+                o.put('.')
+                o.put('.')
+                dotdot = o.w
+        else:
+            if (rooted && o.w != 1) || (!rooted && o.w != 0):
+                o.put(sep)
+            for r < n && !is_sep(rest[r], st):
+                o.put(rest[r])
+                r += 1
+    if o.w == 0:
+        o.put('.')
+    i64 w = o.w
+    // Windows: a clean must not make a volume out of something that was not
+    // one. A colon in the first element (`a/../c:` would clean to `c:`)
+    // gets `.\` before it; a leading `\??` (a device prefix) gets `\.`.
+    string8 guard = ""
+    if st == Style.Windows && vl == 0 && o.diverged:
+        bool colon = false
+        for i in 0..<w:
+            if is_sep(o.buf[i], st):
+                break
+            if o.buf[i] == ':':
+                colon = true
+                break
+        if colon:
+            guard = ".\\"
+        else if w >= 3 && is_sep(o.buf[0], st) && o.buf[1] == '?' && o.buf[2] == '?':
+            guard = "\\."
+    i64 g = #len(guard)
+    put_slashed(out, 0, p[0..<vl], st)
+    for i in 0..<g:
+        out[vl + i] = guard[i]
+    // The body moves down to meet the volume and the guard; `vl + g` is
+    // never past `body`, so a forward copy is safe.
+    for i in 0..<w:
+        out[vl + g + i] = out[body + i]
+    #truncate(out, vl + g + w)
+    return out
+
+private ref []char8 join_in([]string8 parts, Style st):
+    i64 total = 2
+    for p in parts:
+        total += #len(p) + 1
+    ref []char8 b = #make([]char8, total)
+    if b == nil:
+        return b
+    i64 w = 0
+    char8 last = 0
+    for p in parts:
+        string8 e = p
+        // The first non-empty part goes in unchanged; each later one after
+        // a separator, except as below.
+        if w > 0:
+            if st == Style.Windows && is_sep(last, st):
+                // After a separator, the part's own leading separators go,
+                // so two parts never make a UNC `\\`.
+                i64 k = 0
+                for k < #len(e) && is_sep(e[k], st):
+                    k += 1
+                e = e[k..<#len(e)]
+                // `\` then `??` would make the device prefix `\??`.
+                if w == 1 && #len(e) >= 2 && e[0] == '?' && e[1] == '?' && (#len(e) == 2 || is_sep(e[2], st)):
+                    b[w] = '.'
+                    b[w + 1] = '\\'
+                    w += 2
+            else if st != Style.Windows || last != ':':
+                // After a drive letter alone there is none: `C:` + `a` is
+                // `C:a`, as Windows means it.
+                b[w] = sep_of(st)
+                w += 1
+                last = b[w - 1]
+        if #len(e) > 0:
+            for i in 0..<#len(e):
+                b[w + i] = e[i]
+            w += #len(e)
+            last = e[#len(e) - 1]
+    if w == 0:
+        #truncate(b, 0)
+        return b
+    ref []char8 out = clean_in(string8(b[0..<w]), st)
+    #delete(b)
+    return out
+
+private (string8 dir, string8 file) split_in(string8 p, Style st):
+    i64 vl = volume_len(p, st)
+    i64 i = #len(p) - 1
+    for i >= vl && !is_sep(p[i], st):
+        i -= 1
+    return (p[0..<(i + 1)], p[(i + 1)..<#len(p)])
+
+private string8 base_in(string8 p, Style st):
+    if #len(p) == 0:
+        return "."
+    i64 end = #len(p)
+    for end > 0 && is_sep(p[end - 1], st):
+        end -= 1
+    string8 q = p[0..<end]
+    i64 vl = volume_len(q, st)
+    i64 i = end - 1
+    for i >= vl && !is_sep(q[i], st):
+        i -= 1
+    string8 last = q[(i + 1)..<end]
+    if #len(last) == 0:
+        if st == Style.Windows:
+            return "\\"
+        return "/"
+    return last
+
+private ref []char8 dir_in(string8 p, Style st):
+    i64 vl = volume_len(p, st)
+    i64 i = #len(p) - 1
+    for i >= vl && !is_sep(p[i], st):
+        i -= 1
+    ref []char8 d = clean_in(p[vl..<(i + 1)], st)
+    if d == nil:
+        return d
+    string8 ds = string8(d[:])
+    if ds == "." && vl > 2:
+        // A UNC share alone: the share is the directory.
+        #delete(d)
+        return copy_slashed(p[0..<vl], "", st)
+    ref []char8 out = #make([]char8, vl + #len(d))
+    if out != nil:
+        put_slashed(out, 0, p[0..<vl], st)
+        for k in 0..<#len(d):
+            out[vl + k] = d[k]
+    #delete(d)
+    return out
+
+private string8 ext_in(string8 p, Style st):
+    i64 i = #len(p) - 1
+    for i >= 0 && !is_sep(p[i], st):
+        if p[i] == '.':
+            return p[i..<#len(p)]
+        i -= 1
+    return ""
+
+private bool is_abs_in(string8 p, Style st):
+    if st != Style.Windows:
+        return #len(p) > 0 && p[0] == '/'
+    i64 vl = volume_len(p, st)
+    if vl == 0:
+        return false
+    // A UNC or device volume is absolute by itself.
+    if is_sep(p[0], st) && is_sep(p[1], st):
+        return true
+    return #len(p) > vl && is_sep(p[vl], st)
+
+private ref []char8 abs_in(string8 p, string8 from, Style st):
+    if is_abs_in(p, st):
+        return clean_in(p, st)
+    if st == Style.Windows:
+        i64 vl = volume_len(p, st)
+        string8 fvol = from[0..<volume_len(from, st)]
+        if vl > 0:
+            // Drive-relative: `C:x`.
+            string8 drive = p[0..<vl]
+            string8 tail = p[vl..<#len(p)]
+            if same(drive, fvol, st):
+                [2]string8 here = [from, tail]
+                return join_in(here[:], st)
+            [3]string8 root = [drive, "\\", tail]
+            return join_in(root[:], st)
+        if #len(p) > 0 && is_sep(p[0], st):
+            // Rooted on the current drive: `\x`.
+            [2]string8 rooted = [fvol, p]
+            return join_in(rooted[:], st)
+    [2]string8 both = [from, p]
+    return join_in(both[:], st)
+
+private !ref([]char8) rel_in(string8 from, string8 to, Style st):
+    i64 bvl = volume_len(from, st)
+    i64 tvl = volume_len(to, st)
+    string8 bvol = from[0..<bvl]
+    string8 tvol = to[0..<tvl]
+    ref []char8 bc = clean_in(from, st)
+    defer #delete(bc)
+    ref []char8 tc = clean_in(to, st)
+    defer #delete(tc)
+    if bc == nil || tc == nil:
+        return nil
+    string8 bs = string8(bc[:])
+    string8 ts = string8(tc[:])
+    if same(ts, bs, st):
+        return #format(".")
+    string8 b = bs[bvl..<#len(bs)]
+    string8 t = ts[tvl..<#len(ts)]
+    char8 sep = sep_of(st)
+    if b == ".":
+        b = ""
+    else if #len(b) == 0 && bvl > 2:
+        // A UNC share alone is its own root.
+        b = "\\"
+    bool bslash = #len(b) > 0 && b[0] == sep
+    bool tslash = #len(t) > 0 && t[0] == sep
+    if bslash != tslash || !same(bvol, tvol, st):
+        fail DIFFERENT_ROOTS
+    // Walk both to their first differing elements, b[b0..<bi] and t[t0..<ti].
+    i64 bl = #len(b)
+    i64 tl = #len(t)
+    i64 b0 = 0
+    i64 bi = 0
+    i64 t0 = 0
+    i64 ti = 0
+    for:
+        for bi < bl && b[bi] != sep:
+            bi += 1
+        for ti < tl && t[ti] != sep:
+            ti += 1
+        if !same(t[t0..<ti], b[b0..<bi], st):
+            break
+        if bi < bl:
+            bi += 1
+        if ti < tl:
+            ti += 1
+        b0 = bi
+        t0 = ti
+        // Both used up: the loop would compare two empty elements forever.
+        if b0 >= bl && t0 >= tl:
+            break
+    if b[b0..<bi] == "..":
+        fail UNCLIMBABLE
+    if b0 != bl:
+        // Base elements left: climb out of each, then down into the target.
+        i64 seps = 0
+        for i in b0..<bl:
+            if b[i] == sep:
+                seps += 1
+        i64 size = 2 + seps * 3
+        if tl != t0:
+            size += 1 + tl - t0
+        ref []char8 out = #make([]char8, size)
+        if out == nil:
+            return out
+        out[0] = '.'
+        out[1] = '.'
+        i64 at = 2
+        for _i in 0..<seps:
+            out[at] = sep
+            out[at + 1] = '.'
+            out[at + 2] = '.'
+            at += 3
+        if t0 != tl:
+            out[at] = sep
+            for k in t0..<tl:
+                out[at + 1 + k - t0] = t[k]
+        return out
+    return #format(t[t0..<tl])
+
+// ── glob matching ─────────────────────────────────────────────────────────
+
+// The next pattern chunk: the stars before it, then up to the next star
+// outside a class.
+private (bool star, string8 chunk, string8 rest) scan_chunk(string8 pattern, Style st):
+    string8 p = pattern
+    bool star = false
+    for #len(p) > 0 && p[0] == '*':
+        p = p[1..<#len(p)]
+        star = true
+    bool inrange = false
+    i64 i = 0
+    for i < #len(p):
+        char8 c = p[i]
+        if c == '\\' && st == Style.Posix:
+            if i + 1 < #len(p):
+                i += 1
+        else if c == '[':
+            inrange = true
+        else if c == ']':
+            inrange = false
+        else if c == '*' && !inrange:
+            break
+        i += 1
+    return (star, p[0..<i], p[i..<#len(p)])
+
+// One UTF-8 character at the front of `s`: the code point and its length,
+// or U+FFFD and 1 for a byte that does not start a well-formed sequence.
+private (char32 r, i64 n) decode(string8 s):
+    i64 len = #len(s)
+    if len == 0:
+        return (char32(0xFFFD), 0)
+    u32 c0 = u32(u8(s[0]))
+    if c0 < 0x80:
+        return (char32(c0), 1)
+    i64 need = 0
+    u32 cp = 0
+    u32 least = 0
+    if c0 >= 0xC2 && c0 <= 0xDF:
+        need = 1
+        cp = c0 & 0x1F
+        least = 0x80
+    else if c0 >= 0xE0 && c0 <= 0xEF:
+        need = 2
+        cp = c0 & 0x0F
+        least = 0x800
+    else if c0 >= 0xF0 && c0 <= 0xF4:
+        need = 3
+        cp = c0 & 0x07
+        least = 0x10000
+    else:
+        return (char32(0xFFFD), 1)
+    if len < need + 1:
+        return (char32(0xFFFD), 1)
+    for k in 1..=need:
+        u32 ck = u32(u8(s[k]))
+        if ck < 0x80 || ck > 0xBF:
+            return (char32(0xFFFD), 1)
+        cp = (cp << 6) | (ck & 0x3F)
+    if cp < least || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF):
+        return (char32(0xFFFD), 1)
+    return (char32(cp), need + 1)
+
+// A class member: one character, escaped on POSIX. `bad` when the chunk
+// ends, or holds a `-` or `]` where a character must be.
+private (char32 r, string8 rest, bool bad) class_char(string8 chunk, Style st):
+    string8 c = chunk
+    if #len(c) == 0 || c[0] == '-' || c[0] == ']':
+        return (char32(0), c, true)
+    if c[0] == '\\' && st == Style.Posix:
+        c = c[1..<#len(c)]
+        if #len(c) == 0:
+            return (char32(0), c, true)
+    (char32 r, i64 n) = decode(c)
+    bool bad = r == char32(0xFFFD) && n == 1
+    string8 rest = c[n..<#len(c)]
+    if #len(rest) == 0:
+        bad = true
+    return (r, rest, bad)
+
+// Whether `chunk` (no stars) matches a prefix of `s`; what of `s` is left
+// when it does. A malformed chunk is `bad` whatever `s` is.
+private (string8 rest, bool ok, bool bad) match_chunk(string8 chunk_in, string8 s_in, Style st):
+    string8 chunk = chunk_in
+    string8 s = s_in
+    bool failed = false
+    for #len(chunk) > 0:
+        if !failed && #len(s) == 0:
+            failed = true
+        char8 c = chunk[0]
+        if c == '[':
+            char32 r = char32(0)
+            if !failed:
+                (char32 got, i64 n) = decode(s)
+                r = got
+                s = s[n..<#len(s)]
+            chunk = chunk[1..<#len(chunk)]
+            bool negated = false
+            if #len(chunk) > 0 && chunk[0] == '^':
+                negated = true
+                chunk = chunk[1..<#len(chunk)]
+            bool hit = false
+            i64 nrange = 0
+            for:
+                if #len(chunk) > 0 && chunk[0] == ']' && nrange > 0:
+                    chunk = chunk[1..<#len(chunk)]
+                    break
+                (char32 lo, string8 after_lo, bool bad_lo) = class_char(chunk, st)
+                if bad_lo:
+                    return ("", false, true)
+                chunk = after_lo
+                char32 hi = lo
+                if chunk[0] == '-':
+                    (char32 h, string8 after_hi, bool bad_hi) = class_char(chunk[1..<#len(chunk)], st)
+                    if bad_hi:
+                        return ("", false, true)
+                    hi = h
+                    chunk = after_hi
+                if lo <= r && r <= hi:
+                    hit = true
+                nrange += 1
+            if hit == negated:
+                failed = true
+        else if c == '?':
+            if !failed:
+                if is_sep(s[0], st):
+                    failed = true
+                i64 n = decode(s).n
+                s = s[n..<#len(s)]
+            chunk = chunk[1..<#len(chunk)]
+        else:
+            if c == '\\' && st == Style.Posix:
+                chunk = chunk[1..<#len(chunk)]
+                if #len(chunk) == 0:
+                    return ("", false, true)
+            if !failed:
+                char8 want = chunk[0]
+                bool equal = want == s[0] || (is_sep(want, st) && is_sep(s[0], st))
+                if !equal:
+                    failed = true
+                s = s[1..<#len(s)]
+            chunk = chunk[1..<#len(chunk)]
+    if failed:
+        return ("", false, false)
+    return (s, true, false)
+
+private bool has_sep(string8 s, Style st):
+    for i in 0..<#len(s):
+        if is_sep(s[i], st):
+            return true
+    return false
+
+private !bool match_in(string8 pattern_in, string8 name_in, Style st):
+    string8 pattern = pattern_in
+    string8 name = name_in
+    for #len(pattern) > 0:
+        (bool star, string8 chunk, string8 after) = scan_chunk(pattern, st)
+        pattern = after
+        if star && #len(chunk) == 0:
+            // A trailing star takes the rest of the name, unless it crosses
+            // a separator.
+            return !has_sep(name, st)
+        (string8 t, bool ok, bool bad) = match_chunk(chunk, name, st)
+        // The last chunk must use the name up, or the star before it may
+        // still match further along.
+        if ok && (#len(t) == 0 || #len(pattern) > 0):
+            name = t
+            continue
+        if bad:
+            fail BAD_PATTERN
+        bool advanced = false
+        if star:
+            // Skip i + 1 bytes and try again; a star never skips a
+            // separator.
+            i64 i = 0
+            for i < #len(name) && !is_sep(name[i], st):
+                (string8 t2, bool ok2, bool bad2) = match_chunk(chunk, name[(i + 1)..<#len(name)], st)
+                if ok2:
+                    if #len(pattern) == 0 && #len(t2) > 0:
+                        i += 1
+                        continue
+                    name = t2
+                    advanced = true
+                    break
+                if bad2:
+                    fail BAD_PATTERN
+                i += 1
+        if advanced:
+            continue
+        // No match: still report a malformed rest of the pattern.
+        for #len(pattern) > 0:
+            string8 c2 = scan_chunk(pattern, st).chunk
+            pattern = scan_chunk(pattern, st).rest
+            if match_chunk(c2, "", st).bad:
+                fail BAD_PATTERN
+        return false
+    return #len(name) == 0

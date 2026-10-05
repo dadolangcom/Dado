@@ -1,0 +1,137 @@
+// app:log — thread-safe logging from any worker, flushed at the barrier.
+//
+//     import "app:log"
+//
+//     void panel_job(^app.JobArgs a):
+//         log.info("worker", "chunk done", a.worker)
+//
+//     void process(f32 dt):
+//         app.parallel_for(n, grain, panel_job, data)   // joins before returning
+//         log.flush()                                    // safe: no job is in flight
+//
+// **The mechanism.** `core:log` is the fixed `Record` shape and the
+// sink contract; this is the opinion on top — where records live between
+// being logged and being seen, and when that happens. Each worker gets its
+// own fixed-capacity ring (`MAX_WORKERS`, `core:jobs`' own bound), indexed
+// by `JobArgs.worker`. A log call from inside a job writes only to that
+// worker's ring — no lock, no other worker's memory touched, no mid-line
+// interleave, because nobody else can be writing there.
+//
+// **Why no lock is safe, not just fast.** A
+// ring is not read until `flush`, and `flush` is the caller's to call —
+// after every job that might log this frame has been joined (`parallel_for`
+// already joins before returning; a caller using `submit`/`wait` directly
+// must `wait` first). That is the same temporal split `app:app.tick`
+// already relies on for `jobs.reset_scratch`: workers only run *during* the
+// parallel phase, `flush` only runs *after* it, so the two never overlap
+// and no atomic is needed on the ring itself.
+//
+// **Default worker is 0** (`i32 worker = 0`, an ordinary default parameter)
+// — the main thread's own index in `core:jobs`' scheme, so ordinary
+// non-job code (`ready`, `process`, `shutdown`) calls `log.info(tag, msg)`
+// with nothing extra to say. Only a call from inside a `JobFn` needs to
+// name its own worker, because that is the one piece of context this
+// package cannot infer on its own (Dado has no thread-local storage surface).
+//
+// **Overflow drops the newest**, the same stance `app:input`'s ring takes —
+// P1/P2 baseline, no backpressure. A frame that logs more than `RING_CAP`
+// times from one worker is a sign something is spamming, not a case worth
+// spending a resize on.
+//
+// **The stdout sink is on from the first call, with no setup** — it works
+// from the first frame onward. `add_sink` registers more.
+//
+// **This package imports no UI, deliberately (`CLASSIC-B`, 2026-09-06).** It
+// used to carry `set_ui_panel`/`panel_fn`, a sink that painted flushed records
+// into the old UI's `Paragraph` control — so the *logging* package imported a
+// *UI* package, which is the dependency edge pointing the wrong way. That UI
+// has been deleted along with the rest of the TUI, and the sink went with it
+// rather than being repointed at `app:ui`, for two reasons stated here so
+// the next person does not have to rediscover them:
+//
+//   1. Repointing would have moved the inversion, not removed it — `app:log`
+//      would still `import "app:ui"`.
+//   2. It does not need to live here. `add_sink` takes a `corelog.Sink`, which
+//      is a plain `(fn, rawptr)` pair, so a program that wants its log on
+//      screen writes a sink of its own that appends each record to lines it
+//      keeps, and shows those lines in an `app:ui` text view whose source
+//      reads them. The UI knowledge stays on the UI side of the boundary.
+package applog
+
+import corelog "core:log"
+import "core:jobs"
+
+// ── per-worker rings ─────────────────────────────────────────────────────
+
+const i32 RING_CAP = 64
+
+private type Ring: (
+    [RING_CAP]corelog.Record buf,
+    i32 count,
+    i32 dropped,     // records this worker tried to log after buf filled, this frame
+)
+
+private [jobs.MAX_WORKERS]Ring g_rings
+
+private void push(i32 worker, corelog.Level lvl, string8 tag, string8 msg):
+    i32 w = worker
+    if w < 0 || w >= jobs.MAX_WORKERS:
+        w = 0
+    ^Ring r = &g_rings[w]
+    if r.count >= RING_CAP:
+        r.dropped = r.dropped + 1
+        return
+    r.buf[r.count] = corelog.record(lvl, tag, msg)
+    r.count = r.count + 1
+
+void trace(string8 tag, string8 msg, i32 worker = 0): push(worker, corelog.Level.Trace, tag, msg)
+void debug(string8 tag, string8 msg, i32 worker = 0): push(worker, corelog.Level.Debug, tag, msg)
+void info (string8 tag, string8 msg, i32 worker = 0): push(worker, corelog.Level.Info,  tag, msg)
+void warn (string8 tag, string8 msg, i32 worker = 0): push(worker, corelog.Level.Warn,  tag, msg)
+void error(string8 tag, string8 msg, i32 worker = 0): push(worker, corelog.Level.Error, tag, msg)
+
+// How many records this worker has dropped since its last flush — a sign a
+// job is logging faster than `RING_CAP` per frame. Read, not reset, by this
+// call; `flush` clears it.
+i32 dropped(i32 worker):
+    i32 w = worker
+    if w < 0 || w >= jobs.MAX_WORKERS:
+        w = 0
+    return g_rings[w].dropped
+
+// ── sinks ────────────────────────────────────────────────────────────────
+
+const i32 MAX_SINKS = 8
+private [MAX_SINKS]corelog.Sink g_sinks
+private i32 g_nsinks
+private bool g_stdout_added
+
+// Register another sink. A no-op past `MAX_SINKS` — eight is more than any
+// program built against this framework has needed so far; raise it if that
+// changes rather than silently dropping a ninth.
+void add_sink(corelog.Sink s):
+    if g_nsinks >= MAX_SINKS:
+        return
+    g_sinks[g_nsinks] = s
+    g_nsinks = g_nsinks + 1
+
+private void ensure_stdout():
+    if g_stdout_added:
+        return
+    add_sink(corelog.stdout_sink())
+    g_stdout_added = true
+
+// Merge every worker's buffered records — worker 0 first, then 1..N, oldest
+// to newest within a worker — to every registered sink, then clear all
+// rings for the next frame. Call once per frame, and only after every job
+// that might have logged this frame has been joined; see the package doc
+// comment for why that makes the read safe with no lock.
+void flush():
+    ensure_stdout()
+    for w in 0..<jobs.MAX_WORKERS:
+        ^Ring r = &g_rings[w]
+        for i in 0..<r.count:
+            for s in 0..<g_nsinks:
+                corelog.emit(g_sinks[s], &r.buf[i])
+        r.count = 0
+        r.dropped = 0

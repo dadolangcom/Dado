@@ -1,0 +1,299 @@
+// core:slices, the gap buffer — a growable run of anything whose inserts and
+// removes cost the distance from the previous edit, not the distance to the end.
+//
+//     type Lines: (ref []Line data, slices.Gap gap)
+//
+//     Lines doc
+//     _ = slices.gap_init(&doc, 1024, alloc)
+//     if slices.gap_insert(&doc, row, 1):     // one zeroed Line at `row`
+//         slices.gap_at(&doc, row).width = 0
+//     _ = slices.gap_remove(&doc, row, 1)
+//     slices.gap_free(&doc)
+//
+// A plain array pays for an insert near the front with every element after it.
+// This one keeps an unused run — the gap — inside its block and parks it at the
+// last edit, so a second edit nearby moves only what lies between the two, and
+// an edit exactly where the last one was moves nothing at all.
+//
+// ## The shape, and why it is a pair
+//
+// **A `type` cannot bind `$T`**: `type Gap($T): ...` does not parse, and a `$T`
+// written inside a declaration's slots is refused as having nothing to be
+// inferred from. So the container is not one declared type. It is the pair
+//
+//     (ref []T, Gap)
+//
+// — the block, and a concrete `Gap` that says where the gap is — and every
+// function here takes a `^(ref []$T, Gap)`, which binds `T` from whatever pair
+// it is handed. A caller declares the pair under its own names (`Lines` above)
+// or writes it out, and either one binds, because slot names are a view and not
+// part of the shape.
+//
+// That is also why the bodies reach the two halves as `g.x` and `g.y`: a
+// template instantiated over the written-out shape sees no slot names, only
+// the positional axes, and the declared `Gap` inside keeps its own.
+//
+// ## What every index means
+//
+// The **logical** index is the only one a caller sees: `0 ..< gap_len(g)`, in
+// order, with the gap invisible. Out-of-range indices are handled totally and
+// never abort:
+//
+//   * everything that changes the contents **refuses** — `gap_insert`,
+//     `gap_remove`, `gap_set` answer `false` and change nothing;
+//   * everything that reads **refuses** too — `gap_get` answers a zero `T` and
+//     `false`, `gap_at` answers `nil`;
+//   * `gap_move` alone **clamps**, into `0 ..= gap_len(g)`, because where the
+//     gap sits is not something the contents can show — any position is a
+//     correct one, and clamping is the nearest correct one.
+//
+// ## Elements are opaque
+//
+// Nothing here reads an element. It copies them, and a copy of a `ref` is the
+// same `ref`, so a `T` owning memory is moved around as its handle and never
+// duplicated or freed. **Freeing what an element owns is the caller's job, and
+// it has to be done before `gap_remove`**, which closes over the element and
+// leaves nothing to reach it by.
+//
+// No `foreign` block and no import: `Allocator` is a built-in name.
+package slices
+
+// The bookkeeping half of the pair. The block is `[0, #len(block))`; the gap is
+// `[start, end)` inside it; the elements are everything else, in order.
+//
+//     alloc     where the block came from, and where a larger one comes from
+//     start     the first slot of the gap, which is also the logical index the
+//               gap sits in front of
+//     end       one past the last slot of the gap
+//     shifted   bytes copied by gap motion, since `gap_init`
+//     grown     bytes copied into a larger block, since `gap_init`
+//
+// The two counters are the instrument: they say what the edits cost in bytes
+// moved, which is the number this container exists to make small. They count
+// **element** bytes only — `#size(T)` per element copied — and not the zeroing
+// of freshly opened slots, which a plain array pays identically.
+//
+// The allocator is kept rather than taken from the block because a larger block
+// is a fresh `#make` and not a `#resize`: a `#resize` copies the whole block,
+// gap and all, and the part after the gap would then have to be moved again to
+// the new end. A fresh block lets each element be copied once, straight to where
+// it belongs.
+type Gap: ((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc, i64 start, i64 end, u64 shifted, u64 grown)
+
+// The smallest block a growth produces. Doubling from a zero-capacity start
+// would otherwise run 1, 2, 4, 8 and pay four copies for eight elements.
+private const i64 GAP_FLOOR = 8
+
+// ── making and ending ───────────────────────────────────────────────────────
+
+// Take a block of `cap` elements from `a` and set the gap to cover all of it.
+// Answers whether the block was made: `false` for a negative `cap` or a failed
+// allocation, and the pair is then empty and still usable — its first insert
+// asks `a` again. A zero `cap` is a success and allocates nothing.
+//
+// Whatever `g` held before is overwritten, not freed; `gap_free` it first.
+public bool gap_init(^(ref []$T, Gap) g, i64 cap, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a):
+    g.y = (a, 0, 0, 0, 0)
+    g.x = nil
+    if cap <= 0:
+        return cap == 0
+    ref []T block = #make([]T, cap, a)
+    if block == nil:
+        return false
+    g.x = block
+    g.y.end = cap
+    return true
+
+// Return the block to its allocator. The pair is left empty with its allocator
+// and counters kept, so it may be inserted into again. Whatever the elements
+// own is the caller's to free first.
+public void gap_free(^(ref []$T, Gap) g):
+    #delete(g.x)
+    g.x = nil
+    g.y.start = 0
+    g.y.end = 0
+    return
+
+// Forget every element and keep the block. Nothing is copied and nothing is
+// zeroed; the next insert zeroes what it opens.
+public void gap_clear(^(ref []$T, Gap) g):
+    g.y.start = 0
+    g.y.end = #len(g.x)
+    return
+
+// ── measuring ───────────────────────────────────────────────────────────────
+
+// How many elements there are.
+public i64 gap_len(^(ref []$T, Gap) g):
+    return #len(g.x) - (g.y.end - g.y.start)
+
+// How many the block holds before the next insert has to grow it.
+public i64 gap_cap(^(ref []$T, Gap) g):
+    return #len(g.x)
+
+// Every byte copied since `gap_init`: gap motion plus growth. The two halves
+// are `g.y.shifted` and `g.y.grown`.
+public u64 gap_bytes_moved(^(ref []$T, Gap) g):
+    return g.y.shifted + g.y.grown
+
+// ── reaching an element ─────────────────────────────────────────────────────
+
+// Where logical index `i` lives in the block. `i` must already be in range.
+private i64 gap_slot(^(ref []$T, Gap) g, i64 i):
+    if i < g.y.start:
+        return i
+    return i + (g.y.end - g.y.start)
+
+// The element at `i`, or a zero `T` and `false` when `i` is out of range.
+public (T value, bool ok) gap_get(^(ref []$T, Gap) g, i64 i):
+    if i < 0 || i >= gap_len(g):
+        T none
+        return (none, false)
+    return (g.x[gap_slot(g, i)], true)
+
+// Overwrite the element at `i`, answering `false` and writing nothing when `i`
+// is out of range.
+public bool gap_set(^(ref []$T, Gap) g, i64 i, T v):
+    if i < 0 || i >= gap_len(g):
+        return false
+    g.x[gap_slot(g, i)] = v
+    return true
+
+// A pointer to the element at `i`, for changing it in place, or `nil` when `i`
+// is out of range.
+//
+// **It is good until the next insert, remove, move or free** — any of which may
+// copy the element somewhere else or return its block — and nothing checks
+// that. Hold an index across an edit, never this.
+public ^T gap_at(^(ref []$T, Gap) g, i64 i):
+    if i < 0 || i >= gap_len(g):
+        return nil
+    return &g.x[gap_slot(g, i)]
+
+// ── editing ─────────────────────────────────────────────────────────────────
+
+// Park the gap in front of logical index `at`, clamped into `0 ..= gap_len(g)`.
+//
+// Every element between the old position and the new one crosses the gap, so
+// the cost is exactly `|at - start| · #size(T)` bytes — never more, whatever
+// the length — and that is what `shifted` grows by. Moving to where the gap
+// already is costs nothing.
+public void gap_move(^(ref []$T, Gap) g, i64 at):
+    i64 to = at
+    i64 count = gap_len(g)
+    if to < 0:
+        to = 0
+    if to > count:
+        to = count
+    i64 start = g.y.start
+    i64 end = g.y.end
+    if to < start:
+        // `[to, start)` moves up to `[end - d, end)`. The two runs overlap when
+        // `d` exceeds the gap's width, and the destination is the higher one,
+        // so the copy runs downwards.
+        i64 d = start - to
+        i64 k = d - 1
+        for k >= 0:
+            g.x[#no_bounds end - d + k] = g.x[#no_bounds to + k]
+            k = k - 1
+        g.y.start = to
+        g.y.end = end - d
+        g.y.shifted = g.y.shifted + (u64(d) * u64(#size(T)))
+    else if to > start:
+        // `[end, end + d)` moves down to `[start, start + d)`; the destination
+        // is the lower run, so the copy runs upwards.
+        i64 d = to - start
+        for k in i64(0)..<d:
+            g.x[#no_bounds start + k] = g.x[#no_bounds end + k]
+        g.y.start = to
+        g.y.end = end + d
+        g.y.shifted = g.y.shifted + (u64(d) * u64(#size(T)))
+    return
+
+// Open `n` zeroed elements at logical index `at`, so the first of them is `at`
+// and what was at `at` is now at `at + n`. Answers whether they are there.
+//
+// Refused — `false`, nothing changed — for `at` outside `0 ..= gap_len(g)`, a
+// negative `n`, an allocator with no procedure (the zero pair), a length that
+// would overflow, or a failed allocation. `n == 0` succeeds and moves nothing.
+//
+// When the gap is narrower than `n` the block is replaced by one of at least
+// twice the capacity (and at least `GAP_FLOOR`, and at least enough), and the
+// gap is built at `at` during that one copy — so growth costs every element
+// exactly once and no gap motion on top.
+public bool gap_insert(^(ref []$T, Gap) g, i64 at, i64 n):
+    i64 count = gap_len(g)
+    if at < 0 || at > count || n < 0:
+        return false
+    if n == 0:
+        return true
+    if g.y.end - g.y.start < n:
+        if !gap_grow(g, at, n):
+            return false
+    else:
+        gap_move(g, at)
+    T zero
+    i64 start = g.y.start
+    for k in i64(0)..<n:
+        g.x[#no_bounds start + k] = zero
+    g.y.start = start + n
+    return true
+
+// Close `n` elements starting at logical index `at`. Answers whether they are
+// gone.
+//
+// Refused for `at < 0`, `n < 0`, or a run reaching past the end — it is not
+// clamped to what exists, because removing fewer elements than were named is
+// the silent kind of wrong. The closed elements are not read, zeroed or freed.
+public bool gap_remove(^(ref []$T, Gap) g, i64 at, i64 n):
+    i64 count = gap_len(g)
+    if at < 0 || n < 0 || at > count || n > count - at:
+        return false
+    if n == 0:
+        return true
+    gap_move(g, at)
+    g.y.end = g.y.end + n
+    return true
+
+// Put `v` on the end. Answers whether it is there.
+public bool gap_push(^(ref []$T, Gap) g, T v):
+    i64 count = gap_len(g)
+    if !gap_insert(g, count, 1):
+        return false
+    return gap_set(g, count, v)
+
+// Replace the block with a larger one and leave a gap of at least `n` at `at`.
+//
+// The capacity doubles, which is what makes a run of pushes cost O(1) copies per
+// element amortized; `GAP_FLOOR` stops a zero start from growing one slot at a
+// time; and `count + n` covers an insert larger than the doubling. The doubling
+// is refused past `i64`'s half so it cannot overflow.
+private bool gap_grow(^(ref []$T, Gap) g, i64 at, i64 n):
+    if g.y.alloc.proc == nil:
+        return false
+    i64 cap = #len(g.x)
+    i64 count = cap - (g.y.end - g.y.start)
+    if cap > 4611686018427387903 || n > 4611686018427387903 - count:
+        return false
+    i64 want = cap * 2
+    if want < GAP_FLOOR:
+        want = GAP_FLOOR
+    if want < count + n:
+        want = count + n
+    ref []T fresh = #make([]T, want, g.y.alloc)
+    if fresh == nil:
+        return false
+    // Logical `[0, at)` goes to the front and logical `[at, count)` to the
+    // back, each read from wherever the old gap left it.
+    i64 tail = count - at
+    i64 new_end = want - tail
+    for i in i64(0)..<at:
+        fresh[#no_bounds i] = g.x[#no_bounds gap_slot(g, i)]
+    for i in i64(0)..<tail:
+        fresh[#no_bounds new_end + i] = g.x[#no_bounds gap_slot(g, at + i)]
+    #delete(g.x)
+    g.x = fresh
+    g.y.start = at
+    g.y.end = new_end
+    g.y.grown = g.y.grown + (u64(count) * u64(#size(T)))
+    return true

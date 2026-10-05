@@ -1,0 +1,1966 @@
+// app:input — a poll-based input subsystem.
+//
+// Poll-based, not hook-based — three hooks, everything else is polled: a
+// backend emits into the queue, a signal, *outside* the frame barrier (during
+// its own input read), the runtime delivers it once a frame before `process`,
+// and a program drains it *inside* `process` (the safe region) with
+// `input.poll`.
+// Neutral — it imports no backend and operates on the app singleton, answering
+// emptily when the backend does not advertise `Input`, so the same call is safe
+// everywhere and a program runs headless and windowed with no branch in it.
+//
+// The vocabulary below — `EventKind`, `Keycode`, `Modifier` — was written
+// against sokol's own numbering before there was a sokol backend, precisely so
+// that landing the sokol decode would be a *filler* of this shape rather than a
+// churn of it. It landed: `app:input/sokol` is that filler, it is a subpackage
+// rather than code in this file so that a program which never opens a window
+// does not drag sokol_app.h into its translation unit, and it needed no change
+// to `Keycode` or `Modifier` at all.
+package input
+
+import "app:app"
+
+// The kinds of event. **One member per thing that happened; the *direction* of
+// a transition within one of them rides in `mods`, never in a member of its
+// own.** sokol's four mouse event types are one `Mouse` plus
+// `MOUSE_UP`/`MOUSE_MOTION`/`MOUSE_WHEEL`, its KEY_DOWN/KEY_UP pair is one
+// `Key` plus `KEY_UP`, and its FOCUSED/UNFOCUSED pair is one `Focus` plus
+// `FOCUS_LOST`. That rule is what this enum holds to — not a member count. A
+// press and a release are the same event about the same key, and a client that
+// wants both should be able to write one arm.
+//
+// **The flags are not client knowledge.** `mouse_kind`, `mouse_button`,
+// `wheel_delta`, `button_held`, `is_key_press`, `is_key_release`,
+// `is_focus_gained` and `is_focus_lost` are the readers; a client switches on
+// `mouse_kind(e)` and never touches a bit. See "Reading a packed event" below.
+//
+// **Nor is the payload table.** `Drop` carries file paths, which do not fit in
+// five scalar fields and are not in them: they live in this package's own fixed
+// table, and `dropped_count(e)` / `dropped_path(e, i)` are how a client reads
+// them. See "Drop" below.
+//
+// ── Adding a kind ──────────────────────────────────────────────────────────
+//
+// Cheap for the compiler, **not** cheap for the reader, and it is the second
+// half that has to be paid by hand. `Focus` and `Drop` were each added this
+// way:
+//
+//   1. Add the member below, with the next integer. **`Event` does not grow a
+//      field.** Measured: a sixth tuple field is `ERR0504` at every `const`
+//      alias that re-exports one of these predicates and at every site that
+//      names the tuple shape, because a non-`distinct` `enum` is its backing
+//      type and so a program's own event type can *be* this one structurally.
+//      A `mods` bit costs nothing at all; a field costs two collections edited
+//      in lockstep plus every `Event` literal in the tree.
+//   2. Find the payload a seat that is not a field. A **direction** gets a
+//      `mods` bit beside `KEY_UP` and a reader beside `is_key_press`. A
+//      **scalar** goes in `code` or in `x`/`y`, whose meaning is already
+//      per-kind — `Resize` puts its size in `x`/`y`, `Drop` puts its path
+//      count in `code`. Anything **larger than a scalar** goes in a fixed
+//      package-level table this file owns, with `code` saying how many entries
+//      the event claims and `x` saying where they start; `Drop` is the worked
+//      example and its section states the lifetime rule that comes with it.
+//      Either way the layout stays in this file.
+//   3. Add the `push_*` convenience beside `push_quit`, taking the payload in
+//      the shape a backend already has it — a `bool` for a direction, a
+//      `[]string` for paths — so no backend spells a bit or an index either.
+//   4. Fill it in `decode_event` (`app:input/sokol`) from the `sapp_event_type`
+//      it corresponds to, and cover it in `sokol_input_test.dado`.
+//   5. **Read every existing `switch e.kind` yourself.** A `switch` over a
+//      non-`distinct` enum always requires an `else` — `ERR0705`, *"`EventKind
+//      = i32` cannot promise that a value is one of the arms"* — so every one
+//      of them already compiles and silently swallows the new member. The
+//      compiler will not find them for you; `grep` for `.kind` will.
+enum EventKind: (
+    Key    = 0,     // a keystroke, case-insensitive — sokol's KEY_DOWN/KEY_UP
+    Text   = 1,     // one committed codepoint — sokol's CHAR
+    Mouse  = 2,     // a button/motion/wheel report — see the doc comment below
+    Resize = 3,     // the window's pixel size changed
+    Quit   = 4,     // a backend close request (a window's close button, …)
+    Focus  = 5,     // the window gained or lost input focus — see `FOCUS_LOST`
+    Drop   = 6,     // files were dropped on the window — see "Drop" below
+)
+
+// A decoded input event. Deliberately wider than the first decode used, so
+// it could be filled in without a breaking change — this is that fill.
+//
+// **`code` and `mods` are shared, over-loaded fields — what they mean depends
+// on `kind`:**
+//
+//   Key    — `code` is a `Keycode` (256+) or, for a printable key, the
+//            SAPP_KEYCODE-*compatible* uppercase ASCII value (`Keycode`'s own
+//            doc comment has the exact range) — **case-insensitive**, the same
+//            key whether or not Shift was held. `mods` is the `Modifier`
+//            bitmask, OR'd with `KEY_UP` when this is a release rather than a
+//            press (see `KEY_UP` below).
+//   Text   — `code` is the UTF-32 codepoint that was actually typed (case,
+//            accent and all) — sokol's CHAR.char_code. `mods` is the
+//            `Modifier` bitmask that was held when it was typed (E1) — see
+//            "what `mods` on a `Text` event means" below, and prefer
+//            `is_typed_text(e)` to reading it. `x`/`y` unused.
+//   Mouse  — `code`/`mods` are documented together at `MOUSE_UP` below, since
+//            they only make sense read as one packed shape.
+//   Resize — `x`, `y` are the window's new size **in pixels** — sokol's
+//            `framebuffer_width`/`framebuffer_height`, so a high-DPI window
+//            reports its backing-store size and not its logical one. They are
+//            `f32` like every other position here and hold an exact integer:
+//            `push_resize` still takes two `i32`s and widens them, so a caller
+//            reads the size back with `i32(e.x)` and loses nothing (an f32
+//            holds every integer up to 2^24, which is 16 777 216 pixels).
+//            `code`/`mods` unused.
+//   Quit   — every field unused; the `kind` alone is the whole message.
+//   Focus  — the window gained or lost keyboard focus. Every field unused
+//            except `mods`, which is `FOCUS_LOST` on a loss and `0` on a gain
+//            — no keyboard modifiers ride along, because sokol builds these
+//            two events with `_sapp_init_event`, which zeroes `modifiers`.
+//            `is_focus_gained`/`is_focus_lost` are the readers.
+//   Drop   — files were dropped on the window. `code` is how many paths this
+//            drop landed (never 0 — a drop that landed none is not pushed),
+//            and `x` is where they start in this package's path table. Neither
+//            is client knowledge: `dropped_count(e)` and `dropped_path(e, i)`
+//            are the readers, and the paths are **not** in this tuple. `y` and
+//            `mods` unused. See "Drop" below for the lifetime of a path.
+//
+// **`x`/`y` are `f32` (C5b).** sokol reports the pointer as `f32` and the
+// decode used to truncate it. That was lossless enough for hit-testing a cell
+// grid, and it stopped being so the moment `app:ui` went to f32 pixels with
+// sub-pixel layout; it was already wrong for a high-DPI drag, where one logical
+// pixel of motion is two or three backing-store pixels and the fraction is the
+// signal. `Resize` is the one kind that wants an integer, and it gets one: the
+// value is exact and `push_resize` still takes `i32`s.
+type Event: (
+    EventKind kind,
+    i32       code,
+    f32       x,
+    f32       y,
+    u32       mods,
+)
+
+// ── Keycode — the `Key` vocabulary ──────────────────────────────────────────
+//
+// Named seats for the keys that are not printable ASCII. Values are **not our
+// own** — they are copied verbatim from `sapp_keycode`
+// (`collections/vendor/sokol/sokol_app/sokol_app.h`), so the sokol decode needs
+// no lookup table: it puts `sapp_event.key_code` in `Event.code` unchanged.
+// Non-`distinct`, so a member is already an `i32` — no cast to put one in
+// `Event.code`.
+//
+// A **printable** key (space, a digit, a letter, common punctuation) has no
+// seat here because sokol doesn't give it one either: its `sapp_keycode`
+// reuses the ASCII value directly for SPACE(32)..GRAVE_ACCENT(96), and a
+// letter's keycode is always its **uppercase** ASCII value (65-90) —
+// case-insensitive, exactly like every other `Key`. There is nothing to name
+// here because the ASCII table already named them.
+//
+// **This enum names a subset, and `Event.code` is not restricted to it.** Only
+// F1-F12 are seated where sokol goes to F25, and the keypad, the lock keys and
+// the bare modifier keys (LEFT_SHIFT, RIGHT_CONTROL, …) have no seat. The
+// decode passes those through as their sokol number regardless: a program that
+// wants one compares against the `sapp_keycode` value, and a program that does
+// not simply never matches it. Adding a seat here is a one-line change with no
+// decode change behind it.
+enum Keycode: (
+    Escape    = 256,
+    Enter     = 257,
+    Tab       = 258,
+    Backspace = 259,
+    Insert    = 260,
+    Delete    = 261,
+    Right     = 262,
+    Left      = 263,
+    Down      = 264,
+    Up        = 265,
+    PageUp    = 266,
+    PageDown  = 267,
+    Home      = 268,
+    End       = 269,
+    F1        = 290,
+    F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    KpEnter   = 335,
+)
+
+// ── Modifier — the `mods` bitmask ───────────────────────────────────────────
+//
+// Values copied verbatim from `sapp_modifier`
+// (`collections/vendor/sokol/sokol_app/sokol_app.h`) for the same reason as
+// `Keycode`: a terminal decode and a sokol decode have to agree bit-for-bit,
+// or a program that checks `mods & input.Modifier.Ctrl` would need to know
+// which backend it is running under. Non-`distinct`, for the same reason.
+//
+// The sokol decode (`app:input/sokol`) passes `sapp_event.modifiers` straight
+// through, unmasked and untranslated, which is what "copied verbatim" buys: the
+// seven bits below are bit-for-bit `sapp_modifier`, so there is no table.
+//
+// **`mods` is filled on every kind that has modifiers, `Text` included** — see
+// the section below.
+enum u32 Modifier: (
+    Shift = 0x1,
+    Ctrl  = 0x2,
+    Alt   = 0x4,
+    Super = 0x8,
+    Lmb   = 0x100,   // left mouse button currently held
+    Rmb   = 0x200,   // right mouse button currently held
+    Mmb   = 0x400,   // middle mouse button currently held
+)
+
+// ── What `mods` on a `Text` event means, and what a client may rely on ─────
+//
+// **It used to mean nothing: `mods` was documented as unused for `Text`, and
+// the decode pushed a zero.** X11 hands sokol a CHAR of `z` for Ctrl+Z — not
+// `0x1A`, because sokol converts the *keysym*, which the control modifier does
+// not touch — so a client reading `Text` alone could not tell *"the user typed
+// z"* from *"the user pressed Ctrl+Z"*. `example/edit` typed a literal `z` into
+// its buffer on every undo and an `s` after every save until it started
+// shadowing the last `Key` event's modifiers itself, which is a workaround
+// every client would have had to reinvent.
+//
+// **Now: `mods` on a `Text` event is the `Modifier` bitmask that was held when
+// the codepoint was committed**, exactly as it is on the `Key` event that
+// produced it. That is a promise the substrate can keep on every platform sokol
+// supports — `sapp_event.modifiers` is assigned on the CHAR path in each of the
+// X11, macOS, Win32 and Emscripten backends — so it is not an X11-only fact.
+// `KEY_UP`, `MOUSE_UP`, `MOUSE_MOTION` and `MOUSE_WHEEL` are never set on a
+// `Text` event: those flags are the decode's own packing for the other two
+// kinds, and a `Text` event has no transition direction.
+//
+// **Why fill it rather than suppress the `Text` event while Ctrl/Alt/Super is
+// held.** Suppression is a *policy* baked into the decode, it destroys
+// information no other event carries, and it is wrong on two of the four
+// platforms:
+//
+//   * **AltGr.** On Windows AltGr is delivered as Ctrl+Alt — that is how the
+//     platform has always spelled it — so a decode that drops a CHAR while
+//     Ctrl is held eats `@`, `€`, `\` and `#` on the German, French and Polish
+//     layouts. On X11 AltGr is Mod5, which `_sapp_x11_mods` does not map at
+//     all, so the same character arrives with *no* modifier: two platforms,
+//     two answers, and no suppression rule is right on both.
+//   * **macOS Option is a character modifier.** Option-e then e is `é`;
+//     Option-1 is `¡`. Dropping a CHAR while Alt is held deletes half the
+//     Mac keyboard.
+//
+// A compose key is the case where the two designs agree: the committed
+// character arrives with no modifier held, so it survives either way — which
+// is precisely why it is not the case that decides.
+//
+// Filling costs nothing (`mods` is read for every other kind already) and it is
+// strictly more information: a client that wants suppression writes it in one
+// comparison, and a client that wants to see the chord at the text level still
+// can. The decode's job is to report what the substrate said.
+//
+// **What a client should write is `is_typed_text(e)`**, not a hand-rolled mask
+// — see its own comment for the rule and for why the rule is not simply
+// *"no modifiers"*.
+
+// True when this event is a character the user meant to type, rather than the
+// side effect of a command chord. False for every non-`Text` event.
+//
+// The rule, and every clause of it is load-bearing:
+//
+//   * a C0 control or DEL is never typed text (`Enter`, `Tab` and `Backspace`
+//     reach a client as `Key` events with real `Keycode`s, and a client that
+//     wants them handles them there);
+//   * **Alt held means yes**, because Alt is `AltGr`'s other half on Windows
+//     and the Option key on macOS, and both of those produce characters;
+//   * otherwise Ctrl or Super held means no.
+//
+// So `Ctrl+Z` is refused, `AltGr+Q` (Ctrl+Alt on Windows) is accepted, and
+// macOS `Option+e` is accepted. A client whose own chords use plain Alt — and
+// no portable program's should, for the reason above — tests `mods` itself.
+bool is_typed_text(Event e):
+    if e.kind != EventKind.Text:
+        return false
+    if e.code < 0x20 || e.code == 0x7F:
+        return false
+    if (e.mods & u32(Modifier.Alt)) != 0:
+        return true
+    return (e.mods & (u32(Modifier.Ctrl) | u32(Modifier.Super))) == 0
+
+// ── Mouse — `code` and `mods` for `EventKind.Mouse` ─────────────────────────
+//
+// sokol spreads one mouse action across **four** distinct event types
+// (MOUSE_DOWN, MOUSE_UP, MOUSE_MOVE, MOUSE_SCROLL) with no shared "Mouse"
+// `EventKind` at all. Here they are **one** kind: four kinds whose `x`/`y` a
+// client handles identically are four directions of one thing and not four
+// things that happened, so the distinction lives inside `Mouse`'s own
+// `code`/`mods` instead (the "Reading a packed event" section below carries
+// that argument in full, and `EventKind`'s own comment carries the rule). This is
+// therefore a **project-local packing**, not part of the sokol-shared
+// vocabulary the way `Keycode`/`Modifier`'s bits are: `app:input/sokol` sets
+// exactly one of these three flags per Mouse event, picked from which
+// `sapp_event_type` it saw — it never *reads* them back out of a real
+// `sapp_event.modifiers`, and the seven low `Modifier` bits it passes through
+// cannot collide with them.
+//
+//   press (the default — none of the three flags set):
+//     `code` is the button, 0/1/2 for left/right/middle (`sapp_mousebutton`
+//     order). `mods` carries the keyboard modifiers OR'd with the held-button
+//     bit (`Lmb`/`Rmb`/`Mmb`) for the button that is now down — the decode
+//     sets that bit itself, because X11 reports a press with the state as it
+//     was *before* the press.
+//   release (`MOUSE_UP` set):
+//     `code` is the button that was released. `mods` carries only the
+//     keyboard modifiers — the released button's held-bit is cleared.
+//   motion (`MOUSE_MOTION` set):
+//     `code` is `-1` (no button transitioned). `mods`' `Lmb`/`Rmb`/`Mmb` bits
+//     say what is currently held — a drag if any is set, a hover if none is —
+//     OR'd with the keyboard modifiers.
+//   wheel (`MOUSE_WHEEL` set):
+//     how far it turned, positive **down**; sokol's own `scroll_y` runs the
+//     other way (+1 is up) and the decode flips it. With `WHEEL_FINE` also
+//     set — which is what the sokol decode sends — `code` is that distance in
+//     `WHEEL_UNIT`ths of a line, so a trackpad's fraction survives; without
+//     it `code` is whole notches, `+1`/`-1` (what a backend that only knows
+//     notches, and every hand-built test event, sends). Read it with
+//     `wheel_amount` or `wheel_delta`, never from `code`. `x`/`y` are the
+//     cursor's position at the time of the scroll — `app:ui` routes the event
+//     by them, which is why the amount is not in `y`. `mods` carries only
+//     keyboard modifiers and the two wheel flags.
+//
+// In every case `x`/`y` are the pointer's position **in pixels, 0-based**, from
+// sokol's `mouse_x`/`mouse_y` passed through unrounded. They used to be
+// documented as 1-based cells, which was the xterm mouse report's convention
+// inherited by the terminal backend that is now deleted; the two `app:ui` call
+// sites that subtracted 1 to undo it are gone (C5a).
+const u32 MOUSE_UP     = 0x10000
+const u32 MOUSE_MOTION = 0x20000
+const u32 MOUSE_WHEEL  = 0x40000
+
+// ── WHEEL_FINE — a wheel event whose `code` is in fractions of a line ──────
+//
+// sokol reports `scroll_y` as an `f32`: whole notches from a wheel, fractions
+// of a line from a trackpad (macOS scales its precise deltas by 0.1). The
+// decode used to keep only the sign, so a trackpad moved a view three lines on
+// the slightest touch and a flick moved it three lines too. **The distance
+// needs a seat, and a field is not one** (see "Adding a kind": a sixth field
+// is every literal in the tree), and `x`/`y` are not free — they are where the
+// pointer was, and a wheel goes to the node under the pointer. So it goes in
+// `code`, as a fixed-point count of `WHEEL_UNIT`ths of a line, and this flag
+// says so. Without the flag `code` is whole notches as it always was, which
+// keeps every wheel event built by hand meaning what it meant.
+//
+// A millesimal line is below anything a screen shows (a 40-pixel row is 0.04
+// px a unit) and leaves `code` two million lines of headroom either way, which
+// the decode clamps to.
+const u32 WHEEL_FINE   = 0x200000
+const i32 WHEEL_UNIT   = 1000
+
+// ── KEY_UP — the `mods` flag for a key release ──────────────────────────────
+//
+// The same trick as `MOUSE_UP`, for the same reason: a press and a release are
+// the same event about the same key and do not earn two kinds, sokol has
+// KEY_DOWN *and* KEY_UP, and an editor needs the release — modifier tracking ("is Shift still held while I drag?"), any
+// press-and-hold repeat of its own, and any chord that outlives one keystroke
+// are all unwritable without it. Dropping releases on the floor would have been
+// the cheaper decode and it would have made `app:input` unable to describe a
+// state the substrate reports.
+//
+// Set on a `Key` event whose `code` was *released*; clear on a press. It is a
+// `mods` bit and not a `code` value because `code` is the key, and because the
+// mouse packing three lines up had already established that a transition
+// direction lives in `mods`.
+//
+// **A program that only wants presses must say so** — `is_key_press(e)`,
+// exactly as a program that only wants mouse presses asks `mouse_kind(e)`.
+// That is the cost of putting a direction in `mods`, and it is paid at the
+// reader rather than hidden from it.
+const u32 KEY_UP = 0x80000
+
+// ── FOCUS_LOST — the `mods` flag for a focus change ────────────────────────
+//
+// The third use of the same packing, and the reason it is a rule rather than an
+// accident: sokol reports FOCUSED and UNFOCUSED as two event types, they are
+// one thing happening in two directions, and so they are one
+// `EventKind.Focus` with the direction in `mods`.
+//
+// Set on a `Focus` event where the window **lost** focus; clear where it gained
+// focus. The polarity matches `KEY_UP` and `MOUSE_UP`, which likewise mark the
+// *end* of the state rather than its start — and that is exactly the sort of
+// thing a hand-rolled mask gets backwards, so a client calls
+// `is_focus_gained` / `is_focus_lost` and never the bit.
+//
+// **What it is for.** A window losing and regaining focus is the moment an
+// editor re-reads a file another program may have changed while it was away,
+// and the moment a caret stops and starts blinking. Neither is writable
+// without the event, and sokol reports it on all four platforms it supports.
+// No backend flag turns it on: on X11 sokol selects `FocusChangeMask`
+// unconditionally when it creates the window, so `app:display` and
+// `app:graphical` needed no change for this — measured under `Xvfb`.
+const u32 FOCUS_LOST = 0x100000
+
+// ── Drop — file paths, which are the first payload that is not a scalar ────
+//
+// A drop is the one event so far whose payload is neither a direction nor a
+// number: it is one or more file paths, and **they cannot go in `Event`**.
+// Measured: a sixth tuple field is `ERR0504` at every site that names the
+// shape, because a non-`distinct` `enum` is its backing type and a program's
+// own event type can *be* this one structurally — so widening the tuple is two
+// collections edited in lockstep plus every literal in the tree, for a payload
+// four of the six kinds do not have. `EventKind`'s "Adding a kind" recipe
+// states the rule this follows; the table below is what it points at.
+//
+// So the paths live here, in a fixed table this package owns, and the event
+// carries a **claim** on it: `code` is how many paths the drop landed and `x`
+// is the slot the first one is in. Both are read through `dropped_count(e)`
+// and `dropped_path(e, i)`, exactly as the `mods` bits are read through
+// `is_key_press`; a client never indexes the table itself.
+//
+// **The paths are copied in at push time, and that is the whole point.** A
+// backend hands `push_drop` borrowed strings — under sokol they point into
+// `_sapp.drop.buffer`, which `_sapp_clear_drop_buffer` zeroes at the *start*
+// of the next drop — and this queue is polled a frame later. A table holding
+// the backend's pointers would therefore hand a client a path that had already
+// been overwritten, and it would do so only when two drops landed close
+// together, which is the shape of bug that ships. The copy is a byte loop over
+// a fixed array; there is no allocation here, the same stance the 256-entry
+// event queue takes.
+//
+// **The table is a ring, so two drops still in the queue do not collide.**
+// Slots are claimed in order and wrap, so a second drop takes the slots after
+// the first rather than the first's own — which is what makes `dropped_path`
+// answer correctly for an event that has been sitting in the queue behind a
+// newer one. The cost is a lifetime rule, and it is the one thing about this
+// table a client has to know: **a `string` from `dropped_path` borrows a slot,
+// and the slot is reused once `MAX_DROPPED` further paths have been pushed.**
+// Read it, or copy it, in the frame you polled it. Nothing here can check that
+// — it is the same borrow `strings.borrow_from_cstring` hands out, written
+// down at the boundary where it is the routine case.
+//
+// **Nothing turns this on.** A backend that never calls `push_drop` simply has
+// no drops, and under sokol the window must ask for them: `sapp_desc`'s
+// `enable_dragndrop` decides whether the window advertises `XdndAware` at all,
+// and with it unset no drag source will offer it a drop. That flag is
+// `app:display`'s (`display.Config.max_dropped_files`) and a program turns it
+// on with `graphical.set_file_drop(true)` — a window that advertises drops and
+// then swallows them is worse than one that declines.
+
+// How many paths the table holds — across every `Drop` event still in the
+// queue, not per drop. It is therefore also the most one drop can carry: a
+// drop offering more loses the rest, and `code` reports what landed rather
+// than what was offered.
+//
+// 16, because a drop is a human gesture: it is a file or a small selection of
+// them, and a table this size costs `MAX_DROPPED * DROP_PATH_MAX` bytes of
+// package storage — 16 KB — held for the life of the process whether or not a
+// program ever enables drops. That is the honest price of "no allocation", and
+// it is the number to change if it is ever the wrong one.
+const i32 MAX_DROPPED = 16
+
+// The longest path the table holds, in bytes, terminator not included — a
+// longer one is truncated to it, and `dropped_path` answers the truncation
+// rather than the path.
+//
+// In practice sokol refuses it first: `app:graphical` hands `sapp_desc` this
+// number as `max_dropped_file_path_length` (plus one, for the terminator
+// sokol counts and this table does not), so a path that would not fit here is
+// dropped by sokol's own parser before it reaches this package. The clamp
+// below is what keeps that a coincidence rather than a dependency.
+const i32 DROP_PATH_MAX = 1024
+
+private [MAX_DROPPED][DROP_PATH_MAX]char8 g_drop_bytes
+private [MAX_DROPPED]i32 g_drop_len
+private i32 g_drop_next     // the slot the next path is copied into
+
+// How many paths this `Drop` event landed. `0` for every other kind, so it is
+// total in the way `mouse_kind` is: a client cannot read a file count out of a
+// keystroke.
+i32 dropped_count(Event e):
+    if e.kind != EventKind.Drop:
+        return 0
+    return e.code
+
+// Path `index` of this `Drop` event, `0`-based. The empty string for an index
+// this event does not claim and for every event that is not a `Drop`, so an
+// unguarded read is safe and answers nothing rather than someone else's path.
+//
+// **The result borrows the table** — see the lifetime rule above. It is not a
+// copy and it does not outlive the slot.
+string8 dropped_path(Event e, i32 index):
+    if e.kind != EventKind.Drop:
+        return ""
+    if index < 0 || index >= e.code:
+        return ""
+    i32 slot = (i32(e.x) + index) % MAX_DROPPED
+    return string8(g_drop_bytes[slot][0..<g_drop_len[slot]])
+
+// ── Reading a packed event: the predicates (E8) ────────────────────────────
+//
+// **The bit layout stops being client knowledge.** The
+// client's complaint was not the size of `EventKind` — it was that
+// *"a chain of bit tests before it can find out what happened"* was the only
+// way to ask, and that a packing spread across every client is easy to get
+// wrong in a way nothing catches. Both halves of that are fixed by moving the
+// tests here, and neither needs the mouse split turned into kinds.
+//
+// The alternative designs, and why not:
+//
+//   * **Split `Mouse` into four kinds** — add `MousePress`/`MouseRelease`/
+//     `MouseMotion`/`MouseWheel`, and `KeyUp` beside `Key`. Note this is not
+//     the question of whether `EventKind` may grow at all: it may, and it has
+//     — `Focus` and `Drop` are both members added after this section was
+//     written, each because it is a thing that happened and had no seat
+//     anywhere. What is refused here is turning the *directions* of one thing
+//     into kinds. It
+//     costs every existing `switch e.kind` four arms it did not have
+//     (silently, since the `else` swallows them — see "Adding a kind" above),
+//     it makes four kinds out of a set whose `x`/`y` a client handles
+//     identically, and it makes the queue's shape depend on a substrate detail
+//     — sokol happens to spread mouse actions over four event types; a decode
+//     that did not would then be reporting a distinction it does not have.
+//   * **A `MouseKind` sub-enum carried in `Event.code`** — `code` is already
+//     the button on a press and the wheel direction on a scroll, so this
+//     design has to evict one of them into a field it does not have. It buys
+//     a `switch` at the cost of a value.
+//
+// **A function returning the sub-enum is both**: the client gets its `switch`,
+// `code` keeps carrying the button, and the packing is written once. It is
+// also the design that survives a second backend, because a decode that
+// natively distinguishes the four fills the same predicates.
+
+// What a `Mouse` event actually is. `None` for every event that is not one, so
+// this is total and a client cannot read a press out of a keystroke.
+enum MouseKind: (
+    None    = 0,
+    Press   = 1,
+    Release = 2,
+    Motion  = 3,
+    Wheel   = 4,
+)
+
+// Which of the four a `Mouse` event is — the one call that replaces the chain
+// of `MOUSE_*` tests. `MouseKind.None` for any other kind of event.
+MouseKind mouse_kind(Event e):
+    if e.kind != EventKind.Mouse:
+        return MouseKind.None
+    if (e.mods & MOUSE_UP) != 0:
+        return MouseKind.Release
+    if (e.mods & MOUSE_MOTION) != 0:
+        return MouseKind.Motion
+    if (e.mods & MOUSE_WHEEL) != 0:
+        return MouseKind.Wheel
+    return MouseKind.Press
+
+// The button a press or release names — 0/1/2 for left/right/middle,
+// `sapp_mousebutton` order. `-1` for a motion, a wheel notch, or any event
+// that is not a `Mouse` at all, which is the same `-1` the decode already puts
+// in `code` for a motion.
+i32 mouse_button(Event e):
+    MouseKind k = mouse_kind(e)
+    if k == MouseKind.Press || k == MouseKind.Release:
+        return e.code
+    return -1
+
+// How far the wheel turned, in notches, positive **down** — the direction the
+// content moves, which is the sign a scroll offset wants. `0` for anything
+// that is not a wheel event, so `g_top = g_top + wheel_delta(e) * 3` is safe
+// to write unguarded. A fractional distance (a trackpad's) is rounded **away
+// from zero**, so the smallest trackpad movement still moves a notch-counting
+// client one notch rather than nothing; a whole-notch wheel reads exactly as it
+// always did. `wheel_amount` is the unrounded distance.
+i32 wheel_delta(Event e):
+    if mouse_kind(e) != MouseKind.Wheel:
+        return 0
+    if (e.mods & WHEEL_FINE) == 0:
+        return e.code
+    if e.code > 0:
+        return (e.code - 1) / WHEEL_UNIT + 1
+    if e.code < 0:
+        return 0 - ((0 - (e.code + 1)) / WHEEL_UNIT + 1)
+    return 0
+
+// How far the wheel turned, in lines, positive **down**, unrounded: `1.0` a
+// notch of an ordinary wheel, a fraction for a trackpad (to `1 / WHEEL_UNIT`
+// of a line). `0.0` for anything that is not a wheel event. What a view that
+// scrolls by pixels multiplies by its line height.
+f32 wheel_amount(Event e):
+    if mouse_kind(e) != MouseKind.Wheel:
+        return 0.0
+    if (e.mods & WHEEL_FINE) == 0:
+        return f32(e.code)
+    return f32(f64(e.code) / f64(WHEEL_UNIT))
+
+// Whether mouse button `button` (0/1/2) was held when this event was reported.
+// Reads the `Lmb`/`Rmb`/`Mmb` bits, which every kind of event carries — so it
+// answers for a `Key` event during a drag as well as for a motion.
+bool button_held(Event e, i32 button):
+    u32 bit = 0
+    if button == 0:
+        bit = u32(Modifier.Lmb)
+    else if button == 1:
+        bit = u32(Modifier.Rmb)
+    else if button == 2:
+        bit = u32(Modifier.Mmb)
+    else:
+        return false
+    return (e.mods & bit) != 0
+
+// A key going down. False for a release and for every non-`Key` event, so the
+// `(e.mods & input.KEY_UP) == 0` every client was writing has one spelling.
+bool is_key_press(Event e):
+    return e.kind == EventKind.Key && (e.mods & KEY_UP) == 0
+
+// A key coming up.
+bool is_key_release(Event e):
+    return e.kind == EventKind.Key && (e.mods & KEY_UP) != 0
+
+// The window taking keyboard focus. False for a loss and for every non-`Focus`
+// event, so it is total in the same way `is_key_press` is: a client cannot read
+// a focus gain out of a keystroke.
+bool is_focus_gained(Event e):
+    return e.kind == EventKind.Focus && (e.mods & FOCUS_LOST) == 0
+
+// The window giving keyboard focus up. This is the edge an editor reloads on
+// the *other* side of — see `FOCUS_LOST`.
+bool is_focus_lost(Event e):
+    return e.kind == EventKind.Focus && (e.mods & FOCUS_LOST) != 0
+
+// ── `EventKind.Quit` is a question, and the answer has a deadline ──────────
+//
+// **It always was a question; nothing said so, and the deadline was the real
+// defect.** `Quit` is sokol's `QUIT_REQUESTED`, which is sent *before* the
+// close is ordered precisely so a program can refuse it, and
+// `display.cancel_close()` is the refusal. That is exactly the shape an
+// editor's *"unsaved changes"* prompt needs, and it needs no new `EventKind`,
+// no field and no vocabulary: a `Quit` in the queue **is** the request, and
+// calling `app.quit()` in response is the "yes".
+//
+// What was missing is that the answer was unreachable. This queue is polled —
+// a backend fills it during its event read and a program drains it inside
+// `process`, one frame later — and sokol decides the close in the same loop
+// iteration that delivered the event, before the next frame callback runs. So
+// a `cancel_close()` written in `process` was always one frame too late and the
+// window closed anyway. `app:graphical.set_close_confirm(true)` is what makes
+// the deadline reachable: the backend holds the close open at the event
+// callback, where the deadline actually is, and the program answers in
+// `process` where it can see its own state. Off by default, because a program
+// that never handles `Quit` must still close when its window is closed.
+//
+// **With it off, a `Quit` in this queue is never seen at all**, and that is
+// measured rather than reasoned: `example/window` asks its own window to close
+// and stops on that same tick with **zero** `Quit` events drained. The event is
+// pushed and the loop exits before the next `poll`. So the `case
+// EventKind.Quit` arm every program in this tree writes is dead code unless the
+// program turned close confirmation on — which is worth knowing before writing
+// anything into it.
+
+// ── The queue is a signal, and the frame is what drains it ────────────────
+//
+// **A backend emits; the runtime delivers once a frame; a program polls what
+// was delivered.** Three parties, three places, and none of them shares a
+// line of code with another:
+//
+//   * **`push`** emits into `input_events`, a queue signal, from wherever the
+//     backend reads its input — under sokol the event callback, outside the
+//     frame barrier. The emit is lock-free and never blocks, so a backend on
+//     a thread of its own may push without asking anybody.
+//   * **`deliver`** is the one consumer. The runtime calls it once a frame,
+//     from `app:app`'s `tick`, **before `process`** (the `Backend.deliver`
+//     slot; `app:graphical` and `app:headless` fill it), and it moves what is
+//     queued into this frame's list. A signal has one consumer thread for its
+//     life, and the frame thread is that thread by construction.
+//   * **`poll`** hands the frame's list out, in order, once each, and
+//     consumes nothing from the signal — so a `process` that polls in a loop
+//     until it answers 0 ends, however fast another thread is pushing: what
+//     arrives during the frame waits for the next `deliver`.
+//
+// **A program that drives the loop itself calls `deliver` at the top of its
+// frame**, and so does a test that pushes and then polls with no runtime
+// running. There is no second place it happens.
+//
+// **Full is the sender's to see, and here the sender has nothing to do about
+// it.** A backend inside sokol's event callback cannot wait for the consumer,
+// so an emit that finds `CAP` events already queued is dropped — the same
+// newest-lost stance the ring this replaced took. `note_event` has already
+// run by then, which is what keeps the key table right across it.
+//
+// **What is not thread-safe is the rest of `push`.** The key table and the
+// drop table below are plain package state written by `push` itself; the
+// signal makes the queue safe to fill from another thread, not those. A
+// backend pushes from one thread.
+private const i32 CAP = 256
+
+private #signal(CAP) input_events(Event e)
+
+// This frame's delivered events, and how far `poll` has read into them.
+// Unread ones are kept, in order, ahead of the next frame's delivery.
+private [CAP]Event g_frame
+private i32 g_frame_len
+private i32 g_frame_read
+
+// Enqueue one event. Called by a backend from its input decode (outside the
+// barrier). Dropped when `CAP` events are already queued.
+//
+// **`note_event` runs first, and it runs unconditionally** — before the
+// emit, so an event the queue has no room for still moves the key state table
+// below. That ordering is one line and it is the whole of what makes the
+// table survive an overflow; see "Where the state is maintained" for why a
+// table that did not would be the bug it exists to prevent.
+void push(Event e):
+    note_event(e)
+    try #emit(input_events, e) else:
+        return
+
+// Move what the backend has queued into this frame's list, behind whatever the
+// last frame's `poll`s left unread. The runtime's call, once a frame, before
+// `process`; see above for when a program makes it.
+void deliver():
+    i32 keep = g_frame_len - g_frame_read
+    for i in 0..<keep:
+        g_frame[i] = g_frame[g_frame_read + i]
+    g_frame_len = keep
+    g_frame_read = 0
+    for e in #drain(input_events, CAP - keep):
+        g_frame[g_frame_len] = e
+        g_frame_len += 1
+
+// Convenience for a backend delivering a single key press or release. `mods` is
+// the `Modifier` bitmask, OR'd with `KEY_UP` for a release.
+void push_key(i32 code, u32 mods = 0):
+    push((EventKind.Key, code, 0.0, 0.0, mods))
+
+// Convenience for a backend delivering one committed UTF-8 codepoint as text
+// (sokol's CHAR, roughly) — distinct from `push_key`, which is the
+// case-insensitive virtual key (sokol's KEY_DOWN/KEY_UP).
+//
+// **`mods` is not optional to fill (E1)**, though it defaults to 0 for a
+// backend that genuinely has no modifier state to report: it is the `Modifier`
+// bitmask held when the codepoint was committed, and a backend that drops it
+// makes `is_typed_text` unable to tell a chord from a keystroke.
+void push_text(i32 codepoint, u32 mods = 0):
+    push((EventKind.Text, codepoint, 0.0, 0.0, mods))
+
+// Convenience for a backend delivering one mouse report already decoded to
+// this package's `Mouse` vocabulary (`code`/`mods` doc comment above).
+void push_mouse(i32 code, f32 x, f32 y, u32 mods):
+    push((EventKind.Mouse, code, x, y, mods))
+
+// Convenience for a backend delivering a wheel turn of `lines` lines,
+// positive **down** (the decode flips sokol's sign before it calls this), with
+// the pointer at `x`/`y`. The held-button bits (`Lmb`/`Rmb`/`Mmb`) are taken
+// off `mods` — sokol's X11 backend reports them on a scroll, and a wheel
+// event promises keyboard modifiers only (see `MOUSE_WHEEL`), which is what
+// lets `app:ui` leave a drag's capture alone across a wheel turn. Packs the
+// distance with `WHEEL_FINE`, clamped to two
+// million lines either way; a distance that rounds to no `WHEEL_UNIT`th at all
+// — a horizontal-only scroll arrives as exactly zero — pushes nothing, for the
+// reason `push_drop` gives about a message with no content. A NaN is zero.
+void push_wheel(f32 lines, f32 x, f32 y, u32 mods):
+    f64 q = f64(lines) * f64(WHEEL_UNIT)
+    if !(q == q):
+        return
+    if q > 2000000000.0:
+        q = 2000000000.0
+    if q < -2000000000.0:
+        q = -2000000000.0
+    i64 n = 0
+    if q >= 0.0:
+        n = i64(q + 0.5)
+    else:
+        n = 0 - i64(0.5 - q)
+    if n == 0:
+        return
+    push((EventKind.Mouse, i32(n), x, y, (mods & ~WHEEL_BUTTONS) | MOUSE_WHEEL | WHEEL_FINE))
+
+// The held-button bits `push_wheel` takes off a wheel event's `mods`.
+private const u32 WHEEL_BUTTONS = u32(Modifier.Lmb) | u32(Modifier.Rmb) | u32(Modifier.Mmb)
+
+// Convenience for a backend delivering a resize, in pixels. Takes `i32`s
+// deliberately — a framebuffer size is a whole number of pixels and every
+// backend has one — and widens them into `Event.x`/`y`, which are `f32` for the
+// pointer's sake. Read it back with `i32(e.x)`.
+void push_resize(i32 width, i32 height):
+    push((EventKind.Resize, 0, f32(width), f32(height), 0))
+
+// Convenience for a backend delivering a close request.
+void push_quit():
+    push((EventKind.Quit, 0, 0.0, 0.0, 0))
+
+// Convenience for a backend delivering a focus change. Takes the direction as
+// a `bool` deliberately — `FOCUS_LOST` is this package's own packing and a
+// backend should no more spell it than a client should, exactly as `push_key`
+// takes `mods` already OR'd but never asks a backend to build a `Mouse`
+// event's flag set by hand.
+//
+// A backend that cannot observe focus simply never calls this; there is no
+// `app.Capability` for it, because a `Focus` event that never arrives is
+// indistinguishable from a window that never lost focus.
+void push_focus(bool gained):
+    u32 mods = FOCUS_LOST
+    if gained:
+        mods = 0
+    push((EventKind.Focus, 0, 0.0, 0.0, mods))
+
+// Convenience for a backend delivering a file drop. Takes the paths as
+// borrowed `string`s — the shape a backend already has them in, `string(c)`
+// away from a `const char *` — and **copies their bytes into this package's
+// table** before the event is queued; see the "Drop" section for why that copy
+// is the whole design and what the copy's lifetime is.
+//
+// A backend calls this once per drop with every path it landed. Paths past
+// `MAX_DROPPED` and bytes past `DROP_PATH_MAX` are dropped, and `code` reports
+// what actually landed, so a client that reads `dropped_count` never walks off
+// the end of what was stored.
+//
+// **An empty drop pushes nothing.** A `Drop` event claiming no paths is a
+// message with no content — the same reason a horizontal-only wheel event is
+// dropped rather than pushed as a zero-direction scroll — and it would give
+// every client an arm that runs for nothing. sokol produces exactly that case:
+// `sapp_get_num_dropped_files()` answers 0 when drag-and-drop was never
+// enabled or the last drop failed to parse.
+void push_drop([]string8 paths):
+    i32 n = i32(#len(paths))
+    if n > MAX_DROPPED:
+        n = MAX_DROPPED
+    if n <= 0:
+        return
+    i32 base = g_drop_next
+    for i in 0..<n:
+        i32 slot = (base + i) % MAX_DROPPED
+        string8 p = paths[i]
+        i32 m = i32(#len(p))
+        if m > DROP_PATH_MAX:
+            m = DROP_PATH_MAX
+        for b in 0..<m:
+            g_drop_bytes[slot][b] = p[b]
+        g_drop_len[slot] = m
+    g_drop_next = (base + n) % MAX_DROPPED
+    push((EventKind.Drop, n, f32(base), 0.0, 0))
+
+// Hand out this frame's delivered input into `out`, returning how many were
+// written; what does not fit waits for the next `poll`. Empty (and a no-op) on
+// a backend without `Input`, so polling is always safe.
+i32 poll([]Event out):
+    if !app.supports(app.Capability.Input):
+        return 0
+    i32 n = 0
+    for n < #len(out) && g_frame_read < g_frame_len:
+        out[n] = g_frame[g_frame_read]
+        g_frame_read += 1
+        n += 1
+    return n
+
+// How many events are pending — delivered and not yet polled, plus queued and
+// not yet delivered — without taking any. For a backend or a test.
+i32 pending():
+    return (g_frame_len - g_frame_read) + i32(#len(input_events))
+
+// ── Held keys: the other question, and why this package answers two ────────
+//
+// Everything above this line is a **queue**: a backend pushes, a program
+// drains, and an event that has been read is gone. That is exactly right for
+// the question *"what happened?"*. A keystroke is a command, it happens once,
+// and an editor that inserted the same character twice because two parts of it
+// read the queue would be broken in a way no amount of care at the call site
+// repairs. `app:ui`'s `dispatch` is built on that shape and nothing below
+// changes a byte of it.
+//
+// It is the wrong shape for the other question, which is *"is Right held
+// **right now**?"*, asked once a frame for as long as the frame loop runs. A
+// queue cannot answer it. The press was one event, it was drained three hundred
+// frames ago, and all that is left is whatever the program wrote down at the
+// time. So every program that asks it has been building the same small
+// structure — a bitset off `Key` events, set on a press, cleared on a release —
+// and getting the same three things wrong:
+//
+//   1. forgetting that a release exists at all (`EventKind` has no `KeyUp`
+//      member; the direction is a `mods` bit, which is easy to read past);
+//   2. forgetting that a queue with a capacity can drop the release;
+//   3. forgetting that a window can lose focus while a key is down, after
+//      which the release is delivered to somebody else and the bitset says the
+//      key is held for the rest of the process.
+//
+// The third is why this belongs to the framework rather than to each program.
+// It is invisible in every unit test, it needs a second window to reproduce,
+// and its symptom is a player walking off a level with their hands off the
+// keyboard.
+//
+// ── Which surface answers which question ───────────────────────────────────
+//
+// There are now two ways to ask about a key, and a reader meeting both deserves
+// to be told which is which rather than left to pick. **There is a third, at
+// the bottom of this file** — the action map, which is a *binding* layer over
+// this table rather than a fourth source of truth about a key, and the section
+// "Three ways to ask, and which question each answers" is the whole map.
+//
+//   **The queue answers *what happened, in order, once each*.** Every
+//   transition, uncoalesced, carrying the payload that came with it — the
+//   committed codepoint, the pointer position, the dropped paths. Reading
+//   consumes it, and what one reader takes another does not see.
+//
+//   **The table answers *what is true now, and what changed since I last
+//   asked*.** Coalesced, idempotent, consumed by nobody, readable by any
+//   number of readers, and correct even where the queue was full and dropped
+//   the event.
+//
+// The rule at a call site. If the answer must be acted on **once per
+// occurrence** — insert a character, open a file, run a command, append to an
+// undo log — read the queue, because that is the surface that counts. If the
+// answer is a **state re-evaluated every frame** — move while held, keep a
+// camera turning, dim a menu while Ctrl is down, continue a drag — read the
+// table, because that is the surface that remembers.
+//
+// `key_pressed` sits between the two on purpose: it is a once-per-occurrence
+// answer served out of the table, for a program that wants no queue at all. It
+// is strictly lossier than the queue and its own comment says exactly how.
+//
+// ── Where the state is maintained: in `push` ───────────────────────────────
+//
+// The table is updated by `push`, from the event the backend delivered, before
+// the emit that can find the queue full. The alternative was `poll`, and it loses on four
+// counts in increasing order of how badly:
+//
+//   * **A partial drain lags.** `poll` fills a caller's slice and leaves the
+//     rest; nothing in the surface says how large that slice must be, and the
+//     suite beside this file drains two at a time on purpose. A table updated
+//     there would be behind by exactly the events the caller did not ask for.
+//   * **It would be gated off.** `poll` answers 0 and touches nothing when the
+//     backend does not advertise `Capability.Input`. A table fed from there is
+//     silently empty under a backend that pushes without advertising, which is
+//     a configuration mistake that currently costs a program its events and
+//     would then also cost it its state with no second symptom.
+//   * **Overflow would lose a release permanently.** `CAP` is 256 and an emit
+//     into a full queue drops the newest. A dropped `KEY_UP` never reaches a `poll`-fed
+//     table, so the key is held for ever — which is failure mode (2) above
+//     arriving through the very mechanism built to prevent it.
+//   * **Two drainers would disagree.** `poll` is destructive, so a main loop
+//     and a debug overlay that both drain see a disjoint half of the events
+//     each, and would compute two different answers to *"is Right held"*.
+//     There is one keyboard. A table fed by `push` is one table with one
+//     answer for everybody, and that is most of why it is framework state and
+//     not a helper each program instantiates.
+//
+// And the case that settles it: a program that uses only the level surface and
+// **never drains the queue at all** is a legitimate program — a game wanting no
+// text, no drops and no mouse — and under a `poll`-fed table it would see
+// nothing whatever, for ever, with no diagnostic anywhere.
+//
+// **The cost, which is real and is paid by the reader.** The table reflects
+// what the backend has *delivered*, which is ahead of what the program has
+// *drained*. `key_down(Keycode.Right)` can be true while the `Key` press that
+// made it true is still queued, so a program mixing the two surfaces sees
+// them at different times. The gap is bounded and is one-directional: under
+// sokol a backend pushes during its own event read, outside the frame barrier,
+// the frame delivers before `process` and a program drains inside it, so the
+// table runs at most one frame ahead of the queue and never behind it. After a full drain the two agree
+// exactly.
+//
+// The one thing a program owes that cost is to call `clear_edges` at one **end**
+// of its frame rather than somewhere in the middle, so a frame's worth of
+// backend pushes falls on one side of the line instead of straddling it. The
+// drain is already in `process`; the last statement of `process` is where this
+// goes.
+//
+// ── The edges latch; they are not read off the level ───────────────────────
+//
+// `key_pressed` and `key_released` are **sticky bits set by `push`** and
+// cleared by nothing but `clear_edges`. They are deliberately not computed as a
+// difference between the level now and the level at the last clear, which is
+// the cheaper design — one bitset and a shadow copy, rather than three — and
+// the reason is a case the cheap design cannot represent at all:
+//
+//   **a key pressed and released inside one frame.**
+//
+// A tap is a real input. It is how a menu is confirmed and how a jump is
+// buffered, and it is not rare: at 60 Hz a frame is 16.7 ms and a brisk tap is
+// comfortably under that. By the time the program looks, the key is up again. A
+// level difference reads false at both ends and the tap has vanished, leaving a
+// trace nowhere but the queue. A latched edge does not: the press sets
+// `pressed`, the release sets `released`, the level goes up and straight back
+// down, and a program reading all three sees
+//
+//     key_pressed(c) == true, key_released(c) == true, key_down(c) == false
+//
+// simultaneously — which is the honest description of *"tapped and let go this
+// frame"*, and is what the test for it asserts, all three at once.
+//
+// **An edge latches exactly where the level changed, and nowhere else.** A
+// `KEY_DOWN` for a key the table already holds down sets nothing new — which is
+// what makes auto-repeat harmless. sokol delivers a repeated `SAPP_EVENTTYPE_
+// KEY_DOWN` about twice a second while a key is held and `Event` has nowhere to
+// put its `key_repeat` flag, so a rule that latched on every `KEY_DOWN` would
+// make a held jump key fire again half a second in. The level bit is the memory
+// that tells the two apart, and it is already there. The mirror rule holds for
+// releases and matters for the same kind of reason; the focus section below is
+// where it pays out.
+//
+// **What latching gives up, said plainly: the edges are sticky, not counted.**
+// Two taps of one key inside one frame set the same two bits and are
+// indistinguishable from one. The table answers *whether* a transition happened
+// since the last clear and never *how many*. A program that needs the count
+// reads the queue, which has every one of them in order — the clearest single
+// instance of the two surfaces answering two different questions.
+//
+// ── Focus loss clears the levels, and fabricates no edges ──────────────────
+//
+// Hold a direction, alt-tab, let go. The release is delivered to whatever
+// window took focus; this one is never told. A held-key bitset cleared only by
+// a `KEY_UP` therefore says the key is down for the rest of the process.
+//
+// `app:input` already has the event — `EventKind.Focus` with `FOCUS_LOST` set,
+// pushed by the sokol decode from `SAPP_EVENTTYPE_UNFOCUSED`, reported on all
+// four platforms sokol supports and needing no `sapp_desc` flag to turn on. So
+// `push` clears the whole level bitset and `mods_now` on it. That is exactly
+// what `clear_keys` does, and `clear_keys` is public because a program that
+// takes the keyboard away from itself for its own reasons — a modal it drives,
+// a pause, a mode switch — wants the same reset and should not have to fake a
+// focus event to get one.
+//
+// A focus **gain** clears nothing. There is nothing left to clear (the loss did
+// it) and nothing to learn: no platform reports which keys are held at the
+// moment focus arrives, so the table starts a focused session empty and fills
+// from the first real transition — which is correct, because a key held down
+// through the gain will report its release to this window and a release for a
+// key the table has up changes nothing.
+//
+// **It does not set a release edge for the keys it clears, and that is a
+// decision rather than an omission.** An edge is a report that a transition was
+// *observed*. A focus loss is not a transition of any key; it is the withdrawal
+// of the ability to observe one. Three arguments, and the third is the one that
+// decided it:
+//
+//   * **A fabricated edge fires an action.** `key_released` is what a program
+//     hangs a discrete act on — release the charge, commit the drag, confirm
+//     the highlighted item. Synthesising one means this package firing the
+//     player's charged shot because they alt-tabbed. A stale level is a wrong
+//     *state*; a fabricated edge is a wrong *act*, and the second is worse.
+//   * **It would report a release for a press the program has not seen.** The
+//     table is fed by `push` and therefore runs ahead of the drain. A key
+//     pressed and focus-lost inside one frame has its press still queued
+//     at the moment of the clear, so a program mirroring edges into a state
+//     machine of its own would be handed the release first and the press
+//     after it.
+//   * **The program fabrication would help is already broken.** That program
+//     mirrors `key_released` into a held-set of its own — which is this table,
+//     reimplemented, one surface late — and it is equally wrong on a queue
+//     overflow, which fabrication does not repair. Its answer is `key_down`,
+//     which is the level and is correct by construction.
+//
+// **The press edges are deliberately left alone.** Alt-tab is Alt down, Tab
+// down, then the loss, all inside one frame, and a program that reads press
+// edges should still see the two presses that genuinely happened. Only the
+// levels are a claim about the present, so only the levels are cleared.
+//
+// ── Sizing: the real keycode maximum ───────────────────────────────────────
+
+// The highest `sapp_keycode` there is: `SAPP_KEYCODE_MENU`, **348**, read out
+// of `collections/vendor/sokol/sokol_app/sokol_app.h` — the last member of the
+// `sapp_keycode` enum, immediately before its `_SAPP_KEYCODE_FORCE_U32`
+// sentinel, which is a width marker and not a key.
+//
+// `Keycode` above names a deliberate *subset* and stops at `F12` (301); the
+// decode passes every code it has no seat for straight through, as that enum's
+// own comment says it does. So the table is sized from the substrate's range
+// and not from the part of it that has names, or the keypad, the lock keys and
+// the bare modifier keys (`SAPP_KEYCODE_LEFT_SHIFT` is 340) would index off the
+// end of it.
+//
+// **`SAPP_MAX_KEYCODES` (512) is the wrong number and looks like the right
+// one.** It is the length of sokol's own `sapp_keycode keycodes[512]`, which is
+// indexed by a *platform scancode* and holds keycodes as its values; it bounds
+// neither the keycodes nor anything else this package sees. Sizing from it
+// would be 163 bits of slack that no assertion could ever notice — which is how
+// a number that means nothing gets copied onward as if it meant something.
+const i32 KEY_CODE_MAX = 348
+
+// One past it: what the range checks compare against and what the bitsets are
+// sized from. A `code` outside `0 ..< KEY_CODE_COUNT` answers false from every
+// reader and stores nothing in any writer, so an unguarded `key_down(whatever)`
+// is safe in the way `dropped_path` is. The check is not paranoia about this
+// tree: the decode passes through whatever the substrate hands it, and a
+// substrate that one day reports a 400 is a wrong answer here and an
+// out-of-bounds write anywhere that trusted the range.
+const i32 KEY_CODE_COUNT = KEY_CODE_MAX + 1
+
+// 349 bits in 64-bit words is 6 of them, 48 bytes; three bitsets is 144 bytes
+// of package storage held for the life of the process, beside the 256-event
+// signal and its frame list and the drop table (16 KB). No allocation, the same stance
+// everything else in this file takes.
+private const i32 KEY_WORDS = (KEY_CODE_COUNT + 63) / 64
+
+private [KEY_WORDS]u64 g_key_down       // held right now — the level
+private [KEY_WORDS]u64 g_key_pressed    // went down since the last clear_edges
+private [KEY_WORDS]u64 g_key_released   // came up since the last clear_edges
+private u32 g_mods_now                  // the modifier bitmask last reported
+
+// The `mods` bits that are a report about what is **held**, as opposed to this
+// package's own packing of a transition direction. `Modifier`'s seven — four
+// keyboard, three mouse buttons — and nothing else: `KEY_UP`, `MOUSE_UP`,
+// `MOUSE_MOTION`, `MOUSE_WHEEL`, `WHEEL_FINE` and `FOCUS_LOST` ride in the same `u32` and all
+// describe the event rather than the hand on the keyboard, so `mods_now` masks
+// them off rather than answering a release flag as though it were a modifier.
+//
+// Public because it is the mask a client writing `e.mods & input.MODIFIER_MASK`
+// over an event out of the queue wants too, and hand-rolling it is how
+// `KEY_UP`'s bit ends up in somebody's chord comparison.
+const u32 MODIFIER_MASK = (u32(Modifier.Shift) | u32(Modifier.Ctrl) |
+                           u32(Modifier.Alt) | u32(Modifier.Super) |
+                           u32(Modifier.Lmb) | u32(Modifier.Rmb) |
+                           u32(Modifier.Mmb))
+
+// The word of a bitset holding `code`'s bit, and the bit itself. Split out
+// because three bitsets and two writers would otherwise spell `/ 64` and `% 64`
+// ten times over, and one of those would eventually be a shift somebody wrote
+// by hand with the wrong width. Callers have already range-checked `code`.
+private (i32 word, u64 bit) key_slot(i32 code):
+    return (code / 64, u64(1) << u64(code % 64))
+
+// Fold one event into the key state table. Called by `push` for every event,
+// including one the queue has no room for.
+//
+// **Only `Key` moves the levels and the edges**, because only a `Key` event
+// names a key and a direction. `Key`, `Text` and `Mouse` all move `mods_now`,
+// since all three carry a real substrate bitmask (`Text`'s is E1's whole
+// point); `Resize`, `Quit`, `Focus` and `Drop` carry either zero or one of this
+// package's own flags in `mods`, and neither is a report about what is held.
+//
+// A `Key` event whose `code` is outside the table's range still moves
+// `mods_now` and is otherwise ignored. That is deliberate: the modifiers it
+// reported are true whatever key produced them.
+private void note_event(Event e):
+    if e.kind == EventKind.Key:
+        g_mods_now = e.mods & MODIFIER_MASK
+        if e.code < 0 || e.code >= KEY_CODE_COUNT:
+            return
+        (i32 w, u64 b) = key_slot(e.code)
+        bool was_down = (g_key_down[w] & b) != 0
+        if (e.mods & KEY_UP) != 0:
+            // An edge latches only where the level changed, so a release for a
+            // key the table already has up — the one that arrives after a
+            // focus loss cleared it — latches nothing.
+            if was_down:
+                g_key_down[w] = g_key_down[w] &~ b
+                g_key_released[w] = g_key_released[w] | b
+        else:
+            // ...and the same rule makes sokol's auto-repeat KEY_DOWN, which
+            // arrives with no flag distinguishing it, cost nothing.
+            if !was_down:
+                g_key_down[w] = g_key_down[w] | b
+                g_key_pressed[w] = g_key_pressed[w] | b
+        return
+    if e.kind == EventKind.Text || e.kind == EventKind.Mouse:
+        g_mods_now = e.mods & MODIFIER_MASK
+        return
+    if is_focus_lost(e):
+        clear_keys()
+
+// Whether `code` is held **right now** — the level, and the reader a frame loop
+// asking *"is the player moving right"* wants. False for a code outside
+// `0 ..< KEY_CODE_COUNT`, so an unguarded call on whatever the substrate
+// reported is safe.
+//
+// This is what the backend has delivered, which can be one frame ahead of what
+// the program has drained out of the queue; see "Where the state is maintained".
+bool key_down(i32 code):
+    if code < 0 || code >= KEY_CODE_COUNT:
+        return false
+    (i32 w, u64 b) = key_slot(code)
+    return (g_key_down[w] & b) != 0
+
+// Whether `code` went down since the last `clear_edges` — the press edge, and
+// the reader a jump, a menu confirmation or a one-shot toggle wants.
+//
+// **It is a latched bit, not a difference of levels**, which is what lets it be
+// true for a key that has already been released again inside the same frame.
+// `key_pressed(c) && !key_down(c)` is a tap, and it is a state a program should
+// expect to see rather than a contradiction.
+//
+// It is **sticky, not counted**: two taps in one frame are one bit. A program
+// that needs the count reads the queue. And it does **not** re-latch on
+// auto-repeat, because the level says the key was already down.
+bool key_pressed(i32 code):
+    if code < 0 || code >= KEY_CODE_COUNT:
+        return false
+    (i32 w, u64 b) = key_slot(code)
+    return (g_key_pressed[w] & b) != 0
+
+// Whether `code` came up since the last `clear_edges` — the release edge.
+// `key_pressed`'s rules all hold here in mirror image.
+//
+// **A focus loss does not set this**, however many keys it clears; see "Focus
+// loss clears the levels, and fabricates no edges" for why fabricating one
+// would be this package inventing an input the substrate never reported.
+bool key_released(i32 code):
+    if code < 0 || code >= KEY_CODE_COUNT:
+        return false
+    (i32 w, u64 b) = key_slot(code)
+    return (g_key_released[w] & b) != 0
+
+// Drop every latched edge, keeping every level. **The program calls this, once
+// per frame, at one end of the frame** — the last statement of `process`, where
+// the drain already is.
+//
+// It is the program's call and not this package's because this package has no
+// frame: `push` runs on the backend's clock, outside the barrier, and nothing
+// here knows where one frame stops and the next starts. A program that forgets
+// it sees every press it has ever seen stay true for ever, which is loud; a
+// program that calls it twice a frame loses the edges between the two calls,
+// which is not, and is why "at one end" is the instruction rather than "once".
+void clear_edges():
+    for i in 0..<KEY_WORDS:
+        g_key_pressed[i] = 0
+        g_key_released[i] = 0
+
+// Drop every held key and the modifier bitmask, latching no edges. This is what
+// a `Focus` event with `FOCUS_LOST` runs, and it is public so that a program
+// taking the keyboard away from itself — a modal, a pause, a mode switch — can
+// run the same reset without fabricating a focus event to do it.
+//
+// The edges are **not** cleared here, on purpose: a press that genuinely
+// happened this frame happened, whatever came after it, and alt-tab is two real
+// presses followed by a focus loss.
+void clear_keys():
+    for i in 0..<KEY_WORDS:
+        g_key_down[i] = 0
+    g_mods_now = 0
+
+// How many keys are held right now. `0` is *"nothing is held"* — which is the
+// assertion a focus-loss test wants, and the condition an idle animation wants,
+// without either of them walking 349 codes to find out.
+i32 keys_down_count():
+    i32 n = 0
+    for i in 0..<KEY_WORDS:
+        n = n + i32(#popcount(g_key_down[i]))
+    return n
+
+// The `Modifier` bitmask currently held — the four keyboard modifiers and the
+// three mouse-button bits, masked by `MODIFIER_MASK` so no packing flag can
+// reach a caller. `0` before any event has arrived, and `0` after a focus loss.
+//
+// **It is the last bitmask the substrate reported, not a bitmask this package
+// derives**, and that has one edge worth knowing: a platform that reports a key
+// transition with the modifier state as it was *before* the transition — X11
+// does this, which is why the mouse decode sets the pressed button's held-bit
+// itself — will report a bare Shift's own release with Shift still set. A
+// program that needs that answer exactly should ask `key_down` of the modifier
+// key's own code (`SAPP_KEYCODE_LEFT_SHIFT` is 340), which the level table
+// tracks from the `KEY_UP` flag and not from the bitmask, and so gets right.
+u32 mods_now():
+    return g_mods_now
+
+// ── Actions: the binding layer, and Godot's `InputMap` / `Input` surface ────
+//
+// Everything above this line names a **key**. A platformer written against it
+// reads
+//
+//     if input.key_down(input.Keycode.Right):
+//
+// and that line is wrong in a way no test finds: it is the game's movement
+// logic with a hardware decision welded into it. The player who wants `D`
+// cannot have it, the AZERTY player who wants `Z` for jump cannot have it, and
+// the second binding a controller-less build wants means editing the character
+// controller. The fix is the one every engine has landed on and Godot spells
+// most plainly: a **named action** with a list of bindings behind it, and game
+// logic that reads the name.
+//
+//     if input.is_action_pressed("move_right"):
+//
+// Rebinding is then `action_erase_keys` plus `action_add_key`, and not one
+// byte of the movement code moves.
+//
+// ── Three ways to ask, and which question each answers ─────────────────────
+//
+// A reader meeting three surfaces in one package is owed the map, because the
+// wrong one is usually *almost* right and the difference shows up as a bug
+// nobody can reproduce.
+//
+//   **1. The queue — `poll`.** *What happened, in order, once each.* Every
+//   transition uncoalesced, carrying the payload that came with it: the
+//   committed codepoint, the pointer position, the dropped paths. Reading
+//   consumes it, so what one reader takes another does not see. It is the only
+//   surface that can count two taps, the only one that carries text, mouse
+//   positions and file drops at all, and the only one that keeps order between
+//   two different keys.
+//
+//   **2. The key table — `key_down` / `key_pressed` / `key_released`.** *What
+//   is true of this **key** now, and what changed since the last
+//   `clear_edges`.* Coalesced, idempotent, consumed by nobody, correct across a
+//   full queue and across a focus loss. It is where the levels and the
+//   latched edges live, and it is the substrate the third surface reads.
+//
+//   **3. The action map — `is_action_pressed` and the rest of this section.**
+//   *What is true of this **intention** now.* Exactly question 2, asked about a
+//   name a player can rebind instead of a code a program hard-coded. It holds
+//   **no state of its own whatsoever**: every answer below is a fold over
+//   `key_down`/`key_pressed`/`key_released` across an action's bindings,
+//   computed at the call. There is nothing here for `clear_edges` to clear,
+//   nothing for a focus loss to reset, and no second copy of a key's state to
+//   drift from the first.
+//
+// The rule at a call site is unchanged and gains one clause. Once per
+// occurrence — insert a character, open a file, append to an undo log — read
+// the **queue**. A state re-evaluated every frame, or an edge for a discrete
+// act, read the **table**; and read it **through an action** whenever the key
+// is a thing a player might reasonably want to choose, which for a game is
+// every key except the ones a debug overlay uses.
+//
+// ── Actions are a binding layer and carry no policy ────────────────────────
+//
+// This is worth saying before the surface rather than after it, because a
+// reader coming from an engine expects the opposite and would otherwise go
+// looking for the knobs.
+//
+// There are **no dead zones**, because there is no analogue input here to have
+// one: a binding is a key code and a key is down or it is not. Godot's
+// `get_axis`/`get_vector` take a `deadzone` argument; ours cannot, and a
+// parameter that only ever takes one value is worse than no parameter.
+//
+// There is **no repeat**, no auto-fire and no hold-to-trigger timer. Those are
+// timed behaviour, this package has no clock, and a program that wants one
+// already has the frame it is in.
+//
+// There is **no consumption**: reading an action does not take it away from the
+// next reader, because the answer is recomputed from the key table at every
+// call and the key table is consumed by nobody. A UI layer and a game layer
+// that both ask *"is jump pressed"* both get `true`, and deciding which of them
+// acts is the program's business and not a framework's. (The queue is the
+// surface where reading *does* take it away, which is one of the things the map
+// above is for.)
+//
+// And there is **no translation**: an action never fabricates a key event,
+// never pushes onto the queue, and is invisible to `poll`. The queue's behaviour
+// is byte for byte what it was before this section existed.
+//
+// ── Godot's names, and the three places this deliberately differs ──────────
+//
+// | Godot                               | here                                  |
+// |-------------------------------------|---------------------------------------|
+// | `InputMap.add_action(name)`         | `add_action(name)` → `bool`           |
+// | `InputMap.action_add_event(n, ev)`  | `action_add_key(n, code, mods = 0)`   |
+// | `InputMap.action_erase_events(n)`   | `action_erase_keys(n)`                |
+// | `InputMap.has_action(name)`         | `has_action(name)`                    |
+// | `Input.is_action_pressed(n)`        | `is_action_pressed(n)`                |
+// | `Input.is_action_just_pressed(n)`   | `is_action_just_pressed(n)`           |
+// | `Input.is_action_just_released(n)`  | `is_action_just_released(n)`          |
+// | `Input.get_axis(neg, pos)`          | `get_axis(neg, pos)`                  |
+// | `Input.get_vector(l, r, u, d)`      | `get_vector(l, r, u, d)`              |
+//
+// The spellings are Godot's on purpose: the whole value of this layer is that
+// somebody who has written a GDScript character controller can *guess* it, and
+// a cleverer name would spend that for nothing.
+//
+// **`action_add_key` rather than `action_add_event`.** Godot's takes a whole
+// `InputEvent` object because Godot binds joypad axes, joypad buttons, mouse
+// buttons and keys through one call, and an object is the only thing general
+// enough to be all four. Here a binding **is a key code** — there is no joypad
+// in `app:input` at all and the mouse has no level table to read — so the
+// honest spelling names what it takes. An `Event` parameter would be a
+// generality this package cannot honour: three of `EventKind`'s seven members
+// have nothing an action could be matched against, and the one that does is
+// already the `i32` the parameter takes.
+//
+// **The `mods` requirement — a chord action, added because it costs the common
+// case nothing.** The trailing `mods = 0` is the whole of it: `action_add_key
+// ("move_right", i32(Keycode.Right))` is what a caller writes, and
+// `action_add_key("save", i32('S'), u32(Modifier.Ctrl))` is Ctrl+S. It is a
+// **requirement**, never a prohibition — `mods` names bits that must be held,
+// and a binding with `mods = 0` requires nothing and so fires whatever else is
+// held. That polarity is the one that makes the common case right: a player
+// holding Shift to run still wants `ui_left` to move left, and a rule that
+// demanded *no* modifier would break shift-to-run on every movement action in
+// every game. The cost, stated: the test is a subset, so a Ctrl+S chord also
+// fires on Ctrl+Shift+S. A program that needs exclusivity reads `mods_now()`
+// itself, which is one comparison and is exactly what it would have written
+// anyway.
+//
+// The bits are masked with `MODIFIER_MASK` on the way in, so no caller can
+// require `KEY_UP` or `FOCUS_LOST` — this package's own packing — by accident.
+//
+// The requirement is read against `mods_now()`, which is a **level** and is
+// therefore evaluated at the moment of the call rather than at the moment of
+// the press. Within one frame those are the same instant, which is the
+// granularity the latched edges already work at; across a frame boundary they
+// are not, and a chord whose modifier is released before the program asks reads
+// false even though its key edge is still latched. That is the honest
+// description and it is why a chord belongs on a command (`save`) and not on a
+// movement action.
+//
+// **Every mutator answers `bool`, where Godot's answer `void` and print an
+// error.** A printed error is not reachable from a program; every refusal below
+// is a caller-visible `false`, and each one has exactly one meaning. Printing
+// is not available to this package in any case — it is freestanding-clean and
+// imports nothing that renders.
+//
+// **`erase_action` is absent, and that is a decision.** Godot has it; here a
+// handle is a slot index (below), so freeing a slot would make a handle a
+// program is holding name a *different* action later — the stale-handle bug the
+// `app:draw` work order spent a generation counter to avoid. The set of actions
+// is fixed after startup by construction, rebinding needs only
+// `action_erase_keys` + `action_add_key`, and `clear_actions` is the one
+// wholesale reset, which invalidates every handle at once and visibly.
+//
+// ── Storage: a fixed table, because this package has never allocated ───────
+//
+// Nothing in this file allocates. The event queue is a fixed 256 entries, the
+// drop table is a fixed 16 × 1024 bytes, the key table is three fixed bitsets,
+// and every one of those is a deliberate stance rather than an accident: this
+// package runs on the backend's clock, outside the frame barrier, and an
+// allocator call there is a latency spike in the one place a frame loop cannot
+// absorb one. A `#make` here would be the first allocation this package has
+// ever made, and it would be made for a table whose size is known at startup
+// and never changes afterwards. So: a fixed table, sized by two `const`s that
+// have to justify themselves.
+//
+// The whole cost, counted: names `MAX_ACTIONS * ACTION_NAME_MAX` = 768 bytes,
+// name lengths 128, binding codes `MAX_ACTIONS * MAX_BINDINGS * 4` = 512,
+// binding modifier masks another 512, binding counts 128, and the action count
+// itself. **About 2 KB of package storage**, held for the life of the process
+// whether or not a program ever registers an action — beside the 16 KB drop
+// table and the event queue this file already holds unconditionally. It is
+// the smallest of the three.
+//
+// **What happens at the cap is a refusal a caller can see, not a silent drop.**
+// `add_action` answers `false` for the 33rd distinct name and `action_add_key`
+// answers `false` for the 5th binding on one action; nothing is stored and
+// nothing already stored is disturbed. A startup path that checks its return
+// values finds a cap it has outgrown on the first run; one that does not gets a
+// dead action, which is loud the first time a player presses the key.
+
+// How many distinct actions the table holds.
+//
+// 32, and the number comes from counting a real keymap rather than from
+// rounding. Godot ships **sixteen** built-in `ui_*` actions in a default
+// project (`ui_accept`, `ui_cancel`, `ui_left`, `ui_right`, `ui_up`,
+// `ui_down`, `ui_focus_next`, `ui_focus_prev`, `ui_page_up`, `ui_page_down`,
+// `ui_home`, `ui_end`, `ui_select`, `ui_undo`, `ui_redo`, `ui_text_submit` and
+// their neighbours), and a 2D game's own set on top of that is the four
+// directions, jump, shoot, dash, interact, inventory and pause — ten. Thirty-two
+// is both of those with room, and it is a number a program can outgrow
+// visibly rather than one so large that the cap stops being a real limit and
+// starts being 8 KB of storage nothing will ever read.
+const i32 MAX_ACTIONS = 32
+
+// How many key bindings one action holds.
+//
+// 4, because that is what the cases actually want: Godot's own `ui_left` ships
+// with two (Left arrow, joypad d-pad left), a keyboard-only game wants two
+// (arrows and WASD), and a game offering a player a primary and a secondary
+// rebind on top of two defaults wants four. A fifth is a keymap that has stopped
+// being a keymap; `action_add_key` refuses it and says so.
+const i32 MAX_BINDINGS = 4
+
+// The longest action name the table stores, in bytes.
+//
+// 24, measured against the names that exist: Godot's longest built-in is
+// `ui_graph_delete` (15) and its longest anywhere in a stock project is
+// `ui_text_caret_document_end` — which is 26 and is the one case this cap
+// refuses, deliberately, because a name that long is a *command* identifier
+// rather than a binding and belongs in a program's own table. The names this
+// layer is for are `move_right`, `jump`, `interact`, `toggle_inventory` — 4 to
+// 16 bytes.
+//
+// **A longer name is a refusal, not a truncation.** `add_action` answers
+// `false` and stores nothing. Truncating is the alternative and it is much
+// worse: two names that differ past byte 24 would become one action, so a
+// program's `"ui_text_caret_word_left"` and `"ui_text_caret_word_right"` would
+// silently share a keymap, which is a bug with no symptom at the call site at
+// all. A refusal is visible on the first run.
+const i32 ACTION_NAME_MAX = 24
+
+// ── Name storage: the bytes are copied, and here is why that is not optional ─
+//
+// **A `string` in Dado is a window.** It is a pointer and a length into bytes
+// somebody else owns, and it owns nothing itself. So a name handed to
+// `add_action` is a *borrow* into whatever the caller had, and a table that
+// stored the `string` would be storing that borrow for the life of the process.
+//
+// That is fine for a literal, which lives in the program's own rodata, and it
+// is a use-after-free for everything else: a name read out of a settings file
+// into a buffer that is then reused, a name cut out of a line with
+// `strings.substring` — whose own header says *"the result is always a window
+// into `s`"* — a name built in a stack array inside the function that calls
+// `add_action`. Every one of those compiles, and every one of them answers
+// correctly right up until the bytes are reused.
+//
+// **This is not hypothetical and this tree has already paid for it.**
+// `tools/doc`'s first run: a scanner read a file, cut substrings out of it,
+// stored them, freed the file, and then sorted the
+// records. The unsanitized build *"printed a completely correct document"*; the
+// same program under ASan reported `heap-use-after-free` inside
+// `strings.compare`. Right answer, wrong program, and the only instrument that
+// said so was `--sanitize`. A table of borrowed action names is that bug with a
+// longer fuse, because a keymap is written once at startup and read every frame
+// for the rest of the process.
+//
+// The alternative to copying was to **document that names must be string
+// literals**, and it was rejected on two counts. It cannot be checked — nothing
+// in the language distinguishes a literal from a window over a stack buffer, so
+// the rule would be enforced by a sentence in a comment — and it forbids the
+// one feature this layer exists for: a rebinding screen that loads a keymap
+// from a file has no literals, and telling it to keep every line of that file
+// alive for the process is telling it to write the copy by hand, worse.
+//
+// So the bytes are copied into `g_action_name`, exactly as `push_drop` copies a
+// dropped path into `g_drop_bytes` and for exactly the same reason. The copy is
+// a byte loop over a fixed array, it happens once per action at startup, and it
+// allocates nothing.
+//
+// **The direction of the borrow then reverses**, which is the one thing a
+// caller has to know: `action_name` hands *out* a window into this table. That
+// borrow is far safer than the one it replaced — a slot is never reused while
+// the action exists, so the only thing that invalidates it is `clear_actions` —
+// and it is written down at the reader rather than left to be discovered.
+private [MAX_ACTIONS][ACTION_NAME_MAX]char8 g_action_name
+private [MAX_ACTIONS]i32 g_action_name_len
+private [MAX_ACTIONS][MAX_BINDINGS]i32 g_bind_code
+private [MAX_ACTIONS][MAX_BINDINGS]u32 g_bind_mods
+private [MAX_ACTIONS]i32 g_bind_count
+private i32 g_action_count
+
+// ── Lookup cost, counted rather than assumed ───────────────────────────────
+//
+// `is_action_pressed` is called several times a frame per action, so the shape
+// of the walk is worth a number rather than a shrug.
+//
+// A name lookup is a **linear walk of the occupied slots**, and each slot
+// compares its stored length against the probe's before it touches a byte. So
+// the byte loop runs only for slots of exactly the right length. At the cap:
+//
+//   * **32 length comparisons**, always — one `i32` compare per occupied slot,
+//     which is one cache line's worth of a 128-byte array;
+//   * **up to 32 × 24 = 768 byte comparisons** in the worst case that can be
+//     constructed, which is 32 names all of the same length differing only in
+//     the last byte;
+//   * in the realistic case, ~32 length compares and a handful of byte
+//     compares, because names diverge in their first three or four bytes
+//     (`move_left` / `move_right` share five and then differ).
+//
+// A GDScript-shaped first line — `get_vector("move_left", "move_right",
+// "move_up", "move_down")` — is **four lookups**, so at the constructed worst
+// case a full character controller asking six string-form questions a frame
+// costs under 5 000 byte comparisons. Against a 16.7 ms frame that is noise,
+// and against the four texture binds a frame of `app:draw` it is not
+// measurable. **A linear walk is the right structure here** and a hash table
+// would be an index to keep in step with the table for no gain at this size.
+//
+// It is also entirely avoidable, and Godot's own documentation recommends
+// avoiding it, so the fast path exists beside the string form:
+//
+//     // once, at startup
+//     input.Action move_right = input.action_id("move_right")
+//     // every frame
+//     if input.is_pressed(move_right):
+//
+// `is_pressed(Action)` is a bounds check, a walk of at most `MAX_BINDINGS` = 4
+// bindings, and two array reads per binding. **Zero comparisons of anything.**
+//
+// **The two forms cannot disagree, because the string form is defined as the
+// handle form.** `is_action_pressed(name)` is literally `is_pressed(action_id
+// (name))` and every other pair below is the same shape. There is one
+// implementation of each question and the string form is a lookup in front of
+// it — which is the only arrangement under which offering two spellings is not
+// offering two answers.
+
+// A handle naming a registered action — `action_id` once at startup, then the
+// `is_pressed` family every frame.
+//
+// **`distinct`, and not a bare `i32`, for the reason the `app:draw` work order
+// spells out at length**: a name is a view and takes no part in type identity,
+// so an `i32` handle would stand wherever an `i32` keycode is wanted. The
+// mistake that buys is `is_pressed(i32(Keycode.Right))` — which would compile,
+// read slot 262 of a 32-slot table, and answer `false` for ever. `distinct` is
+// the one construct whose whole job is to add an identity, the tag erases at
+// transpile, and the refusal is `ERR0504` at the argument.
+//
+// A handle is a slot index. It is stable for the life of the action and is
+// invalidated only by `clear_actions`, which invalidates every handle at once —
+// see `erase_action`'s absence, above, for why nothing invalidates one alone.
+distinct type Action: (i32 slot)
+
+// Whether `a` names a registered action. False for the handle `action_id`
+// answers for an unknown name, and false for every handle held across a
+// `clear_actions`.
+//
+// Every reader below is total on an invalid handle — `is_pressed` answers
+// false, `axis` answers `0.0` — so this is for a program that wants to *know*,
+// such as a settings screen reporting that a keymap file named an action the
+// build does not have.
+bool action_valid(Action a):
+    i32 s = i32(a)
+    return s >= 0 && s < g_action_count
+
+// Whether slot `s` holds exactly the `n` bytes of `name`. Split out so the
+// length gate and the byte loop are one thing a reader checks once, rather than
+// a pattern repeated at every caller with the gate forgotten in one of them.
+private bool name_matches(i32 s, string8 name, i32 n):
+    if g_action_name_len[s] != n:
+        return false
+    for i in 0..<n:
+        if g_action_name[s][i] != name[i]:
+            return false
+    return true
+
+// The slot `name` occupies, or `-1`. The one lookup; everything that takes a
+// `string` goes through it.
+//
+// **The comparison is a byte loop over this package's own storage and not
+// `core:strings`.** `strings.compare` would answer the same question, and
+// importing it would put an ordering — a *total* order, with a collation
+// disclaimer — into a package that needs equality, for an operand one half of
+// which is a `[ACTION_NAME_MAX]char8` rather than a `string` at all. The loop
+// is six lines, it is the same loop `push_drop` already writes against
+// `g_drop_bytes`, and it keeps this package's import list at one entry.
+private i32 find_action(string8 name):
+    i32 n = i32(#len(name))
+    if n <= 0 || n > ACTION_NAME_MAX:
+        return -1
+    for s in 0..<g_action_count:
+        if name_matches(s, name, n):
+            return s
+    return -1
+
+// Register `name`. Godot's `InputMap.add_action`, answering whether the action
+// is now in the table.
+//
+// **Registering a name that is already registered answers `true` and changes
+// nothing** — no binding is erased and no slot is spent. That is not laxity: a
+// startup path that installs its defaults, and a settings screen that then
+// loads a saved keymap over the top, both call this, and the second must not
+// erase what the player chose. Erasing bindings is `action_erase_keys`, which
+// says so in its name.
+//
+// `false`, and nothing stored, in exactly three cases:
+//
+//   * the name is **empty** — an action nothing can name is not an action;
+//   * the name is **longer than `ACTION_NAME_MAX`** — refused rather than
+//     truncated, see that constant for why truncation is the worse failure;
+//   * the table is **full** at `MAX_ACTIONS` distinct names.
+bool add_action(string8 name):
+    i32 n = i32(#len(name))
+    if n <= 0 || n > ACTION_NAME_MAX:
+        return false
+    if find_action(name) >= 0:
+        return true
+    if g_action_count >= MAX_ACTIONS:
+        return false
+    i32 slot = g_action_count
+    for i in 0..<n:
+        g_action_name[slot][i] = name[i]
+    g_action_name_len[slot] = n
+    g_bind_count[slot] = 0
+    g_action_count = slot + 1
+    return true
+
+// Whether `name` is registered. Godot's `InputMap.has_action`.
+bool has_action(string8 name):
+    return find_action(name) >= 0
+
+// The handle for `name`, resolved **once**, at startup. An unknown name answers
+// a handle `action_valid` refuses and every reader answers emptily for — it
+// does not trap, for the same reason `key_down` of a code past the table does
+// not: the caller of a keymap is often a file, and a file naming an action this
+// build does not have is a configuration mistake rather than a program error.
+Action action_id(string8 name):
+    return Action(find_action(name))
+
+// The name `a` was registered under, or the empty string for an invalid handle.
+//
+// **The result borrows this package's table.** It is the copy `add_action`
+// made, not the caller's original bytes, and it stays valid for as long as the
+// action does — which is until `clear_actions`, because nothing else frees a
+// slot. Copy it before that if it must outlive one, the same rule
+// `dropped_path` carries and for the same reason.
+//
+// This is what a rebinding screen lists its rows from, and it is also the
+// cheapest proof that the copy in `add_action` really happened.
+string8 action_name(Action a):
+    if !action_valid(a):
+        return ""
+    i32 s = i32(a)
+    return string8(g_action_name[s][0..<g_action_name_len[s]])
+
+// How many actions are registered. `MAX_ACTIONS` is the cap.
+i32 action_count():
+    return g_action_count
+
+// Bind key `code` to the action `name`, optionally requiring `mods` to be held.
+// Godot's `InputMap.action_add_event` under the rename its own section argues
+// for.
+//
+// `mods` is a `Modifier` bitmask and is a **requirement**, not a prohibition:
+// the bits named must be held, and anything else may be. `0` — the default, and
+// what every movement binding writes — requires nothing. The value is masked
+// with `MODIFIER_MASK` on the way in, so a caller cannot accidentally require
+// `KEY_UP` or one of the `MOUSE_*` flags, which are this package's packing of a
+// transition and not a report about what is held.
+//
+// **Binding the same `(code, mods)` pair twice answers `true` and spends no
+// slot**, so a keymap loaded twice is the keymap once. Registering the same
+// code under two different `mods` is two bindings, deliberately: `S` and
+// `Ctrl+S` are two different things to ask for.
+//
+// `false`, and nothing stored, in exactly three cases:
+//
+//   * `name` names no registered action — call `add_action` first;
+//   * `code` is outside `0 ..< KEY_CODE_COUNT`, which is the same range every
+//     reader in the key table refuses, so a binding can never name a key the
+//     table has no bit for;
+//   * this action already holds `MAX_BINDINGS` bindings.
+bool action_add_key(string8 name, i32 code, u32 mods = 0):
+    i32 s = find_action(name)
+    if s < 0:
+        return false
+    if code < 0 || code >= KEY_CODE_COUNT:
+        return false
+    u32 req = mods & MODIFIER_MASK
+    for i in 0..<g_bind_count[s]:
+        if g_bind_code[s][i] == code && g_bind_mods[s][i] == req:
+            return true
+    if g_bind_count[s] >= MAX_BINDINGS:
+        return false
+    i32 k = g_bind_count[s]
+    g_bind_code[s][k] = code
+    g_bind_mods[s][k] = req
+    g_bind_count[s] = k + 1
+    return true
+
+// Drop every binding on `name`, keeping the action itself and its handle.
+// Godot's `InputMap.action_erase_events` under the same rename.
+//
+// This plus `action_add_key` is the whole of run-time rebinding, and keeping
+// the action is the point: a handle a program resolved at startup still names
+// the same action afterwards, so the character controller is untouched by a
+// player changing a key in a menu.
+//
+// `false` for a name that is not registered, and nothing is changed.
+bool action_erase_keys(string8 name):
+    i32 s = find_action(name)
+    if s < 0:
+        return false
+    g_bind_count[s] = 0
+    return true
+
+// How many bindings `a` holds. `0` for an invalid handle.
+i32 binding_count(Action a):
+    if !action_valid(a):
+        return 0
+    return g_bind_count[i32(a)]
+
+// How many bindings `name` holds. `0` for an unregistered name, which is the
+// same answer a registered action with no bindings gives — `has_action` is what
+// tells those apart.
+i32 action_key_count(string8 name):
+    return binding_count(action_id(name))
+
+// Drop every action and every binding. **Every `Action` handle is invalidated**
+// — that is the whole reason this is the only wholesale reset and there is no
+// per-action erase.
+//
+// It is what a settings screen reloading a keymap from disk runs first, and it
+// is what a test suite runs to start from a known table. It touches no key
+// state: the levels, the edges and `mods_now` are the key table's and are not
+// this layer's to clear.
+void clear_actions():
+    g_action_count = 0
+
+// ── The edges are inherited, not reinvented ────────────────────────────────
+//
+// `is_just_pressed` is `key_pressed` folded over an action's bindings, and
+// `is_just_released` is `key_released` folded the same way. **Nothing here
+// latches, stores or clears an edge**, which has three consequences worth
+// stating because each of them is a bug this layer does not have:
+//
+//   * the **latch rule is inherited whole** — an edge is set where the level
+//     changed and nowhere else, so sokol's auto-repeat `KEY_DOWN` does not
+//     re-fire a bound jump, exactly as it does not re-fire an unbound one;
+//   * `clear_edges` **already clears it**. There is no second clear point to
+//     call, no second one to forget, and no way for the two to fall out of
+//     step;
+//   * the **tap** — pressed and released inside one frame — is visible through
+//     an action for the same reason it is visible through a key:
+//     `is_just_pressed(a) && is_just_released(a) && !is_pressed(a)` is the
+//     honest description of a tapped, bound key, and the key table is what
+//     remembers it.
+//
+// A focus loss likewise needs nothing here: it clears the levels of the key
+// table, so every action bound to a held key reads `false` on the next call,
+// with no per-action state to have got stale.
+//
+// ── `any`, and the case that makes "just pressed" ambiguous ────────────────
+//
+// An action is a set of bindings, so every question is a fold, and the fold is
+// **any**:
+//
+//   * `is_pressed` — any binding is held;
+//   * `is_just_pressed` — any binding went down since the last `clear_edges`;
+//   * `is_just_released` — any binding came up since the last `clear_edges`.
+//
+// `any` for the level is not in question. The case that is, and it must be
+// written down rather than discovered:
+//
+//   **"move_right" is bound to both Right and D. The player is holding Right,
+//   already, from three frames ago. This frame they also tap D.**
+//
+// `key_pressed(D)` is latched, so **`is_just_pressed("move_right")` answers
+// `true`** — for an action that was already pressed before the frame began, and
+// stays pressed after it. That is the answer, it is tested, and it is not the
+// answer Godot gives: Godot tracks a per-action pressed level of its own and
+// records the "just pressed" frame only on the action's *transition* from
+// unpressed to pressed, so a second binding going down while the action is
+// already pressed sets nothing.
+//
+// **Godot's answer was available and was not taken, for two reasons.**
+//
+// The first is the one that decides it. Godot's answer needs a per-action level
+// shadow plus a per-action edge — a second state machine, with a second clear
+// point, that `clear_edges` does not reach and that a focus loss does not
+// reset. That is precisely *reinventing* the edges rather than inheriting them,
+// and every failure listed three paragraphs up comes back with it: a program
+// would now have two places a stale edge could live and one of them would be
+// this one. A binding layer that holds state is no longer a binding layer.
+//
+// The second is that the fabricated answer is not obviously better at the call
+// site. The player pressed a key bound to jump. Reporting the jump is a
+// defensible reading of what happened; swallowing it because a *different* key
+// bound to the same action happened to be down is a rule the player cannot see
+// and cannot predict. The case is rare — it needs two bindings on one action
+// and a player using both at once — and the sticky-edge rule above means it can
+// fire at most once per frame however many bindings tapped.
+//
+// **The mirror case holds and is the same answer.** Holding Right and D, then
+// releasing Right alone, gives `is_just_released("move_right") == true` while
+// `is_pressed("move_right")` is still `true`, because D is still down. A
+// program hanging a discrete act on a release — commit the drag, fire the
+// charge — should read `is_just_released(a) && !is_pressed(a)` if it means *"no
+// longer held"* rather than *"a binding came up"*. Both of those are real
+// questions and this layer answers the second; the first is one `&&` away and
+// is written where the program's meaning is, which is the right place for it.
+
+// Whether any binding of `a` is held **right now** — the level, and what a
+// frame loop asking *"is the player moving right"* wants. Godot's
+// `Input.is_action_pressed` by handle.
+//
+// A binding with a `mods` requirement counts only while those bits are in
+// `mods_now()`. `false` for an invalid handle and for an action with no
+// bindings, so an unguarded call is safe the way `key_down` is.
+bool is_pressed(Action a):
+    if !action_valid(a):
+        return false
+    i32 s = i32(a)
+    for i in 0..<g_bind_count[s]:
+        if key_down(g_bind_code[s][i]) && (mods_now() & g_bind_mods[s][i]) == g_bind_mods[s][i]:
+            return true
+    return false
+
+// Whether any binding of `a` went down since the last `clear_edges` — the press
+// edge. Godot's `Input.is_action_just_pressed` by handle.
+//
+// See "`any`, and the case that makes 'just pressed' ambiguous" above for what
+// this answers when one binding is held and another is tapped, which is the one
+// case where the fold is a decision rather than an obvious reading.
+bool is_just_pressed(Action a):
+    if !action_valid(a):
+        return false
+    i32 s = i32(a)
+    for i in 0..<g_bind_count[s]:
+        if key_pressed(g_bind_code[s][i]) && (mods_now() & g_bind_mods[s][i]) == g_bind_mods[s][i]:
+            return true
+    return false
+
+// Whether any binding of `a` came up since the last `clear_edges` — the release
+// edge. Godot's `Input.is_action_just_released` by handle.
+//
+// This can be `true` while `is_pressed` is also `true`, when a second binding is
+// still held; the section above says why, and says what to write when the
+// question is *"no longer held"*.
+bool is_just_released(Action a):
+    if !action_valid(a):
+        return false
+    i32 s = i32(a)
+    for i in 0..<g_bind_count[s]:
+        if key_released(g_bind_code[s][i]) && (mods_now() & g_bind_mods[s][i]) == g_bind_mods[s][i]:
+            return true
+    return false
+
+// `-1.0`, `0.0` or `+1.0` from two actions — Godot's `Input.get_axis` by
+// handle, and the first line of every 2D character controller in GDScript.
+//
+// `+1.0` when only `pos` is held, `-1.0` when only `neg` is, and **`0.0` when
+// both are**, which is the case a hand-rolled `if held(right): x = 1; if
+// held(left): x = -1` chain gets wrong by answering whichever branch it wrote
+// last. Godot's digital answer is exactly these three values and this is
+// exactly Godot's arithmetic — `pressed(pos) - pressed(neg)` — rather than a
+// chain that happens to agree on two of the four inputs.
+//
+// There is **no deadzone parameter**, because there is no analogue input here
+// to have one; see "Actions are a binding layer and carry no policy".
+f32 axis(Action neg, Action pos):
+    f32 v = 0.0
+    if is_pressed(pos):
+        v = v + 1.0
+    if is_pressed(neg):
+        v = v - 1.0
+    return v
+
+// The diagonal component of a `vector` answer: `sqrt(0.5)`, to `f32`'s worth of
+// digits.
+//
+// **Written as a constant rather than computed**, which is the whole reason
+// this package still imports nothing but `app:app`. Digital input gives each
+// axis one of three values, so `vector` has exactly nine possible answers and
+// the only magnitudes among them are `0`, `1` and this one. A `sqrt` would be
+// `<math.h>` — a header this freestanding-clean package does not emit and would
+// force on every importer, since a `foreign` block is a property of its package
+// and not of the call that reaches it — bought for a number that is known at
+// compile time.
+const f32 DIAGONAL = 0.70710678
+
+// A direction from four actions — Godot's `Input.get_vector` by handle, with
+// Godot's argument order and Godot's axes.
+//
+// `x` is `axis(left, right)` and `y` is `axis(up, down)`, so **`+y` is down**:
+// the screen convention Godot's 2D uses, which `app:draw` also uses (*"origin
+// top-left, y down"*), so a vector out of here drives a position in there with
+// no sign to remember.
+//
+// **The length is limited to 1, which is Godot's rule and matters.** Held right
+// and down together, the raw sum is `(1, 1)` — length 1.414 — and a character
+// controller multiplying it by a speed would move **41% faster diagonally**,
+// which is the oldest bug in 2D movement and the one Godot's normalisation
+// exists to prevent. The diagonals answer `(±0.70710678, ±0.70710678)`, which is
+// that vector normalised, exactly, with no square root taken; see `DIAGONAL`.
+//
+// The nine answers in full: `(0,0)` with nothing or with both ends of both axes
+// held, `(±1,0)` and `(0,±1)` on an axis, and the four diagonals.
+[2]f32 vector(Action left, Action right, Action up, Action down):
+    f32 x = axis(left, right)
+    f32 y = axis(up, down)
+    if x != 0.0 && y != 0.0:
+        return (x * DIAGONAL, y * DIAGONAL)
+    return (x, y)
+
+// ── The string forms: Godot's spelling, defined as the handle forms ────────
+//
+// Each of the five below is its handle form with `action_id` in front of it and
+// nothing else. That is not a stylistic preference: it is what makes offering
+// two spellings safe, because there is one implementation of each question and
+// no way for the pair to answer differently. An unknown name resolves to an
+// invalid handle, which every reader above already answers emptily for — so an
+// unknown action reads `false`, or `0.0`, and never traps.
+//
+// Prefer these while writing; hoist to a handle when the name is in a hot loop
+// and the profile says so. See "Lookup cost" for what the lookup actually
+// costs, which at this table size is very little.
+
+// Godot's `Input.is_action_pressed`. `false` for a name nothing registered.
+bool is_action_pressed(string8 name):
+    return is_pressed(action_id(name))
+
+// Godot's `Input.is_action_just_pressed`. `false` for a name nothing
+// registered.
+bool is_action_just_pressed(string8 name):
+    return is_just_pressed(action_id(name))
+
+// Godot's `Input.is_action_just_released`. `false` for a name nothing
+// registered.
+bool is_action_just_released(string8 name):
+    return is_just_released(action_id(name))
+
+// Godot's `Input.get_axis`. `0.0` where either name is unregistered, which is
+// the same answer an unheld axis gives — a keymap that failed to load moves
+// nothing rather than moving in one direction.
+f32 get_axis(string8 negative, string8 positive):
+    return axis(action_id(negative), action_id(positive))
+
+// Godot's `Input.get_vector`. Four lookups; see "Lookup cost" for the number,
+// and hoist to `vector` with four handles if a profile ever asks.
+[2]f32 get_vector(string8 left, string8 right, string8 up, string8 down):
+    return vector(action_id(left), action_id(right), action_id(up), action_id(down))

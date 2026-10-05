@@ -1,0 +1,336 @@
+// tools/dado — the Dado toolchain's driver: Dado source to C to a program.
+//
+//     dado build corpus/tour           transpile and compile
+//     dado build game -l raylib        ...and link a system library
+//     dado run   corpus/tour           ...and run it, exiting with its status
+//     dado run   game -- --level 3     ...passing arguments to the program
+//     dado check corpus/tour           diagnostics only, nothing written
+//     dado emit  corpus/tour --emit=types
+//     dado where                       where this toolchain's parts are
+//     dado doc / api / inspect / peek / refs / apply / explain / search / lexicon / agent / new
+//     dado install / editors / uninstall
+//     dado clean
+//
+// The entry is a **package**, a directory (a single `.dado` file works too).
+// The command line is declared once with `core:flags`, which writes the help
+// and refuses what it does not know with the repair; `settings.dado` finds
+// the toolchain from this program's own path; `cc.dado` chooses the C
+// compiler and lays out its argument lists; `build.dado` holds the commands.
+//
+// Written as the bash driver's successor and at parity with it, line for
+// line where other tools read the output: `built <path>`, `ok <name>`, the
+// `dadoc` / `cc` / `run` framing, and `exit N`.
+package driver
+
+import "core:flags"
+import "core:fmt"
+import "core:io"
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:os"
+import "core:strings"
+
+private const string8 SHARED = "build run check emit test"
+
+// The command line, and the handle of each declaration.
+type Line:
+    flags.Parser p
+    flags.TextFlag out
+    flags.ListFlag libs
+    flags.ListFlag defines
+    flags.ListFlag pass
+    flags.TextFlag passes
+    flags.TextFlag cc
+    flags.BoolFlag no_c
+    flags.BoolFlag debug
+    flags.BoolFlag no_werror
+    flags.BoolFlag no_lines
+    flags.TextFlag sanitize
+    flags.BoolFlag no_sanitize
+    flags.BoolFlag lenient
+    flags.BoolFlag link
+    flags.TextFlag target
+    flags.TextFlag manifest
+    flags.BoolFlag web_threads
+    flags.BoolFlag release
+    flags.TextFlag html
+    flags.TextFlag base
+    flags.TextFlag shader
+    flags.BoolFlag no_assert
+    flags.BoolFlag no_expect
+    flags.TextFlag emit
+    flags.TextFlag filter
+    flags.TextFlag shard
+    flags.BoolFlag verbose
+    flags.TextFlag pkg
+    flags.ListFlag args
+    flags.BoolFlag check
+    flags.ListFlag files
+    flags.TextFlag doc_out
+    flags.TextFlag spine
+    flags.TextFlag ext
+    flags.TextFlag captions
+    flags.TextFlag what
+    flags.ListFlag paths
+    flags.BoolFlag no_update_check
+    flags.BoolFlag explain
+    flags.BoolFlag rollback
+    flags.BoolFlag upgrade_yes
+    flags.TextFlag upgrade_version
+
+// The driver's whole command line.
+Line declare():
+    Line d
+    d.p = flags.parser("dado", "The Dado toolchain: build, run and check Dado packages (Dado -> C -> program).")
+    ^flags.Parser p = &d.p
+    p.command("build", "transpile a package and compile it")
+    p.command("run", "build a package, then run it with the arguments after --")
+    p.command("check", "check a package without compiling it")
+    p.command("emit", "print one compiler phase for a package")
+    p.command("test", "build and run a package's @test files")
+    p.command("fmt", "format files in place")
+    p.command("doc", "document a package, the language reference, or parameter lines")
+    p.command("clean", "remove the build directory")
+    p.command("where", "print where the toolchain's parts are")
+    p.command("tools", "list the tools beside dado, or rebuild them (tools rebuild [NAME])")
+    p.command("doctor", "check that the toolchain works here, and say what to do where it does not")
+    p.command("install", "finish an install: tools, PATH, editors (dadoc bootstrap runs it)")
+    p.command("editors", "set Dado up in the editors found here, or take it out (--remove)")
+    p.command("uninstall", "undo every change the install made outside its folder, then delete it")
+    p.command("update", "move the install's collections to the newest this dadoc allows (--rollback: back)")
+    p.command("upgrade", "install the newest dadoc and dado-lsp release (--rollback: the previous ones)")
+    p.command("help", "")
+    d.out = p.text("-o", "PATH", "where to put the program (default: build/<package's path>)", "", SHARED)
+    d.libs = p.list("-l", "NAME", "link a system library; also DADO_LDFLAGS", SHARED)
+    d.defines = p.list("-D", "NAME=VALUE", "replace a @const's initializer with a literal", SHARED)
+    d.pass = p.list("--pass", "=NAME=on|off", "switch one compiler pass", SHARED)
+    d.passes = p.choice("--passes", "=off|default", "every compiler pass off, or the default set", "", SHARED)
+    d.cc = p.text("--cc", "PROG", "the C compiler (default: the pinned zig, as zig cc)", "", SHARED)
+    _ = p.boolean("--keep-c", "", SHARED)
+    d.no_c = p.boolean("--no-c", "delete the generated C after a successful compile", SHARED)
+    d.debug = p.boolean("--debug", "compile the C with -g -O0 rather than -O2", SHARED)
+    d.no_werror = p.boolean("--no-werror", "do not treat C warnings as errors", SHARED)
+    d.no_lines = p.boolean("--no-line-directives", "emit C that reports its own line numbers, not the .dado's", SHARED)
+    d.sanitize = p.choice("--sanitize", "[=address|thread]", "build under the sanitizers (on for test)", "", SHARED)
+    d.no_sanitize = p.boolean("--no-sanitize", "build without the sanitizers", SHARED)
+    d.lenient = p.boolean("--lenient", "drop --strict: the gate's lints are warnings again", SHARED)
+    d.link = p.boolean("--link", "link a freestanding (#OS == #NONE) build anyway, with DADO_LDFLAGS", SHARED)
+    d.target = p.choice("--target", "=web|js", "build for the web, or as a JS library (any other triple: DADO_TARGET)", "", SHARED)
+    d.manifest = p.text("--manifest", "=LIST", "with build: write the manifest, and run the extensions LIST names (h, dts, or a path)", "", SHARED)
+    d.web_threads = p.boolean("--web-threads", "with --target=web: a threaded module", SHARED)
+    d.release = p.boolean("--release", "a release build: #script_reload is refused", SHARED)
+    d.html = p.text("--html", "[=PATH]", "with --target=web: the page's template", "", SHARED)
+    d.base = p.text("--base --html-base", "=PREFIX", "with --target=web: the page's <base href>", "", SHARED)
+    d.shader = p.text("--shader", "=LIST", "the formats DadoGL shaders compile to (reserved)", "", SHARED)
+    d.no_assert = p.boolean("--no-assert", "emit no assert: the statement goes, condition included", SHARED)
+    d.no_expect = p.boolean("--no-expect", "emit no expect: the report goes", SHARED)
+    d.emit = p.text("--emit", "=PHASE", "with emit: the phase to print (tokens, ast, types, views, c, h, diagnostics, ...)", "", SHARED)
+    d.filter = p.text("--filter", "SUBSTR", "with test: only the files whose name holds SUBSTR", "", SHARED)
+    d.shard = p.text("--shard", "K/N", "with test: only slice K of N", "", SHARED)
+    d.verbose = p.boolean("-v --verbose", "print every command before running it", SHARED)
+    d.pkg = p.positional("PKG", "the package directory, or one .dado file", false, SHARED)
+    d.args = p.tail("ARGS", "the program's arguments", "run")
+    d.check = p.boolean("--check", "write nothing; list the files that would change", "fmt")
+    d.files = p.rest("FILE", "the files to format", "fmt")
+    d.doc_out = p.text("-o", "FILE", "the document to write", "", "doc")
+    d.spine = p.text("--spine", "FILE", "the spine document", "", "doc")
+    d.ext = p.text("--ext", "SUFFIX", "the suffix of the files to read", ".dado", "doc")
+    d.captions = p.text("--captions", "FILE", "the reference's captions", "", "doc")
+    d.what = p.positional("WHAT", "a package (core:strings, a directory), a diagnostic code, `reference`, a topic under docs/, or `params`", false, "doc")
+    d.paths = p.rest("PATH", "the paths `params` reads", "doc")
+    d.explain = p.boolean("--explain", "follow each diagnostic with why, and the rule behind its code", SHARED)
+    d.no_update_check = p.boolean("--no-update-check", "do not ask the repository whether the collections moved (also DADO_NO_UPDATE_CHECK=1)")
+    d.rollback = p.boolean("--rollback", "return to what the last update or upgrade replaced", "update upgrade")
+    d.upgrade_yes = p.boolean("--yes", "upgrade without asking, a new major version included", "upgrade")
+    d.upgrade_version = p.text("--version", "X.Y.Z", "upgrade to this release, newer or not", "", "upgrade")
+    declare_tools(p)
+    declare_queries(p)
+    declare_install(p)
+    declare_colour(p)
+    return d
+
+// The help for `command` on standard output.
+private void print_help(^Line d, string8 command):
+    ref []char8 h = d.p.help_for(command)
+    string8 text = h
+    fmt.print(text)
+    _ = io.flush(io.stdout())
+
+// The old names of the toolchain's variables. Nothing reads them, so a
+// profile still setting one is told, once per run, instead of being ignored
+// without a word.
+private const string8 LEGACY = "TOY_TOYC TOY_DADOC TOY_CC TOY_COLLECTIONS TOY_BUILD_DIR TOY_TARGET TOY_CFLAGS TOY_LDFLAGS TOY_NODE TOY_WASM_LD TOY_RUNNER TOY_TRACE TOY_HASH_SEED TOYS_QJS_CACHE TOYS_QJS_UPSTREAM TOYC"
+
+private void legacy_names():
+    strings.Builder b = strings.builder(64)
+    for name in words_of(LEGACY):
+        (ref []char8 _, bool found) = os.get_env(name)
+        if found:
+            _ = strings.append(&b, " ")
+            _ = strings.append(&b, name)
+    string8 seen = strings.text(b)
+    if #len(seen) > 0:
+        warn(txt(#format("ignoring", seen, ": the toolchain's variables are DADO_* now (TOY_TOYC is DADO_DADOC, TOY_HASH_SEED is DADO_HASH_SEED, TOYS_QJS_* is DADO_QJS_*, TOYC is gone). Rename them where they are set")))
+
+i32 main(i32 argc, ^rawptr argv):
+    arena.Arena a = arena.over(libc.allocator())
+    using arena.allocator(&a):
+        i32 status = drive(os.args(argc, argv))
+        _ = io.flush(io.stdout())
+        return status
+
+// The whole driver, over the words after the program's name.
+i32 drive([]string8 all):
+    []string8 args = all[1..<#len(all)] if #len(all) > 0 else all
+    swap_pending_driver()
+    Line d = declare()
+    // A first word that is not a verb is a tool's name: `dado webdev ...`.
+    if #len(args) > 0 && !strings.starts_with(args[0], "-"):
+        (bool verb, string8 hint) = verb_or_hint(&d.p, args[0])
+        if !verb:
+            start()
+            update_check(args[0], false)
+            return dispatch_tool(args[0], args[1..<#len(args)], hint)
+    // Bare `dado` on a terminal is the dashboard, when it is built or can be.
+    if #len(args) == 0 && os.is_terminal(0) && os.is_terminal(1):
+        (bool ran, i32 status) = run_dashboard()
+        if ran: return status
+    // `--` hands words to a running program, so only `run` takes it.
+    if #len(args) > 0 && args[0] != "run" && listed(SHARED, args[0]):
+        for w in args:
+            if w == "--":
+                die(txt(#format("`--` passes arguments to a running program, and `", args[0], "` does not run\n  one. Try:  dado run ", args[0] if #len(args) < 2 else args[1], " -- ...")))
+    try string8 cmd = d.p.parse(args) else:
+        string8 why = d.p.error()
+        if strings.contains(why, "`--target`"):
+            die(txt(#format(why, ".\n  For any other triple set DADO_TARGET, e.g. DADO_TARGET=x86_64-unknown-none.")))
+        if strings.contains(why, "--help"):
+            die(why)
+        die(txt(#format(why, ". Try --help.")))
+        return 1
+    settle_colour(&d.p)
+    legacy_names()
+    if d.p.wants_help() || cmd == "help":
+        print_help(&d, cmd if cmd != "help" else "")
+        return 0
+    if #len(args) == 0 || cmd == "":
+        print_help(&d, "")
+        return 1
+    start()
+    update_check(cmd, d.p.on(d.no_update_check))
+    if cmd == "update":
+        return update_command(d.p.on(d.rollback))
+    if cmd == "upgrade":
+        return upgrade_command(d.p.on(d.rollback), d.p.value(d.upgrade_version), d.p.on(d.upgrade_yes))
+    if cmd == "clean":
+        return clean()
+    if cmd == "fmt":
+        return format_files(d.p.values(d.files), d.p.on(d.check))
+    // Documentation and the questions agents ask (query.dado, gendocs.dado).
+    if cmd == "doc":
+        return doc_verb(&d.p, d.p.value(d.what), d.p.values(d.paths), d.p.value(d.doc_out), d.p.value(d.spine), d.p.value(d.ext), d.p.value(d.captions))
+    (bool answered, i32 answer) = query_verbs(&d.p, cmd)
+    if answered: return answer
+    if cmd == "test":
+        set_test_selection(d.p.value(d.filter), d.p.value(d.shard), d.p.given(d.sanitize))
+    if cmd == "tools":
+        return tools_command(&d.p)
+    if cmd == "doctor":
+        return doctor(doctor_json(&d.p))
+    if cmd == "install" || cmd == "editors" || cmd == "uninstall":
+        return install_verbs(&d.p, cmd)
+    Options o = options(&d, cmd)
+    return package_command(&o)
+
+// Everything the package commands read off the command line.
+type Options:
+    string8 cmd
+    string8 pkg
+    string8 out
+    bool out_given
+    ref []string8 libs           // each as `-l<name>`
+    ref []string8 defines        // `-D…`, `--pass=…`, `--passes=…`, for dadoc
+    ref []string8 strip          // `--no-assert`, `--no-expect`
+    string8 cc
+    bool keep_c
+    bool debug
+    bool werror
+    bool line_directives
+    bool sanitize
+    string8 sanitize_kind
+    bool strict
+    bool link
+    string8 target
+    string8 manifest
+    bool web_threads
+    bool release
+    bool html_given
+    string8 html
+    string8 base
+    string8 shader
+    string8 emit
+    ref []string8 args
+    bool dashed
+    bool explain
+
+private Options options(^Line d, string8 cmd):
+    Options o
+    o.cmd = cmd
+    o.pkg = d.p.value(d.pkg)
+    o.out = d.p.value(d.out)
+    o.out_given = #len(o.out) > 0
+    ref []string8 libs = #make([]string8, 0)
+    for l in d.p.values(d.libs):
+        _ = #append(libs, txt(#format("-l", l)))
+    o.libs = libs
+    ref []string8 defines = #make([]string8, 0)
+    for v in d.p.values(d.defines):
+        _ = #append(defines, txt(#format("-D", v)))
+    for v in d.p.values(d.pass):
+        _ = #append(defines, txt(#format("--pass=", v)))
+    string8 passes = d.p.value(d.passes)
+    if #len(passes) > 0:
+        _ = #append(defines, txt(#format("--passes=", passes)))
+    o.defines = defines
+    ref []string8 strip = #make([]string8, 0)
+    if d.p.on(d.no_assert): _ = #append(strip, "--no-assert")
+    if d.p.on(d.no_expect): _ = #append(strip, "--no-expect")
+    o.strip = strip
+    o.cc = d.p.value(d.cc)
+    o.keep_c = !d.p.on(d.no_c)
+    o.debug = d.p.on(d.debug)
+    o.werror = !d.p.on(d.no_werror)
+    o.line_directives = !d.p.on(d.no_lines)
+    // On for `test`, off for everything else; `--sanitize` turns it on and
+    // `--no-sanitize` off. Given both, `--no-sanitize` wins, wherever each
+    // was written.
+    o.sanitize = cmd == "test"
+    o.sanitize_kind = "address"
+    if d.p.given(d.sanitize):
+        o.sanitize = true
+        o.sanitize_kind = d.p.value(d.sanitize)
+    if d.p.on(d.no_sanitize):
+        o.sanitize = false
+    o.strict = !d.p.on(d.lenient) && cmd != "emit"
+    o.link = d.p.on(d.link)
+    o.target = d.p.value(d.target)
+    o.manifest = d.p.value(d.manifest)
+    o.web_threads = d.p.on(d.web_threads)
+    o.release = d.p.on(d.release)
+    o.html_given = d.p.given(d.html)
+    o.html = d.p.value(d.html)
+    o.base = d.p.value(d.base)
+    o.shader = d.p.value(d.shader)
+    o.emit = d.p.value(d.emit)
+    ref []string8 pargs = #make([]string8, 0)
+    for v in d.p.values(d.args):
+        _ = #append(pargs, v)
+    o.args = pargs
+    o.dashed = #len(pargs) > 0
+    o.explain = d.p.on(d.explain)
+    if verbose_given(d):
+        set_verbose(true)
+    return o
+
+private bool verbose_given(^Line d):
+    return d.p.on(d.verbose)

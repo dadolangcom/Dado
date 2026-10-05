@@ -1,0 +1,636 @@
+@test
+// app:app unit test — drives the singleton runtime with fake backends (no
+// terminal, no window, no drawing): hooks fire in order, the frame barrier
+// ticks, the two allocators are reachable, capabilities gate, and the job
+// surface (now the real core:jobs pool, since the fake backend advertises
+// Threads) runs a parallel_for across workers and a submit/wait to completion,
+// the submitted job handing its result back through a signal.
+//
+// The job work runs inside `ready` — while the scheduler is live — because
+// `teardown` stops the pool; results are captured in package state and asserted
+// after `run` returns.
+//
+// ## What is faked here and what is real, and why that split
+//
+// This package imports no backend, no window and no drawing — that is the whole
+// of its claim — so its own test cannot bring `app:draw` up and look at a
+// canvas. What it tests instead is that the runtime **drives** the five service
+// slots at the right points of the frame: `surface_up` once before `ready`,
+// `render` inside the pass and after the draw hook, `deliver` once per tick
+// before `process`, `end_input` once per tick
+// outside the bracket, `surface_down` after `shutdown`. The slots are filled
+// here with counters and sequence stamps, so an edit that moves one of them is
+// caught by an *order*, not by a count.
+//
+// The other half — that the facade fills those slots with a real `draw.init`,
+// a real root canvas and a real `input.clear_edges` — is `app:headless`'s test,
+// which is where a facade lives and where `app:draw` may be imported.
+package app
+
+import "core:threads"
+import "core:mem/arena"
+import "core:mem/libc"
+
+private i32  g_ready_calls
+private i32  g_shutdown_calls
+private i32  g_ticks
+private i32  g_begins
+private i32  g_ends
+
+// captured job results (computed in ready, asserted after run)
+private i32  g_total
+private i32  g_flag
+
+// A submitted job hands its result back through a signal, and the thread that
+// submitted it — the one running `ready` — drains it after `wait`.
+#signal(4) tj_results(i32 value)
+private i32  g_result
+private i32  g_results_lost
+
+// atomically add this chunk's index-sum to the shared total (race-free across workers)
+void tj_sum(^JobArgs a):
+    i32 partial = 0
+    for i in a.begin..<a.end:
+        partial = partial + i
+    _ = threads.atomic_fetch_add(&g_total, partial)
+
+void tj_flag(^JobArgs a):
+    _ = a
+    threads.atomic_store(&g_flag, 1)
+    try #emit(tj_results, 42) else:
+        _ = threads.atomic_fetch_add(&g_results_lost, 1)
+
+// hooks under test
+!void th_ready():
+    g_ready_calls = g_ready_calls + 1
+    // scheduler is live here — exercise the pooled job surface
+    g_total = 0
+    parallel_for(100, 8, tj_sum, nil)          // sum 0..99 = 4950
+    g_flag = 0
+    g_result = 0
+    Handle h = submit(tj_flag, nil)
+    wait(h)
+    for value in #drain(tj_results):
+        g_result = value
+
+!void th_shutdown(): g_shutdown_calls = g_shutdown_calls + 1
+!void th_process(f32 dt):
+    _ = dt
+    g_ticks = g_ticks + 1
+
+// a fake backend advertising Threads; run drives the fixed frame steps
+private void tb_begin(): g_begins = g_begins + 1
+private void tb_end():   g_ends = g_ends + 1
+private void tb_run():
+    startup()
+    for g_ticks < 3 && !quitting():
+        tick(0.016)
+    teardown()
+
+// ── the service slots, stamped ──────────────────────────────────────────────
+//
+// Five counters and five sequence stamps. The counters answer *how often*; the
+// stamps answer *where in the frame*, which is the question a count cannot
+// answer and the one an edit is most likely to get wrong.
+
+private i32 g_surface_ups
+private i32 g_surface_downs
+private i32 g_renders
+private i32 g_end_inputs
+private i32 g_delivers
+
+private i32 g_at_surface_up
+private i32 g_at_ready
+private i32 g_at_render
+private i32 g_at_end_input
+private i32 g_at_deliver
+private i32 g_at_shutdown
+private i32 g_at_surface_down
+
+private !void ts_surface_up():
+    g_surface_ups = g_surface_ups + 1
+    g_at_surface_up = stamp()
+
+private void ts_surface_down():
+    g_surface_downs = g_surface_downs + 1
+    g_at_surface_down = stamp()
+
+private void ts_render():
+    g_renders = g_renders + 1
+    g_at_render = stamp()
+
+private void ts_end_input():
+    g_end_inputs = g_end_inputs + 1
+    g_at_end_input = stamp()
+
+private void ts_deliver():
+    g_delivers = g_delivers + 1
+    g_at_deliver = stamp()
+
+// ── the collapsed frame shape, and `hook` ───────────────────────────────────
+//
+// Three claims, and none of them can be read off the source of `tick` alone.
+//
+//   1. **There is one frame shape.** The section above sets no draw hook at all
+//      and still gets three `begin_frame`s and three `end_frame`s — under the
+//      retired two-shape `tick` that was the arm that bracketed `process`, and
+//      under this one it is a pass holding the runtime's own render. Same
+//      count, different frame, so the count alone does not tell them apart; the
+//      ordering below is what does.
+//   2. **`process` is outside the bracket and `draw` is inside it**, for a
+//      program that has both, and the runtime's `render` is inside it and
+//      **after** the hook. Asserted as an order rather than as counts: every
+//      step stamps a shared sequence number, and
+//      `process < begin < draw < render < end < end_input` is the frame written
+//      out as one chain of comparisons.
+//   3. **`hook` sets what it names and leaves alone what it does not.** The
+//      second run below changes one parameter and checks that the other three
+//      hooks are still the ones the first call gave them — which is the whole
+//      of what the sentinel-comparison in `hook` buys, and the thing that would
+//      break silently if a future edit made `hook` assign unconditionally.
+
+private i32 g_seq                  // stamped by every step of the frame
+private i32 g_at_process
+private i32 g_at_begin
+private i32 g_at_draw
+private i32 g_at_end
+
+private i32 g_h_ready
+private i32 g_h_process
+private i32 g_h_draw
+private i32 g_h_shutdown
+private i32 g_h_process_b
+
+private i32 g_h_ticks              // this backend's own tick counter
+
+private i32 stamp():
+    g_seq = g_seq + 1
+    return g_seq
+
+!void th2_ready():
+    g_h_ready = g_h_ready + 1
+    g_at_ready = stamp()
+
+!void th2_shutdown():
+    g_h_shutdown = g_h_shutdown + 1
+    g_at_shutdown = stamp()
+
+!void th2_process(f32 dt):
+    _ = dt
+    g_h_process = g_h_process + 1
+    g_at_process = stamp()
+
+// The replacement handed to the second `hook` call. Distinct from `th2_process`
+// so that "the call changed this one" and "the call left the others alone" are
+// two separate counters rather than one.
+!void th2_process_b(f32 dt):
+    _ = dt
+    g_h_process_b = g_h_process_b + 1
+    g_at_process = stamp()
+
+!void th2_draw():
+    g_h_draw = g_h_draw + 1
+    g_at_draw = stamp()
+
+private void t2_begin():
+    g_begins = g_begins + 1
+    g_at_begin = stamp()
+
+private void t2_end():
+    g_ends = g_ends + 1
+    g_at_end = stamp()
+
+private void t2_run():
+    startup()
+    g_h_ticks = 0
+    for g_h_ticks < 2 && !quitting():
+        g_h_ticks = g_h_ticks + 1
+        tick(0.016)
+    teardown()
+
+// ── the ambient allocator, and the per-frame scratch ────────────────────────
+//
+// The runtime's claim is that a program writes no allocator anywhere and its
+// allocations land in the right one of the runtime's two — and *which* one
+// depends on how often the hook runs. None of that is readable off a bare
+// `#make`, which is the point, so all of it is measured: the test installs an
+// arena as the **persistent** allocator, and every hook below writes a bare
+// `#make` and asks which arena grew.
+//
+//   ready     →  the probe (persistent) grows, the temp arena does not
+//   process   →  the temp arena grows, the probe does not
+//   draw      →  the temp arena grows, the probe does not
+//
+// The last of those three is the one a reader is most likely to doubt, so it is
+// asserted rather than assumed: `draw` is grouped with `process`, not with
+// `ready`.
+//
+// The temp arena is asked two further questions. That it is **empty at the top
+// of every frame** — a frame allocates into it and the next frame's first
+// statement reads `temp_used()` and expects 0. And that a **checkpoint** takes
+// bytes back inside a frame: `enter_temp` / `close_temp` around a large `#make`
+// leaves the arena where it started.
+//
+// And the precedence rule is measured too, because it is what an author writes
+// when something in `process` has to outlive the frame: a `using
+// app.allocator():` *inside* a hook that the runtime already put under the temp
+// arena takes it back, exactly as the precedence *explicit argument > `using` >
+// ambient* says it must.
+
+private arena.Arena g_probe
+private bool g_probe_ready
+private bool g_ambient_landed          // a bare #make in `ready` grew the probe
+private bool g_ambient_made            // ... and answered a live reference
+private bool g_ready_missed_temp       // ... and did NOT grow the temp arena
+
+private bool g_proc_in_temp            // a bare #make in `process` grew temp
+private bool g_proc_missed_probe       // ... and did NOT grow the probe
+private bool g_draw_in_temp            // a bare #make in `draw` grew temp
+private bool g_draw_missed_probe       // ... and did NOT grow the probe
+private bool g_override_landed         // `using allocator()` inside `process`
+private bool g_checkpoint_rolled       // enter_temp/close_temp took bytes back
+private bool g_escaping_kept           // enter_temp(true)/close_temp left them
+private u64  g_temp_after              // temp bytes at the end of a frame
+private u64  g_temp_at_top             // temp bytes at the top of frame 2
+private i32  g_temp_depth_in_hook      // depth seen inside a hook
+private i32  g_probe_ticks
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) probe_alloc():
+    if !g_probe_ready:
+        g_probe = arena.over(libc.allocator())
+        g_probe_ready = true
+    return arena.allocator(&g_probe)
+
+!void tp_ready():
+    u64 before = arena.used(g_probe)
+    u64 t_before = temp_used()
+    ref []i32 xs = #make([]i32, 64)          // no allocator written anywhere
+    g_ambient_made = xs != nil
+    g_ambient_landed = arena.used(g_probe) > before
+    g_ready_missed_temp = temp_used() == t_before
+
+!void tp_process(f32 dt):
+    _ = dt
+    g_probe_ticks = g_probe_ticks + 1
+    if g_probe_ticks == 2:
+        g_temp_at_top = temp_used()
+
+    // 1. the ambient here is the temp arena, not the persistent one
+    u64 p_before = arena.used(g_probe)
+    u64 t_before = temp_used()
+    ref []i32 s = #make([]i32, 128)          // no allocator written anywhere
+    _ = s
+    g_proc_in_temp = temp_used() > t_before
+    g_proc_missed_probe = arena.used(g_probe) == p_before
+
+    // 2. an author who needs the frame outlived writes one line, and it wins
+    u64 p2 = arena.used(g_probe)
+    using allocator():
+        ref []i32 keep = #make([]i32, 32)
+        _ = keep
+    g_override_landed = arena.used(g_probe) > p2
+
+    // 3. a checkpoint takes a big transient back inside the frame
+    u64 mark = temp_used()
+    using enter_temp():
+        ref []i32 big = #make([]i32, 4096)
+        _ = big
+        g_temp_depth_in_hook = temp_depth()
+    _ = close_temp()
+    g_checkpoint_rolled = temp_used() == mark
+
+    // 4. an escaping frame opens no rollback, so its bytes survive the close —
+    //    which is the whole of what `escaping` means and the one branch of
+    //    `enter_temp` the checkpoint case above does not reach.
+    u64 esc_mark = temp_used()
+    using enter_temp(true):
+        ref []i32 out = #make([]i32, 256)
+        _ = out
+    _ = close_temp()
+    g_escaping_kept = temp_used() > esc_mark
+
+    g_temp_after = temp_used()
+
+!void tp_draw():
+    u64 p_before = arena.used(g_probe)
+    u64 t_before = temp_used()
+    ref []i32 d = #make([]i32, 64)           // no allocator written anywhere
+    _ = d
+    g_draw_in_temp = temp_used() > t_before
+    g_draw_missed_probe = arena.used(g_probe) == p_before
+
+private void tp_run():
+    startup()
+    g_probe_ticks = 0
+    for g_probe_ticks < 2 && !quitting():
+        tick(0.016)
+    teardown()
+
+// ── a hook that fails ───────────────────────────────────────────────────────
+//
+// The loop runs inside the backend, so a failure cannot unwind out of it. It is
+// recorded, the loop is asked to stop, and `run` fails with the code once the
+// loop has returned. Three things are under test and the third is the one an
+// edit is most likely to lose: the code arrives at `run`, the loop *stops* (a
+// budget of 10 frames against a failure on frame 2), and the frame after the
+// failing one runs no hooks at all.
+
+const i32 TE_PROCESS = 42
+const i32 TE_SURFACE = 9
+
+private i32 g_f_ticks
+private i32 g_f_after                  // hook calls after the failing frame
+private i32 g_f_loops                  // how many times the fake loop spun
+
+!void tf_process(f32 dt):
+    _ = dt
+    g_f_ticks = g_f_ticks + 1
+    if g_f_ticks == 2:
+        fail TE_PROCESS
+    if g_f_ticks > 2:
+        g_f_after = g_f_after + 1
+
+private void tf_run():
+    startup()
+    g_f_loops = 0
+    for g_f_loops < 10 && !quitting():
+        g_f_loops = g_f_loops + 1
+        tick(0.016)
+    teardown()
+
+private !void tf_surface_up():
+    g_surface_ups = g_surface_ups + 1
+    fail TE_SURFACE
+
+private i32 g_su_ready_calls
+!void tf_ready(): g_su_ready_calls = g_su_ready_calls + 1
+
+i32 test():
+    set_backend((nil, tb_run, tb_begin, tb_end,
+                 caps(Capability.Input, Capability.Threads),
+                 ts_surface_up, ts_surface_down, ts_render, ts_end_input,
+                 ts_deliver))
+    on_ready(th_ready)
+    on_process(th_process)
+    on_shutdown(th_shutdown)
+    bool ok = true
+    try run() else code:
+        ok = #expect(false, "the first run failed with ", code) && ok
+
+    ok = #expect(g_ready_calls == 1, "ready called ", g_ready_calls, " times") && ok
+    ok = #expect(g_shutdown_calls == 1, "shutdown called ", g_shutdown_calls, " times") && ok
+    ok = #expect(g_ticks == 3, "ticked ", g_ticks, " times") && ok
+    ok = #expect(g_begins == 3, "begin_frame ", g_begins) && ok
+    ok = #expect(g_ends == 3, "end_frame ", g_ends) && ok
+
+    // ── the runtime drove the five service slots ────────────────────────────
+    ok = #expect(g_surface_ups == 1,
+                 "surface_up ran ", g_surface_ups, " times, want once") && ok
+    ok = #expect(g_surface_downs == 1,
+                 "surface_down ran ", g_surface_downs, " times, want once") && ok
+    ok = #expect(g_renders == 3,
+                 "render ran ", g_renders, " times for ", g_ticks, " ticks") && ok
+    ok = #expect(g_end_inputs == g_ticks,
+                 "end_input ran ", g_end_inputs, " times for ", g_ticks,
+                 " ticks — the input frame ends exactly once per frame") && ok
+    ok = #expect(g_delivers == g_ticks,
+                 "deliver ran ", g_delivers, " times for ", g_ticks,
+                 " ticks — the frame drains exactly once per frame") && ok
+
+    // capabilities gate on what the backend advertised
+    ok = #expect(supports(Capability.Input), "Input advertised") && ok
+    ok = #expect(supports(Capability.Threads), "Threads advertised") && ok
+    ok = #expect(!supports(Capability.Audio), "Audio not advertised") && ok
+    ok = #expect(!supports(Capability.VectorDraw), "VectorDraw not advertised") && ok
+
+    // both allocators are reachable
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) sc = temp()
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) pe = allocator()
+    _ = sc
+    _ = pe
+
+    // the pooled job surface produced the right results
+    ok = #expect(g_total == 4950, "parallel_for summed 0..99 = ", g_total) && ok
+    ok = #expect(g_result == 42 && g_results_lost == 0,
+                 "the submitted job's result arrived through its signal, got ", g_result) && ok
+    ok = #expect(threads.atomic_load(&g_flag) == 1, "submitted job ran, flag = ", g_flag) && ok
+
+    // role seat is inert at standalone
+    ok = #expect(ROLE == "standalone", "ROLE = ", ROLE) && ok
+
+    // The run above set no draw hook and still bracketed every frame — claim 1
+    // of the section above.
+    ok = #expect(g_begins == g_ticks,
+                 "a program with no draw hook still opens a pass per frame: ",
+                 g_begins, " brackets for ", g_ticks, " ticks") && ok
+
+    // ── `hook` sets all four, and the frame shape is one shape ──────────────
+
+    g_begins = 0
+    g_ends = 0
+    g_surface_ups = 0
+    g_surface_downs = 0
+    g_renders = 0
+    g_end_inputs = 0
+    g_delivers = 0
+    set_backend((nil, t2_run, t2_begin, t2_end, caps(Capability.Threads),
+                 ts_surface_up, ts_surface_down, ts_render, ts_end_input,
+                 ts_deliver))
+    hook(ready: th2_ready, process: th2_process, draw: th2_draw,
+         shutdown: th2_shutdown)
+    try run() else code:
+        ok = #expect(false, "the hooked run failed with ", code) && ok
+
+    ok = #expect(g_h_ready == 1, "hook's ready ran ", g_h_ready, " times") && ok
+    ok = #expect(g_h_shutdown == 1, "hook's shutdown ran ", g_h_shutdown) && ok
+    ok = #expect(g_h_process == 2, "hook's process ran ", g_h_process) && ok
+    ok = #expect(g_h_draw == 2, "hook's draw ran ", g_h_draw) && ok
+    ok = #expect(g_begins == 2 && g_ends == 2,
+                 "bracketed ", g_begins, "/", g_ends, " of 2 frames") && ok
+
+    // The shape itself, as an order over the last frame's steps.
+    ok = #expect(g_at_deliver < g_at_process,
+                 "deliver (", g_at_deliver, ") must run before process (",
+                 g_at_process, ") — the frame drains before the program runs") && ok
+    ok = #expect(g_at_process < g_at_begin,
+                 "process (", g_at_process, ") must run before begin_frame (",
+                 g_at_begin, ") — it is outside the pass") && ok
+    ok = #expect(g_at_begin < g_at_draw,
+                 "begin_frame (", g_at_begin, ") must run before draw (",
+                 g_at_draw, ") — draw is inside the pass") && ok
+    ok = #expect(g_at_draw < g_at_render,
+                 "the draw hook (", g_at_draw, ") records and the runtime's ",
+                 "render (", g_at_render, ") issues, so the hook comes first ",
+                 "or a frame's change is a frame late") && ok
+    ok = #expect(g_at_render < g_at_end,
+                 "render (", g_at_render, ") must run before end_frame (",
+                 g_at_end, ") — it is inside the pass") && ok
+    ok = #expect(g_at_end < g_at_end_input,
+                 "end_frame (", g_at_end, ") must run before end_input (",
+                 g_at_end_input, ") — the input frame ends at the far end ",
+                 "of the frame") && ok
+
+    // surface_up is once and it is *before* the program's ready, so a program
+    // has a canvas to record into on its first line.
+    ok = #expect(g_at_surface_up < g_at_ready,
+                 "surface_up (", g_at_surface_up, ") must run before ready (",
+                 g_at_ready, ") — ready records into the canvas it makes") && ok
+    // surface_down is *after* the program's shutdown, so a program's own
+    // release runs while its canvas is still valid.
+    ok = #expect(g_at_shutdown < g_at_surface_down,
+                 "shutdown (", g_at_shutdown, ") must run before surface_down (",
+                 g_at_surface_down, ")") && ok
+
+    // ── an omitted parameter leaves that hook exactly as it was ─────────────
+    //
+    // One named argument. `ready`, `draw` and `shutdown` are not written, so
+    // they keep the functions the call above gave them — and `process` is the
+    // only one that moves.
+
+    g_begins = 0
+    g_ends = 0
+    hook(process: th2_process_b)
+    try run() else code:
+        ok = #expect(false, "the rehooked run failed with ", code) && ok
+
+    ok = #expect(g_h_process_b == 2,
+                 "the named parameter took: process_b ran ", g_h_process_b) && ok
+    ok = #expect(g_h_process == 2,
+                 "the replaced process hook ran ", g_h_process - 2,
+                 " more times after being replaced") && ok
+    ok = #expect(g_h_ready == 2,
+                 "an omitted `ready` kept its hook: ran ", g_h_ready,
+                 " over two runs") && ok
+    ok = #expect(g_h_draw == 4,
+                 "an omitted `draw` kept its hook: ran ", g_h_draw,
+                 " over four frames") && ok
+    ok = #expect(g_h_shutdown == 2,
+                 "an omitted `shutdown` kept its hook: ran ", g_h_shutdown,
+                 " over two runs") && ok
+
+    // ── which arena is ambient in which hook ────────────────────────────────
+
+    set_allocator(probe_alloc())
+    set_backend((nil, tp_run, t2_begin, t2_end, caps(Capability.Threads),
+                 ts_surface_up, ts_surface_down, ts_render, ts_end_input,
+                 ts_deliver))
+    hook(ready: tp_ready, process: tp_process, draw: tp_draw,
+         shutdown: th2_shutdown)
+    try run() else code:
+        ok = #expect(false, "the allocator-probe run failed with ", code) && ok
+
+    ok = #expect(g_ambient_made,
+                 "a bare #make inside a hook answered a live reference") && ok
+    ok = #expect(g_ambient_landed,
+                 "a bare #make in `ready` landed in the persistent allocator ",
+                 "— a hook that runs once allocates for the life of the ",
+                 "program") && ok
+    ok = #expect(g_ready_missed_temp,
+                 "and it did NOT land in the temp arena — a canvas item built ",
+                 "into a per-frame arena is the worst version of this bug") && ok
+
+    ok = #expect(g_proc_in_temp,
+                 "a bare #make in `process` landed in the temp arena — a hook ",
+                 "that runs every frame allocates for the life of the frame") && ok
+    ok = #expect(g_proc_missed_probe,
+                 "and it did NOT land in the persistent allocator") && ok
+    ok = #expect(g_draw_in_temp,
+                 "a bare #make in `draw` landed in the temp arena too — `draw` ",
+                 "is grouped with `process`, not with `ready`") && ok
+    ok = #expect(g_draw_missed_probe,
+                 "and it did NOT land in the persistent allocator either") && ok
+
+    ok = #expect(g_override_landed,
+                 "`using app.allocator():` written inside `process` takes the ",
+                 "ambient back — explicit > using > ambient, which is the one ",
+                 "line an author writes when something outlives the frame") && ok
+
+    ok = #expect(g_temp_depth_in_hook == 1,
+                 "inside one app.enter_temp() the depth reads ",
+                 g_temp_depth_in_hook, ", want 1") && ok
+    ok = #expect(g_checkpoint_rolled,
+                 "enter_temp/close_temp around a 16 KB transient left the temp ",
+                 "arena exactly where it started — that is how an author keeps ",
+                 "one frame from raising the high-water mark for the whole run") && ok
+    ok = #expect(g_escaping_kept,
+                 "an escaping temp frame opens no rollback, so close_temp ",
+                 "leaves its bytes for the frame boundary to reclaim") && ok
+    ok = #expect(temp_depth() == 0,
+                 "every temp frame the hooks opened is closed: depth is ",
+                 temp_depth()) && ok
+
+    ok = #expect(g_temp_after > 0,
+                 "a frame that allocated is holding ", g_temp_after,
+                 " temp bytes at the end of it") && ok
+    ok = #expect(g_temp_at_top == 0,
+                 "the temp arena is empty at the top of every frame; frame 2 ",
+                 "started with ", g_temp_at_top, " bytes") && ok
+
+    // Put the persistent allocator back before the failure runs, so the arena
+    // probe is not still absorbing a job pool it will never free.
+    set_allocator(libc.allocator())
+
+    // ── a failing hook stops the loop and `run` reports its code ────────────
+
+    set_backend((nil, tf_run, t2_begin, t2_end, caps(Capability.Threads),
+                 ts_surface_up, ts_surface_down, ts_render, ts_end_input,
+                 ts_deliver))
+    hook(ready: th2_ready, process: tf_process, draw: th2_draw,
+         shutdown: th2_shutdown)
+    i32 got = 0
+    try run() else code:
+        got = code
+    ok = #expect(got == TE_PROCESS,
+                 "a hook that failed with ", TE_PROCESS, " reached main as ",
+                 got) && ok
+    ok = #expect(g_f_loops < 10,
+                 "the loop stopped early — it spun ", g_f_loops,
+                 " of a possible 10 frames") && ok
+    ok = #expect(g_f_after == 0,
+                 "no hook ran after the failing frame; ", g_f_after,
+                 " did") && ok
+    ok = #expect(failed() && fail_code() == TE_PROCESS,
+                 "the runtime recorded ", fail_code()) && ok
+
+    // ── a failing service slot is the same road ─────────────────────────────
+    //
+    // `surface_up` is the one failable slot, and its failure has to reach the
+    // same place a hook's does — otherwise `draw.init` refusing would be a
+    // silent black window.
+
+    g_su_ready_calls = 0
+    g_surface_ups = 0
+    set_backend((nil, tf_run, t2_begin, t2_end, caps(Capability.Threads),
+                 tf_surface_up, ts_surface_down, ts_render, ts_end_input,
+                 ts_deliver))
+    hook(ready: tf_ready, process: th2_process, draw: th2_draw,
+         shutdown: th2_shutdown)
+    i32 su = 0
+    try run() else code:
+        su = code
+    ok = #expect(su == TE_SURFACE,
+                 "a surface_up that failed with ", TE_SURFACE,
+                 " reached main as ", su) && ok
+    ok = #expect(g_surface_ups == 1, "surface_up was tried once, ", g_surface_ups) && ok
+    ok = #expect(g_su_ready_calls == 0,
+                 "`ready` must not run when the surface refused to come up; ",
+                 "it ran ", g_su_ready_calls, " times") && ok
+
+    // And a clean run afterwards: the failure flag is `run`'s to clear, so a
+    // failing run does not poison the next one the way `quit()` does.
+    g_h_ready = 0
+    set_backend((nil, t2_run, t2_begin, t2_end, caps(Capability.Threads),
+                 ts_surface_up, ts_surface_down, ts_render, ts_end_input,
+                 ts_deliver))
+    hook(ready: th2_ready, process: th2_process, draw: th2_draw,
+         shutdown: th2_shutdown)
+    try run() else code:
+        ok = #expect(false, "the run after a failing run failed with ", code) && ok
+    ok = #expect(g_h_ready == 1,
+                 "a run after a failing run starts clean: ready ran ",
+                 g_h_ready, " times") && ok
+    ok = #expect(!failed(), "the failure flag was cleared by the next run") && ok
+
+    if ok:
+        return 0
+    return 1

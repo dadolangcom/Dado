@@ -1,0 +1,414 @@
+// Doc comments: the plain `//` comment directly above a declaration, read
+// into the fields a reference page shows.
+//
+// A developer writes only prose. The comment's first sentence is the summary,
+// Markdown paragraphs follow, and at the end there may be field lines, one per
+// line: `name: text` for a parameter, `returns: text`, `fails: text`,
+// `example:` followed by an indented block, and `see: name, name`.
+//
+// The language server reads the same comments for its docs page, and both
+// readers are held to the fixtures in `tests/doccomments`: each case is a
+// comment and the fields both readers must answer for it. A change to one reader is a change to the fixtures
+// first.
+//
+// **Everything here borrows.** A `DocComment`'s names are windows into the
+// comment's text and its joined texts are allocated from the allocator the
+// caller passes, so the caller keeps both alive for as long as it reads the
+// result. That is how the rest of this package works: one arena per run.
+package doc
+
+import "core:os/fs"
+import "core:slices"
+import "core:strings"
+import "core:mem/libc"
+
+// One field line of a comment, and the lines that continue it.
+//
+// `kind` is `param`, `returns`, `fails`, `example` or `see`; `name` is the
+// parameter's name for a `param` and empty otherwise. `line` is the field
+// line's index among the comment's lines (from 0) and `col` the 1-based
+// column its key starts at in the source, which is what a warning about the
+// line points at. A `see` list makes one field per name, all on its line.
+public type DocField: (string8 kind, string8 name, string8 text, i32 line, i32 col)
+
+// What a doc comment says. `summary` is empty when there is no prose, and
+// `description` is the prose after the summary, as written.
+public type DocComment: (string8 summary, string8 description, ref []DocField fields)
+
+// ── one line ────────────────────────────────────────────────────────────────
+
+// One comment line without its indentation, its `//`, and one space after.
+// The result is always a suffix of `line`, which is how a field's column is
+// found again: the bytes that were stripped are the difference in length.
+public string8 strip_comment(string8 line):
+    string8 t = strings.trim_left(line)
+    if strings.starts_with(t, "//"):
+        t = strings.rest(t, 2)
+    if strings.starts_with(t, " "):
+        t = strings.rest(t, 1)
+    return t
+
+private bool is_blank(string8 line):
+    string8 t = strings.trim(line)
+    return #len(t) == 0
+
+private bool is_indented(string8 line):
+    return strings.starts_with(line, " ") || strings.starts_with(line, "\t")
+
+private bool key_byte(char8 c, bool first):
+    if c == '_' || (c >= 'a' && c <= 'z'):
+        return true
+    return !first && c >= '0' && c <= '9'
+
+// The key of a field line and the text after its colon: `key:` at the start
+// of the line, `key` a lowercase name, then a space, a tab, or the end of the
+// line. `ok` is false for any other line.
+public (string8 key, string8 text, bool ok) field_key(string8 line):
+    i64 colon = strings.index_of(line, ':')
+    if colon <= 0:
+        return ("", "", false)
+    i64 i = 0
+    for i < colon:
+        if !key_byte(line[i], i == 0):
+            return ("", "", false)
+        i += 1
+    string8 key = strings.substring(line, 0, colon)
+    string8 rest = strings.rest(line, colon + 1)
+    if #len(rest) == 0:
+        return (key, "", true)
+    if !is_indented(rest):
+        return ("", "", false)
+    return (key, strings.trim(rest), true)
+
+private bool is_field(string8 line):
+    (string8 _, string8 _, bool ok) = field_key(line)
+    return ok
+
+// ── building text ───────────────────────────────────────────────────────────
+
+private void put(^ref []char8 b, string8 s):
+    for c in s:
+        _ = #append(b^, c)
+
+private ref []char8 buffer((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 b = #make([]char8, 0, alloc)
+    return b
+
+// A field's text and its continuation lines `lines[from..<to]`, trimmed, the
+// empty ones dropped, joined by one space.
+private string8 joined(string8 first, ref []string8 lines, i64 from, i64 to,
+                       (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 b = buffer(alloc)
+    put(&b, first)
+    i64 i = from
+    for i < to:
+        string8 t = strings.trim(lines[i])
+        if #len(t) > 0:
+            if #len(b) > 0:
+                _ = #append(b, ' ')
+            put(&b, t)
+        i += 1
+    string8 s = b
+    return s
+
+// The lines `lines[from..<to]`, dedented by their common indentation; blank
+// lines become empty, are kept between the others and dropped at either end.
+private string8 dedent(ref []string8 lines, i64 from, i64 to,
+                       (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 indent = -1
+    i64 first = -1
+    i64 last = -1
+    i64 i = from
+    for i < to:
+        if !is_blank(lines[i]):
+            string8 body = strings.trim_left(lines[i])
+            i64 lead = #len(lines[i]) - #len(body)
+            if indent < 0 || lead < indent:
+                indent = lead
+            if first < 0:
+                first = i
+            last = i
+        i += 1
+    ref []char8 b = buffer(alloc)
+    if first < 0:
+        string8 none = b
+        return none
+    i = first
+    for i <= last:
+        if i > first:
+            _ = #append(b, '\n')
+        if !is_blank(lines[i]):
+            put(&b, strings.rest(lines[i], indent))
+        i += 1
+    string8 s = b
+    return s
+
+// ── the prose ───────────────────────────────────────────────────────────────
+
+private bool ascii_space(char8 c):
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == char8(12)
+
+// Where the first sentence of `text` ends: just after the first `.`, `!` or
+// `?` outside backticks that is followed by whitespace or the end, or -1.
+public i64 sentence_end(string8 text):
+    bool in_code = false
+    i64 n = #len(text)
+    i64 i = 0
+    for i < n:
+        char8 c = text[i]
+        if c == '`':
+            in_code = !in_code
+        else if !in_code && (c == '.' || c == '!' || c == '?'):
+            if i + 1 == n || ascii_space(text[i + 1]):
+                return i + 1
+        i += 1
+    return -1
+
+// The summary and the description of the prose `lines[from..<to]`: the first
+// sentence of the first paragraph, its lines joined by one space, and the rest
+// as written.
+private (string8 summary, string8 description) split_prose(ref []string8 lines, i64 from, i64 to,
+        (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 first = from
+    for first < to && is_blank(lines[first]):
+        first += 1
+    i64 last = to
+    for last > first && is_blank(lines[last - 1]):
+        last -= 1
+    if first == last:
+        return ("", "")
+    i64 para_end = first
+    for para_end < last && !is_blank(lines[para_end]):
+        para_end += 1
+    ref []char8 p = buffer(alloc)
+    i64 i = first
+    for i < para_end:
+        if i > first:
+            _ = #append(p, '\n')
+        put(&p, lines[i])
+        i += 1
+    string8 paragraph = p
+    i64 cut = sentence_end(paragraph)
+    if cut < 0:
+        cut = #len(paragraph)
+    ref []char8 sb = buffer(alloc)
+    for c in strings.substring(paragraph, 0, cut):
+        if c == '\n':
+            _ = #append(sb, ' ')
+        else:
+            _ = #append(sb, c)
+    string8 summary = sb
+    ref []char8 rest = buffer(alloc)
+    put(&rest, strings.trim_left(strings.rest(paragraph, cut)))
+    if para_end < last:
+        ref []char8 after = buffer(alloc)
+        i = para_end
+        for i < last:
+            if i > para_end:
+                _ = #append(after, '\n')
+            put(&after, lines[i])
+            i += 1
+        string8 a = after
+        if #len(rest) == 0:
+            i64 k = 0
+            for k < #len(a) && a[k] == '\n':
+                k += 1
+            put(&rest, strings.rest(a, k))
+        else:
+            _ = #append(rest, '\n')
+            put(&rest, a)
+    string8 r = rest
+    return (summary, strings.trim_right(r))
+
+// ── the comment ─────────────────────────────────────────────────────────────
+
+// Read a comment: its lines as they stand in the source, `//` and indentation
+// included. The result borrows from `comment` and from `alloc`.
+public DocComment read_comment(string8 comment,
+                               (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []string8 lines = #make([]string8, 0, alloc)
+    ref []i32 cols = #make([]i32, 0, alloc)
+    i64 at = 0
+    for:
+        (string8 raw, i64 next) = line_at(comment, at)
+        if phantom_end(raw, next):
+            break
+        string8 s = strip_comment(raw)
+        _ = #append(lines, s)
+        _ = #append(cols, i32(#len(raw) - #len(s) + 1))
+        if next < 0:
+            break
+        at = next
+    i64 n = #len(lines)
+
+    // Where the fields begin: a field line that is first or follows a blank
+    // line, with nothing after it but field lines, indented lines and blanks.
+    // Found from the end, the latest line after which every line qualifies.
+    i64 fields_at = n
+    i64 i = n - 1
+    for i >= 0:
+        string8 l = lines[i]
+        if is_field(l) && (i == 0 || is_blank(lines[i - 1])):
+            fields_at = i
+        if !(is_blank(l) || is_indented(l) || is_field(l)):
+            break
+        i -= 1
+    (string8 summary, string8 description) = split_prose(lines, 0, fields_at, alloc)
+
+    ref []DocField fields = #make([]DocField, 0, alloc)
+    i = fields_at
+    for i < n:
+        (string8 key, string8 text, bool ok) = field_key(lines[i])
+        if !ok:
+            i += 1
+            continue
+        // The lines that belong to this field: up to the next field line.
+        i64 j = i + 1
+        for j < n && !is_field(lines[j]):
+            j += 1
+        i32 line = i32(i)
+        i32 col = cols[i]
+        if key == "example":
+            string8 code = dedent(lines, i + 1, j, alloc)
+            if #len(code) == 0:
+                code = text
+            _ = #append(fields, ("example", "", code, line, col))
+        else if key == "see":
+            string8 all = joined(text, lines, i + 1, j, alloc)
+            i64 from = 0
+            for from <= #len(all):
+                string8 tail = strings.rest(all, from)
+                i64 comma = strings.index_of(tail, ',')
+                i64 width = comma
+                if comma < 0:
+                    width = #len(tail)
+                string8 name = strings.trim(strings.substring(tail, 0, width))
+                if #len(name) > 0:
+                    _ = #append(fields, ("see", "", name, line, col))
+                from += width + 1
+        else if key == "returns" || key == "fails":
+            _ = #append(fields, (key, "", joined(text, lines, i + 1, j, alloc), line, col))
+        else:
+            _ = #append(fields, ("param", key, joined(text, lines, i + 1, j, alloc), line, col))
+        i = j
+    return (summary, description, fields)
+
+// ── the fixtures' form ──────────────────────────────────────────────────────
+
+private void put_escaped(^ref []char8 b, string8 s):
+    for c in s:
+        if c == '\\':
+            put(b, "\\\\")
+        else if c == '\n':
+            put(b, "\\n")
+        else if c == '\t':
+            put(b, "\\t")
+        else:
+            _ = #append(b^, c)
+
+// One field per line, tab separated, escaped: `summary` always, then
+// `description` when there is one, then the fields in the order written.
+public string8 render_comment(DocComment d,
+                              (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 b = buffer(alloc)
+    put(&b, "summary\t")
+    put_escaped(&b, d.summary)
+    _ = #append(b, '\n')
+    if #len(d.description) > 0:
+        put(&b, "description\t")
+        put_escaped(&b, d.description)
+        _ = #append(b, '\n')
+    for f in d.fields:
+        put(&b, f.kind)
+        _ = #append(b, '\t')
+        if f.kind == "param":
+            put(&b, f.name)
+            _ = #append(b, '\t')
+        put_escaped(&b, f.text)
+        _ = #append(b, '\n')
+    string8 s = b
+    return s
+
+// ── cutting a comment out of a file ─────────────────────────────────────────
+
+// The start of the line `at` is on.
+private i64 line_start(string8 text, i64 at):
+    i64 i = at
+    if i > #len(text):
+        i = #len(text)
+    for i > 0 && text[i - 1] != '\n':
+        i -= 1
+    return i
+
+// Whether a line belongs to a doc comment: its first non-space text is `//`,
+// and it is neither a block line for this tool (the marker) nor a rule line,
+// a `//` line whose text starts with the box-drawing horizontal `─`.
+public bool doc_line(string8 raw):
+    string8 t = strings.trim(raw)
+    if !strings.starts_with(t, "//") || strings.starts_with(t, MARKER):
+        return false
+    string8 body = strings.trim_left(strings.rest(t, 2))
+    return !strings.starts_with(body, "─")
+
+// The doc comment above the declaration that starts at byte `start` of
+// `text`: the run of comment lines directly above the declaration's line,
+// stopping at a blank line, a block line or a rule line, none of which is
+// part of it. `comment` is a window into `text`, every line whole and the
+// last newline included; `at` is its offset. An empty window when there is
+// no comment.
+public (string8 comment, i64 at) cut_comment(string8 text, i64 start):
+    i64 end = line_start(text, start)
+    i64 top = end
+    for top > 0:
+        i64 above = line_start(text, top - 1)
+        if !doc_line(strings.substring(text, above, top - above)):
+            break
+        top = above
+    return (strings.substring(text, top, end - top), top)
+
+// The 1-based line number of byte `at` of `text`.
+public i32 line_number(string8 text, i64 at):
+    string8 before = strings.substring(text, 0, at)
+    return i32(strings.count_byte(before, '\n')) + 1
+
+// ── the fixtures ────────────────────────────────────────────────────────────
+
+// A fixture that read differently from its `.fields`: the case's path, what
+// the file says, and what the reader answered. `want` is empty and `missing`
+// true when there is no `.fields` beside the comment.
+public type FixtureMiss: (string8 path, string8 want, string8 got, bool missing)
+
+// Every `<case>.comment` under `dir` read and rendered, and compared with its
+// `<case>.fields`; each disagreement is appended to `out`. Answers how many
+// cases were read, which a caller holds to a floor: a directory that went
+// missing or empty would otherwise pass.
+public i32 check_fixtures(string8 dir, ^ref []FixtureMiss out,
+                          (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    fs.Listing tree = fs.walk(dir, alloc)
+    ref []string8 paths = #make([]string8, 0, alloc)
+    for e in tree.entries:
+        if !e.is_dir && strings.ends_with(e.path, ".comment"):
+            ref []char8 owned = #format(e.path, alloc)
+            string8 kept = owned
+            _ = #append(paths, kept)
+    fs.release(tree)
+    // Sorted, so a run reports its mismatches in the same order every time.
+    slices.sort(paths[:], strings.before)
+    i32 cases = 0
+    for path in paths:
+        cases += 1
+        string8 stem = strings.substring(path, 0, #len(path) - 8)
+        ref []char8 cpath = strings.clone_to_cstring(path, alloc)
+        ref []char8 fpath = #format(stem, ".fields", alloc)
+        ref []char8 fpathc = strings.clone_to_cstring(fpath, alloc)
+        ref []char8 ctext = slurp(cstring(cpath), alloc)
+        string8 c = ctext
+        string8 got = render_comment(read_comment(c, alloc), alloc)
+        if !fs.is_file(cstring(fpathc)):
+            _ = #append(out^, (path, "", got, true))
+            continue
+        ref []char8 want = slurp(cstring(fpathc), alloc)
+        string8 w = want
+        if got != w:
+            _ = #append(out^, (path, w, got, false))
+    return cases

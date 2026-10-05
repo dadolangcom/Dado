@@ -1,0 +1,258 @@
+// The web target (`--target=web`) and the JavaScript library (`--target=js`).
+//
+// **A web build is a wasm module**, not a native program: the emitted C is
+// compiled for wasm32 by clang, one object per translation unit, and linked
+// by `wasm-ld` into `<package>.wasm`, with the build manifest beside it as
+// `<package>.wasm.build` (the loader checks every `wasm-import` line is one
+// it supplies before it runs anything). `run` and `test` hand the module to
+// `tools/web/load.mjs` under node, whose exit status is the program's, a trap
+// being 134 as an abort is natively. `build` also writes the page that runs
+// it in a browser (`dadoc --page`). There is no sanitizer runtime for wasm and
+// no native library to link.
+//
+// **The web compiles with the pinned zig by default**, as native builds do:
+// `zig cc -target wasm32-freestanding`, without debug sections (zig emits them
+// at every optimisation level), linked by `zig wasm-ld`. `--cc` names a clang
+// instead, linked by `wasm-ld`; `DADO_WASM_LD` names another linker either way.
+
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+// What a threaded module (`--web-threads`) adds: wasm's atomics and
+// thread-local storage, and a shared memory the loader creates and hands to
+// every worker, 1 GiB at most, with the stack pointer exported so a worker
+// can point it at its own stack.
+private const string8 CFLAGS_WEB_THREADS = "-matomics -mbulk-memory"
+private const string8 LDFLAGS_WEB_THREADS = "--shared-memory --import-memory --export-memory --max-memory=1073741824 --export=__stack_pointer"
+
+private string8 g_web_ld = ""
+// The pinned zig, when the web build compiles with it; "" for a clang.
+private string8 g_web_zig = ""
+
+// The compiler a web build uses: `--cc`'s clang when given, otherwise the
+// pinned zig, the native default. A clang is checked for the wasm32 target,
+// and the wasm linker is checked too. Ends the process, naming the repair,
+// when one is missing.
+string8 web_compiler(string8 given):
+    if #len(given) == 0:
+        Compiler z = compiler("", true)
+        if !z.found: die(z.why)
+        g_web_zig = z.words[0]
+        (string8 zld, bool zset) = env("DADO_WASM_LD")
+        if zset:
+            string8 zld_found = on_path(zld)
+            if #len(zld_found) == 0:
+                die(txt(#format("DADO_WASM_LD names `", zld, "`, which is not on PATH.\n  Unset it to link with `zig wasm-ld`, or name a wasm linker that is there.")))
+            g_web_ld = zld
+        return g_web_zig
+    string8 cc = given
+    string8 found = on_path(cc)
+    if #len(found) == 0:
+        die(txt(#format("--target=web compiles with clang, and `", cc, "` is not on PATH.\n  Install clang (with the wasm32 target), or pass --cc <a clang that has it>.")))
+    Command targets = command(cc)
+    add(&targets, "--print-targets")
+    Captured r = capture(targets, true)
+    if !r.started || !strings.contains(txt(r.out), "wasm32"):
+        die(txt(#format("`", cc, "` has no wasm32 target, which --target=web compiles for.\n  Use a clang built with WebAssembly (`clang --print-targets` lists wasm32), or pass --cc <one>.")))
+    (string8 ld, bool set) = env("DADO_WASM_LD")
+    if !set: ld = "wasm-ld"
+    string8 ld_found = on_path(ld)
+    if #len(ld_found) == 0:
+        die(txt(#format("--target=web links with wasm-ld, and `", ld, "` is not on PATH.\n  Install lld (Ubuntu: the lld package), or set DADO_WASM_LD to one.")))
+    g_web_ld = ld
+    return cc
+
+// The node a web module runs under: `DADO_NODE`, else `node`. Ends the
+// process when it is not there.
+string8 web_node_program(string8 cmd):
+    (string8 node, bool set) = env("DADO_NODE")
+    if !set: node = "node"
+    string8 node_found = on_path(node)
+    if #len(node_found) == 0:
+        die(txt(#format("`dado ", cmd, " --target=web` runs the module under node, and `", node, "` is not on PATH.\n  Install node, or set DADO_NODE to one. `dado build --target=web` needs none.")))
+    return node
+
+// Compile `c_file` and each of `sources` for wasm32 and link them into the
+// module `out`; false when a step failed (its compiler has said why). The
+// generated C's object is `out` with `.o` for `.wasm`; a source's is its
+// base name with `.wasm.o`, beside `out`.
+bool web_module(string8 cc, ^Options o, string8 c_file, []string8 sources, []string8 flags, []string8 includes, string8 out):
+    ref []string8 units = #make([]string8, 0)
+    _ = #append(units, c_file)
+    for s in sources:
+        _ = #append(units, s)
+    string8 stem = out
+    if strings.ends_with(out, ".wasm"): stem = out[0..<#len(out) - 5]
+    Command link = command(g_web_ld)
+    if #len(g_web_zig) > 0 && #len(g_web_ld) == 0:
+        link = command(g_web_zig)
+        add(&link, "wasm-ld")
+    add_split(&link, setting("LDFLAGS_WEB"))
+    if o.web_threads: add_split(&link, LDFLAGS_WEB_THREADS)
+    for tu in units:
+        string8 obj = txt(#format(stem, ".o"))
+        if tu != c_file:
+            string8 b = path.base(tu)
+            if strings.ends_with(b, ".c"): b = b[0..<#len(b) - 2]
+            obj = join2(dir_of(out), txt(#format(b, ".wasm.o")))
+        Command c = command(cc)
+        if #len(g_web_zig) > 0:
+            // zig spells the target its own way and adds debug sections
+            // unless told not to; clang's `--target=` from the defaults is
+            // left out.
+            add(&c, "cc")
+            add(&c, "-target")
+            add(&c, "wasm32-freestanding")
+            add(&c, "-g0")
+            for w in words_of(setting("CFLAGS_WEB")):
+                if !strings.starts_with(w, "--target="): add(&c, w)
+        else:
+            add_split(&c, setting("CFLAGS_WEB"))
+        if o.web_threads: add_split(&c, CFLAGS_WEB_THREADS)
+        add_split(&c, setting("CFLAGS_BASE"))
+        add_split(&c, setting("CFLAGS_INTEROP"))
+        if o.werror: add_split(&c, setting("CFLAGS_WERROR"))
+        if o.debug:
+            add_split(&c, "-g -O0")
+        else:
+            add(&c, "-O2")
+        add(&c, "-c")
+        add_all(&c, flags)
+        add_all(&c, includes)
+        add(&c, tu)
+        add(&c, "-o")
+        add(&c, obj)
+        if run(c) != 0: return false
+        add(&link, obj)
+    add(&link, "-o")
+    add(&link, out)
+    (string8 user_ldflags, bool _) = env("DADO_LDFLAGS")
+    add_split(&link, user_ldflags)
+    return run(link) == 0
+
+// The checks a web build's flags get before anything runs: threads and the
+// page are a web build's, and the page is `build`'s and `check`'s. Answers
+// the `--html=` flag dadoc is told, or "".
+string8 web_flags(^Options o):
+    bool web = targets_web()
+    if o.web_threads && !web:
+        die("--web-threads builds a threaded web module, and this build's target is not the web. Add --target=web.")
+    if o.html_given && #len(o.html) == 0 && !web:
+        die("--html writes a web build's page, and this build's target is not the web. Add --target=web.")
+    if #len(o.html) == 0 && #len(o.base) == 0: return ""
+    if !web:
+        die("--html= and --base= write a web build's page, and this build's target is not the web. Add --target=web.")
+    if o.cmd != "build" && o.cmd != "check":
+        string8 with_html = ""
+        if #len(o.html) > 0: with_html = txt(#format(" --html=", o.html))
+        die(txt(#format("--html= and --base= write the page `dado build --target=web` makes, and `dado ", o.cmd, " --target=web` runs the module under node, with no page. Try: dado build ", o.pkg, " --target=web", with_html)))
+    if #len(o.html) == 0: return ""
+    if !is_file(o.html):
+        die(txt(#format("no page template at ", o.html)))
+    string8 abs = absolute(o.html, working_dir())
+    return txt(#format("--html=", abs))
+
+// `build`/`run` of a program whose target resolved to `#WEB`: the module,
+// the manifest beside it, and the page (`build`) or a run under node (`run`).
+// `manifest` is the build manifest's text, the transpile's `js-module` lines
+// included.
+i32 web_build(^Plan p, ^Options o, ^Manifest m, string8 manifest, string8 c_file, string8 html_flag):
+    if o.sanitize:
+        die(txt(#format("`dado ", o.cmd, " --target=web` cannot sanitize: there is no sanitizer runtime for wasm. Drop --sanitize.")))
+    ref []string8 libs = #make([]string8, 0)
+    for l in o.libs:
+        _ = #append(libs, l)
+    for l in m.links:
+        _ = #append(libs, l)
+    if #len(libs) > 0:
+        ref []char8 lj = strings.join(libs[:], " ")
+        die(txt(#format("a web build cannot link native libraries, and this one asks for: ", txt(lj), "\n  A `link` clause or `-l` names a library of this machine's; a module has only\n  the compiler's runtime and what its host supplies.")))
+    if o.cmd == "run" && #len(o.args) > 0:
+        ref []char8 aj = strings.join(o.args[:], " ")
+        die(txt(#format("a web program has no command line, so `--` has nowhere to put: ", txt(aj))))
+    string8 cc = web_compiler(o.cc)
+    string8 node = ""
+    if o.cmd == "run": node = web_node_program(o.cmd)
+    string8 out = o.out
+    if !o.out_given: out = txt(#format(p.build_dir, "/", p.stem, ".wasm"))
+    ref []string8 includes = #make([]string8, 0)
+    for inc in m.includes:
+        _ = #append(includes, txt(#format("-I", inc)))
+    (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+    for w in words_of(user_cflags):
+        _ = #append(includes, w)
+    if #len(m.sources) > 0:
+        ref []char8 listed_c = strings.join(m.sources[:], " ")
+        note(txt(#format("       + C: ", txt(listed_c))))
+    say(txt(#format("cc     ", cc, " (web: wasm32, linked by ", g_web_ld, ")")))
+    if !web_module(cc, o, c_file, m.sources[:], m.flags[:], includes[:], out):
+        die(txt(#format("the C did not build for wasm32. Rerun with -v for the commands; the generated C is\n    ", c_file)))
+    try fs.write_file(txt(#format(out, ".build")), txt(#format(manifest, "\n"))) else code:
+        die(txt(#format("cannot write ", out, ".build: ", os.message(code))))
+        return 1
+    if !o.keep_c: remove_quietly(c_file)
+    note(txt(#format("       -> ", out)))
+    string8 loader = join3(root(), "tools", join2("web", "load.mjs"))
+    if o.cmd == "build":
+        // The page last: each `integrity` is a hash of a file already there.
+        Command pg = command(p.dadoc)
+        add(&pg, txt(#format("--page=", out)))
+        add(&pg, txt(#format("--loader=", loader)))
+        if #len(html_flag) > 0: add(&pg, html_flag)
+        if #len(o.base) > 0: add(&pg, txt(#format("--base=", o.base)))
+        if verbose(): note(txt(#format("  $ ", shown(pg))))
+        Captured said = capture(pg, false)
+        if !said.started || said.status != 0:
+            die(txt(#format("the page was not written. The module is built:\n    ", out)))
+        say_green("built", txt(#format(" ", out)))
+        write_manifest_outputs(p, o)
+        string8 serve = join3(root(), "tools", join2("web", "serve.mjs"))
+        for l in lines_of(txt(said.out)):
+            (string8 kind, string8 value, bool _) = strings.field(l)
+            string8 v = strings.trim(value)
+            if kind == "page":
+                say_green("page", txt(#format("  ", v, " (open it from a web server; `node ", serve, " ", dir_of(out), "` is one)")))
+            else if kind == "headers":
+                say(txt(#format("       ", v, " (--web-threads: COOP same-origin, COEP require-corp)")))
+            else if kind == "csp-hash":
+                say(txt(#format("       a Content-Security-Policy allows the inline import map with script-src ", v)))
+        return 0
+    say(txt(#format("run    ", out, " (node)")))
+    rule()
+    Command r = command(node)
+    add(&r, loader)
+    add(&r, out)
+    default_sigpipe()
+    i32 status = run_quietly(r)
+    rule()
+    if status == 0:
+        say_green(txt(#format("exit ", status)), "")
+    else:
+        say(txt(#format("exit ", status)))
+    return status
+
+// `build --target=js`: the package's scripts as a JavaScript library in
+// `<build>/<stem>.js/`, and the manifest's extensions beside it.
+i32 js_library(^Plan p, ^Options o):
+    if o.cmd != "build":
+        die(txt(#format("--target=js builds a JavaScript library, which `dado ", o.cmd, "` has nothing to do with: a JavaScript host imports it. Try: dado build ", o.pkg, " --target=js")))
+    if o.web_threads:
+        die("--web-threads is a web build's, and --target=js builds a JavaScript library: drop one of them.")
+    string8 out = txt(#format(p.build_dir, "/", p.stem, ".js"))
+    _ = fs.make_dirs(out, #default)
+    Command c = command(p.dadoc)
+    add(&c, txt(#format("--collections=", p.collections)))
+    add_all(&c, o.defines[:])
+    if o.strict: add(&c, "--strict")
+    add(&c, "--emit=js-package")
+    add(&c, "--package")
+    add(&c, "-o")
+    add(&c, out)
+    add(&c, p.pkg_abs)
+    if run(c) != 0: return 1
+    say_green("built", txt(#format(" ", out)))
+    set_manifest_package(true)
+    write_manifest_outputs(p, o)
+    return 0

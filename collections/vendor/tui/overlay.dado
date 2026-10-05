@@ -1,0 +1,296 @@
+// vendor:tui — the things that sit on top: modals, toasts, and the palette.
+//
+// **An overlay is drawn last and takes input first**, and those two pull in
+// opposite directions in a one-pass immediate-mode library: it lands on top
+// because it is composed after everything else, but the widgets it is on top of
+// already ran and already read the mouse.
+//
+// The answer is the one the claiming rule already uses — *last frame's state is
+// what is in force*. `input.dado` keeps `g_overlay_active` from the previous
+// frame and every input query outside an overlay answers false while it is set.
+// The cost is one frame at the moment a modal opens, during which the modal is
+// not drawn yet either, so there is nothing to aim at. Invisible rather than
+// merely cheap.
+//
+// The one thing this asks of you: **declare overlays last in your frame**. They
+// draw in the order they are called like everything else, and a modal written
+// above the panels would be under them.
+package tui
+
+import "core:fmt"
+import "core:chars"
+
+// ── modal ──────────────────────────────────────────────────────────────────
+
+// A centred panel above everything else, with the screen behind it dimmed.
+//
+//     if tui.modal(title: "Discard changes?", open: &confirming):
+//         defer tui.end()
+//         tui.paragraph("Three files have unsaved edits.")
+//         for tui.row(tag: "modal-buttons"):
+//             if tui.button("Discard"): discard()
+//             if tui.button("Cancel"): confirming = false
+//
+// `open` is yours, as every value in this library is. Esc closes it, and so
+// does a click outside it — both by writing `false` through your pointer, so
+// the state a modal is in is a state your program can see and set.
+//
+// The `if` form and not the `for` form, because a modal body almost always has
+// a `return` or a `break` in it and the close has to be written.
+bool modal(string8 title, ^bool open, i32 width = 0 - 1, i32 height = 0 - 1, u32 dim = 150):
+    if !open^: return false
+    Rect s = screen()
+    if s.w < 8 || s.h < 5: return false
+
+    i32 w = width
+    if w < 0: w = (s.w * 3) / 5
+    if w > s.w - 4: w = s.w - 4
+    i32 h = height
+    if h < 0: h = (s.h * 2) / 5
+    if h > s.h - 2: h = s.h - 2
+    if w < 8 || h < 4: return false
+
+    Rect box = (s.x + ((s.w - w) / 2), s.y + ((s.h - h) / 2), w, h)
+
+    // Everything behind, pushed toward the window's own background. This is
+    // what makes a modal read as being *in front of* rather than *instead of*.
+    dim_rect(s, dim)
+
+    // Esc closes. Checked before the body so the body is not run for a frame
+    // that is already dismissing.
+    bool opening = !g_overlay_active
+    mark_overlay()
+    enter_overlay()
+    if opening: adopt_focus()
+    if key("esc"):
+        open^ = false
+        leave_overlay()
+        return false
+    // A click outside is a dismissal, which is what every modal that is not a
+    // dialogue box does and what everybody tries first.
+    if g_mpress && !holds(box, g_mx, g_my):
+        open^ = false
+        leave_overlay()
+        return false
+
+    fill_rect(box, (g_theme.text, g_theme.overlay, Attr.NONE))
+    Rect inner = inset(box, 1)
+    inner = (inner.x + 1, inner.y, inner.w - 2, inner.h)
+    Rect saved = push_clip(box)
+    if !open_region(hash_str(FNV_OFFSET, title), inner, Axis.Down, 0, saved):
+        leave_overlay()
+        return false
+    region_bg(g_theme.overlay)
+    g_stack[g_depth].bordered = true
+    g_stack[g_depth].frame_box = box
+    g_stack[g_depth].title = title
+    g_stack[g_depth].focus_ring = true      // a modal is always what has focus
+    g_stack[g_depth].overlay = true
+    return true
+
+// ── toasts ─────────────────────────────────────────────────────────────────
+//
+// A message that appears, is read, and goes away.
+//
+//     tui.toast("build finished")
+//     tui.toast("3 tests failed", tui.now().err)
+//
+// It is queued from anywhere — including from outside a frame, which is the
+// point: a build finishing is not a frame event. They are drawn automatically
+// at the end of every frame, so nothing is called in the frame body and a
+// program that never mentions toasts still shows them.
+
+private const i32 MAX_TOASTS = 8
+private const i32 TOAST_TEXT = 120
+private type ToastText: [TOAST_TEXT]char8
+
+private [MAX_TOASTS]ToastText g_toast_text
+private [MAX_TOASTS]i32 g_toast_len
+private [MAX_TOASTS]Color g_toast_color
+private [MAX_TOASTS]f64 g_toast_until
+private i32 g_ntoasts
+
+// Show `s` for `seconds`. The default colour is the accent; pass `err` or `ok`
+// for something that wants to be read as a result.
+void toast(string8 s, Color color = DEFAULT, f64 seconds = 4.0):
+    if g_ntoasts >= MAX_TOASTS:
+        // Drop the oldest rather than the newest: the newest is the one that
+        // just happened, and a queue that discards it is a queue that goes
+        // quiet exactly when the program gets busy.
+        for i in 0..<(MAX_TOASTS - 1):
+            g_toast_text[i] = g_toast_text[i + 1]
+            g_toast_len[i] = g_toast_len[i + 1]
+            g_toast_color[i] = g_toast_color[i + 1]
+            g_toast_until[i] = g_toast_until[i + 1]
+        g_ntoasts = MAX_TOASTS - 1
+
+    i32 at = g_ntoasts
+    i32 n = i32(#len(s))
+    if n > TOAST_TEXT: n = TOAST_TEXT
+    for i in 0..<n:
+        g_toast_text[at][i] = s[i]
+    g_toast_len[at] = n
+    Color c = color
+    if is_default(c): c = g_theme.accent
+    g_toast_color[at] = c
+    g_toast_until[at] = clock() + seconds
+    g_ntoasts = g_ntoasts + 1
+    g_dirty = true
+
+void toasts_clear():
+    g_ntoasts = 0
+
+i32 toasts_showing():
+    return g_ntoasts
+
+// Drop the expired ones and draw the rest, stacked up from the bottom right.
+// Called by `end_frame`, not by you.
+private void draw_toasts():
+    if g_ntoasts == 0: return
+    f64 now = clock()
+    i32 keep = 0
+    for i in 0..<g_ntoasts:
+        if g_toast_until[i] <= now: continue
+        if keep != i:
+            g_toast_text[keep] = g_toast_text[i]
+            g_toast_len[keep] = g_toast_len[i]
+            g_toast_color[keep] = g_toast_color[i]
+            g_toast_until[keep] = g_toast_until[i]
+        keep = keep + 1
+    g_ntoasts = keep
+    if g_ntoasts == 0:
+        g_dirty = true            // one more frame, to clear where they were
+        return
+
+    // Something is counting down, so the loop must keep waking; otherwise a
+    // toast would sit on screen until the next keystroke.
+    animate()
+
+    Rect s = screen()
+    Rect was = g_clip
+    g_clip = s
+    // Two rows clear of the bottom, because the bottom row is where a footer
+    // lives and a toast that lands on the hints bar hides the keys you would
+    // use to react to it.
+    i32 y = s.y + s.h - 3
+    if y < s.y: y = s.y
+    for k in 0..<g_ntoasts:
+        i32 i = g_ntoasts - 1 - k
+        string8 text = string8(g_toast_text[i][0..<g_toast_len[i]])
+        i32 w = measure(text) + 4
+        if w > s.w - 2: w = s.w - 2
+        if y < s.y: break
+        Rect box = (s.x + s.w - w - 2, y, w, 1)
+        Style body = (g_theme.base, g_toast_color[i], Attr.BOLD)
+        fill_rect(box, body)
+        // A one-cell bar of the window's own background at each end, so the
+        // toast reads as a chip rather than as a stripe reaching the edge.
+        draw_glyph(box.x, y, toast_cap_left(), (g_toast_color[i], g_theme.base, Attr.NONE))
+        draw_glyph(box.x + box.w - 1, y, toast_cap_right(), (g_toast_color[i], g_theme.base, Attr.NONE))
+        _ = draw_text(box.x + 2, y, text, body, box.w - 4)
+        y = y - 1
+    g_clip = was
+
+private string8 toast_cap_left():
+    if g_theme.wide_glyphs: return "▐"
+    return " "
+
+private string8 toast_cap_right():
+    if g_theme.wide_glyphs: return "▌"
+    return " "
+
+// ── the command palette ────────────────────────────────────────────────────
+//
+// A modal with a filter and a list: type, choose, done. Built out of `modal`,
+// `line_edit` and `list`, because a palette that were its own mechanism would
+// be a second implementation of all three.
+//
+//     private bool palette_open
+//     private ref []char8 palette_query
+//     ...
+//     i32 chose = tui.palette(open: &palette_open, query: &palette_query,
+//                             items: COMMANDS[:])
+//     if chose >= 0: run_command(chose)
+//
+// Answers the index **into `items`** of what was chosen, or `-1`. The index is
+// the caller's own, not a filtered one — resolving that here is the whole
+// difference between a palette you can act on and one you have to re-derive
+// the meaning of.
+
+private i32 g_palette_pick
+
+i32 palette(^bool open, ^ref []char8 query, []string8 items, string8 title = "Commands"):
+    if !open^:
+        g_palette_pick = 0
+        return 0 - 1
+    i32 n = i32(#len(items))
+    i32 rows = n + 5
+    if rows > 18: rows = 18
+
+    // Opening clears the query. A palette that reopens holding what you typed
+    // last time matches nothing and looks broken — and "reopen and retype" is
+    // the gesture, not "reopen and continue".
+    bool opening = !g_overlay_active
+    if !modal(title: title, open: open, width: 0 - 1, height: rows): return 0 - 1
+    defer end()
+    if opening:
+        query^ = set_text(query^, "")
+        g_palette_pick = 0
+
+    // The field takes the keyboard on the frame the palette opens — `modal`
+    // asked for that — so the first thing typed lands in it. A palette you have
+    // to click into, or that eats your first letter, is one you would not have
+    // opened.
+    _ = line_edit(label: "", buf: query, placeholder: "type to filter…")
+    space()
+
+    string8 want = edited(query^)
+    ref []i32 back = #make([]i32, 0, mem)      // filtered row -> original index
+    ref []string8 shown = #make([]string8, 0, mem)
+    if back == nil || shown == nil: return 0 - 1
+    for i in 0..<n:
+        // Case-insensitively, because nobody types the capital letter of a
+        // command they are trying to find quickly.
+        if #len(want) > 0 && !contains_fold(items[i], want): continue
+        if !#append(back, i): break
+        if !#append(shown, items[i]): break
+
+    i32 count = i32(#len(shown))
+    if g_palette_pick >= count: g_palette_pick = count - 1
+    if g_palette_pick < 0: g_palette_pick = 0
+
+    // Up and Down reach the list even though the field has focus, because the
+    // field is what you are typing into and the list is what you are choosing
+    // from — which is one gesture in a palette and two controls in the library.
+    if count > 0:
+        if own_key("down"): g_palette_pick = g_palette_pick + 1
+        if own_key("up"): g_palette_pick = g_palette_pick - 1
+        if g_palette_pick >= count: g_palette_pick = 0
+        if g_palette_pick < 0: g_palette_pick = count - 1
+
+    bool chose = false
+    if count > 0 && own_key("enter"): chose = true
+    if list(selected: &g_palette_pick, items: shown, height: REST, tag: "palette"):
+        chose = true
+
+    if !chose: return 0 - 1
+    open^ = false
+    if g_palette_pick < 0 || g_palette_pick >= count: return 0 - 1
+    return back[g_palette_pick]
+
+// `strings.contains`, ignoring case. ASCII only, which is what a command name
+// is; a fold that claimed to handle the rest would be claiming to know about
+// Turkish dotless i, and this does not.
+private bool contains_fold(string8 haystack, string8 needle):
+    i32 n = i32(#len(needle))
+    i32 h = i32(#len(haystack))
+    if n == 0: return true
+    if n > h: return false
+    for at in 0..<(h - n + 1):
+        bool all = true
+        for k in 0..<n:
+            if chars.lower(haystack[at + k]) != chars.lower(needle[k]):
+                all = false
+                break
+        if all: return true
+    return false

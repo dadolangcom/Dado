@@ -1,0 +1,1491 @@
+// app:ui — a UI framework whose layout and text are bound to a monospace cell
+// grid, and whose region interiors are not.
+//
+// **The unit is the cell.** Every rectangle, every minimum size and every
+// position this package speaks is a whole number of cells (`cell.CellRect`,
+// `cell.CellPoint`). A widget that later owns a free-pixel interior — an
+// image, a viewport — gets a rectangle in cells like every other node and does
+// what it likes inside it; no pixel ever reaches the layout.
+//
+// ── The tree ───────────────────────────────────────────────────────────────
+//
+// A `Control` is a handle, `(slot, generation)`, into one package-owned pool
+// of nodes. Each node records its kind, an opaque `rawptr` state, its parent,
+// its first and last child and its two siblings, the rectangle layout gave it,
+// the minimum size it last measured, four flags (expand horizontally, expand
+// vertically, visible, focusable) and its dirty bits. Removing a node bumps its
+// slot's generation and threads the slot onto a free list, so a handle held
+// past the removal no longer matches, and the node that later reuses the slot
+// is not reachable through it.
+//
+// There is one implicit root, created on first use and answered by `root()`:
+// a vertical box that `update` sizes to the screen rectangle. `create` with a
+// `NIL` parent attaches the new node to the root.
+//
+// ── Kinds and hooks ────────────────────────────────────────────────────────
+//
+// There are no methods, subclasses or virtual tables. A widget is a
+// constructor plus a state record, and its behaviour is a `Kind`: a set of
+// function references (`Hooks`) registered once with `register_kind`. Every
+// hook receives the node's handle and its state pointer; any of them may be
+// nil, and each type below says what a nil one means. The node's state is
+// either a pointer the widget owns and gives back in its `free` hook, or a
+// zeroed block from `create_owned` that this package frees after the `free`
+// hook has run.
+//
+// ── Signals ────────────────────────────────────────────────────────────────
+//
+// A signal is an interned name (`signal`) and a connection is a function
+// reference plus a context pointer on one node (`connect`). `emit` runs a
+// node's connections for one signal in the order they were made. A removed
+// node takes its connections with it.
+//
+// ── Two dirty bits, two walks ──────────────────────────────────────────────
+//
+// `mark_layout(c)` sets layout-dirty on `c` and on each ancestor until it
+// meets one that is already layout-dirty, and sets paint-dirty on `c`.
+// `mark_paint(c)` sets paint-dirty on `c` and a "some descendant needs paint"
+// bit on each ancestor until it meets one that already has it. Both bits
+// therefore reach the root whenever anything visible is dirty, and `update`
+// answers an idle frame by reading the root's bits alone.
+//
+// `update(screen)` runs the layout walk and then the paint walk:
+//
+//   - measure, bottom-up, only through layout-dirty nodes: a clean subtree
+//     keeps its cached minimum and is not entered;
+//   - arrange, top-down from the root: a node is arranged when it is
+//     layout-dirty or its rectangle changed, and a node whose rectangle
+//     changes becomes paint-dirty;
+//   - paint, in tree order (a parent before its children), entering only
+//     subtrees that are paint-dirty or hold a paint-dirty descendant. A node
+//     that repaints forces its whole subtree to repaint, because its paint
+//     may overwrite its children's cells. Each paint hook receives the node's
+//     rectangle clipped to every ancestor's, and every node repainted, hook
+//     or no hook, records itself as the owner of those cells in the hit map
+//     that routes the mouse (`hit`, in input.dado).
+//
+// A changed screen rectangle makes every node layout- and paint-dirty.
+// Invisible nodes are laid out as empty rectangles, and neither they nor their
+// subtrees are measured, arranged or painted. Every bit the walks reach is
+// clear when `update` returns.
+//
+// Cells a node stops covering are repainted by its parent: removing or hiding
+// a node marks its parent for paint, and a container whose children cover
+// less than they did marks itself from its arrange hook (`mark_paint` works
+// there).
+//
+// While `update` runs, the tree's shape is frozen: `create`, `remove`,
+// `mark_layout` and every setter that marks layout do nothing, `mark_paint`
+// does nothing during the paint walk, and `set_rect` does something only for
+// a visible child of the node whose arrange hook is running.
+//
+// ── Layer groups ───────────────────────────────────────────────────────────
+//
+// Every node paints into one of the grid's layer groups (`grid.target`): the
+// one `set_layer` gave it, or else its parent's, down to the root's
+// `grid.BASE`. A layer is a whole screen of cells over the ones below, so a
+// floating subtree drawn into its own layer covers the base without the base
+// repainting under it, and uncovers it by clearing its own cells rather than
+// by repainting the base. layers.dado has the rules.
+//
+// ── Focus ──────────────────────────────────────────────────────────────────
+//
+// One node at most has focus, and keys go to it (`dispatch`). A program moves
+// focus between panes with `focus_next`/`focus_prev`, which step through the
+// focusable nodes in view in tree order, and asks whether focus is inside a
+// subtree with `focus_within`. A focus move marks nothing for layout or paint:
+// a box whose look follows it is chrome, which is rebuilt, and a widget whose
+// cells follow it asks to be repainted (`set_focus_repaint`).
+//
+// ── Chrome ─────────────────────────────────────────────────────────────────
+//
+// A kind with a `style` hook answers the `StyleBox` it is drawn with now;
+// `chrome_sync` turns every visible node's box into the grid's pixel chrome
+// when something it depends on changed, and does nothing on an idle frame.
+// chrome.dado has the rules, and why a shadow's bleed marks nothing.
+//
+// ── Totality ───────────────────────────────────────────────────────────────
+//
+// Every public entry point accepts any handle. A handle that is `NIL`, names a
+// slot outside the pool, names a removed node, or names a slot that has since
+// been recycled for another node reads as the empty thing — an empty
+// rectangle, `NIL` parent and children, zero counts, a nil state, false — and
+// every mutation through it does nothing. No entry point aborts on one.
+//
+// ── Storage ────────────────────────────────────────────────────────────────
+//
+// There is no fixed cap on nodes, children, kinds, signals or connections:
+// every pool grows by doubling. The allocator is the ambient one — `#default`
+// — at the first call that creates anything, and every later growth passes it
+// explicitly, because a later call may run inside a per-frame scratch arena
+// that is rolled back every frame.
+package ui
+
+import "app:ui/cell"
+import "app:input"
+import "app:ui/grid"
+
+// ── Handles ────────────────────────────────────────────────────────────────
+
+distinct type Control: (i32 slot, u32 generation)
+
+// The handle that names nothing.
+const Control NIL = Control((-1, 0))
+
+// A registered kind: an index into the kind registry. `NO_KIND` names none.
+distinct type Kind: i32
+
+const Kind NO_KIND = Kind(-1)
+
+// ── Hooks ──────────────────────────────────────────────────────────────────
+
+// The node's minimum size in cells, as `(cols, rows)` in a `CellPoint`'s
+// `(col, row)`. A container reads its children's through `minimum(child)`,
+// which the bottom-up walk has already brought up to date. A negative extent
+// is taken as zero. Nil: `(0, 0)`.
+type MeasureFn: cell.CellPoint(Control, rawptr)
+
+// For a container: given the node's final rectangle, give each child its
+// rectangle by calling `set_rect(child, r)`. A child the hook leaves alone
+// keeps the rectangle it had. Nil: every child gets the node's own rectangle.
+type ArrangeFn: void(Control, rawptr, cell.CellRect)
+
+// Draw the node. The rectangle is the node's own intersected with every
+// ancestor's; `rect(c)` is the unclipped one. Never called with an empty
+// rectangle. The hook owns every cell of that rectangle: a cell it leaves
+// unwritten keeps whatever was drawn there before. Nil: nothing is drawn.
+type PaintFn: void(Control, rawptr, cell.CellRect)
+
+// Offered a key or text event while the node or a descendant has focus, and
+// a mouse event while the node or a descendant is under the pointer or holds
+// the capture (see `dispatch`); answers whether it handled it. Nil: not
+// handled, and the event bubbles on.
+type InputFn: bool(Control, rawptr, input.Event)
+
+// Release the widget's own state. Called once, when the node is removed,
+// after its children have been removed and while its handle is still valid.
+type FreeFn: void(Control, rawptr)
+
+// The box the node is drawn with now, for its current state (a panel's
+// focus box while focus is inside it, say). It must answer from the node's
+// state, the theme and the tree's reads alone — it is called outside paint,
+// by `chrome_sync` and by the bleed rule — and a widget whose answer changes
+// for any reason the tree does not see (a rect, focus, a theme, a removal)
+// calls `chrome_changed`. Nil: `style_empty()`, no chrome.
+type StyleFn: StyleBox(Control, rawptr)
+
+// The mouse cursor the node wants shown with the pointer over screen cell
+// `p` — a `CURSOR_*`, or `CURSOR_INHERIT` for "not mine: ask my parent". Asked
+// for the hovered node (or the one holding the capture) and then each ancestor
+// until one answers a cursor; nobody answering is `CURSOR_DEFAULT`. `p` may lie
+// outside the node's rectangle while it holds the capture. Like `style`, it
+// answers from state alone and draws nothing. Nil: `CURSOR_INHERIT`.
+// input.dado has the rules.
+type CursorFn: i32(Control, rawptr, cell.CellPoint)
+
+// A connected signal handler: the emitting node and the context pointer given
+// to `connect`.
+type SignalFn: void(Control, rawptr)
+
+type Hooks: (
+    MeasureFn measure,
+    ArrangeFn arrange,
+    PaintFn   paint,
+    InputFn   input,
+    FreeFn    free,
+    StyleFn   style,
+    CursorFn  cursor,
+)
+
+// ── Counters ───────────────────────────────────────────────────────────────
+
+// `measured`, `arranged` and `painted` count nodes stepped by the most recent
+// `update` (a node counts whether or not its kind has that hook; `painted`
+// counts nodes repainted); `updates` and `updates_idle` count every `update`
+// since the last `reset`, and the second only those that found nothing dirty.
+type Stats: (
+    i32 nodes_live,
+    i32 measured,
+    i32 arranged,
+    i32 painted,
+    i32 updates,
+    i32 updates_idle,
+)
+
+// ── Storage ────────────────────────────────────────────────────────────────
+
+// Links are slot indices, -1 for none: a live node only ever links to live
+// nodes, so no generation is needed inside the pool.
+private type Node: (
+    bool           live,
+    u32            generation,
+    i32            free_next,
+    Kind           kind,
+    rawptr         state,
+    ref []u64      owned,
+    i32            parent,
+    i32            first_child,
+    i32            last_child,
+    i32            next_sibling,
+    i32            prev_sibling,
+    i32            child_count,
+    i32            conn_head,
+    i32            conn_tail,
+    cell.CellRect  area,
+    cell.CellPoint min_size,
+    bool           expand_h,
+    bool           expand_v,
+    bool           shown,
+    bool           takes_focus,
+    bool           layout_dirty,
+    bool           paint_dirty,
+    bool           paint_below,
+    bool           area_changed,
+    // Shown, and every ancestor shown: what `hit` and `captured` read, kept
+    // current by `set_visible` so neither has to climb.
+    bool           in_view,
+    // The clipped rectangle this node last wrote into the hit map; empty when
+    // the map may no longer hold it there (input.dado, `own_cells`).
+    cell.CellRect  claimed,
+    // The layer `set_layer` gave this node, -1 to take its parent's; and the
+    // layer it paints into, which is that resolved (layers.dado).
+    i32            layer_own,
+    i32            layer,
+    // The grid region this node's paint draws through (`set_region`), -1 for
+    // none.
+    i32            region,
+    // Repainted whenever focus moves (`set_focus_repaint`).
+    bool           focus_paint,
+    // The grid ink list this node's paint rebuilds (`ink_begin`), -1 for
+    // none.
+    i32            ink,
+    // Where a stack places this node (`set_anchor`): `ANCHOR_NONE` to fill
+    // the stack, else one of the nine anchors, with a fixed size (a
+    // non-positive extent is the node's minimum on that axis) and an inset
+    // from the anchored edges.
+    i32            anchor,
+    cell.CellPoint anchor_size,
+    cell.CellPoint anchor_off,
+)
+
+private type KindSlot: (string8 name, Hooks hooks)
+
+private type Conn: (
+    bool     live,
+    i32      sig,
+    SignalFn fn,
+    rawptr   ctx,
+    i32      next,
+)
+
+// What `update` is doing, which decides what the mutators may do.
+private const i32 PHASE_IDLE    = 0
+private const i32 PHASE_MEASURE = 1
+private const i32 PHASE_ARRANGE = 2
+private const i32 PHASE_PAINT   = 3
+// `remove` or `reset` is tearing a subtree down and its free hooks are running.
+private const i32 PHASE_REMOVE  = 4
+
+private bool      g_have_alloc
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) g_alloc
+
+private ref []Node g_nodes
+private i32        g_used
+private i32        g_free = -1
+// The generation every fresh slot starts at. `reset` raises it past every
+// generation it gave out, so a handle held across a `reset` cannot match a
+// node the new pool makes.
+private u32        g_gen_base
+private i32        g_root = -1
+private i32        g_focus = -1
+
+private ref []KindSlot g_kinds
+private i32            g_nkinds
+
+private ref []string8 g_sig_names
+private i32          g_nsigs
+
+private ref []Conn g_conns
+private i32        g_conns_used
+private i32        g_conns_free = -1
+
+// How many ancestor bits the two climbs have set, ever. Read by the tests to
+// see the climbs stop early; nothing else reads it.
+private i32           g_climbed
+// Live nodes with a region (`set_region`): `hide_regions` has nothing to do
+// while there are none.
+private i32           g_region_nodes
+// Live nodes with an ink list (`ink_begin`): `hide_regions` has nothing to do
+// while there are none of these either.
+private i32           g_ink_nodes
+// Live nodes with `focus_paint` set: `focus_moved` has nothing to do while
+// there are none. And a focus move that happened during a removal, when
+// nothing may be marked, to be announced once the removal is done.
+private i32           g_focus_watchers
+private bool          g_focus_pending
+private i32           g_phase
+private i32           g_arranging = -1
+private bool          g_have_screen
+private cell.CellRect g_screen
+private Stats         g_stats
+
+// ── Allocation ─────────────────────────────────────────────────────────────
+
+private void capture_alloc():
+    if !g_have_alloc:
+        g_alloc = #default
+        g_have_alloc = true
+
+// The node pool and the root, made on first use.
+private bool ensure():
+    capture_alloc()
+    if g_nodes == nil:
+        g_nodes = #make([]Node, 16, g_alloc)
+        if g_nodes == nil:
+            return false
+        for i in 0..<16:
+            blank_slot(i32(i))
+        g_used = 0
+        g_free = -1
+    if g_root < 0:
+        Kind vk = vbox_kind()
+        if !kind_ok(vk):
+            return false
+        g_root = new_node(vk, -1, nil)
+    return g_root >= 0
+
+private void blank_slot(i32 i):
+    g_nodes[i].live = false
+    g_nodes[i].generation = g_gen_base
+    g_nodes[i].free_next = -1
+    g_nodes[i].owned = nil
+
+private i32 alloc_slot():
+    if g_free >= 0:
+        i32 idx = g_free
+        g_free = g_nodes[idx].free_next
+        return idx
+    if g_used >= i32(#len(g_nodes)):
+        i32 old = i32(#len(g_nodes))
+        if !#resize(g_nodes, old * 2):
+            return -1
+        for i in old..<old * 2:
+            blank_slot(i32(i))
+    i32 idx = g_used
+    g_used = g_used + 1
+    return idx
+
+// ── Handles, checked ───────────────────────────────────────────────────────
+
+// The slot a handle names, or -1 for any handle that names no live node.
+private i32 index(Control c):
+    if g_nodes == nil || c.slot < 0 || c.slot >= g_used:
+        return -1
+    if !g_nodes[c.slot].live || g_nodes[c.slot].generation != c.generation:
+        return -1
+    return c.slot
+
+private Control handle(i32 i):
+    if i < 0:
+        return NIL
+    return Control((i, g_nodes[i].generation))
+
+private cell.CellRect empty_rect():
+    cell.CellRect r = (0, 0, 0, 0)
+    return r
+
+private cell.CellPoint zero_point():
+    cell.CellPoint p = (0, 0)
+    return p
+
+// ── Kinds ──────────────────────────────────────────────────────────────────
+
+// Register a kind once and keep the answer. The registry outlives `reset`: a
+// kind is part of the program's vocabulary, like a type. Answers `NO_KIND`
+// only when the registry cannot grow.
+Kind register_kind(string8 name, Hooks h):
+    capture_alloc()
+    if g_kinds == nil:
+        g_kinds = #make([]KindSlot, 8, g_alloc)
+        if g_kinds == nil:
+            return NO_KIND
+        g_nkinds = 0
+    if g_nkinds >= i32(#len(g_kinds)):
+        if !#resize(g_kinds, g_nkinds * 2):
+            return NO_KIND
+    g_kinds[g_nkinds].name = name
+    g_kinds[g_nkinds].hooks = h
+    g_nkinds = g_nkinds + 1
+    return Kind(g_nkinds - 1)
+
+private bool kind_ok(Kind k):
+    return i32(k) >= 0 && i32(k) < g_nkinds
+
+// The name a kind was registered with, or "" for one that was not.
+string8 kind_name(Kind k):
+    if !kind_ok(k):
+        return ""
+    return g_kinds[i32(k)].name
+
+// ── Creating and removing ──────────────────────────────────────────────────
+
+// A new node of kind `k`, last child of `parent` (of the root when `parent`
+// is `NIL`), holding `state`. Answers `NIL` for an unregistered kind, for a
+// non-`NIL` parent that is not live, while `update` or `remove` is running,
+// or when the pool cannot grow. The node starts visible, not expanding, not
+// focusable, with an empty rectangle, and layout-dirty.
+Control create(Kind k, Control parent, rawptr state):
+    if g_phase != PHASE_IDLE || !kind_ok(k):
+        return NIL
+    if !ensure():
+        return NIL
+    i32 p = g_root
+    if parent != NIL:
+        p = index(parent)
+        if p < 0:
+            return NIL
+    return handle(new_node(k, p, state))
+
+// As `create`, with a state block of `nbytes` zeroed bytes that the node owns:
+// `state(c)` points at it, it is aligned for any 8-byte scalar, and it is
+// freed after the kind's `free` hook has run. `nbytes` of zero or less makes
+// no block.
+Control create_owned(Kind k, Control parent, i64 nbytes):
+    Control c = create(k, parent, nil)
+    i32 i = index(c)
+    if i < 0 || nbytes <= 0:
+        return c
+    ref []u64 blk = #make([]u64, (nbytes + 7) / 8, g_alloc)
+    if blk == nil:
+        remove(c)
+        return NIL
+    g_nodes[i].state = rawptr(&blk[0])
+    g_nodes[i].owned = blk
+    return c
+
+private i32 new_node(Kind k, i32 p, rawptr state):
+    i32 i = alloc_slot()
+    if i < 0:
+        return -1
+    g_nodes[i].live = true
+    g_nodes[i].free_next = -1
+    g_nodes[i].kind = k
+    g_nodes[i].state = state
+    g_nodes[i].owned = nil
+    g_nodes[i].parent = p
+    g_nodes[i].first_child = -1
+    g_nodes[i].last_child = -1
+    g_nodes[i].next_sibling = -1
+    g_nodes[i].prev_sibling = -1
+    g_nodes[i].child_count = 0
+    g_nodes[i].conn_head = -1
+    g_nodes[i].conn_tail = -1
+    g_nodes[i].area = empty_rect()
+    g_nodes[i].min_size = zero_point()
+    g_nodes[i].expand_h = false
+    g_nodes[i].expand_v = false
+    g_nodes[i].shown = true
+    g_nodes[i].takes_focus = false
+    g_nodes[i].layout_dirty = false
+    g_nodes[i].paint_dirty = false
+    g_nodes[i].paint_below = false
+    g_nodes[i].area_changed = false
+    g_nodes[i].in_view = p < 0 || g_nodes[p].in_view
+    g_nodes[i].claimed = empty_rect()
+    g_nodes[i].layer_own = -1
+    g_nodes[i].layer = grid.BASE
+    g_nodes[i].region = -1
+    g_nodes[i].focus_paint = false
+    g_nodes[i].ink = -1
+    g_nodes[i].anchor = ANCHOR_NONE
+    g_nodes[i].anchor_size = zero_point()
+    g_nodes[i].anchor_off = zero_point()
+    if p >= 0:
+        g_nodes[i].layer = g_nodes[p].layer
+    if p >= 0:
+        i32 last = g_nodes[p].last_child
+        g_nodes[i].prev_sibling = last
+        if last >= 0:
+            g_nodes[last].next_sibling = i
+        else:
+            g_nodes[p].first_child = i
+        g_nodes[p].last_child = i
+        g_nodes[p].child_count = g_nodes[p].child_count + 1
+    g_stats.nodes_live = g_stats.nodes_live + 1
+    layout_up(i)
+    return i
+
+// Remove `c` and its whole subtree, children before parents. Each node's
+// `free` hook runs once, its connections are dropped, its owned state is
+// freed, focus held inside it is cleared, and its slot's generation moves on.
+// Removing the root removes every node; the next call that needs a root makes
+// a fresh one. Does nothing while `update` or another `remove` is running.
+void remove(Control c):
+    if g_phase != PHASE_IDLE:
+        return
+    i32 i = index(c)
+    if i < 0:
+        return
+    i32 p = g_nodes[i].parent
+    bool floats = floats_above(i)
+    g_phase = PHASE_REMOVE
+    leaving_layers(i, p)
+    unlink(i)
+    destroy(i)
+    g_chrome_dirty = true
+    g_phase = PHASE_IDLE
+    if i == g_root:
+        g_root = -1
+    if g_focus_pending:
+        focus_moved()
+    if p >= 0 && g_nodes[p].live:
+        if floats:
+            // A floating subtree's cells were never the parent's: its layer
+            // is blanked under it (layers.dado) and the parent's cells, in the
+            // layer below, never changed. Relaid out, not repainted.
+            layout_only_up(p)
+        else:
+            // The removed node's cells are exposed: the parent's paint covers
+            // them, and must claim them in the hit map even with its clip
+            // unchanged.
+            g_nodes[p].claimed = empty_rect()
+            layout_up(p)
+    // A modal inside what went is no longer one, and focus goes back.
+    modal_prune()
+
+private void unlink(i32 i):
+    i32 p = g_nodes[i].parent
+    if p < 0:
+        return
+    i32 prev = g_nodes[i].prev_sibling
+    i32 next = g_nodes[i].next_sibling
+    if prev >= 0:
+        g_nodes[prev].next_sibling = next
+    else:
+        g_nodes[p].first_child = next
+    if next >= 0:
+        g_nodes[next].prev_sibling = prev
+    else:
+        g_nodes[p].last_child = prev
+    g_nodes[p].child_count = g_nodes[p].child_count - 1
+    g_nodes[i].parent = -1
+    g_nodes[i].prev_sibling = -1
+    g_nodes[i].next_sibling = -1
+
+// Children first. A subtree being destroyed is walked by the links it had
+// when the walk reached it, each read before that child's slot is released,
+// so the walk never follows a freed slot.
+private void destroy(i32 i):
+    i32 ch = g_nodes[i].first_child
+    for ch >= 0:
+        i32 next = g_nodes[ch].next_sibling
+        destroy(ch)
+        ch = next
+    FreeFn fr = g_kinds[i32(g_nodes[i].kind)].hooks.free
+    if fr != nil:
+        fr(handle(i), g_nodes[i].state)
+    drop_connections(i)
+    if g_nodes[i].region >= 0:
+        g_nodes[i].region = -1
+        g_region_nodes = g_region_nodes - 1
+    if g_nodes[i].focus_paint:
+        g_nodes[i].focus_paint = false
+        g_focus_watchers = g_focus_watchers - 1
+    if g_nodes[i].ink >= 0:
+        grid.ink_free(g_nodes[i].ink)
+        g_nodes[i].ink = -1
+        g_ink_nodes = g_ink_nodes - 1
+    if g_nodes[i].owned != nil:
+        #delete(g_nodes[i].owned)
+        g_nodes[i].owned = nil
+    if g_focus == i:
+        g_focus = -1
+        g_chrome_dirty = true
+        focus_moved()
+    if g_capture == i:
+        g_capture = -1
+        g_capture_auto = false
+    g_nodes[i].live = false
+    watch_sync(i)
+    g_nodes[i].state = nil
+    g_nodes[i].first_child = -1
+    g_nodes[i].last_child = -1
+    g_nodes[i].generation = g_nodes[i].generation + 1
+    g_nodes[i].free_next = g_free
+    g_free = i
+    g_stats.nodes_live = g_stats.nodes_live - 1
+
+// Tear the whole tree down — every free hook runs, children first — drop every
+// connection and give back the node and connection pools. Kinds and signal
+// names survive. Every handle from before reads as dead afterwards, including
+// one whose slot a later node reuses. Does nothing while `update` or `remove`
+// is running.
+void reset():
+    if g_phase != PHASE_IDLE:
+        return
+    if g_nodes != nil:
+        if g_root >= 0:
+            g_phase = PHASE_REMOVE
+            destroy(g_root)
+            g_phase = PHASE_IDLE
+        u32 top = g_gen_base
+        for i in 0..<g_used:
+            if g_nodes[i].generation >= top:
+                top = g_nodes[i].generation + 1
+        g_gen_base = top
+        #delete(g_nodes)
+        g_nodes = nil
+    if g_conns != nil:
+        #delete(g_conns)
+        g_conns = nil
+    g_used = 0
+    g_free = -1
+    g_root = -1
+    g_focus = -1
+    g_region_nodes = 0
+    g_ink_nodes = 0
+    g_nwatch = 0
+    g_watch_all = false
+    g_focus_watchers = 0
+    g_focus_pending = false
+    g_conns_used = 0
+    g_conns_free = -1
+    g_have_screen = false
+    free_owners()
+    reset_layers()
+    modal_reset()
+    g_chrome_dirty = true
+    g_capture = -1
+    g_capture_auto = false
+    g_have_pointer = false
+    Stats zero = (0, 0, 0, 0, 0, 0)
+    g_stats = zero
+
+// ── Reading the tree ───────────────────────────────────────────────────────
+
+// The implicit root: a vertical box that `update` sizes to the screen. Made
+// on first use; `NIL` only when the pool cannot be made.
+Control root():
+    if g_phase == PHASE_IDLE:
+        ensure()
+    if g_root < 0:
+        return NIL
+    return handle(g_root)
+
+bool valid(Control c):
+    return index(c) >= 0
+
+Control parent(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return NIL
+    return handle(g_nodes[i].parent)
+
+Control first_child(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return NIL
+    return handle(g_nodes[i].first_child)
+
+Control last_child(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return NIL
+    return handle(g_nodes[i].last_child)
+
+Control next_sibling(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return NIL
+    return handle(g_nodes[i].next_sibling)
+
+Control prev_sibling(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return NIL
+    return handle(g_nodes[i].prev_sibling)
+
+i32 child_count(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return 0
+    return g_nodes[i].child_count
+
+rawptr state(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return nil
+    return g_nodes[i].state
+
+Kind kind(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return NO_KIND
+    return g_nodes[i].kind
+
+// The rectangle the last layout gave the node, unclipped. Empty for an
+// invisible node.
+cell.CellRect rect(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return empty_rect()
+    return g_nodes[i].area
+
+// The minimum the node last measured, `(cols, rows)`; `(0, 0)` for an
+// invisible node, which is what a container's measure hook should see.
+cell.CellPoint minimum(Control c):
+    i32 i = index(c)
+    if i < 0 || !g_nodes[i].shown:
+        return zero_point()
+    return g_nodes[i].min_size
+
+bool expands_h(Control c):
+    i32 i = index(c)
+    return i >= 0 && g_nodes[i].expand_h
+
+bool expands_v(Control c):
+    i32 i = index(c)
+    return i >= 0 && g_nodes[i].expand_v
+
+bool is_visible(Control c):
+    i32 i = index(c)
+    return i >= 0 && g_nodes[i].shown
+
+bool is_focusable(Control c):
+    i32 i = index(c)
+    return i >= 0 && g_nodes[i].takes_focus
+
+bool is_layout_dirty(Control c):
+    i32 i = index(c)
+    return i >= 0 && g_nodes[i].layout_dirty
+
+bool is_paint_dirty(Control c):
+    i32 i = index(c)
+    return i >= 0 && g_nodes[i].paint_dirty
+
+Stats stats():
+    return g_stats
+
+// ── Flags ──────────────────────────────────────────────────────────────────
+
+void set_expand(Control c, bool h, bool v):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_IDLE:
+        return
+    if g_nodes[i].expand_h == h && g_nodes[i].expand_v == v:
+        return
+    g_nodes[i].expand_h = h
+    g_nodes[i].expand_v = v
+    layout_up(i)
+
+// Hiding a node exposes its cells, so its parent repaints; showing it marks it
+// layout-dirty and climbs from there, whatever bits it kept while hidden.
+// Hiding also takes the node and its subtree out of mouse routing at once —
+// `hit` and `captured` stop answering them and a capture held inside ends —
+// rather than at the next paint, so a press cannot land on what is no longer
+// drawn. Both the node's and its parent's hit-map claims are dropped: the
+// parent's paint must reclaim the exposed cells, and a node shown again must
+// reclaim cells its parent painted over while it was hidden.
+//
+// **A floating node is the exception** (`floats_above`: it paints into a
+// layer above its parent's): its cells were never its parent's, so hiding it
+// repaints nothing below — its layer blanks what it covered (layers.dado) —
+// and showing it again paints it alone. So an overlay opens and closes at the
+// cost of its own cells.
+void set_visible(Control c, bool v):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_IDLE:
+        return
+    if g_nodes[i].shown == v:
+        return
+    g_nodes[i].shown = v
+    i32 p = g_nodes[i].parent
+    bool floats = floats_above(i)
+    if !v:
+        leaving_layers(i, p)
+    set_in_view(i, p < 0 || g_nodes[p].in_view)
+    g_nodes[i].claimed = empty_rect()
+    if p >= 0 && !floats:
+        g_nodes[p].claimed = empty_rect()
+    layout_up(i)
+    if !v && p >= 0 && !floats:
+        paint_up(p)
+    if !v:
+        modal_prune()
+
+// Whether node `i` paints into a layer above its parent's: the root of a
+// floating subtree. The root and a node on its parent's layer do not.
+private bool floats_above(i32 i):
+    i32 p = g_nodes[i].parent
+    return p >= 0 && g_nodes[i].layer > g_nodes[p].layer
+
+// Recompute `in_view` down the subtree under a parent whose own is `above`,
+// ending a capture held by any node that leaves the view. Costs the subtree,
+// once per visibility change — the price of `hit` and `captured` reading one
+// bit rather than climbing on every mouse event.
+private void set_in_view(i32 i, bool above):
+    bool v = above && g_nodes[i].shown
+    g_nodes[i].in_view = v
+    // A layer a node brings back into view is one the grid must have again,
+    // though a clear may have found it unused (layers.dado).
+    if v && g_nodes[i].layer + 1 > g_layers_used:
+        g_layers_used = g_nodes[i].layer + 1
+    if !v && g_capture == i:
+        g_capture = -1
+        g_capture_auto = false
+    i32 ch = g_nodes[i].first_child
+    for ch >= 0:
+        set_in_view(ch, v)
+        ch = g_nodes[ch].next_sibling
+
+// Clearing focusability on the focused node clears focus.
+void set_focusable(Control c, bool f):
+    i32 i = index(c)
+    if i < 0:
+        return
+    g_nodes[i].takes_focus = f
+    if !f && g_focus == i:
+        g_focus = -1
+        g_chrome_dirty = true
+        focus_moved()
+
+// ── Dirty bits ─────────────────────────────────────────────────────────────
+
+// See the package comment. Does nothing while `update` runs.
+void mark_layout(Control c):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_IDLE:
+        return
+    layout_up(i)
+
+// See the package comment. Does nothing during the paint walk or a removal;
+// from a measure or arrange hook it takes effect in the same `update`.
+void mark_paint(Control c):
+    i32 i = index(c)
+    if i < 0 || g_phase == PHASE_PAINT || g_phase == PHASE_REMOVE:
+        return
+    paint_up(i)
+
+// Layout-dirty on `i` and up to the first ancestor that already is; paint-dirty
+// on `i`. The start node never stops the climb, which is what lets a node
+// shown again re-dirty a chain it left dirty while hidden.
+private void layout_up(i32 i):
+    g_nodes[i].layout_dirty = true
+    i32 p = g_nodes[i].parent
+    for p >= 0 && !g_nodes[p].layout_dirty:
+        g_nodes[p].layout_dirty = true
+        g_climbed = g_climbed + 1
+        p = g_nodes[p].parent
+    paint_up(i)
+
+// Layout-dirty on `i` and up, as `layout_up`, and nothing marked for paint
+// on `i` itself: for a parent whose floating child went, which must be laid
+// out again and has no cell to repaint. The root's layout bit is what makes
+// the next `update` run and blank what the child left.
+private void layout_only_up(i32 i):
+    g_nodes[i].layout_dirty = true
+    i32 p = g_nodes[i].parent
+    for p >= 0 && !g_nodes[p].layout_dirty:
+        g_nodes[p].layout_dirty = true
+        g_climbed = g_climbed + 1
+        p = g_nodes[p].parent
+
+private void paint_up(i32 i):
+    g_nodes[i].paint_dirty = true
+    i32 p = g_nodes[i].parent
+    for p >= 0 && !g_nodes[p].paint_below:
+        g_nodes[p].paint_below = true
+        g_climbed = g_climbed + 1
+        p = g_nodes[p].parent
+
+// ── Layout ─────────────────────────────────────────────────────────────────
+
+// Give `c` its rectangle. Effective only from an arrange hook, and only for a
+// visible child of the node being arranged; anywhere else it does nothing,
+// because the next layout would overwrite it (an invisible child's rectangle
+// is always the empty one at its parent's corner). A negative extent is taken as zero. A
+// changed rectangle makes the child paint-dirty and gets it arranged.
+void set_rect(Control c, cell.CellRect r):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_ARRANGE || g_arranging < 0:
+        return
+    if g_nodes[i].parent != g_arranging || !g_nodes[i].shown:
+        return
+    store_rect(i, r)
+
+private void store_rect(i32 i, cell.CellRect r):
+    cell.CellRect q = r
+    if q.cols < 0:
+        q.cols = 0
+    if q.rows < 0:
+        q.rows = 0
+    if g_nodes[i].area == q:
+        return
+    moving_layer_root(i)
+    g_nodes[i].area = q
+    g_nodes[i].area_changed = true
+    g_chrome_dirty = true
+    paint_up(i)
+
+// Lay out and repaint whatever is dirty. See the package comment. Does
+// nothing when called from inside a hook.
+void update(cell.CellRect screen):
+    if g_phase != PHASE_IDLE || !ensure():
+        return
+    g_stats.updates = g_stats.updates + 1
+    g_stats.measured = 0
+    g_stats.arranged = 0
+    g_stats.painted = 0
+    if !g_have_screen || g_screen != screen:
+        g_have_screen = true
+        g_screen = screen
+        size_owners(screen)
+        for i in 0..<g_used:
+            if g_nodes[i].live:
+                g_nodes[i].layout_dirty = true
+                g_nodes[i].paint_dirty = true
+                g_nodes[i].paint_below = true
+                g_nodes[i].claimed = empty_rect()
+    i32 r = g_root
+    if !g_nodes[r].layout_dirty && !g_nodes[r].paint_dirty && !g_nodes[r].paint_below:
+        g_stats.updates_idle = g_stats.updates_idle + 1
+        return
+    // A hidden root lays out and paints nothing, and keeps its bits: the
+    // update after it is shown again then does all the work it skipped.
+    // Arranging its children here would clear their layout bits without having
+    // measured them, and their minimums would stay stale.
+    if !g_nodes[r].shown:
+        hide_regions()
+        return
+    if g_nodes[r].layout_dirty:
+        g_phase = PHASE_MEASURE
+        measure_walk(r)
+        g_phase = PHASE_ARRANGE
+        store_rect(r, screen)
+        arrange_walk(r)
+        g_nodes[r].area_changed = false
+    g_phase = PHASE_PAINT
+    flush_layer_clears()
+    paint_walk(r, g_nodes[r].area, false)
+    grid.target(grid.BASE)
+    g_phase = PHASE_IDLE
+    hide_regions()
+
+private void measure_walk(i32 i):
+    if !g_nodes[i].layout_dirty || !g_nodes[i].shown:
+        return
+    i32 ch = g_nodes[i].first_child
+    for ch >= 0:
+        measure_walk(ch)
+        ch = g_nodes[ch].next_sibling
+    cell.CellPoint m = zero_point()
+    MeasureFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.measure
+    if fn != nil:
+        m = fn(handle(i), g_nodes[i].state)
+        if m.col < 0:
+            m.col = 0
+        if m.row < 0:
+            m.row = 0
+    g_nodes[i].min_size = m
+    g_stats.measured = g_stats.measured + 1
+
+// `i` is visible and its rectangle is final. Its layout-dirty bit is cleared
+// here rather than in `measure_walk`, which is how this walk tells a child
+// that needs entering from one that does not.
+private void arrange_walk(i32 i):
+    g_stats.arranged = g_stats.arranged + 1
+    ArrangeFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.arrange
+    i32 saved = g_arranging
+    g_arranging = i
+    if fn != nil:
+        fn(handle(i), g_nodes[i].state, g_nodes[i].area)
+    else:
+        i32 each = g_nodes[i].first_child
+        for each >= 0:
+            if g_nodes[each].shown:
+                store_rect(each, g_nodes[i].area)
+            each = g_nodes[each].next_sibling
+    g_arranging = saved
+    g_nodes[i].layout_dirty = false
+    cell.CellRect at = g_nodes[i].area
+    i32 ch = g_nodes[i].first_child
+    for ch >= 0:
+        if !g_nodes[ch].shown:
+            cell.CellRect none = (at.col, at.row, 0, 0)
+            store_rect(ch, none)
+        else if g_nodes[ch].layout_dirty || g_nodes[ch].area_changed:
+            arrange_walk(ch)
+        g_nodes[ch].area_changed = false
+        ch = g_nodes[ch].next_sibling
+
+// ── Paint ──────────────────────────────────────────────────────────────────
+
+// A subtree that is invisible or wholly clipped away is not entered, and its
+// nodes below the top one keep whatever bits they hold. It can only come back
+// into view through a rectangle change at or above its top node, and that
+// node then repaints and forces the whole subtree with it.
+private bool g_paint_forced
+
+// Inside a paint hook: whether this paint was forced by an ancestor that
+// repainted, rather than asked for by the node's own `mark_paint` or a change
+// of its rectangle. A forced paint may have had its cells overwritten by the
+// ancestor, so a widget that repaints only what it knows changed must repaint
+// everything when this is true. False outside a paint hook.
+bool paint_forced():
+    return g_paint_forced
+
+private void paint_walk(i32 i, cell.CellRect outer, bool forced):
+    bool dirty = forced || g_nodes[i].paint_dirty
+    bool below = g_nodes[i].paint_below
+    g_nodes[i].paint_dirty = false
+    g_nodes[i].paint_below = false
+    if !g_nodes[i].shown:
+        return
+    cell.CellRect clip = cell.intersect(g_nodes[i].area, outer)
+    if cell.is_empty(clip):
+        return
+    if dirty:
+        g_stats.painted = g_stats.painted + 1
+        refit_layer_root(i, clip)
+        own_cells(i, clip, forced)
+        PaintFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.paint
+        if fn != nil:
+            grid.target(g_nodes[i].layer)
+            g_paint_forced = forced
+            fn(handle(i), g_nodes[i].state, clip)
+            g_paint_forced = false
+            // An ink list a hook opened and did not close ends with its paint.
+            ink_end()
+    if !dirty && !below:
+        return
+    i32 ch = g_nodes[i].first_child
+    for ch >= 0:
+        paint_walk(ch, clip, dirty)
+        ch = g_nodes[ch].next_sibling
+
+// ── Scrolling regions ──────────────────────────────────────────────────────
+//
+// A widget that draws part of itself through a grid region (`grid.region_make`)
+// paints into it and sets its rect from its paint hook, and frees it from its
+// free hook. What no paint hook can see is the node leaving the picture — it,
+// or an ancestor, hidden, or its rectangle clipped away entirely — since a
+// node out of view is not painted at all, while a region goes on drawing its
+// buffer until its rect changes. So the widget tells the tree its region, and
+// every `update` that did any work ends by giving each such node whose
+// rectangle, clipped by every ancestor's, is empty or out of view an empty
+// region rect, which draws nothing, and asks for a frame (`request_frame`)
+// when that changed the rect, since no paint may follow to ask for one. The
+// node's next paint sets the rect again, and `grid.region_set_rect` then
+// answers true, so it repaints whole.
+//
+// A node's ink list (`ink_begin`) has the same problem and the same answer:
+// the grid replays it every drawn frame until it is rebuilt, and only a paint
+// rebuilds it. So the same pass empties the ink list of every such node and
+// asks for a frame when that removed any triangles; the node's next paint
+// rebuilds it.
+
+// Record `id` as the region `c`'s paint draws through; -1 records none. The
+// tree only ever empties the rect; making and freeing it are the widget's.
+void set_region(Control c, i32 id):
+    i32 i = index(c)
+    if i < 0:
+        return
+    i32 v = id
+    if v < 0:
+        v = -1
+    if g_nodes[i].region < 0 && v >= 0:
+        g_region_nodes = g_region_nodes + 1
+    if g_nodes[i].region >= 0 && v < 0:
+        g_region_nodes = g_region_nodes - 1
+    g_nodes[i].region = v
+    watch_sync(i)
+
+// The slots of the nodes holding a region or an ink list, `g_nwatch` of
+// them, so `hide_regions` visits those and not the whole pool — it runs on
+// every `update` that did any work, and a pool is mostly nodes with neither.
+// `g_watch_all` is set when the list could not grow, and the pass then walks
+// the pool as it once did.
+private ref []i32 g_watch
+private i32       g_nwatch
+private bool      g_watch_all
+
+// Node `i`'s region or ink changed, or it went: add it to the list, or take
+// it off, to match.
+private void watch_sync(i32 i):
+    bool want = g_nodes[i].live && (g_nodes[i].region >= 0 || g_nodes[i].ink >= 0)
+    i32 at = -1
+    for k in 0..<g_nwatch:
+        if g_watch[k] == i:
+            at = i32(k)
+    if want && at < 0:
+        capture_alloc()
+        if g_watch == nil:
+            g_watch = #make([]i32, 8, g_alloc)
+        else if g_nwatch >= i32(#len(g_watch)) && !#resize(g_watch, i64(g_nwatch) * 2):
+            g_watch_all = true
+            return
+        if g_watch == nil:
+            g_watch_all = true
+            return
+        g_watch[g_nwatch] = i
+        g_nwatch = g_nwatch + 1
+    else if !want && at >= 0:
+        g_nwatch = g_nwatch - 1
+        g_watch[at] = g_watch[g_nwatch]
+
+// The region `set_region` recorded for `c`; -1 for none and for a dead handle.
+i32 node_region(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return -1
+    return g_nodes[i].region
+
+// Node `i`'s rectangle clipped by every ancestor's, which is what its paint
+// hook is handed; empty when it or an ancestor is hidden.
+private cell.CellRect visible_clip(i32 i):
+    if !g_nodes[i].in_view:
+        return empty_rect()
+    cell.CellRect r = g_nodes[i].area
+    i32 p = g_nodes[i].parent
+    for p >= 0:
+        r = cell.intersect(r, g_nodes[p].area)
+        p = g_nodes[p].parent
+    return r
+
+private void hide_regions():
+    if g_region_nodes <= 0 && g_ink_nodes <= 0:
+        return
+    i32 n = g_nwatch
+    if g_watch_all:
+        n = g_used
+    for k in 0..<n:
+        i32 i = i32(k)
+        if !g_watch_all:
+            i = g_watch[k]
+        if !g_nodes[i].live || (g_nodes[i].region < 0 && g_nodes[i].ink < 0):
+            continue
+        if !cell.is_empty(visible_clip(i)):
+            continue
+        // A region that stops drawing changes the picture with no cell
+        // painted — a hidden root paints nothing at all — so the frame is
+        // asked for here.
+        if g_nodes[i].region >= 0 && grid.region_set_rect(g_nodes[i].region, empty_rect()):
+            request_frame()
+        // So does an ink list emptied for the same reason (`ink_begin`).
+        if g_nodes[i].ink >= 0 && grid.ink_count(g_nodes[i].ink) > 0:
+            grid.ink_clear(g_nodes[i].ink)
+            request_frame()
+
+// ── Focus and input ────────────────────────────────────────────────────────
+
+// Give focus to a live, focusable node; `NIL` clears focus. Any other handle,
+// and a node that is not focusable, leaves focus where it was.
+void set_focus(Control c):
+    if c == NIL:
+        if g_focus >= 0:
+            g_chrome_dirty = true
+            g_focus = -1
+            focus_moved()
+        return
+    i32 i = index(c)
+    if i < 0 || !g_nodes[i].takes_focus:
+        return
+    // While a modal is open focus stays inside it (modal.dado).
+    i32 m = modal_index()
+    if m >= 0 && !in_subtree(i, m):
+        return
+    if g_focus != i:
+        g_chrome_dirty = true
+        g_focus = i
+        focus_moved()
+
+Control focused():
+    if g_focus < 0 || g_nodes == nil || !g_nodes[g_focus].live:
+        return NIL
+    return handle(g_focus)
+
+// Whether the focused node is `c` or one of its descendants: "is focus inside
+// this subtree". False when nothing has focus and for a dead handle. Costs the
+// focused node's depth.
+bool focus_within(Control c):
+    i32 i = index(c)
+    if i < 0 || g_focus < 0 || !g_nodes[g_focus].live:
+        return false
+    i32 at = g_focus
+    for at >= 0:
+        if at == i:
+            return true
+        at = g_nodes[at].parent
+    return false
+
+// Move focus to the next focusable node in tree order — a parent before its
+// children, children in child order — after the focused one, wrapping from the
+// last to the first; with nothing focused, to the first. Only a node that is
+// focusable and in view (it and every ancestor visible) is taken. Answers the
+// node focused afterwards, which is the one focused before when no other
+// qualifies, and `NIL` when nothing does. Does nothing while `update` runs.
+Control focus_next():
+    return focus_step(true)
+
+// As `focus_next`, backwards: the previous focusable node in tree order,
+// wrapping from the first to the last; with nothing focused, the last.
+Control focus_prev():
+    return focus_step(false)
+
+//
+// While a modal is open (modal.dado) the walk is the modal's subtree alone,
+// wrapping inside it: focus cannot step out.
+private Control focus_step(bool forward):
+    if g_phase != PHASE_IDLE || !ensure():
+        return focused()
+    i32 top = modal_index()
+    if top < 0:
+        top = g_root
+    i32 start = -1
+    if g_focus >= 0 && g_nodes[g_focus].live && in_subtree(g_focus, top):
+        start = g_focus
+    i32 at = start
+    // Every live node is under the root, so a walk of `nodes_live` steps
+    // visits each once before it comes back round to where it began.
+    i32 steps = g_stats.nodes_live + 1
+    for k in 0..<steps:
+        _ = k
+        if at < 0:
+            at = top
+            if !forward:
+                at = last_descendant(top)
+        else if forward:
+            at = order_next(at, top)
+        else:
+            at = order_prev(at, top)
+        if at < 0:
+            at = top
+            if !forward:
+                at = last_descendant(top)
+        if at == start:
+            break
+        if g_nodes[at].in_view && g_nodes[at].takes_focus:
+            set_focus(handle(at))
+            return handle(at)
+    return focused()
+
+// The node after `i` in tree order within `top`'s subtree, -1 after its
+// last.
+private i32 order_next(i32 i, i32 top):
+    if g_nodes[i].first_child >= 0:
+        return g_nodes[i].first_child
+    i32 at = i
+    for at >= 0 && at != top:
+        if g_nodes[at].next_sibling >= 0:
+            return g_nodes[at].next_sibling
+        at = g_nodes[at].parent
+    return -1
+
+// The node before `i` in tree order within `top`'s subtree, -1 before
+// `top`.
+private i32 order_prev(i32 i, i32 top):
+    if i == top:
+        return -1
+    if g_nodes[i].prev_sibling >= 0:
+        return last_descendant(g_nodes[i].prev_sibling)
+    return g_nodes[i].parent
+
+// Whether slot `i` is `top` or inside its subtree. Costs `i`'s depth.
+private bool in_subtree(i32 i, i32 top):
+    i32 at = i
+    for at >= 0:
+        if at == top:
+            return true
+        at = g_nodes[at].parent
+    return false
+
+// The last node of `i`'s subtree in tree order.
+private i32 last_descendant(i32 i):
+    i32 at = i
+    for g_nodes[at].last_child >= 0:
+        at = g_nodes[at].last_child
+    return at
+
+// Repaint `c` whenever focus moves anywhere (on), or stop (off): for a widget
+// whose cells show whether focus is inside some subtree — a tab bar's
+// selected tab — since a focus move marks nothing on its own. The mark is a
+// `mark_paint`, so it lands on the next `update`; a move during a removal is
+// announced when the removal is done. Costs one pass over the node pool per
+// focus move while any node has it on, and nothing while none does.
+void set_focus_repaint(Control c, bool on):
+    i32 i = index(c)
+    if i < 0 || g_nodes[i].focus_paint == on:
+        return
+    g_nodes[i].focus_paint = on
+    if on:
+        g_focus_watchers = g_focus_watchers + 1
+    else:
+        g_focus_watchers = g_focus_watchers - 1
+
+private void focus_moved():
+    if g_focus_watchers <= 0:
+        g_focus_pending = false
+        return
+    if g_phase == PHASE_REMOVE:
+        g_focus_pending = true
+        return
+    g_focus_pending = false
+    for i in 0..<g_used:
+        if g_nodes[i].live && g_nodes[i].focus_paint:
+            mark_paint(handle(i32(i)))
+
+// Offer `e` to a node's input hook, then to each ancestor's in turn until one
+// answers true, and answer whether one did. A key, text or any other
+// non-mouse event starts at the focused node, and is handled by nobody when
+// nothing has focus. A mouse event starts at the capturing node while one
+// holds the capture, and otherwise at the node under the pointer
+// (`hit(event_cell(e))`); input.dado says what a press does to focus and
+// capture. A window focus loss ends any capture before it is offered. A hook
+// may remove nodes: the climb goes on to the parent read before the call only
+// while that parent is still live.
+//
+// While a modal is open (modal.dado), a key or text event starts at the
+// focused node inside it — at the modal itself when focus is not inside —
+// and climbs no higher than the modal; Tab and Shift+Tab that nothing there
+// took move focus within it; and every other key or text event it leaves is
+// swallowed, answered as handled, so no key reaches what is under it. Other
+// events (a quit request, a focus change, a resize) are offered as ever.
+bool dispatch(input.Event e):
+    if e.kind == input.EventKind.Mouse:
+        return dispatch_mouse(e)
+    if input.is_focus_lost(e):
+        focus_lost()
+    i32 m = modal_index()
+    if m >= 0 && (e.kind == input.EventKind.Key || e.kind == input.EventKind.Text):
+        return modal_key(m, e)
+    (bool handled, Control by) = bubble(focused(), e, -1)
+    _ = by
+    return handled
+
+// ── Signals ────────────────────────────────────────────────────────────────
+
+// Signal 0, interned as "pressed" before any other.
+const i32 SIG_PRESSED = 0
+
+private bool ensure_signals():
+    capture_alloc()
+    if g_sig_names == nil:
+        g_sig_names = #make([]string8, 8, g_alloc)
+        if g_sig_names == nil:
+            return false
+        g_sig_names[0] = "pressed"
+        g_nsigs = 1
+    return true
+
+// The id of the signal called `name`, interning it on first sight. The name is
+// kept as given, so it must stay readable as long as the table is used — a
+// literal does. The table outlives `reset`. Answers -1 only when the table
+// cannot grow.
+i32 signal(string8 name):
+    if !ensure_signals():
+        return -1
+    for i in 0..<g_nsigs:
+        if g_sig_names[i] == name:
+            return i32(i)
+    if g_nsigs >= i32(#len(g_sig_names)):
+        if !#resize(g_sig_names, g_nsigs * 2):
+            return -1
+    g_sig_names[g_nsigs] = name
+    g_nsigs = g_nsigs + 1
+    return g_nsigs - 1
+
+// The name a signal id was interned as, or "".
+string8 signal_name(i32 sig):
+    if g_sig_names == nil || sig < 0 || sig >= g_nsigs:
+        return ""
+    return g_sig_names[sig]
+
+// Call `fn(c, ctx)` whenever `sig` is emitted on `c`, after every connection
+// made before this one. Does nothing for a dead node, an unknown signal or a
+// nil function.
+void connect(Control c, i32 sig, SignalFn fn, rawptr ctx):
+    i32 i = index(c)
+    if i < 0 || fn == nil || !ensure_signals() || sig < 0 || sig >= g_nsigs:
+        return
+    if g_conns == nil:
+        g_conns = #make([]Conn, 16, g_alloc)
+        if g_conns == nil:
+            return
+        g_conns_used = 0
+        g_conns_free = -1
+    i32 k = -1
+    if g_conns_free >= 0:
+        k = g_conns_free
+        g_conns_free = g_conns[k].next
+    else:
+        if g_conns_used >= i32(#len(g_conns)):
+            if !#resize(g_conns, g_conns_used * 2):
+                return
+        k = g_conns_used
+        g_conns_used = g_conns_used + 1
+    g_conns[k].live = true
+    g_conns[k].sig = sig
+    g_conns[k].fn = fn
+    g_conns[k].ctx = ctx
+    g_conns[k].next = -1
+    i32 tail = g_nodes[i].conn_tail
+    if tail >= 0:
+        g_conns[tail].next = k
+    else:
+        g_nodes[i].conn_head = k
+    g_nodes[i].conn_tail = k
+
+// Connect to `SIG_PRESSED`.
+void on_pressed(Control c, SignalFn fn, rawptr ctx):
+    connect(c, SIG_PRESSED, fn, ctx)
+
+// Run every connection of `(c, sig)` in the order they were made; answers how
+// many ran. Only the connections that existed when `emit` began run. If a
+// handler removes `c`, the rest do not run.
+i32 emit(Control c, i32 sig):
+    i32 i = index(c)
+    if i < 0 || g_conns == nil:
+        return 0
+    i32 last = g_nodes[i].conn_tail
+    i32 k = g_nodes[i].conn_head
+    i32 ran = 0
+    for k >= 0:
+        i32 next = g_conns[k].next
+        bool final = k == last
+        if g_conns[k].sig == sig:
+            SignalFn fn = g_conns[k].fn
+            fn(c, g_conns[k].ctx)
+            ran = ran + 1
+            if index(c) < 0:
+                return ran
+        if final:
+            break
+        k = next
+    return ran
+
+// How many connections `c` holds, over every signal.
+i32 connection_count(Control c):
+    i32 i = index(c)
+    if i < 0 || g_conns == nil:
+        return 0
+    i32 n = 0
+    i32 k = g_nodes[i].conn_head
+    for k >= 0:
+        n = n + 1
+        k = g_conns[k].next
+    return n
+
+private void drop_connections(i32 i):
+    if g_conns == nil:
+        return
+    i32 k = g_nodes[i].conn_head
+    for k >= 0:
+        i32 next = g_conns[k].next
+        g_conns[k].live = false
+        g_conns[k].fn = nil
+        g_conns[k].ctx = nil
+        g_conns[k].next = g_conns_free
+        g_conns_free = k
+        k = next
+    g_nodes[i].conn_head = -1
+    g_nodes[i].conn_tail = -1

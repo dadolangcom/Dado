@@ -1,0 +1,831 @@
+// vendor:tui — the platform facts a terminal UI needs that C99 does not have.
+//
+// ── THIS WAS `tty.h` AND `tty.c`, 398 LINES OF HAND-WRITTEN C, AND IT IS Dado ──
+//
+// Raw mode, the window size, the timed read, the four signal handlers, the
+// epilogue string and the flag between a handler and the main loop. All of it.
+// The two reasons that file gave for existing were:
+//
+//   * *"TOY has no `volatile`, and therefore no `sig_atomic_t` … There is no
+//     attribute or spelling for the qualifier in the language today."* **False
+//     since CP-2.** `volatile`, `restrict` and `_Atomic` are positional words
+//     (`dadoc --emit=lexicon | grep c-type`) and `const` was already a keyword,
+//     so all four of C's qualifiers landed together. `g_continued` below is
+//     `private volatile SigAtomic` and emits
+//     `static DADO_UNUSED volatile sig_atomic_t dado_tui_g__continued = {0};`,
+//     which is the declaration the C had, spelled in Dado.
+//
+//   * *"A signal handler may call `write` and may not call `printf`."* **True,
+//     and it never needed C.** `write` restates in one line and the handlers
+//     below are ordinary Dado functions installed with `signal`; what Dado does
+//     not have is a way to *mark* a function handler-safe, and C did not have
+//     one either — the C file held the discipline by being small, and so does
+//     this one. `tty_epilogue` is one `write` of one constant string and
+//     nothing else, `tty_onsignal`/`tty_onstop`/`tty_oncont` call only
+//     `tcsetattr`, `write`, `signal` and `raise`, and **no function in this
+//     file reachable from a handler calls `print`.** That sentence is the
+//     guarantee; keeping it true is a reading job, as it always was.
+//
+// **No inline C.** `@c_body` exists and this package was surveyed as its one
+// population, on the premise that a handler epilogue had to stay verbatim. It
+// does not: every construct the C used has a Dado spelling, each measured here
+// under gcc and clang. What that costs is written down rather than hidden — see
+// `SIG_DFL` and `errno` below, both of which are macros Dado reaches by
+// declaring the name and letting the preprocessor do the expanding at the use
+// site, which is the same mechanism `foreign` has always used for a function.
+//
+// ── WHAT IS PLATFORM AND WHAT IS NOT ──
+//
+// Everything else in this package — the cell grid, the compositor, layout, the
+// widgets, the UTF-8 and SGR handling, the input decoder — was already Dado,
+// because none of it is a fact about the platform. These are the facts:
+//
+//   * **raw mode**, which is `termios` read, masked and written back;
+//   * **the window size**, which is `ioctl(TIOCGWINSZ)`;
+//   * **a read with a timeout**, which is `select` then `read`;
+//   * **stopping**, which is `raise(SIGTSTP)` with the default disposition;
+//   * **the signal handlers**, which are what make Ctrl-C and Ctrl-Z leave a
+//     usable terminal behind.
+//
+// Draining a child's output used to be listed here as a sixth. It is
+// `core:os/proc`'s `drain` now, Dado over `poll` with no C at all, and `drain`
+// is also this file's precedent for every `when #OS` arm below.
+//
+// **Windows has an arm of its own**, the console API behind `when #OS ==
+// #WINDOWS`, which supplies the same private functions over different facts
+// and is described where it is written, below. Everything above the arms is
+// shared by both.
+//
+// **The `#DARWIN` arms are type-checked and not run**, exactly as `drain.dado`
+// says of its `nfds_t`. This project verifies Linux in the sandbox; `dadoc
+// --target=*-apple-darwin` checks these arms and emits their C, and nothing has
+// compiled that C against Darwin's headers. The Darwin `termios` differs in
+// three places (`tcflag_t` and `speed_t` are 64-bit, there is no `c_line`, and
+// `c_cc` is 20 bytes) and `struct timeval`'s `tv_usec` is 32-bit there. Each is
+// a layout assertion the C compiler will check the first time somebody builds
+// this on a Mac.
+//
+// ── NAMES ──
+//
+// Everything here is `private` and prefixed `tty_`, because the package it
+// lives in already has a `cols`, a `rows`, a `measure`, an `is_terminal` and a
+// `stop` of its own — the library's, which are about the grid and the UI rather
+// than about the terminal. The C these replace carried `dado_sys_tty_*` for the
+// same reason from the other side: it was avoiding the `dado_tty_*` a package
+// named `tty` would have emitted. One package and one prefix answers both.
+package tui
+
+import "core:time"
+
+// ── what both arms share ────────────────────────────────────────────────────
+
+private i32 g_cols_cache = 80
+private i32 g_rows_cache = 24
+
+private i32 tty_cols():
+    return g_cols_cache
+
+private i32 tty_rows():
+    return g_rows_cache
+
+// Leaving the alternate screen, showing the cursor, and turning off everything
+// `open` turned on: the three mouse-reporting modes and bracketed paste. One
+// string, because the signal path and the ordinary path must not be able to
+// drift apart.
+private string8 EPILOGUE = "\x1b[0m\x1b[?2004l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?25h\x1b[?1049l"
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+//
+// The console API, through `<windows.h>` as MinGW-w64 ships it — the header
+// `zig cc -target x86_64-windows-gnu` compiles against. The same functions as
+// the POSIX arm below, over different facts:
+//
+//   * **raw mode** is `SetConsoleMode` on the input handle: line input and
+//     echo off, `ENABLE_VIRTUAL_TERMINAL_INPUT` on, so keys, mouse reports and
+//     bracketed paste arrive as the same escape sequences a POSIX terminal
+//     sends and the decoder in `input.dado` reads them unchanged; and quick-edit
+//     off, which would otherwise take the mouse for selecting text. On the
+//     output handle, `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, so the compositor's
+//     SGR stream is drawn rather than printed. Both original modes are saved
+//     and put back by `tty_raw(0)`.
+//   * **`ENABLE_PROCESSED_INPUT` stays on**, which is the POSIX arm's `ISIG`
+//     decision made again: Ctrl-C is a console control event and not a byte,
+//     and the handler `tty_raw` installs (`SetConsoleCtrlHandler`) puts both
+//     modes back and writes the epilogue before the default handler ends the
+//     process — as `tty_onsignal` does for `SIGINT`. It also runs for
+//     Ctrl-Break and for the console window closing.
+//   * **the window size** is `GetConsoleScreenBufferInfo`'s visible window,
+//     `srWindow`, and not the buffer, which is as tall as the scrollback.
+//   * **the timed read** is `WaitForSingleObject` on the input handle, then
+//     `ReadConsoleInputW` for no more records than
+//     `GetNumberOfConsoleInputEvents` says are waiting — so it never blocks —
+//     keeping the characters of key-down events and dropping the rest (focus,
+//     menu and resize records). `ReadConsoleW` would be shorter and is wrong:
+//     a resize record wakes the wait and then `ReadConsoleW` blocks waiting
+//     for a character. The characters are UTF-16 and are handed on as UTF-8,
+//     a surrogate pair split across two reads included.
+//   * **stopping** does not exist: a Windows console has no job control, so
+//     `tty_stop` returns at once and `tui.stop` is a suspend and a resume.
+//
+// `INPUT_RECORD` is a tag and a union, and is read by its documented offsets
+// rather than restated: the tag is the `WORD` at 0, and a key event's
+// `bKeyDown` is the `BOOL` at 4, `wRepeatCount` the `WORD` at 8 and
+// `UnicodeChar` the `WCHAR` at 14, in a record of 20 bytes — which `tty_read`
+// checks against the header's `sizeof` before it reads one.
+when #OS == #WINDOWS:
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        type COORD: (#c.short X, #c.short Y)
+        type SMALL_RECT: (#c.short Left, #c.short Top, #c.short Right, #c.short Bottom)
+        type CONSOLE_SCREEN_BUFFER_INFO:
+            COORD       dwSize,
+            COORD       dwCursorPosition,
+            #c.ushort   wAttributes,
+            SMALL_RECT  srWindow,
+            COORD       dwMaximumWindowSize,
+        type INPUT_RECORD
+
+        const rawptr INVALID_HANDLE_VALUE
+        const #c.ulong STD_INPUT_HANDLE
+        const #c.ulong STD_OUTPUT_HANDLE
+        const #c.ulong WAIT_OBJECT_0
+        const #c.ulong INFINITE
+        const #c.ulong ENABLE_PROCESSED_INPUT
+        const #c.ulong ENABLE_LINE_INPUT
+        const #c.ulong ENABLE_ECHO_INPUT
+        const #c.ulong ENABLE_QUICK_EDIT_MODE
+        const #c.ulong ENABLE_EXTENDED_FLAGS
+        const #c.ulong ENABLE_VIRTUAL_TERMINAL_INPUT
+        const #c.ulong ENABLE_PROCESSED_OUTPUT
+        const #c.ulong ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        const #c.uint CP_UTF8
+
+        rawptr GetStdHandle(#c.ulong which)
+        #c.int GetConsoleMode(rawptr console, ^#c.ulong mode)
+        #c.int SetConsoleMode(rawptr console, #c.ulong mode)
+        #c.int SetConsoleCtrlHandler(TtyCtrlHandler handler, #c.int add)
+        #c.int GetConsoleScreenBufferInfo(rawptr console, ^CONSOLE_SCREEN_BUFFER_INFO info)
+        #c.int GetNumberOfConsoleInputEvents(rawptr console, ^#c.ulong count)
+        #c.int ReadConsoleInputW(rawptr console, ^INPUT_RECORD records, #c.ulong count, ^#c.ulong read)
+        #c.ulong WaitForSingleObject(rawptr handle, #c.ulong milliseconds)
+        #c.int WriteConsoleA(rawptr console, const rawptr buffer, #c.ulong count, ^#c.ulong written, rawptr reserved)
+        #c.int WideCharToMultiByte(#c.uint code_page, #c.ulong flags, ^const u16 from, #c.int from_count, ^#c.char into, #c.int into_count, cstring default_char, ^#c.int used_default)
+
+    // `KEY_EVENT` is a `WORD` tag; `winbase.h` writes it as a plain integer.
+    private const u16 KEY_EVENT = 1
+
+    // The record size `tty_read`'s offsets are for.
+    private const u64 RECORD_BYTES = 20
+
+    // The records one read takes at most, and the bytes they are read into,
+    // as eight-byte words so the buffer is aligned for the header's type.
+    private const i32 RECORDS = 64
+    private const i32 RECORD_WORDS = 160
+
+    // Named so the conversions to them are not read as function types.
+    private type RecordsAt: ^INPUT_RECORD
+    private type WordAt: ^u16
+    private type BoolAt: ^#c.int
+    private type CharsAt: ^#c.char
+
+    // A console control handler: `BOOL WINAPI (DWORD)`. `WINAPI` is the
+    // platform's default convention on x86-64 and on arm64, so the type is
+    // the plain one.
+    private type TtyCtrlHandler: #c.int(#c.ulong)
+
+    private #c.ulong g_saved_in
+    private #c.ulong g_saved_out
+    private bool g_have_saved
+    private bool g_handler_installed
+
+    // The high half of a surrogate pair whose low half has not arrived yet.
+    private u16 g_high
+
+    private rawptr tty_handle(#c.ulong which):
+        rawptr h = GetStdHandle(which)
+        if h == INVALID_HANDLE_VALUE: return nil
+        return h
+
+    // One `WriteConsoleA` of the epilogue, which is ASCII, to the output
+    // console. It is written while virtual-terminal processing is still on,
+    // which is what reads it as `\x1b` sequences; an output that is not a
+    // console was never drawn on, and the write fails harmlessly.
+    private void tty_epilogue():
+        rawptr out = tty_handle(STD_OUTPUT_HANDLE)
+        if out == nil: return
+        #c.ulong wrote = 0
+        _ = WriteConsoleA(out, rawptr(EPILOGUE), #c.ulong(#len(EPILOGUE)), &wrote, nil)
+
+    // Put both modes back. Shared by `tty_raw(0)` and the control handler,
+    // which Windows runs on a thread of its own.
+    private void tty_restore():
+        if !g_have_saved: return
+        g_have_saved = false
+        rawptr input = tty_handle(STD_INPUT_HANDLE)
+        rawptr out = tty_handle(STD_OUTPUT_HANDLE)
+        if input != nil: _ = SetConsoleMode(input, g_saved_in)
+        if out != nil: _ = SetConsoleMode(out, g_saved_out)
+
+    // Ctrl-C, Ctrl-Break, and the console closing: the terminal back, then
+    // FALSE, so the next handler — the default one, which ends the process —
+    // runs as if this one had not.
+    private #c.int tty_onctrl(#c.ulong event):
+        _ = event
+        if g_have_saved:
+            tty_epilogue()
+            tty_restore()
+        return 0
+
+    private i32 tty_continued_since():
+        return 0
+
+    private i32 tty_is_terminal():
+        rawptr input = tty_handle(STD_INPUT_HANDLE)
+        #c.ulong mode = 0
+        if input != nil && GetConsoleMode(input, &mode) != 0: return 1
+        return 0
+
+    private i32 tty_raw(i32 on):
+        if on == 0:
+            if !g_have_saved: return 0
+            tty_restore()
+            return 0
+        rawptr input = tty_handle(STD_INPUT_HANDLE)
+        rawptr out = tty_handle(STD_OUTPUT_HANDLE)
+        if input == nil || out == nil: return 0 - 1
+        #c.ulong in_mode = 0
+        #c.ulong out_mode = 0
+        if GetConsoleMode(input, &in_mode) == 0 || GetConsoleMode(out, &out_mode) == 0: return 0 - 1
+        g_saved_in = in_mode
+        g_saved_out = out_mode
+
+        #c.ulong raw_in = in_mode &~ (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE)
+        raw_in = raw_in | ENABLE_PROCESSED_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
+        #c.ulong raw_out = out_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if SetConsoleMode(input, raw_in) == 0: return 0 - 1
+        // A console that refuses virtual-terminal output would show the
+        // compositor's escape sequences as text: refused, and put back.
+        if SetConsoleMode(out, raw_out) == 0:
+            _ = SetConsoleMode(input, in_mode)
+            return 0 - 1
+        g_have_saved = true
+        g_high = 0
+        if !g_handler_installed:
+            g_handler_installed = SetConsoleCtrlHandler(tty_onctrl, 1) != 0
+        return 0
+
+    // 80x24 when the output is not a console, which is what a pipe gets.
+    private i32 tty_measure():
+        i32 cols = 80
+        i32 rows = 24
+        rawptr out = tty_handle(STD_OUTPUT_HANDLE)
+        CONSOLE_SCREEN_BUFFER_INFO info
+        if out != nil && GetConsoleScreenBufferInfo(out, &info) != 0:
+            i32 w = i32(info.srWindow.Right) - i32(info.srWindow.Left) + 1
+            i32 h = i32(info.srWindow.Bottom) - i32(info.srWindow.Top) + 1
+            if w > 0 && h > 0:
+                cols = w
+                rows = h
+        i32 changed = 0
+        if cols != g_cols_cache || rows != g_rows_cache: changed = 1
+        g_cols_cache = cols
+        g_rows_cache = rows
+        return changed
+
+    // `tty_read`'s answers, the POSIX arm's: bytes, 0 at the end, -1 for a
+    // timeout and -2 for a failure. A console never ends; a handle that is
+    // not a console is a failure, since `open` refuses one.
+    private i32 tty_read(rawptr buf, i32 cap, i32 timeout_ms):
+        if cap <= 0: return 0 - 2
+        if #size(INPUT_RECORD) != RECORD_BYTES: return 0 - 2
+        rawptr input = tty_handle(STD_INPUT_HANDLE)
+        #c.ulong mode = 0
+        if input == nil || GetConsoleMode(input, &mode) == 0: return 0 - 2
+        f64 began = time.now()
+        for:
+            #c.ulong wait = INFINITE
+            if timeout_ms >= 0:
+                i64 left = i64(timeout_ms) - time.ms_since(began)
+                if left < 0: left = 0
+                wait = #c.ulong(left)
+            if WaitForSingleObject(input, wait) != WAIT_OBJECT_0: return 0 - 1
+            i32 got = tty_read_records(input, buf, cap)
+            if got != 0: return got
+            // Only records that carry no character: wait again for the rest
+            // of the time.
+            if timeout_ms >= 0 && time.ms_since(began) >= i64(timeout_ms): return 0 - 1
+        return 0 - 1
+
+    // The characters of the key-down records waiting now, as UTF-8 in `buf`.
+    // Answers the byte count (0 when no record carried one), or -2.
+    private i32 tty_read_records(rawptr input, rawptr buf, i32 cap):
+        #c.ulong waiting = 0
+        if GetNumberOfConsoleInputEvents(input, &waiting) == 0: return 0 - 2
+        if waiting == 0: return 0
+        // Each character is at most three bytes of UTF-8 (four for a pair,
+        // which is two records), so this many records always fit.
+        i64 take = i64(waiting)
+        if take > i64(RECORDS): take = i64(RECORDS)
+        if take > i64(cap) / 3: take = i64(cap) / 3
+        if take < 1: take = 1
+        [RECORD_WORDS]u64 records
+        #c.ulong read = 0
+        if ReadConsoleInputW(input, RecordsAt(rawptr(&records[0])), #c.ulong(take), &read) == 0: return 0 - 2
+        #c.uintptr_t base = #c.uintptr_t(rawptr(&records[0]))
+        #c.uintptr_t out = #c.uintptr_t(buf)
+        i32 used = 0
+        for r in 0..<i64(read):
+            #c.uintptr_t at = base + #c.uintptr_t(u64(r) * RECORD_BYTES)
+            if WordAt(rawptr(at))^ != KEY_EVENT: continue
+            if BoolAt(rawptr(at + 4))^ == 0: continue
+            u16 unit = WordAt(rawptr(at + 14))^
+            if unit == 0: continue
+            i32 repeat = i32(WordAt(rawptr(at + 8))^)
+            if repeat < 1: repeat = 1
+            for k in 0..<repeat:
+                i32 n = tty_utf8(unit, CharsAt(rawptr(out + #c.uintptr_t(used))), cap - used)
+                if n < 0: break
+                used += n
+        return used
+
+    // One UTF-16 unit into `into` as UTF-8, holding a high surrogate until
+    // its low half comes. Answers the bytes written, or -1 when they do not
+    // fit in `room`.
+    private i32 tty_utf8(u16 unit, ^#c.char into, i32 room):
+        [2]u16 pair
+        #c.int units = 1
+        if unit >= 0xD800 && unit < 0xDC00:
+            g_high = unit
+            return 0
+        if unit >= 0xDC00 && unit < 0xE000:
+            if g_high == 0: return 0
+            pair[0] = g_high
+            pair[1] = unit
+            units = 2
+        else:
+            pair[0] = unit
+        g_high = 0
+        #c.int need = WideCharToMultiByte(CP_UTF8, 0, &pair[0], units, nil, 0, nil, nil)
+        if need <= 0: return 0
+        if i32(need) > room: return 0 - 1
+        return i32(WideCharToMultiByte(CP_UTF8, 0, &pair[0], units, into, need, nil, nil))
+
+    // No job control on a Windows console: there is nothing to stop for.
+    private void tty_stop():
+        pass
+
+// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+else:
+    // ── signals ────────────────────────────────────────────────────────────────
+    //
+    // `SIG_DFL` is the interesting one. It is not an integer-constant macro — glibc
+    // writes `#define SIG_DFL ((__sighandler_t) 0)` — so it is a *value* of the
+    // handler type rather than a number, and it binds the same way every other
+    // foreign constant does: the declaration emits nothing at all and the use site
+    // writes the bare name, which the preprocessor then expands. `signal(sig,
+    // SIG_DFL)` emits `signal(dado_l_sig, SIG_DFL)` and C does the rest.
+    private type TtyHandler: void(i32)
+
+    when #OS == #DARWIN:
+        private foreign "signal.h":
+            type @c("sig_atomic_t") SigAtomic: #c.int
+            const i32 SIGINT
+            const i32 SIGTERM
+            const i32 SIGHUP
+            const i32 SIGTSTP
+            const i32 SIGCONT
+            const TtyHandler SIG_DFL
+            TtyHandler signal(i32 sig, TtyHandler handler)
+            i32 raise(i32 sig)
+    else:
+        private foreign "signal.h" define "_POSIX_C_SOURCE=200809L":
+            type @c("sig_atomic_t") SigAtomic: #c.int
+            const i32 SIGINT
+            const i32 SIGTERM
+            const i32 SIGHUP
+            const i32 SIGTSTP
+            const i32 SIGCONT
+            const TtyHandler SIG_DFL
+            TtyHandler signal(i32 sig, TtyHandler handler)
+            i32 raise(i32 sig)
+
+    // `errno` is a macro too, and an unusual one: it expands to an lvalue,
+    // `(*__errno_location())`. A foreign constant is exactly the right shape for
+    // reading it — the name is written at the use site and nothing is declared —
+    // and reading is all this file does with it. `@macro` is a foreign *function*'s
+    // attribute and is refused here (ERR0418), which is correct: there is no
+    // signature for it to stand in for.
+    private foreign "errno.h":
+        const i32 errno
+        const i32 EINTR
+
+    // ── the descriptors, `isatty`, and the two raw byte moves ──────────────────
+    //
+    // `write` takes a `const rawptr` and `read` a `rawptr`, which are the header's
+    // `const void *` and `void *`. `write`'s used to be restated `cstring`, on the
+    // ground that a `const char *` converts to `const void *` implicitly — true of
+    // the call, and not of the declaration: the two are different parameter types,
+    // and the `_Generic` assertion over each foreign signature compares
+    // declarations. So the one caller writes `rawptr(EPILOGUE)`.
+    //
+    // The result of `write` is assigned rather than discarded because glibc marks
+    // it `warn_unused_result` and `-Werror` means it: `_ = write(…)` emits
+    // `(void)(write(…))`, which gcc still refuses. That is the same dance the C
+    // did with `ssize_t ignored = write(…); (void)ignored;`.
+    //
+    // `ssize_t` and `size_t` are `#c.long` and `#c.size_t`, on both platforms,
+    // rather than `i64` and `u64`: the declaration assertion compares C types, and
+    // on Darwin `int64_t` is `long long` where `ssize_t` is `long`. On glibc the
+    // two spellings are one type, so Linux's C does not change.
+    when #OS == #DARWIN:
+        private foreign "unistd.h":
+            const i32 STDIN_FILENO
+            const i32 STDOUT_FILENO
+            i32 isatty(i32 fd)
+            #c.long read(i32 fd, rawptr buf, #c.size_t count)
+            #c.long write(i32 fd, const rawptr buf, #c.size_t count)
+    else:
+        private foreign "unistd.h" define "_POSIX_C_SOURCE=200809L":
+            const i32 STDIN_FILENO
+            const i32 STDOUT_FILENO
+            i32 isatty(i32 fd)
+            #c.long read(i32 fd, rawptr buf, #c.size_t count)
+            #c.long write(i32 fd, const rawptr buf, #c.size_t count)
+
+    // ── termios ────────────────────────────────────────────────────────────────
+    //
+    // POSIX declares a tagged struct and no typedef, so `define "TermiosT=struct
+    // termios"` supplies a spelling the way `drain`'s `define "PollFd=struct
+    // pollfd"` does. The restatement is transparent, which is what makes
+    // `dado_assert__sizeof__TermiosT` and a `dado_assert__offsetof__TermiosT__*` per
+    // member appear in the emitted C — the layout is the C compiler's to check on
+    // every build, and it was checked by nothing at all while this was a sidecar.
+    //
+    // `tcflag_t` is 32-bit on glibc and 64-bit on Darwin, and `speed_t` goes with
+    // it; Darwin has no `c_line` and its `c_cc` is 20 bytes rather than 32. The
+    // flag constants are declared at the width of the member they mask, so the
+    // `&~` below needs no conversion. Darwin's are `#c.ulong` and not `u64`
+    // because that is the type its header writes (`unsigned long`), and the
+    // emitter asserts each member's C type as well as its size: Darwin's
+    // `uint64_t` is `unsigned long long`, the right width and a different type.
+    when #OS == #DARWIN:
+        private foreign "termios.h" define "TermiosT=struct termios" define "_DARWIN_C_SOURCE=1":
+            type TermiosT:
+                #c.ulong c_iflag,
+                #c.ulong c_oflag,
+                #c.ulong c_cflag,
+                #c.ulong c_lflag,
+                [20]u8   c_cc,
+                #c.ulong c_ispeed,
+                #c.ulong c_ospeed,
+            const #c.ulong ECHO
+            const #c.ulong ICANON
+            const #c.ulong IXON
+            const #c.ulong ICRNL
+            const i32 VMIN
+            const i32 VTIME
+            const i32 TCSAFLUSH
+            i32 tcgetattr(i32 fd, ^TermiosT t)
+            i32 tcsetattr(i32 fd, i32 actions, ^const TermiosT t)
+    else:
+        private foreign "termios.h" define "TermiosT=struct termios" define "_POSIX_C_SOURCE=200809L":
+            type TermiosT:
+                u32     c_iflag,
+                u32     c_oflag,
+                u32     c_cflag,
+                u32     c_lflag,
+                u8      c_line,
+                [32]u8  c_cc,
+                u32     c_ispeed,
+                u32     c_ospeed,
+            const u32 ECHO
+            const u32 ICANON
+            const u32 IXON
+            const u32 ICRNL
+            const i32 VMIN
+            const i32 VTIME
+            const i32 TCSAFLUSH
+            i32 tcgetattr(i32 fd, ^TermiosT t)
+            i32 tcsetattr(i32 fd, i32 actions, ^const TermiosT t)
+
+    // ── the window size ────────────────────────────────────────────────────────
+    //
+    // `ioctl` is variadic and this tree admits C's `...` in a `foreign` signature,
+    // so it is restated directly rather than wrapped. Its request is `unsigned
+    // long` on glibc and on Darwin both, so it is `#c.ulong`: a `u64` is that type
+    // on glibc and not on Darwin. `TIOCGWINSZ` is an object-like integer-constant
+    // macro and binds as a `const` with no initializer, which is the construct
+    // that gives `core:time` its `CLOCK_MONOTONIC`.
+    private foreign "sys/ioctl.h" define "WinSize=struct winsize":
+        type WinSize: (u16 ws_row, u16 ws_col, u16 ws_xpixel, u16 ws_ypixel)
+        const #c.ulong TIOCGWINSZ
+        i32 ioctl(i32 fd, #c.ulong request, ...)
+
+    // ── select ─────────────────────────────────────────────────────────────────
+    //
+    // `fd_set` is declared with no body — an address with a name and no layout —
+    // because nothing here reads a member of one, and its three accessors are
+    // **function-like macros**, which is the genuinely hard case and which crosses
+    // because a `foreign` function emits a bare call and no prototype of its own:
+    // the preprocessor expands at the call site. They carry `@macro`, which is what
+    // makes the emitter write `#ifndef FD_ZERO / #error` beside each of them — an
+    // unmarked declaration is proved to be a real symbol and a marked one is proved
+    // to be a macro, and getting that backwards is a compile error rather than a
+    // silent hole.
+    //
+    // The parameter is `^FdSet` and deliberately not `rawptr`: a macro expands *at*
+    // the call, so a parameter's C type has to be what the macro's body
+    // dereferences. `FD_ISSET`'s body is `((s)->__fds_bits)[…]`, and a `void *`
+    // there is `request for member '__fds_bits' in something not a structure`.
+    //
+    // `struct timeval` comes from `<sys/time.h>` and not from `<sys/socket.h>`,
+    // which only forward-declares it — a transparent restatement over the wrong
+    // header gets `incomplete result type` out of the emitter's own conversion
+    // helper.
+    //
+    // The members are C's own types and not Dado's widths, and `Usec` names the one
+    // that differs: `tv_sec` is a `time_t`, which is `long` on both platforms, and
+    // `tv_usec` a `suseconds_t`, which is `long` on glibc and `int` on Darwin. The
+    // widths alone are not enough, because the emitter asserts each member's C
+    // *type* with `_Generic` beside its size and offset: Darwin's `int64_t` is
+    // `long long`, so an `i64 tv_sec` is the right size and the wrong type there.
+    // `core:http` restates the same struct the same way.
+    when #OS == #DARWIN:
+        private type Usec: #c.int
+        private foreign "sys/time.h" define "TimeVal=struct timeval":
+            type TimeVal: (#c.long tv_sec, #c.int tv_usec)
+    else:
+        private type Usec: #c.long
+        private foreign "sys/time.h" define "TimeVal=struct timeval" define "_POSIX_C_SOURCE=200809L":
+            type TimeVal: (#c.long tv_sec, #c.long tv_usec)
+
+    when #OS == #DARWIN:
+        private foreign "sys/select.h":
+            type @c("fd_set") FdSet
+            @macro void FD_ZERO(^FdSet set)
+            @macro void FD_SET(i32 fd, ^FdSet set)
+            @macro i32 FD_ISSET(i32 fd, ^FdSet set)
+    else:
+        private foreign "sys/select.h" define "_POSIX_C_SOURCE=200809L":
+            type @c("fd_set") FdSet
+            @macro void FD_ZERO(^FdSet set)
+            @macro void FD_SET(i32 fd, ^FdSet set)
+            @macro i32 FD_ISSET(i32 fd, ^FdSet set)
+
+    // `select` is bound as `sys`, because this package already declares a `select`
+    // — the widget. A binding is what keeps one name from having to be two things;
+    // the emitted C is still the bare identifier. `drain`'s `read` is bound the
+    // same way and for the same reason. The three macros above need no binding, so
+    // they stay in the block that declares the type they take.
+    when #OS == #DARWIN:
+        private foreign sys "sys/select.h":
+            i32 select(i32 nfds, ^FdSet readfds, ^FdSet writefds, ^FdSet exceptfds, ^TimeVal timeout)
+    else:
+        private foreign sys "sys/select.h" define "_POSIX_C_SOURCE=200809L":
+            i32 select(i32 nfds, ^FdSet readfds, ^FdSet writefds, ^FdSet exceptfds, ^TimeVal timeout)
+
+    // ── storage ────────────────────────────────────────────────────────────────
+
+    // The saved mode, and whether there is one. One UI per process: the library
+    // says so out loud, and this is where that is true rather than merely stated.
+    //
+    // `g_have_saved` is `volatile SigAtomic` and not a `bool`, because a handler
+    // writes it and the main loop reads it — which is the one crossing C99 promises
+    // anything about, and only for that type. The C this replaces used a plain
+    // `static int` here and was quietly outside its own guarantee.
+    private TermiosT g_saved
+    private volatile SigAtomic g_have_saved = SigAtomic(0)
+
+    // Set by the SIGCONT handler and read once by the Dado side. The handler does
+    // nothing else, because re-entering raw mode means writing an escape string the
+    // rest of the package owns.
+    private volatile SigAtomic g_continued = SigAtomic(0)
+
+    // A `volatile T` read out of a *variable* keeps the qualifier and there is no
+    // implicit discard, so `g_continued != SigAtomic(0)` is ERR0504. A **parameter**
+    // discards a top-level qualifier, and so does a member read, so one hop through
+    // this is the working spelling and it costs nothing at `-O2` — the emitted call
+    // is `dado_tui_tty__plain(dado_tui_g__continued)`.
+    //
+    // That a variable read and a member read disagree about discarding is a real
+    // inconsistency and it is not this file's to settle. It is reported, not fixed.
+    private i32 tty_plain(SigAtomic v):
+        return i32(v)
+
+    // Where a `write`'s result goes. glibc marks `write` `warn_unused_result`, and
+    // there is nothing useful to do when a terminal will not take its own reset.
+    private #c.long g_wrote = 0
+
+    // `sizeof seq - 1` is what the C wrote. Dado does not fold a string literal's
+    // length into a `const` — `#len` folds for a fixed array and not for a window,
+    // whose count is in the value — so the count is read once, from `tty_raw` and
+    // never from a handler, and the handler reads the number. A zero here would
+    // make the epilogue a `write` of no bytes, which is why an unprimed handler
+    // degrades to silence rather than to a wrong length.
+    //
+    // A `string8` and not a `cstring`: `write` is restated with the header's
+    // `const void *`, and a `string8`'s bytes reach that as `rawptr(EPILOGUE)`
+    // where a `cstring` has no conversion to a `rawptr` at all (ERR0504). The
+    // count is then the string's own, and `strlen` — which is not on the
+    // async-signal-safe list either — is gone.
+    private #c.size_t g_epilogue_len = 0
+
+    // ── the epilogue, and the handlers ─────────────────────────────────────────
+
+    // One `write` of one constant string, and nothing else. `write` is on the
+    // async-signal-safe list and `print` is `printf`, which is not — so this
+    // function is the whole of what a handler is allowed to say, and keeping it
+    // that way is the discipline the header this replaces was written to hold.
+    private void tty_epilogue():
+        g_wrote = write(STDOUT_FILENO, rawptr(EPILOGUE), g_epilogue_len)
+
+    // A frame, in one `write` — and in more only when the terminal takes part
+    // of it, which a blocking descriptor does only when a signal interrupts
+    // the call. Answers false when the terminal refused the rest.
+    private bool tty_write_frame([]char8 bytes):
+        i64 done = 0
+        i64 total = #len(bytes)
+        for done < total:
+            #c.long n = write(STDOUT_FILENO, rawptr(&bytes[done]), #c.size_t(total - done))
+            if n < 0:
+                if errno == EINTR: continue
+                return false
+            done = done + i64(n)
+        return true
+
+    // Ctrl-Z with `ISIG` on never reaches the program as a byte: the line
+    // discipline turns it into SIGTSTP for the foreground process group. So a TUI
+    // cannot bind it — it has to *handle* it, and the handling is: put the terminal
+    // back, stop for real with the default disposition, and let SIGCONT say when to
+    // take it again.
+    //
+    // Everything here is on the async-signal-safe list. `tcsetattr`, `write`,
+    // `signal` and `raise` are.
+    private void tty_onstop(i32 sig):
+        if tty_plain(g_have_saved) != 0:
+            _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved)
+        tty_epilogue()
+        _ = signal(SIGCONT, tty_oncont)
+        _ = signal(sig, SIG_DFL)
+        _ = raise(sig)
+
+    private void tty_oncont(i32 sig):
+        _ = sig
+        g_continued = SigAtomic(1)
+        _ = signal(SIGTSTP, tty_onstop)
+
+    // Re-raise with the default disposition, so the exit status is the one the
+    // signal means rather than one this handler invented.
+    private void tty_onsignal(i32 sig):
+        if tty_plain(g_have_saved) != 0:
+            g_have_saved = SigAtomic(0)
+            _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved)
+        tty_epilogue()
+        _ = signal(sig, SIG_DFL)
+        _ = raise(sig)
+
+    // Whether a SIGCONT has arrived since this was last asked, clearing the flag.
+    // The rest of the package re-enters raw mode from its own loop rather than from
+    // a handler, where it would be writing escape sequences from inside a signal.
+    private i32 tty_continued_since():
+        if tty_plain(g_continued) == 0: return 0
+        g_continued = SigAtomic(0)
+        return 1
+
+    // ── raw mode ───────────────────────────────────────────────────────────────
+
+    // Whether stdin is a terminal — `isatty`, asked without changing anything.
+    // Separate from `tty_raw` because a program wants to know *before* it commits.
+    private i32 tty_is_terminal():
+        if isatty(STDIN_FILENO) != 0: return 1
+        return 0
+
+    // Enter (`on` non-zero) or leave raw mode. 0 on success, -1 if stdin is not a
+    // terminal or the call failed.
+    //
+    // Entering also installs handlers for SIGINT, SIGTERM and SIGHUP that restore
+    // the terminal before re-raising with the default disposition. `ISIG` is left
+    // **on**, so Ctrl-C still interrupts; it is the handler that makes that safe
+    // rather than the absence of the signal. Leaving a user in raw mode with the
+    // cursor hidden because they pressed Ctrl-C is worth this much to avoid.
+    private i32 tty_raw(i32 on):
+        if on == 0:
+            if tty_plain(g_have_saved) == 0: return 0
+            g_have_saved = SigAtomic(0)
+            if tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved) == 0: return 0
+            return 0 - 1
+
+        if isatty(STDIN_FILENO) == 0: return 0 - 1
+        if tcgetattr(STDIN_FILENO, &g_saved) != 0: return 0 - 1
+        g_have_saved = SigAtomic(1)
+        g_epilogue_len = #c.size_t(#len(EPILOGUE))
+
+        TermiosT raw = g_saved
+        // Echo and line discipline off; ISIG stays on so Ctrl-C still interrupts,
+        // and the handlers above are what make that leave a usable terminal.
+        raw.c_lflag = raw.c_lflag &~ (ECHO | ICANON)
+        // IXON is software flow control: with it on, Ctrl-S is XOFF and *stops the
+        // terminal's output* instead of reaching the program — so a UI that binds
+        // ctrl+s appears to freeze, which is the single most confusing thing a
+        // terminal can do to a user. Ctrl-Q would unstick it, and nobody knows
+        // that. ICRNL is cleared for a duller reason: it rewrites CR as NL on the
+        // way in, so a program cannot tell Return from Ctrl-J.
+        raw.c_iflag = raw.c_iflag &~ (IXON | ICRNL)
+        // VMIN 0 / VTIME 0: a `read` never blocks, because the waiting is done by
+        // `select` below, where the timeout is a parameter.
+        raw.c_cc[VMIN] = 0
+        raw.c_cc[VTIME] = 0
+        if tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0: return 0 - 1
+
+        // The C guarded SIGTSTP and SIGHUP with `#ifdef`. Both are POSIX-mandated
+        // and present on both platforms this project supports, which is what the
+        // guards were measured to be defending against: nothing.
+        _ = signal(SIGINT, tty_onsignal)
+        _ = signal(SIGTERM, tty_onsignal)
+        _ = signal(SIGHUP, tty_onsignal)
+        _ = signal(SIGTSTP, tty_onstop)
+        _ = signal(SIGCONT, tty_oncont)
+        return 0
+
+    // ── the window size ────────────────────────────────────────────────────────
+
+    // Re-read the window size. 1 when it differs from the last reading, 0 when it
+    // does not. 80x24 if the ioctl fails, which is what a pipe gets.
+    private i32 tty_measure():
+        WinSize ws
+        i32 cols = 80
+        i32 rows = 24
+
+        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0:
+            cols = i32(ws.ws_col)
+            rows = i32(ws.ws_row)
+
+        i32 changed = 0
+        if cols != g_cols_cache || rows != g_rows_cache: changed = 1
+        g_cols_cache = cols
+        g_rows_cache = rows
+        return changed
+
+    // ── the timed read ─────────────────────────────────────────────────────────
+
+    // Read what is waiting on stdin, up to `cap` bytes.
+    //
+    //   >0  that many bytes are in `buf`
+    //    0  end of input
+    //   -1  the timeout expired with nothing to read
+    //   -2  the read failed
+    //
+    // `timeout_ms` below zero blocks. The buffer is NOT null-terminated: input is
+    // bytes and the count is the length.
+    //
+    // The timeout is not a luxury: the flagship consumer of this library shells out
+    // to a compiler and has to keep drawing while a child process writes, and a
+    // blocking `read` cannot.
+    //
+    // An interrupted wait is a wait that ended early, not a failure: it is reported
+    // as a timeout so the caller's loop goes round again and re-checks whatever else
+    // it was watching. Telling that from a real failure is what `errno` is read for,
+    // and `drain` — which has no `errno` — collapses the two instead.
+    private i32 tty_read(rawptr buf, i32 cap, i32 timeout_ms):
+        i32 fd = STDIN_FILENO
+        if cap <= 0: return 0 - 2
+
+        FdSet set
+        FD_ZERO(&set)
+        FD_SET(fd, &set)
+
+        TimeVal tv
+        tv.tv_sec = #c.long(timeout_ms / 1000)
+        tv.tv_usec = Usec((timeout_ms % 1000) * 1000)
+
+        ^TimeVal deadline = nil
+        if timeout_ms >= 0: deadline = &tv
+
+        i32 ready = sys.select(fd + 1, &set, nil, nil, deadline)
+        if ready == 0: return 0 - 1
+        if ready < 0:
+            if errno == EINTR: return 0 - 1
+            return 0 - 2
+
+        i64 got = i64(read(fd, buf, #c.size_t(cap)))
+        if got < 0:
+            if errno == EINTR: return 0 - 1
+            return 0 - 2
+        return i32(got)
+
+    // ── stopping ───────────────────────────────────────────────────────────────
+
+    // Stop this process the way Ctrl-Z does, and return when it is continued.
+    //
+    // Straight to `tty_onstop`, so a stop the program asked for and a stop the user
+    // asked for take exactly the same path. In an orphaned process group — which is
+    // what a pty without job control gives you — the kernel discards SIGTSTP and
+    // this returns having changed nothing, which is why the caller resumes
+    // unconditionally afterwards.
+    //
+    // The disposition is a per-process property C99 does not have and Dado cannot
+    // name, which is why this is `raise` with the default restored rather than
+    // anything cleverer. The caller restores the terminal first and puts it back
+    // afterwards — so there is exactly one place that knows how to leave and
+    // re-enter raw mode and it is not here.
+    private void tty_stop():
+        _ = raise(SIGTSTP)

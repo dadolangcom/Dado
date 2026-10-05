@@ -1,0 +1,151 @@
+// core:script — what a host sees when a script fails: the reserved codes the
+// verbs answer, and the failure's text, which `#script_error()` reads.
+//
+// **The reserved codes.** `INT32_MIN .. INT32_MIN + 255` are the runtime's
+// own codes, each a named constant a host compares against after
+// `import "core:script"` — `script.STALE`, `script.STOPPED` — so no script's
+// `fail n` and no Dado code means one by accident. A verb answers one of them
+// when the failure is the runtime's: the handle reaches no script, the answer
+// is not the type the entry returns, the allocator refused, the engine was
+// stopped or is busy. A script's own failure keeps its own code — `fail 16`
+// is 16, a fault 70 — and a throw that carries no code is `ERROR`. Each
+// code's low eight bits are its place in the band, so `ERROR`'s are 0 and
+// every other's are not; a failure leaving `main` never exits 0 either way
+// (`ERROR` exits 70, as Dado's own `fail 256` does).
+//
+// **The failure's text.** Everything this package writes to an engine's
+// error sink about a failure — the script's `Error` and its trace, or the
+// runtime's sentence — is also kept, on the thread that made the call, until
+// the next failure on that thread replaces it. `#script_error()`, written in
+// the `else` of a `try` over a verb, reads it there, so the code the `else`
+// binds and the text it reads are the same failure's. The text lives in a
+// buffer of the thread's own and is never freed or moved, so a string
+// `#script_error()` answered stays readable — though a later failure on the
+// thread overwrites what it says, and `#format` keeps a copy. A text longer than
+// the buffer is cut at a character's boundary.
+package script
+
+import "core:io"
+
+// ── The reserved codes ──────────────────────────────────────────────────────
+
+// The script threw something that carries no code, or an `Error` whose code
+// was 0 when it was made: a failure is never 0, so it is this.
+const i32 ERROR = -2147483647 - 1
+
+// The script was stopped: by `#script_stop`, during the run that answers it,
+// or before a run through a handle on an engine that has ended. A script sees
+// it too, as the `Error` the polite phase raises into it.
+const i32 STOPPED = -2147483647
+
+// The handle reaches no script: it was never one, or `#delete` ended it or
+// the VM it was made in.
+const i32 STALE = -2147483646
+
+// The script answered a value of another type than the entry returns.
+const i32 TYPE = -2147483645
+
+// The allocator refused, or one of the engine's tables is full: more than 16
+// arguments to one call, more than 255 values held, more than 64 runs nested.
+const i32 NO_MEMORY = -2147483644
+
+// The engine is paused, or another thread is running it: the run, the
+// construction or the handle operation was not made. Try again once it is
+// resumed or the other run is done.
+const i32 BUSY = -2147483643
+
+// A structure a run lent the script was written, during the run, by a Dado
+// function the script called back into: the lend lock (the glue's section
+// of `script.dado`). The run's answer is not read.
+const i32 LENT = -2147483642
+
+// `#script_reload`'s new code was not swapped in — it could not be read, did
+// not check against what the build bound, or did not evaluate — and the code
+// running now stays; the failure's text says why (`reload.dado`).
+const i32 RELOAD = -2147483641
+
+// A run, a construction, a field or a reload through a VM from a thread that
+// did not make the VM: a VM belongs to the thread that made it, and only its
+// stop, pause, resume and queries come from any thread.
+const i32 THREAD = -2147483640
+
+// An instance crossed into a script on another VM than its own — an argument
+// of a run or a construction, or a Dado function's answer to a script: an
+// instance lives in the VM that made it, and a script reaches only its own
+// VM's.
+const i32 OTHER_VM = -2147483639
+
+// ── The failure's text ──────────────────────────────────────────────────────
+
+// How many bytes of a failure's text are kept.
+private const i64 TEXT_MAX = 4096
+
+private @thread_local [TEXT_MAX]char8 g_text
+private @thread_local i64 g_text_len
+// The error sink the last failure's text was written to: where an untried
+// verb's last line goes, beside it.
+private @thread_local Sink g_text_sink
+
+// `#script_error()`: the text of the last failure a verb answered on this
+// thread — what its error sink was given — borrowed from a buffer that is
+// never freed. Empty before any failure.
+string8 failure_text():
+    return string8(g_text[0..<g_text_len])
+
+// A new failure's text begins, written to `err`.
+private void text_begin(Sink err):
+    g_text_len = 0
+    g_text_sink = err
+
+// `s` kept as the failure's text, and not written anywhere: the text of a
+// failure that writes nothing to the error sink (a stop).
+private void text_keep(string8 s):
+    i64 room = TEXT_MAX - g_text_len
+    i64 n = #len(s)
+    bool cut = n > room
+    if cut:
+        n = room
+    for i in 0..<n:
+        g_text[g_text_len + i] = s[i]
+    g_text_len += n
+    if cut:
+        text_cut()
+
+// A text that filled the buffer ends at a character's boundary: a sequence
+// the cut left short is dropped.
+private void text_cut():
+    i64 at = g_text_len
+    for at > 0 && (u8(g_text[at - 1]) & 0xC0) == 0x80:
+        at -= 1
+    if at == 0:
+        return
+    u8 lead = u8(g_text[at - 1])
+    i64 need = 1
+    if lead >= 0xF0:
+        need = 4
+    else if lead >= 0xE0:
+        need = 3
+    else if lead >= 0xC0:
+        need = 2
+    if at - 1 + need > g_text_len:
+        g_text_len = at - 1
+
+// `s` written to the error sink `err` and kept as the failure's text.
+private void err_put(Sink err, string8 s):
+    _ = io_write(err, s)
+    text_keep(s)
+
+// The error sink the last failure's text went to, or standard error before
+// any failure on this thread.
+private Sink failure_sink():
+    if g_text_sink.proc == nil:
+        return io.stderr_sink()
+    return g_text_sink
+
+// What a stop leaves as the failure's text: a stop writes nothing to the
+// error sink — it is the host's own doing — and `#script_error()` still says
+// what happened. Answers `STOPPED`.
+private i32 stopped(Engine e):
+    text_begin(err_of(e))
+    text_keep("script: the host stopped this script (`#script_stop`, or `#delete` of its VM)")
+    return STOPPED

@@ -1,0 +1,319 @@
+// app:net — the RPC-and-packets escape hatch on top of `core:net`: framed
+// remote calls, and peers named by a small integer.
+//
+//     import "app:net"    // binds `net` — the last path segment
+//
+//     void ready():
+//         net.listen(17777, 32)                    // server role
+//         // — or —
+//         i32 srv = net.dial("127.0.0.1", 17777)   // client role; srv is the
+//                                                    // server's peer id
+//
+//     void process(f32 dt):
+//         [16]net.NetEvent evs
+//         i32 n = net.poll(evs[:])
+//         for i in 0..<n:
+//             if evs[i].kind == net.NetEventKind.Connect:
+//                 net.rpc(evs[i].peer, MSG_HELLO, []u8{}, net.Class.Reliable)
+//             if evs[i].kind == net.NetEventKind.Rpc:
+//                 handle(evs[i].id, evs[i].peer, evs[i].data)
+//
+// **Named `NetEvent`/`NetEventKind`, not the bare `Event`/`EventKind` a
+// reader might expect from `app:input`'s precedent.** The names are kept for
+// readability — a program that polls both this package and `app:input` in one
+// `process` reads better when the two vocabularies are distinguishable at the
+// call site — and that is now the *whole* of the reason.
+//
+// It was not the original reason, and the correction is worth keeping. This
+// package first chose these names to escape a refusal: with `core:net`'s own
+// `Event` and a local `Event` both visible, every field access on either was
+// `ERR0518`, and the comment here explained it as view resolution keying
+// "off the plain name, not full structural identity." That was a
+// compiler defect, not a rule — what is refused is *two visible spellings of
+// **one shape***, and these were two shapes. It is fixed;
+// `example/net`'s client now imports `core:net` and `app:input` into one file,
+// which is the case that could not be written. **Reverting the names is a
+// live option and deliberately not taken here**: it is an API change to a
+// landed package with a test and an example against it, and the names earn
+// their keep on their own merits now. Whoever weighs it should know it is a
+// preference and no longer a constraint.
+//
+// **The mechanism.** `core:net` is the `Reliable`/
+// `Unreliable` wrapper over `vendor:enet` — a `Host`, a `Peer`, `send`/
+// `broadcast`, and a `poll` that drains ENet's event loop. This is the
+// opinion on top, the same split `core:log`/`app:log` already follows:
+// **peer identity as a small `i32`**
+// instead of a raw pointer, and **`rpc`'s `id` framed onto the wire** so a
+// receiver's `poll` hands back `(id, peer, bytes)` exactly as an
+// `app.rpc`/`event(id, peer, bytes)` pair reads, without the
+// program having to invent its own message-id convention.
+//
+// **One `Host` per process, matching the app singleton** ("there
+// is one terminal, one window, one app" — extended here to "one network
+// role"). `listen` makes this process a server; `dial` (on a process with no
+// host yet) makes it a client and immediately starts connecting to one peer.
+// A server cannot also `dial` out in this baseline — a program that needs
+// both roles in one process is out of scope here (the target shape is a
+// headless server *and* a separate TUI client, two processes).
+//
+// **Peer ids, not pointers.** `core:net.Peer` is a raw `^ENetPeer`; this
+// package keeps a fixed `MAX_PEERS`-slot table and hands back a small `i32`
+// instead — the surface names a `peer_id`, not a pointer, and a
+// small int is what a program can put in an array index or send back over
+// the wire itself. A server's peers are registered as `core:net`'s own
+// `Kind.Connect` events arrive (their id is not known before then); a client's one peer is
+// registered synchronously by `dial`, at `connect`'s return, before the
+// handshake even completes — the same event fires again once it does, and
+// `poll` recognises the peer by pointer identity rather than re-registering
+// it under a second id.
+//
+// **`poll` is drained at the barrier, exactly like `input.poll`** —
+// three hooks, and everything else is polled: call it from `process`, not
+// anywhere else. Unlike `input`, there is no separate backend-driven fill
+// step — `core:net.poll`'s own `timeout_ms = 0` call is non-blocking and
+// ENet already buffers internally, so calling it directly, in a loop, from
+// inside `process` *is* the drain; no intermediate ring is needed. That was
+// the open question this package settles — a ring turned out to be
+// unnecessary, not just avoidable.
+//
+// **A `Rpc` event's `data` is a window, not an owning `ref`, and needs no
+// `delete`.** Every payload — the wire-framed outgoing bytes `rpc` builds
+// and the incoming bytes `poll` decodes — is allocated from `app.temp()`,
+// the per-frame arena every other transient value in this framework already
+// uses (`arena.Free` is a documented no-op, `FreeAll` only runs at the next
+// frame's barrier — see `core:mem/arena`'s own doc comment) — so a `Rpc`
+// event's `data` stays valid for the rest of this frame and is reclaimed
+// automatically at the next one — the lifetime every scratch-backed value in
+// this framework gets, and the reason a `poll` result must be read or copied
+// within the frame that produced it.
+//
+// **The wire format `rpc` adds over a raw `core:net` packet is one `i32`,
+// little-endian, prefixed to the payload** — `id`, so `poll` can hand it
+// back without the program inventing its own header. This is the one piece
+// of framing `app:net` owns; the *payload* bytes are still "the program
+// serialises itself." **`core:net`'s own `send`/`broadcast`
+// are not re-exposed here** — the "raw packets, one level lower" surface
+// (`app.send`/`app.receive`, unframed) is deliberately deferred: sharing one
+// `Host`/channel pair between framed `rpc` traffic and unframed raw traffic
+// needs its own disambiguation design (`poll` consumes exactly one
+// `core:net.poll` event per call and cannot peek its bytes before deciding
+// how to decode them), and the Definition of done here is "exchange RPCs,"
+// not both surfaces at once. A future task can add it once a real caller
+// needs it.
+package appnet
+
+import corenet "core:net"
+import "app:app"
+
+// ── peer table ───────────────────────────────────────────────────────────
+
+const i32 MAX_PEERS = 64
+
+private corenet.Host g_host
+private bool     g_host_valid
+private bool     g_is_server
+private bool     g_net_inited
+
+private [MAX_PEERS]corenet.Peer g_peers
+
+private void ensure_init():
+    if !g_net_inited:
+        corenet.init()
+        g_net_inited = true
+
+// First free slot, or -1 if the table is full (`MAX_PEERS` simultaneous
+// peers is generous for the baseline; raise it here if a real program needs
+// more).
+private i32 peer_register(corenet.Peer p):
+    for i in 0..<MAX_PEERS:
+        if g_peers[i] == nil:
+            g_peers[i] = p
+            return i
+    return -1
+
+private i32 peer_find(corenet.Peer p):
+    for i in 0..<MAX_PEERS:
+        if g_peers[i] == p:
+            return i
+    return -1
+
+private void peer_release(i32 id):
+    if id >= 0 && id < MAX_PEERS:
+        corenet.Peer nilp = nil
+        g_peers[id] = nilp
+
+private corenet.Peer peer_at(i32 id):
+    if id < 0 || id >= MAX_PEERS:
+        corenet.Peer nilp = nil
+        return nilp
+    return g_peers[id]
+
+// ── role & lifecycle ─────────────────────────────────────────────────────
+
+// Become a server, bound to `port`, accepting up to `max_peers`. `false` on
+// failure (a host already open, or `core:net.host_server` itself failing —
+// usually the port is busy).
+bool listen(u16 port, u64 max_peers):
+    ensure_init()
+    if g_host_valid:
+        return false
+    corenet.Host h = corenet.host_server(port, max_peers)
+    if !corenet.host_valid(h):
+        return false
+    g_host = h
+    g_host_valid = true
+    g_is_server = true
+    return true
+
+// Become a client (on first call) and connect to `address:port`. Returns the
+// new peer's id, or `-1` on failure — a malformed address, ENet refusing the
+// connection outright, or this process is already a server (a server cannot
+// also dial out in this baseline — see package doc comment).
+i32 dial(string8 address, u16 port):
+    ensure_init()
+    if g_host_valid && g_is_server:
+        return -1
+    if !g_host_valid:
+        corenet.Host h = corenet.host_client(1)
+        if !corenet.host_valid(h):
+            return -1
+        g_host = h
+        g_host_valid = true
+        g_is_server = false
+    corenet.Peer p = corenet.connect(g_host, address, port)
+    if p == nil:
+        return -1
+    return peer_register(p)
+
+// Ask a peer to disconnect gracefully — drain `poll` for the matching
+// `NetEventKind.Disconnect`. `false` if `peer_id` does not name a live peer.
+bool disconnect_peer(i32 peer_id):
+    corenet.Peer p = peer_at(peer_id)
+    if p == nil:
+        return false
+    corenet.disconnect(p)
+    return true
+
+// Push queued outgoing traffic now rather than waiting for the next `poll`.
+void flush():
+    if g_host_valid:
+        corenet.flush(g_host)
+
+// Tear down the host (and, if this was the last one, the ENet library
+// itself) and forget every registered peer. Safe to call with no host open.
+void close():
+    if g_host_valid:
+        corenet.host_destroy(g_host)
+        g_host_valid = false
+    for i in 0..<MAX_PEERS:
+        corenet.Peer nilp = nil
+        g_peers[i] = nilp
+    if g_net_inited:
+        corenet.shutdown()
+        g_net_inited = false
+
+bool is_open():
+    return g_host_valid
+
+bool is_server():
+    return g_host_valid && g_is_server
+
+// How many peers are currently connected. `0` with no host open.
+u32 peer_count():
+    if !g_host_valid:
+        return 0
+    return corenet.host_peer_count(g_host)
+
+// ── the RPC wire format: one little-endian i32, prefixed to the payload ──
+
+private void pack_id([]u8 out, i32 id):
+    u32 v = u32(id)
+    out[0] = u8(v & 255)
+    out[1] = u8((v >> 8) & 255)
+    out[2] = u8((v >> 16) & 255)
+    out[3] = u8((v >> 24) & 255)
+
+private i32 unpack_id([]u8 b):
+    u32 v = u32(b[0]) | (u32(b[1]) << 8) | (u32(b[2]) << 16) | (u32(b[3]) << 24)
+    return i32(v)
+
+// Send `bytes` tagged with `id` to one peer (`peer_id`) or every connected
+// peer (`peer_id == -1`, the standing convention). `false` if `peer_id`
+// names no live peer or nothing is open; a broadcast with zero peers
+// connected is not an error (mirrors `core:net.broadcast`).
+bool rpc(i32 peer_id, i32 id, []u8 bytes, corenet.Class cls):
+    if !g_host_valid:
+        return false
+    i32 n = i32(#len(bytes))
+    ref []u8 framed = #make([]u8, u64(n + 4), app.temp())
+    pack_id(framed[0..<4], id)
+    for i in 0..<n:
+        framed[4 + i] = bytes[i]
+
+    if peer_id == -1:
+        corenet.broadcast(g_host, cls, framed[:])
+        return true
+
+    corenet.Peer p = peer_at(peer_id)
+    if p == nil:
+        return false
+    return corenet.send(p, cls, framed[:])
+
+// ── polling — the barrier drain, mirroring `input.poll` ─────────────────
+
+enum i32 NetEventKind: (Connect, Disconnect, Timeout, Rpc)
+
+// `id`/`data` are meaningful only for `NetEventKind.Rpc` — every other kind carries
+// `id = 0` and an empty `data`. `peer` is `-1` if the underlying
+// `core:net.Peer` could not be resolved against this package's own table
+// (should not happen in practice; see `peer_find`'s callers).
+type NetEvent: (NetEventKind kind, i32 peer, i32 id, []u8 data)
+
+private []u8 g_empty
+
+// Drain up to `#len(out)` pending events, returning how many were written. A
+// partial drain (more pending than `#len(out)`) leaves the rest for the next
+// `poll` call, exactly like `input.poll`. A no-op (`0`) with no host open.
+i32 poll([]NetEvent out):
+    if !g_host_valid:
+        return 0
+    i32 n = 0
+    for n < #len(out):
+        corenet.Event ev = corenet.poll(g_host, 0, app.temp())
+        if ev.kind == corenet.Kind.None:
+            break
+
+        if ev.kind == corenet.Kind.Connect:
+            i32 pid = peer_find(ev.peer)
+            if pid == -1:
+                pid = peer_register(ev.peer)
+            out[n] = (NetEventKind.Connect, pid, 0, g_empty)
+            n = n + 1
+        else if ev.kind == corenet.Kind.Disconnect:
+            i32 pid = peer_find(ev.peer)
+            peer_release(pid)
+            out[n] = (NetEventKind.Disconnect, pid, 0, g_empty)
+            n = n + 1
+        else if ev.kind == corenet.Kind.Timeout:
+            i32 pid = peer_find(ev.peer)
+            peer_release(pid)
+            out[n] = (NetEventKind.Timeout, pid, 0, g_empty)
+            n = n + 1
+        else if ev.kind == corenet.Kind.Receive:
+            i32 pid = peer_find(ev.peer)
+            i64 total = #len(ev.data)
+            if total < 4:
+                // Malformed — not a frame this package ever sent. Drop and
+                // keep draining rather than surfacing a half-decoded event.
+                #delete(ev.data)
+            else:
+                i32 rid = unpack_id(ev.data[0..<4])
+                // A window into `ev.data`, handed to the caller — so the block
+                // is **not** deleted here. It was allocated in `app.temp()`
+                // and the frame boundary reclaims it; a `#delete` before the
+                // store left `payload` pointing into a freed block, which only
+                // read correctly because an arena's free does nothing (ERR0803).
+                []u8 payload = ev.data[4..<total]
+                out[n] = (NetEventKind.Rpc, pid, rid, payload)
+                n = n + 1
+    return n

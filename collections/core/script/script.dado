@@ -1,0 +1,2586 @@
+// core:script — the native runtime a DadoScript program runs on: QuickJS-ng, the
+// fork, embedded.
+//
+//     import "core:script"
+//     import "core:mem/libc"
+//
+//     try script.Engine e = script.create(libc.allocator()) else code:
+//         return code
+//     defer script.destroy(e)
+//     script.add_module(e, "counter", COUNTER_JS)      // an embedded ES module
+//     try script.Handle m = script.load(e, "counter") else code:
+//         return code                                  // its text is on stderr
+//     script.arg_i64(e, 40)
+//     try script.Handle c = script.construct(e, m, "Counter") else code:
+//         return code
+//     script.arg_i64(e, 2)
+//     try script.call_method(e, c, "add") else code:
+//         return code
+//     try i64 n = script.result_i64(e) else code:
+//         return code
+//
+// **What this package is.** The seam the generated glue of `#script_vm`,
+// `#script_new`, `#script_run` and member calls through a handle calls: an
+// engine on the host allocator, a registry of embedded ES modules that the engine's module loader reads by name, `print` and
+// `println` on the engine's output sink, and an uncaught exception's text on
+// its error sink; and the interrupt hook, with stopping and pausing a running
+// script (`stop.dado`); the sink stack each run pushes and pops
+// (`sinks.dado`); and the reserved codes a verb answers and the failure's text
+// `#script_error()` reads (`failure.dado`). It is not all of the runtime
+// library: the print suite's rendering rules arrive with the row that owns
+// them.
+//
+// **The engine is a toolchain component, never compiled in a program's
+// build.** `quickjs.h` is not in this directory: it is the header of the
+// archive `./dado` links, built once per target triple, compiler and flags from
+// the pinned upstream and the fork's patch series (`tools/quickjs/build.sh`).
+// The build learns that it needs the archive from the compiler: a program whose
+// live set holds this package gets an `engine quickjs` line in its build
+// manifest, and the driver answers it with the archive's directory on the
+// include path and the archive on the link line. A program that never reaches
+// this package links nothing and stays one translation unit.
+//
+// **Hand-restated, not generated, and checked all the same.** Every other
+// binding of a C library in this tree is `bindgen`'s output over a header in
+// the tree. This header is the output of the patch series applied to a pinned
+// upstream, and it lives beside the archive in the cache: a copy committed
+// here would be a second source of truth for a header that has one. So the
+// declarations below are the handful this package calls, restated by hand,
+// and the emitter's assertions check each against the real header on every
+// build — every signature's C type by `_Generic`, every restated struct's
+// layout by `sizeof`/`offsetof`, and every constant's value comes from C.
+//
+// **No scripting on `#NONE`; on the web, the page's engine.** QuickJS-ng
+// needs a hosted C library even with its allocator routed through Dado's, so a
+// freestanding build that reaches this package is refused: the `foreign` block
+// names a header outside C's freestanding set (`ERR1032`), and the driver
+// refuses an `engine` line on such a target by the same reason. On the web a
+// script runs on the page's own engine and a web build links none:
+// `quickjs.h` is a header the compiler's web runtime supplies, implementing
+// every function below over the JavaScript engine beside the module, so this
+// package compiles unchanged there; its scripts are files beside the module,
+// never source an engine compiles.
+//
+// **Values cross as scalars, and `int` in its tiers.** A DadoScript `int` is
+// exactly `i64`, held in the smallest canonical tier that fits: a 32-bit
+// integer, a double exact to 2⁵³ − 1, or a BigInt beyond. `arg_i64` builds
+// that tier and `result_i64` reads any of the three, so a value past 2⁵³
+// crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
+package script
+
+import "core:mem"
+import "core:io"
+import "core:strings"
+
+// ── The engine's header ─────────────────────────────────────────────────────
+//
+// On LP64 `JSValue` is a 16-byte struct passed by value — a payload union and a
+// 64-bit tag — and never the NaN-boxed `uint64_t` of a 32-bit build; every
+// target this package compiles for is 64-bit, and the layout assertion the
+// emitter writes for `JSValue` is what says so on the next one.
+foreign "quickjs.h":
+    type JSRuntime
+    type JSContext
+    type JSModuleDef
+
+    cunion JSValueUnion:
+        i32 int32,
+        f64 float64,
+        rawptr ptr,
+        i32 short_big_int,
+
+    type JSValue:
+        JSValueUnion u,
+        i64 tag,
+
+    type JSMallocFunctions:
+        rawptr(rawptr, #c.size_t, #c.size_t) js_calloc,
+        rawptr(rawptr, #c.size_t) js_malloc,
+        void(rawptr, rawptr) js_free,
+        rawptr(rawptr, rawptr, #c.size_t) js_realloc,
+        #c.size_t(const rawptr) js_malloc_usable_size,
+
+    enum @c("JSCFunctionEnum") JSCFunctionEnum:
+        @c("JS_CFUNC_generic") Generic,
+
+    enum @c("JSPromiseStateEnum") JSPromiseStateEnum:
+        @c("JS_PROMISE_NOT_A_PROMISE") NotAPromise,
+        @c("JS_PROMISE_PENDING") Pending,
+        @c("JS_PROMISE_FULFILLED") Fulfilled,
+        @c("JS_PROMISE_REJECTED") Rejected,
+
+    // The value tags this package reads. An anonymous enum in the header, so
+    // they are constants here, each valued by C.
+    const i32 JS_TAG_BIG_INT
+    const i32 JS_TAG_SHORT_BIG_INT
+    const i32 JS_TAG_INT
+    const i32 JS_TAG_BOOL
+    const i32 JS_TAG_UNDEFINED
+    const i32 JS_TAG_FLOAT64
+    const i32 JS_TAG_STRING
+    const i32 JS_TAG_STRING_ROPE
+    const i32 JS_TAG_OBJECT
+    const i32 JS_TAG_EXCEPTION
+
+    const i32 JS_EVAL_TYPE_MODULE
+    const i32 JS_EVAL_FLAG_COMPILE_ONLY
+    // The fork's flag (patch 0002): code evaluated with it compiles the
+    // `__dados_*` intrinsics — the tiered `int` operations among them — to the
+    // fork's opcodes. A stock QuickJS-ng header does not declare it, so a build
+    // against the wrong engine fails here, by name.
+    const i32 JS_EVAL_FLAG_DADOS
+
+    ^JSRuntime JS_NewRuntime2(^const JSMallocFunctions mf, rawptr opaque)
+    void JS_FreeRuntime(^JSRuntime rt)
+    void JS_UpdateStackTop(^JSRuntime rt)
+    // The hook the engine calls at its polls (`stop.dado`), and the fork's
+    // answer (patch 0007) that raises what the hook threw, catchable, where
+    // any other nonzero answer raises the engine's uncatchable error. A stock
+    // QuickJS-ng header does not declare it.
+    void JS_SetInterruptHandler(^JSRuntime rt, i32(^JSRuntime, rawptr) cb, rawptr opaque)
+    const i32 JS_INTERRUPT_RAISE
+    ^JSContext JS_NewContext(^JSRuntime rt)
+    void JS_FreeContext(^JSContext ctx)
+    void JS_SetContextOpaque(^JSContext ctx, rawptr opaque)
+    rawptr JS_GetContextOpaque(^JSContext ctx)
+    void JS_SetModuleLoaderFunc(^JSRuntime rt, (^#c.char)(^JSContext, cstring, cstring, rawptr) module_normalize, (^JSModuleDef)(^JSContext, cstring, rawptr) module_loader, rawptr opaque)
+    i32 JS_ExecutePendingJob(^JSRuntime rt, ^^JSContext pctx)
+
+    JSValue JS_Eval(^JSContext ctx, cstring input, #c.size_t input_len, cstring filename, i32 eval_flags)
+    JSValue JS_LoadModule(^JSContext ctx, cstring basename, cstring filename)
+    JSPromiseStateEnum JS_PromiseState(^JSContext ctx, JSValue promise)
+    JSValue JS_PromiseResult(^JSContext ctx, JSValue promise)
+
+    JSValue JS_GetGlobalObject(^JSContext ctx)
+    JSValue JS_GetPropertyStr(^JSContext ctx, JSValue this_obj, cstring prop)
+    i32 JS_SetPropertyStr(^JSContext ctx, JSValue this_obj, cstring prop, JSValue val)
+    // A handle's mark (`handles.dado`): a property no script names, kept out
+    // of what a script walks.
+    i32 JS_DefinePropertyValueStr(^JSContext ctx, JSValue this_obj, cstring prop, JSValue val, i32 flags)
+    const i32 JS_PROP_WRITABLE
+    const i32 JS_PROP_CONFIGURABLE
+    // A counted reference more: what a handle holds of an instance.
+    JSValue JS_DupValue(^JSContext ctx, JSValue v)
+    bool JS_IsFunction(^JSContext ctx, JSValue val)
+    JSValue JS_Call(^JSContext ctx, JSValue func_obj, JSValue this_obj, i32 argc, ^JSValue argv)
+    JSValue JS_CallConstructor(^JSContext ctx, JSValue func_obj, i32 argc, ^JSValue argv)
+    JSValue JS_NewCFunction2(^JSContext ctx, JSValue(^JSContext, JSValue, i32, ^JSValue) func, cstring name, i32 length, JSCFunctionEnum cproto, i32 magic)
+    ^JSModuleDef JS_NewCModule(^JSContext ctx, cstring name_str, i32(^JSContext, ^JSModuleDef) func)
+    i32 JS_AddModuleExport(^JSContext ctx, ^JSModuleDef m, cstring name_str)
+    i32 JS_SetModuleExport(^JSContext ctx, ^JSModuleDef m, cstring export_name, JSValue val)
+
+    JSValue JS_GetException(^JSContext ctx)
+    JSValue JS_Throw(^JSContext ctx, JSValue obj)
+    bool JS_IsError(JSValue val)
+    JSValue JS_ThrowReferenceError(^JSContext ctx, cstring fmt, ...)
+    JSValue JS_ThrowTypeError(^JSContext ctx, cstring fmt, ...)
+    JSValue JS_ThrowPlainError(^JSContext ctx, cstring fmt, ...)
+    void JS_FreeValue(^JSContext ctx, JSValue v)
+
+    JSValue JS_NewBool(^JSContext ctx, bool val)
+    JSValue JS_NewInt32(^JSContext ctx, i32 val)
+    JSValue JS_NewFloat64(^JSContext ctx, f64 val)
+    JSValue JS_NewBigInt64(^JSContext ctx, i64 v)
+    JSValue JS_NewStringLen(^JSContext ctx, cstring str1, #c.size_t len1)
+    i32 JS_ToBigInt64(^JSContext ctx, ^i64 pres, JSValue val)
+    ^const #c.char JS_ToCStringLen2(^JSContext ctx, ^#c.size_t plen, JSValue val1, bool cesu8)
+    // `const char *` in the header, which is what a `cstring` is in C: a
+    // `string8` the engine made goes back as one.
+    void JS_FreeCString(^JSContext ctx, cstring ptr)
+    // A string's UTF-16 code units, unmatched surrogates kept, and a string
+    // made of them: how a `char16` crosses, exactly.
+    ^const u16 JS_ToCStringLenUTF16(^JSContext ctx, ^#c.size_t plen, JSValue val1)
+    void JS_FreeCStringUTF16(^JSContext ctx, ^const u16 ptr)
+    JSValue JS_NewStringUTF16(^JSContext ctx, ^const u16 buf, #c.size_t len)
+    // Arrays, for the values that cross as one: a Dado slice, array or tuple.
+    JSValue JS_NewArray(^JSContext ctx)
+    bool JS_IsArray(JSValue val)
+    i32 JS_GetLength(^JSContext ctx, JSValue obj, ^i64 pres)
+    JSValue JS_GetPropertyInt64(^JSContext ctx, JSValue this_obj, i64 idx)
+    i32 JS_SetPropertyInt64(^JSContext ctx, JSValue this_obj, i64 idx, JSValue val)
+    bool JS_IsMap(JSValue val)
+    JSValue JS_ThrowOutOfMemory(^JSContext ctx)
+
+// ── Failure ─────────────────────────────────────────────────────────────────
+//
+// What every failable function here fails with. Each failure has already
+// written its sentence to the engine's error sink by the time the code
+// arrives, so a caller that only wants to stop returns the code and says
+// nothing of its own. Besides the reserved codes (`failure.dado`) — `TYPE`
+// for an answer of the wrong type, `NO_MEMORY` for an allocator that refused
+// or a full table — the calls a program makes by hand fail with two codes of
+// their own, which the verbs never answer: a verb answers the `Error`'s code
+// for `THREW` and `STALE` for `NO_SUCH`.
+
+// The script threw and nothing caught it; the error's text and stack are on
+// the error sink, and its code is the engine's `thrown`.
+const i32 THREW = 1
+// No module, export, class or method has that name.
+const i32 NO_SUCH = 2
+
+// ── The engine ──────────────────────────────────────────────────────────────
+
+// One engine: a QuickJS-ng runtime and its one context, the allocator both
+// live on, the embedded modules its loader can find, the sinks `print` and a
+// failure write to, and the tables the calls below go through. It is reached
+// only through `Engine`, and every field is this package's.
+type State:
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc,
+    ^JSRuntime rt,
+    ^JSContext ctx,
+    Sink out,
+    Sink err,
+    // The sinks each run in progress displaced (`sinks.dado`).
+    SinkStack sinks,
+    // The embedded modules, by name: registered by `add_module`, read by the
+    // loader. Neither string is copied — both are the program's constants.
+    [MAX_MODULES]Module modules,
+    i32 nmodules,
+    // Each embedded module's definition once the engine has compiled it —
+    // loaded by `#script_new` or imported by a module that was — by the
+    // index of its row in `modules`; nil before. What a reload finds a
+    // class's namespace by.
+    [MAX_MODULES]^JSModuleDef compiled,
+    // Values a caller holds by number: a loaded module's namespace, a
+    // constructed object. Slot 0 is never used, so a `Handle` of 0 is none.
+    [MAX_HANDLES]JSValue handles,
+    // The arguments of the next call, in order, and whether one was pushed
+    // past the table's end — which fails the call rather than making it with
+    // an argument missing.
+    [MAX_ARGS]JSValue args,
+    i32 nargs,
+    bool args_lost,
+    // The last call's answer, and the C string `result_string` borrowed from
+    // it; both are released by the next call and by `destroy`.
+    JSValue result,
+    ^const #c.char result_text,
+    i64 result_len,
+    // What the allocator procedures below are holding: blocks and bytes,
+    // counted so a test can see the heap is empty when the runtime is gone.
+    i64 live_blocks,
+    i64 live_bytes,
+    // The modules a host's `#script_new` has loaded into this VM so far, each
+    // by its name — a constant of the program's — and its namespace, which
+    // every `#script_new` of a class it exports constructs from; empty for an
+    // engine `create` made until something loads one.
+    [MAX_MODULES]Loaded loaded,
+    i32 nloaded,
+    // The code of the last failure reported: a DadoScript `Error`'s, or 70 for a
+    // throw that carries none.
+    i32 thrown,
+    // The Dado functions the program's scripts call, as the glue's table of
+    // `Bound` rows ended by a row whose module is nil — nil for an engine
+    // `create` made — and the native modules made of it so far, by the
+    // definition the engine links them through.
+    const rawptr bound,
+    [MAX_MODULES]Native natives,
+    i32 nnatives,
+    // The engine word, and what stopping and pausing it share with its runs
+    // (`stop.dado`).
+    Stopper stop,
+    // What an untried call does when the script fails (`policy.dado`).
+    i32 on_error,
+    // How many times this package has entered the engine to call into it
+    // (`call`, `call_method`, `construct`), and how many times a thunk of a
+    // bound Dado function has run on it: the two counters the lend lock reads.
+    i64 entries,
+    i64 thunks,
+    // The bytes of the strings that crossed into Dado and out of it through
+    // the glue (`take_string`, `give_string`), and every counter as it stood
+    // when the frame began: what `counters` reads (`counters.dado`).
+    i64 bytes_in,
+    i64 bytes_out,
+    Counters frame,
+    // The lend lock's lends still waiting for their fingerprint, each a
+    // `Lend` at the head of a list the generated glue keeps on its stack: a
+    // script's structures a thunk lent Dado, fingerprinted the first time the
+    // engine is entered again during the call, and Dado's structures a run
+    // lent the script, fingerprinted the first time a thunk runs during it.
+    rawptr script_lends,
+    rawptr host_lends,
+    // An argument the glue built for the next call threw while it was built
+    // (the engine ran out of memory): the call fails rather than being made.
+    bool args_threw,
+    // What the engine keeps of its reloads (`reload.dado`).
+    Reloading reloading,
+    // The signals of the program a script may connect a handler to — the
+    // glue's `SignalTable`, nil when no script connects any — and this VM's
+    // handlers (`signals.dado`).
+    const rawptr signals,
+    Connections connections,
+    // The thunks running on the engine, and a script's error a call of its
+    // function from Dado left for the innermost of them (`callbacks.dado`).
+    Parking parking,
+
+// An engine, as the address of its state.
+type Engine: ^State
+
+// A value the engine holds for its caller: a module's namespace or an object.
+// 0 is no value.
+type Handle: i32
+
+// One embedded ES module: the name `import` and `load` reach it by, and its
+// source. Both are C strings the program holds for as long as the engine.
+type Module: (cstring name, cstring source)
+
+// A module a VM has loaded for its host: its name, a constant of the
+// program's, and the namespace the engine holds for it.
+type Loaded: (cstring name, Handle ns)
+
+// One Dado function a script calls: the native module `dado:<package>` it is
+// exported from, the name it is exported under, the thunk the compiler
+// generated for it, and how many arguments it takes. The program's table of
+// them is C the compiler writes (`dado_js__bound`), laid out as this is.
+type Bound: (cstring module, cstring name, JSValue(^JSContext, JSValue, i32, ^JSValue) thunk, i32 arity)
+
+// A native module made for an engine: its definition, and the row of the
+// glue's table its first export is — whose module name is the program's
+// constant, where the name the loader was handed is the engine's and gone
+// once the loader returns; −1 for a module with no export.
+type Native: (^JSModuleDef def, i64 first)
+
+const i32 MAX_MODULES = 64
+const i32 MAX_HANDLES = 256
+const i32 MAX_ARGS = 16
+
+// A new engine on `alloc`, which everything it allocates comes from — the
+// runtime, every object a script creates, and the engine's own state. Its
+// output sink is standard output and its error sink standard error, the
+// streams `core:fmt` writes to, so a script's lines and the program's never
+// reorder.
+!Engine create((rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    rawptr p = alloc.proc(alloc.data, mem.AllocatorMode.Alloc, #size(State), mem.MAX_ALIGN, nil, 0)
+    if p == nil:
+        fail NO_MEMORY
+    Engine e = Engine(p)
+    e^.alloc = alloc
+    e^.out = io.stdout_sink()
+    e^.err = io.stderr_sink()
+    JSMallocFunctions mf
+    mf.js_calloc = engine_calloc
+    mf.js_malloc = engine_malloc
+    mf.js_free = engine_free
+    mf.js_realloc = engine_realloc
+    mf.js_malloc_usable_size = engine_usable_size
+    e^.rt = JS_NewRuntime2(&mf, rawptr(e))
+    if e^.rt == nil:
+        release_state(e)
+        fail NO_MEMORY
+    e^.ctx = JS_NewContext(e^.rt)
+    if e^.ctx == nil:
+        JS_FreeRuntime(e^.rt)
+        release_state(e)
+        fail NO_MEMORY
+    if !stopper_open(e):
+        JS_FreeContext(e^.ctx)
+        JS_FreeRuntime(e^.rt)
+        release_state(e)
+        fail NO_MEMORY
+    stopper_made_here(e)
+    JS_SetContextOpaque(e^.ctx, rawptr(e))
+    JS_SetModuleLoaderFunc(e^.rt, normalize_import, load_embedded, rawptr(e))
+    JSValue global = JS_GetGlobalObject(e^.ctx)
+    _ = JS_SetPropertyStr(e^.ctx, global, "print", JS_NewCFunction2(e^.ctx, host_print, "print", 1, JSCFunctionEnum.Generic, 0))
+    _ = JS_SetPropertyStr(e^.ctx, global, "println", JS_NewCFunction2(e^.ctx, host_println, "println", 1, JSCFunctionEnum.Generic, 0))
+    JS_FreeValue(e^.ctx, global)
+    return e
+
+// Release everything the engine holds, the runtime last, and then the
+// engine's own state. Every handle is released with it. An engine a stop
+// has ended has released its heap already, and here only its state goes.
+void destroy(Engine e):
+    if e == nil:
+        return
+    if !e^.stop.ended:
+        end_engine(e)
+    // Every host handle on the engine is stale from here (`handles.dado`).
+    slots_drop(e)
+    stopper_close(e)
+    release_state(e)
+
+// The engine's heap, in one step: every value it holds for its caller, the
+// pending arguments and answer, the context and the runtime. What is left is
+// the engine's state, which `destroy` frees.
+private void end_engine(Engine e):
+    clear_args(e)
+    clear_result(e)
+    // The signals a script connected, let go of; a parked error with them.
+    disconnect_all(e)
+    JS_FreeValue(e^.ctx, e^.parking.parked)
+    e^.parking.parked = undefined()
+    e^.parking.at = 0
+    // What the host's handles hold, and what `#delete` let go of during a
+    // run, go while the runtime is still there; the handles stay.
+    slots_release(e)
+    release_waiting(e)
+    // An empty slot is zero or `undefined`, and freeing either does nothing.
+    for i in 1..<MAX_HANDLES:
+        JS_FreeValue(e^.ctx, e^.handles[i])
+        e^.handles[i] = undefined()
+    JS_FreeContext(e^.ctx)
+    JS_FreeRuntime(e^.rt)
+    e^.ctx = nil
+    e^.rt = nil
+
+// Where `print` and `println` write, and where a failure's text goes.
+void set_sinks(Engine e, Sink out, Sink err):
+    e^.out = out
+    e^.err = err
+
+// The blocks and bytes the engine's runtime holds on its allocator right now.
+// After `destroy` there is no engine to ask; a caller that wants to see the
+// heap emptied counts on its own allocator.
+(i64 blocks, i64 bytes) held(Engine e):
+    return (e^.live_blocks, e^.live_bytes)
+
+// ── Modules ─────────────────────────────────────────────────────────────────
+
+// Register the ES module `source` under `name`, for `load` and for any
+// module's `import`. Nothing is compiled until something imports it. Both
+// strings are borrowed for the engine's life.
+!void add_module(Engine e, cstring name, cstring source):
+    if e^.nmodules >= MAX_MODULES:
+        say(e, "script: more than 64 embedded modules")
+        fail NO_MEMORY
+    e^.modules[e^.nmodules] = (name, source)
+    e^.nmodules += 1
+
+// Import the module `name` and evaluate it (and everything it imports) under
+// the fork's DadoScript flag, and answer its namespace. A module is evaluated once;
+// loading it again answers the same namespace.
+!Handle load(Engine e, cstring name):
+    JSValue promise = JS_LoadModule(e^.ctx, "", name)
+    if is_exception(promise):
+        report(e)
+        fail THREW
+    if !drain(e):
+        JS_FreeValue(e^.ctx, promise)
+        fail THREW
+    JSPromiseStateEnum state = JS_PromiseState(e^.ctx, promise)
+    if state == JSPromiseStateEnum.Rejected:
+        _ = JS_Throw(e^.ctx, JS_PromiseResult(e^.ctx, promise))
+        JS_FreeValue(e^.ctx, promise)
+        report(e)
+        fail THREW
+    if state != JSPromiseStateEnum.Fulfilled:
+        JS_FreeValue(e^.ctx, promise)
+        say(e, "script: module evaluation did not finish (top-level await is not supported)")
+        fail THREW
+    JSValue ns = JS_PromiseResult(e^.ctx, promise)
+    JS_FreeValue(e^.ctx, promise)
+    try Handle h = keep(e, ns)
+    return h
+
+// ── Arguments ───────────────────────────────────────────────────────────────
+//
+// The next call's arguments, pushed in order; the call consumes them, whether
+// it succeeds or not.
+
+// An `int`, in the smallest canonical tier that holds it.
+void arg_i64(Engine e, i64 v):
+    push(e, from_i64(e, v))
+
+void arg_f64(Engine e, f64 v):
+    push(e, JS_NewFloat64(e^.ctx, v))
+
+void arg_bool(Engine e, bool v):
+    push(e, JS_NewBool(e^.ctx, v))
+
+// The string's bytes, read as UTF-8 and copied into the engine: bytes out
+// of Dado, counted (`counters.dado`).
+void arg_string(Engine e, string8 s):
+    e^.bytes_out += #len(s)
+    push(e, JS_NewStringLen(e^.ctx, cstring(rawptr(s)), #c.size_t(#len(s))))
+
+// ── Calls ───────────────────────────────────────────────────────────────────
+
+// Call the function `module` exports as `function` with the pushed arguments;
+// the answer is read with the `result_` functions.
+!void call(Engine e, Handle module, cstring function):
+    try JSValue f = member(e, module, function, "function")
+    e^.entries += 1
+    settle_lends(&e^.script_lends)
+    [MAX_ARGS]JSValue argv
+    i32 n = take_args(e, &argv)
+    JSValue r = JS_Call(e^.ctx, f, undefined(), n, &argv[0])
+    free_args(e, &argv, n)
+    JS_FreeValue(e^.ctx, f)
+    try settle(e, r)
+
+// Construct `module`'s exported class `class` with the pushed arguments, and
+// hold the object.
+!Handle construct(Engine e, Handle module, cstring class):
+    try JSValue k = member(e, module, class, "class")
+    e^.entries += 1
+    settle_lends(&e^.script_lends)
+    [MAX_ARGS]JSValue argv
+    i32 n = take_args(e, &argv)
+    JSValue r = JS_CallConstructor(e^.ctx, k, n, &argv[0])
+    free_args(e, &argv, n)
+    JS_FreeValue(e^.ctx, k)
+    clear_args(e)
+    if is_exception(r):
+        report(e)
+        fail THREW
+    try Handle h = keep(e, r)
+    return h
+
+// Call `object`'s method `method` with the pushed arguments.
+!void call_method(Engine e, Handle object, cstring method):
+    if object <= 0 || object >= MAX_HANDLES:
+        clear_args(e)
+        say(e, "script: no such value")
+        fail NO_SUCH
+    try call_on(e, e^.handles[object], method)
+
+// Call the method `method` of the object `obj` with the pushed arguments.
+private !void call_on(Engine e, JSValue obj, cstring method):
+    try JSValue f = member_of(e, obj, method, "method")
+    e^.entries += 1
+    settle_lends(&e^.script_lends)
+    [MAX_ARGS]JSValue argv
+    i32 n = take_args(e, &argv)
+    JSValue r = JS_Call(e^.ctx, f, obj, n, &argv[0])
+    free_args(e, &argv, n)
+    JS_FreeValue(e^.ctx, f)
+    try settle(e, r)
+
+// Read the field `field` of the object `obj`: the answer, as a call's is.
+private !void get_on(Engine e, JSValue obj, cstring field):
+    clear_args(e)
+    JSValue v = JS_GetPropertyStr(e^.ctx, obj, field)
+    clear_result(e)
+    if is_exception(v):
+        report(e)
+        fail THREW
+    e^.result = v
+
+// Write the one pushed argument into the field `field` of the object `obj`.
+private !void put_on(Engine e, JSValue obj, cstring field):
+    if e^.args_threw || e^.args_lost || e^.nargs != 1:
+        clear_args(e)
+        say(e, "script: a field is written with exactly one value")
+        fail NO_MEMORY
+    [MAX_ARGS]JSValue argv
+    _ = take_args(e, &argv)
+    clear_result(e)
+    if JS_SetPropertyStr(e^.ctx, obj, field, argv[0]) < 0:
+        report(e)
+        fail THREW
+
+// Let go of a value the engine holds for the caller.
+void release(Engine e, Handle h):
+    if h <= 0 || h >= MAX_HANDLES:
+        return
+    JS_FreeValue(e^.ctx, e^.handles[h])
+    e^.handles[h] = undefined()
+
+// ── Answers ─────────────────────────────────────────────────────────────────
+
+// The last answer as an `int`, from whichever tier holds it.
+!i64 result_i64(Engine e):
+    JSValue r = e^.result
+    i32 tag = i32(r.tag)
+    if tag == JS_TAG_INT:
+        return i64(r.u.int32)
+    if tag == JS_TAG_FLOAT64:
+        f64 d = r.u.float64
+        if d >= 0.0 - SAFE_F && d <= SAFE_F && d == f64(i64(d)):
+            return i64(d)
+    if tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT:
+        i64 v = 0
+        if JS_ToBigInt64(e^.ctx, &v, r) == 0:
+            return v
+        report(e)
+        fail THREW
+    wrong(e, "an int")
+    fail TYPE
+
+!f64 result_f64(Engine e):
+    JSValue r = e^.result
+    i32 tag = i32(r.tag)
+    if tag == JS_TAG_FLOAT64:
+        return r.u.float64
+    if tag == JS_TAG_INT:
+        return f64(r.u.int32)
+    wrong(e, "a float")
+    fail TYPE
+
+!bool result_bool(Engine e):
+    JSValue r = e^.result
+    if i32(r.tag) == JS_TAG_BOOL:
+        return r.u.int32 != 0
+    wrong(e, "a bool")
+    fail TYPE
+
+// The last answer as a string, borrowed: it is valid until the next call and
+// until `destroy`. Its bytes are counted into Dado once, as it is first read.
+!string8 result_string(Engine e):
+    JSValue r = e^.result
+    i32 tag = i32(r.tag)
+    if tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE:
+        wrong(e, "a string")
+        fail TYPE
+    if e^.result_text == nil:
+        #c.size_t n = 0
+        e^.result_text = JS_ToCStringLen2(e^.ctx, &n, r, false)
+        if e^.result_text == nil:
+            report(e)
+            fail THREW
+        e^.result_len = i64(n)
+        e^.bytes_in += i64(n)
+    Chars at = Chars(rawptr(e^.result_text))
+    return string8(at[0..<e^.result_len])
+
+// ── What the verbs lower to ─────────────────────────────────────────────────
+//
+// A program does not call these by name. `#script_vm(alloc)`,
+// `#script_new(vm, Class, ..args)`, `#script_run(c)`, `#delete` and, through
+// an instance's handle, `c.hit(3)`, `c.hp` and `c.hp = 3` are the compiler's
+// verbs, checked against the class the handle is typed by, and the C they
+// emit calls the functions below. A VM is an engine; a handle is eight bytes
+// naming a slot of the process's handle table (`handles.dado`), crossing as a
+// `rawptr` that is never an address: nil is a handle that holds no script.
+// The handle `#script_vm` answers owns the engine and holds no instance; each
+// `#script_new`, and each instance a script hands Dado, is one more handle on
+// the same engine, holding its instance.
+//
+// **A VM belongs to the thread that made it.** Every run, construction,
+// field and reload through a handle on it enters it (`enter`), and one from
+// another thread fails `THREAD`; its stop, pause, resume and queries come
+// from any thread (`stop.dado`). A thread may hold several VMs.
+//
+// **A failure's text is on the error sink before its code arrives**, as
+// everywhere in this package. A call written under `try` answers the code;
+// one written without `try` ends the program with the failure's code
+// (`exit_status`) — or, under `on_error: script.CONTINUE`, answers its zero
+// value (`policy.dado`). `#script_run(c)` is neither: it answers the code a
+// failing `main` would exit with (`run_ready`).
+
+// The status a program ends with when a script fails inside a run no `try`
+// was written around and the failure carries no code of its own: Dado's code
+// for a failure nothing handled.
+const i32 UNTRIED = 70
+
+// What a run through a handle does with the name it is given: call the
+// method, read the field, or write the field with the one pushed argument.
+private const i32 CALL = 0
+private const i32 GET = 1
+private const i32 PUT = 2
+
+// A host's `#script_vm(alloc)`: an engine on `alloc`, every row of `table`
+// registered — the embedded modules, `{name, source}` pairs ended by a row
+// whose name is nil — and `bound`, the Dado functions the scripts call, kept
+// for the loader; nothing loaded yet: `#script_new` loads a class's module
+// the first time it makes one of it. The engine belongs to this thread.
+// Answers the VM's own handle, which holds no instance. Every failure frees
+// what was built.
+!rawptr vm_create((rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc, const rawptr table, const rawptr bound, const rawptr signals):
+    try Engine e = create(alloc) else code:
+        text_begin(loose_err())
+        err_put(loose_err(), "script: no memory for a VM\n")
+        drop_sinks()
+        drop_policy()
+        fail code
+    take_sinks(e)
+    take_policy(e)
+    e^.bound = bound
+    e^.signals = signals
+    i64 at = 0
+    for:
+        Module row = row_of(table, at)
+        if row.name == nil:
+            break
+        try add_module(e, row.name, row.source) else code:
+            destroy(e)
+            fail code
+        at += 1
+    rawptr s = slot_new(e, undefined(), true, nil)
+    if s == nil:
+        destroy(e)
+        fail NO_MEMORY
+    return s
+
+// `#script_vm()`, the allocator omitted: `#heap`, the long-lived root,
+// because a script's state lives as long as its VM.
+!rawptr vm_create_on_heap(const rawptr table, const rawptr bound, const rawptr signals):
+    return vm_create(#heap, table, bound, signals)
+
+// The namespace of the module `name`, loaded into the engine the first time
+// it is asked for — which evaluates it — and the same one after. A module
+// that fails to evaluate fails with its code, its text on the error sink.
+private !Handle module_of(Engine e, cstring name):
+    for i in 0..<e^.nloaded:
+        if string8(e^.loaded[i].name) == string8(name):
+            return e^.loaded[i].ns
+    if e^.nloaded >= MAX_MODULES:
+        say(e, "script: more than 64 modules loaded into one VM")
+        fail NO_MEMORY
+    try Handle m = load(e, name) else code:
+        fail script_code(e, code)
+    e^.loaded[e^.nloaded] = (name, m)
+    e^.nloaded += 1
+    return m
+
+// `#delete(s)`: on a VM's own handle, the engine and everything in its
+// heap — a run in progress on another thread forced first (`finish`) — and
+// then the engine's state, which makes every handle on it stale; on any other
+// handle, Dado's hold on its instance alone, which makes every copy of that
+// handle stale. A nil or stale handle does nothing, so deleting a copy of a
+// handle already deleted is harmless.
+//
+// **From inside the engine's own run** — a Dado function the script called
+// deleting the handle — nothing the run is standing on can go yet: on the
+// VM's own handle the run is forced, as `#script_stop(vm, 0)` from inside
+// forces it, and the engine and its state are freed when the outermost run
+// leaves (`leave`); on an instance's handle, the counted reference is let go
+// of then too, since the run may be inside one of its methods. The same holds
+// for a run another thread is in.
+void close(rawptr s):
+    Slot at
+    if !slot_read(s, &at):
+        return
+    Engine e = at.engine
+    if at.owner:
+        finish(e, 0)
+        if delete_on_exit(e):
+            return
+        destroy(e)
+        return
+    hold_lock(e)
+    if slot_take(s, &at) && !e^.stop.ended:
+        if e^.stop.running == 0:
+            JS_FreeValue(e^.ctx, at.value)
+        else:
+            release_later(e, at.value)
+    drop_lock(e)
+
+// `#script_new(vm, Class, ..args)` under `try`: an instance of `class`,
+// exported by `module`, in the VM — the module loaded the first time — made
+// with the pushed arguments, which runs its `init`, and a handle holding it.
+!rawptr new_instance(rawptr vm, cstring module, cstring class):
+    try Engine e = entering_new(vm, module)
+    try Handle o = constructing(e, module, class) else code:
+        fail leaving(e, code)
+    rawptr h = hold_object(e, o, class)
+    if h == nil:
+        fail leaving(e, NO_MEMORY)
+    leave(e)
+    return h
+
+// `#script_new` with no `try` around it: a failure ends the program with the
+// failure's code (`exit_status`), as an untried member call's does, after
+// the error sink has the script's text and one line saying which
+// construction failed — `label` is `Class.init`. A stop is not a failure: it
+// answers nil, a handle holding no script.
+rawptr new_instance_or_quit(rawptr vm, cstring module, cstring class, cstring label):
+    try rawptr h = new_instance(vm, module, class) else code:
+        if code == STOPPED || goes_on(vm, label, "#script_new", code):
+            return nil
+        end_program(exit_status(code))
+        return nil
+    return h
+
+// `class` of the loaded `module`, constructed in the entered engine with the
+// pushed arguments; a failure's code a verb's.
+private !Handle constructing(Engine e, cstring module, cstring class):
+    try Handle m = module_of(e, module) else code:
+        clear_args(e)
+        fail code
+    try Handle o = construct(e, m, class) else code:
+        fail script_code(e, code)
+    return o
+
+// `#script_run(c)`: the instance's `ready`, with `main`'s rules — blocking,
+// never failable, and answering a status: `ready`'s `int` as it is when
+// `answers` (it returns one), 0 when it returns nothing, and for a failure
+// escaping it the code an untried failing `main` exits with
+// (`exit_status`: the code's low eight bits, 70 when those are 0) — its text
+// already on the error sink. A stop, a busy VM, a stale handle and a run from
+// another thread answer the same way, by their reserved codes' low bits.
+i64 run_ready(rawptr s, bool answers):
+    if answers:
+        try i64 v = run_int(s, READY) else code:
+            return i64(exit_status(code))
+        return v
+    try run(s, READY) else code:
+        return i64(exit_status(code))
+    return 0
+
+// The entry `#script_run(c)` runs.
+private const cstring READY = "ready"
+
+// The next `run`'s arguments, pushed in order, each as its DadoScript type: `int`
+// in its canonical tier, `float`, `bool`, a `string` copied in from the
+// bytes, read as UTF-8, and an instance by its handle. They wait on this
+// thread, beside no engine, until the run that follows them has entered its
+// engine: a push touches no engine, so one made for an engine another thread
+// is running races nothing, and the run answers `BUSY`. A string is borrowed
+// until then, which is the end of the statement that pushed it.
+void push_int(rawptr s, i64 v):
+    pend(1, v, 0.0, "")
+
+void push_float(rawptr s, f64 v):
+    pend(2, 0, v, "")
+
+void push_bool(rawptr s, bool v):
+    i64 n = 0
+    if v:
+        n = 1
+    pend(3, n, 0.0, "")
+
+void push_string(rawptr s, string8 v):
+    pend(4, 0, 0.0, v)
+
+// An instance, by its handle: the run checks it once it has entered — a
+// stale handle fails `STALE`, and one of another VM `OTHER_VM` — and hands
+// the script the instance itself.
+void push_instance(rawptr s, rawptr v):
+    pend(5, i64(bits_of(v)), 0.0, "")
+
+// A member call `g.entry(…)` under `try` (and `#script_run(c)`, `ready`):
+// the method `entry` of the instance the handle holds, called with the pushed
+// arguments, and its answer read as the entry's return type says. The
+// compiler checked the name, the arity and every argument against the class,
+// so a failure here is the script's own — a throw, which fails with the
+// `Error`'s code (`fail 16` in the script is 16 here, a fault 70) — or a
+// handle that holds no instance, or the engine's: `STOPPED` and `BUSY`
+// (`stop.dado`).
+!void run(rawptr s, cstring entry):
+    try Engine e = performing(s, entry, CALL)
+    leave(e)
+
+!i64 run_int(rawptr s, cstring entry):
+    try i64 v = int_of(s, entry, CALL)
+    return v
+
+!f64 run_float(rawptr s, cstring entry):
+    try f64 v = float_of(s, entry, CALL)
+    return v
+
+!bool run_bool(rawptr s, cstring entry):
+    try bool v = bool_of(s, entry, CALL)
+    return v
+
+// A `string` answer is a create verb's: a copy of the engine's string, on the
+// ambient allocator of the program that asked, which owns it and ends it with
+// `#delete`.
+!ref([]char8) run_string(rawptr s, cstring entry):
+    try ref([]char8) v = string_of(s, entry, CALL)
+    return v
+
+// An instance answered: the handle Dado holds it by — the one it already has
+// when it crossed before (`adopt`), so one object is one handle.
+!rawptr run_instance(rawptr s, cstring entry, cstring class):
+    try rawptr v = instance_of(s, entry, CALL, class)
+    return v
+
+// `g.field`, read: the field of the instance the handle holds, read as its
+// declared type says. A field holding a value of another type fails `TYPE`.
+!i64 get_int(rawptr s, cstring field):
+    try i64 v = int_of(s, field, GET)
+    return v
+
+!f64 get_float(rawptr s, cstring field):
+    try f64 v = float_of(s, field, GET)
+    return v
+
+!bool get_bool(rawptr s, cstring field):
+    try bool v = bool_of(s, field, GET)
+    return v
+
+!ref([]char8) get_string(rawptr s, cstring field):
+    try ref([]char8) v = string_of(s, field, GET)
+    return v
+
+!rawptr get_instance(rawptr s, cstring field, cstring class):
+    try rawptr v = instance_of(s, field, GET, class)
+    return v
+
+// `g.field = v`: the one pushed argument written into the field.
+!void put_field(rawptr s, cstring field):
+    try Engine e = performing(s, field, PUT)
+    leave(e)
+
+private !i64 int_of(rawptr s, cstring name, i32 op):
+    try Engine e = performing(s, name, op)
+    try i64 v = result_i64(e) else code:
+        fail leaving(e, script_code(e, code))
+    leave(e)
+    return v
+
+private !f64 float_of(rawptr s, cstring name, i32 op):
+    try Engine e = performing(s, name, op)
+    try f64 v = result_f64(e) else code:
+        fail leaving(e, script_code(e, code))
+    leave(e)
+    return v
+
+private !bool bool_of(rawptr s, cstring name, i32 op):
+    try Engine e = performing(s, name, op)
+    try bool v = result_bool(e) else code:
+        fail leaving(e, script_code(e, code))
+    leave(e)
+    return v
+
+private !ref([]char8) string_of(rawptr s, cstring name, i32 op):
+    try Engine e = performing(s, name, op)
+    try string8 text = result_string(e) else code:
+        fail leaving(e, script_code(e, code))
+    ref([]char8) out = #make([]char8, #len(text))
+    if out == nil:
+        fail leaving(e, NO_MEMORY)
+    for i in 0..<#len(text):
+        out[i] = text[i]
+    leave(e)
+    return out
+
+private !rawptr instance_of(rawptr s, cstring name, i32 op, cstring class):
+    try Engine e = performing(s, name, op)
+    try rawptr v = result_instance(e, class) else code:
+        fail leaving(e, script_code(e, code))
+    leave(e)
+    return v
+
+// A member call with no `try` around it: the same calls, and a failure ends
+// the program with the failure's code (`exit_status`), after the error sink
+// has the script's text and one line saying which entry failed — unless the
+// script was loaded with `on_error: script.CONTINUE` (`policy.dado`), when it
+// answers the zero value of its type and the program goes on. **A stop is
+// not a failure**: the host decided it, so a run it stopped — or one through
+// a handle on the engine it ended — answers the zero value of its type and
+// the program goes on. A method called through a handle, `g.hit(3)`, is the
+// same run, and so is a field read or written (`verb` says which, for the
+// last line).
+void run_or_quit(rawptr s, cstring entry):
+    try run(s, entry) else code:
+        if code == STOPPED || goes_on(s, entry, CALL_VERB, code):
+            return
+        end_program(exit_status(code))
+        return
+
+i64 run_int_or_quit(rawptr s, cstring entry):
+    try i64 v = run_int(s, entry) else code:
+        if code == STOPPED || goes_on(s, entry, CALL_VERB, code):
+            return 0
+        end_program(exit_status(code))
+        return 0
+    return v
+
+f64 run_float_or_quit(rawptr s, cstring entry):
+    try f64 v = run_float(s, entry) else code:
+        if code == STOPPED || goes_on(s, entry, CALL_VERB, code):
+            return 0.0
+        end_program(exit_status(code))
+        return 0.0
+    return v
+
+bool run_bool_or_quit(rawptr s, cstring entry):
+    try bool v = run_bool(s, entry) else code:
+        if code == STOPPED || goes_on(s, entry, CALL_VERB, code):
+            return false
+        end_program(exit_status(code))
+        return false
+    return v
+
+// A stopped run's empty string is still the caller's to `#delete`.
+ref([]char8) run_string_or_quit(rawptr s, cstring entry):
+    try ref([]char8) v = run_string(s, entry) else code:
+        if code == STOPPED || goes_on(s, entry, CALL_VERB, code):
+            return empty_string()
+        end_program(exit_status(code))
+        return empty_string()
+    return v
+
+// A stopped run's instance is nil, a handle that holds no script.
+rawptr run_instance_or_quit(rawptr s, cstring entry, cstring class):
+    try rawptr v = run_instance(s, entry, class) else code:
+        if code == STOPPED || goes_on(s, entry, CALL_VERB, code):
+            return nil
+        end_program(exit_status(code))
+        return nil
+    return v
+
+// A field read is never under `try`: these are the only reads there are.
+i64 get_int_or_quit(rawptr s, cstring field):
+    try i64 v = get_int(s, field) else code:
+        if code == STOPPED || goes_on(s, field, FIELD, code):
+            return 0
+        end_program(exit_status(code))
+        return 0
+    return v
+
+f64 get_float_or_quit(rawptr s, cstring field):
+    try f64 v = get_float(s, field) else code:
+        if code == STOPPED || goes_on(s, field, FIELD, code):
+            return 0.0
+        end_program(exit_status(code))
+        return 0.0
+    return v
+
+bool get_bool_or_quit(rawptr s, cstring field):
+    try bool v = get_bool(s, field) else code:
+        if code == STOPPED || goes_on(s, field, FIELD, code):
+            return false
+        end_program(exit_status(code))
+        return false
+    return v
+
+ref([]char8) get_string_or_quit(rawptr s, cstring field):
+    try ref([]char8) v = get_string(s, field) else code:
+        if code == STOPPED || goes_on(s, field, FIELD, code):
+            return empty_string()
+        end_program(exit_status(code))
+        return empty_string()
+    return v
+
+rawptr get_instance_or_quit(rawptr s, cstring field, cstring class):
+    try rawptr v = get_instance(s, field, class) else code:
+        if code == STOPPED || goes_on(s, field, FIELD, code):
+            return nil
+        end_program(exit_status(code))
+        return nil
+    return v
+
+void put_or_quit(rawptr s, cstring field):
+    try put_field(s, field) else code:
+        if code == STOPPED || goes_on(s, field, FIELD, code):
+            return
+        end_program(exit_status(code))
+        return
+
+// What an untried field read or write names as its verb, for its last line.
+private const cstring FIELD = "field"
+
+// What an untried member call names as its verb, for its last line.
+private const cstring CALL_VERB = "call"
+
+private ref([]char8) empty_string():
+    ref([]char8) none = #make([]char8, 0)
+    if none == nil:
+        end_program(exit_status(NO_MEMORY))
+        return nil
+    return none
+
+// A run through the handle `s`: entered, its arguments made, and `op` done on
+// the instance — the method called, the field read or written — with the
+// answer left for the reader; the engine stays entered for it. A failure
+// has left.
+private !Engine performing(rawptr s, cstring name, i32 op):
+    JSValue obj
+    try Engine e = entering(s, &obj)
+    i32 got = 0
+    if op == CALL:
+        try call_on(e, obj, name) else code:
+            got = code
+    else if op == GET:
+        try get_on(e, obj, name) else code:
+            got = code
+    else:
+        try put_on(e, obj, name) else code:
+            got = code
+    if got != 0:
+        fail leaving(e, script_code(e, got))
+    return e
+
+// The engine a run through `s` goes through, entered and holding its
+// arguments, with the instance the handle holds in `obj` — borrowed while the
+// run is entered, since nothing releases a value while a run is — or a
+// failure having said why there is none: a nil or stale handle, an engine
+// loaded with no instance, or one stopped or busy.
+private !Engine entering(rawptr s, ^JSValue obj):
+    Slot at
+    if !slot_read(s, &at):
+        no_script(s)
+        drop_pending()
+        fail STALE
+    Engine e = at.engine
+    try enter(e) else code:
+        drop_pending()
+        fail code
+    take_sinks(e)
+    // Read again now that the run is counted: a `#delete` on another thread
+    // before it may have let the instance go, and none can after it.
+    if !slot_read(s, &at):
+        no_script(s)
+        drop_pending()
+        fail leaving(e, STALE)
+    if i32(at.value.tag) != JS_TAG_OBJECT:
+        no_instance(e)
+        drop_pending()
+        fail leaving(e, STALE)
+    obj^ = at.value
+    try take_pending(e) else code:
+        fail leaving(e, code)
+    return e
+
+// The VM a construction goes through, entered, the module `module` loaded
+// into it, and holding its arguments — made only once the module is there,
+// since loading it runs the engine's jobs — or a failure having said why
+// there is none.
+private !Engine entering_new(rawptr vm, cstring module):
+    Slot at
+    if !slot_read(vm, &at):
+        no_script(vm)
+        drop_pending()
+        fail STALE
+    Engine e = at.engine
+    try enter(e) else code:
+        drop_pending()
+        fail code
+    take_sinks(e)
+    if !slot_read(vm, &at):
+        no_script(vm)
+        drop_pending()
+        fail leaving(e, STALE)
+    try _ = module_of(e, module) else code:
+        drop_pending()
+        fail leaving(e, code)
+    try take_pending(e) else code:
+        fail leaving(e, code)
+    return e
+
+// One argument waiting for its run: a kind (1 `int`, 2 `float`, 3 `bool`,
+// 4 `string`, 5 an instance's handle) and its value.
+private type Pending: (i32 kind, i64 whole, f64 real, string8 text)
+
+private @thread_local [MAX_ARGS]Pending g_pending
+private @thread_local i32 g_npending
+private @thread_local bool g_pending_lost
+
+private void pend(i32 kind, i64 whole, f64 real, string8 text):
+    if g_npending >= MAX_ARGS:
+        g_pending_lost = true
+        return
+    g_pending[g_npending] = (kind, whole, real, text)
+    g_npending += 1
+
+private void drop_pending():
+    g_npending = 0
+    g_pending_lost = false
+    drop_sinks()
+
+// The waiting arguments, made in the engine this thread has entered. An
+// instance's handle that is stale, or holds an instance of another engine,
+// fails the run before anything is called.
+private !void take_pending(Engine e):
+    bool lost = g_pending_lost
+    i32 refused = 0
+    for i in 0..<g_npending:
+        Pending p = g_pending[i]
+        if p.kind == 1:
+            arg_i64(e, p.whole)
+        else if p.kind == 2:
+            arg_f64(e, p.real)
+        else if p.kind == 3:
+            arg_bool(e, p.whole != 0)
+        else if p.kind == 4:
+            arg_string(e, p.text)
+        else if refused == 0:
+            refused = arg_instance(e, as_handle(u64(p.whole)), i32(i) + 1)
+    drop_pending()
+    if refused != 0:
+        clear_args(e)
+        fail refused
+    if lost:
+        clear_args(e)
+        say(e, "script: a call was given more than 16 arguments")
+        fail NO_MEMORY
+
+// The instance `h` holds, pushed as argument `n` (counted from 1), or the
+// code that refuses it, having said why: `STALE` for a handle that holds no
+// script, `OTHER_VM` for an instance another VM holds — a script reaches only
+// the objects of its own VM.
+private i32 arg_instance(Engine e, rawptr h, i32 n):
+    Slot at
+    if !slot_read(h, &at) || i32(at.value.tag) != JS_TAG_OBJECT:
+        text_begin(e^.err)
+        err_put(e^.err, "script: argument ")
+        err_status(e^.err, n)
+        err_put(e^.err, " is a handle that holds no instance: it was never one, or `#delete` ended it or the engine it was made in\n")
+        return STALE
+    if !on_vm(at, e):
+        text_begin(e^.err)
+        err_put(e^.err, "script: argument ")
+        err_status(e^.err, n)
+        err_put(e^.err, " is an instance of another VM: an instance lives in the VM that made it, and a script reaches only its own VM's — pass it to a call on an instance of its own VM, or pass its values\n")
+        return OTHER_VM
+    push(e, JS_DupValue(e^.ctx, at.value))
+    return 0
+
+// ── What the glue calls ─────────────────────────────────────────────────────
+//
+// A script calls a Dado function through a thunk the compiler writes per
+// function a reached script calls: a C function of the engine's own shape,
+// exported from the native module `dado:<package>` (see the loader below).
+// The thunk reads each argument with a `take_` function, by its value tag and
+// never by coercion — a value of the wrong type throws `TypeError` naming the
+// function and the parameter, where JavaScript's own conversions would have
+// made `"3"` a 3 — narrows it as Dado's written conversion does, calls the Dado
+// function, and answers with a `give_` function. A failable Dado function's
+// code becomes a thrown error carrying it (`failed`). A program does not call
+// these by name.
+
+// Argument `i` as an `int`, from whichever of its three tiers holds it.
+!i64 take_int(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    JSValue v = nth(argv, i)
+    i32 tag = i32(v.tag)
+    if tag == JS_TAG_INT:
+        return i64(v.u.int32)
+    if tag == JS_TAG_FLOAT64:
+        f64 d = v.u.float64
+        if d >= 0.0 - SAFE_F && d <= SAFE_F && d == f64(i64(d)):
+            return i64(d)
+    if tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT:
+        i64 out = 0
+        if JS_ToBigInt64(ctx, &out, v) == 0:
+            return out
+        fail THREW
+    mistyped(ctx, v, function, param, "an int")
+    fail TYPE
+
+// Argument `i` as a `float`; an `int` in any tier is read as the nearest
+// double, which is what a Dado `f64` parameter given a script's `int` holds.
+!f64 take_float(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    JSValue v = nth(argv, i)
+    i32 tag = i32(v.tag)
+    if tag == JS_TAG_FLOAT64:
+        return v.u.float64
+    if tag == JS_TAG_INT:
+        return f64(v.u.int32)
+    if tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT:
+        i64 out = 0
+        if JS_ToBigInt64(ctx, &out, v) == 0:
+            return f64(out)
+        fail THREW
+    mistyped(ctx, v, function, param, "a float")
+    fail TYPE
+
+!bool take_bool(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    JSValue v = nth(argv, i)
+    if i32(v.tag) == JS_TAG_BOOL:
+        return v.u.int32 != 0
+    mistyped(ctx, v, function, param, "a bool")
+    fail TYPE
+
+// Argument `i` as a `string8`: the engine's UTF-8 copy, borrowed until
+// `drop_string` gives it back, which the thunk does once the call is over.
+!string8 take_string(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    JSValue v = nth(argv, i)
+    i32 tag = i32(v.tag)
+    if tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE:
+        mistyped(ctx, v, function, param, "a string")
+        fail TYPE
+    #c.size_t n = 0
+    ^const #c.char text = JS_ToCStringLen2(ctx, &n, v, false)
+    if text == nil:
+        fail THREW
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    e^.bytes_in += i64(n)
+    Chars at = Chars(rawptr(text))
+    return string8(at[0..<i64(n)])
+
+void drop_string(^JSContext ctx, string8 s):
+    JS_FreeCString(ctx, cstring(rawptr(s)))
+
+// Argument `i` as a `char32`: a string of exactly one code point, which is
+// how a Dado character reaches a script. Any other string throws `Error`.
+!char32 take_char32(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    try string8 s = take_string(ctx, argv, i, function, param)
+    u32 c = one_code_point(s)
+    drop_string(ctx, s)
+    if c == NOT_ONE:
+        _ = JS_ThrowPlainError(ctx, "`%s`'s parameter `%s` is a character, which takes a string of exactly one code point", function, param)
+        fail TYPE
+    return char32(c)
+
+// Argument `i` as a `char16`: a string of exactly one UTF-16 code unit —
+// JavaScript's own character, a lone surrogate included. Any other string
+// throws `Error`. (A `char8` is a byte, read as an `int` by `take_int`.)
+!char16 take_char16(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    JSValue v = nth(argv, i)
+    i32 tag = i32(v.tag)
+    if tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE:
+        mistyped(ctx, v, function, param, "a string")
+        fail TYPE
+    #c.size_t n = 0
+    ^const u16 units = JS_ToCStringLenUTF16(ctx, &n, v)
+    if units == nil:
+        fail THREW
+    u16 unit = 0
+    if n == 1:
+        unit = units^
+    JS_FreeCStringUTF16(ctx, units)
+    if n != 1:
+        _ = JS_ThrowPlainError(ctx, "`%s`'s parameter `%s` is a `char16`, which takes a string of exactly one UTF-16 code unit, and this one has %d", function, param, i32(n))
+        fail TYPE
+    return char16(unit)
+
+// An `int`, in the smallest canonical tier that holds it.
+JSValue give_int(^JSContext ctx, i64 v):
+    return tier(ctx, v)
+
+JSValue give_float(^JSContext ctx, f64 v):
+    return JS_NewFloat64(ctx, v)
+
+JSValue give_bool(^JSContext ctx, bool v):
+    return JS_NewBool(ctx, v)
+
+// A copy of `s`'s bytes, read as UTF-8: the Dado function's string may be
+// gone once the thunk returns.
+JSValue give_string(^JSContext ctx, string8 s):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    e^.bytes_out += #len(s)
+    return JS_NewStringLen(ctx, cstring(rawptr(s)), #c.size_t(#len(s)))
+
+// A Dado function's new string, copied into the engine and then ended on the
+// ambient allocator it was made on: the script holds the copy, and the Dado
+// allocation does not outlive the call.
+JSValue give_owned_string(^JSContext ctx, ref([]char8) s):
+    string8 text = string8(s[0..<#len(s)])
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    e^.bytes_out += #len(text)
+    JSValue v = JS_NewStringLen(ctx, cstring(rawptr(text)), #c.size_t(#len(text)))
+    #delete(s)
+    return v
+
+// A character as a one-code-point string. A value that is no Unicode scalar
+// value — a surrogate, or past U+10FFFF — arrives as U+FFFD, the replacement
+// character, as a decoder writes one.
+JSValue give_char32(^JSContext ctx, char32 c):
+    u32 v = u32(c)
+    if (v >= 0xD800 && v <= 0xDFFF) || v > 0x10FFFF:
+        v = 0xFFFD
+    [4]char8 buf
+    i64 n = 0
+    if v < 0x80:
+        buf[0] = char8(v)
+        n = 1
+    else if v < 0x800:
+        buf[0] = char8(0xC0 | (v >> 6))
+        buf[1] = char8(0x80 | (v & 0x3F))
+        n = 2
+    else if v < 0x10000:
+        buf[0] = char8(0xE0 | (v >> 12))
+        buf[1] = char8(0x80 | ((v >> 6) & 0x3F))
+        buf[2] = char8(0x80 | (v & 0x3F))
+        n = 3
+    else:
+        buf[0] = char8(0xF0 | (v >> 18))
+        buf[1] = char8(0x80 | ((v >> 12) & 0x3F))
+        buf[2] = char8(0x80 | ((v >> 6) & 0x3F))
+        buf[3] = char8(0x80 | (v & 0x3F))
+        n = 4
+    return JS_NewStringLen(ctx, cstring(rawptr(&buf)), #c.size_t(n))
+
+// A `char16` as a string of that one UTF-16 code unit, a lone surrogate
+// included: JavaScript holds one as it is.
+JSValue give_char16(^JSContext ctx, char16 c):
+    u16 unit = u16(c)
+    return JS_NewStringUTF16(ctx, &unit, 1)
+
+// Argument `i` as an instance: the handle Dado holds it by (`adopt`), one
+// handle per object, which Dado owns from here until its `#delete` — `class`
+// what the Dado parameter types it as. Anything but an object throws.
+!rawptr take_instance(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param, cstring class):
+    JSValue v = nth(argv, i)
+    if i32(v.tag) != JS_TAG_OBJECT:
+        mistyped(ctx, v, function, param, "an instance")
+        fail TYPE
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    rawptr h = adopt(e, v, class)
+    if h == nil:
+        _ = JS_ThrowOutOfMemory(ctx)
+        fail NO_MEMORY
+    return h
+
+// A Dado function's handle answered to the script: the instance itself. A
+// handle that holds no instance throws `Error` with code `STALE`, and one of
+// another VM's instances `Error` with code `OTHER_VM`: a script reaches only
+// its own VM's objects.
+JSValue give_instance(^JSContext ctx, cstring function, rawptr h):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    Slot at
+    if !slot_read(h, &at) || i32(at.value.tag) != JS_TAG_OBJECT:
+        return raise_code(ctx, STALE, "`%s` answered a handle that holds no instance: it was never one, or `#delete` ended it or the engine it was made in", function)
+    if !on_vm(at, e):
+        return raise_code(ctx, OTHER_VM, "`%s` answered an instance of another VM: an instance lives in the VM that made it, and a script reaches only its own VM's", function)
+    return JS_DupValue(ctx, at.value)
+
+// An `Error` carrying `code`, thrown: its message `fmt`, naming `function`.
+private JSValue raise_code(^JSContext ctx, i32 code, cstring fmt, cstring function):
+    _ = JS_ThrowPlainError(ctx, fmt, function)
+    JSValue ex = JS_GetException(ctx)
+    _ = JS_SetPropertyStr(ctx, ex, "code", JS_NewInt32(ctx, code))
+    _ = JS_Throw(ctx, ex)
+    return raised()
+
+// What a thunk of a Dado function returning nothing answers.
+JSValue give_nothing():
+    return undefined()
+
+// What a thunk answers once an exception is pending: the engine's
+// exception marker, which makes the script's call throw it.
+JSValue raised():
+    JSValue v
+    v.tag = i64(JS_TAG_EXCEPTION)
+    return v
+
+// A failable Dado function's failure, thrown into the script as an `Error`
+// whose message names the function and the code, and whose `code` is the
+// code.
+JSValue failed(^JSContext ctx, cstring function, i32 code):
+    _ = JS_ThrowPlainError(ctx, "`%s` failed with code %d", function, code)
+    JSValue ex = JS_GetException(ctx)
+    _ = JS_SetPropertyStr(ctx, ex, "code", JS_NewInt32(ctx, code))
+    return JS_Throw(ctx, ex)
+
+// ── Containers: what the generated readers and writers call ─────────────────
+//
+// A Dado slice, array or tuple crosses as a JavaScript `Array` — a DadoScript `[]T`
+// or a DadoScript tuple, which a script holds as an `Array` too — **by copy, for the
+// call**. The compiler writes one reader and one writer per distinct Dado type
+// that crosses, shared by every call that crosses it, and each reads or builds
+// its elements through the functions below: every tag read and every value
+// made is this package's, as for scalars. A reader answers 0, or a nonzero
+// code with a `TypeError` pending in the engine; the path of indices it
+// walked (`at [2][0]`) is the generated code's, handed down so the error names
+// the element.
+//
+// **The lend lock.** A structure lent across is locked for its call: written
+// while the call runs, by code the call reached back into, it raises. The
+// check costs nothing unless the call reached back. A lend is a `Lend` the
+// generated glue keeps on its stack and hands this package (`lend_script`,
+// `lend_host`) for the length of the call; the first time the call reaches
+// back — this package entering the engine again (`call`, `call_method`,
+// `construct`) for a script's structure a thunk lent Dado, a thunk running
+// (`thunk_entered`) for Dado's structure a run lent the script — every lend
+// still waiting is handed to its own `settle`, which fingerprints the
+// structure as it was lent. Only a settled lend is compared when the call
+// returns: a thunk reads the script's array again and throws `Error`
+// (`lent_written`) when its fingerprint moved; a run fingerprints the Dado
+// value again and fails `LENT` (`lent_changed`). What Dado does to its own
+// copy of an argument is not a write of the script's structure, so the
+// fingerprint is of the structure lent, never of the copy. The two counters,
+// `entries` and `thunks`, count the same events.
+
+// The thunk side's counter: a thunk of a bound Dado function is running, so
+// every structure a run lent the script is fingerprinted before Dado runs.
+void thunk_entered(^JSContext ctx):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    e^.thunks += 1
+    e^.parking.active += 1
+    settle_lends(&e^.host_lends)
+
+// A lend waiting for its fingerprint: the generated glue's frame begins with
+// these two, and `settle` fingerprints the rest of it.
+type Lend: (void(rawptr) settle, rawptr next)
+
+// A thunk lending Dado a script's structure for the call: `lend` goes on the
+// engine's list; answers the list as it was, for `unlend_script`.
+rawptr lend_script(^JSContext ctx, rawptr lend):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    rawptr was = e^.script_lends
+    ^Lend l = ^Lend(lend)
+    l^.next = was
+    e^.script_lends = lend
+    return was
+
+// The call returned: a lend still waiting is taken off, and one settled is
+// gone already.
+void unlend_script(^JSContext ctx, rawptr was):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    if e^.script_lends != nil:
+        e^.script_lends = was
+
+// A run lending the script a Dado structure: as `lend_script`, on the engine
+// the run has entered (`begin_run`).
+rawptr lend_host(^JSContext ctx, rawptr lend):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    rawptr was = e^.host_lends
+    ^Lend l = ^Lend(lend)
+    l^.next = was
+    e^.host_lends = lend
+    hold(1)
+    return was
+
+void unlend_host(^JSContext ctx, rawptr was):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    hold(-1)
+    if e^.host_lends != nil:
+        e^.host_lends = was
+
+// Give back an error a fingerprint's reading left pending: a lend whose
+// structure cannot be read as it was lent is left unsettled, and unchecked.
+void clear_exception(^JSContext ctx):
+    JS_FreeValue(ctx, JS_GetException(ctx))
+
+// What a thunk throws when a script's structure it lent Dado was written
+// while the call ran.
+JSValue lent_written(^JSContext ctx, cstring function, cstring param):
+    _ = JS_ThrowPlainError(ctx, "the value passed as `%s`'s parameter `%s` was written while it was lent for the call: a structure lent across is locked until the call returns, so don't write it from code that `%s` calls back into, or pass a copy (`.copy()`)", function, param, function)
+    return raised()
+
+// What a run says when a Dado structure it lent the script was written during
+// the run by a Dado function the script called back into, on the error sink
+// and as the failure's text; answers `LENT`. Called while the run is still
+// entered; `label` is the method, `Class.entry`.
+i32 lent_changed(^JSContext ctx, cstring label, cstring structure):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    text_begin(e^.err)
+    err_put(e^.err, "script: `")
+    err_put(e^.err, string8(label))
+    err_put(e^.err, "` was lent `")
+    err_put(e^.err, string8(structure))
+    err_put(e^.err, "`, and a Dado function the script called back into wrote it during the run: a structure lent across is locked for its call, so don't write it from a Dado function the script calls, or pass the script a copy\n")
+    return LENT
+
+// `v` as an `int`, wherever in an argument or an answer it is: `what` names
+// the parameter or the answer, and the first `depth` entries of `path` the
+// element.
+!i64 read_int(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    i32 tag = i32(v.tag)
+    if tag == JS_TAG_INT:
+        return i64(v.u.int32)
+    if tag == JS_TAG_FLOAT64:
+        f64 d = v.u.float64
+        if d >= 0.0 - SAFE_F && d <= SAFE_F && d == f64(i64(d)):
+            return i64(d)
+    if tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT:
+        i64 out = 0
+        if JS_ToBigInt64(ctx, &out, v) == 0:
+            return out
+        fail THREW
+    mistyped_at(ctx, v, function, what, path, depth, "an int")
+    fail TYPE
+
+!f64 read_float(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    i32 tag = i32(v.tag)
+    if tag == JS_TAG_FLOAT64:
+        return v.u.float64
+    if tag == JS_TAG_INT:
+        return f64(v.u.int32)
+    if tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT:
+        i64 out = 0
+        if JS_ToBigInt64(ctx, &out, v) == 0:
+            return f64(out)
+        fail THREW
+    mistyped_at(ctx, v, function, what, path, depth, "a float")
+    fail TYPE
+
+!bool read_bool(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    if i32(v.tag) == JS_TAG_BOOL:
+        return v.u.int32 != 0
+    mistyped_at(ctx, v, function, what, path, depth, "a bool")
+    fail TYPE
+
+// `v` as a `string8`: the engine's UTF-8 copy, borrowed until `drop_string`;
+// its bytes counted into Dado.
+!string8 read_string(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    i32 tag = i32(v.tag)
+    if tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE:
+        mistyped_at(ctx, v, function, what, path, depth, "a string")
+        fail TYPE
+    #c.size_t n = 0
+    ^const #c.char text = JS_ToCStringLen2(ctx, &n, v, false)
+    if text == nil:
+        fail THREW
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    e^.bytes_in += i64(n)
+    Chars at = Chars(rawptr(text))
+    return string8(at[0..<i64(n)])
+
+// `v` as a new string a Dado host owns: a copy on the ambient allocator.
+!ref([]char8) read_owned_string(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    try string8 text = read_string(ctx, v, function, what, path, depth)
+    ref([]char8) out = #make([]char8, #len(text))
+    if out == nil:
+        drop_string(ctx, text)
+        _ = JS_ThrowOutOfMemory(ctx)
+        fail NO_MEMORY
+    for i in 0..<#len(text):
+        out[i] = text[i]
+    drop_string(ctx, text)
+    return out
+
+// `v` as a `char32`: a string of exactly one code point.
+!char32 read_char32(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    try string8 s = read_string(ctx, v, function, what, path, depth)
+    u32 c = one_code_point(s)
+    drop_string(ctx, s)
+    if c == NOT_ONE:
+        mistyped_at(ctx, v, function, what, path, depth, "a string of exactly one code point")
+        fail TYPE
+    return char32(c)
+
+// `v` as a `char16`: a string of exactly one UTF-16 code unit.
+!char16 read_char16(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    i32 tag = i32(v.tag)
+    if tag != JS_TAG_STRING && tag != JS_TAG_STRING_ROPE:
+        mistyped_at(ctx, v, function, what, path, depth, "a string")
+        fail TYPE
+    #c.size_t n = 0
+    ^const u16 units = JS_ToCStringLenUTF16(ctx, &n, v)
+    if units == nil:
+        fail THREW
+    u16 unit = 0
+    if n == 1:
+        unit = units^
+    JS_FreeCStringUTF16(ctx, units)
+    if n != 1:
+        mistyped_at(ctx, v, function, what, path, depth, "a string of exactly one UTF-16 code unit")
+        fail TYPE
+    return char16(unit)
+
+// How many elements the array `v` holds; anything but an array throws.
+!i64 read_length(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth):
+    if !JS_IsArray(v):
+        mistyped_at(ctx, v, function, what, path, depth, "an array")
+        fail TYPE
+    i64 n = 0
+    if JS_GetLength(ctx, v, &n) < 0:
+        fail THREW
+    return n
+
+// That `v` is an array of exactly `n` elements — a Dado `[N]T` or tuple takes
+// no more and no fewer, and nothing is padded or cut.
+!void read_exactly(^JSContext ctx, JSValue v, i64 n, cstring function, cstring what, ^i64 path, i32 depth):
+    try i64 got = read_length(ctx, v, function, what, path, depth)
+    if got != n:
+        [128]char8 text
+        where_into(&text, path, depth)
+        _ = JS_ThrowTypeError(ctx, "`%s`'s %s%s takes an array of exactly %d elements, and was given one of %d", function, what, cstring(rawptr(&text)), i32(n), i32(got))
+        fail TYPE
+
+// Element `i` of the array `v`, held until `free_value` lets go of it.
+!JSValue element(^JSContext ctx, JSValue v, i64 i):
+    JSValue e = JS_GetPropertyInt64(ctx, v, i)
+    if is_exception(e):
+        fail THREW
+    return e
+
+void free_value(^JSContext ctx, JSValue v):
+    JS_FreeValue(ctx, v)
+
+// A block for the call, zeroed, on the engine's allocator; `unscratch` gives
+// it back. A refusal throws.
+!rawptr scratch(^JSContext ctx, u64 bytes):
+    if bytes == 0:
+        return nil
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    rawptr p = a.proc(a.data, mem.AllocatorMode.Alloc, bytes, mem.MAX_ALIGN, nil, 0)
+    if p == nil:
+        _ = JS_ThrowOutOfMemory(ctx)
+        fail NO_MEMORY
+    return p
+
+void unscratch(^JSContext ctx, rawptr p, u64 bytes):
+    if p == nil:
+        return
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    _ = a.proc(a.data, mem.AllocatorMode.Free, 0, 0, p, bytes)
+
+// What a reader answers when the ambient allocator refuses a block for an
+// answer: the engine's out-of-memory error, pending.
+i32 out_of_memory(^JSContext ctx):
+    _ = JS_ThrowOutOfMemory(ctx)
+    return NO_MEMORY
+
+// A new, empty array.
+JSValue new_array(^JSContext ctx):
+    return JS_NewArray(ctx)
+
+// `arr[i] = v`, taking `v`. Either one already the exception marker — a
+// writer that failed — fails, letting go of the other.
+!void put(^JSContext ctx, JSValue arr, i64 i, JSValue v):
+    if is_exception(arr):
+        JS_FreeValue(ctx, v)
+        fail THREW
+    if is_exception(v):
+        JS_FreeValue(ctx, arr)
+        fail THREW
+    if JS_SetPropertyInt64(ctx, arr, i, v) < 0:
+        JS_FreeValue(ctx, arr)
+        fail THREW
+
+// A fingerprint of a value's bytes, for the lend lock: FNV-1a over 64-bit
+// words.
+u64 mix(u64 h, u64 bits):
+    return (h ~ bits) * 1099511628211
+
+u64 mix_float(u64 h, f64 v):
+    Bits64 b = Bits64(v)
+    return mix(h, b.u)
+
+u64 mix_string(u64 h, string8 s):
+    u64 out = mix(h, u64(#len(s)))
+    for i in 0..<#len(s):
+        out = mix(out, u64(s[i]))
+    return out
+
+// ── A container run, entered ────────────────────────────────────────────────
+//
+// A member call or a `#script_new` that lends or answers a container is a
+// helper the compiler writes for the call, and **it enters before it builds
+// anything**: `begin_run` (`begin_new` for a construction) enters the engine
+// as a scalar run does — the handle checked, `STALE`, `STOPPED` and `BUSY`
+// answered with the same texts, the verb's sinks taken — and answers the
+// context to build in. Only then are the arguments built, in order, each
+// pushed with `push_value` (a scalar made by its `give_` function), so an
+// engine another thread is running is never touched. The call is
+// `call_entered` or `construct_entered`, the answer is read while still
+// entered (`answer_int` … `answer_string`, or a generated reader over
+// `answer_of`), and `end_run` leaves — on success and on every failure once
+// `begin_run` has succeeded. After `end_run` the helper touches neither the
+// engine nor, for a stop, the handle: a run that deleted its own VM frees
+// both as it leaves.
+
+// The engine the handle holds, entered for a run of its instance, its sinks
+// taken: what a member call's helper builds its arguments in.
+!^JSContext begin_run(rawptr s):
+    JSValue obj
+    try Engine e = entering(s, &obj)
+    return e^.ctx
+
+// As `begin_run`, for `#script_new`: the VM's handle, entered with `module`
+// loaded into it.
+!^JSContext begin_new(rawptr vm, cstring module):
+    try Engine e = entering_new(vm, module)
+    return e^.ctx
+
+// The entered run's argument, built by a generated writer or a `give_`
+// function; one that threw while it was built fails the call.
+void push_value(^JSContext ctx, JSValue v):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    if is_exception(v):
+        e^.args_threw = true
+        return
+    push(e, v)
+
+// The entered run's call: the method `entry` of the instance `s` holds, with
+// the pushed arguments, its code a verb's (`script_code`). The run stays
+// entered either way.
+!void call_entered(rawptr s, cstring entry):
+    Slot at
+    if !slot_read(s, &at) || i32(at.value.tag) != JS_TAG_OBJECT:
+        no_script(s)
+        fail STALE
+    Engine e = at.engine
+    try call_on(e, at.value, entry) else code:
+        fail script_code(e, code)
+
+// The entered construction: an instance of `class`, exported by the loaded
+// `module`, made with the pushed arguments, and a handle holding it.
+!rawptr construct_entered(^JSContext ctx, cstring module, cstring class):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    try Handle o = constructing(e, module, class)
+    rawptr h = hold_object(e, o, class)
+    if h == nil:
+        fail NO_MEMORY
+    return h
+
+// The entered run's scalar answer, as the entry's return type says.
+!i64 answer_int(^JSContext ctx):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    try i64 v = result_i64(e) else code:
+        fail script_code(e, code)
+    return v
+
+!f64 answer_float(^JSContext ctx):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    try f64 v = result_f64(e) else code:
+        fail script_code(e, code)
+    return v
+
+!bool answer_bool(^JSContext ctx):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    try bool v = result_bool(e) else code:
+        fail script_code(e, code)
+    return v
+
+// A copy of the answer on the ambient allocator, as `run_string`'s.
+!ref([]char8) answer_string(^JSContext ctx):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    try string8 text = result_string(e) else code:
+        fail script_code(e, code)
+    ref([]char8) out = #make([]char8, #len(text))
+    if out == nil:
+        say(e, "script: no memory for the answer")
+        fail NO_MEMORY
+    for i in 0..<#len(text):
+        out[i] = text[i]
+    return out
+
+// The entered run's answer, borrowed, for a generated reader.
+JSValue answer_of(^JSContext ctx):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    return e^.result
+
+// The answer a generated reader refused: its error, pending, written to the
+// error sink and kept as the failure's text; answers `TYPE`, or `NO_MEMORY`
+// for an allocator's refusal.
+i32 answer_refused(^JSContext ctx, i32 code):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    JSValue ex = JS_GetException(e^.ctx)
+    text_begin(e^.err)
+    err_put(e^.err, "script: the answer did not cross: ")
+    write_value(e, e^.err, ex, true)
+    err_put(e^.err, "\n")
+    JS_FreeValue(e^.ctx, ex)
+    if code == NO_MEMORY:
+        return NO_MEMORY
+    return TYPE
+
+// The entered run leaving: the last thing its helper does with the engine.
+void end_run(^JSContext ctx):
+    leave(Engine(JS_GetContextOpaque(ctx)))
+
+// A container run or construction no `try` was written around, failed: as
+// the scalar `_or_quit` functions decide — a stop, or a script loaded with
+// `on_error: script.CONTINUE`, returns and the helper answers its zero value;
+// otherwise the program ends with the failure's code.
+void quit_untried(rawptr s, cstring entry, cstring verb, i32 code):
+    if code == STOPPED || goes_on(s, entry, verb, code):
+        return
+    end_program(exit_status(code))
+    return
+
+private cunion Bits64: (f64 f, u64 u)
+
+// Every lend in `pending` fingerprinted, and the list emptied: the call is
+// about to reach back across.
+private void settle_lends(^rawptr pending):
+    rawptr at = pending^
+    pending^ = nil
+    for at != nil:
+        ^Lend l = ^Lend(at)
+        rawptr next = l^.next
+        l^.settle(at)
+        at = next
+
+// `TypeError`: what a value at `path` takes, and what it was given.
+private void mistyped_at(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth, cstring wanted):
+    [128]char8 text
+    where_into(&text, path, depth)
+    _ = JS_ThrowTypeError(ctx, "`%s`'s %s%s takes %s, and was given %s", function, what, cstring(rawptr(&text)), wanted, kind_in(ctx, v))
+
+// ` at [2][0]` for a path of two, nothing for none, into `text`, ended by a
+// zero byte.
+private void where_into(^[128]char8 text, ^i64 path, i32 depth):
+    i64 k = 0
+    if depth > 0:
+        text^[0] = ' '
+        text^[1] = 'a'
+        text^[2] = 't'
+        text^[3] = ' '
+        k = 4
+    for d in 0..<depth:
+        if k > 100:
+            break
+        i64 n = path_at(path, d)
+        text^[k] = '['
+        k += 1
+        [20]char8 digits
+        i64 m = 0
+        for:
+            digits[m] = char8(48 + n % 10)
+            m += 1
+            n = n / 10
+            if n == 0 || m == 20:
+                break
+        for j in 0..<m:
+            text^[k] = digits[m - 1 - j]
+            k += 1
+        text^[k] = ']'
+        k += 1
+    text^[k] = char8(0)
+
+// `path[i]`, by address: Dado has no pointer arithmetic.
+private i64 path_at(^i64 path, i32 i):
+    ^i64 at = ^i64(rawptr(#c.uintptr_t(rawptr(path)) + #c.uintptr_t(i) * #c.uintptr_t(#size(i64))))
+    return at^
+
+// What a value is, for an error: `kind_of`'s words, and an array or a map.
+private cstring kind_in(^JSContext ctx, JSValue v):
+    if i32(v.tag) == JS_TAG_OBJECT:
+        if JS_IsArray(v):
+            return "an array"
+        if JS_IsMap(v):
+            return "a map"
+    return kind_of(v)
+
+// ── Inside ──────────────────────────────────────────────────────────────────
+
+private type Chars: ^char8
+
+// What a run through a handle that holds no engine says before it fails
+// `STALE`, on the error sink the verb was given, or the one a scope put in
+// force; else, when `s` is a handle `#delete` ended on a VM that is still
+// there, that VM's — where every other failure of a call into it is written;
+// else, the VM gone too, standard error.
+private void no_script(rawptr s):
+    Sink err = loose_err()
+    Sink vm_err
+    if !g_err_given && g_scope_err.proc == nil && slot_was_err(s, &vm_err):
+        err = vm_err
+    text_begin(err)
+    err_put(err, "script: this handle holds no script: it was never one, or `#delete` ended it or the VM it was made in\n")
+
+// What a program ends with when a script's failure reaches a member call or
+// a `#script_new` no `try` was written around, and what `#script_run(c)`
+// answers for a failing `ready`: the failure's code as the operating system
+// keeps it, its low eight bits, unless those are 0 — which would report
+// success — when it ends with `UNTRIED`, 70.
+i32 exit_status(i32 code):
+    i32 low = code & 255
+    if low == 0:
+        return UNTRIED
+    return low
+
+// A verb's failure code: a script's throw (`THREW`) is the code it was
+// reported with, its `Error`'s; a name the engine does not hold (`NO_SUCH`)
+// is `STALE`; the reserved codes are themselves.
+private i32 script_code(Engine e, i32 code):
+    if code == THREW:
+        if e^.thrown != 0:
+            return e^.thrown
+        return ERROR
+    if code == NO_SUCH:
+        return STALE
+    return code
+
+// The last line a failure no `try` caught writes, on the engine's error sink:
+// which method failed, under which verb, and the status the program ends
+// with.
+private void untried(rawptr s, cstring entry, cstring verb, i32 code):
+    Sink err = failure_sink()
+    failed_member(err, s, entry, verb)
+    _ = io_write(err, ", so the program ends with ")
+    write_status(err, exit_status(code))
+    _ = io_write(err, "\n")
+
+// `script: `Goblin.hit` failed, and the call is not under `try``,
+// or for a field `script: `Goblin.hp` could not be read or written, and a
+// field is reached with no `try``: the start of an untried failure's last
+// line. The class is the one Dado typed the handle's instance as.
+private void failed_member(Sink err, rawptr s, cstring entry, cstring verb):
+    _ = io_write(err, "script: `")
+    Slot at
+    if slot_read(s, &at) && at.class != nil:
+        _ = io_write(err, string8(at.class))
+        _ = io_write(err, ".")
+    _ = io_write(err, string8(entry))
+    if string8(verb) == string8(FIELD):
+        _ = io_write(err, "` could not be read or written, and a field is reached with no `try`")
+        return
+    if string8(verb) == string8(CALL_VERB):
+        _ = io_write(err, "` failed, and the call is not under `try`")
+        return
+    _ = io_write(err, "` failed, and its `")
+    _ = io_write(err, string8(verb))
+    _ = io_write(err, "` is not under `try`")
+
+// A number, 1 to 255, in decimal, written to the error sink and kept as the
+// failure's text, as `err_put` keeps what it writes.
+private void err_status(Sink err, i32 n):
+    [3]char8 digits
+    i64 k = 0
+    if n >= 100:
+        digits[k] = char8(48 + n / 100)
+        k += 1
+    if n >= 10:
+        digits[k] = char8(48 + n / 10 % 10)
+        k += 1
+    digits[k] = char8(48 + n % 10)
+    k += 1
+    err_put(err, string8(digits[0..<k]))
+
+// A status, 1 to 255, in decimal.
+private void write_status(Sink out, i32 n):
+    [3]char8 digits
+    i64 k = 0
+    if n >= 100:
+        digits[k] = char8(48 + n / 100)
+        k += 1
+    if n >= 10:
+        digits[k] = char8(48 + n / 10 % 10)
+        k += 1
+    digits[k] = char8(48 + n % 10)
+    k += 1
+    _ = io_write(out, string8(digits[0..<k]))
+
+// The engine a handle holds, or nil: a nil or stale handle.
+private Engine engine_of(rawptr s):
+    Slot at
+    if !slot_read(s, &at):
+        return nil
+    return at.engine
+
+// What a run through a handle that holds no instance says before it fails
+// `STALE`: its VM was stopped, which released every instance in it.
+private void no_instance(Engine e):
+    text_begin(e^.err)
+    err_put(e^.err, "script: this handle's instance is gone: its VM was stopped, which released every instance in it\n")
+
+// Whether the slot `at` names an instance of the VM `e` — the check every
+// instance crossing into a script makes: a handle carries its VM.
+private bool on_vm(Slot at, Engine e):
+    return at.engine == e
+
+// The last answer as an instance: the handle Dado holds it by (`adopt`).
+private !rawptr result_instance(Engine e, cstring class):
+    JSValue r = e^.result
+    if i32(r.tag) != JS_TAG_OBJECT:
+        wrong(e, "an instance")
+        fail TYPE
+    rawptr h = adopt(e, r, class)
+    if h == nil:
+        fail NO_MEMORY
+    return h
+
+// A value `#delete` let go of while a run was in the engine, released when
+// the outermost run leaves (`leave`) or the heap ends.
+private void release_later(Engine e, JSValue v):
+    if e^.stop.nreleases < MAX_HANDLES:
+        e^.stop.releases[e^.stop.nreleases] = v
+        e^.stop.nreleases += 1
+        return
+    // A full list: the engine keeps it, and its heap's end releases it.
+    try _ = keep(e, v) else _:
+        return
+
+private void release_waiting(Engine e):
+    for i in 0..<e^.stop.nreleases:
+        JS_FreeValue(e^.ctx, e^.stop.releases[i])
+        e^.stop.releases[i] = undefined()
+    e^.stop.nreleases = 0
+
+// Row `i` of a module table: a C array of `{const char *name, const char
+// *source}`, laid out as `Module` is. Dado has no pointer arithmetic, so the
+// address crosses to an integer and back.
+private Module row_of(const rawptr table, i64 i):
+    ^Module at = ^Module(rawptr(#c.uintptr_t(table) + #c.uintptr_t(i) * #c.uintptr_t(#size(Module))))
+    return at^
+
+// 2⁵³ − 1: the largest magnitude the double tier holds exactly.
+private const i64 SAFE = 9007199254740991
+private const f64 SAFE_F = 9007199254740991.0
+
+private JSValue undefined():
+    JSValue v
+    v.tag = i64(JS_TAG_UNDEFINED)
+    return v
+
+private bool is_exception(JSValue v):
+    return i32(v.tag) == JS_TAG_EXCEPTION
+
+// The canonical tier of `v` (the fork's `dados_int_canon`, from the host side).
+private JSValue from_i64(Engine e, i64 v):
+    return tier(e^.ctx, v)
+
+private JSValue tier(^JSContext ctx, i64 v):
+    if v >= 0 - 2147483648 && v <= 2147483647:
+        return JS_NewInt32(ctx, i32(v))
+    if v >= 0 - SAFE && v <= SAFE:
+        return JS_NewFloat64(ctx, f64(v))
+    return JS_NewBigInt64(ctx, v)
+
+// What a thunk says of an argument of the wrong type: `TypeError`, naming
+// the function, the parameter, what it takes and what it was given.
+private void mistyped(^JSContext ctx, JSValue v, cstring function, cstring param, cstring wanted):
+    _ = JS_ThrowTypeError(ctx, "`%s`'s parameter `%s` takes %s, and was given %s", function, param, wanted, kind_of(v))
+
+private cstring kind_of(JSValue v):
+    i32 tag = i32(v.tag)
+    if tag == JS_TAG_INT || tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT:
+        return "an int"
+    if tag == JS_TAG_FLOAT64:
+        return "a float"
+    if tag == JS_TAG_BOOL:
+        return "a bool"
+    if tag == JS_TAG_STRING || tag == JS_TAG_STRING_ROPE:
+        return "a string"
+    if tag == JS_TAG_UNDEFINED:
+        return "nothing"
+    return "a value of another kind"
+
+// What `one_code_point` answers for a string that is not one code point.
+private const u32 NOT_ONE = 0xFFFFFFFF
+
+// The one Unicode scalar value `s` encodes in UTF-8, or `NOT_ONE`.
+private u32 one_code_point(string8 s):
+    i64 n = #len(s)
+    if n == 0:
+        return NOT_ONE
+    u32 b0 = u32(s[0])
+    i64 want = 0
+    u32 c = 0
+    if b0 < 0x80:
+        want = 1
+        c = b0
+    else if b0 >= 0xC2 && b0 <= 0xDF:
+        want = 2
+        c = b0 & 0x1F
+    else if b0 >= 0xE0 && b0 <= 0xEF:
+        want = 3
+        c = b0 & 0x0F
+    else if b0 >= 0xF0 && b0 <= 0xF4:
+        want = 4
+        c = b0 & 0x07
+    else:
+        return NOT_ONE
+    if n != want:
+        return NOT_ONE
+    for k in 1..<n:
+        u32 b = u32(s[k])
+        if (b & 0xC0) != 0x80:
+            return NOT_ONE
+        c = (c << 6) | (b & 0x3F)
+    bool shortest = (want == 1) || (want == 2 && c >= 0x80) || (want == 3 && c >= 0x800) || (want == 4 && c >= 0x10000)
+    if !shortest || (c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF:
+        return NOT_ONE
+    return c
+
+// Row `i` of the glue's table, laid out as `Bound` is.
+private Bound bound_of(const rawptr table, i64 i):
+    ^Bound at = ^Bound(rawptr(#c.uintptr_t(table) + #c.uintptr_t(i) * #c.uintptr_t(#size(Bound))))
+    return at^
+
+// The scheme every native module's name starts with: `dado:<package>`, the
+// name the compiler's glue table files each exported function under.
+private const string8 NATIVE_SCHEME = "dado:"
+
+// Whether a module name is a native module's: the scheme, and a package after it.
+private bool is_native(string8 name):
+    string8 scheme = NATIVE_SCHEME
+    return #len(name) > #len(scheme) && strings.starts_with(name, scheme)
+
+// The native module `name`, `dado:<package>`: every row of the glue's table
+// whose module is `name`, each exported under its Dado name. The exports are
+// declared here and given their functions by `init_native` when the engine
+// links the module; an ES import binding cannot be reassigned by the module
+// that imports it, so what a script calls is the thunk and nothing else.
+private ^JSModuleDef native_module(Engine e, ^JSContext ctx, cstring name):
+    if e^.nnatives >= MAX_MODULES:
+        _ = JS_ThrowReferenceError(ctx, "more than 64 native modules: '%s'", name)
+        return nil
+    ^JSModuleDef m = JS_NewCModule(ctx, name, init_native)
+    if m == nil:
+        return nil
+    string8 wanted = string8(name)
+    i64 first = 0 - 1
+    i64 at = 0
+    for:
+        Bound row = bound_of(e^.bound, at)
+        if row.module == nil:
+            break
+        if string8(row.module) == wanted:
+            if JS_AddModuleExport(ctx, m, row.name) < 0:
+                return nil
+            if first < 0:
+                first = at
+        at += 1
+    e^.natives[e^.nnatives] = (m, first)
+    e^.nnatives += 1
+    return m
+
+private i32 init_native(^JSContext ctx, ^JSModuleDef m):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    i64 first = 0 - 2
+    for i in 0..<e^.nnatives:
+        if e^.natives[i].def == m:
+            first = e^.natives[i].first
+    if first == 0 - 2:
+        return 0 - 1
+    if first < 0:
+        return 0
+    string8 wanted = string8(bound_of(e^.bound, first).module)
+    i64 at = first
+    for:
+        Bound row = bound_of(e^.bound, at)
+        if row.module == nil:
+            break
+        if string8(row.module) == wanted:
+            JSValue f = JS_NewCFunction2(ctx, row.thunk, row.name, row.arity, JSCFunctionEnum.Generic, 0)
+            if JS_SetModuleExport(ctx, m, row.name, f) < 0:
+                return 0 - 1
+        at += 1
+    return 0
+
+private void push(Engine e, JSValue v):
+    if e^.nargs >= MAX_ARGS:
+        JS_FreeValue(e^.ctx, v)
+        e^.args_lost = true
+        return
+    e^.args[e^.nargs] = v
+    e^.nargs += 1
+
+// The pushed arguments, moved out of the engine's table for one call: a run
+// made from inside that call — a Dado function the script called running the
+// script again — pushes its own into an empty table, and its call is given
+// its own arguments alone.
+private i32 take_args(Engine e, ^[MAX_ARGS]JSValue into):
+    i32 n = e^.nargs
+    for i in 0..<n:
+        into^[i] = e^.args[i]
+    e^.nargs = 0
+    return n
+
+// The arguments `take_args` moved out, released once their call returned.
+private void free_args(Engine e, ^[MAX_ARGS]JSValue argv, i32 n):
+    for i in 0..<n:
+        JS_FreeValue(e^.ctx, argv^[i])
+
+private void clear_args(Engine e):
+    for i in 0..<e^.nargs:
+        JS_FreeValue(e^.ctx, e^.args[i])
+    e^.nargs = 0
+    e^.args_lost = false
+    e^.args_threw = false
+
+private void clear_result(Engine e):
+    if e^.result_text != nil:
+        JS_FreeCString(e^.ctx, cstring(rawptr(e^.result_text)))
+        e^.result_text = nil
+    JS_FreeValue(e^.ctx, e^.result)
+    e^.result = undefined()
+
+// Hold `v` in the first free slot. Takes ownership whether it succeeds or not.
+private !Handle keep(Engine e, JSValue v):
+    for i in 1..<MAX_HANDLES:
+        // Free is never-used (all zero) or released (`undefined`); a slot this
+        // package fills always holds an object or a namespace.
+        JSValue slot = e^.handles[i]
+        if (slot.tag == 0 && slot.u.ptr == nil) || i32(slot.tag) == JS_TAG_UNDEFINED:
+            e^.handles[i] = v
+            return Handle(i)
+    JS_FreeValue(e^.ctx, v)
+    say(e, "script: more than 255 values held at once")
+    fail NO_MEMORY
+
+// `holder.name`, which must be a function; `what` names it in the refusal.
+private !JSValue member(Engine e, Handle holder, cstring name, cstring what):
+    if holder <= 0 || holder >= MAX_HANDLES:
+        clear_args(e)
+        say(e, "script: no such value")
+        fail NO_SUCH
+    try JSValue f = member_of(e, e^.handles[holder], name, what)
+    return f
+
+// `holder.name` of the object `holder`, which must be a function.
+private !JSValue member_of(Engine e, JSValue holder, cstring name, cstring what):
+    if e^.args_threw:
+        clear_args(e)
+        report(e)
+        fail NO_MEMORY
+    if e^.args_lost:
+        clear_args(e)
+        say(e, "script: a call was given more than 16 arguments")
+        fail NO_MEMORY
+    JSValue f = JS_GetPropertyStr(e^.ctx, holder, name)
+    if is_exception(f):
+        clear_args(e)
+        report(e)
+        fail THREW
+    if !JS_IsFunction(e^.ctx, f):
+        JS_FreeValue(e^.ctx, f)
+        clear_args(e)
+        text_begin(e^.err)
+        err_put(e^.err, "script: no ")
+        err_put(e^.err, string8(what))
+        err_put(e^.err, " named `")
+        err_put(e^.err, string8(name))
+        err_put(e^.err, "`\n")
+        fail NO_SUCH
+    return f
+
+// The end of a call: the arguments released, the answer kept or the
+// exception reported, and any job the call queued run.
+private !void settle(Engine e, JSValue r):
+    clear_args(e)
+    clear_result(e)
+    if is_exception(r):
+        report(e)
+        fail THREW
+    e^.result = r
+    // A forced engine runs nothing more, not even the jobs this call queued.
+    if forced(e):
+        e^.thrown = stopped(e)
+        fail THREW
+    if !drain(e):
+        fail THREW
+    try settled(e)
+
+// The answer of an `async` method is a promise, and `drain` has run every job
+// there is, so it has settled or never will: a fulfilled one's value becomes
+// the answer, a rejected one's reason is reported as a throw is, and one still
+// pending — waiting on something no job left to run can finish — fails. Any
+// other answer is left as it is.
+private !void settled(Engine e):
+    JSPromiseStateEnum state = JS_PromiseState(e^.ctx, e^.result)
+    if state == JSPromiseStateEnum.NotAPromise:
+        return
+    if state == JSPromiseStateEnum.Pending:
+        say(e, "script: the method is `async`, and what it answered never settled: the engine ran every job it had, and none was left to finish it")
+        e^.thrown = UNTRIED
+        fail THREW
+    JSValue value = JS_PromiseResult(e^.ctx, e^.result)
+    clear_result(e)
+    if state == JSPromiseStateEnum.Rejected:
+        _ = JS_Throw(e^.ctx, value)
+        report(e)
+        fail THREW
+    e^.result = value
+
+// Run every queued job. A job that throws is reported, and answers false.
+private bool drain(Engine e):
+    ^JSContext job_ctx = nil
+    for:
+        i32 rc = JS_ExecutePendingJob(e^.rt, &job_ctx)
+        if rc == 0:
+            return true
+        if rc < 0:
+            report(e)
+            return false
+    return true
+
+// The pending exception, written to the error sink: the value as a string,
+// and then its stack, and its code kept in `thrown`. The exception is
+// consumed. In an engine holding DadoScript's runtime the exception is first made a
+// DadoScript `Error` — anything else thrown is wrapped, as a script's `try` wraps
+// it — so the text is `error <code>: <message>` and its `at` lines, and the
+// code is the `Error`'s; elsewhere it is the value as the engine has it,
+// `Error: message` and the engine's stack, and the code 70 unless the value
+// carries an integer `code`.
+private void report(Engine e):
+    if quiet_stop(e):
+        e^.thrown = stopped(e)
+        return
+    JSValue ex = as_failure(e, JS_GetException(e^.ctx))
+    e^.thrown = code_of(e, ex)
+    text_begin(e^.err)
+    write_value(e, e^.err, ex, true)
+    err_put(e^.err, "\n")
+    if i32(ex.tag) == JS_TAG_OBJECT:
+        JSValue stack = JS_GetPropertyStr(e^.ctx, ex, "stack")
+        if i32(stack.tag) == JS_TAG_STRING || i32(stack.tag) == JS_TAG_STRING_ROPE:
+            write_value(e, e^.err, stack, true)
+        forget_exception(e, stack)
+        JS_FreeValue(e^.ctx, stack)
+    JS_FreeValue(e^.ctx, ex)
+
+// The thrown value `ex` as a DadoScript `Error`, through the global
+// `__dados_failure` that `dados:runtime` installs when it is evaluated; `ex` as
+// it is in an engine without it, or when the wrapping fails. Takes `ex`.
+private JSValue as_failure(Engine e, JSValue ex):
+    JSValue global = JS_GetGlobalObject(e^.ctx)
+    JSValue wrap = JS_GetPropertyStr(e^.ctx, global, "__dados_failure")
+    JS_FreeValue(e^.ctx, global)
+    if !JS_IsFunction(e^.ctx, wrap):
+        forget_exception(e, wrap)
+        JS_FreeValue(e^.ctx, wrap)
+        return ex
+    JSValue arg = ex
+    JSValue r = JS_Call(e^.ctx, wrap, undefined(), 1, &arg)
+    JS_FreeValue(e^.ctx, wrap)
+    if is_exception(r):
+        forget_exception(e, r)
+        return ex
+    JS_FreeValue(e^.ctx, ex)
+    return r
+
+// A failure's code: the value's integer `code` when it has a nonzero one —
+// every DadoScript `Error` has — and `ERROR`, a throw that carries no code,
+// otherwise.
+private i32 code_of(Engine e, JSValue ex):
+    if i32(ex.tag) != JS_TAG_OBJECT:
+        return ERROR
+    JSValue c = JS_GetPropertyStr(e^.ctx, ex, "code")
+    i32 code = ERROR
+    if i32(c.tag) == JS_TAG_INT && c.u.int32 != 0:
+        code = c.u.int32
+    forget_exception(e, c)
+    JS_FreeValue(e^.ctx, c)
+    return code
+
+// When `v` is the engine's exception marker, the exception it marks taken
+// and dropped: a read that threw while a failure was being reported.
+private void forget_exception(Engine e, JSValue v):
+    if is_exception(v):
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+
+private void wrong(Engine e, cstring wanted):
+    text_begin(e^.err)
+    err_put(e^.err, "script: the answer is not ")
+    err_put(e^.err, string8(wanted))
+    err_put(e^.err, "\n")
+
+// A failure's one line, on the error sink and as the failure's text.
+private void say(Engine e, cstring line):
+    say_to(e^.err, line)
+
+// `line` and a newline on `err`, kept as the failure's text.
+private void say_to(Sink err, cstring line):
+    text_begin(err)
+    err_put(err, string8(line))
+    err_put(err, "\n")
+
+// `v` as JavaScript's `String(v)` spells it, into `out`, and kept as the
+// failure's text when `keep` says so.
+private void write_value(Engine e, Sink out, JSValue v, bool keep):
+    #c.size_t n = 0
+    ^const #c.char s = JS_ToCStringLen2(e^.ctx, &n, v, false)
+    if s == nil:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+        _ = io_write(out, "<unprintable>")
+        if keep:
+            text_keep("<unprintable>")
+        return
+    Chars at = Chars(rawptr(s))
+    string8 text = string8(at[0..<i64(n)])
+    if n > 0 && out.proc != nil:
+        _ = out.proc(out.data, rawptr(s), i64(n))
+    if keep:
+        text_keep(text)
+    JS_FreeCString(e^.ctx, cstring(rawptr(s)))
+
+private i64 io_write(Sink out, string8 s):
+    if out.proc == nil || #len(s) == 0:
+        return 0
+    return out.proc(out.data, rawptr(s), #len(s))
+
+private void release_state(Engine e):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    _ = a.proc(a.data, mem.AllocatorMode.Free, 0, 0, rawptr(e), #size(State))
+
+// ── print and println ───────────────────────────────────────────────────────
+//
+// A script's output goes to the engine's output sink, which is standard output
+// unless the host said otherwise. Arguments are written one after another with
+// nothing between them, as `core:fmt`'s `print` does, each as `String(x)`.
+
+private JSValue host_print(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    return emit(ctx, argc, argv, false)
+
+private JSValue host_println(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    return emit(ctx, argc, argv, true)
+
+// `argv[i]`. A window over the arguments has no spelling — `JSValue` names
+// its members, so a run of them is not a Dado slice — and Dado has no pointer
+// arithmetic, so the address crosses to an integer and back.
+private JSValue nth(^JSValue argv, i32 i):
+    ^JSValue at = ^JSValue(rawptr(#c.uintptr_t(rawptr(argv)) + #c.uintptr_t(i) * #c.uintptr_t(#size(JSValue))))
+    return at^
+
+private JSValue emit(^JSContext ctx, i32 argc, ^JSValue argv, bool newline):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    if argc > 0:
+        for i in 0..<argc:
+            write_value(e, e^.out, nth(argv, i), false)
+    if newline:
+        _ = io_write(e^.out, "\n")
+    return undefined()
+
+// ── The module loader ───────────────────────────────────────────────────────
+//
+// QuickJS-ng asks for a module by its normalized name (the default normalizer
+// keeps a bare name as written). The answer is compiled, not evaluated: the
+// engine links and evaluates the graph itself.
+
+private ^JSModuleDef load_embedded(^JSContext ctx, cstring name, rawptr opaque):
+    Engine e = Engine(opaque)
+    string8 wanted = string8(name)
+    if e^.bound != nil && is_native(wanted):
+        return native_module(e, ctx, name)
+    if wanted == HOST_MODULE:
+        return host_module(ctx, name)
+    for i in 0..<e^.nmodules:
+        Module m = e^.modules[i]
+        if string8(m.name) == wanted:
+            string8 src = string8(m.source)
+            i32 flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_DADOS
+            JSValue v = JS_Eval(ctx, m.source, #c.size_t(#len(src)), m.name, flags)
+            if is_exception(v):
+                return nil
+            ^JSModuleDef def = ^JSModuleDef(v.u.ptr)
+            JS_FreeValue(ctx, v)
+            e^.compiled[i] = def
+            return def
+    _ = JS_ThrowReferenceError(ctx, "no embedded module named '%s'", name)
+    return nil
+
+// ── The engine's allocator ──────────────────────────────────────────────────
+//
+// QuickJS-ng's allocation interface frees and resizes without saying how
+// large the block was, and Dado's allocator interface is told. So each block
+// carries its size in a 16-byte header in front of what the engine is handed
+// — 16 so the engine's block keeps the alignment the allocator gave the whole
+// one. The header is also what `js_malloc_usable_size` answers from.
+
+private const u64 HEADER = 16
+
+private type Word: ^u64
+
+private rawptr engine_malloc(rawptr opaque, #c.size_t size):
+    return block(Engine(opaque), u64(size))
+
+private rawptr engine_calloc(rawptr opaque, #c.size_t count, #c.size_t size):
+    // Dado's allocators zero every block, so calloc is malloc.
+    u64 n = u64(count) * u64(size)
+    if u64(size) != 0 && n / u64(size) != u64(count):
+        return nil
+    return block(Engine(opaque), n)
+
+private void engine_free(rawptr opaque, rawptr ptr):
+    if ptr == nil:
+        return
+    Engine e = Engine(opaque)
+    rawptr base = base_of(ptr)
+    u64 size = Word(base)^
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    _ = a.proc(a.data, mem.AllocatorMode.Free, 0, 0, base, size + HEADER)
+    e^.live_blocks -= 1
+    e^.live_bytes -= i64(size)
+
+private rawptr engine_realloc(rawptr opaque, rawptr ptr, #c.size_t size):
+    Engine e = Engine(opaque)
+    if ptr == nil:
+        return block(e, u64(size))
+    if u64(size) == 0:
+        engine_free(opaque, ptr)
+        return nil
+    rawptr base = base_of(ptr)
+    u64 old = Word(base)^
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    rawptr fresh = a.proc(a.data, mem.AllocatorMode.Resize, u64(size) + HEADER, mem.MAX_ALIGN, base, old + HEADER)
+    if fresh == nil:
+        return nil
+    Word(fresh)^ = u64(size)
+    e^.live_bytes += i64(u64(size)) - i64(old)
+    return user_of(fresh)
+
+private #c.size_t engine_usable_size(const rawptr ptr):
+    if ptr == nil:
+        return 0
+    return #c.size_t(Word(base_of(ptr))^)
+
+private rawptr block(Engine e, u64 size):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    rawptr base = a.proc(a.data, mem.AllocatorMode.Alloc, size + HEADER, mem.MAX_ALIGN, nil, 0)
+    if base == nil:
+        return nil
+    Word(base)^ = size
+    e^.live_blocks += 1
+    e^.live_bytes += i64(size)
+    return user_of(base)
+
+// Dado has no pointer arithmetic; an address crosses to an integer and back.
+private rawptr user_of(rawptr base):
+    return rawptr(#c.uintptr_t(base) + #c.uintptr_t(HEADER))
+
+private rawptr base_of(const rawptr user):
+    return rawptr(#c.uintptr_t(user) - #c.uintptr_t(HEADER))

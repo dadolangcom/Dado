@@ -1,0 +1,1243 @@
+// app:app — the runtime's engine room.
+//
+// **`app` is a runtime, not a library.** That is the sentence the rest of this
+// file is written against, and it is the sentence this file used to get wrong.
+// It described a library a program drives: the program brought `app:draw` up,
+// the program made a canvas, the program rendered it, the program called
+// `input.clear_edges()` at the right moment, the program decided which
+// allocator everything landed in. Every one of those is now the runtime's, and
+// what is left for a program to write is the part that is actually the
+// program's.
+//
+// ## What a runtime is for, and who it is not for
+//
+// It is **opinionated**, and that is the point rather than an apology. There is
+// one frame shape, one root canvas, one persistent allocator, one per-frame
+// temp arena, one input barrier and one place each of them happens. A program
+// that wants to prototype — to get a window, a canvas and a loop and then spend its
+// attention on the thing it is actually making — writes four lines and gets all
+// of it:
+//
+//     import app "app:graphical"
+//     import "app:draw"
+//
+//     !void ready():
+//         draw.Item bg = draw.canvas_item_create(app.canvas())
+//         draw.rect(bg, (0.0, 0.0, 800.0, 600.0), (26, 30, 38, 255))
+//
+//     !i32 main():
+//         try app.init(800, 600, "sketch")
+//         app.hook(ready: ready)
+//         try app.run() else code:
+//             return code
+//         return 0
+//
+// There is no `draw.init` in that program, no `canvas_create`, no
+// `canvas_render`, no `clear_edges` and no allocator written anywhere — and it
+// draws, every frame, for as long as the window is open. That is what "a
+// runtime is packaged for you" means here.
+//
+// **What the runtime does not take over is a font.** That was the obvious next
+// thing to package and it is deliberately absent; the argument, with the bytes
+// it would have cost every program, is at `app:graphical`'s `canvas()`.
+//
+// **What a program gives up is control over all six of those decisions.** The
+// root canvas is the runtime's and is rendered on the runtime's schedule. The
+// ambient allocator inside every hook is the runtime's, and which of its two
+// arenas it is, is the runtime's too. The input edges are
+// cleared on the runtime's clock. The pass is opened and closed by the runtime
+// and a program never sees the handle. If any of that is the thing you are
+// building — a custom engine, a second render target, a frame graph, an
+// allocator strategy per subsystem, a loop that is not one-frame-at-a-time —
+// **this is the wrong package**, and the repair is not to fight it: import
+// `app:display`, `app:draw`, `app:input` and `core:jobs` directly and write the
+// twenty lines this package is. They are all public, none of them requires this
+// one, and `app:graphical`'s `run_loop` is the worked example of driving them
+// by hand.
+//
+// ## What is still in this file, and what is not
+//
+// The app is a singleton — one window, one loop, one app — so nothing is
+// threaded on a `^App`: the state lives here in package scope and is reached
+// through accessors, the way `#default` is ambient. The lifecycle hooks take no
+// app and no allocator, and **all four are failable**:
+//
+//     !void ready()               // once, after the surface is up
+//     !void process(f32 dt)       // once per frame, outside the pass
+//     !void draw()                // once per drawn frame, inside the pass
+//     !void shutdown()            // once, on teardown
+//
+// A program imports a *facade* (`app:headless`, `app:graphical`) to install a
+// backend on the singleton, assigns its hooks — one at a time with
+// `on_ready`/`on_process`/`on_draw`/`on_shutdown`, or all four in one call with
+// `hook` — and calls `run`. One backend at a time, one process-wide app, and the
+// hooks are the only entry points a program writes.
+//
+// **The facade is the front door, and this package is the room behind it.** A
+// program binds its facade under the name `app` (`import app "app:graphical"`)
+// and reaches `init`, `hook`, `run`, `quit`, `canvas` and the two allocators
+// through it; every one of those but `init`, `run` and `canvas` is a forward to
+// a name declared here.
+//
+// **This package imports no backend, no window and no drawing.** That is not
+// tidiness, it is what makes the escape hatch above real: a program that must
+// not link sokol installs a `Backend` of its own and gets the loop, the
+// allocators, the job pool and the frame order with nothing else attached. The
+// five *services* a runtime drives — bringing a drawing surface up, tearing it
+// down, rendering the root canvas, delivering what other threads queued for
+// the frame, and ending the input frame — are therefore **slots on the
+// `Backend` vtable** rather than calls written here.
+//
+// One of the four is forced and the other three follow it. `app:input` imports
+// *this* package (it asks `supports(Capability.Input)` before it drains), so
+// this package calling `input.clear_edges()` is `ERR0302` — the import graph is
+// acyclic and that edge is the cycle. A vtable slot is the way out, and once
+// there is one mechanism for reaching a package this file may not import, using
+// a second mechanism for the three that it merely *should* not import would be
+// two answers to one question. So `surface_up`, `surface_down`, `render`,
+// `end_input` and `deliver` are all slots, all nil-checked, and a backend that
+// fills none of them still runs.
+package app
+
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:jobs"
+import "core:threads"
+
+// ── role (an inert build seat) ─────────────────────────────────────────────
+// The composite client/server split is a build constant the driver swaps with
+// `-D ROLE=server` / `-D ROLE=client`. Inert at `"standalone"`; the
+// networking layer is what reads it in a `when`.
+@const string8 ROLE = "standalone"
+
+// ── lifecycle hooks ─────────────────────────────────────────────────────────
+// The only hooks. `process` and `draw` are the safe region for touching the
+// work pool; outside ready/process/draw/shutdown, races may occur.
+//
+// ## All four are failable, and the old `void()` shapes are gone
+//
+// A hook may `fail`, and the code it fails with becomes `run`'s failure, which
+// becomes `main`'s, which becomes the process exit status. That is the whole
+// chain and it is written out at `run` below.
+//
+// **A `void()` function can no longer fill one of these**, and there is no
+// spelling that lets it. It is `ERR0504` at the `on_*` or `hook` call — *the
+// place assigned to is ReadyFn = !void(), and this is void()* — naming both
+// shapes, on the line that sets the hook, at compile time. The repair is one
+// character: put a `!` on the hook's return type. A hook that never fails is a
+// `!void` function containing no `fail`, which compiles and costs nothing.
+//
+// **Keeping the old shapes working was attempted and abandoned, and here is the
+// arithmetic.** Two types per hook — `ReadyFn` and a failable twin — means two
+// package globals per hook, two setters per hook, and a `hook` with eight
+// parameters instead of four, of which six are `void()` or `!void()` and so
+// cannot be told apart by any check. It also means two frame shapes again: a
+// `tick` that calls one slot or the other, and every sentence in this file
+// about what happens when a hook fails hedged with *"if it is the failable
+// one"*. **This file has been here before.** The section below on `on_draw`
+// records what carrying two frame shapes cost the last time and why they were
+// collapsed; the same argument applies with the same force, and the cost of the
+// flag day is measured the same way: this tree has seven programs with hooks,
+// twenty-one hook declarations between them, and the edit to each is one
+// character.
+//
+// ## `on_draw`, and where the render pass goes (C4a)
+//
+// **`draw` is the hook that has a render pass open; `process` is the hook that
+// does not** — on every frame of every program, with no condition anywhere that
+// selects otherwise. `tick` runs `process` first, outside the pass, then
+// brackets the draw hook with the backend's `begin_frame`/`end_frame`. So a
+// frame's simulation, its input decode, its buffer mutation and its 3.6 MB
+// `fwrite` all happen before `sg_begin_pass`, and only the drawing happens
+// between the pass calls.
+//
+// Before this there was one hook and it ran inside the pass, because the pass
+// bracket *is* the frame bracket and there was nowhere else to put it. That was
+// harmless while nothing in the tree touched the GPU and wrong the moment a
+// real client existed: `example/edit` decoded input, mutated a rope and wrote a
+// file to disk with a swapchain pass open.
+//
+// ## A draw hook is optional now, and most programs have none
+//
+// **The runtime renders its own root canvas**, so the picture a program
+// recorded in `ready` is painted on every frame with no draw hook anywhere. See
+// `render` in the frame order at `tick`. What a draw hook is *for* now is the
+// part of a picture that changes: re-recording an item whose contents moved
+// this frame, or issuing drawing of a program's own that the canvas model does
+// not cover.
+//
+// ## The second frame shape is retired, and this is what it cost to keep
+//
+// **There used to be two shapes, chosen by `g_draw == nil`.** With no draw hook
+// the bracket wrapped `process` — `begin_frame` → `process` → `end_frame` — and
+// with one it wrapped `draw`. It was written that way so that C4a would not be
+// a flag day: a program that had not yet separated its drawing kept the frame
+// it had, byte for byte, and migrated when it chose to.
+//
+// The nil check was cheap. Carrying the two shapes was not. **A frame is the
+// one thing in a framework every other sentence is written against**, and with
+// two of them every such sentence had to be written twice or hedged once:
+// `set_redraw_on_demand` carried a documented do-nothing case, `app:display`'s
+// `drawing()` answered differently about the *same* hook depending on a
+// program's hook table, and the migration this bought was a migration nobody in
+// the tree ever had to make — which is the measurement that settled it.
+//
+// **What it breaks, outside this tree, is a program that draws inside `process`
+// and sets no draw hook.** That program is now wrong. It is wrong *loudly*, on
+// frame one, by name: its drawing calls issue GPU commands with no pass open,
+// which `sokol_gfx`'s validation layer refuses by name, and which `app:draw`'s
+// own primitives refuse ahead of even that, because they ask
+// `display.drawing()` and `#panic` outside the pass. It does not get a blank
+// window, a silently dropped frame or a wrong picture — the three endings a
+// silent change would have given it. The repair is one line: move the drawing
+// into a function of its own and hand it to `on_draw`, or to
+// `hook(draw: draw_frame)`.
+//
+// That is the trade, stated plainly: one flag day, refused by name on the first
+// frame, against a second frame shape maintained forever.
+type ReadyFn:    !void()
+type ProcessFn:  !void(f32)
+type DrawFn:     !void()
+type ShutdownFn: !void()
+
+private ReadyFn    g_ready
+private ProcessFn  g_process
+private DrawFn     g_draw
+private ShutdownFn g_shutdown
+
+// Assign the lifecycle hooks. Order does not matter; call before `run`.
+void on_ready(ReadyFn f):       g_ready = f
+void on_process(ProcessFn f):   g_process = f
+void on_shutdown(ShutdownFn f): g_shutdown = f
+
+// Assign the draw hook — see the section above. `process` is outside the render
+// pass whether or not this is set, and the runtime renders its root canvas
+// whether or not this is set, so a program that names no draw hook still gets a
+// picture. This is for the part of the picture that changes.
+void on_draw(DrawFn f):         g_draw = f
+
+// ── `hook`: four setters in one call ────────────────────────────────────────
+//
+// ## Write it all-named. The language cannot make you, and here is why
+//
+// **`app.hook(ready: ready, process: process, draw: draw_frame,
+// shutdown: shutdown)`** — every argument named, every time. Not as a style
+// rule. As the only check there is.
+//
+// `ReadyFn`, `DrawFn` and `ShutdownFn` are each `!void()`, and in this language
+// a slot's name is a *view* over a shape rather than part of the shape's
+// identity, so those three declarations are **one type** and one arena entry.
+// There is nothing left for a check to compare. `hook(draw_frame, ready)` —
+// first and third swapped, written positionally and short — is exactly as
+// well-typed as the call its author meant, and no diagnostic exists that could
+// be raised for it. A named call has no positions to get wrong: `ERR0602`
+// refuses a name the callee did not declare and `ERR0603` refuses a slot filled
+// twice, so a typo is a refusal instead of a silent reordering.
+//
+// **`distinct` would catch the swap, and it was considered and rejected.**
+// Tagging the three makes `hook(draw_frame, ready)` a `ERR0504` at the
+// argument, naming both shapes — precisely the refusal wanted. It also refuses
+// `on_ready(ready)`, `on_draw(draw_frame)` and every existing call site in this
+// tree and outside it, because a plain `!void()` cannot fill a tagged slot
+// without a conversion written at each one, and a nominal wrapper round every
+// hook in every program is a tax on everybody to protect the one call that is
+// written short. Keeping the old surface working was decided first. So the tag
+// is not taken, the three stay one type, and the names are the protection.
+//
+// ## What a swapped positional call does at run time
+//
+// Nothing is refused and nothing is nil, so the program runs — which is why the
+// symptom is worth writing down. The giveaway is always **frequency**: a hook
+// running once that should run per frame, or per frame that should run once.
+//
+//   * `draw_frame` installed as `ready` runs **once**, before the first frame
+//     and outside any pass. Under `app:draw` that is a `#panic` out of
+//     `display.drawing()`; under raw `sokol_gfx` it is a named validation
+//     refusal. This one is loud.
+//   * `ready` installed as `draw` runs **every frame, inside the pass**. Its
+//     one-time setup is done again per frame — an atlas rebuilt, a canvas
+//     recreated, an allocation that grows without bound — and nothing is ever
+//     drawn, because the thing that draws was never installed. This one is
+//     quiet, and it is the one to look for: a memory graph that climbs and a
+//     window that stays at the clear colour.
+//   * `shutdown` installed as `draw` prints its end-of-run report on every
+//     frame, which is the easiest of the three to spot from a terminal.
+//
+// **`process` is the one slot a swap cannot reach.** `ProcessFn` takes an `f32`
+// and the other three take nothing, so a shape check has something to say about
+// it and `ERR0504` catches it — that one, and only that one.
+//
+// ## The defaults are functions because `nil` cannot be one
+//
+// A default folds at the declaration and `nil` is not a compile-time constant
+// (`ERR0901`), so "unset" cannot be spelled `nil` here. It is spelled as a
+// named do-nothing function instead, and `hook` **compares** each argument
+// against that function rather than calling it: an argument that *is* the
+// sentinel is an omitted parameter, and an omitted parameter leaves that hook
+// exactly as it was. That is what makes `hook(ready: r)` followed by
+// `hook(draw: d)` two calls rather than the second undoing the first, and it is
+// what keeps `g_draw` genuinely nil for a program that never named a draw hook
+// — see below for why that still matters.
+//
+// **Two sentinels, one per arity, and not four.** The comparison rests on C's
+// promise that two different functions have two different addresses (C11
+// 6.5.9), and the one thing that breaks that promise is identical-code folding
+// at link time, which is off by default in every linker this tree builds with.
+// Four empty `!void()` bodies would be four candidates for folding into one;
+// two functions whose *shapes* differ cannot be folded together at all. So this
+// is the arrangement that leans on the promise least, which is the only reason
+// the count is two rather than one per slot.
+//
+// **Both are `private`, and a defaulted call from another package still works**
+// — measured: `app.hook(ready: r)` written in a `main` package compiles with
+// these unexported. A default is call-site sugar rather than part of the type,
+// but the sugar is expanded where the signature is known and not by pasting the
+// name into the caller, so "unset" is a spelling nobody outside this file can
+// write down. That is the point of it being private: a program that wants a
+// hook unset writes `on_draw(nil)`, and there is no public name for the
+// sentinel that could be handed in and then quietly skipped.
+//
+// The two carry the `!` for one reason and it is not that either of them can
+// fail: a sentinel has to *be* the hook type to be comparable with one, and the
+// hook type has the `!`.
+private !void nothing():               return
+private !void nothing_process(f32 dt): _ = dt
+
+// ## And what "is a draw hook set" is for now
+//
+// Under the two-shape frame this question **chose a frame shape**, and getting
+// it wrong put the pass in the wrong place. Under one shape it does not choose
+// anything: the bracket runs either way. All it decides is whether there is
+// something to call *between* `begin_frame` and the runtime's own render — so a
+// wrong answer now costs one null call or one skipped one, and never a
+// misplaced pass.
+//
+// It is still asked honestly rather than allowed to rot, because `tick` has to
+// know whether to call through `g_draw` and a nil call is undefined behaviour
+// rather than a no-op. The answer stays `g_draw != nil`: `hook` skips the slot
+// whose argument is the sentinel, so a program that never named a draw hook
+// leaves `g_draw` nil, exactly as it would have with the four setters. **The
+// sentinel is never stored.** The alternative — store `nothing` and call it
+// every frame — would have made the question unanswerable (nil and "defaulted"
+// would be indistinguishable) and bought an indirect call per frame for it.
+//
+// Assign any subset of the four hooks. An omitted parameter leaves that hook
+// alone. Order does not matter; call before `run`.
+void hook(ReadyFn    ready    = nothing,
+          ProcessFn  process  = nothing_process,
+          DrawFn     draw     = nothing,
+          ShutdownFn shutdown = nothing):
+    if ready != nothing:
+        g_ready = ready
+    if process != nothing_process:
+        g_process = process
+    if draw != nothing:
+        g_draw = draw
+    if shutdown != nothing:
+        g_shutdown = shutdown
+
+// ── conditional frames (E7) ────────────────────────────────────────────────
+//
+// **sokol cannot idle, and this does not pretend otherwise.** `_sapp_linux_run`
+// is a hard loop — `XPending` (which does not block), drain, frame callback,
+// `XFlush`, repeat — with no `select`, no `XNextEvent` wait and no
+// wait-for-event mode of any kind; the only thing that ever blocks is
+// `glXSwapBuffers` under vsync, and that stops blocking the moment the driver
+// is software Mesa or the window is unmapped. There is no `sapp_desc` field
+// that changes this. So *"wake only when an event arrives"* is not on offer and
+// nothing below claims it.
+//
+// What is on offer is not doing the **work**. A frame that changes nothing
+// costs a render pass, a client's whole paint walk, a vertex upload and a
+// buffer swap; skipping those is most of the cost of an idle text editor, and
+// `app:graphical` adds a short nap on a skipped frame so the loop yields its
+// core instead of spinning it. What remains is a cheap poll at a rate the
+// backend chooses.
+//
+// **Off by default.** With `set_redraw_on_demand(false)` — the default — every
+// frame draws and nothing here has any effect. It is opt-in because sokol
+// reports no expose or damage event, so nothing can tell a program that its
+// window was occluded and needs repainting; on a compositing desktop the
+// compositor holds those pixels and it does not matter, and without one an
+// idle window can show stale content until something asks for a frame. A
+// program that turns this on is stating that it knows when its content
+// changes.
+//
+// **It skips the bracket and it never skips `process`.** `process` drains the
+// input queue and advances the clock, so it runs on every frame whatever this
+// is set to; what a skipped frame skips is `begin_frame`, the draw hook, the
+// runtime's render and `end_frame`. It does **not** skip the input barrier —
+// see `end_input` in the frame order at `tick`, which is outside the bracket
+// for exactly that reason.
+private bool g_on_demand
+private bool g_redraw = true
+private bool g_drew
+
+// Ask for the next frame to be drawn. Cheap, idempotent, and safe to call from
+// anywhere — a program calls it from wherever its state changes rather than
+// reasoning about frames.
+void request_redraw():
+    g_redraw = true
+
+// Draw every frame (`false`, the default) or only after `request_redraw`
+// (`true`). Turning it on requests one frame immediately, so a program that
+// enables it in `ready` paints once before it goes quiet.
+void set_redraw_on_demand(bool on):
+    g_on_demand = on
+    if on:
+        g_redraw = true
+
+// Whether the next `tick` will open the pass. Always true while on-demand
+// redrawing is off.
+bool redraw_pending():
+    return !g_on_demand || g_redraw
+
+// Whether the **last** `tick` opened the render-pass bracket — which is the
+// same question as whether it presented a frame, and is what a backend asks to
+// decide whether to nap. It is not quite "ran the draw hook": a program with no
+// draw hook still brackets, still clears, still has its root canvas rendered
+// and still presents, and still answers true.
+bool drew():
+    return g_drew
+
+// ── capabilities ────────────────────────────────────────────────────────────
+// What a backend supports, and **it must be what the backend can actually do**:
+// `app:graphical` spent a milestone advertising all six while `run_loop` was a
+// `#panic`, which made `supports` worth nothing to ask. `app:headless`
+// advertises `Threads` and nothing else; `app:graphical` advertises the five it
+// honours — `VectorDraw` among them now that it is the facade that brings
+// `app:draw` up — and not `Audio`, because it has no audio device.
+//
+// A capability is a **query**, not a gate: `supports` is the whole surface.
+// There is no `require`-style refusal — a subsystem that cannot service a call
+// answers it emptily (`input.poll` returns 0 on a backend with no `Input`, so
+// polling is safe to write unguarded on every backend) and a program that wants
+// to behave differently asks `supports` first.
+enum u32 Capability: (
+    Input      = 1,
+    VectorDraw = 2,
+    Windowing  = 4,
+    Audio      = 8,
+    Threads    = 16,
+    Clipboard  = 32,
+)
+
+distinct type Caps: u32
+
+// Build a capability set from a list of capabilities.
+Caps caps(..Capability cs):
+    u32 v = 0
+    for cp in cs:
+        v = v | u32(cp)
+    return Caps(v)
+
+// ── the backend vtable ──────────────────────────────────────────────────────
+// A backend is its own state plus a table of function references, all nullary and
+// named only in terms of the singleton — nothing substrate-specific leaks up here.
+// `run` owns the loop and calls the frame steps; `begin_frame`/`end_frame` bracket
+// the draw hook and the runtime's render.
+//
+// ## The five service slots, and why they are slots
+//
+// `surface_up`, `surface_down`, `render`, `end_input` and `deliver` are the
+// packages this
+// runtime *drives* — `app:draw` and `app:input` — reached through the one seat a
+// backend already fills. The argument for a slot rather than an import is in the
+// package comment: `app:input` imports this package, so an import back is
+// `ERR0302`, and having reached for a vtable once it would be two answers to one
+// question to reach for anything else for the other three.
+//
+//   surface_up    bring the drawing surface up. Called **once**, inside
+//                 `startup`, after the job pool and **before** `ready`, so the
+//                 program's `ready` has a canvas to record into. The one
+//                 failable slot: `draw.init` answers false when there is no
+//                 shader for the live `sokol_gfx` backend or an allocation
+//                 refused, and that is a condition a program has to hear about.
+//   surface_down  tear it down. Called inside `teardown`, **after** `shutdown`,
+//                 so a program's own release runs while its canvas is still
+//                 valid.
+//   render        render the runtime's root canvas. Called inside the pass,
+//                 **after** the draw hook — the ordering is argued at `tick`.
+//   end_input     end the input frame (`input.clear_edges`). Called last in
+//                 `tick`, outside the bracket, on every frame.
+//   deliver       take what was queued for this frame (`input.deliver`, which
+//                 drains `app:input`'s signal). Called first in `tick`, before
+//                 `process`, on every frame — the one point the frame drains.
+//
+// **Every one is nil-checked and a backend may fill none of them.** A backend
+// with no drawing surface leaves the first three nil and loses nothing; a
+// backend with no event source leaves the last two nil. That is what makes this
+// package's claim to import no backend, no window and no drawing a true one.
+//
+// **Ten slots, and the swap hazard is real.** Seven of them are `void()` and are
+// therefore one type, so a `Backend` literal written in the wrong order is not
+// checkable — the same hazard `hook` has and for the same reason. There is no
+// named form for a tuple literal to lean on here, so the protection is that a
+// `Backend` is constructed in exactly three places in this tree (`app:graphical`,
+// `app:headless`, and this package's own test) and each one is written out on
+// four lines with the slot each argument fills sitting directly above it. The
+// newest slot goes last, so no existing position moved when it arrived.
+type Backend: (
+    rawptr data,
+    void() run,
+    void() begin_frame,
+    void() end_frame,
+    Caps caps,
+    !void() surface_up,
+    void() surface_down,
+    void() render,
+    void() end_input,
+    void() deliver,
+)
+
+private Backend g_backend
+private bool    g_backend_set
+
+// A facade installs its backend on the singleton before `run`.
+void set_backend(Backend b):
+    g_backend = b
+    g_backend_set = true
+
+// The backend's own opaque state, for a facade that needs it. Nil until set.
+rawptr backend_data():
+    return g_backend.data
+
+// ── stopping, and the two ways it happens ───────────────────────────────────
+//
+// **A program stops the loop with `quit()`. The runtime stops it with a
+// failure, and the two are deliberately different flags.**
+//
+// `g_quitting` is the program's and is **set-only** — there is no `unquit`, and
+// adding one to suit a caller would be the caller steering the design. So a run
+// that ends in `quit()` ends every later run in the same process too: the
+// loop's own condition refuses to enter. That is a known property and two tests
+// in this tree are ordered around it.
+//
+// `g_failed` is the runtime's and is **cleared by `run`**, so a run that ended
+// in a hook's failure does not poison the next one. The distinction is not new:
+// `app:headless`'s frame budget already ends its loop through a local rather
+// than through `app.quit()`, for exactly this reason, and a failure is the same
+// kind of ending — the runtime's decision about its own loop, not the
+// program's.
+private bool g_quitting
+private bool g_failed
+private i32  g_fail_code
+
+// Ask the loop to stop after this frame.
+void quit():
+    g_quitting = true
+
+// A backend's loop polls this to know when to stop. True when the program asked
+// **or** when a hook failed — a backend needs no second condition and no
+// knowledge that failures exist.
+bool quitting():
+    return g_quitting || g_failed
+
+// Record a failure raised by a hook or a service and stop the loop.
+//
+// **First code wins.** A failing `process` sets the code; the `shutdown` that
+// runs on the way out may fail too, and reporting the second would hand the
+// program the consequence instead of the cause.
+private void note_failure(i32 code):
+    if !g_failed:
+        g_failed = true
+        g_fail_code = code
+
+// Whether the last `run` ended in a failure, and the code it ended with. `0`
+// when nothing failed. A program does not normally ask — `run` fails with the
+// code and `main` answers it — but a test does.
+bool failed():
+    return g_failed
+
+i32 fail_code():
+    return g_fail_code
+
+// ── capability queries ──────────────────────────────────────────────────────
+bool supports(Capability cp):
+    return (u32(g_backend.caps) & u32(cp)) != 0
+
+// **`require(Capability, string)` was here and is deleted.** It `#panic`ed on a
+// missing capability and was written for "a subsystem calls this at its entry".
+// It was called from nowhere in the tree, and the reason is not that nobody got
+// round to it: there is exactly one capability-gated entry point in the whole
+// collection — `input.poll` — and it deliberately does the opposite, returning
+// 0 so that the same program runs headless and windowed with no branch in it.
+// That is the pattern this framework actually wants, and a `#panic` helper
+// sitting beside `supports` argued for the other one while honouring neither.
+// Restoring it costs five lines over `supports` if a subsystem is ever written
+// that genuinely has no empty answer to give.
+
+// ── the program's own state pointer (optional) ──────────────────────────────
+// In the singleton model a program usually keeps its state in its own package
+// scope; this is here for a library that must reach it through the app.
+private rawptr g_user
+void set_user(rawptr p): g_user = p
+rawptr user():           return g_user
+
+// ── the two allocators ─────────────────────────────────────────────────────
+//
+// **Two arenas, and which one is ambient depends on how often the hook runs.**
+// That is the whole rule and it is worth learning as one sentence:
+//
+//     a hook that runs ONCE allocates for the life of the program
+//     a hook that runs EVERY FRAME allocates for the life of the frame
+//
+//     ready, shutdown         →  using allocator()   the persistent arena
+//     process, draw           →  using temp()        the app's temp arena,
+//                                                    rolled back every frame
+//
+// The one allocator rule is *don't thread allocators as parameters; change the
+// ambient with `using`* — so the runtime opens the `using` and a program's
+// `#make`, `#new`, `#copy` and `#format` land in the right arena with nothing
+// written anywhere.
+//
+// ## Why per-frame is the default inside a per-frame hook
+//
+// **Because in a frame loop, per-frame allocation is the common case, and a
+// runtime should make the common case free and persistence the thing you write
+// down.** A `process` that formats a label, builds a candidate list, collects
+// contacts, sorts a visible set, measures a string — every one of those is
+// storage for this frame and nothing else, and every one of them is something
+// an author would otherwise have to remember to free, or to allocate through a
+// name they have to go and learn first. Under this arrangement they write
+// `#make` and it costs a pointer bump and is gone at the end of the tick.
+//
+// The other direction was written here for one milestone and it was the wrong
+// way round. It said the temp arena must never be ambient, because *"an
+// allocation that landed in it silently by way of being the default would be a
+// live reference to freed bytes one frame later"*. The hazard in that sentence
+// is real and is **not** retracted below — what was wrong was the conclusion.
+// It priced the rare mistake at the cost of making the common case ceremony, in
+// a package whose entire reason to exist is that the common case should be
+// free.
+//
+// ## The hazard, stated plainly, because it is accepted rather than avoided
+//
+// **A `#make` inside `process` that you store somewhere that outlives the frame
+// is a dangling reference on the next frame.** Nothing reports it. The bytes are
+// not freed to the heap — the arena keeps its blocks — so it is not a `free`
+// you can catch; the storage is handed to the *next* frame's allocations and
+// your reference quietly starts reading somebody else's data.
+//
+//     private ref []Enemy g_spawned            // package state: outlives the frame
+//
+//     !void process(f32 dt):
+//         g_spawned = #make([]Enemy, n)        // WRONG — gone at the end of this tick
+//
+// **What you write instead is one line, and it is visible where it matters.**
+// The precedence is *explicit argument > `using` > ambient*, so either of the
+// two upper levels takes it back:
+//
+//     !void process(f32 dt):
+//         using app.allocator():               // the whole suite is persistent
+//             g_spawned = #make([]Enemy, n)
+//
+//     !void process(f32 dt):
+//         g_spawned = #make([]Enemy, n, app.allocator())    // just this one
+//
+// An author who keeps a lot of persistent state in `process` is encouraged to
+// hold an allocator of their own — their own arena, their own pool — and open a
+// `using` of it; the runtime's persistent allocator is available for that and is
+// not special.
+//
+// ## Checkpoints, for the frame that allocates a lot and then stops
+//
+// The temp arena is rolled back once per frame, so its high-water mark is the
+// largest single frame the program ever has — and it keeps those blocks for the
+// rest of the run. One frame that builds a 40 MB intermediate makes the process
+// 40 MB resident for ever. `enter_temp` / `close_temp` is how an author takes
+// that back inside the frame:
+//
+//     using app.enter_temp():                  // opens a checkpoint AND installs it
+//         ref []Candidate c = #make([]Candidate, 500000)
+//         choose(c)
+//     app.close_temp()                         // rolls the arena back to here
+//
+// See the temp section below for the whole surface.
+//
+// ## What `app:draw` does about all this, which is nothing
+//
+// **`app:draw` mints its command tapes from the allocator it captured at
+// `draw.init`, not from the ambient at record time.** So `draw.rect(item, …)`
+// inside a `draw` hook records into storage that belongs to the drawing server
+// and outlives the frame exactly as the retained model requires — the ambient
+// being the temp arena there changes nothing about it. `draw.init` is called
+// from `surface_up`, which is inside `startup`, which is under the *persistent*
+// allocator; that is what makes the captured allocator the right one.
+//
+// That is also the reason `draw` is grouped with `process` and not with
+// `ready`. A draw hook's own allocations — a `#format`ed label, a temporary
+// point array, a measured run — are per-frame by nature, and the one thing in a
+// draw hook that has to outlive the frame does not go through the ambient at
+// all.
+//
+// `temp`       — the per-frame arena, rolled back every tick, ambient inside
+//                `process` and `draw`. Allocate freely, never free.
+// `allocator`  — the persistent, runtime-owned home for state that outlives a
+//                frame; ambient inside `ready` and `shutdown`; backed by
+//                core:mem/libc by default, swappable before `run`.
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data)   g_persistent
+private bool        g_persistent_ready
+private bool        g_running
+
+// The persistent allocator — and the ambient `#default` inside `ready` and
+// `shutdown`.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator():
+    if !g_persistent_ready:
+        g_persistent = libc.allocator()
+        g_persistent_ready = true
+    return g_persistent
+
+// Swap the persistent allocator. **Before `run`, and this now refuses
+// afterwards.**
+//
+// ## What changed, and why the refusal rather than a quiet swap
+//
+// The old comment said *"typically once, inside `ready`"*, and under a library
+// that a program drove, that was harmless: nothing read `allocator()` but the
+// program itself, so the swap took effect at the next call and nobody could
+// tell the difference.
+//
+// It is not harmless now. The runtime opens a `using allocator()` around each
+// of `startup`, `tick` and `teardown`, and a `using` binds the value it is
+// given at the top of its suite. A swap inside `ready` therefore leaves the
+// whole of `startup` — the root canvas, every item a program recorded, every
+// allocation `app:draw` made bringing itself up — in the **old** allocator, and
+// puts every later frame in the new one. Nothing dangles, both allocators are
+// live, and that is precisely the problem: the runtime's one promise is *your
+// allocations land in the runtime's allocator*, and after a mid-run swap that
+// sentence has two answers depending on which frame asked.
+//
+// **A `#panic` and not a `!`**, on the same grounds as `run`'s two panics: this
+// is a program calling a setup call after setup, which is a mistake with no
+// recovery and no caller to report to. A `!` would put a `try` on every correct
+// call site to carry a code that means *"you wrote this line in the wrong
+// place"*, which is a compile-time-shaped problem wearing a run-time answer.
+//
+// **The refusal is cheap and it is exact.** `g_running` goes true in `run`
+// before the loop is entered and false when it returns, and the first read of
+// `allocator()` is the `using` in `startup`, which is inside the loop. So the
+// line the panic refuses is exactly the line that would have been half-applied.
+void set_allocator((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a):
+    if g_running:
+        #panic("app.set_allocator: the runtime is already running and has installed its allocator — call set_allocator before run(), not from a hook")
+    g_persistent = a
+    g_persistent_ready = true
+
+// ── the app's temp arena ───────────────────────────────────────────────────
+//
+// ## It is the app's own, and `core:runtime`'s scratch is left alone
+//
+// **This package does not call `core:runtime` and must not start.** Not
+// `init_scratch`, not `enter_temp`, not `reset_scratch`, not `destroy_scratch`
+// — checked across the whole `app:` collection and there is not one call to
+// that package anywhere in it.
+//
+// The reason is ownership. `core:runtime`'s scratch is **the author's**: one
+// arena per thread, the main thread's being the one a program configures near
+// the top of `main` and uses for
+// its own temporaries, at its own depths, with its own reset points. A runtime
+// that quietly took a frame-sized checkpoint on it every tick would be sharing
+// a LIFO stack with the person holding the other end of it — `reset_scratch`
+// from a program would be refused (or deferred by `TEMP_GUARD`) because a scope
+// the *runtime* opened is still live, `temp_depth()` would never read what the
+// author expects, and the high-water mark an author is watching would be the
+// runtime's frame mixed with their own. So `app` brings its own arena and
+// `runtime.temp()` keeps meaning exactly what it meant before this package
+// existed.
+//
+// The cost of that is this section: about forty lines that look like
+// `core:runtime`'s. It is deliberate that they look like it — see the naming
+// note — and it is deliberate that they are fewer.
+//
+// ## What is mirrored, and what is deliberately not
+//
+// Mirrored, name for name, so that an author who knows one knows the other:
+// `temp()` (the arena as an allocator, no checkpoint), `enter_temp(escaping)`
+// (a checkpoint *and* the allocator, in one call, so a frame cannot be opened
+// and left uninstalled), `close_temp()`, `temp_used()`, `temp_depth()`.
+//
+// **Not mirrored: `TEMP_GUARD`, the deferral counter, the `Checkpoint` serials
+// and the hand-held `temp_open`/`temp_close` pair.** Those exist in
+// `core:runtime` to police a rollback that would free storage an outer scope is
+// still handing out, in an arena with no natural outer boundary. This one has
+// one: **the frame is the outermost checkpoint and it rolls back
+// unconditionally.** A hook that opens a temp frame and forgets to close it
+// cannot leak past the end of the tick, because `tick` resets the arena and
+// empties the stack whatever depth it is at — and says so, once, on the frame
+// it happened. That is the whole of what the guard machinery buys here, for one
+// `#expect` instead of a subsystem.
+//
+// **Also not mirrored: `init_scratch`.** There is nothing to configure and no
+// call to remember. The arena is made on first use and destroyed in `teardown`;
+// `core:mem/arena` asks its backing allocator for nothing until the first
+// allocation, so a program that never allocates a temporary pays five words.
+//
+// ## Naming: `temp` won, and `app.scratch()` is gone
+//
+// This surface used to be called `app.scratch()`, and adding `enter_temp` beside
+// it would have been two vocabularies for one arena. `temp` won on three counts.
+// Sam's words for it are *"the app's temp arena"*. `core:runtime` already splits
+// the two words and the split is meaningful there — *scratch* is the arena's
+// lifetime (`init_scratch`, `reset_scratch`, `destroy_scratch`) and *temp* is a
+// checkpointed region inside it (`temp()`, `enter_temp`, `close_temp`) — and
+// this package has no lifetime surface at all, only regions. And `temp` is what
+// the frame boundary actually does to it: it is rolled back, not freed.
+//
+// **`JobArgs.scratch` keeps its name and that is not an inconsistency.** It is a
+// different arena — one per worker thread, handed to a job explicitly, never the
+// ambient anywhere — and it is `core:jobs`' name for `core:jobs`' thing. The
+// name that moved is the one whose meaning moved.
+const i32 TEMP_DEPTH = 32
+
+private arena.Arena          g_temp_arena
+private bool                 g_temp_ready
+private [TEMP_DEPTH]arena.Mark g_temp_marks
+private i32                  g_temp_top
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) temp_alloc():
+    if !g_temp_ready:
+        g_temp_arena = arena.over(libc.allocator())
+        g_temp_ready = true
+    return arena.allocator(&g_temp_arena)
+
+// The app's temp arena, as an allocator. Already the ambient `#default` inside
+// `process` and `draw`, so a per-frame `#make` there needs none of this written;
+// this is for reaching it from somewhere else — a helper called outside a hook,
+// or an explicit `#make([]T, n, app.temp())` argument.
+//
+// **It opens no checkpoint.** Storage taken through this is reclaimed by the
+// frame boundary and by nothing else. `enter_temp` is the one that checkpoints.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) temp():
+    return temp_alloc()
+
+// Open a temp frame and install it: a checkpoint is taken and the arena is
+// answered, in one call, so there is no way to open a frame and forget to use
+// it.
+//
+//     using app.enter_temp():
+//         ref []Candidate c = #make([]Candidate, 500000)
+//         choose(c)
+//     app.close_temp()
+//
+// Nest these freely — each frame reclaims only its own temporaries. `escaping`
+// is for the one case where the *result* of the work lives in the arena and has
+// to outlive this frame: it opens no rollback, so `close_temp` unwinds the
+// bookkeeping and leaves the bytes for the enclosing frame — or, at the
+// outermost level, for the end of the tick. Do not reach for it to keep
+// ordinary temporaries alive; that only moves them up one level.
+//
+// **More than `TEMP_DEPTH` nested frames opens none** and reports it, rather
+// than writing past the stack. A depth of 32 inside one frame of one hook is a
+// missing `close_temp`, not a deep program.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) enter_temp(bool escaping = false):
+    bool room = g_temp_top < TEMP_DEPTH
+    if !#expect(room, "app.enter_temp: more than ", TEMP_DEPTH, " nested temp frames — opening none; look for a missing close_temp"):
+        return temp_alloc()
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = temp_alloc()
+    arena.Mark m = (nil, nil, 0)
+    if !escaping:
+        m = arena.begin(&g_temp_arena)
+    g_temp_marks[g_temp_top] = m
+    g_temp_top = g_temp_top + 1
+    return a
+
+// Close the innermost temp frame, rolling the arena back to where it was.
+// `false` when no frame is open.
+//
+// An escaping frame's mark names no arena, and `arena.end` on one is a no-op by
+// construction — which is why there is no second array of `escaping` bits here
+// the way `core:runtime` needs one: the zero `Mark` *is* the "leave the bytes"
+// instruction.
+bool close_temp():
+    if g_temp_top == 0:
+        return false
+    g_temp_top = g_temp_top - 1
+    arena.end(g_temp_marks[g_temp_top])
+    return true
+
+// How many bytes the temp arena is holding. `0` at the top of every frame,
+// because `tick` rolls it back at the bottom of the last one.
+u64 temp_used():
+    if !g_temp_ready:
+        return 0
+    return arena.used(g_temp_arena)
+
+// How many temp frames are open. `0` everywhere a correct program can observe
+// it, since the frame boundary empties the stack.
+i32 temp_depth():
+    return g_temp_top
+
+// The frame boundary: roll the whole arena back and empty the checkpoint stack.
+// Called from `tick` and from nowhere else.
+//
+// **It does not care what depth it is at**, and that is the property that makes
+// the rest of this section short. A hook that opened a temp frame and returned
+// without closing it has its storage reclaimed here anyway; what it gets is one
+// report naming the depth, on the frame it happened, rather than an arena that
+// grows for the rest of the run.
+private void temp_frame_reset():
+    if !g_temp_ready:
+        return
+    bool balanced = g_temp_top == 0
+    #expect(balanced, "app: a hook left ", g_temp_top, " temp frame(s) open at the end of the frame — every app.enter_temp() wants an app.close_temp(). The frame boundary reclaimed them anyway.")
+    g_temp_top = 0
+    arena.reset(&g_temp_arena)
+
+// ── the job system ─────────────────────────────────────────────────────────
+// The job surface, delegated to a core:jobs Scheduler the app owns. The engine
+// is pooled when the backend advertises `Threads` (real worker threads) and
+// serial otherwise (every job inline) — the same code either way. The
+// scheduler is started in `startup` and stopped in `teardown`; its per-worker
+// scratch arenas reset with the frame (`tick`).
+//
+// `JobArgs`/`JobFn`/`Handle` are re-exposed here so a program writes `app.*`. The
+// arg/fn shapes are structurally identical to core:jobs' (names are not part of a
+// type), so a program's `app.JobFn` reaches the pool with no conversion; `Handle`
+// is nominal, so it is carried across as its underlying `i32`.
+//
+// **Job concurrency contract** (see core:jobs): the ambient allocator is per
+// thread, so a job's bare `#make` reads its worker's `#default` — the heap —
+// and its temporaries go in `using ja.scratch:`, the worker's own arena, reset
+// with the frame. **The runtime's `using` does not reach a worker thread**: it
+// changes the ambient on the thread that opened it, and a job runs somewhere
+// else.
+type JobArgs: (
+    i32       worker,
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) scratch,
+    i32       begin,
+    i32       end,
+    rawptr    data,
+)
+
+type JobFn: void(^JobArgs)
+
+distinct type Handle: i32
+
+private jobs.Scheduler g_sched
+private bool           g_sched_started
+
+// Start the scheduler once: pooled if the backend advertises `Threads`, else
+// serial. Called from `startup`, after the backend (and its caps) are installed.
+private void sched_start():
+    if g_sched_started:
+        return
+    i32 nt = 0
+    if supports(Capability.Threads):
+        nt = threads.hardware_concurrency() - 1
+        if nt < 1:
+            nt = 1
+    _ = jobs.start(&g_sched, nt)
+    g_sched_started = true
+
+// Submit one job. Returns a handle to wait on (`wait`); a job hands its result
+// back by emitting it into a signal the program drains in `process` (see
+// `core:jobs`' header).
+Handle submit(JobFn fn, rawptr data):
+    return Handle(i32(jobs.submit(&g_sched, fn, data)))
+
+// Submit `fn` to run after `dep`.
+Handle submit_after(JobFn fn, rawptr data, Handle dep):
+    return Handle(i32(jobs.submit_after(&g_sched, fn, data, jobs.Handle(i32(dep)))))
+
+// Fork-join over [0, n) in `grain`-sized chunks; joins before returning.
+void parallel_for(i32 n, i32 grain, JobFn fn, rawptr data):
+    jobs.parallel_for(&g_sched, n, grain, fn, data)
+
+// Cooperatively wait for a handle.
+void wait(Handle h):
+    jobs.wait(&g_sched, jobs.Handle(i32(h)))
+
+// ── frame steps a backend calls ─────────────────────────────────────────────
+//
+// The backend owns the loop shape (sokol's `sapp_run` owns it and calls back;
+// `app:headless` writes a plain `for`); these three are the fixed lifecycle it
+// drives, and **none of them is failable**.
+//
+// ## How a hook's failure reaches `main`, through a C loop that cannot carry it
+//
+// This is the one genuinely awkward part of the design and it is awkward for a
+// reason no amount of arranging removes: under `app:graphical` the frame loop
+// is *inside* `sapp_run`. The call stack at the moment a hook fails is
+//
+//     main → run → sapp_run → _sapp_frame → display's frame_cb → _frame → tick → process
+//                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ C
+//
+// and a Dado failure has no way to unwind through those C frames. Worse, the
+// three callbacks it would have to unwind *to* are `display.Hooks` slots typed
+// `void()` and `void(f32)` — C function pointers sokol holds — so they could
+// not carry a `!` even if C could carry the failure.
+//
+// So the failure is **recorded and re-raised**, in three steps:
+//
+//   1. `startup`, `tick` and `teardown` are the public, **non-failable** entries
+//      a backend calls. Each is a `try` over the failable body beside it, with
+//      an `else` that hands the code to `note_failure`. The catch lives here and
+//      not in each backend so that a backend cannot forget it and a third
+//      backend inherits it by doing nothing.
+//   2. `note_failure` stores the first code and makes `quitting()` true. The
+//      backend's loop already polls `quitting()` — `app:headless` in its `for`
+//      condition, `app:graphical` in `_frame`, where it calls
+//      `display.request_close()` — so the loop stops by the road it already had,
+//      and neither backend needed a line for this.
+//   3. `run` is failable. It clears the flag, hands the loop to the backend, and
+//      when the loop returns — through however many C frames — it fails with the
+//      recorded code.
+//
+// **What this costs: a failing hook does not stop the frame it is in at the
+// instruction that failed.** It stops the *frame*. The bracket is still closed
+// (an unbalanced `sg_begin_pass` is a validation error and a lost swapchain
+// image), the temp arena is still rolled back, the input frame is still ended,
+// and only then does `tick` fail. The frame after it does nothing at all — `run_frame`
+// returns on `g_failed` before it touches a hook — and the loop exits on the
+// next poll. So the worst case is one extra frame's worth of nothing between
+// the failure and the exit, which is the price of the pass staying balanced.
+//
+// **What it does not cost: nothing is lost.** The code a hook failed with is
+// the code `main` gets, and `!i32 main()` makes that the process exit status
+// (measured: a hook failing with 7 exits 7).
+
+// Once, at the top of the loop: the job pool, the drawing surface, the `ready`
+// hook.
+//
+// **Under `using allocator()` — the persistent arena — and every word of that
+// is load-bearing.** `ready` is where a program builds the things that have to
+// still be there on frame 900: its canvas items, its level, its tables. A
+// canvas item created into a per-frame arena is the worst version of the
+// dangling-reference hazard the allocator section describes, because it does
+// not look like an allocation at the call site at all. `surface_up` is under
+// the same `using` for the same reason one level down: `draw.init` captures the
+// ambient and mints every command tape from it for the whole run.
+void startup():
+    try run_startup() else code:
+        note_failure(code)
+
+private !void run_startup():
+    using allocator():
+        sched_start()
+        if g_backend.surface_up != nil:
+            try g_backend.surface_up()
+        if g_ready != nil:
+            try g_ready()
+
+// One frame. **One shape, for every program.**
+//
+//     deliver
+//     · [ using temp():  process · [ begin_frame · draw · render · end_frame ] ]
+//     · temp rollback · job scratch reset · end_input
+//
+// Step by step, and every step is here rather than in a backend:
+//
+//   0. **`deliver`** — the frame's one drain point. What another thread or the
+//      backend's event read queued since the last frame is taken, here and
+//      nowhere else in the frame, so `process` works on a snapshot that
+//      nothing changes under it.
+//   1. **`process`**, outside the pass, always. Simulation, input drain, file
+//      writes, anything at all.
+//   2. **`begin_frame`** — the backend's pass bracket opens, if this frame
+//      draws. `redraw_pending()` decides, and it is unconditionally true unless
+//      the program asked for on-demand redrawing.
+//   3. **the `draw` hook**, inside the pass, if the program named one. This is
+//      where a program *records* into the canvas tree.
+//   4. **`render`** — the runtime draws its own root canvas.
+//   5. **`end_frame`** — the bracket closes and the frame is presented.
+//   6. **the resets** — the temp arena is rolled back and its checkpoint stack
+//      emptied, then the job pool's per-worker scratch. After the bracket, so a
+//      hook may allocate temporaries while drawing.
+//   7. **`end_input`** — `input.clear_edges()`, outside the bracket so that a
+//      skipped frame still ends its input frame.
+//
+// ## Why the frame drains at one point, and why it is before `process`
+//
+// **A signal has one consumer thread for its life, and a frame is where that
+// thread already is.** Queued input is a signal (`app:input`'s
+// `input_events`): the backend emits into it outside the frame barrier and
+// the frame takes it. Taking it at one fixed step — before `process`, on
+// every frame, drawn or skipped — is what makes the frame thread the consumer
+// by construction rather than by each program's care, and what makes a
+// `process` that polls until it answers 0 end however fast a producer runs:
+// everything emitted after step 0 waits for the next frame's. It is the
+// native counterpart of the web glue's check points, and the point a
+// script's signal delivery joins when there is one.
+//
+// A program's own signals — a job's results, a worker's records — are drained
+// by the program, in `process`, which is the same thread; the runtime has no
+// way to name them and does not try.
+//
+// ## Steps 1 to 5 run under `using temp()`
+//
+// The `using` covers the whole of the frame's work and nothing else: it opens
+// above `process` and closes below `end_frame`, so **`process` and `draw` — the
+// two hooks that run every frame — have the temp arena as their ambient
+// `#default`**, and the rollback in step 6 is outside it. The argument for
+// per-frame being the default there, the dangling-reference hazard it accepts,
+// and the one line an author writes when something has to outlive the frame,
+// are all in the allocator section above.
+//
+// The three steps between the hooks are under it too and none of them cares:
+// `begin_frame` and `end_frame` are pass calls, and `render` walks the canvas
+// tree and grows `app:draw`'s own paint run, which is a `#resize` through the
+// allocator that run already carries rather than through the ambient.
+//
+// **Step 6 is deliberately outside the `using`.** It is the boundary, not part
+// of the frame, and it has to run at a point where nothing is still holding the
+// arena as its default — including on the path where a hook failed, which is
+// why it sits below the `using` rather than as its last statement.
+//
+// ## Why `render` comes after the draw hook and not before
+//
+// **Because `app:draw` is retained and recording is not drawing.** A
+// `draw.rect` call appends to an item's command tape; `draw.canvas_render` is
+// what walks the tree and issues. So a hook that re-records an item this frame
+// and a render that ran *before* it would put this frame's change on screen
+// **next** frame — a one-frame lag that is invisible in a still picture and
+// reads as input latency the moment anything moves. Hook first, render second,
+// and what a program recorded this frame is what it sees this frame.
+//
+// **What that costs is z-order for a hook that bypasses the canvas.** A draw
+// hook issuing its own `sokol_gp` commands is drawn *under* the runtime's
+// canvas, because its commands are recorded into the pass first. A program that
+// wants to paint over the canvas does it the way the canvas model already
+// provides — record into an item with a higher `z_index` — and a program that
+// genuinely cannot is a program that wanted its own render order, which is the
+// case the package comment sends to `app:display` and `app:draw` directly.
+//
+// ## Why `end_input` is the last statement of the frame
+//
+// `app:input`'s own prose asks for `clear_edges` at **one end** of the frame,
+// and names what goes wrong otherwise: a second call inside a frame drops the
+// edges set between the two and does it silently. It was the program's call and
+// the owner's instruction is that it should not be, so it is the runtime's now.
+//
+// **The end and not the beginning, and the difference is a whole frame of
+// input.** Under sokol the event callbacks for a frame run *before* that
+// frame's frame callback — sokol drains its event queue, then calls the frame
+// function. Clearing at the top of `tick` would therefore wipe the edges that
+// this frame's events have just latched, before `process` ever looks at them: a
+// key tapped between two frames would be observable by nothing. Clearing at the
+// bottom puts the line between frames where the backend already puts it, so a
+// frame's pushes fall entirely inside the next frame.
+//
+// **A program must not also call `input.clear_edges()`.** Not "should not" —
+// the runtime cannot stop it and `app:input` cannot tell who is calling, so
+// this is a rule rather than a refusal. What goes wrong is specific: a program
+// clearing at the end of its own `process` drops the edges before its `draw`
+// hook runs, so any `key_pressed` read from `draw` is false for ever, on a line
+// that is correct in every other respect. `clear_keys()` — the levels, not the
+// edges — is still the program's and is untouched by any of this.
+void tick(f32 dt):
+    try run_frame(dt) else code:
+        note_failure(code)
+
+private !void run_frame(f32 dt):
+    // A frame after a failure does nothing at all. The loop has been asked to
+    // stop and has not got there yet; running a program's hooks in between
+    // would be running them after the runtime already gave up on them.
+    if g_failed:
+        return
+    // Step 0: the one drain point, before anything the program runs.
+    if g_backend.deliver != nil:
+        g_backend.deliver()
+    i32 hurt = 0
+    // Steps 1–5, with the temp arena as the ambient `#default`.
+    using temp():
+        if g_process != nil:
+            try g_process(dt) else code:
+                hurt = code
+        g_drew = false
+        if hurt == 0:
+            g_drew = redraw_pending()
+            g_redraw = false
+            if g_drew:
+                if g_backend.begin_frame != nil:
+                    g_backend.begin_frame()
+                if g_draw != nil:
+                    try g_draw() else code:
+                        hurt = code
+                // A half-recorded tree is not a picture, so a failing draw hook
+                // skips the render — but never the `end_frame` below it.
+                if hurt == 0 && g_backend.render != nil:
+                    g_backend.render()
+                if g_backend.end_frame != nil:
+                    g_backend.end_frame()
+    // Step 6, outside it: the boundary is not part of the frame.
+    temp_frame_reset()
+    if g_sched_started:
+        jobs.reset_scratch(&g_sched)
+    if g_backend.end_input != nil:
+        g_backend.end_input()
+    if hurt != 0:
+        fail hurt
+
+// Once, at the bottom of the loop: the `shutdown` hook, the drawing surface,
+// the job pool, the temp arena.
+//
+// **Under `using allocator()`, with `ready`**, and for the matching reason: a
+// `shutdown` hook is releasing things that were built persistently and may
+// build one last persistent thing on the way out — a report, a saved file's
+// buffer — and the temp arena is destroyed three lines later, so it is not a
+// place to be allocating into. The rule stays the one sentence: a hook that
+// runs once allocates for the life of the program.
+//
+// **Everything here runs even when the run is already failing**, and the
+// `shutdown` hook is included. A release path that only runs when nothing went
+// wrong is not a release path, and the frame this is unwinding from is exactly
+// the one a program most wants its own cleanup to see. `note_failure` keeps the
+// first code, so a `shutdown` that fails on the way out of a failing run
+// reports the cause rather than the consequence.
+void teardown():
+    try run_teardown() else code:
+        note_failure(code)
+
+private !void run_teardown():
+    using allocator():
+        i32 hurt = 0
+        if g_shutdown != nil:
+            try g_shutdown() else code:
+                hurt = code
+        if g_backend.surface_down != nil:
+            g_backend.surface_down()
+        if g_sched_started:
+            jobs.stop(&g_sched)
+            g_sched_started = false
+        if g_temp_ready:
+            arena.destroy(&g_temp_arena)
+            g_temp_ready = false
+            g_temp_top = 0
+        if hurt != 0:
+            fail hurt
+
+// Run the app: hand the loop to the backend, which calls the frame steps above.
+//
+// ## Failable now, and the old argument for `void` is what made it so
+//
+// This used to be `void`, and the argument was *"a `?` here would be a mark on
+// a function with nothing to report"* — every caller writes `try`, no caller can
+// ever observe it. **That argument was right and it is why the mark is here
+// now**: there is something to report. A hook can fail, its code is recorded
+// while the loop is inside C, and this is the one call that is still on the
+// stack when the loop comes back. Nothing else can carry it.
+//
+// The two `#panic`s stay panics and are not folded into the `!`. They are
+// reached by a program that imported the core directly and skipped its facade's
+// `init`, which is a mistake with no recovery and no caller to report to — the
+// panic names the repair. A code for *"you forgot a line"* would be a
+// compile-time-shaped problem wearing a run-time answer, and it would sit in the
+// same `else` arm as a program's own genuine failures.
+//
+// **The flag is cleared here and not in `note_failure`'s caller**, which is what
+// makes a failing run survivable: a second `run` in the same process starts
+// clean. The program's own `quit()` deliberately does not — see the stopping
+// section above.
+!void run():
+    if !g_backend_set:
+        #panic("app.run: no backend installed — call a facade's init() first (app:graphical.init, app:headless.init)")
+    if g_backend.run == nil:
+        #panic("app.run: the installed backend has no run — a Backend's `run` is the loop and may not be nil")
+    g_failed = false
+    g_fail_code = 0
+    g_running = true
+    g_backend.run()
+    g_running = false
+    if g_failed:
+        fail g_fail_code

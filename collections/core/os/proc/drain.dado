@@ -1,0 +1,124 @@
+// core:os/proc — reading from a child without waiting for it.
+//
+// `read` hands back a `^io.FILE` and every way of reading one blocks: a program
+// that also has to draw, service a socket or watch a clock has nowhere to put
+// that work while a compiler is thinking. This is the other half — *whatever
+// the child has written so far*, and a timeout instead of a wait.
+//
+//     ^io.FILE p = proc.read(cstring("dadoc --emit=c app 2>&1"))
+//     [4096]char8 chunk
+//     for building:
+//         i32 n = proc.drain(p, chunk[:], 30)
+//         if n > 0: absorb(chunk[0..<n])
+//         if n == 0: break                    // end of output
+//         draw_the_ui()
+//     (bool exited, i32 status) = proc.close(p)
+//
+// **`poll` and not `select`.** `select` needs an `fd_set`, whose layout is the
+// platform's and which therefore cannot be declared here — that is the storage
+// problem that puts a `.c` file beside a package, and this package deleted its
+// own on purpose. `struct pollfd` is three members POSIX fixes the meaning of,
+// so it is a *transparent* foreign type: Dado restates the layout, the emitter
+// writes size and offset assertions beside it, and the C compiler proves them.
+// A restatement that is wrong is a build error naming the field.
+//
+// **Do not mix `drain` with `io.read_line` on one stream.** `drain` reads the
+// descriptor under the `FILE`, and stdio's buffer knows nothing about that, so
+// bytes one of them takes the other will never see. Pick one per stream. The
+// `FILE` is still what `close` wants, because the exit status lives there.
+package proc
+
+import "core:io"
+
+// What `drain` answers when it did not read anything, told apart. A caller that
+// treats every non-positive answer as "done" busies out on a timeout and hangs
+// on an error, which is why these are three values and not one.
+const i32 DRAINED = 0                // the child closed its end: no more output
+const i32 WAITED = 0 - 1             // the timeout expired with nothing ready
+const i32 BROKE = 0 - 2              // the read failed, or there is no stream
+
+// The same answer for a bare descriptor, which is what `drain` does once it has
+// one and what `receive` in `duplex.dado` does with the pipes it made itself —
+// there is one poll-then-read in this package and both callers go through it.
+//
+// **One read is capped at `READ_CAP` bytes** so the count always fits the
+// `i32` it is answered in; a larger `into` is filled over several calls, which
+// is what a caller looping on `drain` already does.
+private const i64 READ_CAP = 1073741824     // 2^30
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+//
+// The `FILE`'s descriptor, the handle under it, and `windows.dado`'s
+// `drain_handle`: `PeekNamedPipe` for the wait, since an anonymous pipe's
+// handle cannot be waited on, and one `ReadFile` of what the peek saw. The
+// warning above about mixing `drain` with `io.read_line` holds here too.
+when #OS == #WINDOWS:
+    i32 drain(^io.FILE stream, []char8 into, i32 timeout_ms = 0):
+        if stream == nil: return BROKE
+        return drain_handle(handle_of(_fileno(stream)), into, timeout_ms)
+
+// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+else:
+    // `fileno` is POSIX rather than C11, so it needs the feature-test macro — and a
+    // macro is emitted above every `#include`, because `<features.h>` fixes the
+    // whole feature set the first time any header pulls it in.
+    private foreign "stdio.h" define "_POSIX_C_SOURCE=200809L":
+        i32 fileno(^io.FILE stream)
+
+    // Bound as `sys`, because this package already declares a `read` — the one
+    // that starts a command. A binding is what keeps one name from having to be two
+    // things; the emitted C is still the bare identifier. `ssize_t` and `size_t`
+    // are written `#c.long` and `#c.size_t`, not `i64` and `u64`: the emitter
+    // asserts the declaration's C type, and Darwin's `int64_t` is `long long`
+    // where its `ssize_t` is `long`. On glibc the spellings are one type.
+    private foreign sys "unistd.h" define "_POSIX_C_SOURCE=200809L":
+        #c.long read(i32 fd, rawptr buf, #c.size_t count)
+
+    // `nfds_t` is `unsigned long` on glibc and `unsigned int` on Darwin. A
+    // restatement has to be true on the platform it is compiled for, and this is
+    // the one construct that says so — the untaken arm is parsed and nothing else.
+    // **`PollFd=struct pollfd` is not a trick, it is what `define` is for.**
+    // POSIX declares a *tagged* struct and no typedef, and a `foreign` type emits
+    // under the name it was written with — so there is no spelling of `struct
+    // pollfd` for Dado to use. A `define` clause is emitted above every `#include`,
+    // so the name Dado writes expands to the name C has, and the layout assertions
+    // the emitter puts beside it are assertions about the real struct.
+    when #OS == #DARWIN:
+        private foreign "poll.h" define "PollFd=struct pollfd":
+            type PollFd: (i32 fd, i16 events, i16 revents)
+            i32 poll(^PollFd fds, u32 nfds, i32 timeout)
+    else:
+        private foreign "poll.h" define "_POSIX_C_SOURCE=200809L" define "PollFd=struct pollfd":
+            type PollFd: (i32 fd, i16 events, i16 revents)
+            i32 poll(^PollFd fds, u64 nfds, i32 timeout)
+
+    private const i16 POLL_IN = 1        // POLLIN
+
+    // Read whatever `stream` has written, waiting at most `timeout_ms`.
+    //
+    // Answers the byte count, or one of `DRAINED` / `WAITED` / `BROKE`. A negative
+    // `timeout_ms` waits indefinitely, which is `io.read_line` with a different
+    // buffer and is here only so a caller can say so rather than switching APIs.
+    i32 drain(^io.FILE stream, []char8 into, i32 timeout_ms = 0):
+        if stream == nil: return BROKE
+        return drain_fd(fileno(stream), into, timeout_ms)
+
+    private i32 drain_fd(i32 fd, []char8 into, i32 timeout_ms):
+        if fd < 0: return BROKE
+        i64 cap = #len(into)
+        if cap <= 0: return BROKE
+        if cap > READ_CAP: cap = READ_CAP
+
+        PollFd one = (fd, POLL_IN, 0)
+        i32 ready = poll(&one, 1, timeout_ms)
+        if ready == 0: return WAITED
+        // An interrupted wait ended early rather than failed: report it as a
+        // timeout so the caller's loop goes round and re-checks whatever else it
+        // was watching. There is no `errno` here to tell EINTR from a real failure,
+        // and treating a rare early return as a timeout costs one more pass.
+        if ready < 0: return WAITED
+
+        i64 got = i64(sys.read(fd, rawptr(&into[0]), #c.size_t(cap)))
+        if got < 0: return BROKE
+        if got == 0: return DRAINED
+        return i32(got)

@@ -1,0 +1,211 @@
+@test
+// core:http/server — the parser, the router and the responses, end to end
+// through `App.handle` (bytes in, bytes out, no socket), then one real round
+// trip over loopback with `curl`, wall-clock bounded as `core:http`'s test is.
+package server
+
+import "core:strings"
+import "core:runtime"
+import "core:os/proc"
+import "core:io"
+import "core:time"
+
+// ── the handlers the tests route to ─────────────────────────────────────────
+
+private Response index(Request req):
+    return html("<h1>hello</h1>")
+
+private Response user(Request req):
+    return text(#format("user ", req.param("id"), " tab ", req.query("tab", "none")))
+
+private Response file_path(Request req):
+    return text(req.param("rest"))
+
+private Response echo(Request req):
+    return json(#format("{\"name\": \"", req.form("name"), "\", \"type\": \"",
+                        req.header("CONTENT-TYPE"), "\"}"), 201)
+
+private Response moved(Request req):
+    return redirect("/").with_header("X-Why", "moved")
+
+private Response missing(Request req):
+    return text(#format("nothing at ", req.path), 404)
+
+private void stream(Request req, ^Writer w):
+    w.set_status(202)
+    w.header("Content-Type", "text/event-stream")
+    for i in 0..<3:
+        _ = w.write(#format("data: ", i, "\n\n"))
+
+private App routes():
+    App a = app()
+    a.quiet = true
+    a.get("/", index)
+    a.get("/users/{id}", user)
+    a.get("/files/{rest...}", file_path)
+    a.post("/echo", echo)
+    a.get("/old", moved)
+    a.raw("GET", "/events", stream)
+    return a
+
+// The response to `raw`, as text.
+private string8 ask(^App a, string8 raw):
+    ref []char8 out = a.handle(raw)
+    string8 s = out
+    return s
+
+private bool has(string8 s, string8 part):
+    return strings.contains(s, part)
+
+i32 test():
+    bool ok = true
+    using runtime.enter_temp():
+        App a = routes()
+
+        // A page.
+        string8 r = ask(&a, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 200 OK\r\n"), "GET / is 200: ", r) && ok
+        ok = #expect(has(r, "Content-Type: text/html; charset=utf-8\r\n"), "html content type: ", r) && ok
+        ok = #expect(has(r, "Content-Length: 14\r\n"), "its length: ", r) && ok
+        ok = #expect(strings.ends_with(r, "\r\n\r\n<h1>hello</h1>"), "its body: ", r) && ok
+
+        // A capture, and a query decoded on asking.
+        r = ask(&a, "GET /users/42?tab=a%20b+c HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.ends_with(r, "user 42 tab a b c"), "param and query: ", r) && ok
+        r = ask(&a, "GET /users/7/ HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.ends_with(r, "user 7 tab none"), "trailing slash, query fallback: ", r) && ok
+
+        // The rest of the path.
+        r = ask(&a, "GET /files/a/b/c.txt HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.ends_with(r, "\r\n\r\na/b/c.txt"), "{rest...}: ", r) && ok
+
+        // A form body, a header asked in another case, a status argument.
+        r = ask(&a, "POST /echo HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 13\r\n\r\nname=Sam+M%2E")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 201 Created\r\n"), "201: ", r) && ok
+        ok = #expect(has(r, "{\"name\": \"Sam M.\", \"type\": \"application/x-www-form-urlencoded\"}"), "form and header: ", r) && ok
+
+        // Chaining.
+        r = ask(&a, "GET /old HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 302 Found\r\n"), "redirect: ", r) && ok
+        ok = #expect(has(r, "Location: /\r\n") && has(r, "X-Why: moved\r\n"), "with_header: ", r) && ok
+
+        // HEAD is a GET without its body.
+        r = ask(&a, "HEAD / HTTP/1.1\r\n\r\n")
+        ok = #expect(has(r, "Content-Length: 14\r\n") && strings.ends_with(r, "\r\n\r\n"), "HEAD: ", r) && ok
+
+        // The wrong method is 405 naming the right one; no route is 404.
+        r = ask(&a, "DELETE /echo HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 405 ") && has(r, "Allow: POST\r\n"), "405: ", r) && ok
+        r = ask(&a, "GET /nope HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 404 Not Found\r\n"), "404: ", r) && ok
+        a.on_not_found(missing)
+        r = ask(&a, "GET /nope HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.ends_with(r, "nothing at /nope"), "fallback: ", r) && ok
+
+        // A raw route streams with no length.
+        r = ask(&a, "GET /events HTTP/1.1\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 202 Accepted\r\n"), "raw status: ", r) && ok
+        ok = #expect(has(r, "Content-Type: text/event-stream\r\n") && !has(r, "Content-Length"), "raw head: ", r) && ok
+        ok = #expect(strings.ends_with(r, "data: 0\n\ndata: 1\n\ndata: 2\n\n"), "raw body: ", r) && ok
+
+        // Malformed requests.
+        r = ask(&a, "nonsense\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 400 "), "400: ", r) && ok
+        r = ask(&a, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        ok = #expect(strings.starts_with(r, "HTTP/1.1 501 "), "chunked is 501: ", r) && ok
+
+        // The pieces on their own.
+        (bool hit, ref []Header ps) = match("/a/{x}/c", "/a/b/c")
+        ok = #expect(hit && #len(ps) == 1 && ps[0].value == "b", "match") && ok
+        (bool miss, ref []Header _) = match("/a/{x}/c", "/a/b")
+        ok = #expect(!miss, "a short path does not match") && ok
+        ok = #expect(decode("%41%2b+%zz") == "A+ %zz", "decode: ", decode("%41%2b+%zz")) && ok
+        ok = #expect(content_type("app.WASM") == "application/wasm", "content type") && ok
+        ok = #expect(escape("<a href='x'>&\"</a>") == "&lt;a href=&#39;x&#39;&gt;&amp;&quot;&lt;/a&gt;", "escape: ", escape("<a href='x'>&\"</a>")) && ok
+        ok = #expect(escape("plain") == "plain", "escape leaves plain text") && ok
+        (i64 total, bool known) = expected_size("POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\nab")
+        ok = #expect(known && total == 43, "expected size: ", total) && ok
+
+        a.header("Cache-Control", "no-store")
+        r = ask(&a, "GET / HTTP/1.1\r\n\r\n")
+        ok = #expect(has(r, "\r\nCache-Control: no-store\r\n"), "an app header on a response: ", r) && ok
+        r = ask(&a, "GET /events HTTP/1.1\r\n\r\n")
+        ok = #expect(has(r, "\r\nCache-Control: no-store\r\n"), "and on a raw route's head: ", r) && ok
+        r = ask(&a, "GET /nope HTTP/1.1\r\n\r\n")
+        ok = #expect(has(r, "\r\nCache-Control: no-store\r\n"), "and on the fallback: ", r) && ok
+
+        ok = static_files() && ok
+        ok = round_trip() && ok
+        a.destroy()
+    _ = runtime.close_temp()
+    return 0 if ok else 1
+
+// ── static files ────────────────────────────────────────────────────────────
+
+private const cstring DIR = "/tmp/dado-server-test"
+
+private bool put_file(cstring path, cstring text):
+    ^io.FILE f = io.open_write(path)
+    if !io.opened(f):
+        return false
+    _ = io.write(f, text)
+    _ = io.close(f)
+    return true
+
+private bool static_files():
+    bool ok = true
+    (bool made, i32 st) = proc.run("mkdir -p /tmp/dado-server-test/sub")
+    ok = #expect(proc.ok(made, st), "made the directory") && ok
+    ok = #expect(put_file("/tmp/dado-server-test/index.html", "<p>root</p>"), "wrote index.html") && ok
+    ok = #expect(put_file("/tmp/dado-server-test/sub/app.css", "p{}"), "wrote app.css") && ok
+    ok = #expect(put_file("/tmp/dado-server-secret", "secret"), "wrote a file outside") && ok
+
+    App a = app()
+    a.quiet = true
+    a.files("/static", "/tmp/dado-server-test")
+    string8 r = ask(&a, "GET /static/sub/app.css HTTP/1.1\r\n\r\n")
+    ok = #expect(has(r, "Content-Type: text/css; charset=utf-8\r\n") && strings.ends_with(r, "p{}"), "a file: ", r) && ok
+    r = ask(&a, "GET /static/ HTTP/1.1\r\n\r\n")
+    ok = #expect(strings.ends_with(r, "<p>root</p>"), "a directory's index.html: ", r) && ok
+    r = ask(&a, "GET /static/sub HTTP/1.1\r\n\r\n")
+    ok = #expect(strings.starts_with(r, "HTTP/1.1 301 ") && has(r, "Location: /static/sub/\r\n"), "a directory without its slash redirects: ", r) && ok
+    r = ask(&a, "GET /static HTTP/1.1\r\n\r\n")
+    ok = #expect(strings.starts_with(r, "HTTP/1.1 301 ") && has(r, "Location: /static/\r\n"), "the prefix itself redirects to its slash: ", r) && ok
+    r = ask(&a, "GET /static/../dado-server-secret HTTP/1.1\r\n\r\n")
+    ok = #expect(strings.starts_with(r, "HTTP/1.1 404 "), "`..` cannot climb out: ", r) && ok
+    r = ask(&a, "GET /static/%2e%2e/dado-server-secret HTTP/1.1\r\n\r\n")
+    ok = #expect(strings.starts_with(r, "HTTP/1.1 404 "), "nor `..` encoded: ", r) && ok
+    r = ask(&a, "GET /static/none.txt HTTP/1.1\r\n\r\n")
+    ok = #expect(strings.starts_with(r, "HTTP/1.1 404 "), "a missing file: ", r) && ok
+    a.destroy()
+    return ok
+
+// ── over a real socket ──────────────────────────────────────────────────────
+
+private const u16 PORT = 18974
+
+private bool round_trip():
+    bool ok = true
+    App a = routes()
+    ok = #expect(a.listen(PORT), "listen on ", i32(PORT)) && ok
+    if !a.listening:
+        return false
+    ok = #expect(!a.step(), "no client: step answers nothing") && ok
+
+    ^io.FILE cli = proc.read(
+        "curl -s --retry 3 --retry-delay 1 --retry-connrefused 'http://127.0.0.1:18974/users/9?tab=x' 2>/dev/null")
+    ok = #expect(proc.opened(cli), "curl launched") && ok
+    f64 t0 = time.now()
+    bool served = false
+    for time.since(t0) < 5.0 && !served:
+        if a.step():
+            served = true
+        else:
+            time.nap(5)
+    ok = #expect(served, "answered within 5s") && ok
+    (cstring got, bool read) = io.read_line(cli)
+    ok = #expect(read && strings.borrow_from_cstring(got) == "user 9 tab x",
+                 "curl read the body: ", strings.borrow_from_cstring(got)) && ok
+    _ = proc.close(cli)
+    a.destroy()
+    return ok

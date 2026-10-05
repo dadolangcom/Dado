@@ -1,0 +1,646 @@
+// `tools/doc`'s command line.
+//
+// **Four commands and they are two pairs.** `scan` and `weave` are the halves
+// the checks need separately — one produces records, the other consumes them —
+// and `build` is the two run together for somebody who only wants the
+// document. `bare` is the fourth because a stranger pointed at their own
+// package has no spine and should not have to write one before they see
+// anything.
+//
+// Arguments are positional and there is one flag. That is not minimalism for
+// its own sake: this program is invoked by `./dado doc` far more often than by
+// a person, and a driver passing four positional arguments cannot get an
+// option order wrong.
+package doc
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "core:mem/arena"
+import "core:mem/libc"
+
+// The extension of the language's source: what `--ext` reads by default, and
+// what each fence's sample is written out as.
+private const string8 DEFAULT_EXT = ".dado"
+
+private void usage():
+    fmt.println("dado doc — documentation scanned out of the code that implements it")
+    fmt.println("")
+    fmt.println("usage:")
+    fmt.println("    doc scan  <root> <records>              write one record per block")
+    fmt.println("    doc weave <records> <spine> <out>       fill a spine's slots")
+    fmt.println("    doc build <root> <spine> <out>          scan and weave in one pass")
+    fmt.println("    doc bare  <root> <out> [title]          every slot, no spine")
+    fmt.println("    doc page  <dir> <title> <decls> <out>   a package's page: its comment,")
+    fmt.println("                                              its declarations (`dadoc query")
+    fmt.println("                                              inspect`'s answer), its blocks")
+    fmt.println("")
+    fmt.println("the checks that make it honest:")
+    fmt.println("    doc check    <records> <lexicon> <words>   every claim exists")
+    fmt.println("    doc slots    <records> <spine>             a slot nothing fills,")
+    fmt.println("                                              a block no spine wants")
+    fmt.println("    doc fences   <records> <outdir>            write each `dado sample")
+    fmt.println("                                              out as a package to compile")
+    fmt.println("    doc coverage <records> <lexicon> <floor>   a ratchet that only rises")
+    fmt.println("")
+    fmt.println("the generated half of the reference:")
+    fmt.println("    doc reference <lexicon> <captions> <out>   every roster, as markdown")
+    fmt.println("")
+    fmt.println("doc comments, the plain `//` comment above a declaration:")
+    fmt.println("    doc params <declarations> <source> [<declarations> <source>]...")
+    fmt.println("                                  warn where a comment describes a")
+    fmt.println("                                  parameter the declaration does not")
+    fmt.println("                                  have, or one twice; the declarations")
+    fmt.println("                                  are `dadoc --emit=declarations`'s")
+    fmt.println("    doc comments <dir>            read every <case>.comment under <dir>")
+    fmt.println("                                  and compare it with its .fields")
+    fmt.println("")
+    fmt.println("    --ext <suffix>    which files to read          [default: ", DEFAULT_EXT, "]")
+    fmt.println("    --bless           rewrite the floor instead of checking it")
+    fmt.println("")
+    fmt.println("A block is a run of lines whose first non-space text is `//@`.")
+    fmt.println("Its first line names a slot and, optionally, an integer that")
+    fmt.println("orders it within that slot. The rest is markdown.")
+
+// `--ext <suffix>` anywhere after the command, or the default. Written as a
+// scan of every argument rather than a position, so the flag may go before or
+// after the positional arguments and neither order is a surprise.
+private bool has_flag(i32 argc, ^rawptr argv, string8 flag):
+    i32 i = 1
+    for i < argc:
+        if strings.borrow_from_cstring(os.arg(argv, i)) == flag:
+            return true
+        i += 1
+    return false
+
+private string8 ext_of(i32 argc, ^rawptr argv):
+    i32 i = 1
+    for i < argc - 1:
+        if strings.borrow_from_cstring(os.arg(argv, i)) == "--ext":
+            return strings.borrow_from_cstring(os.arg(argv, i + 1))
+        i += 1
+    return DEFAULT_EXT
+
+// The n'th argument that is not a flag and is not a flag's value. `--ext` is
+// the only flag, so its value is the only argument that has to be skipped.
+private (string8 value, bool ok) positional(i32 argc, ^rawptr argv, i32 want):
+    i32 seen = 0
+    i32 i = 1
+    for i < argc:
+        string8 a = strings.borrow_from_cstring(os.arg(argv, i))
+        // `--ext` is the one flag that takes a value, so it is the one that
+        // skips two. Every other `--flag` skips itself. Written as a rule
+        // rather than a list, so a new valueless flag needs no edit here.
+        if a == "--ext":
+            i += 2
+            continue
+        if strings.starts_with(a, "--"):
+            i += 1
+            continue
+        if seen == want:
+            return (a, true)
+        seen += 1
+        i += 1
+    return ("", false)
+
+// The whole of a text file, or the empty string. The caller reports the
+// absence; this does not, because the two callers want to say different
+// things about it.
+private (ref []char8 text, bool ok) read_whole(string8 path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 pc = strings.clone_to_cstring(path, alloc)
+    bool there = fs.is_file(cstring(pc))
+    ref []char8 t = slurp(cstring(pc), alloc)
+    #delete(pc)
+    return (t, there)
+
+
+// The slot check, both ways, before a single byte is written.
+//
+// **This is where the check lives, and it could not live in the gate.** A
+// spine is a document, and audit H refuses any script the gate runs from so
+// much as naming one — which it did, to the first draft of gate step 8b. That
+// rule is right: a step that reads a document dies when the document is
+// deleted and goes vacuous when it is emptied, and neither shows up as red.
+//
+// Weaving is the better home anyway. It is the moment a slot problem actually
+// matters, the answer cannot be stale because it is computed from the two
+// inputs in hand, and refusing here means **no document is written at all**
+// rather than one that is quietly short a section.
+private bool slots_agree(string8 spine, ref []Record rs, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []string8 slots = #make([]string8, 0, alloc)
+    declared_slots(spine, &slots, alloc)
+    ref []string8 gaps = #make([]string8, 0, alloc)
+    unfilled(slots, rs, &gaps, alloc)
+    ref []string8 strays = #make([]string8, 0, alloc)
+    orphans(slots, rs, &strays, alloc)
+    ref []string8 twice = #make([]string8, 0, alloc)
+    repeated(slots, &twice, alloc)
+    if #len(gaps) == 0 && #len(strays) == 0 && #len(twice) == 0:
+        return true
+    for g in gaps:
+        fmt.println("  the spine declares `", g, "` and nothing fills it")
+    for x in strays:
+        fmt.println("  blocks are addressed to `", x, "` and no spine declares it")
+    for d in twice:
+        fmt.println("  the spine declares `", d, "` more than once, so its blocks")
+        fmt.println("    would be poured more than once into one document")
+    fmt.println("doc: these are failures and none is visible from the others. An")
+    fmt.println("  empty slot is a documented feature that does not exist; an")
+    fmt.println("  undeclared one is a feature nobody wove in; a repeated one is a")
+    fmt.println("  document that says the same thing twice and reports a count")
+    fmt.println("  larger than the blocks it had. Nothing was written — a document")
+    fmt.println("  known to be wrong is worse than none.")
+    return false
+
+i32 main(i32 argc, ^rawptr argv):
+    if argc < 2:
+        usage()
+        return 1
+    string8 cmd = strings.borrow_from_cstring(os.arg(argv, 1))
+    if cmd == "-h" || cmd == "--help" || cmd == "help":
+        usage()
+        return 0
+
+    string8 ext = ext_of(argc, argv)
+
+    // One arena for every string the records hold, freed in one call. The
+    // records borrow from it and from nothing else, so nothing here has to
+    // track which buffer a body came from.
+    arena.Arena a = arena.over(libc.allocator())
+    defer arena.destroy(&a)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al = arena.allocator(&a)
+
+    ref []Record rs = #make([]Record, 0, al)
+    i32 files = 0
+
+    if cmd == "scan":
+        (string8 root, bool ok1) = positional(argc, argv, 1)
+        (string8 out, bool ok2) = positional(argc, argv, 2)
+        if !ok1 || !ok2:
+            usage()
+            return 1
+        walk(root, ext, &rs, &files, al)
+        sort(rs)
+        ref []char8 oc = strings.clone_to_cstring(out, al)
+        if !write_records(cstring(oc), rs, al):
+            fmt.println("doc: cannot write ", out)
+            return 1
+        report("scanned", files, i32(#len(rs)))
+        return 0
+
+    if cmd == "weave":
+        (string8 recs, bool ok1) = positional(argc, argv, 1)
+        (string8 spine, bool ok2) = positional(argc, argv, 2)
+        (string8 out, bool ok3) = positional(argc, argv, 3)
+        if !ok1 || !ok2 || !ok3:
+            usage()
+            return 1
+        (ref []char8 rtext, bool rok) = read_whole(recs, al)
+        if !rok:
+            fmt.println("doc: no record stream at ", recs)
+            return 1
+        string8 rt = rtext
+        (bool pok, string8 why) = read_records(rt, &rs, al)
+        if !pok:
+            fmt.println("doc: ", recs, ": ", why)
+            return 1
+        (ref []char8 stext, bool sok) = read_whole(spine, al)
+        if !sok:
+            fmt.println("doc: no spine at ", spine)
+            return 1
+        string8 st = stext
+        if !slots_agree(st, rs, al):
+            return 1
+        ref []char8 oc = strings.clone_to_cstring(out, al)
+        (i32 slots, i32 poured, bool wok) = weave(st, cstring(oc), rs, al)
+        if !wok:
+            fmt.println("doc: cannot write ", out)
+            return 1
+        fmt.println("wove: ", slots, " slot(s), ", poured, " of ",
+                    i32(#len(rs)), " block(s) poured")
+        return 0
+
+    if cmd == "build":
+        (string8 root, bool ok1) = positional(argc, argv, 1)
+        (string8 spine, bool ok2) = positional(argc, argv, 2)
+        (string8 out, bool ok3) = positional(argc, argv, 3)
+        if !ok1 || !ok2 || !ok3:
+            usage()
+            return 1
+        walk(root, ext, &rs, &files, al)
+        sort(rs)
+        (ref []char8 stext, bool sok) = read_whole(spine, al)
+        if !sok:
+            fmt.println("doc: no spine at ", spine)
+            return 1
+        string8 st = stext
+        report("scanned", files, i32(#len(rs)))
+        if !slots_agree(st, rs, al):
+            return 1
+        ref []char8 oc = strings.clone_to_cstring(out, al)
+        (i32 slots, i32 poured, bool wok) = weave(st, cstring(oc), rs, al)
+        if !wok:
+            fmt.println("doc: cannot write ", out)
+            return 1
+        fmt.println("wove: ", slots, " slot(s), ", poured, " of ",
+                    i32(#len(rs)), " block(s) poured")
+        return 0
+
+    if cmd == "bare":
+        (string8 root, bool ok1) = positional(argc, argv, 1)
+        (string8 out, bool ok2) = positional(argc, argv, 2)
+        if !ok1 || !ok2:
+            usage()
+            return 1
+        (string8 title, bool tok) = positional(argc, argv, 3)
+        if !tok:
+            title = root
+        walk(root, ext, &rs, &files, al)
+        sort(rs)
+        ref []char8 oc = strings.clone_to_cstring(out, al)
+        (i32 blocks, bool bok) = bare(cstring(oc), title, rs, al)
+        if !bok:
+            fmt.println("doc: cannot write ", out)
+            return 1
+        report("scanned", files, blocks)
+        return 0
+
+    if cmd == "page":
+        (string8 root, bool ok1) = positional(argc, argv, 1)
+        (string8 title, bool ok2) = positional(argc, argv, 2)
+        (string8 apif, bool ok3) = positional(argc, argv, 3)
+        (string8 out, bool ok4) = positional(argc, argv, 4)
+        if !ok1 || !ok2 || !ok3 || !ok4:
+            usage()
+            return 1
+        walk(root, ext, &rs, &files, al)
+        // A package is one directory: the blocks of the packages under it
+        // belong on their own pages.
+        ref []Record own = #make([]Record, 0, al)
+        for r in rs:
+            if #len(r.file) > #len(root) + 1:
+                string8 rel = r.file[#len(root) + 1..<#len(r.file)]
+                if strings.index_of(rel, '/') < 0 && strings.index_of(rel, '\\') < 0:
+                    _ = #append(own, r)
+        sort(own)
+        (ref []char8 api, bool _) = read_whole(apif, al)
+        ref []char8 oc = strings.clone_to_cstring(out, al)
+        (i32 blocks, bool pok) = page(cstring(oc), root, title, ext, string8(api[:]), own, al)
+        if !pok:
+            fmt.println("doc: cannot write ", out)
+            return 1
+        report("scanned", files, blocks)
+        return 0
+
+    // ── the checks ──────────────────────────────────────────────────────
+
+    if cmd == "check":
+        (string8 recs, bool ok1) = positional(argc, argv, 1)
+        (string8 lexf, bool ok2) = positional(argc, argv, 2)
+        (string8 wordf, bool ok3) = positional(argc, argv, 3)
+        if !ok1 || !ok2 || !ok3:
+            usage()
+            return 1
+        if !load_records(recs, &rs, al):
+            return 1
+        (ref []char8 ltext, bool lok) = read_whole(lexf, al)
+        if !lok:
+            fmt.println("doc: no lexicon dump at ", lexf)
+            fmt.println("  produce one with: dadoc --emit=lexicon > ", lexf)
+            return 1
+        string8 lt = ltext
+        ref []string8 lex = lexicon_words(lt, al)
+        // **A lexicon that parsed to nothing is refused, not passed.** A dump
+        // this could not read would make every claim in the tree unknown and
+        // the run would look like a catastrophe; a dump that was *empty* would
+        // make every claim pass, and that is the one that would go unnoticed.
+        if #len(lex) == 0:
+            fmt.println("doc: ", lexf, " yielded no spellings at all — that is an")
+            fmt.println("  empty vocabulary, against which every claim would pass")
+            return 1
+        ref []string8 allow = #make([]string8, 0, al)
+        (ref []char8 wtext, bool wok) = read_whole(wordf, al)
+        if wok:
+            string8 wt = wtext
+            allow = word_list(wt, al)
+        ref []Fault fs2 = #make([]Fault, 0, al)
+        faults(rs, lex, allow, &fs2, al)
+        // Printed on every run, green included: a check whose population went
+        // to zero looks exactly like one that worked.
+        fmt.println("checked: ", i32(#len(rs)), " block(s) against ",
+                    i32(#len(lex)), " spelling(s), ", i32(#len(allow)),
+                    " allowed as prose")
+        if #len(fs2) == 0:
+            return 0
+        for f in fs2:
+            fmt.println("  ", f.file, ":", f.line, " (", f.slot, ") names the ",
+                        kind_name(f.kind), " `", f.token, "`, which the compiler does not have")
+        fmt.println("doc: ", i32(#len(fs2)), " claim(s) the language does not have.")
+        fmt.println("  A word the compiler does not know is a word a reader will")
+        fmt.println("  go looking for. Fix the block, or add the word to the prose")
+        fmt.println("  list if it was never a language word: ", wordf)
+        return 1
+
+    if cmd == "slots":
+        (string8 recs, bool ok1) = positional(argc, argv, 1)
+        (string8 spine, bool ok2) = positional(argc, argv, 2)
+        if !ok1 || !ok2:
+            usage()
+            return 1
+        if !load_records(recs, &rs, al):
+            return 1
+        (ref []char8 stext, bool sok) = read_whole(spine, al)
+        if !sok:
+            fmt.println("doc: no spine at ", spine)
+            return 1
+        string8 st = stext
+        ref []string8 slots = #make([]string8, 0, al)
+        declared_slots(st, &slots, al)
+        ref []string8 gaps = #make([]string8, 0, al)
+        unfilled(slots, rs, &gaps, al)
+        ref []string8 strays = #make([]string8, 0, al)
+        orphans(slots, rs, &strays, al)
+        fmt.println("slots: ", i32(#len(slots)), " declared, ", i32(#len(rs)),
+                    " block(s), ", i32(#len(gaps)), " unfilled, ",
+                    i32(#len(strays)), " undeclared")
+        for g in gaps:
+            fmt.println("  the spine declares `", g, "` and nothing fills it")
+        for x in strays:
+            fmt.println("  blocks are addressed to `", x, "` and no spine declares it")
+        if #len(gaps) == 0 && #len(strays) == 0:
+            return 0
+        fmt.println("doc: both directions are failures and neither is visible from")
+        fmt.println("  the other. An empty slot is a documented feature that does")
+        fmt.println("  not exist; an undeclared one is a feature nobody wove in.")
+        return 1
+
+    if cmd == "fences":
+        (string8 recs, bool ok1) = positional(argc, argv, 1)
+        (string8 outdir, bool ok2) = positional(argc, argv, 2)
+        if !ok1 || !ok2:
+            usage()
+            return 1
+        if !load_records(recs, &rs, al):
+            return 1
+        i32 n = write_fences(rs, outdir, al)
+        fmt.println("fences: ", n, " dado sample(s) written to ", outdir)
+        return 0
+
+    if cmd == "coverage":
+        (string8 recs, bool ok1) = positional(argc, argv, 1)
+        (string8 lexf, bool ok2) = positional(argc, argv, 2)
+        (string8 floorf, bool ok3) = positional(argc, argv, 3)
+        if !ok1 || !ok2 || !ok3:
+            usage()
+            return 1
+        if !load_records(recs, &rs, al):
+            return 1
+        (ref []char8 ltext, bool lok) = read_whole(lexf, al)
+        if !lok:
+            fmt.println("doc: no lexicon dump at ", lexf)
+            return 1
+        string8 lt = ltext
+        ref []string8 lex = lexicon_words(lt, al)
+        if #len(lex) == 0:
+            fmt.println("doc: ", lexf, " yielded no spellings at all")
+            return 1
+        (i32 named, i32 total) = coverage(rs, lex, al)
+        fmt.println("coverage: ", named, " of ", total, " spelling(s) are named by a block")
+        if has_flag(argc, argv, "--bless"):
+            if !write_floor(floorf, named, al):
+                fmt.println("doc: cannot write ", floorf)
+                return 1
+            fmt.println("  wrote the floor: ", named)
+            return 0
+        (i32 floor, bool fok) = read_floor(floorf, al)
+        if !fok:
+            fmt.println("doc: no floor at ", floorf, " — write one with --bless")
+            return 1
+        if named >= floor:
+            if named > floor:
+                fmt.println("  above the floor of ", floor, " — re-bless to raise it: --bless")
+            return 0
+        fmt.println("doc: coverage FELL, ", floor, " -> ", named, ".")
+        fmt.println("  This is a ratchet: the floor may rise and may not fall. A")
+        fmt.println("  block was deleted, or renamed a word the compiler no longer")
+        fmt.println("  has. Restore it, or lower the floor on purpose with --bless")
+        fmt.println("  and say in the commit which documentation went away.")
+        return 1
+
+    if cmd == "reference":
+        (string8 lexf, bool ok1) = positional(argc, argv, 1)
+        (string8 capf, bool ok2) = positional(argc, argv, 2)
+        (string8 out, bool ok3) = positional(argc, argv, 3)
+        if !ok1 || !ok2 || !ok3:
+            usage()
+            return 1
+        (ref []char8 ltext, bool lok) = read_whole(lexf, al)
+        if !lok:
+            fmt.println("doc: no lexicon dump at ", lexf)
+            fmt.println("  produce one with: dadoc --emit=lexicon > ", lexf)
+            return 1
+        string8 lt = ltext
+        ref []Caption cs = #make([]Caption, 0, al)
+        (ref []char8 ctext, bool cok) = read_whole(capf, al)
+        if cok:
+            string8 ct = ctext
+            cs = captions(ct, al)
+        ref []char8 oc = strings.clone_to_cstring(out, al)
+        (i32 sections, i32 rows) = reference(cstring(oc), lt, cs, al)
+        // **Zero sections is a failure and not an empty answer.** A lexicon
+        // that parsed to nothing would write a reference with a title and no
+        // content, and a reader comparing it against a committed copy would
+        // see a large deletion rather than a broken run.
+        if sections == 0:
+            fmt.println("doc: ", lexf, " yielded no rosters at all")
+            return 1
+        fmt.println("reference: ", sections, " roster(s), ", rows, " row(s) -> ", out)
+        return 0
+
+    // ── doc comments ────────────────────────────────────────────────────
+
+    if cmd == "params":
+        // Pairs, so a caller checking a tree starts this program once.
+        i32 pair = 0
+        i32 checked = 0
+        ref []string8 warnings = #make([]string8, 0, al)
+        for:
+            (string8 declf, bool ok1) = positional(argc, argv, 1 + 2 * pair)
+            if !ok1:
+                break
+            (string8 source, bool ok2) = positional(argc, argv, 2 + 2 * pair)
+            if !ok2:
+                usage()
+                return 1
+            (ref []char8 dtext, bool dok) = read_whole(declf, al)
+            if !dok:
+                fmt.println("doc: no declarations at ", declf)
+                fmt.println("  produce them with: dadoc --package --emit=declarations ", source, " > ", declf)
+                return 1
+            (ref []char8 stext, bool sok) = read_whole(source, al)
+            if !sok:
+                fmt.println("doc: no source file at ", source)
+                return 1
+            string8 dt = dtext
+            string8 st = stext
+            (i32 n, bool pok) = param_warnings(dt, st, source, &warnings, al)
+            if !pok:
+                fmt.println("doc: ", declf, " is not a declarations dump: its first line is not")
+                fmt.println("  `declarations 1`. Produce it with: dadoc --package --emit=declarations ", source)
+                return 1
+            checked += n
+            pair += 1
+        if pair == 0:
+            usage()
+            return 1
+        // Warnings only, so the exit status is 0 whatever is printed; and
+        // nothing at all is printed when every comment agrees.
+        for w in warnings:
+            fmt.println(w)
+        return 0
+
+    if cmd == "comments":
+        (string8 dir, bool ok1) = positional(argc, argv, 1)
+        if !ok1:
+            usage()
+            return 1
+        ref []FixtureMiss misses = #make([]FixtureMiss, 0, al)
+        i32 cases = check_fixtures(dir, &misses, al)
+        for m in misses:
+            if m.missing:
+                fmt.println(m.path, ": there is no .fields beside it; it reads as")
+                fmt.print(m.got)
+            else:
+                fmt.println(m.path, ": reads differently from its .fields")
+                fmt.println("--- want")
+                fmt.print(m.want)
+                fmt.println("--- got")
+                fmt.print(m.got)
+        fmt.println("comments: ", cases, " case(s), ", i32(#len(misses)), " read differently")
+        // No cases at all is a failure: a directory that went missing would
+        // otherwise pass.
+        if cases == 0 || #len(misses) > 0:
+            return 1
+        return 0
+
+    fmt.println("doc: no such command: ", cmd)
+    usage()
+    return 1
+
+// A record stream into `rs`, reporting its own failure. Three callers wanted
+// the same six lines and the same two messages.
+private bool load_records(string8 path, ^ref []Record rs, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    (ref []char8 text, bool ok) = read_whole(path, alloc)
+    if !ok:
+        fmt.println("doc: no record stream at ", path)
+        fmt.println("  produce one with: doc scan <root> ", path)
+        return false
+    string8 t = text
+    (bool pok, string8 why) = read_records(t, rs, alloc)
+    if !pok:
+        fmt.println("doc: ", path, ": ", why)
+        return false
+    return true
+
+// Each ` ```dado ` fence as a package under `outdir`, ready to compile.
+//
+// **A fence is compiled as a whole package.** If its first non-blank line is a
+// `package` line it goes out as written; otherwise `package doc_sample` is
+// prepended and nothing else is added. The caller compiles each with
+// `--library --strict`: `--library` is why a sample that is only declarations
+// compiles at all, since ERR0301 would otherwise refuse a package with no
+// entry point, and `--strict` is the bar everything else in this tree is held
+// to.
+//
+// A sample that needs *statements* writes a function around them, and that is
+// the right answer rather than a concession: a statement with no function
+// around it is not something a reader can copy into their program either.
+private i32 write_fences(ref []Record rs, string8 outdir, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 dc = strings.clone_to_cstring(outdir, alloc)
+    if !fs.is_dir(cstring(dc)):
+        _ = fs.make_dir(cstring(dc))
+    i32 n = 0
+    for r in rs:
+        ref []string8 samples = #make([]string8, 0, alloc)
+        sample_fences(r.body, &samples, alloc)
+        for sample in samples:
+            ref []char8 dir = #format(outdir, "/s", n, alloc)
+            ref []char8 dirc = strings.clone_to_cstring(dir, alloc)
+            if !fs.is_dir(cstring(dirc)):
+                _ = fs.make_dir(cstring(dirc))
+            ref []char8 path = #format(dir, "/main", DEFAULT_EXT, alloc)
+            ref []char8 pc = strings.clone_to_cstring(path, alloc)
+            ^io.FILE f = io.open_write(cstring(pc))
+            if io.opened(f):
+                // The provenance comment is the only thing added beyond the
+                // package line: a sample that fails to compile has to say
+                // which block it came from, or the failure names a temporary
+                // directory and nothing else.
+                ref []char8 head = #format("// from ", r.file, ":", r.line,
+                                           " (", r.slot, ")\n", alloc)
+                _ = io.write_bytes(f, head[:])
+                #delete(head)
+                if !declares_package(sample):
+                    ref []char8 pkg = #format("package doc_sample\n\n", alloc)
+                    _ = io.write_bytes(f, pkg[:])
+                    #delete(pkg)
+                ref []char8 body = #format(sample, alloc)
+                _ = io.write_bytes(f, body[:])
+                #delete(body)
+                _ = io.close(f)
+                n += 1
+            #delete(pc)
+            #delete(path)
+            #delete(dirc)
+            #delete(dir)
+    #delete(dc)
+    return n
+
+private bool declares_package(string8 sample):
+    i64 at = 0
+    for:
+        (string8 raw, i64 next) = line_at(sample, at)
+        string8 line = strings.trim(raw)
+        if #len(line) > 0:
+            return strings.starts_with(line, "package ")
+        if next < 0:
+            return false
+        at = next
+    return false
+
+// The coverage floor: one number, in a file that says what it is.
+private (i32 floor, bool ok) read_floor(string8 path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    (ref []char8 text, bool there) = read_whole(path, alloc)
+    if !there:
+        return (0, false)
+    string8 t = text
+    i64 at = 0
+    for:
+        (string8 raw, i64 next) = line_at(t, at)
+        string8 line = strings.trim(raw)
+        if #len(line) > 0 && !strings.starts_with(line, "#"):
+            return to_int(line)
+        if next < 0:
+            break
+        at = next
+    return (0, false)
+
+private bool write_floor(string8 path, i32 named, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 pc = strings.clone_to_cstring(path, alloc)
+    ^io.FILE f = io.open_write(cstring(pc))
+    #delete(pc)
+    if !io.opened(f):
+        return false
+    ref []char8 text = #format(
+        "# How many of the compiler's own spellings are named by a doc block.\n",
+        "# A ratchet: it may rise and may not fall. Raise it with\n",
+        "#   doc coverage <records> <lexicon> <this file> --bless\n",
+        "# and say in the commit what was documented. Lower it only on purpose,\n",
+        "# and say what documentation went away.\n",
+        "\n", named, "\n", alloc)
+    _ = io.write_bytes(f, text[:])
+    #delete(text)
+    _ = io.close(f)
+    return true

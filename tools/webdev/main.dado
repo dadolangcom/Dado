@@ -1,0 +1,356 @@
+// tools/webdev — build a package for the web and serve it, rebuilding when its
+// sources change and reloading the page when the build is new.
+//
+//     ./dado run tools/webdev -- corpus/shapes
+//     ./dado run tools/webdev -- example/app --port 8100 --open
+//     ./dado run tools/webdev -- mygame --html page.html --threads
+//     ./dado run tools/webdev -- example/dados_hello --cc "$CLANG" --open
+//
+// `--cc` names the C compiler the web build uses, passed to `./dado build` as
+// written: a clang with the wasm32 target (Apple's has none; LLVM 19's does).
+//
+// A satellite, not the toolchain's: `./dado serve` is where this goes once the
+// web build's page is settled. It shells out to `./dado build --target=web
+// --html` (so it runs from the checkout's root), writes into
+// `build/webdev/<name>/`, and serves that directory with `core:http/server`.
+//
+// **The loop.** The page carries a small script that asks `/__webdev/version`
+// once a second. Asking checks the package's sources against the last build —
+// any `.dado` or `.dados` file under it newer than the build's stamp — and
+// rebuilds when one is; when the version moves the page goes back to `/`, which
+// shows the new build, or the failure when it did not build. A build that
+// fails is shown in the page, the compiler's text as it wrote it, and the next
+// good build replaces it. Only the package's own directory is watched: an edit
+// to a collection it imports needs a reload by hand (the `rebuild` link).
+//
+// **A program that runs DadoScript scripts is served like any other**: the web build
+// writes the scripts' modules beside the page, and the page's import map and
+// loader wire them, so `example/dados_hello` runs in the browser as it does
+// natively.
+//
+// Every response says `Cache-Control: no-store`, so the browser never shows a
+// stale module, and `--threads` builds with `--web-threads` and sends the two
+// headers that make the page cross-origin isolated, which shared memory needs.
+package main
+
+import "core:http/server"
+import "core:os"
+import "core:os/proc"
+import "core:io"
+import "core:strings"
+import "core:fmt"
+import "core:time"
+
+// ── what was asked ──────────────────────────────────────────────────────────
+
+private string8 package_dir = ""
+private string8 name = ""
+private string8 out_dir = ""
+private string8 template = ""
+private string8 compiler = ""        // `--cc`, or "" for the driver's own choice
+private bool threads = false
+
+// ── the last build ──────────────────────────────────────────────────────────
+
+private i64 version = 0          // moves on every build, good or bad
+private bool built_ok = false
+private ref []char8 build_log    // the driver's output, on `#heap`
+private bool ever_built = false
+
+// The page the toolchain fills when the user gave none: every marker, and the
+// reload script, which is a file of its own so a strict page policy holds.
+private const string8 DEV_PAGE = "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"icon\" href=\"data:,\">\n<!-- dado:title -->\n<!-- dado:importmap -->\n<!-- dado:preload -->\n<style>\n  body { margin: 16px; font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }\n  pre { margin: 0; white-space: pre-wrap; }\n</style>\n</head>\n<body>\n<p id=\"dado-status\">running…</p>\n<pre id=\"dado-output\"></pre>\n<!-- dado:loader -->\n<script src=\"/__webdev/reload.js\"></script>\n</body>\n</html>\n"
+
+private const string8 RELOAD_JS = "// tools/webdev: reload the page when the build moves.\n(() => {\n  let seen = null;\n  async function tick() {\n    try {\n      const r = await fetch(\"/__webdev/version\", { cache: \"no-store\" });\n      const v = (await r.json()).version;\n      if (seen === null) seen = v;\n      else if (v !== seen) { location.href = \"/\"; return; }\n    } catch (e) {}\n    setTimeout(tick, 1000);\n  }\n  tick();\n})();\n"
+
+// ── building ────────────────────────────────────────────────────────────────
+
+private string8 stamp_path():
+    ref []char8 p = #format(out_dir, "/.stamp", #heap)
+    string8 s = p
+    return s
+
+// Build the package with the driver, keeping what it printed.
+private void build():
+    ref []char8 wasm = #format(out_dir, "/", name, ".wasm", #heap)
+    ref []char8 html = #format("--html=", template, #heap)
+    string8 wasm_s = wasm
+    string8 html_s = html
+    ref []char8 a_wasm = strings.clone_to_cstring(wasm_s, #heap)
+    ref []char8 a_html = strings.clone_to_cstring(html_s, #heap)
+    ref []char8 a_pkg = strings.clone_to_cstring(package_dir, #heap)
+    ref []char8 a_cc = strings.clone_to_cstring(compiler, #heap)
+    [10]cstring argv
+    i32 n = 0
+    argv[n] = "./dado"
+    n += 1
+    argv[n] = "build"
+    n += 1
+    argv[n] = "--target=web"
+    n += 1
+    argv[n] = cstring(a_html)
+    n += 1
+    if threads:
+        argv[n] = "--web-threads"
+        n += 1
+    if #len(compiler) > 0:
+        argv[n] = "--cc"
+        n += 1
+        argv[n] = cstring(a_cc)
+        n += 1
+    argv[n] = cstring(a_pkg)
+    n += 1
+    argv[n] = "-o"
+    n += 1
+    argv[n] = cstring(a_wasm)
+    n += 1
+
+    fmt.println("webdev: building ", package_dir)
+    _ = io.flush(io.stdout())
+    f64 started = time.now()
+    #delete(build_log)
+    build_log = #make([]char8, 0, #heap)
+    proc.Duplex d = proc.duplex(argv[0..<n], proc.ERRORS_MERGE)
+    bool ok = false
+    if !proc.started(d):
+        append_log("webdev: could not start ./dado — run this from the checkout's root\n")
+    else:
+        _ = proc.close_input(&d)
+        [4096]char8 chunk
+        for:
+            i32 got = proc.receive(&d, chunk[:], 200)
+            if got == proc.DRAINED || got == proc.BROKE:
+                break
+            if got > 0:
+                append_log(string8(chunk[0..<got]))
+        (bool done, bool exited, i32 status) = proc.finish(&d, 0 - 1)
+        ok = done && exited && status == 0
+        proc.release(&d)
+    built_ok = ok
+    ever_built = true
+    version += 1
+    touch(stamp_path())
+    fmt.println("webdev: ", "built" if ok else "FAILED", " in ", time.ms_since(started), " ms (version ", version, ")")
+    if !ok:
+        string8 said = build_log
+        fmt.println(said)
+    _ = io.flush(io.stdout())
+    #delete(wasm)
+    #delete(html)
+    #delete(a_wasm)
+    #delete(a_html)
+    #delete(a_pkg)
+    #delete(a_cc)
+
+private void append_log(string8 s):
+    for c in s:
+        _ = #append(build_log, c)
+
+private void touch(string8 path):
+    ref []char8 p = strings.clone_to_cstring(path, #heap)
+    [3]cstring argv
+    argv[0] = "touch"
+    argv[1] = cstring(p)
+    proc.Child c = proc.spawn(argv[0..<2])
+    _ = proc.wait(c)
+    #delete(p)
+
+// Whether a source file under the package is newer than the last build.
+// The package path is checked to hold no shell syntax before it gets here.
+private bool stale():
+    if !ever_built:
+        return true
+    ref []char8 cmd = #format("find ", package_dir, " \\( -name '*.dado' -o -name '*.dados' \\) -newer ",
+                              stamp_path(), " 2>/dev/null | head -1", #heap)
+    string8 cmd_s = cmd
+    ref []char8 c = strings.clone_to_cstring(cmd_s, #heap)
+    ^io.FILE f = proc.read(cstring(c))
+    bool newer = false
+    if proc.opened(f):
+        (cstring line, bool got) = io.read_line(f)
+        string8 first = strings.borrow_from_cstring(line)
+        newer = got && #len(first) > 0
+        _ = proc.close(f)
+    #delete(c)
+    #delete(cmd)
+    return newer
+
+// ── serving ─────────────────────────────────────────────────────────────────
+
+server.Response page(server.Request req):
+    if stale():
+        build()
+    if !built_ok:
+        return server.html(failure_page(), 500)
+    return server.redirect(#format("/", name, ".html"))
+
+server.Response version_now(server.Request req):
+    if req.has_query("rebuild") || stale():
+        build()
+    return server.json(#format("{\"version\": ", version, ", \"ok\": ", "true" if built_ok else "false", "}\n"))
+
+server.Response reload_js(server.Request req):
+    return server.respond(RELOAD_JS, "text/javascript; charset=utf-8")
+
+server.Response rebuild(server.Request req):
+    build()
+    return server.redirect("/")
+
+private string8 failure_page():
+    string8 said = build_log
+    ref []char8 p = #format(
+        "<!doctype html><meta charset=\"utf-8\"><link rel=\"icon\" href=\"data:,\">",
+        "<title>", name, ": build failed</title>",
+        "<style>body{margin:16px;font:14px/1.45 ui-monospace,Menlo,monospace}",
+        "h1{font-size:16px}pre{white-space:pre-wrap}</style>",
+        "<h1>", server.escape(package_dir), " did not build for the web</h1>",
+        "<p>Fix it and save: this page reloads on the next good build. ",
+        "<a href=\"/__webdev/rebuild\">rebuild now</a></p>",
+        "<pre>", server.escape(said), "</pre>",
+        "<script src=\"/__webdev/reload.js\"></script>")
+    string8 s = p
+    return s
+
+// ── the command line ────────────────────────────────────────────────────────
+
+private bool safe_path(string8 s):
+    if #len(s) == 0:
+        return false
+    for c in s:
+        bool ok = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '/' || c == '.' || c == '_' || c == '-')
+        if !ok:
+            return false
+    return true
+
+private (i64 n, bool ok) number(string8 s):
+    if #len(s) == 0 || #len(s) > 6:
+        return (0, false)
+    i64 n = 0
+    for c in s:
+        if c < '0' || c > '9':
+            return (0, false)
+        n = n * 10 + i64(c - '0')
+    return (n, true)
+
+private i32 usage(string8 why):
+    fmt.println("webdev: ", why)
+    fmt.println("usage: ./dado run tools/webdev -- <package> [--port N] [--cc clang] [--html page.html] [--threads] [--open]")
+    return 2
+
+private string8 basename(string8 path):
+    string8 p = path
+    for #len(p) > 1 && p[#len(p) - 1] == '/':
+        p = strings.substring(p, 0, i64(#len(p)) - 1)
+    i64 slash = strings.last_index_of(p, '/')
+    return strings.rest(p, slash + 1) if slash >= 0 else p
+
+i32 main(i32 argc, ^rawptr argv):
+    u16 port = 8100
+    bool open_browser = false
+    i32 i = 1
+    for os.has_arg(argc, i):
+        string8 a = strings.borrow_from_cstring(os.arg(argv, i))
+        if a == "--port" && os.has_arg(argc, i + 1):
+            (i64 n, bool ok) = number(strings.borrow_from_cstring(os.arg(argv, i + 1)))
+            if !ok || n <= 0 || n > 65535:
+                return usage("--port takes a number from 1 to 65535")
+            port = u16(n)
+            i += 2
+        else if a == "--html" && os.has_arg(argc, i + 1):
+            template = strings.borrow_from_cstring(os.arg(argv, i + 1))
+            i += 2
+        else if a == "--cc" && os.has_arg(argc, i + 1):
+            compiler = strings.borrow_from_cstring(os.arg(argv, i + 1))
+            if #len(compiler) == 0:
+                return usage("--cc was given an empty name: is the variable holding it set in this shell?")
+            i += 2
+        else if a == "--threads":
+            threads = true
+            i += 1
+        else if a == "--open":
+            open_browser = true
+            i += 1
+        else if strings.starts_with(a, "-"):
+            return usage(#format("unknown option ", a, #heap))
+        else if #len(package_dir) == 0:
+            package_dir = a
+            i += 1
+        else:
+            return usage("one package at a time")
+    if #len(package_dir) == 0:
+        return usage("which package? e.g. corpus/shapes")
+    if !safe_path(package_dir):
+        return usage("a package path of letters, digits and / . _ - only")
+    if !fs_has_driver():
+        return usage("run this from the checkout's root, where ./dado is")
+
+    name = basename(package_dir)
+    ref []char8 dir = #format("build/webdev/", name, #heap)
+    out_dir = dir
+    if #len(template) == 0:
+        // The dev page: the toolchain's markers, and the reload script.
+        ref []char8 path = #format(out_dir, "/.webdev.html", #heap)
+        template = path
+        if !write_file(template, DEV_PAGE):
+            return usage(#format("could not write ", template, #heap))
+
+    server.App app = server.app()
+    // The page asks for the version every second, so a line per request is
+    // noise; the builds are what this tool reports.
+    app.quiet = true
+    app.header("Cache-Control", "no-store")
+    if threads:
+        app.header("Cross-Origin-Opener-Policy", "same-origin")
+        app.header("Cross-Origin-Embedder-Policy", "require-corp")
+    app.get("/", page)
+    app.get("/__webdev/version", version_now)
+    app.get("/__webdev/reload.js", reload_js)
+    app.get("/__webdev/rebuild", rebuild)
+    app.files("/", out_dir)
+
+    build()
+    ref []char8 url = #format("http://localhost:", i32(port), "/", #heap)
+    string8 url_s = url
+    fmt.println("webdev: ", package_dir, " at ", url_s, "  (ctrl-c to stop)")
+    _ = io.flush(io.stdout())
+    if open_browser:
+        launch(url_s)
+    return app.run(port: port)
+
+private bool fs_has_driver():
+    ^io.FILE f = io.open_read("./dado")
+    if !io.opened(f):
+        return false
+    _ = io.close(f)
+    return true
+
+private bool write_file(string8 path, string8 text):
+    ref []char8 dir = #format("mkdir -p ", out_dir, #heap)
+    string8 dir_s = dir
+    ref []char8 dc = strings.clone_to_cstring(dir_s, #heap)
+    _ = proc.run(cstring(dc))
+    ref []char8 p = strings.clone_to_cstring(path, #heap)
+    ^io.FILE f = io.open_write(cstring(p))
+    if !io.opened(f):
+        return false
+    _ = io.write_bytes(f, strings.bytes(text))
+    _ = io.close(f)
+    return true
+
+when #OS == #DARWIN:
+    private void launch(string8 url):
+        ref []char8 u = strings.clone_to_cstring(url, #heap)
+        [3]cstring argv
+        argv[0] = "open"
+        argv[1] = cstring(u)
+        proc.Child c = proc.spawn(argv[0..<2])
+        _ = proc.wait(c)
+else:
+    private void launch(string8 url):
+        ref []char8 u = strings.clone_to_cstring(url, #heap)
+        [3]cstring argv
+        argv[0] = "xdg-open"
+        argv[1] = cstring(u)
+        proc.Child c = proc.spawn(argv[0..<2])
+        _ = proc.wait(c)

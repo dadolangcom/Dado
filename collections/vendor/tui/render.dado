@@ -1,0 +1,464 @@
+// vendor:tui — the compositor: the only place an escape sequence is produced.
+//
+// A frame is drawn into `back`. `present` walks it against `front`, and for
+// every cell that differs emits a cursor move (only when the cursor is not
+// already there), a style change (only when the style actually changed) and
+// the glyph. One keystroke that changes one character costs one move and one
+// character, not a screen clear and a repaint.
+//
+// The bytes go into a fixed frame buffer and reach the terminal in **one
+// write**, which is what removes the flicker that a `printf` per line has
+// inside `tmux`. One `write(2)`, not one `fwrite`: stdio splits a large
+// `fwrite` on a line-buffered terminal into a buffer's worth, the whole blocks
+// after it, and the tail, and `strace` on a 120x40 first frame showed exactly
+// that — 1024, 23552 and 16 bytes, three writes, with a terminal free to paint
+// between them.
+//
+// The destination is a `Sink`, not stdout. That is a testing requirement
+// rather than a feature: a whole frame can be composed into a `fmt.Cursor` and
+// the bytes asserted, with no terminal anywhere, in an ordinary `@test` file.
+package tui
+
+import "core:chars"
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:strings"
+
+// A full repaint of a 120x40 screen in truecolour measured 24.6 KB; this is
+// room for a 300x80 one, so a frame is never cut into two writes by the
+// buffer filling either.
+private const i32 FRAME_CAP = 262144
+private type FrameBuf: [FRAME_CAP]char8
+
+private FrameBuf g_frame
+private i32 g_flen
+private Sink g_out
+private bool g_have_out
+private bool g_own_sink
+
+// How many colours the terminal is sent. The compositor downgrades every
+// colour to this many, so a theme is written once in 24-bit and still reads on
+// a 16-colour console.
+const i32 COLORS_NONE = 0
+const i32 COLORS_16 = 16
+const i32 COLORS_256 = 256
+const i32 COLORS_TRUE = 16777216
+
+private i32 g_colors = COLORS_TRUE
+
+// What the last frame cost to send: its bytes, and how many writes carried
+// them. One is the promise; the counter is how a test checks it.
+private i32 g_sent_bytes
+private i32 g_sent_writes
+
+// Send frames somewhere other than stdout. The library never opens a stream of
+// its own, so a program that wants its UI in a pipe, a pty it owns, or a test
+// buffer just says so.
+void sink(Sink out):
+    g_out = out
+    g_have_out = true
+    g_own_sink = true
+    g_force = true
+
+private void ensure_out():
+    if !g_have_out:
+        g_out = io.stdout_sink()
+        g_have_out = true
+
+// Whether 24-bit colour is available. Decided once at `open` from the
+// environment, and overridable — a program that knows better than the
+// environment variables should be able to say so. Off means 256 colours.
+void truecolor(bool on):
+    g_colors = COLORS_TRUE if on else COLORS_256
+    g_force = true
+
+// Set the colour depth outright: `COLORS_NONE`, `COLORS_16`, `COLORS_256` or
+// `COLORS_TRUE`. Anything else is read as the nearest depth not above it.
+void colors(i32 depth):
+    if depth >= COLORS_TRUE: g_colors = COLORS_TRUE
+    else if depth >= COLORS_256: g_colors = COLORS_256
+    else if depth >= COLORS_16: g_colors = COLORS_16
+    else: g_colors = COLORS_NONE
+    g_force = true
+
+// The colour depth in force, so a program can choose a theme written for it:
+// a 16-colour palette of the terminal's own colours reads better than a
+// 24-bit one squeezed into sixteen.
+i32 color_depth():
+    return g_colors
+
+// From the environment, at `open`:
+//
+//   * `NO_COLOR` set to anything (https://no-color.org), or `TERM` empty or
+//     `dumb`: no colour at all. Attributes still go out, so bold and reverse
+//     keep the structure.
+//   * `COLORTERM` of `truecolor` or `24bit`: 24-bit.
+//   * `TERM` naming `256color` or `direct`: 256. Truecolour terminals almost
+//     always set COLORTERM, so the smaller claim is the safe one; a
+//     washed-out palette is a disappointment and a mojibake one a bug report.
+//   * Any other `TERM` (`xterm`, `linux`, `screen`, `vt100`): 16, the
+//     colours every terminal that has colour at all agrees on. Sending one of
+//     those a `38;5;n` paints whatever its parser makes of it.
+private void detect_colors():
+    string8 no = strings.borrow_from_cstring(os.env(cstring("NO_COLOR")))
+    string8 term = strings.borrow_from_cstring(os.env(cstring("TERM")))
+    if #len(no) > 0 || #len(term) == 0 || term == "dumb":
+        g_colors = COLORS_NONE
+        return
+    string8 ct = strings.borrow_from_cstring(os.env(cstring("COLORTERM")))
+    if strings.contains(ct, "truecolor") || strings.contains(ct, "24bit"):
+        g_colors = COLORS_TRUE
+        return
+    if strings.contains(term, "256color") || strings.contains(term, "direct"):
+        g_colors = COLORS_256
+        return
+    g_colors = COLORS_16
+
+// ── the frame buffer ───────────────────────────────────────────────────────
+
+// Send what the frame buffer holds. To a sink of the program's, through it;
+// to the terminal, as one `write(2)` of the whole buffer after anything stdio
+// still holds has gone ahead of it (`tty_write_frame`). Windows' console takes
+// the bytes through the C runtime's stream, as it always has.
+private void flush_frame():
+    if g_flen <= 0: return
+    ensure_out()
+    g_sent_bytes = g_sent_bytes + g_flen
+    g_sent_writes = g_sent_writes + 1
+    if g_own_sink:
+        _ = fmt.put_bytes(g_frame[0..<g_flen], g_out)
+        g_flen = 0
+        return
+    when #OS == #WINDOWS:
+        _ = fmt.put_bytes(g_frame[0..<g_flen], g_out)
+        _ = io.flush(io.stdout())
+    else:
+        _ = io.flush(io.stdout())
+        _ = tty_write_frame(g_frame[0..<g_flen])
+    g_flen = 0
+
+// The bytes and writes the last `present` sent: `(bytes, writes)`. Writes is
+// 1 for any frame that changed a cell, and 0 for one that changed none.
+(i32 bytes, i32 writes) frame_output():
+    return (g_sent_bytes, g_sent_writes)
+
+private void emit_byte(char8 c):
+    if g_flen >= FRAME_CAP - 8:
+        flush_frame()
+    g_frame[g_flen] = c
+    g_flen = g_flen + 1
+
+private void emit(string8 s):
+    i32 n = i32(#len(s))
+    for i in 0..<n:
+        emit_byte(s[i])
+
+// Decimal, straight into the frame. A repaint can touch thousands of cells and
+// each move carries two numbers, so one `#format` per number would be one
+// allocation per number — which is the reason this exists rather than style.
+private void emit_int(i32 v):
+    i32 x = v
+    if x < 0:
+        emit_byte('-')
+        x = 0 - x
+    if x == 0:
+        emit_byte('0')
+        return
+    [12]char8 tmp
+    i32 n = 0
+    for x > 0:
+        tmp[n] = char8(i32('0') + (x % 10))
+        x = x / 10
+        n = n + 1
+    for k in 0..<n:
+        emit_byte(tmp[n - 1 - k])
+
+private void emit_glyph(u32 g):
+    if g == 0:
+        emit_byte(' ')
+        return
+    [4]char8 buf
+    i32 n = chars.encode(char32(g), buf[:], 0)
+    if n == 0:
+        emit_byte(' ')
+        return
+    for i in 0..<n:
+        emit_byte(buf[i])
+
+// ── colour on the wire ─────────────────────────────────────────────────────
+
+// The xterm 256-colour cube's own levels. A channel is snapped to the nearest
+// of these six, which is what every downgrade worth having does.
+private const [6]u32 CUBE = [0, 95, 135, 175, 215, 255]
+
+private u32 cube_index(u32 v):
+    u32 best = 0
+    u32 best_d = 999
+    for i in 0..<6:
+        u32 c = CUBE[i]
+        u32 d = c - v
+        if c < v: d = v - c
+        if d < best_d:
+            best_d = d
+            best = u32(i)
+    return best
+
+// The nearest 256-colour index to a 24-bit value. Greys are checked against
+// the 24-step greyscale ramp as well as the cube, because the cube's own greys
+// are six steps apart and a UI's surface ramp lives entirely among them —
+// downgrading four distinct surfaces onto one colour is exactly the failure
+// this function exists to avoid.
+private u32 to_256(u32 rgb):
+    u32 r = (rgb >> 16) & 0xFF
+    u32 g = (rgb >> 8) & 0xFF
+    u32 b = rgb & 0xFF
+
+    u32 ri = cube_index(r)
+    u32 gi = cube_index(g)
+    u32 bi = cube_index(b)
+    u32 cr = CUBE[ri]
+    u32 cg = CUBE[gi]
+    u32 cb = CUBE[bi]
+    u32 cube_err = sq_diff(r, cr) + sq_diff(g, cg) + sq_diff(b, cb)
+
+    // The grey ramp: 232 + n, with level 8 + 10n.
+    u32 avg = (r + g + b) / 3
+    u32 gn = 0
+    if avg > 8: gn = (avg - 8) / 10
+    if gn > 23: gn = 23
+    u32 gl = 8 + (gn * 10)
+    u32 grey_err = sq_diff(r, gl) + sq_diff(g, gl) + sq_diff(b, gl)
+
+    if grey_err < cube_err: return 232 + gn
+    return 16 + (36 * ri) + (6 * gi) + bi
+
+private u32 sq_diff(u32 a, u32 b):
+    u32 d = a - b
+    if a < b: d = b - a
+    return d * d
+
+// The sixteen colours as xterm draws them, for choosing the nearest. A
+// terminal draws its own sixteen, so this is a guess at its palette and only
+// ever used to choose between them.
+private const [48]u32 SIXTEEN = [
+    0, 0, 0,  205, 0, 0,  0, 205, 0,  205, 205, 0,
+    0, 0, 238,  205, 0, 205,  0, 205, 205,  229, 229, 229,
+    127, 127, 127,  255, 0, 0,  0, 255, 0,  255, 255, 0,
+    92, 92, 255,  255, 0, 255,  0, 255, 255,  255, 255, 255,
+]
+
+// The nearest of the sixteen to a 24-bit value — among the six hues and
+// their bright forms when the colour has a hue of its own. Plain distance
+// sends a muted accent to grey: copper (229, 139, 87) is nearer xterm's
+// bright black than its yellow, and an accent that turns grey is no accent.
+// So a colour whose channels spread by 64 or more never lands on black,
+// white or either grey.
+private u32 to_16(u32 rgb):
+    u32 r = (rgb >> 16) & 0xFF
+    u32 g = (rgb >> 8) & 0xFF
+    u32 b = rgb & 0xFF
+    u32 hi = r
+    if g > hi: hi = g
+    if b > hi: hi = b
+    u32 lo = r
+    if g < lo: lo = g
+    if b < lo: lo = b
+    bool hued = hi - lo >= 64
+    u32 best = 0
+    u32 best_d = 0xFFFFFFFF
+    for i in 0..<16:
+        if hued && (i == 0 || i == 7 || i == 8 || i == 15): continue
+        u32 d = sq_diff(r, SIXTEEN[i * 3]) + sq_diff(g, SIXTEEN[(i * 3) + 1]) + sq_diff(b, SIXTEEN[(i * 3) + 2])
+        if d < best_d:
+            best_d = d
+            best = u32(i)
+    return best
+
+// The 24-bit value of a 256-colour index above 15: the cube or the greys.
+private u32 rgb_of_256(u32 i):
+    if i >= 232:
+        u32 v = 8 + ((i - 232) * 10)
+        return (v << 16) | (v << 8) | v
+    u32 k = i - 16
+    return (CUBE[k / 36] << 16) | (CUBE[(k / 6) % 6] << 8) | CUBE[k % 6]
+
+// One of the sixteen as its own SGR number: 30–37 and 90–97 for the
+// foreground, 40–47 and 100–107 for the background. Every terminal with
+// colour reads these, which is not true of `38;5;n`.
+private void emit_basic(u32 base, u32 idx):
+    emit("\x1b[")
+    i32 first = 30 if base == 38 else 40
+    if idx < 8: emit_int(first + i32(idx))
+    else: emit_int(first + 60 + i32(idx) - 8)
+    emit_byte('m')
+
+private void emit_color(u32 base, Color c):
+    if g_colors == COLORS_NONE: return
+    if is_default(c):
+        emit("\x1b[")
+        emit_int(i32(base) + 1)      // 39 for foreground, 49 for background
+        emit_byte('m')
+        return
+    u32 raw = u32(c)
+    u32 kind = raw & 0x0F000000
+    u32 value = raw & 0x00FFFFFF
+    if kind == 0x01000000 && (value & 0xFF) < 16:
+        emit_basic(base, value & 0xFF)
+        return
+    if g_colors == COLORS_16:
+        if kind == 0x02000000: emit_basic(base, to_16(value))
+        else: emit_basic(base, to_16(rgb_of_256(value & 0xFF)))
+        return
+    emit("\x1b[")
+    emit_int(i32(base))
+    if kind == 0x02000000 && g_colors == COLORS_TRUE:
+        emit(";2;")
+        emit_int(i32((value >> 16) & 0xFF))
+        emit_byte(';')
+        emit_int(i32((value >> 8) & 0xFF))
+        emit_byte(';')
+        emit_int(i32(value & 0xFF))
+    else:
+        emit(";5;")
+        if kind == 0x02000000: emit_int(i32(to_256(value)))
+        else: emit_int(i32(value & 0xFF))
+    emit_byte('m')
+
+// A whole style, written from a clean slate. Emitting `0m` first and then only
+// what is on is two bytes more than computing the difference and is immune to
+// the class of bug where an attribute nobody turned off outlives its widget.
+private void emit_style(Color fg, Color bg, Attr at):
+    emit("\x1b[0m")
+    if has_attr(at, Attr.BOLD): emit("\x1b[1m")
+    if has_attr(at, Attr.DIM): emit("\x1b[2m")
+    if has_attr(at, Attr.ITALIC): emit("\x1b[3m")
+    if has_attr(at, Attr.UNDER): emit("\x1b[4m")
+    if has_attr(at, Attr.BLINK): emit("\x1b[5m")
+    if has_attr(at, Attr.REVERSE): emit("\x1b[7m")
+    if has_attr(at, Attr.STRIKE): emit("\x1b[9m")
+    if !is_default(fg): emit_color(38, fg)
+    if !is_default(bg): emit_color(48, bg)
+
+// ── the diff ───────────────────────────────────────────────────────────────
+
+private bool same_cell(Cell a, Cell b):
+    return a.glyph == b.glyph && a.fg == b.fg && a.bg == b.bg && a.attr == b.attr && a.cont == b.cont
+
+// Clear `back` to the theme's own background. Not to "nothing": a cell painted
+// with the terminal default where the theme says `base` is a one-cell hole in
+// the window, and on a terminal whose own background differs it is visible.
+private void clear_back():
+    Cell blank = (32, g_theme.text, g_theme.base, Attr.NONE, false)
+    for i in 0..<(g_cols * g_rows):
+        g_back[i] = blank
+
+private void clear_front():
+    for i in 0..<(g_cols * g_rows):
+        g_front[i] = BLANK
+
+// Walk the grid and write what changed. `front` is updated as we go, so it
+// always mirrors what the terminal was last told.
+void present():
+    if g_back == nil: return
+    g_flen = 0
+    g_sent_bytes = 0
+    g_sent_writes = 0
+
+    if g_force:
+        // A forced frame cannot trust `front` — the first one, a resize, a
+        // theme change. Clear the screen, invalidate the front buffer, and let
+        // the diff below repaint everything.
+        emit("\x1b[0m\x1b[2J\x1b[H")
+        clear_front()
+
+    i32 cur_r = -1
+    i32 cur_c = -1
+    bool styled_yet = false
+    Color sf = DEFAULT
+    Color sb = DEFAULT
+    Attr sa = Attr.NONE
+
+    for r in 0..<g_rows:
+        for c in 0..<g_cols:
+            i32 at = (r * g_cols) + c
+            Cell want = g_back[at]
+            if same_cell(want, g_front[at]): continue
+            g_front[at] = want
+            // A continuation cell has no glyph of its own: the terminal drew
+            // two columns when it drew the wide character to its left, and
+            // writing anything here would overwrite the right half of it.
+            if want.cont:
+                cur_r = -1
+                continue
+
+            if r != cur_r || c != cur_c:
+                emit("\x1b[")
+                emit_int(r + 1)
+                emit_byte(';')
+                emit_int(c + 1)
+                emit_byte('H')
+            if !styled_yet || want.fg != sf || want.bg != sb || want.attr != sa:
+                emit_style(want.fg, want.bg, want.attr)
+                sf = want.fg
+                sb = want.bg
+                sa = want.attr
+                styled_yet = true
+            emit_glyph(want.glyph)
+            cur_r = r
+            cur_c = c + 1
+            if want.glyph != 0 && chars.width(char32(want.glyph)) == 2:
+                cur_c = c + 2
+
+    emit("\x1b[0m")
+    flush_frame()
+    _ = io.flush(io.stdout())
+    g_force = false
+
+// ── reading the grid back ──────────────────────────────────────────────────
+
+// What is painted at (x, y) in the frame just composed. `cont` marks the right
+// half of a double-width character, which holds no glyph of its own.
+//
+// This exists so a design review does not need a terminal: a tool can walk the
+// grid and render it as an image, an HTML page, or a diff. A library whose
+// selling point is looking good has to be inspectable by something other than
+// a screenshot of somebody's tmux.
+(u32 glyph, Color fg, Color bg, Attr attr, bool cont) cell_at(i32 x, i32 y):
+    if g_back == nil: return (32, DEFAULT, DEFAULT, Attr.NONE, false)
+    if x < 0 || x >= g_cols || y < 0 || y >= g_rows:
+        return (32, DEFAULT, DEFAULT, Attr.NONE, false)
+    Cell c = g_back[(y * g_cols) + x]
+    return (c.glyph, c.fg, c.bg, c.attr, c.cont)
+
+// The 24-bit value behind a colour, resolved through the theme's default.
+// `has` is false for the terminal's own default, which has no value to give.
+(u32 value, bool has) color_rgb(Color c):
+    if is_default(c): return (0, false)
+    u32 raw = u32(c)
+    if (raw & 0x0F000000) == 0x02000000: return (raw & 0x00FFFFFF, true)
+    return (0, false)
+
+// ── snapshots ──────────────────────────────────────────────────────────────
+
+// The current frame as plain text, one row per line, no colour. For golden
+// tests and for `--print` modes: a UI that can be diffed as text is a UI whose
+// layout can be regression-tested without a terminal.
+string8 snapshot((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 run = #make([]char8, 0, alloc)
+    if run == nil: return ""
+    Sink into = fmt.to_run(&run)
+    for r in 0..<g_rows:
+        for c in 0..<g_cols:
+            Cell cell = g_back[(r * g_cols) + c]
+            if cell.cont: continue
+            [4]char8 buf
+            u32 g = cell.glyph
+            if g == 0: g = 32
+            i32 n = chars.encode(char32(g), buf[:], 0)
+            if n > 0: _ = fmt.put_bytes(buf[0..<n], into)
+        _ = fmt.put_char('\n', into)
+    // The lend `ref []char8` -> `string` applies on assignment and at a
+    // parameter, but not at a `return` — so it is spelled with a binding.
+    string8 out = run
+    return out

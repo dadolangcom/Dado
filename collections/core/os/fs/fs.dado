@@ -1,0 +1,787 @@
+// core:os/fs — what is on the disk.
+//
+//     import "core:os/fs"
+//
+//     ^fs.Dir d = fs.open(".")
+//     defer fs.close(d)
+//     for:
+//         (cstring name, bool ok) = fs.next(d)
+//         if !ok: break
+//         println(name, "  dir=", fs.is_dir(name))
+//
+// **The package, in four files.** This one asks questions of a path and walks
+// a directory, over `cstring` paths and with `bool` answers. `files.dado` reads
+// and writes whole files and changes the tree — remove, rename, copy, `mtime`,
+// temp directories, links — over `string8` paths, failing with `core:os`'s
+// codes. `walk.dado` walks and makes whole trees. `windows.dado` holds what the
+// Windows arms share.
+//
+// Tier: hosted — Linux, macOS and Windows, each with an arm of its own. The
+// error codes are `core:os`'s. Thread-safety: `cwd` answers in this package's
+// own buffer, so two threads asking at once overwrite each other; everything
+// else is safe from any thread.
+//
+// **Every path in this file is a `cstring`**, and that is the boundary at a signature.
+// A path exists in this package only to be handed to `<dirent.h>` or to a
+// `stat`, so the parameter says what the platform needs and the caller says how
+// it got one: a literal already is one, and bytes a program built become one
+// through `strings.clone_to_cstring` and a `cstring(…)` at the call. A name
+// coming *back* — from `next` or `cwd` — is a `cstring` for the mirror reason:
+// C hands over a pointer and threw the length away, and there is no conversion
+// into a `string` to hide the walk that finds it again.
+//
+// Everything here is a question about a path, answered by the platform. There
+// is no path *algebra* — no join, no basename, no normalise — because those
+// return new bytes and there is nowhere to build them that outlives the block.
+// Use `format` at the point of use; it is one line and the bytes
+// live exactly as long as you need them.
+//
+// **This package has no C of its own.** On POSIX, `<dirent.h>`, `<sys/stat.h>`,
+// `<stdlib.h>`, `<string.h>` and `<unistd.h>` are bound directly and the bodies
+// below are the whole implementation; what that costs, and what it buys, is
+// written beside `Stat`. On Windows, `<windows.h>` is, through `windows.dado`.
+package fs
+
+// ── what every system shares ────────────────────────────────────────────────
+
+// Whether a name is `.`, `..`, or begins with a dot. The three a listing
+// usually skips, as one question.
+//
+// **It takes a `string` and `next` hands back a `cstring`, and the comment that
+// stood here said that gap could not be crossed. It can, and the claim is
+// deleted rather than carried forward.** What it said was true of the two
+// operations this function needs — a `cstring` has no indexing, because it is
+// one machine word that says only that a `\0` is somewhere ahead of it, and no
+// equality by contents, because `==` on one compares addresses — and false
+// about the way to reach them: `string(c)` is a **borrowing** conversion and
+// walks to the terminator once, which is exactly the walk a tag keeps out of an
+// operator. `hidden(string(name))` is the call, and this package's own test
+// makes it.
+//
+// It stays on `string` because the borrow is one word at the call site and
+// belongs where a caller can see the walk, and because a program that already
+// has the name as a `string` — a literal, a path it assembled — should not have
+// to go the other way to ask.
+bool hidden(string8 name):
+    if name == "" || name == "." || name == "..":
+        return true
+    return name[0] == '.'
+
+// How many bytes `cwd` has to answer in. The platform's own ceiling is
+// `PATH_MAX`, which is 4096 on Linux, 1024 on Darwin, and permitted to be
+// undefined — so this is a buffer this package sizes and not a claim about the
+// platform's. A working directory longer than this comes back empty, the same
+// answer a `getcwd` failure gives.
+private const i64 CWDCAP = 4096
+private [CWDCAP]char8 g_cwd
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+//
+// The same surface over Win32, with the declarations and the path conversion
+// in `windows.dado`. Each function's contract is the one written on its POSIX
+// twin below; what differs is said here.
+when #OS == #WINDOWS:
+    // The search a directory listing is: `FindFirstFileW` answers the first
+    // entry along with the handle, so it is held until the first `next`. The
+    // record is allocated from the process heap by `open` and freed by
+    // `close`, because `^Dir` is a pointer the caller holds and no Dado
+    // allocator is in scope to free it with.
+    type Dir: (rawptr search, bool pending, FsFindData found, [1024]char8 name)
+
+    ^Dir open(cstring path):
+        if path == nil:
+            return nil
+        string8 p = text_of(path)
+        if #len(p) == 0:
+            return nil
+        // `dir\*` lists `dir`; a path that already ends in a separator takes
+        // only the `*`.
+        ref []char8 pattern = #format(p, "\\*")
+        if p[#len(p) - 1] == '/' || p[#len(p) - 1] == '\\':
+            #delete(pattern)
+            pattern = #format(p, "*")
+        ref []u16 w = wide_path(pattern)
+        #delete(pattern)
+        if #len(w) == 0:
+            #delete(w)
+            return nil
+        rawptr block = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, #c.size_t(#size(Dir)))
+        if block == nil:
+            #delete(w)
+            return nil
+        ^Dir d = ^Dir(block)
+        d^.search = FindFirstFileW(&w[0], &d^.found)
+        #delete(w)
+        if d^.search == INVALID_HANDLE_VALUE:
+            _ = HeapFree(GetProcessHeap(), 0, block)
+            return nil
+        d^.pending = true
+        return d
+
+    bool opened(^Dir dir):
+        return dir != nil
+
+    void close(^Dir dir):
+        if dir != nil:
+            _ = FindClose(dir^.search)
+            _ = HeapFree(GetProcessHeap(), 0, rawptr(dir))
+
+    // The name is converted into the record's own buffer, so it is good until
+    // the next `next` on the same handle, as on POSIX. `.` and `..` are
+    // included, as on POSIX: Windows lists both for every directory but a
+    // drive's root.
+    (cstring name, bool ok) next(^Dir dir):
+        if dir == nil:
+            return (nil, false)
+        if dir^.pending:
+            dir^.pending = false
+        else if FindNextFileW(dir^.search, &dir^.found) == 0:
+            return (nil, false)
+        #c.int wrote = WideCharToMultiByte(CP_UTF8, 0, &dir^.found.cFileName[0], -1, WCharBuf(rawptr(&dir^.name[0])), 1023, nil, nil)
+        if wrote <= 0:
+            dir^.name[0] = '\0'
+        dir^.name[1023] = '\0'
+        return (cstring(rawptr(&dir^.name[0])), true)
+
+    // Following links, as `stat` does on POSIX.
+    bool is_dir(cstring path):
+        if path == nil: return false
+        (FsHandleInfo info, bool got) = info_follow(text_of(path))
+        return got && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+
+    bool is_file(cstring path):
+        if path == nil: return false
+        (FsHandleInfo info, bool got) = info_follow(text_of(path))
+        return got && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+
+    bool exists(cstring path):
+        if path == nil: return false
+        (FsHandleInfo _, bool got) = info_follow(text_of(path))
+        return got
+
+    i64 bytes(cstring path):
+        if path == nil: return 0 - 1
+        (FsHandleInfo info, bool got) = info_follow(text_of(path))
+        if !got: return 0 - 1
+        return i64(info.nFileSizeHigh) * 4294967296 + i64(info.nFileSizeLow)
+
+    // `GetFinalPathNameByHandleW` over a handle that followed every link: the
+    // path Windows itself resolved to, with every `.` and `..` gone. It answers
+    // in the `\\?\` form, which is taken off (`\\?\UNC\` back to `\\`) because
+    // the result is for a person and for comparing, and the plain form is the
+    // one both expect.
+    i64 real_path(cstring path, []char8 out):
+        i64 cap = #len(out)
+        if path == nil || cap <= 0:
+            return 0 - 1
+        ref []u16 w = wide_path(text_of(path))
+        defer #delete(w)
+        if #len(w) == 0:
+            return 0 - 1
+        rawptr h = CreateFileW(&w[0], FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nil, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nil)
+        if h == INVALID_HANDLE_VALUE:
+            return 0 - 1
+        ref []u16 buf = #make([]u16, 32768)
+        defer #delete(buf)
+        #c.ulong got = GetFinalPathNameByHandleW(h, &buf[0], 32767, VOLUME_NAME_DOS)
+        _ = CloseHandle(h)
+        if got == 0 || got >= 32767:
+            return 0 - 1
+        ref []char8 text = narrow(&buf[0], i64(got))
+        defer #delete(text)
+        string8 t = text
+        ref []char8 plain = plain_form(t)
+        defer #delete(plain)
+        i64 n = #len(plain)
+        if n >= cap:
+            return 0 - 1
+        for i in 0..<n:
+            out[i] = plain[i]
+        out[i32(n)] = '\0'
+        return n
+
+    // `CreateSymbolicLinkW`, through `make_symlink`, which says why it failed.
+    bool symlink(cstring target, cstring path):
+        if target == nil || path == nil:
+            return false
+        try make_symlink(text_of(target), text_of(path)) else:
+            return false
+        return true
+
+    i64 read_link(cstring path, []char8 out):
+        i64 cap = #len(out)
+        if path == nil || cap <= 0:
+            return 0 - 1
+        (ref []char8 text, bool got) = link_text(text_of(path))
+        defer #delete(text)
+        i64 n = #len(text)
+        if !got || n >= cap:
+            return 0 - 1
+        for i in 0..<n:
+            out[i] = text[i]
+        out[i32(n)] = '\0'
+        return n
+
+    bool is_symlink(cstring path):
+        if path == nil: return false
+        return link_at(text_of(path))
+
+    // **Windows has no execute bit**: whether a file runs is decided by its
+    // name, against the extensions in `PATHEXT` (`.COM;.EXE;.BAT;.CMD` when it
+    // is unset). So this asks that question of a file that exists.
+    bool executable(cstring path):
+        if path == nil || !is_file(path): return false
+        return runnable_name(text_of(path))
+
+    // Nothing to set: with no execute bit, a file that exists is as runnable
+    // as its name makes it, and that is what this says.
+    bool make_executable(cstring path):
+        return is_file(path)
+
+    cstring cwd():
+        [4096]u16 wide
+        #c.ulong got = GetCurrentDirectoryW(4096, &wide[0])
+        g_cwd[0] = '\0'
+        if got > 0 && got < 4096:
+            #c.int wrote = WideCharToMultiByte(CP_UTF8, 0, &wide[0], #c.int(got), WCharBuf(rawptr(&g_cwd[0])), #c.int(CWDCAP - 1), nil, nil)
+            if wrote > 0 && i64(wrote) < CWDCAP:
+                g_cwd[i64(wrote)] = '\0'
+            else:
+                g_cwd[0] = '\0'
+        return cstring(rawptr(&g_cwd[0]))
+
+    bool set_cwd(cstring path):
+        if path == nil:
+            return false
+        ref []u16 w = widen(text_of(path))
+        defer #delete(w)
+        return #len(w) > 0 && SetCurrentDirectoryW(&w[0]) != 0
+
+    bool make_dir(cstring path):
+        if path == nil:
+            return false
+        ref []u16 w = wide_path(text_of(path))
+        defer #delete(w)
+        return #len(w) > 0 && CreateDirectoryW(&w[0], nil) != 0
+
+    // Owner and `SYSTEM` only, through a protected DACL (`windows.dado`), which
+    // is what `0700` says on POSIX.
+    bool make_private_dir(cstring path):
+        if path == nil:
+            return false
+        try create_private(text_of(path)) else:
+            return false
+        return true
+else:
+    // ── POSIX: Linux and macOS ──────────────────────────────────────────────
+    //
+    // ── the platform's own layouts, restated ────────────────────────────────────
+    //
+    // **`struct stat` is the one layout in this package Dado owns, and owning it is
+    // a real cost, so here is the whole of it.** The emitter writes a shadow struct
+    // beside every transparent `foreign` type and asks the C compiler to prove
+    // `sizeof` equal and every member's `offsetof` and width equal — so a
+    // restatement is not a guess that might be read wrong at run time, it is a
+    // claim the C compiler either proves or rejects by name at compile time. That
+    // is what makes restating a layout admissible at all.
+    //
+    // Two consequences, and they are the price:
+    //
+    //   * **glibc's `struct stat` has padding, and padding has names.** `int
+    //     __pad0` and `__syscall_slong_t __glibc_reserved[3]` are members glibc
+    //     reserves to itself, and a `sizeof`-exact restatement has to spell both.
+    //     Dado is therefore writing down two names no standard promises. It is
+    //     admissible *because the failure is loud*: a glibc that renames or
+    //     reshapes either one does not miscompute a file size, it fails to build,
+    //     naming the member.
+    //   * **This narrows the package from "any POSIX libc" to the two this tree
+    //     builds for.** POSIX fixes which members `struct stat` has and fixes
+    //     nothing about their order, their widths or the padding between them, and
+    //     every libc answers differently — Darwin's is a different shape, not a
+    //     different spelling of this one. A third libc is a build error here where
+    //     it used to be somebody else's `#include`. That is the trade, taken
+    //     deliberately: the C compiler still checks the claim on the platform the
+    //     program is actually being built for, and there is no C file left to keep
+    //     in step with this one.
+    //
+    // **The Darwin arm has never been compiled.** This tree's machine is glibc on
+    // Linux; an untaken `when` arm is parsed and nothing else, so what is written
+    // there rests on Darwin's header and not on a build. Say so rather than imply
+    // it was measured.
+    //
+    // `S_ISDIR` and `S_ISREG` are **function-like macros**, not functions, and
+    // `@macro` is what says so: a `foreign` function emits a bare call and no
+    // prototype, so the preprocessor expands `S_ISDIR(st.st_mode)` at the call
+    // site and the declaration here exists to type the argument. Without the
+    // marker the emitted C carries an `#ifdef`/`#error` pair that fails the build
+    // asking for it.
+    //
+    // **The timestamps are written as member lists, `(#c.long tv_sec, #c.long
+    // tv_nsec) st_atim`, and not as `core:time`'s `struct timespec`.** A C type has
+    // one Dado name and one body across an entire build — ERR1003 — and `core:time`
+    // already declares `struct timespec`, as `sys.TimeSpec`, in a `private` block;
+    // a second declaration here is an error the moment one program imports both,
+    // which `ide` does. A bodiless one in this package is ERR1003 too, and could
+    // not be a by-value member of a `sizeof`-exact layout anyway.
+    //
+    // A member list written in a member's position is a C type Dado declares for
+    // itself (ERR1025), so it is not a second `struct timespec` — and it says what
+    // the header says one level down: the two members, their names and their
+    // types, each asserted through the member C named (`offsetof(Stat,
+    // st_atim.tv_nsec)`, with the member's type claimed beside it). What is not
+    // asserted is the member's own C type, because Dado's is one it declared and
+    // C's is `struct timespec`: two struct types are never compatible, whatever
+    // they hold.
+    //
+    // **This used to be `[2]#c.long`**, on the argument that the layout assertions
+    // checked only `offsetof` and `sizeof` — the same sixteen bytes, so the same
+    // proof. Row 2.2 asks each member's C type as well, and an array of two `long`s
+    // is not a struct of two: the restatement was right about the bytes and wrong
+    // about the type, and the check is what said so.
+    //
+    // Nothing here reads a timestamp; `stat` is read for `st_mode` and `st_size`.
+    // A future `fs.modified_time` reads `st_mtim.tv_sec` directly.
+    //
+    // The Darwin arm changes the same way and is still written from Darwin's
+    // header and never compiled: the C compiler on a Darwin machine will say
+    // whether it holds.
+    when #OS == #DARWIN:
+        private foreign "sys/stat.h" define "Stat=struct stat":
+            type Stat: (i32 st_dev, u16 st_mode, u16 st_nlink, u64 st_ino,
+                        u32 st_uid, u32 st_gid, i32 st_rdev,
+                        (#c.long tv_sec, #c.long tv_nsec) st_atimespec,
+                        (#c.long tv_sec, #c.long tv_nsec) st_mtimespec,
+                        (#c.long tv_sec, #c.long tv_nsec) st_ctimespec,
+                        (#c.long tv_sec, #c.long tv_nsec) st_birthtimespec,
+                        i64 st_size, i64 st_blocks, i32 st_blksize,
+                        u32 st_flags, u32 st_gen, i32 st_lspare, [2]i64 st_qspare)
+            #c.int stat(cstring path, ^Stat buf)
+            #c.int lstat(cstring path, ^Stat buf)
+            @macro #c.int S_ISDIR(u16 mode)
+            @macro #c.int S_ISREG(u16 mode)
+            @macro #c.int S_ISLNK(u16 mode)
+    else:
+        private foreign "sys/stat.h" define "Stat=struct stat":
+            type Stat: (u64 st_dev, u64 st_ino, u64 st_nlink,
+                        u32 st_mode, u32 st_uid, u32 st_gid, i32 __pad0,
+                        u64 st_rdev, i64 st_size, i64 st_blksize, i64 st_blocks,
+                        (#c.long tv_sec, #c.long tv_nsec) st_atim,
+                        (#c.long tv_sec, #c.long tv_nsec) st_mtim,
+                        (#c.long tv_sec, #c.long tv_nsec) st_ctim,
+                        [3]i64 __glibc_reserved)
+            #c.int stat(cstring path, ^Stat buf)
+            #c.int lstat(cstring path, ^Stat buf)
+            @macro #c.int S_ISDIR(u32 mode)
+            @macro #c.int S_ISREG(u32 mode)
+            @macro #c.int S_ISLNK(u32 mode)
+
+    // `mkdir`'s and `chmod`'s mode is a `mode_t`, which is `unsigned int` on glibc
+    // and `unsigned short` on Darwin. It needs an arm: C would convert an argument
+    // to either, but the emitter asserts each restated signature's C type with
+    // `_Generic`, and `unsigned int` is not `unsigned short` — the one spelling
+    // that used to serve both was a build error on every Mac. `mode_bits` below
+    // reads it as a `u32` on both, so the conversion to `mode_t` is each arm's.
+    when #OS == #DARWIN:
+        private foreign mk "sys/stat.h":
+            #c.int mkdir(cstring path, #c.ushort mode)
+            #c.int chmod(cstring path, #c.ushort mode)
+
+        private bool chmod_to(cstring path, u32 mode): return mk.chmod(path, #c.ushort(mode)) == 0
+    else:
+        private foreign mk "sys/stat.h":
+            #c.int mkdir(cstring path, #c.uint mode)
+            #c.int chmod(cstring path, #c.uint mode)
+
+        private bool chmod_to(cstring path, u32 mode): return mk.chmod(path, #c.uint(mode)) == 0
+
+    // `DIR` is opaque in C itself — `<dirent.h>` typedefs it over a struct it never
+    // defines — and a bodiless `foreign` type is exactly that: complete enough to
+    // have a pointer to and nothing else. Neither side learns what is inside.
+    private foreign "dirent.h":
+        type DIR
+        ^DIR opendir(cstring path)
+        #c.int closedir(^DIR d)
+
+    // `struct dirent` is restated for one member — `d_name` — and the shape around
+    // it differs between the two platforms exactly as `struct stat`'s does. The
+    // bytes of a name belong to the directory stream, which is why `next` hands
+    // back a pointer into it rather than a copy.
+    when #OS == #DARWIN:
+        private foreign "dirent.h" define "Dirent=struct dirent":
+            type Dirent: (u64 d_ino, u64 d_seekoff, u16 d_reclen, u16 d_namlen,
+                          u8 d_type, [1024]#c.char d_name)
+            ^Dirent readdir(^DIR d)
+    else:
+        private foreign "dirent.h" define "Dirent=struct dirent":
+            type Dirent: (u64 d_ino, i64 d_off, u16 d_reclen, u8 d_type,
+                          [256]#c.char d_name)
+            ^Dirent readdir(^DIR d)
+
+    // `realpath` is the one call here a feature-test macro is needed for: glibc
+    // guards it behind `__USE_XOPEN_EXTENDED`/`__USE_MISC` and declares `stat`,
+    // `opendir`, `getcwd`, `chdir` and `mkdir` unconditionally.
+    //
+    // **`_DEFAULT_SOURCE` and not `_XOPEN_SOURCE 700`.** A `define` clause is
+    // emitted above *every* `#include` in the whole program's translation unit, not
+    // just this package's — so a feature macro here is one every other package in
+    // the program gets. `_DEFAULT_SOURCE` only *widens* what glibc declares;
+    // `_XOPEN_SOURCE 700` would also suppress the set glibc turns on by itself when
+    // nothing asks, which takes declarations away from packages that never asked
+    // for anything. `_DARWIN_C_SOURCE` is the same widening on Darwin and is inert
+    // on Linux, as `_DEFAULT_SOURCE` is on Darwin.
+    private foreign "stdlib.h" define "_DEFAULT_SOURCE=1" define "_DARWIN_C_SOURCE=1":
+        // **`realpath(path, nil)`, not a caller-sized buffer.** POSIX.1-2008 makes
+        // a null second argument mean *allocate the answer*, which is what deletes
+        // this package's `PATH_MAX` question: a buffer the caller sizes has to be
+        // at least `PATH_MAX`, `PATH_MAX` is 4096 on Linux and 1024 on Darwin, and
+        // a system is allowed to leave it undefined entirely. Asking the platform
+        // for the bytes asks none of that. The buffer is `free`d before this
+        // package returns, on every path out.
+        ^#c.char realpath(cstring path, ^#c.char resolved)
+        void free(rawptr p)
+
+    // **`memcpy` carries `@macro` and `strlen` does not, and the asymmetry is
+    // evidence rather than taste.** The emitter asks `#ifdef <name>` / `#error` of
+    // every *unmarked* `foreign` function, because a name the preprocessor
+    // replaces is a name whose signature nothing checks. On macOS, `<string.h>`
+    // defines `memcpy` as a macro — `__builtin___memcpy_chk` under the fortified
+    // headers — so the unmarked declaration is a build error there. Measured on
+    // the author's Mac, 2026-09-19: `1 error generated`, naming `memcpy` and not
+    // `strlen`, which is why only one of them is marked.
+    //
+    // **`@macro` is an exemption and never an assertion.** *"Is a macro"* is not
+    // assertable at all: whether a name is one is a property of a **compile**, not
+    // of a header — glibc guards several behind `__OPTIMIZE__`, so the same name
+    // is an extern at `-O0` and a macro at `-O2`. So this does not claim `memcpy`
+    // is a macro; it declines to ask, which is the only honest thing available.
+    // The cost is real and is why it is not applied to the whole block: an
+    // unmarked `foreign` function surviving a build is *proved* to name a real
+    // symbol under that build's own flags, and marking one gives that up.
+    //
+    // This surfaced late because nothing had ever compiled this package on a Mac.
+    // It is reached from a program, `./dado build` on a Mac is the only thing that
+    // compiles one there, and `collections/` held no program until `tools/doc`.
+    private foreign "string.h":
+        #c.size_t strlen(cstring s)
+        @macro rawptr memcpy(rawptr dst, rawptr src, #c.size_t nbytes)
+
+    // A byte buffer handed to C as the `char *` the header declares. `realpath`,
+    // `getcwd` and `readlink` write into a `char *`, and a restatement saying
+    // `rawptr` there is a `void *` the header does not have — the `_Generic`
+    // assertion over each foreign signature refuses it. `^#c.char` is C's own
+    // `char *`; this name is how a `rawptr(&out[0])` becomes one: `^#c.char(p)`
+    // would read as a function type, so a pointer conversion is written with a
+    // type's name.
+    private type CharBuf: ^#c.char
+
+    // Bound as `sys`, because this package already declares `cwd` and `set_cwd` and
+    // reads better with the platform's own names kept apart from them. A binding is
+    // what keeps one name from having to be two things; the emitted C is still the
+    // bare identifier.
+    private foreign sys "unistd.h":
+        ^#c.char getcwd(^#c.char buf, #c.size_t nbytes)
+        #c.int chdir(cstring path)
+        #c.int symlink(cstring target, cstring path)
+        #c.long readlink(cstring path, ^#c.char buf, #c.size_t nbytes)
+        // **`access` and not a mode read**, because *"can this be executed"* is a
+        // question about the caller's own permissions and not about the bits: the
+        // owner's `x` bit says nothing to anybody else, and `access` is the one
+        // call that answers for whoever is asking. `X_OK` is taken from the header
+        // rather than restated — POSIX fixes it at 1 today and a restated constant
+        // is a copy that cannot know if that changes.
+        #c.int access(cstring path, i32 mode)
+        const i32 X_OK
+
+    // The handle, under the name a program writes. A `type` is a view and creates
+    // no new type, so this is the C name with a Dado spelling and costs
+    // nothing.
+    type Dir: DIR
+
+    // ── walking a directory ───────────────────────────────────────────────────
+
+    // **A `nil` path is answered, not passed on.** Every function here that takes a
+    // `cstring` checks it first, because `next` hands back `nil` at the end of a
+    // directory and a caller that reads the name without reading `ok` would
+    // otherwise reach `stat(NULL, …)` — undefined behaviour in C, whatever a given
+    // libc happens to survive. The deleted `.c` guarded the same way and the answer
+    // is the same one it gave: nothing on the disk.
+    ^Dir open(cstring path):
+        if path == nil:
+            return nil
+        return opendir(path)
+
+    bool opened(^Dir dir):
+        return dir != nil
+
+    void close(^Dir dir):
+        if dir != nil:
+            _ = closedir(dir)
+
+    // The next entry's name, and whether there was one.
+    //
+    // `.` and `..` are included, because filtering them is a policy and this is
+    // not the layer for one — `hidden` below is the policy, spelled where you can
+    // see it and skip calling it.
+    //
+    // The bytes belong to the directory stream, so the name is good until the next
+    // `next` on the same handle. `cstring(…)` at the end is what says *this pointer
+    // is terminated* — after the null has been asked about, which is the question
+    // `ok` answers.
+    //
+    // `nil` and not an empty name for the end, because an entry named nothing and
+    // the end of the directory are different events and only `ok` used to tell them
+    // apart. Now both do.
+    (cstring name, bool ok) next(^Dir dir):
+        if dir == nil:
+            return (nil, false)
+        ^Dirent e = readdir(dir)
+        if e == nil:
+            return (nil, false)
+        return (cstring(&e^.d_name[0]), true)
+
+    // ── asking about a path ───────────────────────────────────────────────────
+
+    // `stat` follows symlinks, which is what a program listing a tree almost always
+    // means, and a path that does not exist is not an error here — it is `false`.
+    bool is_dir(cstring path):
+        Stat st
+        if path == nil || stat(path, &st) != 0:
+            return false
+        return S_ISDIR(st.st_mode) != 0
+
+    bool is_file(cstring path):
+        Stat st
+        if path == nil || stat(path, &st) != 0:
+            return false
+        return S_ISREG(st.st_mode) != 0
+
+    bool exists(cstring path):
+        Stat st
+        if path == nil:
+            return false
+        return stat(path, &st) == 0
+
+    // Bytes, or -1 when the path cannot be read. `i64`, because a file may be
+    // larger than a 32-bit count on a 32-bit target and the honest width is the
+    // one that always holds.
+    i64 bytes(cstring path):
+        Stat st
+        if path == nil || stat(path, &st) != 0:
+            return 0 - 1
+        return i64(st.st_size)
+
+    // ── canonicalization ──────────────────────────────────────────────────────
+
+    // Resolve `path` to its canonical absolute form against the disk — every `.`,
+    // `..` and symbolic link followed — writing the result into `out` and returning
+    // the byte length written (a terminator is written but not counted), or **-1**
+    // when the path cannot be resolved: it does not exist, a component is not a
+    // directory, a link loops, or `out` is too small to hold the answer. `realpath`
+    // behind the same signature on every POSIX platform.
+    //
+    // **The bytes are the caller's**, and that is the whole difference from `cwd`.
+    // `cwd` hands back a `cstring` into a static buffer, which is exactly the shape
+    // `hidden`'s comment calls out as a gap — there is no way to read those bytes
+    // back into an owned `string`. `real_path` writes into a `[]char8` the caller
+    // already owns, so the resolved path arrives *as* Dado bytes with a length, ready
+    // to compare or key a package on with no crossing back. That is why the load
+    // stage's `identity` — realpath where the filesystem can answer, the lexical
+    // `normalize` where it cannot — can be written at all.
+    //
+    // `rawptr(&out[0])` is the conversion at the boundary, guarded because a
+    // zero-length slice has no element 0 to take the address of (the `io.read_bytes`
+    // idiom).
+    i64 real_path(cstring path, []char8 out):
+        i64 cap = #len(out)
+        if path == nil || cap <= 0:
+            return 0 - 1
+
+        rawptr got = rawptr(realpath(path, nil))
+        if got == nil:
+            return 0 - 1
+
+        i64 n = i64(strlen(cstring(got)))
+        // The terminator is copied too, so it has to fit as well — a result that
+        // exactly fills `out` is refused rather than handed back unterminated.
+        if n >= cap:
+            free(got)
+            return 0 - 1
+
+        _ = memcpy(rawptr(&out[0]), got, #c.size_t(n + 1))
+        free(got)
+        return n
+
+    // ── links, and the one permission bit a toolchain cares about ────────────
+
+    // **Removing and moving are in `files.dado`**, failable and over `string8`:
+    // `remove_file`, `remove_dir`, `remove_all` and `rename`, each saying why
+    // it failed, where `io.delete` and `io.move` answer only `bool`.
+
+    // Make `path` a symbolic link to `target`. `target` is stored as written and
+    // is not resolved, so a relative one is relative to the link's own directory
+    // — which is what makes a whole tree of them movable, and is why an installer
+    // wants it.
+    //
+    // False when the link could not be made, `path` already exists included. This
+    // does **not** replace an existing link: POSIX has no atomic `symlink` over
+    // one, and the two-step "unlink then symlink" has a window in which the name
+    // is missing. A caller that wants a moving symlink makes a new name and
+    // `rename`s it over the old, which `rename(2)` does atomically.
+    bool symlink(cstring target, cstring path):
+        if target == nil || path == nil:
+            return false
+        return sys.symlink(target, path) == 0
+
+    // What `path` points at, written into `out`, as a count of bytes. `-1` when
+    // `path` is not a link or could not be read.
+    //
+    // **The one hop, and not the resolution** — `real_path` is the resolution, and
+    // the two answer different questions: `real_path` follows every link to a
+    // file, and this reports the text of one link, which is the only way to tell a
+    // link from the thing it names.
+    //
+    // `readlink` does **not** terminate what it writes, so this does, and a result
+    // that exactly fills `out` is refused rather than handed back unterminated —
+    // the rule `real_path` uses, for the same reason.
+    i64 read_link(cstring path, []char8 out):
+        i64 cap = #len(out)
+        if path == nil || cap <= 0:
+            return 0 - 1
+        i64 n = i64(sys.readlink(path, CharBuf(rawptr(&out[0])), #c.size_t(cap)))
+        if n < 0 || n >= cap:
+            return 0 - 1
+        out[i32(n)] = '\0'
+        return n
+
+    // Whether `path` is itself a symbolic link.
+    //
+    // **This is the one predicate in the package that does not follow links**, and
+    // it is here because every other one does: `stat` resolves, so a dangling link
+    // reports `exists=false` and `is_file=false` — indistinguishable from nothing
+    // being there at all. `lstat` is what tells those two apart.
+    bool is_symlink(cstring path):
+        Stat st
+        if path == nil || lstat(path, &st) != 0:
+            return false
+        return S_ISLNK(st.st_mode) != 0
+
+    // Whether the caller could execute `path`.
+    bool executable(cstring path):
+        if path == nil:
+            return false
+        return sys.access(path, sys.X_OK) == 0
+
+    // The three read bits, as hex: Dado writes integer literals in decimal and in
+    // hex and has no octal, so this is `0444`. The same note is on `make_dir`'s
+    // `0x1FF`. Two places right of each read bit is the class's execute bit —
+    // `0444 >> 2` is `0111` — which is why the rule below needs one constant and
+    // not two.
+    private const u32 READ_BITS = 0x124
+
+    // Add the execute bit to `path`, **for each class that can already read it**.
+    //
+    // That rule rather than `mode | 0111`, and rather than a mode the caller
+    // writes. A file at `0600` becomes `0700` and not `0711`: making a private
+    // file executable by everybody is not what anybody meant by *"make it
+    // runnable"*, and it is what a plain `| 0111` does. It is also `chmod +x`'s own
+    // answer under the usual umask, without depending on the umask — which a
+    // library cannot read without changing it.
+    //
+    // Nothing here removes the bit. `chmod -x` has no caller in this tree, and an
+    // operation that can make a file unrunnable is worth adding when something
+    // needs it rather than for symmetry.
+    //
+    // False when `path` could not be stat'd or chmod'd. Already-executable is
+    // `true`: this says what the file is afterwards, not whether it changed.
+    bool make_executable(cstring path):
+        (u32 mode, bool got) = mode_bits(path)
+        if !got:
+            return false
+        u32 want = mode | ((mode & READ_BITS) >> 2)
+        if want == mode:
+            return true
+        return set_mode(path, want)
+
+    // The permission bits of `path`, and whether there were any to read. Package
+    // -private: the two callers are `make_executable` and the test beside it, and a
+    // public mode reader would be a width this package promises — `st_mode` is
+    // `u16` on Darwin and `u32` here — for a question nothing in the tree asks.
+    private (u32 mode, bool ok) mode_bits(cstring path):
+        Stat st
+        if path == nil || stat(path, &st) != 0:
+            return (0, false)
+        return (u32(st.st_mode), true)
+
+    // Whether `path` itself exists — a link is not followed — and whether it
+    // is a directory. `remove_all`'s question, because it must never enter a
+    // link.
+    private (bool there, bool dir) lstat_kind(cstring path):
+        Stat st
+        if path == nil || lstat(path, &st) != 0:
+            return (false, false)
+        return (true, S_ISDIR(st.st_mode) != 0)
+
+    // When `path` (followed) was last written, in nanoseconds since the Unix
+    // epoch. The member is `st_mtimespec` on Darwin and `st_mtim` on Linux.
+    when #OS == #DARWIN:
+        private (i64 ns, bool ok) mtime_of(cstring path):
+            Stat st
+            if path == nil || stat(path, &st) != 0:
+                return (0, false)
+            return (i64(st.st_mtimespec.tv_sec) * 1000000000 + i64(st.st_mtimespec.tv_nsec), true)
+    else:
+        private (i64 ns, bool ok) mtime_of(cstring path):
+            Stat st
+            if path == nil || stat(path, &st) != 0:
+                return (0, false)
+            return (i64(st.st_mtim.tv_sec) * 1000000000 + i64(st.st_mtim.tv_nsec), true)
+
+    // The other half, and the only `chmod` in the package. Private for the same
+    // reason: a caller writing its own mode is writing octal this language cannot
+    // spell, against a width it would have to be told.
+    private bool set_mode(cstring path, u32 mode):
+        if path == nil:
+            return false
+        return chmod_to(path, mode)
+
+    // ── the working directory ─────────────────────────────────────────────────
+
+
+    // Where the process is. The bytes are this package's own storage and the next
+    // call overwrites them, exactly as `io.read_line`'s are — same reason, same
+    // warning. Never `nil`: a failed `getcwd` leaves an empty buffer, so a failure
+    // measures zero rather than arriving as a pointer nobody checked.
+    cstring cwd():
+        rawptr into = rawptr(&g_cwd[0])
+        if sys.getcwd(CharBuf(into), #c.size_t(CWDCAP)) == nil:
+            g_cwd[0] = '\0'
+        return cstring(into)
+
+    bool set_cwd(cstring path):
+        if path == nil:
+            return false
+        return sys.chdir(path) == 0
+
+    // Create one directory. Not the parents — `mkdir -p` is a loop over a split
+    // path, and there is no split until there is somewhere to put the pieces.
+    //
+    // `0x1FF` is `0777`: Dado writes integer literals in decimal and in hex and has
+    // no octal, and permission bits are three octal digits by convention, so the
+    // value is spelled in hex and named here.
+    bool make_dir(cstring path):
+        if path == nil:
+            return false
+        return mk.mkdir(path, 0x1FF) == 0
+
+    // `make_dir` with the mode `0700` (`0x1C0`): a directory only its owner can
+    // list, enter or write in, whatever is later put inside it — for scratch files
+    // holding a user's text, which other users on the machine should not read.
+    // **False when anything is already at `path`**, a directory or a symbolic link
+    // included, because `mkdir` never opens an existing name: a caller that gets
+    // true made the directory itself, so nobody else chose what is in it. Pick
+    // another name and try again on false; a name another process is racing for
+    // goes to exactly one of them.
+    bool make_private_dir(cstring path):
+        if path == nil:
+            return false
+        return mk.mkdir(path, 0x1C0) == 0

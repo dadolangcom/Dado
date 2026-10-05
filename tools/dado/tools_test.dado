@@ -1,0 +1,270 @@
+@test
+// The pure logic of tools and the doctor: reading a `tool.toml`, finding
+// tools over a fake tree, the sources' SHA-256, the state file and when a
+// tool is stale, the nearest name, versions, and the doctor's report.
+//
+// What is not here, and is exercised by running the driver instead:
+// building and running a tool, and the checks themselves, which start
+// programs.
+package driver
+
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "core:time"
+
+private bool same(string8 got, string8 want, string8 what):
+    return #expect(got == want, what, " is `", got, "`, not `", want, "`")
+
+private bool put(string8 file, string8 text):
+    try fs.write_file(file, text) else:
+        return false
+    return true
+
+// ── tool.toml ───────────────────────────────────────────────────────────────
+
+private bool tomls_read():
+    bool ok = true
+    (ToolSpec t, bool good, string8 why) = parse_tool_toml("# a tool\nname = \"webdev\"\n\nsummary = \"serve a web build\"   # trailing\nship = false\n")
+    ok = #expect(good, "a good tool.toml was refused: ", why) && ok
+    ok = same(t.name, "webdev", "name") && ok
+    ok = same(t.summary, "serve a web build", "summary") && ok
+    ok = #expect(!t.ship, "ship = false was not read") && ok
+    (ToolSpec d, bool good2, string8 _) = parse_tool_toml("name=\"doc\"\nsummary=\"x = y\"")
+    ok = #expect(good2 && d.ship, "ship defaults to true, and `=` inside a value is the value's") && ok
+    ok = same(d.summary, "x = y", "a summary holding `=`") && ok
+
+    (ToolSpec _, bool b1, string8 w1) = parse_tool_toml("name = doc\nsummary = \"x\"\n")
+    ok = #expect(!b1 && strings.contains(w1, "line 1") && strings.contains(w1, "double-quoted"), "an unquoted name: ", w1) && ok
+    (ToolSpec _, bool b2, string8 w2) = parse_tool_toml("name = \"doc\"\n")
+    ok = #expect(!b2 && strings.contains(w2, "summary"), "a missing summary: ", w2) && ok
+    (ToolSpec _, bool b3, string8 w3) = parse_tool_toml("name = \"doc\"\nsummary = \"x\"\nversion = \"1\"\n")
+    ok = #expect(!b3 && strings.contains(w3, "line 3") && strings.contains(w3, "no key `version`"), "an unknown key: ", w3) && ok
+    (ToolSpec _, bool b4, string8 w4) = parse_tool_toml("name = \"Doc Tool\"\nsummary = \"x\"\n")
+    ok = #expect(!b4 && strings.contains(w4, "lower-case"), "a name with capitals and a space: ", w4) && ok
+    (ToolSpec _, bool b5, string8 w5) = parse_tool_toml("name = \"doc\"\nsummary = \"x\"\nship = maybe\n")
+    ok = #expect(!b5 && strings.contains(w5, "true or false"), "ship = maybe: ", w5) && ok
+    (ToolSpec _, bool b6, string8 w6) = parse_tool_toml("name = \"doc\" extra\nsummary = \"x\"\n")
+    ok = #expect(!b6, "text after a closing quote was accepted: ", w6) && ok
+    (ToolSpec _, bool b7, string8 w7) = parse_tool_toml("just words\n")
+    ok = #expect(!b7 && strings.contains(w7, "key = value"), "a line with no `=`: ", w7) && ok
+    return ok
+
+// ── discovery, and the sources' SHA-256, over a fake tree ───────────────────
+
+private bool tools_found():
+    bool ok = true
+    try ref []char8 made = fs.make_temp_dir("dado-tools-test") else code:
+        return #expect(false, "no temp directory: ", os.message(code))
+    string8 t = txt(made)
+    string8 tools = join2(t, "tools")
+    ok = #expect(fs.make_dirs(join2(tools, "zeta"), #default), "making zeta") && ok
+    ok = #expect(fs.make_dirs(join3(tools, "alpha", "sub"), #default), "making alpha/sub") && ok
+    ok = #expect(fs.make_dirs(join2(tools, "plain"), #default), "making plain") && ok
+    ok = #expect(fs.make_dirs(join2(tools, "wrong"), #default), "making wrong") && ok
+    ok = put(join3(tools, "zeta", "tool.toml"), "name = \"zeta\"\nsummary = \"the last\"\nship = false\n") && ok
+    ok = put(join3(tools, "alpha", "tool.toml"), "name = \"alpha\"\nsummary = \"the first\"\n") && ok
+    ok = put(join3(tools, "alpha", "main.dado"), "package alpha\n") && ok
+    ok = put(join3(tools, "alpha", join2("sub", "x.dado")), "package alpha\n") && ok
+    ok = put(join3(tools, "plain", "main.dado"), "package plain\n") && ok
+    ok = put(join3(tools, "wrong", "tool.toml"), "name = \"other\"\nsummary = \"misnamed\"\n") && ok
+
+    ref []Tool found = discover_tools(tools)
+    ok = #expect(#len(found) == 3, #len(found), " tools found, not 3 (a directory without tool.toml is none)") && ok
+    if #len(found) == 3:
+        ok = same(found[0].name, "alpha", "the first tool, by name") && ok
+        ok = #expect(found[0].ok && found[0].spec.ship, "alpha reads, and ships") && ok
+        ok = same(found[1].name, "wrong", "the second tool") && ok
+        ok = #expect(!found[1].ok && strings.contains(found[1].why, "named for its directory"), "a tool.toml naming another directory: ", found[1].why) && ok
+        ok = same(found[2].name, "zeta", "the third tool") && ok
+        ok = #expect(found[2].ok && !found[2].spec.ship, "zeta does not ship") && ok
+    (Tool a, bool has_a) = tool_named_in(found[:], "alpha")
+    ok = #expect(has_a && a.dir == join2(tools, "alpha"), "alpha by name") && ok
+    (Tool _, bool has_p) = tool_named_in(found[:], "plain")
+    ok = #expect(!has_p, "a directory without tool.toml was taken for a tool") && ok
+    ref []Tool none = discover_tools(join2(t, "nowhere"))
+    ok = #expect(#len(none) == 0, "a missing tools directory holds tools") && ok
+
+    // The hash: stable, hidden files ignored, any change to a file's bytes
+    // or name noticed.
+    string8 h1 = sources_hash(a.dir)
+    ok = #expect(#len(h1) == 64, "the hash is ", #len(h1), " hex digits, not 64") && ok
+    ok = same(sources_hash(txt(#format(a.dir, "/"))), h1, "the hash of the same directory spelled with a trailing /") && ok
+    ok = put(join3(tools, "alpha", ".hidden"), "anything") && ok
+    ok = same(sources_hash(a.dir), h1, "the hash after a hidden file appeared") && ok
+    ok = put(join3(tools, "alpha", "main.dado"), "package alpha \n") && ok
+    string8 h2 = sources_hash(a.dir)
+    ok = #expect(h2 != h1, "a changed file did not change the hash") && ok
+    ok = put(join3(tools, "alpha", "main.dado"), "package alpha\n") && ok
+    ok = same(sources_hash(a.dir), h1, "the hash after the change was undone") && ok
+    try fs.rename(join3(tools, "alpha", join2("sub", "x.dado")), join3(tools, "alpha", join2("sub", "y.dado"))) else:
+        ok = #expect(false, "renaming sub/x.dado") && ok
+    ok = #expect(sources_hash(a.dir) != h1, "a renamed file did not change the hash") && ok
+    // Fed as the head of tools.dado says, the empty directory's hash is the
+    // SHA-256 of nothing.
+    ok = #expect(fs.make_dirs(join2(t, "empty"), #default), "making empty") && ok
+    ok = same(sources_hash(join2(t, "empty")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "an empty directory's hash") && ok
+
+    try fs.remove_all(t) else code:
+        ok = #expect(false, "removing the fake tree: ", os.message(code)) && ok
+    return ok
+
+// ── the state file, and staleness ───────────────────────────────────────────
+
+private const string8 STATE = "# a comment\nupdate checked 2026-10-04T10:00\ntool doc abc123 dadoc 1.0.0-dev+aaaa\n\ntool short abc\ntool webdev def456 dadoc 1.0.0-dev+aaaa\n"
+
+private bool states_kept():
+    bool ok = true
+    (ref []ToolState tools, ref []string8 other) = parse_state(STATE)
+    ok = #expect(#len(tools) == 2, #len(tools), " tool lines, not 2 (a short one is dropped)") && ok
+    ok = #expect(#len(other) == 1, #len(other), " other lines, not 1") && ok
+    (ToolState doc, bool has_doc) = recorded_state(tools[:], "doc")
+    ok = #expect(has_doc, "doc's line was not read") && ok
+    ok = same(doc.hash, "abc123", "doc's hash") && ok
+    ok = same(doc.dadoc, "dadoc 1.0.0-dev+aaaa", "doc's dadoc line, spaces and all") && ok
+    (ToolState _, bool has_short) = recorded_state(tools[:], "short")
+    ok = #expect(!has_short, "a tool line without its dadoc was kept") && ok
+
+    ToolState fresh
+    fresh.name = "alpha"
+    fresh.hash = "999"
+    fresh.dadoc = "dadoc 2.0.0"
+    ref []ToolState added = with_tool_state(tools[:], fresh)
+    ToolState newer
+    newer.name = "doc"
+    newer.hash = "777"
+    newer.dadoc = "dadoc 2.0.0"
+    ref []ToolState replaced = with_tool_state(added[:], newer)
+    ok = #expect(#len(replaced) == 3, "replacing a line added one") && ok
+    string8 text = format_state(replaced[:], other[:])
+    ok = #expect(strings.starts_with(text, "# dado's state"), "the state file starts with its comment") && ok
+    ok = #expect(strings.contains(text, "\nupdate checked 2026-10-04T10:00\ntool alpha 999 dadoc 2.0.0\ntool doc 777 dadoc 2.0.0\ntool webdev def456 dadoc 1.0.0-dev+aaaa\n"), "the other line kept, then the tools by name:\n", text) && ok
+    (ref []ToolState again, ref []string8 other2) = parse_state(text)
+    ok = #expect(#len(again) == 3 && #len(other2) == 1, "the state file read back") && ok
+
+    ToolState rec
+    rec.name = "doc"
+    rec.hash = "h"
+    rec.dadoc = "dadoc 1.0.0"
+    ok = same(why_stale(false, true, rec, "h", "dadoc 1.0.0"), "it is not built yet", "not built") && ok
+    ok = same(why_stale(true, false, rec, "h", "dadoc 1.0.0"), "there is no record of what it was built from", "built with no record") && ok
+    ok = same(why_stale(true, true, rec, "h", "dadoc 1.0.1"), "dadoc changed (dadoc 1.0.0 -> dadoc 1.0.1)", "another dadoc") && ok
+    ok = same(why_stale(true, true, rec, "g", "dadoc 1.0.0"), "its sources changed", "other sources") && ok
+    ok = same(why_stale(true, true, rec, "h", "dadoc 1.0.0"), "", "current") && ok
+    return ok
+
+// ── names ───────────────────────────────────────────────────────────────────
+
+private bool names_near():
+    bool ok = true
+    ok = #expect(edit_distance("dashbord", "dashboard") == 1, "one insertion") && ok
+    ok = #expect(edit_distance("tolos", "tools") == 1, "one swap") && ok
+    ok = #expect(edit_distance("", "doc") == 3, "from nothing") && ok
+    ok = #expect(edit_distance("same", "same") == 0, "the same word") && ok
+    ref []string8 names = words_of("doc webdev dashboard tools doctor")
+    ok = same(nearest_name("dashbaord", names[:]), "dashboard", "the nearest to dashbaord") && ok
+    ok = same(nearest_name("docter", names[:]), "doctor", "the nearest to docter") && ok
+    ok = same(nearest_name("frobnicate", names[:]), "", "nothing near frobnicate") && ok
+    ok = same(nearest_name("dc", names[:]), "doc", "one edit is always near enough") && ok
+    ok = same(padded("ab", 4), "ab  ", "padded") && ok
+    ok = same(padded("abcdef", 4), "abcdef", "padded past its width") && ok
+    return ok
+
+// ── versions ────────────────────────────────────────────────────────────────
+
+private bool order_is(string8 a, string8 b, i32 want):
+    (i32 got, bool ok) = compare_versions(a, b)
+    return #expect(ok && got == want, a, " against ", b, " is ", got, " (ok ", ok, "), not ", want)
+
+private bool versions_compared():
+    bool ok = true
+    ok = same(version_word("dadoc 1.0.0-dev+2d3720de7bb9"), "1.0.0-dev+2d3720de7bb9", "dadoc's version word") && ok
+    ok = same(version_word("dado-lsp 1.0.0"), "1.0.0", "dado-lsp's version word") && ok
+    ok = order_is("1.0.0", "1.0.0", 0) && ok
+    ok = order_is("1.0.0+abc", "1.0.0+def", 0) && ok
+    ok = order_is("1.0.0", "1.0.1", -1) && ok
+    ok = order_is("1.10.0", "1.9.9", 1) && ok
+    ok = order_is("2.0.0", "1.99.99", 1) && ok
+    ok = order_is("1.0.0-dev", "1.0.0", -1) && ok
+    ok = order_is("1.0.0", "1.0.0-rc.1", 1) && ok
+    ok = order_is("1.0.0-rc.2", "1.0.0-rc.10", -1) && ok
+    ok = order_is("1.0.0-rc.1", "1.0.0-rc", 1) && ok
+    ok = order_is("1.0.0-alpha", "1.0.0-beta", -1) && ok
+    ok = order_is("1.0.0-1", "1.0.0-alpha", -1) && ok
+    (i32 _, bool bad) = compare_versions("1.0", "1.0.0")
+    ok = #expect(!bad, "1.0 was taken for a version") && ok
+    (i32 _, bool bad2) = compare_versions("1.x.0", "1.0.0")
+    ok = #expect(!bad2, "1.x.0 was taken for a version") && ok
+    return ok
+
+// ── the doctor's report ─────────────────────────────────────────────────────
+
+private Check checked(string8 name, string8 status, string8 detail, string8 repair):
+    Check c
+    c.name = name
+    c.status = status
+    c.detail = detail
+    c.repair = repair
+    return c
+
+private bool reports_written():
+    bool ok = true
+    ok = same(json_quote("a\"b\\c\nd\te\x01"), "\"a\\\"b\\\\c\\nd\\te\\u0001\"", "a quoted JSON string") && ok
+    ref []Check cs = #make([]Check, 0)
+    _ = #append(cs, checked("dadoc", "ok", "dadoc 1.0.0 at /x", ""))
+    _ = #append(cs, checked("node", "note", "not on PATH", "install \"node\""))
+    string8 j = checks_json("install", "/opt/dado/src", cs[:])
+    ok = same(j, "{\n  \"layout\": \"install\",\n  \"root\": \"/opt/dado/src\",\n  \"checks\": [\n    {\"name\": \"dadoc\", \"status\": \"ok\", \"detail\": \"dadoc 1.0.0 at /x\", \"repair\": \"\"},\n    {\"name\": \"node\", \"status\": \"note\", \"detail\": \"not on PATH\", \"repair\": \"install \\\"node\\\"\"}\n  ]\n}\n", "the JSON report") && ok
+    ref []Check empty = #make([]Check, 0)
+    ok = same(checks_json("monorepo", "/r", empty[:]), "{\n  \"layout\": \"monorepo\",\n  \"root\": \"/r\",\n  \"checks\": []\n}\n", "an empty JSON report") && ok
+    ok = #expect(doctor_status(cs[:]) == 0, "notes and oks fail the doctor") && ok
+    _ = #append(cs, checked("zig", "warn", "w", "r"))
+    ok = #expect(doctor_status(cs[:]) == 0, "a warning fails the doctor") && ok
+    _ = #append(cs, checked("hello", "fail", "did not build", "look"))
+    ok = #expect(doctor_status(cs[:]) == 1, "a failure does not fail the doctor") && ok
+    string8 text = checks_text("monorepo", "/r", cs[:])
+    ok = #expect(strings.contains(text, "  ok    dadoc  dadoc 1.0.0 at /x\n"), "a check's line:\n", text) && ok
+    ok = #expect(strings.contains(text, "  note  node   not on PATH\n               -> install \"node\"\n"), "a repair under its check:\n", text) && ok
+    ok = #expect(strings.contains(text, "1 ok, 1 to look at, 1 failed, 1 notes"), "the counts:\n", text) && ok
+    ok = same(last_lines("a\nb\n\nc\nd\n", 3), "b / c / d", "the last three lines") && ok
+    ok = same(last_lines("only", 3), "only", "fewer lines than asked") && ok
+    return ok
+
+// A program still running at the limit is killed and reported as hung,
+// well before it would have finished; one that exits 0 is not. (The
+// sanitizer probe runs the program it built through this.)
+when #OS == #WINDOWS:
+    private bool limits_kept(): return true
+else:
+    private bool limits_kept():
+        bool ok = true
+        Command quick = command("true")
+        (bool ran, bool hung) = succeeds_within(quick, 5000)
+        ok = #expect(ran && !hung, "`true` gave ran=", ran, " hung=", hung) && ok
+        Command slow = command("sleep")
+        add(&slow, "30")
+        time.Instant t0 = time.instant()
+        (bool ran2, bool hung2) = succeeds_within(slow, 300)
+        i64 ms = time.as_milliseconds(time.elapsed(t0))
+        ok = #expect(!ran2 && hung2, "`sleep 30` under a 300 ms limit gave ran=", ran2, " hung=", hung2) && ok
+        ok = #expect(ms < 5000, "the limit took ", ms, " ms to stop `sleep 30`") && ok
+        Command failing = command("false")
+        (bool ran3, bool hung3) = succeeds_within(failing, 5000)
+        ok = #expect(!ran3 && !hung3, "`false` gave ran=", ran3, " hung=", hung3) && ok
+        return ok
+
+i32 test():
+    arena.Arena a = arena.over(libc.allocator())
+    defer arena.destroy(&a)
+    using arena.allocator(&a):
+        bool ok = tomls_read()
+        ok = tools_found() && ok
+        ok = states_kept() && ok
+        ok = names_near() && ok
+        ok = versions_compared() && ok
+        ok = reports_written() && ok
+        ok = limits_kept() && ok
+        if ok: return 0
+        return 1

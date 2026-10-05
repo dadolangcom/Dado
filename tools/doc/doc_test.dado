@@ -1,0 +1,484 @@
+@test
+// `tools/doc`'s own suite.
+//
+// **Every case here is a pure function over a literal**, and that is a choice
+// rather than an accident. The scanner's risky parts are the line splitter,
+// the block boundary, the header parse and the record round trip; none of them
+// needs a filesystem, and a suite that wrote temporary files would be testing
+// `core:io` beside its own logic and would fail on a machine for reasons that
+// had nothing to do with the thing under test.
+//
+// What is therefore **not** covered here, stated rather than left to be
+// discovered: `walk`, `slurp`, `write_records` and the two output writers all
+// touch the disk and are exercised by running the program rather than by this
+// file. `doc bare` over this package is the standing end-to-end check.
+//
+// **The round trip is the case that earns the most.** A record whose body is
+// written and read back has to come out byte-identical, because the whole
+// reason `scan` and `weave` are separate commands is that something in between
+// reads the records — and a format that loses a blank line or a trailing
+// space is a format that silently rewrites documentation.
+package doc
+
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:slices"
+import "core:strings"
+
+// The fixture is **built from `MARKER` rather than written with it**, and
+// that is not fussiness — it is the scanner's documented price, met in the
+// first tree that had both a scanner and a test for one.
+//
+// A line whose first non-space text is the marker **is** a block, because the
+// scanner parses nothing and cannot know it is inside a string literal. So a
+// test file that spelled its fixture out would put four real blocks into every
+// scan of this package, addressed to slots nobody declared — which is exactly
+// what happened, and what the slot check reported.
+//
+// Composing it from the constant costs a few lines and buys two things: the
+// file holds no scannable block, and the test exercises the real marker rather
+// than a copy of it that could drift.
+//
+// **The general rule for this tree:** anything holding Dado *source* as data —
+// a test fixture, a sample, a golden file — builds its marker lines rather
+// than writing them.
+private string8 fixture((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    ref []char8 b = #format(
+        "package x\n",
+        "\n",
+        MARKER, " types/tuples 30\n",
+        MARKER, " ### Tuples\n",
+        MARKER, "\n",
+        MARKER, " Everything is a tuple.\n",
+        "i32 f():\n",
+        "    return 0\n",
+        "\n",
+        "// an ordinary comment\n",
+        MARKER, " intro\n",
+        MARKER, " One line, at the end of the file, with nothing after it.\n",
+        al)
+    string8 text = b
+    return text
+
+private bool head_cases():
+    (string8 s1, i32 o1) = head_of("types/tuples 30")
+    bool ok = #expect(s1 == "types/tuples" && o1 == 30, "head_of gave ", s1, " ", o1)
+    // No order at all: the knob is optional and its absence is 0, not a refusal.
+    (string8 s2, i32 o2) = head_of("intro")
+    ok = #expect(s2 == "intro" && o2 == 0, "head_of of a bare slot gave ", s2, " ", o2) && ok
+    // An order that is not a number is 0 and the slot survives — a typo in the
+    // knob must not cost the block its destination.
+    (string8 s3, i32 o3) = head_of("intro later")
+    ok = #expect(s3 == "intro" && o3 == 0, "head_of of a bad order gave ", s3, " ", o3) && ok
+    (string8 s4, i32 o4) = head_of("   spaced   7   ")
+    ok = #expect(s4 == "spaced" && o4 == 7, "head_of of a spaced head gave ", s4, " ", o4) && ok
+    return ok
+
+private bool int_cases():
+    (i32 v1, bool k1) = to_int("0")
+    bool ok = #expect(v1 == 0 && k1, "to_int(\"0\") gave ", v1, " ", k1)
+    (i32 v2, bool k2) = to_int("1234")
+    ok = #expect(v2 == 1234 && k2, "to_int gave ", v2) && ok
+    // **The distinction `atoi` cannot make**, and the reason this function
+    // exists: not-a-number is `false` and not `0`.
+    (i32 v3, bool k3) = to_int("12a")
+    ok = #expect(!k3, "to_int of a non-number reported ok with ", v3) && ok
+    (i32 v4, bool k4) = to_int("")
+    ok = #expect(!k4, "to_int of the empty string reported ok with ", v4) && ok
+    return ok
+
+private bool line_cases():
+    (string8 l1, i64 n1) = line_at("alpha\nbeta", 0)
+    bool ok = #expect(l1 == "alpha" && n1 == 6, "line_at gave ", l1, " ", n1)
+    (string8 l2, i64 n2) = line_at("alpha\nbeta", 6)
+    // The last line has no newline after it, so `next` is negative and that is
+    // how a caller's loop ends.
+    ok = #expect(l2 == "beta" && n2 < 0, "the last line gave ", l2, " ", n2) && ok
+    // A carriage return is dropped, so the same file written on two platforms
+    // scans to the same records.
+    (string8 l3, i64 _) = line_at("alpha\r\nbeta", 0)
+    ok = #expect(l3 == "alpha", "a CRLF line kept its return: [", l3, "]") && ok
+    // A blank line is a line, not a gap: markdown needs it.
+    (string8 l4, i64 n4) = line_at("a\n\nb", 2)
+    ok = #expect(#len(l4) == 0 && n4 == 3, "a blank line gave [", l4, "] ", n4) && ok
+    return ok
+
+private bool find_cases():
+    bool ok = #expect(find_sub("a //@ b", "//@") == 2, "find_sub gave ", find_sub("a //@ b", "//@"))
+    ok = #expect(find_sub("nothing here", "//@") < 0, "find_sub found an absent needle") && ok
+    // The empty needle is at 0 rather than nowhere, which is what every
+    // caller's loop assumes when a configured needle is left blank.
+    ok = #expect(find_sub("abc", "") == 0, "the empty needle was not at 0") && ok
+    // A needle longer than the haystack cannot be in it, and the loop bound is
+    // where an off-by-one would show.
+    ok = #expect(find_sub("ab", "abc") < 0, "a too-long needle was found") && ok
+    return ok
+
+private bool slot_cases():
+    bool ok = #expect(slot_declared("<!--@ types/tuples -->") == "types/tuples",
+                      "slot_declared gave [", slot_declared("<!--@ types/tuples -->"), "]")
+    ok = #expect(slot_declared("    <!--@ indented -->") == "indented", "an indented slot was missed") && ok
+    // Ordinary prose and an ordinary HTML comment both declare nothing. The
+    // second matters: a spine may carry real comments.
+    ok = #expect(slot_declared("## A heading") == "", "a heading declared a slot") && ok
+    ok = #expect(slot_declared("<!-- an ordinary comment -->") == "", "a plain comment declared a slot") && ok
+    ok = #expect(slot_declared("<!--@ -->") == "", "an empty declaration named a slot") && ok
+    return ok
+
+private bool scan_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    ref []Record rs = #make([]Record, 0, al)
+    scan_text(fixture(al), "fixture.dado", &rs, al)
+    bool ok = #expect(#len(rs) == 2, "scan_text found ", i32(#len(rs)), " block(s), wanted 2")
+    if #len(rs) != 2:
+        return ok
+    ok = #expect(rs[0].slot == "types/tuples" && rs[0].order == 30,
+                 "the first block is ", rs[0].slot, " ", rs[0].order) && ok
+    ok = #expect(rs[0].body == "### Tuples\n\nEverything is a tuple.\n",
+                 "the first body is [", rs[0].body, "]") && ok
+    // The block at the end of the text, with no line after it to close it.
+    ok = #expect(rs[1].slot == "intro", "the second block is ", rs[1].slot) && ok
+    ok = #expect(rs[1].body == "One line, at the end of the file, with nothing after it.\n",
+                 "the trailing body is [", rs[1].body, "]") && ok
+    // The line is the block's first, which is what makes a generated document
+    // able to point at the code.
+    ok = #expect(rs[0].line == 3, "the first block claims line ", rs[0].line) && ok
+    return ok
+
+private bool order_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    ref []Record rs = #make([]Record, 0, al)
+    _ = #append(rs, ("b", 0, "z.dado", 1, "second slot\n"))
+    _ = #append(rs, ("a", 10, "a.dado", 1, "ten\n"))
+    _ = #append(rs, ("a", 5, "z.dado", 9, "five\n"))
+    // Same slot, same order, different file: the file breaks the tie, so a
+    // walk that visited directories in another order still sorts the same.
+    _ = #append(rs, ("a", 5, "a.dado", 9, "five, earlier file\n"))
+    sort(rs)
+    bool ok = #expect(rs[0].body == "five, earlier file\n", "first is [", rs[0].body, "]")
+    ok = #expect(rs[1].body == "five\n", "second is [", rs[1].body, "]") && ok
+    ok = #expect(rs[2].body == "ten\n", "third is [", rs[2].body, "]") && ok
+    ok = #expect(rs[3].slot == "b", "last slot is ", rs[3].slot) && ok
+    return ok
+
+private bool stream_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    // The round trip, by hand: a stream written the way `write_records`
+    // writes one, read back, and compared body for body. A blank line and a
+    // line that *looks like* a header are both in the body deliberately —
+    // the line count is what makes them data rather than structure.
+    string8 stream = """
+        #dadodoc 1
+        @block types/tuples 30 3 a/b.dado:12
+        ### Tuples
+
+        @block is not a header here.
+        @block intro 0 1 c.dado:1
+        one line
+        """
+    ref []Record rs = #make([]Record, 0, al)
+    (bool ok1, string8 why) = read_records(stream, &rs, al)
+    bool ok = #expect(ok1, "read_records refused a good stream: ", why)
+    if !ok1:
+        return ok
+    ok = #expect(#len(rs) == 2, "read_records found ", i32(#len(rs)), " record(s), wanted 2") && ok
+    if #len(rs) != 2:
+        return ok
+    ok = #expect(rs[0].slot == "types/tuples" && rs[0].order == 30, "header parsed as ",
+                 rs[0].slot, " ", rs[0].order) && ok
+    ok = #expect(rs[0].file == "a/b.dado" && rs[0].line == 12, "location parsed as ",
+                 rs[0].file, ":", rs[0].line) && ok
+    // The body kept its blank line and its `@block` line. This is the case the
+    // line-counted format exists for.
+    ok = #expect(rs[0].body == "### Tuples\n\n@block is not a header here.\n",
+                 "the body came back as [", rs[0].body, "]") && ok
+    ok = #expect(rs[1].slot == "intro" && rs[1].body == "one line\n",
+                 "the second record is ", rs[1].slot, " [", rs[1].body, "]") && ok
+    return ok
+
+private bool refusal_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    // **A stream this cannot read is refused, never skipped.** A reader that
+    // ignored what it did not recognise would report zero records over a file
+    // full of them, and a generator would then write an empty document over a
+    // good one and call it success.
+    ref []Record rs = #make([]Record, 0, al)
+    (bool ok1, string8 why1) = read_records("## not a record stream\n", &rs, al)
+    bool ok = #expect(!ok1, "a file with no header was accepted")
+    ok = #expect(#len(why1) > 0, "a refusal with no reason") && ok
+
+    ref []Record rs2 = #make([]Record, 0, al)
+    (bool ok2, string8 why2) = read_records("#dadodoc 1\nnot a block header\n", &rs2, al)
+    ok = #expect(!ok2, "a stream with a bad body was accepted") && ok
+    ok = #expect(#len(why2) > 0, "a refusal with no reason") && ok
+
+    // A header short of a field. Every field is required, and a short header
+    // is the shape a hand-edited stream takes.
+    ref []Record rs3 = #make([]Record, 0, al)
+    (bool ok3, string8 _) = read_records("#dadodoc 1\n@block onlyslot\n", &rs3, al)
+    ok = #expect(!ok3, "a header missing its order was accepted") && ok
+
+    // An empty stream is a stream: a tree with no blocks in it is a state,
+    // not an error, and the generator's job over one is to write an empty
+    // document rather than to fail.
+    ref []Record rs4 = #make([]Record, 0, al)
+    (bool ok4, string8 why4) = read_records("#dadodoc 1\n", &rs4, al)
+    ok = #expect(ok4, "an empty stream was refused: ", why4) && ok
+    ok = #expect(#len(rs4) == 0, "an empty stream produced ", i32(#len(rs4)), " record(s)") && ok
+    return ok
+
+// ── the checks ──────────────────────────────────────────────────────────────
+
+private bool claim_cases():
+    // The three shapes a claim comes in, and the shapes that are not claims.
+    bool ok = #expect(claim_kind("ERR0504") == CLAIM_CODE, "ERR0504 is ", claim_kind("ERR0504"))
+    ok = #expect(claim_kind("LNT0412") == CLAIM_CODE, "LNT0412 is ", claim_kind("LNT0412")) && ok
+    ok = #expect(claim_kind("WRN0419") == CLAIM_CODE, "WRN0419 is ", claim_kind("WRN0419")) && ok
+    // The legacy prefix is still a code, so a block citing it is checked —
+    // and refused, since the lexicon prints only today's spelling.
+    ok = #expect(claim_kind("TOY0504") == CLAIM_CODE, "TOY0504 is ", claim_kind("TOY0504")) && ok
+    ok = #expect(claim_kind("ERR999") == CLAIM_NONE, "a three-digit code was classed as one") && ok
+    ok = #expect(claim_kind("ERR05040") == CLAIM_NONE, "a five-digit code was classed as one") && ok
+    ok = #expect(claim_kind("ERRabcd") == CLAIM_NONE, "ERRabcd was classed as a code") && ok
+    ok = #expect(claim_kind("XYZ0504") == CLAIM_NONE, "XYZ0504 was classed as a code") && ok
+    ok = #expect(claim_kind("#default") == CLAIM_SIGIL, "#default is ", claim_kind("#default")) && ok
+    ok = #expect(claim_kind("#") == CLAIM_NONE, "a bare sigil was classed as a name") && ok
+    ok = #expect(claim_kind("defer") == CLAIM_WORD, "defer is ", claim_kind("defer")) && ok
+    ok = #expect(claim_kind("has_eq") == CLAIM_WORD, "has_eq is ", claim_kind("has_eq")) && ok
+    // **The three shapes that must be left alone**, because they are
+    // implementation symbols and a check that flagged them would be switched
+    // off within a week.
+    ok = #expect(claim_kind("TypeId") == CLAIM_NONE, "TypeId was classed as a claim") && ok
+    ok = #expect(claim_kind("Parser::at_has") == CLAIM_NONE, "a path was classed as a claim") && ok
+    ok = #expect(claim_kind("--strict") == CLAIM_NONE, "a flag was classed as a claim") && ok
+    ok = #expect(claim_kind("") == CLAIM_NONE, "the empty token was classed as a claim") && ok
+    return ok
+
+private bool vocab_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    // Two rosters and the `token` exception: the fourth field is the spelling
+    // a program writes and the second is a `TokenKind` name.
+    string8 dump = ""
+    ref []char8 d = #format(
+        "token\tKW_DEFER\tkeyword\tdefer\n",
+        "token\tNEWLINE\tlayout\t-\n",
+        "builtin\tbreakpoint\t#breakpoint\n",
+        "code\tERR0001\tfile\tthe rule\tthe title\terror\n", al)
+    dump = d
+    ref []string8 lex = lexicon_words(dump, al)
+    bool ok = #expect(holds(lex, "defer"), "the keyword spelling is missing")
+    ok = #expect(holds(lex, "KW_DEFER"), "the token kind is missing") && ok
+    ok = #expect(holds(lex, "breakpoint"), "the builtin is missing") && ok
+    ok = #expect(holds(lex, "ERR0001"), "the code is missing") && ok
+    // A `layout` row's spelling is `-`, which is not a spelling.
+    ok = #expect(!holds(lex, "-"), "the placeholder spelling was taken as a word") && ok
+    ok = #expect(!holds(lex, "trait"), "a word nothing declares was found") && ok
+    return ok
+
+private bool span_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    string8 body = ""
+    ref []char8 b = #format(
+        "A `word` and a `#name` and `ERR0001`.\n",
+        "\n",
+        "```dado\n",
+        "// `not_a_claim` — inside a fence\n",
+        "i32 x = 1\n",
+        "```\n",
+        "\n",
+        "    `also_not` — four-space indented, which is code too\n",
+        "\n",
+        "An unpaired ` backtick ends the line and not the document.\n",
+        "Back to `normal`.\n", al)
+    body = b
+    ref []string8 out = #make([]string8, 0, al)
+    spans(body, &out, al)
+    bool ok = #expect(#len(out) == 4, "spans found ", i32(#len(out)), ", wanted 4")
+    if #len(out) != 4:
+        for t in out:
+            ok = #expect(false, "  got [", t, "]") && ok
+        return ok
+    ok = #expect(out[0] == "word" && out[1] == "#name" && out[2] == "ERR0001",
+                 "the prose spans are ", out[0], " ", out[1], " ", out[2]) && ok
+    // The line after the unpaired backtick still reads, which is the point of
+    // ending the line's scan rather than the body's.
+    ok = #expect(out[3] == "normal", "the span after an unpaired backtick is [", out[3], "]") && ok
+    return ok
+
+private bool fence_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    string8 body = ""
+    ref []char8 b = #format(
+        "before\n",
+        "```dado\n",
+        "i32 x = 1\n",
+        "```\n",
+        "between\n",
+        "```c\n",
+        "int y = 2;\n",
+        "```\n",
+        "```dado\n",
+        "i32 z = 3\n", al)
+    body = b
+    ref []string8 out = #make([]string8, 0, al)
+    sample_fences(body, &out, al)
+    // Two: the tagged one, and the unclosed tagged one at the end. The `c`
+    // fence is not a Dado sample and is not compiled as one.
+    bool ok = #expect(#len(out) == 2, "sample_fences found ", i32(#len(out)), ", wanted 2")
+    if #len(out) != 2:
+        return ok
+    ok = #expect(out[0] == "i32 x = 1\n", "the first sample is [", out[0], "]") && ok
+    // **An unclosed fence is still a sample.** Dropping it would be the silent
+    // skip this whole file exists to refuse — and compiling it is how its
+    // author finds out it was never closed.
+    ok = #expect(out[1] == "i32 z = 3\n", "the unclosed sample is [", out[1], "]") && ok
+    return ok
+
+private bool fault_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    ref []string8 lex = #make([]string8, 0, al)
+    _ = #append(lex, "defer")
+    _ = #append(lex, "#default")
+    _ = #append(lex, "ERR0504")
+    slices.sort(lex[:], strings.before)
+    ref []string8 allow = #make([]string8, 0, al)
+    _ = #append(allow, "file")
+
+    ref []Record rs = #make([]Record, 0, al)
+    ref []char8 b = #format(
+        "`defer` and `#default` and `ERR0504` are real.\n",
+        "`trait` and `#clear` and `ERR9999` are not.\n",
+        "`file` is prose. `TypeId` is a symbol.\n", al)
+    string8 body = b
+    _ = #append(rs, ("lang/x", 0, "a.rs", 7, body))
+
+    ref []Fault out = #make([]Fault, 0, al)
+    faults(rs, lex, allow, &out, al)
+    bool ok = #expect(#len(out) == 3, "faults found ", i32(#len(out)), ", wanted 3")
+    if #len(out) != 3:
+        for f in out:
+            ok = #expect(false, "  got [", f.token, "]") && ok
+        return ok
+    // Sorted by where they appear, which is the order they were read in.
+    ok = #expect(out[0].token == "trait" && out[0].kind == CLAIM_WORD,
+                 "the first fault is ", out[0].token) && ok
+    ok = #expect(out[1].token == "#clear" && out[1].kind == CLAIM_SIGIL,
+                 "the second fault is ", out[1].token) && ok
+    ok = #expect(out[2].token == "ERR9999" && out[2].kind == CLAIM_CODE,
+                 "the third fault is ", out[2].token) && ok
+    // The fault carries where to go, or a reader has a word and no file.
+    ok = #expect(out[0].file == "a.rs" && out[0].line == 7 && out[0].slot == "lang/x",
+                 "the fault does not name its block") && ok
+
+    // **A code and a sigil have no allowlist.** Putting them in one must not
+    // silence them, or the one unambiguous half of this check is negotiable.
+    ref []string8 wide = #make([]string8, 0, al)
+    // `file` is carried over from the narrow list on purpose: this case is
+    // about whether a code and a sigil can be silenced, and dropping the prose
+    // word would change the count for an unrelated reason. (It did, the first
+    // time this was written — the assertion read as a code defect and was a
+    // defect in the fixture.)
+    _ = #append(wide, "file")
+    _ = #append(wide, "#clear")
+    _ = #append(wide, "ERR9999")
+    _ = #append(wide, "trait")
+    slices.sort(wide[:], strings.before)
+    ref []Fault out2 = #make([]Fault, 0, al)
+    faults(rs, lex, wide, &out2, al)
+    ok = #expect(#len(out2) == 2, "an allowlisted code or sigil was silenced: ",
+                 i32(#len(out2)), " fault(s) left, wanted 2") && ok
+    return ok
+
+private bool coverage_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    ref []string8 lex = #make([]string8, 0, al)
+    _ = #append(lex, "defer")
+    _ = #append(lex, "switch")
+    _ = #append(lex, "return")
+    slices.sort(lex[:], strings.before)
+    ref []Record rs = #make([]Record, 0, al)
+    _ = #append(rs, ("a", 0, "f", 1, "`defer` and `defer` again and `nothing`.\n"))
+    _ = #append(rs, ("b", 0, "g", 1, "`switch` here.\n"))
+    (i32 named, i32 total) = coverage(rs, lex, al)
+    // Two of three, and the repeat counts once — a ratchet that could be
+    // raised by saying the same word twice would measure nothing.
+    bool ok = #expect(named == 2, "coverage named ", named, ", wanted 2")
+    ok = #expect(total == 3, "coverage total is ", total, ", wanted 3") && ok
+    return ok
+
+private bool slot_check_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    string8 spine = "# S\n\n<!--@ a -->\n<!--@ gap -->\n"
+    ref []string8 slots = #make([]string8, 0, al)
+    declared_slots(spine, &slots, al)
+    bool ok = #expect(#len(slots) == 2, "declared_slots found ", i32(#len(slots)))
+    ref []Record rs = #make([]Record, 0, al)
+    _ = #append(rs, ("a", 0, "f", 1, "x\n"))
+    _ = #append(rs, ("stray", 0, "g", 1, "y\n"))
+    ref []string8 gaps = #make([]string8, 0, al)
+    unfilled(slots, rs, &gaps, al)
+    ref []string8 strays = #make([]string8, 0, al)
+    orphans(slots, rs, &strays, al)
+    // **Both directions, and neither is visible from the other.**
+    ok = #expect(#len(gaps) == 1 && gaps[0] == "gap",
+                 "unfilled found ", i32(#len(gaps))) && ok
+    ok = #expect(#len(strays) == 1 && strays[0] == "stray",
+                 "orphans found ", i32(#len(strays))) && ok
+
+    // **A third direction, and it is invisible from the other two.** A spine
+    // declaring one slot twice has no gap and no stray; what it has is a
+    // document saying the same thing twice, and the only thing that showed it
+    // before this was the report's own arithmetic — `24 of 22 block(s)
+    // poured`.
+    string8 dup = "# S\n\n<!--@ a -->\n<!--@ b -->\n<!--@ a -->\n<!--@ a -->\n"
+    ref []string8 many = #make([]string8, 0, al)
+    declared_slots(dup, &many, al)
+    ok = #expect(#len(many) == 4, "declared_slots found ", i32(#len(many))) && ok
+    ref []string8 twice = #make([]string8, 0, al)
+    repeated(many, &twice, al)
+    // Named once however many times it repeats: three declarations of `a` are
+    // one mistake, not two.
+    ok = #expect(#len(twice) == 1 && twice[0] == "a",
+                 "repeated found ", i32(#len(twice))) && ok
+    ref []string8 once = #make([]string8, 0, al)
+    repeated(slots, &once, al)
+    ok = #expect(#len(once) == 0, "repeated found ", i32(#len(once)),
+                 " in a spine with no repeat") && ok
+    return ok
+
+// A package page's pieces: the opening comment (which stops at a block, and
+// is nothing in a test file), and the declarations as markdown.
+private bool page_cases((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al):
+    ref []char8 src = #format("// core:x — a package.\n//\n//     code\n// More.\n//\n", MARKER, " intro\npackage x\n", al)
+    ref []string8 c = package_comment(string8(src[:]), al)
+    bool ok = #expect(#len(c) == 4, "the comment has ", #len(c), " lines, not 4")
+    if #len(c) == 4:
+        ok = #expect(c[0] == "core:x — a package." && c[1] == "" && c[2] == "    code" && c[3] == "More.", "the comment read as `", c[0], "` `", c[1], "` `", c[2], "` `", c[3], "`") && ok
+    ref []string8 none = package_comment("@test\n// a test\npackage x\n", al)
+    ok = #expect(#len(none) == 0, "a test file's comment was read") && ok
+    ref []string8 d = declarations_markdown("core:x  (2 declarations, 1 public)\n\ni32 f(i32 a)\n    What f does, cut\ntype T: `odd`\n", al)
+    ok = #expect(#len(d) == 4, "the declarations are ", #len(d), " lines, not 4") && ok
+    if #len(d) == 4:
+        ok = #expect(d[0] == "2 declarations, 1 public.", "the summary is `", d[0], "`") && ok
+        ok = #expect(d[2] == "* `i32 f(i32 a)` — What f does, cut…", "a declaration is `", d[2], "`") && ok
+        ok = #expect(d[3] == "* `` type T: `odd` ``", "a backticked declaration is `", d[3], "`") && ok
+    ref []string8 empty = declarations_markdown("", al)
+    ok = #expect(#len(empty) == 0, "no answer gave ", #len(empty), " lines") && ok
+    return ok
+
+i32 test():
+    arena.Arena a = arena.over(libc.allocator())
+    defer arena.destroy(&a)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al = arena.allocator(&a)
+
+    bool ok = head_cases()
+    ok = int_cases() && ok
+    ok = line_cases() && ok
+    ok = find_cases() && ok
+    ok = slot_cases() && ok
+    ok = scan_cases(al) && ok
+    ok = order_cases(al) && ok
+    ok = stream_cases(al) && ok
+    ok = refusal_cases(al) && ok
+    ok = claim_cases() && ok
+    ok = vocab_cases(al) && ok
+    ok = span_cases(al) && ok
+    ok = fence_cases(al) && ok
+    ok = fault_cases(al) && ok
+    ok = coverage_cases(al) && ok
+    ok = slot_check_cases(al) && ok
+    ok = page_cases(al) && ok
+
+    if ok:
+        return 0
+    return 1

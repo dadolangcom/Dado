@@ -1,0 +1,193 @@
+// app:input/sokol — the sokol decode: `sapp_event` in, `app:input`'s queue out.
+//
+// `app:input`'s `Event`, `EventKind`, `Keycode` and `Modifier` were written
+// against sokol's own numbering before there was a sokol backend, so this is a
+// *filler* of that shape and not a translation into it. There is no lookup
+// table anywhere below: `sapp_event.key_code` is already an `input.Keycode`
+// value, `sapp_event.modifiers` is already an `input.Modifier` bitmask, and
+// `sapp_event.mouse_button` is already `input.Event.code` for a press. What is
+// left is the four places sokol's shape and `app:input`'s genuinely differ.
+// Three of them are one collapse — a direction belongs in `mods`, not in a
+// kind: sokol's four mouse event types become one `EventKind.Mouse` plus a
+// flag, its KEY_UP becomes `EventKind.Key` plus a flag, and its
+// FOCUSED/UNFOCUSED pair becomes `EventKind.Focus` plus a flag.
+//
+// The fourth runs the other way, and it is the only place this file **reads**
+// sokol rather than reshaping what it was handed. A FILES_DROPPED carries no
+// payload in the `sapp_event` at all: the paths sit behind
+// `sapp_get_num_dropped_files` / `sapp_get_dropped_file_path`, in a buffer
+// sokol clears at the start of the next drop. So the decode fetches them and
+// hands them to `input.push_drop`, which copies their bytes out before the
+// event is queued — `input.dado`'s "Drop" section carries the argument for the
+// copy, and it is the reason this arm is more than two lines.
+//
+// **Why this is a subpackage and not a function in `input.dado`.** A `foreign`
+// block's `#include` is emitted for every importer, reached or not. Putting the
+// decode in `app:input` would put `sokol_app.h` — and, with `define
+// "SOKOL_IMPL"` on its block, the whole of sokol_app's implementation — into
+// the translation unit of every program that imports `app:input`, including
+// every headless one. `app:input` stays backend-neutral, as its own doc comment
+// promises; the one package that already drags sokol in (`app:graphical`)
+// imports this.
+package sokol_input
+
+import "app:input"
+import "vendor:sokol/sokol_app"
+
+// The pointer type the raw callback payload is read through. `display`'s event
+// hook hands out a `rawptr` because that is what dropping the `const` off
+// sokol's `^const sapp_event` produces; this is the other end of it, and it is
+// why the hook shape does not have to carry a qualifier of its own.
+type EventPtr: ^sokol_app.sapp_event
+
+// Decode one raw `sapp_event` address and push whatever it means onto
+// `app:input`'s queue. Nil-safe; an event kind with no seat in `EventKind` is
+// dropped, which is still most of them — mouse enter/leave, touch,
+// iconify/restore, suspend/resume and clipboard paste. Focus and drag-drop are
+// no longer among them: `EventKind.Focus` and `EventKind.Drop` seat them, and
+// the arms below fill both.
+//
+// This is what `app:graphical`'s event hook calls, and it is the only reason
+// the payload's type is `rawptr` this far up.
+//
+// **Returns whether this event was a close request** (E8). The queue is polled
+// a frame later and sokol decides the close in this same loop iteration, so a
+// backend that means to hold the close open has to know *here*, inside the
+// event callback, that it is looking at one. Answering it costs a `bool` the
+// caller may ignore; recovering it later is impossible.
+bool decode(rawptr ev):
+    EventPtr p = EventPtr(ev)
+    if rawptr(p) == nil:
+        return false
+    return decode_event(p)
+
+// The decode proper, against a typed `sapp_event`. Separate from `decode` so a
+// test can hand it a hand-built event without inventing a window. Returns
+// whether the event was a close request, as `decode` does.
+bool decode_event(EventPtr p):
+    sokol_app.sapp_event e = p^
+    u32 mods = e.modifiers
+    switch e.type_:
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_DOWN:
+            input.push_key(i32(e.key_code), mods)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_UP:
+            // `EventKind` has no seat for a release, so the direction rides in
+            // `mods` — the same packing `MOUSE_UP` already uses. See
+            // `input.KEY_UP` for why dropping releases was not acceptable.
+            input.push_key(i32(e.key_code), mods | input.KEY_UP)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_CHAR:
+            // **E1: the modifiers ride along.** `sapp_event.modifiers` is
+            // assigned on the CHAR path in every sokol backend (X11, macOS,
+            // Win32, Emscripten), so this is the same bitmask the KEY_DOWN
+            // that produced it carried, and it is what lets a client tell
+            // "typed z" from "pressed Ctrl+Z". The decode does **not** drop
+            // the event while a modifier is held: that would be policy, and it
+            // is wrong policy on Windows (AltGr is Ctrl+Alt) and on macOS
+            // (Option is a character modifier) — `input.is_typed_text` carries
+            // the argument in full.
+            input.push_text(i32(e.char_code), mods)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_DOWN:
+            // X11 reports a press with the button state as it was *before* the
+            // press, so the held-bit is set here rather than trusted from
+            // `modifiers`. `app:input`'s press contract asks for exactly that.
+            input.push_mouse(i32(e.mouse_button), e.mouse_x, e.mouse_y,
+                             mods | held_bit(e.mouse_button))
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_UP:
+            // ...and cleared here, for the mirror-image reason: the release
+            // contract is "the released button's held-bit is cleared", and only
+            // some platforms have done it already.
+            input.push_mouse(i32(e.mouse_button), e.mouse_x, e.mouse_y,
+                             (mods & ~held_bit(e.mouse_button)) | input.MOUSE_UP)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_MOVE:
+            input.push_mouse(-1, e.mouse_x, e.mouse_y,
+                             mods | input.MOUSE_MOTION)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL:
+            // sokol's scroll_y is +1 for a wheel-up; `app:input`'s distance
+            // is positive for a scroll *down* (the direction the content
+            // moves), so the sign flips here. **The float is kept**:
+            // `push_wheel` packs it as `WHEEL_UNIT`ths of a line with
+            // `WHEEL_FINE`, so a trackpad's 0.1 reaches `wheel_amount` as 0.1
+            // and `wheel_delta` still answers a whole notch (rounded away
+            // from zero). A horizontal-only scroll (scroll_y == 0) has no seat
+            // in `EventKind`, and `push_wheel` drops a zero distance. X11
+            // puts the held buttons in a scroll's `modifiers`; `push_wheel`
+            // masks them off, so a wheel event carries keyboard modifiers
+            // only, as `input.MOUSE_WHEEL` documents.
+            input.push_wheel(f32(0.0) - e.scroll_y, e.mouse_x, e.mouse_y, mods)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_RESIZED:
+            // Framebuffer pixels, not the logical window size: on a high-DPI
+            // display the two differ and the framebuffer is what anything
+            // drawing has to size itself against.
+            input.push_resize(e.framebuffer_width, e.framebuffer_height)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_FOCUSED:
+            // FOCUSED and UNFOCUSED are one thing in two directions, so they
+            // are one `EventKind.Focus` and the direction is a `mods` bit —
+            // the same collapse `KEY_UP` and `MOUSE_UP` already are.
+            //
+            // `mods` is *not* passed through here, and it costs nothing:
+            // sokol builds both of these with `_sapp_init_event`, which zeroes
+            // the whole `sapp_event` before setting the type, so
+            // `e.modifiers` is 0 on either. `push_focus` therefore leaves
+            // `Event.mods` as exactly the flag or exactly zero, which is what
+            // `input.dado` documents for this kind.
+            //
+            // No `sapp_desc` flag turns these on: sokol's X11 window selects
+            // `FocusChangeMask` unconditionally at creation, and the macOS,
+            // Win32 and Emscripten backends report focus from the platform's
+            // own window messages. Measured under Xvfb — `XSetInputFocus` to
+            // the window, to `PointerRoot`, and back produced type 17, 18, 17
+            // with no change to `app:display` or `app:graphical`.
+            input.push_focus(true)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_UNFOCUSED:
+            input.push_focus(false)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_FILES_DROPPED:
+            push_dropped_files()
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_QUIT_REQUESTED:
+            input.push_quit()
+            return true
+        else:
+            return false
+    return false
+
+// Fetch the paths sokol landed for the drop it has just reported, and push
+// them as one `input.EventKind.Drop`.
+//
+// **The `sapp_event` is not the payload here**, which is why this is a call and
+// not two lines in the arm above: sokol keeps the paths in its own buffer and
+// hands them out one `const char *` at a time. `string(c)` borrows each; the
+// borrows live only until `input.push_drop` returns, because that is where the
+// bytes are copied into `app:input`'s table. Handing a client one of these
+// pointers instead would be a dangling read the moment the next drop cleared
+// the buffer — `_sapp_clear_drop_buffer` runs at the *start* of a drop, and
+// this queue is polled a frame later.
+//
+// The count is clamped to `input.MAX_DROPPED` before the fetch loop, not after
+// it: `sapp_get_dropped_file_path` asserts on an index past what sokol landed,
+// and `input.push_drop` would discard the surplus anyway.
+//
+// **A drop that landed nothing pushes nothing**, and the decision is
+// `input.push_drop`'s rather than a guard here: `sapp_get_num_dropped_files`
+// answers 0 when drag-and-drop was never enabled — the window's own default —
+// and when the last drop failed to parse, the fetch loop then runs zero times,
+// and an empty `[]string` pushes no event. This is the one arm of the decode
+// that is reachable with no window open, which is what
+// `sokol_input_test.dado` pins.
+private void push_dropped_files():
+    i32 n = sokol_app.sapp_get_num_dropped_files()
+    if n > input.MAX_DROPPED:
+        n = input.MAX_DROPPED
+    [input.MAX_DROPPED]string8 paths
+    for i in 0..<n:
+        paths[i] = string8(sokol_app.sapp_get_dropped_file_path(i))
+    input.push_drop(paths[0..<n])
+
+// The `Modifier` held-button bit for a `sapp_mousebutton`. Zero for
+// SAPP_MOUSEBUTTON_INVALID, which is what a motion event carries.
+private u32 held_bit(sokol_app.sapp_mousebutton button):
+    if button == sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_LEFT:
+        return u32(input.Modifier.Lmb)
+    if button == sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_RIGHT:
+        return u32(input.Modifier.Rmb)
+    if button == sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_MIDDLE:
+        return u32(input.Modifier.Mmb)
+    return 0

@@ -1,0 +1,617 @@
+// core:script — reloading a static script's class: what
+// `#script_reload(vm, Class)` and `#script_reload(vm, Class, dir)` lower to.
+//
+// **Where the new code comes from.** The module `dadoc --emit=reload` wrote
+// for the class's file, at `<dir>/<package>/<Class>.js` — `dir` is
+// `reload` under the working directory when the verb writes none. A module
+// that `dadoc` wrote starts with `// dados ` lines saying what it is: the class
+// (`reload`), each Dado function it calls with the signature it calls it with
+// and where (`fn`), each method with its signature (`method`) and each field
+// with its type (`field`).
+//
+// **What it is checked against.** The build's manifest — what
+// `dadoc --emit=bindings` prints, which the compiler writes into a program that
+// reloads as one C string and hands every reload: each Dado function the build
+// binds (`fn`), each method its Dado runs through a handle (`entry`), each
+// field of each class (`field`), and each field its Dado reads or writes
+// through a handle (`member`). New code passes when every function it calls
+// is bound with the same signature, every method the build's Dado runs is
+// still there with its signature, every field the build's Dado reaches is
+// still there with its type, and every other field it shares with the code
+// running now keeps its type. On any miss nothing changes, the code running
+// now stays, and the failure's text — `#script_error()` — names every miss.
+//
+// **The swap.** The new module is compiled and evaluated under a name of its
+// own, `<package>/<Class>@<n>`, and its `$dados$reload` (written by `dadoc`)
+// is called with the class running now and the instances the host's handles
+// hold: the running class's prototype takes on every method of the new code,
+// and since every instance there is shares that prototype, every instance
+// runs the new code from then on; fields stay where they are; each held
+// instance runs `reloaded()`. **A safe point:** with no run in progress the
+// swap happens at once; called from inside the engine's own run — a Dado
+// function the script called reloading it — the new code is checked and
+// evaluated at once, so the `try` answers whether it will be swapped in, and
+// the swap itself waits for that run to leave the engine (`leave`), with the
+// RELOADING bit set in the engine's word meanwhile. A reload from a thread
+// that did not make the VM answers `THREAD`, as any run does.
+package script
+
+import "core:io"
+
+// What the reload needs of the engine's header beyond `script.dado`'s.
+private foreign "quickjs.h":
+    JSValue JS_EvalFunction(^JSContext ctx, JSValue fun_obj)
+    JSValue JS_GetModuleNamespace(^JSContext ctx, ^JSModuleDef m)
+
+// What an engine keeps of its reloads: how many it has evaluated, which
+// names the next one's module, and the namespace of new code waiting for the
+// run in progress to leave — a value the engine holds (`keep`), so an engine
+// that ends frees it with the rest — or 0.
+type Reloading:
+    i64 made,
+    Handle waiting,
+    // The module and the class the waiting code is for.
+    cstring module,
+    cstring class,
+
+private const i64 PATH_MAX = 1024
+
+// `#script_reload(vm, Class, dir)` under `try`: the class `class` of the
+// module `module` (the compiler's constants), which the VM has loaded, takes
+// on the new code at `<dir>/<module>.js`, checked against `manifest`. A
+// failure says why on the VM's error sink and fails `RELOAD`; a stale handle
+// `STALE`; a busy or stopped VM `BUSY` or `STOPPED`, and a call from a thread
+// that did not make it `THREAD`.
+!void reload_engine(rawptr vm, cstring module, cstring class, string8 dir, cstring manifest):
+    Engine e = engine_of(vm)
+    if e == nil:
+        no_script(vm)
+        fail STALE
+    try enter(e)
+    JSValue running = namespace_of(e, string8(module))
+    bool loaded = i32(running.tag) == JS_TAG_OBJECT
+    JS_FreeValue(e^.ctx, running)
+    if !loaded:
+        not_loaded(e, module, class)
+        fail leaving(e, RELOAD)
+    bool inside = e^.stop.running > 1
+    [PATH_MAX]char8 path
+    i64 n = path_of(&path, dir, string8(module))
+    if n < 0:
+        say(e, "script: the reload's path is longer than 1023 bytes")
+        fail leaving(e, RELOAD)
+    cstring at = cstring(rawptr(&path[0]))
+    ref([]char8) source = read_whole(at)
+    if source == nil:
+        text_begin(e^.err)
+        err_put(e^.err, "script: no new code for `")
+        err_put(e^.err, string8(module))
+        err_put(e^.err, "`: `")
+        err_put(e^.err, string8(path[0..<n]))
+        err_put(e^.err, "` cannot be read — write it with `dadoc --emit=reload <the class's file> -o ")
+        err_put(e^.err, string8(path[0..<n]))
+        err_put(e^.err, "`; the code running now stays\n")
+        fail leaving(e, RELOAD)
+    string8 text = string8(source[0..<#len(source) - 1])
+    if !check(e, text, string8(module), string8(class), string8(path[0..<n]), string8(manifest)):
+        #delete(source)
+        fail leaving(e, RELOAD)
+    Handle next = evaluate(e, source, module)
+    #delete(source)
+    if next == 0:
+        fail leaving(e, RELOAD)
+    if inside:
+        if e^.reloading.waiting != 0:
+            release(e, e^.reloading.waiting)
+        e^.reloading.waiting = next
+        e^.reloading.module = module
+        e^.reloading.class = class
+        _ = #atomic_fetch_or(&e^.stop.word, RELOADING, #ACQ_REL)
+        leave(e)
+        return
+    bool swapped = swap(e, next, module, class)
+    release(e, next)
+    if !swapped:
+        fail leaving(e, script_code(e, THREW))
+    leave(e)
+
+// The namespace of the module `module` running in the engine — one a
+// `#script_new` loaded, or one a loaded module imported, which the engine has
+// compiled and evaluated with it — as a counted reference the caller frees;
+// `undefined` when the engine has not loaded it. Finding it runs no job, so a
+// reload from inside a run may ask.
+private JSValue namespace_of(Engine e, string8 module):
+    for i in 0..<e^.nloaded:
+        if string8(e^.loaded[i].name) == module:
+            return JS_DupValue(e^.ctx, e^.handles[e^.loaded[i].ns])
+    for i in 0..<e^.nmodules:
+        if string8(e^.modules[i].name) == module && e^.compiled[i] != nil:
+            JSValue ns = JS_GetModuleNamespace(e^.ctx, e^.compiled[i])
+            if is_exception(ns):
+                forget_exception(e, ns)
+                return undefined()
+            return ns
+    return undefined()
+
+// What a reload of a class the VM has not loaded says: there is no code of
+// it running there to swap.
+private void not_loaded(Engine e, cstring module, cstring class):
+    text_begin(e^.err)
+    err_put(e^.err, "script: the new code for `")
+    err_put(e^.err, string8(module))
+    err_put(e^.err, "` was not swapped in: this VM has not loaded `")
+    err_put(e^.err, string8(class))
+    err_put(e^.err, "`, so no code of it runs there — a VM loads a class the first time `#script_new` makes one; reload it in a VM that has made one\n")
+
+// The outermost run leaving an engine with new code waiting: the swap, unless
+// the engine is being stopped. Its failure — a `reloaded()` that threw — is on
+// the error sink, with no `try` to answer.
+private void reload_at_exit(Engine e):
+    Handle next = e^.reloading.waiting
+    e^.reloading.waiting = 0
+    _ = #atomic_fetch_and(&e^.stop.word, UNRELOADING, #ACQ_REL)
+    if (word_of(e) & (ASK | STOP)) == 0:
+        _ = swap(e, next, e^.reloading.module, e^.reloading.class)
+    release(e, next)
+
+// ── The check ───────────────────────────────────────────────────────────────
+
+// Whether `text`, the new code at `path`, may replace the code of `module`
+// running now. When it may not, every reason is on the engine's error sink,
+// one per line after a first saying what was refused.
+private bool check(Engine e, string8 text, string8 module, string8 class, string8 path, string8 manifest):
+    i64 misses = check_pass(e, text, module, class, path, manifest, false)
+    if misses == 0:
+        return true
+    text_begin(e^.err)
+    err_put(e^.err, "script: the new code for `")
+    err_put(e^.err, module)
+    err_put(e^.err, "` at `")
+    err_put(e^.err, path)
+    err_put(e^.err, "` was not swapped in, and the code running now stays:\n")
+    _ = check_pass(e, text, module, class, path, manifest, true)
+    return false
+
+// How many reasons there are; each written when `say` says so.
+private i64 check_pass(Engine e, string8 text, string8 module, string8 class, string8 path, string8 manifest, bool write):
+    i64 misses = 0
+    (string8 line, i64 next) first = line_at(text, 0)
+    (string8 kind, string8 name, string8 rest) head = words(after(first.line, DADOS_LINE))
+    if !starts(first.line, DADOS_LINE) || head.kind != "reload":
+        if write:
+            miss(e, "`", path, "` is not new code `dadoc --emit=reload` wrote: its first line is no `// dados reload` line")
+        return 1
+    if head.name != module || head.rest != class:
+        if write:
+            err_put(e^.err, "  `")
+            err_put(e^.err, path)
+            err_put(e^.err, "` holds the class `")
+            err_put(e^.err, head.rest)
+            err_put(e^.err, "` (")
+            err_put(e^.err, head.name)
+            err_put(e^.err, "), and a reload of `")
+            err_put(e^.err, module)
+            err_put(e^.err, "` replaces the class `")
+            err_put(e^.err, class)
+            err_put(e^.err, "` with new code of the same class; load the other class as a script of its own, or rebuild\n")
+        return 1
+    // The Dado functions it calls.
+    i64 at = first.next
+    for at < #len(text):
+        (string8 line, i64 next) l = line_at(text, at)
+        at = l.next
+        if !starts(l.line, DADOS_LINE):
+            break
+        (string8 kind, string8 name, string8 rest) w = words(after(l.line, DADOS_LINE))
+        if w.kind != "fn":
+            continue
+        (string8 sig, string8 place) call = cut(w.rest, '\t')
+        (string8 have, bool found) bound = manifest_line(manifest, "fn", w.name)
+        if !bound.found:
+            misses += 1
+            if write:
+                miss(e, "`", w.name, "` has no binding in this build; rebuild to call it from a script")
+        else if bound.have != call.sig:
+            misses += 1
+            if write:
+                err_put(e^.err, "  `")
+                err_put(e^.err, w.name)
+                err_put(e^.err, "` is bound as `")
+                err_put(e^.err, bound.have)
+                err_put(e^.err, "` in this build, and ")
+                if #len(call.place) > 0:
+                    err_put(e^.err, call.place)
+                else:
+                    err_put(e^.err, "`")
+                    err_put(e^.err, module)
+                    err_put(e^.err, "`")
+                err_put(e^.err, " calls it as `")
+                err_put(e^.err, call.sig)
+                err_put(e^.err, "`; rebuild to call it with this signature\n")
+    // The methods the build's Dado runs.
+    at = 0
+    for at < #len(manifest):
+        (string8 line, i64 next) l = line_at(manifest, at)
+        at = l.next
+        (string8 kind, string8 name, string8 rest) w = words(l.line)
+        if w.kind != "entry" || !in_module(w.name, module):
+            continue
+        string8 method = w.name[#len(module) + 1..<#len(w.name)]
+        (string8 got, bool found) now = header_member(text, "method", module, method)
+        if !now.found || now.got != w.rest:
+            misses += 1
+            if write:
+                err_put(e^.err, "  `")
+                err_put(e^.err, class)
+                err_put(e^.err, ".")
+                err_put(e^.err, method)
+                err_put(e^.err, "` is run by this build's Dado as `")
+                err_put(e^.err, w.rest)
+                if !now.found:
+                    err_put(e^.err, "`, and the new code has no method `")
+                    err_put(e^.err, method)
+                    err_put(e^.err, "`; keep the method, or rebuild\n")
+                else:
+                    err_put(e^.err, "`, and the new code declares it `")
+                    err_put(e^.err, now.got)
+                    err_put(e^.err, "`; keep that signature, or rebuild\n")
+    // The fields the build's Dado reads or writes through a handle: kept,
+    // with the type Dado was compiled against.
+    at = 0
+    for at < #len(manifest):
+        (string8 line, i64 next) l = line_at(manifest, at)
+        at = l.next
+        (string8 kind, string8 name, string8 rest) w = words(l.line)
+        if w.kind != "member" || !in_module(w.name, module):
+            continue
+        string8 field = w.name[#len(module) + 1..<#len(w.name)]
+        (string8 got, bool found) now = header_member(text, "field", module, field)
+        if !now.found || now.got != w.rest:
+            misses += 1
+            if write:
+                err_put(e^.err, "  `")
+                err_put(e^.err, class)
+                err_put(e^.err, ".")
+                err_put(e^.err, field)
+                err_put(e^.err, "` is read or written by this build's Dado through a handle as `")
+                err_put(e^.err, w.rest)
+                if !now.found:
+                    err_put(e^.err, "`, and the new code has no field `")
+                    err_put(e^.err, field)
+                    err_put(e^.err, "`; keep the field, or rebuild\n")
+                else:
+                    err_put(e^.err, "`, and the new code declares it `")
+                    err_put(e^.err, now.got)
+                    err_put(e^.err, "`; keep that type, or rebuild\n")
+    // The other fields it keeps.
+    string8 running = running_fields(e, module, class)
+    at = first.next
+    for at < #len(text):
+        (string8 line, i64 next) l = line_at(text, at)
+        at = l.next
+        if !starts(l.line, DADOS_LINE):
+            break
+        (string8 kind, string8 name, string8 rest) w = words(after(l.line, DADOS_LINE))
+        if w.kind != "field" || !in_module(w.name, module):
+            continue
+        string8 field = w.name[#len(module) + 1..<#len(w.name)]
+        // One Dado reaches through a handle was checked above, and is said once.
+        (string8 ty, bool found) reached = manifest_line(manifest, "member", w.name)
+        if reached.found:
+            continue
+        (string8 old, bool found) was = running_field(running, manifest, module, field)
+        if was.found && was.old != w.rest:
+            misses += 1
+            if write:
+                err_put(e^.err, "  `")
+                err_put(e^.err, class)
+                err_put(e^.err, ".")
+                err_put(e^.err, field)
+                err_put(e^.err, "` is `")
+                err_put(e^.err, was.old)
+                err_put(e^.err, "` in the code running now and `")
+                err_put(e^.err, w.rest)
+                err_put(e^.err, "` in the new code: a reload keeps a field's value, so it keeps its type; rename the field to start it afresh, or rebuild\n")
+    return misses
+
+// One reason, written `  <a><b><c>` on a line of its own.
+private void miss(Engine e, string8 a, string8 b, string8 c):
+    err_put(e^.err, "  ")
+    err_put(e^.err, a)
+    err_put(e^.err, b)
+    err_put(e^.err, c)
+    err_put(e^.err, "\n")
+
+// The `rest` of the manifest's line `<kind> <name> <rest>`, if it has one.
+private (string8 rest, bool found) manifest_line(string8 manifest, string8 kind, string8 name):
+    i64 at = 0
+    for at < #len(manifest):
+        (string8 line, i64 next) l = line_at(manifest, at)
+        at = l.next
+        (string8 kind, string8 name, string8 rest) w = words(l.line)
+        if w.kind == kind && w.name == name:
+            return (w.rest, true)
+    return ("", false)
+
+// What the new code's header says of `<module>.<member>` on a `<kind>` line.
+private (string8 rest, bool found) header_member(string8 text, string8 kind, string8 module, string8 member):
+    i64 at = 0
+    for at < #len(text):
+        (string8 line, i64 next) l = line_at(text, at)
+        at = l.next
+        if !starts(l.line, DADOS_LINE):
+            break
+        (string8 kind, string8 name, string8 rest) w = words(after(l.line, DADOS_LINE))
+        if w.kind == kind && in_module(w.name, module) && w.name[#len(module) + 1..<#len(w.name)] == member:
+            return (w.rest, true)
+    return ("", false)
+
+// The fields of the code running now, `<field> <type>` a line: what the last
+// reload's code recorded on the running class, or empty before any reload —
+// when the manifest's are the running code's.
+private string8 running_fields(Engine e, string8 module, string8 class):
+    JSValue ns = namespace_of(e, module)
+    [PATH_MAX]char8 name
+    i64 n = cstring_into(&name, class)
+    if n < 0:
+        JS_FreeValue(e^.ctx, ns)
+        return ""
+    JSValue live = JS_GetPropertyStr(e^.ctx, ns, cstring(rawptr(&name[0])))
+    JS_FreeValue(e^.ctx, ns)
+    forget_exception(e, live)
+    JSValue fields = JS_GetPropertyStr(e^.ctx, live, "$dados$fields")
+    forget_exception(e, fields)
+    JS_FreeValue(e^.ctx, live)
+    string8 out = ""
+    if i32(fields.tag) == JS_TAG_STRING || i32(fields.tag) == JS_TAG_STRING_ROPE:
+        out = copy_text(e, fields)
+    JS_FreeValue(e^.ctx, fields)
+    return out
+
+// A field's type in the code running now.
+private (string8 ty, bool found) running_field(string8 running, string8 manifest, string8 module, string8 field):
+    if #len(running) > 0:
+        i64 at = 0
+        for at < #len(running):
+            (string8 line, i64 next) l = line_at(running, at)
+            at = l.next
+            (string8 name, string8 ty) w = cut(l.line, ' ')
+            if w.name == field:
+                return (w.ty, true)
+        return ("", false)
+    i64 at = 0
+    for at < #len(manifest):
+        (string8 line, i64 next) l = line_at(manifest, at)
+        at = l.next
+        (string8 kind, string8 name, string8 rest) w = words(l.line)
+        if w.kind == "field" && in_module(w.name, module) && w.name[#len(module) + 1..<#len(w.name)] == field:
+            return (w.rest, true)
+    return ("", false)
+
+// A string value's text, kept in a buffer of this thread's until the next
+// reload: the running fields' list is short, and is read once per check.
+private @thread_local [4096]char8 g_fields
+private string8 copy_text(Engine e, JSValue v):
+    #c.size_t n = 0
+    ^const #c.char s = JS_ToCStringLen2(e^.ctx, &n, v, false)
+    if s == nil:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+        return ""
+    string8 got = string8(cstring(rawptr(s)))
+    i64 k = #len(got)
+    if k > 4096:
+        k = 4096
+    for i in 0..<k:
+        g_fields[i] = got[i]
+    JS_FreeCString(e^.ctx, cstring(rawptr(s)))
+    return string8(g_fields[0..<k])
+
+// ── Evaluating and swapping ─────────────────────────────────────────────────
+
+// The new code, compiled under a module name of its own and evaluated, and
+// its namespace held by the engine; 0 having said why not.
+private Handle evaluate(Engine e, ref([]char8) source, cstring module):
+    [PATH_MAX]char8 name
+    i64 n = cstring_into(&name, string8(module))
+    if n < 0 || n + 24 >= PATH_MAX:
+        say(e, "script: the module's name is too long to reload")
+        return 0
+    e^.reloading.made += 1
+    name[n] = '@'
+    n += 1
+    n = put_decimal(&name, n, e^.reloading.made)
+    name[n] = '\0'
+    cstring named = cstring(rawptr(&name[0]))
+    i32 flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_DADOS
+    JSValue compiled = JS_Eval(e^.ctx, cstring(rawptr(&source[0])), #c.size_t(#len(source) - 1), named, flags)
+    if is_exception(compiled):
+        report(e)
+        return 0
+    ^JSModuleDef def = ^JSModuleDef(compiled.u.ptr)
+    JSValue done = JS_EvalFunction(e^.ctx, compiled)
+    if is_exception(done):
+        report(e)
+        return 0
+    JSPromiseStateEnum state = JS_PromiseState(e^.ctx, done)
+    if state == JSPromiseStateEnum.Rejected:
+        _ = JS_Throw(e^.ctx, JS_PromiseResult(e^.ctx, done))
+        JS_FreeValue(e^.ctx, done)
+        report(e)
+        return 0
+    JS_FreeValue(e^.ctx, done)
+    if state == JSPromiseStateEnum.Pending:
+        say(e, "script: the new code's module did not finish evaluating (top-level await is not supported)")
+        return 0
+    JSValue ns = JS_GetModuleNamespace(e^.ctx, def)
+    if is_exception(ns):
+        report(e)
+        return 0
+    try Handle h = keep(e, ns) else _:
+        return 0
+    return h
+
+// The new code's `$dados$reload`, called with the class running now and every
+// instance a handle holds. Whether it returned; a throw is reported.
+private bool swap(Engine e, Handle next, cstring module, cstring class):
+    JSValue ns = namespace_of(e, string8(module))
+    JSValue live = JS_GetPropertyStr(e^.ctx, ns, class)
+    JS_FreeValue(e^.ctx, ns)
+    JSValue f = JS_GetPropertyStr(e^.ctx, e^.handles[next], "$dados$reload")
+    if !JS_IsFunction(e^.ctx, f):
+        forget_exception(e, f)
+        JS_FreeValue(e^.ctx, f)
+        JS_FreeValue(e^.ctx, live)
+        say(e, "script: the new code exports no `$dados$reload`: it is not a module `dadoc --emit=reload` wrote")
+        return false
+    // Every instance a handle on this engine holds — the loaded one, each
+    // `#script_new`'s, each one answered Dado — one slot of the handle table
+    // at a time (`slot_held_from`), the array holding a counted reference to
+    // each for the call.
+    JSValue held = JS_NewArray(e^.ctx)
+    i64 k = 0
+    i64 from = 1
+    for from != 0:
+        (JSValue value, i64 next) got = slot_held_from(e, from)
+        from = got.next
+        if from != 0:
+            _ = JS_SetPropertyInt64(e^.ctx, held, k, got.value)
+            k += 1
+    [2]JSValue argv
+    argv[0] = live
+    argv[1] = held
+    JSValue r = JS_Call(e^.ctx, f, undefined(), 2, &argv[0])
+    JS_FreeValue(e^.ctx, f)
+    JS_FreeValue(e^.ctx, live)
+    JS_FreeValue(e^.ctx, held)
+    if is_exception(r):
+        report(e)
+        return false
+    JS_FreeValue(e^.ctx, r)
+    return true
+
+// ── Text ────────────────────────────────────────────────────────────────────
+
+// What every line of the new code's header starts with.
+private const string8 DADOS_LINE = "// dados "
+
+// The line of `text` starting at `at`, without its newline, and where the
+// next starts.
+private (string8 line, i64 next) line_at(string8 text, i64 at):
+    i64 end = at
+    for end < #len(text) && text[end] != '\n':
+        end += 1
+    i64 next = end
+    if next < #len(text):
+        next += 1
+    return (text[at..<end], next)
+
+private bool starts(string8 s, string8 prefix):
+    return #len(s) >= #len(prefix) && s[0..<#len(prefix)] == prefix
+
+// `s` without `prefix`, which it starts with.
+private string8 after(string8 s, string8 prefix):
+    if !starts(s, prefix):
+        return s
+    return s[#len(prefix)..<#len(s)]
+
+// `s` cut at the first `c`: what is before it and what is after; all of `s`
+// and nothing when there is none.
+private (string8 head, string8 tail) cut(string8 s, char8 c):
+    for i in 0..<#len(s):
+        if s[i] == c:
+            return (s[0..<i], s[i + 1..<#len(s)])
+    return (s, "")
+
+// `<kind> <name> <rest>`.
+private (string8 kind, string8 name, string8 rest) words(string8 line):
+    (string8 head, string8 tail) a = cut(line, ' ')
+    (string8 head, string8 tail) b = cut(a.tail, ' ')
+    return (a.head, b.head, b.tail)
+
+// Whether `name` is `<module>.<member>`.
+private bool in_module(string8 name, string8 module):
+    return #len(name) > #len(module) + 1 && starts(name, module) && name[#len(module)] == '.'
+
+// `<dir>/<module>.js`, NUL-terminated, into `out`: its length without the NUL,
+// or −1 when it does not fit.
+private i64 path_of(^[PATH_MAX]char8 out, string8 dir, string8 module):
+    string8 d = dir
+    if #len(d) == 0:
+        d = "reload"
+    if #len(d) + #len(module) + 5 >= PATH_MAX:
+        return 0 - 1
+    i64 n = 0
+    for i in 0..<#len(d):
+        out^[n] = d[i]
+        n += 1
+    if out^[n - 1] != '/':
+        out^[n] = '/'
+        n += 1
+    for i in 0..<#len(module):
+        out^[n] = module[i]
+        n += 1
+    out^[n] = '.'
+    out^[n + 1] = 'j'
+    out^[n + 2] = 's'
+    out^[n + 3] = '\0'
+    return n + 3
+
+// `s`, NUL-terminated, into `out`: its length, or −1 when it does not fit.
+private i64 cstring_into(^[PATH_MAX]char8 out, string8 s):
+    if #len(s) + 1 >= PATH_MAX:
+        return 0 - 1
+    for i in 0..<#len(s):
+        out^[i] = s[i]
+    out^[#len(s)] = '\0'
+    return #len(s)
+
+// `v` in decimal into `out` from `at`; where the digits end.
+private i64 put_decimal(^[PATH_MAX]char8 out, i64 at, i64 v):
+    [20]char8 digits
+    i64 k = 0
+    i64 x = v
+    for:
+        digits[k] = char8(48 + x % 10)
+        k += 1
+        x = x / 10
+        if x == 0:
+            break
+    i64 n = at
+    for i in 0..<k:
+        out^[n] = digits[k - 1 - i]
+        n += 1
+    return n
+
+// The file at `path`, whole, with a NUL after it; nil when it cannot be read.
+// A web program reads no file — `core:io`'s files are the hosted arm's — and
+// the compiler refuses on the web the two verbs that would read one, a reload
+// and a load by path, so there it answers nil and is never reached.
+when #OS == #WEB:
+    private ref([]char8) read_whole(cstring path):
+        return nil
+
+else:
+    private ref([]char8) read_whole(cstring path):
+        ^io.FILE f = io.open_read(path)
+        if !io.opened(f):
+            return nil
+        ref([]char8) buf = #make([]char8, 4096)
+        if buf == nil:
+            _ = io.close(f)
+            return nil
+        i64 used = 0
+        for:
+            if used + 1 >= #len(buf):
+                if !#resize(buf, #len(buf) * 2):
+                    _ = io.close(f)
+                    #delete(buf)
+                    return nil
+            i64 got = io.read_bytes(f, buf[used..<#len(buf) - 1])
+            if got <= 0:
+                break
+            used += got
+        _ = io.close(f)
+        buf[used] = '\0'
+        _ = #resize(buf, used + 1)
+        return buf

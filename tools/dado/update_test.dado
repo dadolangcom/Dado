@@ -1,0 +1,198 @@
+@test
+// The pure logic of the update check, `dado update` and `dado upgrade`: the
+// order of releases (semantic versioning's, prereleases included), which
+// tag is newest, `ls-remote`'s output, `DADOC_MIN`, `SHA256SUMS`, when the
+// network is due to be asked, the release asset for each host, and the state
+// file's `NAME=value` lines alongside the tools' lines.
+//
+// What is not here, and is exercised by running the driver against a local
+// repository and a local folder of releases instead: git, curl and tar
+// themselves, and moving an install.
+package driver
+
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+private bool same(string8 got, string8 want, string8 what):
+    return #expect(got == want, what, " is `", got, "`, not `", want, "`")
+
+private bool older(string8 a, string8 b):
+    (i32 got, bool ok) = compare_versions(a, b)
+    (i32 back, bool ok2) = compare_versions(b, a)
+    bool back_ok = ok2 && back == 1
+    return #expect(ok && got == 0 - 1 && back_ok, a, " is not older than ", b, " (", got, ", ", back, ")")
+
+// ── the order of releases ───────────────────────────────────────────────────
+
+private bool releases_ordered():
+    bool ok = true
+    // Semantic versioning 2.0's own example chain, then this project's.
+    ok = older("1.0.0-alpha", "1.0.0-alpha.1") && ok
+    ok = older("1.0.0-alpha.1", "1.0.0-alpha.beta") && ok
+    ok = older("1.0.0-alpha.beta", "1.0.0-beta") && ok
+    ok = older("1.0.0-beta", "1.0.0-beta.2") && ok
+    ok = older("1.0.0-beta.2", "1.0.0-beta.11") && ok
+    ok = older("1.0.0-beta.11", "1.0.0-rc.1") && ok
+    ok = older("1.0.0-rc.1", "1.0.0") && ok
+    ok = older("1.0.0-rc.2", "1.0.0") && ok
+    ok = older("1.0.0-rc.1", "1.0.0-rc.2") && ok
+    ok = older("1.0.0-dev", "1.0.0-rc.1") && ok
+    ok = older("1.0.0-dev+abc.dirty", "1.0.0") && ok
+    ok = older("1.0.0", "1.0.1-rc.1") && ok
+    ok = #expect(is_prerelease("1.0.0-dev+2d3720de7bb9"), "1.0.0-dev is a prerelease") && ok
+    ok = #expect(is_prerelease("1.0.0-rc.1"), "1.0.0-rc.1 is a prerelease") && ok
+    ok = #expect(!is_prerelease("1.0.0+meta"), "1.0.0+meta is a release") && ok
+    ok = same(without_build("1.0.0-dev+b59cf088146e.dirty"), "1.0.0-dev", "a version without its build") && ok
+    ok = #expect(major_change("1.4.2", "2.0.0") && !major_change("1.0.0-rc.2", "1.9.0"), "a major change") && ok
+    return ok
+
+// ── ls-remote, and the newest tag ───────────────────────────────────────────
+
+private const string8 LS = "3f1c0de6c34a2b2c2f1e5a1d1b5c4e7f6a9b8c7d\tHEAD\n1111111111111111111111111111111111111111\trefs/tags/v1.0.0-rc.1\n2222222222222222222222222222222222222222\trefs/tags/v1.0.0-rc.1^{}\n3333333333333333333333333333333333333333\trefs/tags/v1.0.0-rc.2\n4444444444444444444444444444444444444444\trefs/tags/vnext\n5555555555555555555555555555555555555555\trefs/tags/v0.9.0\n6666666666666666666666666666666666666666\trefs/tags/release-2\n"
+
+private bool remotes_read():
+    bool ok = true
+    Remote r = parse_ls_remote(LS)
+    ok = same(r.head, "3f1c0de6c34a2b2c2f1e5a1d1b5c4e7f6a9b8c7d", "HEAD") && ok
+    ok = #expect(#len(r.versions) == 3, #len(r.versions), " versions, not 3 (a peeled line, `vnext` and `release-2` are none)") && ok
+    (string8 pre, bool any_pre) = newest_version(r.versions[:], true)
+    ok = #expect(any_pre, "no newest version") && ok
+    ok = same(pre, "1.0.0-rc.2", "the newest, prereleases counted") && ok
+    (string8 rel, bool any_rel) = newest_version(r.versions[:], false)
+    ok = #expect(any_rel, "no newest release") && ok
+    ok = same(rel, "0.9.0", "the newest, prereleases left out") && ok
+    Remote none = parse_ls_remote("")
+    ok = #expect(#len(none.head) == 0 && #len(none.versions) == 0, "nothing read from nothing") && ok
+    (string8 _, bool any_none) = newest_version(none.versions[:], true)
+    ok = #expect(!any_none, "a newest of no versions") && ok
+    Remote only_pre = parse_ls_remote("1111111111111111111111111111111111111111\trefs/tags/v1.0.0-rc.1\n")
+    (string8 _, bool any_only) = newest_version(only_pre.versions[:], false)
+    ok = #expect(!any_only, "a release found among prereleases only") && ok
+    return ok
+
+// ── DADOC_MIN ───────────────────────────────────────────────────────────────
+
+private bool minimums_read():
+    bool ok = true
+    ok = same(dadoc_min_of("# the oldest dadoc this tree works with\n\n1.2.0\n"), "1.2.0", "DADOC_MIN after a comment") && ok
+    ok = same(dadoc_min_of(""), "", "no DADOC_MIN") && ok
+    ok = #expect(dadoc_allows("1.0.0", ""), "no minimum allows any dadoc") && ok
+    ok = #expect(dadoc_allows("1.2.0", "1.2.0\n"), "the minimum itself is allowed") && ok
+    ok = #expect(dadoc_allows("1.3.0+abc", "1.2.0"), "a newer dadoc is allowed") && ok
+    ok = #expect(!dadoc_allows("1.0.0-dev+b59cf088146e", "9.9.9"), "1.0.0-dev met 9.9.9") && ok
+    ok = #expect(!dadoc_allows("1.0.0-rc.2", "1.0.0"), "a prerelease met its release") && ok
+    ok = #expect(!dadoc_allows("1.0.0", "one point two"), "a minimum that is not a version allowed a dadoc") && ok
+    return ok
+
+// ── SHA256SUMS ──────────────────────────────────────────────────────────────
+
+private const string8 SUMS = "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08  dado-linux-x86_64.tar.gz\n60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752 *dado-windows-x86_64.zip\nnot-hex  dado-macos-universal.tar.gz\n"
+
+private bool sums_read():
+    bool ok = true
+    (string8 lin, bool f1) = sum_for(SUMS, "dado-linux-x86_64.tar.gz")
+    ok = #expect(f1, "the linux line was not found") && ok
+    ok = same(lin, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "the linux sum, in lower case") && ok
+    (string8 win, bool f2) = sum_for(SUMS, "dado-windows-x86_64.zip")
+    ok = #expect(f2, "a line with the binary marker was not found") && ok
+    ok = same(win, "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752", "the windows sum") && ok
+    (string8 _, bool f3) = sum_for(SUMS, "dado-macos-universal.tar.gz")
+    ok = #expect(!f3, "a sum that is not 64 hex digits was taken") && ok
+    (string8 _, bool f4) = sum_for(SUMS, "dado-linux-aarch64.tar.gz")
+    ok = #expect(!f4, "a sum for a file the list does not name") && ok
+    (string8 _, bool f5) = sum_for(SUMS, "x86_64.tar.gz")
+    ok = #expect(!f5, "a name matched by its end") && ok
+    return ok
+
+// ── when to ask, and what to download ───────────────────────────────────────
+
+private bool intervals_decided():
+    bool ok = true
+    ok = #expect(check_due(1000, 0, false, 900), "no record of a check is due") && ok
+    ok = #expect(!check_due(1000, 500, true, 900), "a check 500 s ago is not due at 900") && ok
+    ok = #expect(check_due(1400, 500, true, 900), "a check 900 s ago is due at 900") && ok
+    ok = #expect(check_due(1000, 1000, true, 0), "an interval of 0 is always due") && ok
+    ok = #expect(check_due(100, 5000, true, 900), "a clock set back is due") && ok
+    (i64 n, bool good) = whole_number(" 900 ")
+    ok = #expect(good && n == 900, "900 read as ", n) && ok
+    for bad in ["", "-1", "9x", "1.5", "1234567890123456789"]:
+        (i64 _, bool taken) = whole_number(bad)
+        ok = #expect(!taken, "`", bad, "` taken for a whole number") && ok
+    return ok
+
+private bool assets_named():
+    bool ok = true
+    ok = same(asset_name("macos", "aarch64"), "dado-macos-universal.tar.gz", "a Mac on ARM") && ok
+    ok = same(asset_name("macos", "x86_64"), "dado-macos-universal.tar.gz", "a Mac on Intel") && ok
+    ok = same(asset_name("linux", "x86_64"), "dado-linux-x86_64.tar.gz", "Linux on x86_64") && ok
+    ok = same(asset_name("linux", "aarch64"), "dado-linux-aarch64.tar.gz", "Linux on ARM") && ok
+    ok = same(asset_name("windows", "x86_64"), "dado-windows-x86_64.zip", "Windows") && ok
+    ok = same(asset_name("windows", "aarch64"), "dado-windows-x86_64.zip", "Windows on ARM, emulated") && ok
+    ok = same(asset_name("linux", "riscv64"), "", "a host with no release") && ok
+    (string8 o, string8 a) = this_host()
+    string8 mine = asset_name(o, a)
+    ok = #expect(#len(mine) > 0, "this host (", o, ", ", a, ") has no release asset") && ok
+    return ok
+
+// ── the state file ──────────────────────────────────────────────────────────
+
+private bool state_lines():
+    bool ok = true
+    string8 text = "# dado's state\ntool webdev abc dadoc 1.0.0-dev+x\nupdate_checked=100\nother kind of line\n"
+    (string8 v, bool found) = state_value(text, "update_checked")
+    ok = #expect(found, "update_checked was not found") && ok
+    ok = same(v, "100", "update_checked") && ok
+    (string8 _, bool absent) = state_value(text, "previous_tree")
+    ok = #expect(!absent, "a name the file lacks was found") && ok
+    string8 t2 = with_state_value(text, "update_checked", "200")
+    ok = same(t2, "# dado's state\ntool webdev abc dadoc 1.0.0-dev+x\nupdate_checked=200\nother kind of line\n", "a value replaced in place") && ok
+    string8 t3 = with_state_value(t2, "previous_tree", "deadbeef")
+    ok = same(t3, "# dado's state\ntool webdev abc dadoc 1.0.0-dev+x\nupdate_checked=200\nother kind of line\nprevious_tree=deadbeef\n", "a value added") && ok
+    ok = same(with_state_value("", "a", "1"), "a=1\n", "a value into an empty file") && ok
+    ok = same(with_state_value("x=1\nx=2", "x", "3"), "x=3\n", "a name written twice, made one") && ok
+    // The tools' own reader keeps these lines, and its writer writes them back.
+    (ref []ToolState tools, ref []string8 other) = parse_state(t3)
+    ok = #expect(#len(tools) == 1, "the tool line was lost among NAME=value lines") && ok
+    string8 back = format_state(tools[:], other[:])
+    (string8 again, bool kept) = state_value(back, "previous_tree")
+    ok = #expect(kept, "the tools' writer dropped a NAME=value line") && ok
+    ok = same(again, "deadbeef", "previous_tree after the tools' writer") && ok
+    // And through the disk, as `remember` writes it.
+    try ref []char8 made = fs.make_temp_dir("dado-update-test") else code:
+        return #expect(false, "no temp directory: ", os.message(code))
+    string8 file = join2(txt(made), "state")
+    try fs.write_file(file, with_state_value(t3, "remote_head", "cafe")) else code:
+        return #expect(false, "cannot write ", file, ": ", os.message(code))
+    try ref []char8 read_back = fs.read_file(file) else code:
+        return #expect(false, "cannot read ", file, ": ", os.message(code))
+    (string8 head, bool has_head) = state_value(txt(read_back), "remote_head")
+    ok = #expect(has_head && head == "cafe", "remote_head after a round trip through the disk") && ok
+    (string8 tree, bool has_tree) = state_value(txt(read_back), "previous_tree")
+    ok = #expect(has_tree && tree == "deadbeef", "previous_tree after a round trip through the disk") && ok
+    remove_tree_quietly(txt(made))
+    return ok
+
+private bool shas_shortened():
+    bool ok = true
+    ok = same(short_sha("3f1c0de6c34a2b2c2f1e5a1d1b5c4e7f6a9b8c7d"), "3f1c0de6c34a", "a short commit") && ok
+    ok = same(short_sha("abc"), "abc", "a commit already short") && ok
+    ok = #expect(strings.contains(LS, "HEAD"), "the fixture") && ok
+    return ok
+
+i32 test():
+    arena.Arena a = arena.over(libc.allocator())
+    defer arena.destroy(&a)
+    using arena.allocator(&a):
+        bool ok = releases_ordered()
+        ok = remotes_read() && ok
+        ok = minimums_read() && ok
+        ok = sums_read() && ok
+        ok = intervals_decided() && ok
+        ok = assets_named() && ok
+        ok = state_lines() && ok
+        ok = shas_shortened() && ok
+        if ok: return 0
+        return 1

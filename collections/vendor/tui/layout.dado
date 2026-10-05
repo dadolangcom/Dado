@@ -1,0 +1,575 @@
+// vendor:tui — regions, placement, and the containers.
+//
+// A region is a rectangle, an axis, two cursors and a gap. A widget is
+// *placed* into the innermost region and advances its cursor. Regions nest.
+//
+// **There is no flex solver and no second pass**, deliberately. One pass is
+// possible in a terminal because a widget's size is known before it is placed
+// — text measures itself — and one pass is what keeps immediate mode honest:
+// what you see on screen is what the code did, in the order it did it.
+//
+// Two cursors rather than one is the whole alignment story. `align(START)`
+// packs forward from the near edge and `align(END)` packs backward from the
+// far edge, so a status bar with a left group and a right group is one row and
+// no arithmetic:
+//
+//     for tui.row():
+//         tui.text("dadoc 0.6")
+//         tui.align(tui.END)
+//         tui.text(clock)
+package tui
+
+// ── sizes ──────────────────────────────────────────────────────────────────
+//
+// A size is a count of cells, or one of three sentinels. They are negative so
+// they cannot collide with a real extent, and `pct` encodes below all of them.
+
+// Fit the content. The default cross size for a row's children.
+const i32 AUTO = 0 - 1
+// Everything the region has left along this axis. The default cross size for a
+// column's children — which is the opinion that makes a stack of widgets look
+// composed with nothing written.
+const i32 REST = 0 - 2
+
+// Fill the cross axis, take the natural size along the main one. The default
+// for every text-shaped widget, and the reason a stack of labels is full-width
+// while a row of them is packed: one sentinel, resolved per axis, rather than
+// every widget having to know which kind of region it landed in.
+const i32 FLOW = 0 - 3
+
+private const i32 PCT_BASE = 0 - 1000
+
+// A fraction of the region's extent along this axis. `pct(50)` in a row is
+// half the row.
+i32 pct(i32 n):
+    return PCT_BASE - n
+
+private i32 resolve(i32 v, i32 extent, i32 natural):
+    if v == REST: return extent
+    if v == AUTO: return natural
+    if v <= PCT_BASE:
+        i32 n = PCT_BASE - v
+        return (extent * n) / 100
+    return v
+
+// ── axis and anchor ────────────────────────────────────────────────────────
+
+enum Axis: (Down, Right)
+
+// Where along the *main* axis a widget is placed. `START` packs forward from
+// the near edge (the default), `END` packs backward from the far edge, and
+// `MIDDLE` centres one item in what is left.
+enum Anchor: (START, MIDDLE, END)
+
+// The spellings that read right in each direction. They are the same three
+// values; `LEFT` in a row and `TOP` in a column are one thing, and a program
+// should be able to say whichever one is true.
+const Anchor LEFT = Anchor.START
+const Anchor CENTER = Anchor.MIDDLE
+const Anchor RIGHT = Anchor.END
+const Anchor TOP = Anchor.START
+const Anchor MIDDLE = Anchor.MIDDLE
+const Anchor BOTTOM = Anchor.END
+
+// ── the region stack ───────────────────────────────────────────────────────
+
+private const i32 MAX_DEPTH = 32
+
+// A table wider than this is a table that wanted to be a list.
+const i32 MAX_TABLE_COLS = 12
+
+// `near_used` and `far_used` and not `near` and `far`: `<windows.h>` defines
+// both of those as empty macros, so a member named either is deleted from the
+// emitted C on Windows.
+private type Region: (
+    Rect box,          // the content rectangle, inside any padding or border
+    i32 near_used,     // cells consumed from the near edge along the main axis
+    i32 far_used,      // cells consumed from the far edge
+    i32 resv,          // cells promised to the far edge by `reserve`, not yet taken
+    Axis axis,
+    i32 gap,
+    Anchor anchor,
+    u32 id,            // this region's identity, for the widgets inside it
+    i32 seq,           // how many things the *parent* had placed when this opened
+    Rect saved_clip,
+    bool bordered,     // whether `end` owes a frame — set by `panel`
+    Rect frame_box,
+    string8 title,
+    bool focus_ring,
+    u32 salt,          // the id salt in force when this region opened
+    bool scroller,     // whether `end` owes a scrollbar and a content measure
+    Rect port,         // a scroller's visible rectangle, which its box is not
+    i32 ncols,         // a table row's column count; 0 for an ordinary region
+    [MAX_TABLE_COLS]i32 cols,
+    bool has_bg,       // whether this region painted a background of its own
+    Color bg,          // ...and which, so its children draw on it and not through it
+    bool overlay,      // whether closing this region leaves the overlay
+)
+
+private [MAX_DEPTH]Region g_stack
+private i32 g_depth
+private bool g_overflowed
+
+// Identity. A widget's id is a hash of the enclosing region's id, its ordinal
+// within that region, and its label. Stable across frames because the frame
+// code is stable; `push_id` is what a loop over changing data uses when the
+// ordinal is the only thing telling two rows apart.
+private const u32 FNV_OFFSET = 2166136261
+private const u32 FNV_PRIME = 16777619
+
+private u32 hash_u32(u32 h, u32 v):
+    u32 acc = h
+    for i in 0..<4:
+        acc = (acc ~ ((v >> (u32(i) * 8)) & 0xFF)) * FNV_PRIME
+    return acc
+
+private u32 hash_str(u32 h, string8 s):
+    u32 acc = h
+    for b in s:
+        acc = (acc ~ u32(b)) * FNV_PRIME
+    return acc
+
+private u32 g_id_salt
+
+// Distinguish otherwise identical widgets in a loop.
+//
+//     for t, i in tests:
+//         tui.push_id(i)
+//         defer tui.pop_id()
+//         if tui.button(t.name): run(t)
+void push_id(i32 n):
+    g_id_salt = hash_u32(g_id_salt, u32(n))
+
+void push_id_str(string8 s):
+    g_id_salt = hash_str(g_id_salt, s)
+
+void pop_id():
+    g_id_salt = 0
+
+// The id a widget with this label would have here. Also what a container uses
+// to recognise its own closing call.
+private u32 slot_id(string8 label):
+    Region r = g_stack[g_depth]
+    u32 h = hash_u32(r.id, u32(r.seq))
+    h = hash_u32(h, g_id_salt)
+    return hash_str(h, label)
+
+// ── placement ──────────────────────────────────────────────────────────────
+
+// The region's whole extent along the main axis.
+private i32 extent(Region r):
+    if r.axis == Axis.Down: return r.box.h
+    return r.box.w
+
+// How much room is left, in two senses.
+//
+// `remaining` is what a **`REST`-sized** widget may claim: everything except
+// what `reserve` has promised to something still to come. `remaining_all` is
+// what any *other* widget may occupy, which includes the reservation — because
+// the reservation was made for it.
+//
+// That split is the whole of `reserve`, and it is what lets a fixed-size panel
+// and a footer both sit after a `REST`-sized sibling without a second pass.
+private i32 remaining(Region r):
+    return extent(r) - r.near_used - r.far_used - r.resv
+
+private i32 remaining_all(Region r):
+    return extent(r) - r.near_used - r.far_used
+
+// Place a widget of the requested size and answer where it landed.
+//
+// `nat_w`/`nat_h` are what the widget measured itself as, and are what `AUTO`
+// resolves to. A cross size defaults to `REST` in a column and `AUTO` in a
+// row, which is the difference between a stack of full-width rows and a line
+// of packed items — and it is the single opinion that makes an unstyled
+// column look deliberate.
+private Rect place(i32 w, i32 h, i32 nat_w, i32 nat_h):
+    if g_depth < 0 || g_depth >= MAX_DEPTH: return NOWHERE
+    ^Region r = &g_stack[g_depth]
+    i32 left = remaining_all(r^)
+    if left <= 0: return NOWHERE
+    // What `REST` resolves against holds the reservation back; what a sized
+    // widget may occupy does not.
+    i32 flexible = remaining(r^)
+
+    // A table row hands out its own column widths: whatever a cell asks for,
+    // it gets the column it is in. That is what lets every widget in the
+    // library work as a table cell with no table-aware variant of any of them.
+    //
+    // **Only in a row.** A column is a horizontal idea, and the table's own
+    // body region is vertical — it carries the widths so its rows can inherit
+    // them, and applying them there gives the *first row* a height of the first
+    // column's width.
+    i32 aw = w
+    i32 ah = h
+    if r.ncols > 0 && r.axis == Axis.Right && r.seq < r.ncols:
+        aw = r.cols[r.seq]
+    if r.axis == Axis.Down:
+        if aw == FLOW: aw = REST
+        if ah == FLOW: ah = AUTO
+    else:
+        if aw == FLOW: aw = AUTO
+        if ah == FLOW: ah = REST
+
+    Rect out = NOWHERE
+    if r.axis == Axis.Down:
+        i32 rw = resolve(aw, r.box.w, nat_w)
+        i32 rh = resolve(ah, flexible, nat_h)
+        if rh > left: rh = left
+        if rw > r.box.w: rw = r.box.w
+        i32 x = r.box.x
+        i32 y = 0
+        if r.anchor == Anchor.END:
+            y = r.box.y + r.box.h - r.far_used - rh
+            r.far_used = r.far_used + rh + r.gap
+            r.resv = r.resv - (rh + r.gap)
+            if r.resv < 0: r.resv = 0
+        else if r.anchor == Anchor.MIDDLE:
+            y = r.box.y + r.near_used + ((left - rh) / 2)
+            r.near_used = r.near_used + rh + r.gap
+        else:
+            y = r.box.y + r.near_used
+            r.near_used = r.near_used + rh + r.gap
+            if ah != REST:
+                r.resv = r.resv - (rh + r.gap)
+                if r.resv < 0: r.resv = 0
+        out = (x, y, rw, rh)
+    else:
+        i32 rw = resolve(aw, flexible, nat_w)
+        i32 rh = resolve(ah, r.box.h, nat_h)
+        if rw > left: rw = left
+        if rh > r.box.h: rh = r.box.h
+        i32 y = r.box.y
+        i32 x = 0
+        if r.anchor == Anchor.END:
+            x = r.box.x + r.box.w - r.far_used - rw
+            r.far_used = r.far_used + rw + r.gap
+            r.resv = r.resv - (rw + r.gap)
+            if r.resv < 0: r.resv = 0
+        else if r.anchor == Anchor.MIDDLE:
+            x = r.box.x + r.near_used + ((left - rw) / 2)
+            r.near_used = r.near_used + rw + r.gap
+        else:
+            x = r.box.x + r.near_used
+            r.near_used = r.near_used + rw + r.gap
+            if aw != REST:
+                r.resv = r.resv - (rw + r.gap)
+                if r.resv < 0: r.resv = 0
+        out = (x, y, rw, rh)
+
+    r.seq = r.seq + 1
+    return out
+
+// Where the next widget would go, without taking it.
+Rect available():
+    if g_depth < 0 || g_depth >= MAX_DEPTH: return NOWHERE
+    Region r = g_stack[g_depth]
+    i32 left = remaining(r)
+    if left <= 0: return NOWHERE
+    if r.axis == Axis.Down:
+        return (r.box.x, r.box.y + r.near_used, r.box.w, left)
+    return (r.box.x + r.near_used, r.box.y, left, r.box.h)
+
+// Set the anchor for everything placed after this, until the region closes.
+void align(Anchor a):
+    if g_depth < 0 || g_depth >= MAX_DEPTH: return
+    g_stack[g_depth].anchor = a
+
+// Set the gap between everything placed after this.
+void gap(i32 n):
+    if g_depth < 0 || g_depth >= MAX_DEPTH: return
+    g_stack[g_depth].gap = n
+
+// ── opening and closing ────────────────────────────────────────────────────
+//
+// Every container answers `bool`, which buys two spellings and costs nothing.
+//
+// **The `for` form**, which is the default:
+//
+//     for tui.panel("Build"):
+//         tui.checkbox("release", &release)
+//
+// `for cond:` is Dado's only `while` and it re-evaluates after each pass, so
+// the first call opens the region and answers true, and the second recognises
+// its own region on top of the stack, closes it, and answers false. `continue`
+// is safe because it *is* the close. **`break` is not** — it skips the
+// condition, so the region never closes and everything after it lands inside.
+// A region swept up by `end_frame` rather than closed by its own call is a
+// mistake the library reports rather than hides.
+//
+// **The `if` form**, for a body with a `break` or an early `return` in it:
+//
+//     if tui.panel("Build"):
+//         defer tui.end()
+//         ...
+
+// Is this container call the *closing* half of a `for` loop rather than a
+// fresh open? The innermost region knows the id it was opened with, so the
+// answer is whether recomputing that id — from **its parent**, whose ordinal
+// the opening call deliberately did not spend — lands on the same number.
+//
+// ── the one ambiguity, stated ──────────────────────────────────────────────
+//
+// The two calls are indistinguishable to the library: an opening call for a
+// container nested directly inside one with the same tag sees exactly the
+// state a closing call sees. There is no call-site information in the language
+// to tell them apart. So the rule is:
+//
+// > **With the `for` form, a container may not be a direct child of a
+// > container with the same tag.**
+//
+// `panel` uses its title, so two panels only collide when they share a title —
+// which is a UI bug of its own. `row` and `column` share one default each,
+// which is why both take a `tag:` argument. A row directly inside a row is
+// `for tui.row(tag: "inner"):`, or the `if ...: defer tui.end()` form, which
+// has no ambiguity at all because the close is written out.
+//
+// Closing always wins the tie. The alternative — reading it as a nested open —
+// turns `for tui.panel("x"): pass` into a loop that nests until the stack
+// overflows, and a layout that is wrong beats a program that hangs.
+private bool closing(string8 tag):
+    if g_depth <= 0: return false
+    Region me = g_stack[g_depth]
+    Region parent = g_stack[g_depth - 1]
+    u32 h = hash_u32(parent.id, u32(parent.seq))
+    h = hash_u32(h, me.salt)
+    if me.id != hash_str(h, tag): return false
+    // Closing a container that never had anything placed in it is *almost*
+    // always the ambiguity above rather than an empty container: somebody
+    // nested a `row` in a `row`. The library cannot tell the two apart, so it
+    // takes the interpretation that terminates and says what it did — see
+    // `warn`, which puts it on the screen rather than in a log nobody reads.
+    if me.seq == 0:
+        warn("empty <", tag, "> closed")
+    return true
+
+// ── saying so ──────────────────────────────────────────────────────────────
+//
+// A layout mistake that draws *something* is worse than one that crashes,
+// because it gets shipped. These are drawn over the frame, in the error
+// colour, at the top-right — where they cannot be missed and cannot be
+// mistaken for content.
+
+private const i32 WARN_CAP = 160
+private type WarnBuf: [WARN_CAP]char8
+private WarnBuf g_warn_text
+private i32 g_warn_len
+private bool g_warned
+
+// **A TUI library may not report a problem by printing.** `#breakpoint` and
+// `println` write to the terminal this library is drawing on, so a diagnostic
+// about the layout arrives *as* a corrupted layout — the message overwrites the
+// screen, the compositor's front buffer no longer matches what is there, and
+// every frame after it is diffed against a lie. The report has to be a thing
+// the compositor draws, like everything else.
+private void warn(string8 a, string8 b = "", string8 c = ""):
+    if g_warned: return
+    g_warned = true
+    g_warn_len = 0
+    warn_put(a)
+    warn_put(b)
+    warn_put(c)
+
+private void warn_put(string8 s):
+    for i in 0..<i32(#len(s)):
+        if g_warn_len >= WARN_CAP: return
+        g_warn_text[g_warn_len] = s[i]
+        g_warn_len = g_warn_len + 1
+
+// Whether the frame just composed had a layout problem, and what it was.
+(bool any, string8 what) layout_warning():
+    string8 w = ""
+    if g_warn_len > 0: w = string8(g_warn_text[0..<g_warn_len])
+    return (g_warned, w)
+
+private void clear_warning():
+    g_warned = false
+    g_warn_len = 0
+
+private void draw_warning():
+    if !g_warned || g_warn_len == 0: return
+    Rect s = screen()
+    if s.h < 1: return
+    string8 what = string8(g_warn_text[0..<g_warn_len])
+    i32 w = measure(what) + 10
+    if w + 2 > s.w: w = s.w - 2
+    if w < 8: return
+    i32 x = s.x + s.w - w - 1
+    Style st = (g_theme.base, g_theme.err, Attr.BOLD)
+    fill_rect((x, s.y, w, 1), st)
+    i32 used = draw_text(x + 1, s.y, "layout: ", st, w - 1)
+    _ = draw_text(x + 1 + used, s.y, what, st, w - 1 - used)
+
+// Place a container's rectangle **without** advancing the parent's ordinal.
+//
+// A container is placed by its opening call and its ordinal is spent by its
+// closing one, so that both calls compute the same id and the second can
+// recognise the first. Letting `place` advance it here is the bug that makes
+// `for tui.row():` open a second row instead of closing the first.
+private Rect place_container(i32 w, i32 h):
+    Rect at = place(w, h, 0, 0)
+    g_stack[g_depth].seq = g_stack[g_depth].seq - 1
+    return at
+
+private bool open_region(u32 id, Rect box, Axis axis, i32 gap_n, Rect saved):
+    if g_depth + 1 >= MAX_DEPTH:
+        g_overflowed = true
+        return false
+    g_depth = g_depth + 1
+    [MAX_TABLE_COLS]i32 nocols
+    g_stack[g_depth] = (box, 0, 0, 0, axis, gap_n, Anchor.START, id, 0,
+                        saved, false, NOWHERE, "", false, g_id_salt, false, NOWHERE,
+                        0, nocols, false, DEFAULT, false)
+    return true
+
+// Close the innermost region.
+void end():
+    if g_depth <= 0: return
+    if g_stack[g_depth].scroller:
+        end_scroll()
+        return
+    Region r = g_stack[g_depth]
+    if r.overlay: leave_overlay()
+    if r.bordered:
+        Style line = (border_color(r), g_theme.surface, Attr.NONE)
+        // The caption carries weight: a panel title in the same colour and
+        // weight as the labels under it is not a title, it is the first row.
+        draw_box(r.frame_box, g_theme.frame, line, r.title,
+                 (g_theme.subtext, g_theme.surface, Attr.BOLD))
+    set_clip(r.saved_clip)
+    g_depth = g_depth - 1
+    g_stack[g_depth].seq = g_stack[g_depth].seq + 1
+
+private Color border_color(Region r):
+    if r.focus_ring: return g_theme.border_focus
+    return g_theme.border
+
+// A vertical stack. Children fill its width unless they say otherwise.
+bool column(i32 width = REST, i32 height = REST, i32 gap = 0, i32 pad = 0, string8 tag = "col"):
+    if closing(tag):
+        end()
+        return false
+    u32 cand = slot_id(tag)
+    Rect at = place_container(width, height)
+    if empty(at): return false
+    Rect inner = inset(at, pad)
+    if empty(inner): return false
+    Rect saved = push_clip(at)
+    return open_region(cand, inner, Axis.Down, gap, saved)
+
+// A horizontal run. Children take their natural width unless they say
+// otherwise, and one cell of gap, because packed text with no gap reads as one
+// word.
+bool row(i32 width = REST, i32 height = 1, i32 gap = 1, i32 pad = 0, string8 tag = "row"):
+    if closing(tag):
+        end()
+        return false
+    u32 cand = slot_id(tag)
+    Rect at = place_container(width, height)
+    if empty(at): return false
+    Rect inner = inset(at, pad)
+    if empty(inner): return false
+    Rect saved = push_clip(at)
+    return open_region(cand, inner, Axis.Right, gap, saved)
+
+// A bordered, titled column on the raised surface.
+//
+// `pad` is 2 and not 1 on purpose: the caption sits at `x + 3` (corner, dash,
+// space) and content at `x + 1 + pad`, so a pad of 1 puts the title one cell
+// right of everything under it and the panel reads crooked. Two lines them up,
+// and the extra breathing room is what a panel wants anyway.
+//
+// The border is drawn on `end` rather than on open, so a panel whose body sets
+// `focus` gets the focus ring — a frame cannot know it is focused before its
+// contents have said so, and drawing it twice to find out is worse than
+// drawing it late.
+bool panel(string8 title = "", i32 width = REST, i32 height = REST, i32 gap = 0, i32 pad = 2):
+    if closing(title):
+        end()
+        return false
+    u32 cand = slot_id(title)
+    Rect at = place_container(width, height)
+    if at.w < 3 || at.h < 2: return false
+
+    fill_rect(at, (g_theme.text, g_theme.surface, Attr.NONE))
+    Rect inner = inset(at, 1)
+    inner = (inner.x + pad, inner.y, inner.w - (pad * 2), inner.h)
+    if empty(inner): return false
+
+    Rect saved = push_clip(at)
+    if !open_region(cand, inner, Axis.Down, gap, saved): return false
+    region_bg(g_theme.surface)
+    g_stack[g_depth].bordered = true
+    g_stack[g_depth].frame_box = at
+    g_stack[g_depth].title = title
+    return true
+
+// Say what a region painted its background, so the widgets inside it draw on
+// that rather than on whatever their enclosing *panel* is.
+//
+// Without this a table row's zebra stripe and a list's selection tint are
+// painted first and then punched through by every cell that fills its own
+// background — which is exactly the artefact a cell compositor is supposed to
+// make impossible.
+void region_bg(Color c):
+    if g_depth <= 0: return
+    g_stack[g_depth].has_bg = true
+    g_stack[g_depth].bg = c
+
+// Mark the enclosing panel as focused, so its frame draws in the accent
+// colour. A widget that takes focus calls this; a program rarely does.
+void focus_frame():
+    if g_depth <= 0: return
+    g_stack[g_depth].focus_ring = true
+
+// ── fillers ────────────────────────────────────────────────────────────────
+
+// Blank cells along the main axis.
+void space(i32 n = 1):
+    _ = place(FLOW, n, n, n)
+
+// Take everything left along the main axis, so what follows an `align(END)`
+// sits against the far edge with a real gap between.
+void fill():
+    _ = place(REST, REST, 0, 0)
+
+// Promise `n` cells to something placed later, at either edge.
+//
+// This is what one-pass layout asks of you, and it is the whole of it: a
+// `REST`-sized widget takes everything the region has left *at the moment it is
+// placed*, so anything written after it finds nothing. `reserve` says how much
+// is spoken for before the flexible middle is measured — `REST` then resolves
+// against what is left over, and any later sized widget spends the promise.
+//
+//     tui.reserve(7)                        // a 6-row pane and a footer row
+//     for tui.panel(height: tui.REST): ...  // REST now stops 7 short
+//     for tui.panel(height: 6): ...         // spends 6 of the promise
+//     tui.align(tui.BOTTOM)
+//     tui.hints()                           // spends the last one
+void reserve(i32 n):
+    if g_depth < 0 || g_depth >= MAX_DEPTH: return
+    if n <= 0: return
+    g_stack[g_depth].resv = g_stack[g_depth].resv + n
+
+// A themed hairline across the region, optionally with an inset caption.
+//
+// It is drawn in `faint` and not in `border`, because a rule inside a panel
+// sits *on* the panel's surface and a line as loud as the frame around it
+// makes the panel look like two panels.
+void rule(string8 title = ""):
+    Rect at = place(FLOW, 1, 0, 1)
+    if empty(at): return
+    Style line = (g_theme.faint, g_theme.surface, Attr.NONE)
+    if #len(title) == 0:
+        draw_hline(at.x, at.y, at.w, g_theme.frame.h, line)
+        return
+    // The caption is **flush with the region's left edge**, not inset behind a
+    // leading dash. A section label that starts two cells right of the text it
+    // labels is two cells wrong, and nothing about a rule is worth that.
+    i32 w = measure(title)
+    if w + 3 > at.w:
+        draw_hline(at.x, at.y, at.w, g_theme.frame.h, line)
+        return
+    _ = draw_text(at.x, at.y, title, (g_theme.muted, g_theme.surface, Attr.NONE), w)
+    put_cell(at.x + w, at.y, 32, line, false)
+    draw_hline(at.x + w + 1, at.y, at.w - w - 1, g_theme.frame.h, line)

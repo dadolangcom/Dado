@@ -1,0 +1,542 @@
+@test
+// The text edit with no window, driven by dispatched events: typing ASCII,
+// two- and three-byte codepoints and a combining mark; Enter, Backspace and
+// Delete across line ends; the seam's motions over a wide cluster, a tab and
+// an accent; the goal column; the undo log's coalescing, caret restoring and
+// redo; read-only; the chords left to bubble; and bad handles. The document is
+// an in-memory run of owned lines behind an edit source, as a program's would
+// be.
+package ui
+
+import "app:input"
+import "app:ui/cell"
+
+// ── The document ───────────────────────────────────────────────────────────
+
+private type TLine: (ref []char8 text, i32 len)
+private type TDoc: (ref []TLine lines, i64 n)
+private type TDocPtr: ^TDoc
+
+private TDoc g_tdoc
+
+private string8 tline(^TDoc d, i64 i):
+    if i < 0 || i >= d.n || d.lines[i].text == nil || d.lines[i].len == 0:
+        return ""
+    return string8(d.lines[i].text[0..<d.lines[i].len])
+
+// Line `i` becomes `a` then `b`. Both are copied before the old bytes go, so
+// either may be a view into them.
+private void tset(^TDoc d, i64 i, string8 a, string8 b):
+    i64 n = #len(a) + #len(b)
+    i64 cap = n
+    if cap < 1:
+        cap = 1
+    ref []char8 t = #make([]char8, cap)
+    for k in 0..<#len(a):
+        t[k] = a[k]
+    for k in 0..<#len(b):
+        t[#len(a) + i64(k)] = b[k]
+    if d.lines[i].text != nil:
+        #delete(d.lines[i].text)
+    d.lines[i].text = t
+    d.lines[i].len = i32(n)
+
+// A new empty line at index `at`, the lines from there moving down one.
+private void topen(^TDoc d, i64 at):
+    if d.lines == nil:
+        d.lines = #make([]TLine, 4)
+    if d.n >= #len(d.lines):
+        _ = #resize(d.lines, #len(d.lines) * 2)
+    i64 k = d.n
+    for k > at:
+        d.lines[k] = d.lines[k - 1]
+        k = k - 1
+    d.lines[at].text = nil
+    d.lines[at].len = 0
+    d.n = d.n + 1
+
+private void tpush(string8 s):
+    topen(&g_tdoc, g_tdoc.n)
+    tset(&g_tdoc, g_tdoc.n - 1, s, "")
+
+private void tclear():
+    for i in 0..<g_tdoc.n:
+        if g_tdoc.lines[i].text != nil:
+            #delete(g_tdoc.lines[i].text)
+            g_tdoc.lines[i].text = nil
+    g_tdoc.n = 0
+
+private i64 tcount(rawptr ctx):
+    return TDocPtr(ctx).n
+
+private string8 tline_fn(rawptr ctx, i64 i):
+    return tline(TDocPtr(ctx), i)
+
+private bool tvalid(^TDoc d, cell.TextPos p):
+    if p.line < 0 || p.line >= d.n || p.byte < 0:
+        return false
+    return p.byte <= d.lines[p.line].len
+
+private cell.TextPos tinsert(rawptr ctx, cell.TextPos p, string8 text):
+    ^TDoc d = TDocPtr(ctx)
+    if !tvalid(d, p) || #len(text) == 0:
+        return p
+    // The tail after `p` is copied out first: the line is rewritten under it.
+    string8 line = tline(d, p.line)
+    i64 tn = #len(line) - i64(p.byte)
+    ref []char8 tail = #make([]char8, tn + 1)
+    for k in 0..<tn:
+        tail[k] = line[i64(p.byte) + i64(k)]
+    string8 tail_s = string8(tail[0..<tn])
+    i64 at = p.line
+    i64 start = 0
+    bool first = true
+    cell.TextPos end = p
+    for k in 0..<#len(text):
+        if text[k] == '\n':
+            string8 part = text[start..<i64(k)]
+            if first:
+                string8 whole = tline(d, at)
+                tset(d, at, whole[0..<i64(p.byte)], part)
+                first = false
+            else:
+                topen(d, at)
+                tset(d, at, part, "")
+            at = at + 1
+            start = i64(k) + 1
+    string8 last = text[start..<#len(text)]
+    if first:
+        string8 whole = tline(d, at)
+        tset(d, at, whole[0..<i64(p.byte)], last)
+        end = cell.pos(at, p.byte + i32(#len(last)))
+        string8 done = tline(d, at)
+        tset(d, at, done, tail_s)
+    else:
+        topen(d, at)
+        tset(d, at, last, tail_s)
+        end = cell.pos(at, i32(#len(last)))
+    #delete(tail)
+    return end
+
+private bool tremove(rawptr ctx, cell.TextPos from, cell.TextPos to):
+    ^TDoc d = TDocPtr(ctx)
+    if !tvalid(d, from) || !tvalid(d, to) || !cell.pos_before(from, to):
+        return false
+    string8 head = tline(d, from.line)
+    string8 a = head[0..<i64(from.byte)]
+    string8 b = tline(d, to.line)
+    tset(d, from.line, a, b[i64(to.byte)..<#len(b)])
+    i64 gone = to.line - from.line
+    if gone > 0:
+        for k in (from.line + 1)..<(to.line + 1):
+            if d.lines[k].text != nil:
+                #delete(d.lines[k].text)
+        for k in (to.line + 1)..<d.n:
+            d.lines[k - gone] = d.lines[k]
+        d.n = d.n - gone
+    return true
+
+private EditSource tsource():
+    EditSource s = (tcount, tline_fn, tinsert, tremove, rawptr(&g_tdoc))
+    return s
+
+// ── Events ─────────────────────────────────────────────────────────────────
+
+private const u32 CTRL = 0x2
+private const u32 SHIFT = 0x1
+private const u32 SUPER = 0x8
+
+private bool key(input.Keycode k):
+    input.Event e = (input.EventKind.Key, i32(k), 0.0, 0.0, 0)
+    return dispatch(e)
+
+private bool chord(i32 code, u32 mods):
+    input.Event e = (input.EventKind.Key, code, 0.0, 0.0, mods)
+    return dispatch(e)
+
+private bool typed(i32 cp):
+    input.Event e = (input.EventKind.Text, cp, 0.0, 0.0, 0)
+    return dispatch(e)
+
+private void type_ascii(string8 s):
+    for k in 0..<#len(s):
+        _ = typed(i32(u8(s[k])))
+
+// ── Observers ──────────────────────────────────────────────────────────────
+
+private i32 g_texts
+private i32 g_moves
+
+private void count_text(Control c, rawptr ctx):
+    _ = c
+    _ = ctx
+    g_texts = g_texts + 1
+
+private void count_move(Control c, rawptr ctx):
+    _ = c
+    _ = ctx
+    g_moves = g_moves + 1
+
+private Control g_ed
+private i32 g_pokes
+
+// A sibling whose paint tries every mutator of the edit: all refused.
+private void poke_edit(Control c, rawptr st, cell.CellRect r):
+    _ = c
+    _ = st
+    _ = r
+    g_pokes = g_pokes + 1
+    _ = text_edit_insert(g_ed, "during paint")
+    _ = text_edit_undo(g_ed)
+    text_edit_set_caret(g_ed, cell.pos(0, 0))
+    _ = text_edit_scroll_lines(g_ed, 3)
+
+private cell.CellPoint poke_size(Control c, rawptr st):
+    _ = c
+    _ = st
+    cell.CellPoint p = (1, 1)
+    return p
+
+private void panel_paint(Control c, rawptr st, cell.CellRect r):
+    _ = c
+    _ = st
+    _ = r
+
+private cell.CellRect g_screen_rect
+
+private i64 painted_by(Control c):
+    (i64 e, i64 lines) = text_edit_counters(c)
+    _ = e
+    return lines
+
+// Lines painted by one `update`.
+private i64 frame(Control c):
+    i64 before = painted_by(c)
+    update(g_screen_rect)
+    return painted_by(c) - before
+
+private bool at(Control c, i64 line, i32 byte, string8 what):
+    cell.TextPos p = text_edit_caret(c)
+    return #expect(p.line == line && p.byte == byte, what, ": caret ", p.line, ",", p.byte, " want ", line, ",", byte)
+
+private bool line_is(i64 i, string8 want, string8 what):
+    string8 got = tline(&g_tdoc, i)
+    return #expect(got == want, what, ": line ", i, " is '", got, "'")
+
+private bool history_is(Control c, i32 u, i32 r, string8 what):
+    (i32 hu, i32 hr) = text_edit_history(c)
+    return #expect(hu == u && hr == r, what, ": history ", hu, "/", hr, " want ", u, "/", r)
+
+i32 test():
+    bool ok = true
+
+    // ── Pure arithmetic ────────────────────────────────────────────────────
+    ok = #expect(edit_follow_top(0, 3, 5) == 0 && edit_follow_top(0, 5, 5) == 1, "follow down") && ok
+    ok = #expect(edit_follow_top(4, 2, 5) == 2 && edit_follow_top(4, 8, 0) == 4, "follow up, no rows") && ok
+    ok = #expect(edit_follow_left(0, 19, 20) == 0 && edit_follow_left(0, 20, 20) == 1, "follow right") && ok
+    ok = #expect(edit_follow_left(11, 3, 20) == 3 && edit_follow_left(7, 3, 0) == 7, "follow left, no cols") && ok
+    ok = #expect(edit_page(5) == 4 && edit_page(1) == 1 && edit_page(0) == 1, "page") && ok
+    string8 acc = "xe\xCC\x81y"
+    ok = #expect(edit_snap(acc, 2) == 1 && edit_snap(acc, 4) == 4 && edit_snap(acc, 99) == 5 && edit_snap(acc, -3) == 0, "snap back") && ok
+    ok = #expect(edit_snap_forward(acc, 2) == 4 && edit_snap_forward(acc, 1) == 1, "snap forward") && ok
+    cell.TextPos rp = edit_right(cell.pos(0, 1), acc, 2)
+    ok = #expect(rp.byte == 4, "right over the accent ", rp.byte) && ok
+    ok = #expect(edit_right(cell.pos(0, 5), acc, 2) == cell.pos(1, 0), "right off the end") && ok
+    ok = #expect(edit_right(cell.pos(1, 5), acc, 2) == cell.pos(1, 5), "right at the document end") && ok
+    ok = #expect(edit_left(cell.pos(0, 4), acc, 0) == cell.pos(0, 1), "left over the accent") && ok
+    ok = #expect(edit_left(cell.pos(3, 0), acc, 7) == cell.pos(2, 7), "left off the start") && ok
+    (cell.TextPos bf, cell.TextPos bt) = edit_back_span(cell.pos(0, 4), acc, 0)
+    ok = #expect(bf == cell.pos(0, 1) && bt == cell.pos(0, 4), "back span is the cluster") && ok
+    (cell.TextPos ff, cell.TextPos ft) = edit_forward_span(cell.pos(0, 5), acc, 2)
+    ok = #expect(ff == cell.pos(0, 5) && ft == cell.pos(1, 0), "forward span is the break") && ok
+    (cell.TextPos zf, cell.TextPos zt) = edit_back_span(cell.pos(0, 0), acc, 0)
+    ok = #expect(zf == zt, "nothing before the start") && ok
+    ok = #expect(edit_joins(true, cell.pos(0, 3), cell.pos(0, 3), "\xC3\xA9"), "joins one codepoint") && ok
+    ok = #expect(!edit_joins(true, cell.pos(0, 3), cell.pos(0, 3), "\n"), "a newline does not join") && ok
+    ok = #expect(!edit_joins(true, cell.pos(0, 3), cell.pos(0, 3), "ab"), "two do not join") && ok
+    ok = #expect(!edit_joins(true, cell.pos(0, 3), cell.pos(0, 4), "a") && !edit_joins(false, cell.pos(0, 3), cell.pos(0, 3), "a"), "elsewhere or closed") && ok
+
+    // ── Bad handles, and an edit with no source ────────────────────────────
+    ok = #expect(text_edit_caret(NIL) == cell.pos(0, 0), "NIL caret") && ok
+    ok = #expect(!text_edit_insert(NIL, "x") && !text_edit_undo(NIL) && !text_edit_redo(NIL), "NIL edits") && ok
+    ok = #expect(!text_edit_can_undo(NIL) && !text_edit_scroll_lines(NIL, 1), "NIL reads") && ok
+    text_edit_set_source(NIL, tsource())
+    text_edit_set_caret(NIL, cell.pos(1, 1))
+    text_edit_set_read_only(NIL, true)
+    Control lab = label(NIL, "not an edit")
+    ok = #expect(!text_edit_insert(lab, "x") && text_edit_left_col(lab) == 0, "a label is not an edit") && ok
+    ok = history_is(lab, 0, 0, "label history") && ok
+    remove(lab)
+
+    g_screen_rect = cell.rect(0, 0, 20, 5)
+    Control ed = text_edit(NIL)
+    text_edit_set_gutter(ed, false)
+    g_ed = ed
+    ok = #expect(valid(ed) && is_focusable(ed) && expands_h(ed) && expands_v(ed), "made") && ok
+    set_focus(ed)
+    ok = #expect(!typed(i32('a')) && !text_edit_insert(ed, "x"), "no source: nothing handled") && ok
+    update(g_screen_rect)
+
+    // ── Typing ─────────────────────────────────────────────────────────────
+    tpush("")
+    text_edit_set_source(ed, tsource())
+    on_text_changed(ed, count_text, nil)
+    on_caret_moved(ed, count_move, nil)
+    ok = #expect(frame(ed) == 1, "first paint: the one line") && ok
+    ok = #expect(frame(ed) == 0 && stats().painted == 0, "idle frame paints nothing") && ok
+
+    type_ascii("hello")
+    ok = line_is(0, "hello", "typed") && at(ed, 0, 5, "after hello") && ok
+    ok = history_is(ed, 1, 0, "hello is one record") && ok
+    ok = #expect(g_texts == 5 && g_moves == 5, "signals ", g_texts, " ", g_moves) && ok
+    ok = #expect(frame(ed) == 1, "typing repaints its line") && ok
+
+    ok = #expect(chord(i32('Z'), CTRL), "ctrl+z handled") && ok
+    ok = line_is(0, "", "undo hello") && at(ed, 0, 0, "undo hello") && history_is(ed, 0, 1, "after undo") && ok
+    ok = #expect(chord(i32('Z'), CTRL | SHIFT), "ctrl+shift+z handled") && ok
+    ok = line_is(0, "hello", "redo hello") && at(ed, 0, 5, "redo hello") && ok
+    _ = chord(i32('Z'), SUPER)
+    ok = #expect(chord(i32('Y'), CTRL), "ctrl+y handled") && ok
+    ok = line_is(0, "hello", "super+z then ctrl+y") && history_is(ed, 1, 0, "back to one") && ok
+
+    // Two- and three-byte codepoints; the seam steps over the wide one whole.
+    _ = typed(0xE9)
+    _ = typed(0x65E5)
+    ok = line_is(0, "hello\xC3\xA9\xE6\x97\xA5", "e-acute, nichi") && at(ed, 0, 10, "after nichi") && ok
+    ok = history_is(ed, 2, 0, "redo closed the record; the two codepoints are one") && ok
+    _ = key(input.Keycode.Left)
+    ok = at(ed, 0, 7, "left over nichi") && ok
+    _ = key(input.Keycode.Left)
+    ok = at(ed, 0, 5, "left over e-acute") && ok
+    _ = key(input.Keycode.Right)
+    _ = key(input.Keycode.Right)
+    ok = at(ed, 0, 10, "right twice") && ok
+    ok = #expect(i32(cell.visual_of(tline(&g_tdoc, 0), cell.LogicalOffset(10))) == 8, "nichi is two columns") && ok
+
+    // ── Enter, a combining mark, Backspace, undo restoring the caret ───────
+    ok = #expect(key(input.Keycode.Enter), "enter handled") && ok
+    ok = line_is(1, "", "enter opens a line") && at(ed, 1, 0, "enter") && ok
+    ok = history_is(ed, 3, 0, "enter is its own record") && ok
+    _ = typed(i32('e'))
+    _ = typed(0x301)
+    ok = line_is(1, "e\xCC\x81", "e + combining acute") && at(ed, 1, 3, "after the mark") && ok
+    ok = history_is(ed, 4, 0, "e and its mark are one record") && ok
+    _ = key(input.Keycode.Left)
+    ok = at(ed, 1, 0, "left over e+mark is one step") && ok
+    _ = key(input.Keycode.Right)
+    ok = at(ed, 1, 3, "right over e+mark") && ok
+    _ = key(input.Keycode.Backspace)
+    ok = line_is(1, "", "backspace takes the base and its mark") && at(ed, 1, 0, "backspace") && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(1, "e\xCC\x81", "undo backspace: text") && at(ed, 1, 3, "undo backspace: caret") && ok
+
+    // Enter splits a line; Backspace at column 0 joins; Delete at the end
+    // joins; each undoes whole with its caret.
+    text_edit_set_caret(ed, cell.pos(0, 5))
+    _ = key(input.Keycode.Enter)
+    ok = line_is(0, "hello", "split head") && line_is(1, "\xC3\xA9\xE6\x97\xA5", "split tail") && at(ed, 1, 0, "split") && ok
+    ok = #expect(g_tdoc.n == 3, "three lines ", g_tdoc.n) && ok
+    _ = key(input.Keycode.Backspace)
+    ok = line_is(0, "hello\xC3\xA9\xE6\x97\xA5", "backspace joins") && at(ed, 0, 5, "join caret") && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(1, "\xC3\xA9\xE6\x97\xA5", "undo join") && at(ed, 1, 0, "undo join caret") && ok
+    _ = key(input.Keycode.Up)
+    _ = key(input.Keycode.End)
+    ok = at(ed, 0, 5, "end of hello") && ok
+    _ = key(input.Keycode.Delete)
+    ok = line_is(0, "hello\xC3\xA9\xE6\x97\xA5", "delete joins") && at(ed, 0, 5, "delete keeps the caret") && ok
+    ok = #expect(g_tdoc.n == 2, "two lines ", g_tdoc.n) && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = #expect(g_tdoc.n == 3, "undo delete: three lines") && at(ed, 0, 5, "undo delete caret") && ok
+    // Delete removes the whole cluster after the caret.
+    text_edit_set_caret(ed, cell.pos(2, 0))
+    _ = key(input.Keycode.Delete)
+    ok = line_is(2, "", "delete takes e and its mark") && ok
+    _ = chord(i32('Z'), CTRL)
+
+    // A new edit clears redo; a motion closes the open record.
+    (i32 u0, i32 r0) = text_edit_history(ed)
+    _ = chord(i32('Z'), CTRL)
+    ok = history_is(ed, u0 - 1, r0 + 1, "one more to redo") && ok
+    _ = typed(i32('q'))
+    ok = history_is(ed, u0, 0, "typing cleared redo") && ok
+    _ = typed(i32('r'))
+    _ = key(input.Keycode.Left)
+    _ = key(input.Keycode.Right)
+    _ = typed(i32('s'))
+    ok = history_is(ed, u0 + 1, 0, "a motion closed the record") && ok
+
+    // ── Motions: a tab, the goal column, Home/End, document ends ──────────
+    tclear()
+    tpush("a\tb")
+    tpush("abcdefgh")
+    tpush("ab")
+    tpush("abcdefgh")
+    tpush("\xE6\x97\xA5\xE6\x97\xA5\xE6\x97\xA5x")
+    text_edit_set_source(ed, tsource())
+    ok = history_is(ed, 0, 0, "a new source empties the log") && at(ed, 0, 0, "a new source") && ok
+    _ = key(input.Keycode.Right)
+    _ = key(input.Keycode.Right)
+    ok = at(ed, 0, 2, "right over the tab") && ok
+    ok = #expect(i32(cell.visual_of(tline(&g_tdoc, 0), cell.LogicalOffset(2))) == cell.TAB_COLUMNS, "b at the tab stop") && ok
+    _ = key(input.Keycode.Left)
+    ok = at(ed, 0, 1, "left onto the tab") && ok
+    text_edit_set_caret(ed, cell.pos(1, 6))
+    _ = key(input.Keycode.Down)
+    ok = at(ed, 2, 2, "down onto a short line") && ok
+    _ = key(input.Keycode.Down)
+    ok = at(ed, 3, 6, "down restores the goal") && ok
+    _ = key(input.Keycode.Down)
+    ok = at(ed, 4, 9, "goal column 6 on a line of wide clusters is the x") && ok
+    _ = key(input.Keycode.Up)
+    ok = at(ed, 3, 6, "up keeps the goal") && ok
+    _ = key(input.Keycode.Up)
+    ok = at(ed, 2, 2, "up through the short line") && ok
+    _ = key(input.Keycode.Up)
+    ok = at(ed, 1, 6, "up restores the goal") && ok
+    text_edit_set_caret(ed, cell.pos(3, 3))
+    _ = key(input.Keycode.Down)
+    ok = at(ed, 4, 3, "column 3 is the right half of the second wide: its start") && ok
+    _ = key(input.Keycode.Home)
+    ok = at(ed, 4, 0, "home") && ok
+    _ = key(input.Keycode.Down)
+    ok = at(ed, 4, 10, "down from the last line goes to its end") && ok
+    _ = key(input.Keycode.End)
+    ok = at(ed, 4, 10, "end") && ok
+    _ = chord(i32(input.Keycode.Home), CTRL)
+    ok = at(ed, 0, 0, "ctrl+home") && ok
+    _ = key(input.Keycode.Up)
+    ok = at(ed, 0, 0, "up from the first line") && ok
+    _ = key(input.Keycode.Left)
+    ok = at(ed, 0, 0, "left at the document start") && ok
+    _ = chord(i32(input.Keycode.End), SUPER)
+    ok = at(ed, 4, 10, "super+end") && ok
+    _ = key(input.Keycode.Right)
+    ok = at(ed, 4, 10, "right at the document end") && ok
+    text_edit_set_caret(ed, cell.pos(1, 8))
+    _ = key(input.Keycode.Right)
+    ok = at(ed, 2, 0, "right across a line end") && ok
+    _ = key(input.Keycode.Left)
+    ok = at(ed, 1, 8, "left across a line end") && ok
+    text_edit_set_caret(ed, cell.pos(4, 4))
+    ok = at(ed, 4, 3, "set_caret inside a cluster snaps to its start") && ok
+    text_edit_set_caret(ed, cell.pos(99, 99))
+    ok = at(ed, 4, 10, "set_caret past the end clamps") && ok
+
+    // ── Repaint granularity and scrolling, in a 20 x 5 view ────────────────
+    tclear()
+    for i in 0..<20:
+        tpush("line")
+    tpush("0123456789abcdefghijklmnopqrstuvwxyz")
+    text_edit_set_source(ed, tsource())
+    ok = #expect(frame(ed) == 5, "a new source repaints the view") && ok
+    _ = key(input.Keycode.Down)
+    ok = #expect(frame(ed) == 2, "a caret step repaints two lines") && ok
+    _ = typed(i32('!'))
+    ok = #expect(frame(ed) == 1, "a keystroke repaints one line") && ok
+    _ = key(input.Keycode.Enter)
+    ok = #expect(frame(ed) == 4, "enter repaints from its line down") && ok
+    (i64 t0, i64 o0) = text_edit_position(ed)
+    ok = #expect(t0 == 0 && o0 == 0, "no scroll yet") && ok
+    _ = key(input.Keycode.PageDown)
+    (i64 t1, i64 _) = text_edit_position(ed)
+    ok = at(ed, 6, 0, "page down moves rows-1") && ok
+    ok = #expect(t1 == 4, "page down scrolls with it: top ", t1) && ok
+    ok = #expect(frame(ed) == 5, "a scroll repaints the view") && ok
+    text_edit_set_caret(ed, cell.pos(8, 0))
+    _ = frame(ed)
+    _ = key(input.Keycode.Down)
+    (i64 t2, i64 _) = text_edit_position(ed)
+    ok = #expect(t2 == 5, "down off the bottom scrolls one: top ", t2) && ok
+    ok = #expect(text_edit_scroll_lines(ed, -3), "scroll lines") && at(ed, 9, 0, "scrolling leaves the caret") && ok
+    input.Event wheel = (input.EventKind.Mouse, 1, 0.0, 0.0, input.MOUSE_WHEEL)
+    ok = #expect(dispatch(wheel), "wheel handled") && at(ed, 9, 0, "the wheel leaves the caret") && ok
+    (i64 t3, i64 _) = text_edit_position(ed)
+    ok = #expect(t3 == 2 + i64(WHEEL_LINES), "wheel scrolls: top ", t3) && ok
+    _ = chord(i32(input.Keycode.End), CTRL)
+    _ = key(input.Keycode.End)
+    ok = at(ed, 21, 36, "ctrl+end") && ok
+    ok = #expect(text_edit_left_col(ed) == 36 - 20 + 1, "end scrolls right: left ", text_edit_left_col(ed)) && ok
+    ok = #expect(frame(ed) == 5, "a horizontal scroll repaints the view") && ok
+    _ = key(input.Keycode.Home)
+    ok = #expect(text_edit_left_col(ed) == 0, "home scrolls back") && ok
+    _ = frame(ed)
+    ok = #expect(frame(ed) == 0, "idle again") && ok
+    // Hidden and shown again, the edit gets back the rectangle it last painted;
+    // only its measure hook having run tells it the cells are not its own.
+    set_visible(ed, false)
+    ok = #expect(frame(ed) == 0, "hidden paints nothing") && ok
+    set_visible(ed, true)
+    ok = #expect(frame(ed) == 5, "shown again repaints the view") && ok
+
+    // ── Read-only ──────────────────────────────────────────────────────────
+    text_edit_set_read_only(ed, true)
+    i32 texts = g_texts
+    ok = #expect(typed(i32('x')), "read-only still takes the key") && ok
+    _ = key(input.Keycode.Backspace)
+    _ = key(input.Keycode.Enter)
+    ok = #expect(!text_edit_insert(ed, "x") && !text_edit_undo(ed) && !text_edit_can_undo(ed), "read-only refuses") && ok
+    ok = #expect(g_texts == texts && g_tdoc.n == 22, "read-only: document unchanged") && ok
+    _ = key(input.Keycode.Right)
+    ok = at(ed, 21, 1, "read-only still moves the caret") && ok
+    text_edit_set_read_only(ed, false)
+
+    // ── Chords left to bubble ──────────────────────────────────────────────
+    ok = #expect(!chord(i32('S'), CTRL) && !chord(i32('Q'), CTRL), "ctrl+s, ctrl+q bubble") && ok
+    ok = #expect(!chord(i32('S'), SUPER) && !chord(i32('Q'), SUPER), "super+s, super+q bubble") && ok
+    input.Event cs = (input.EventKind.Text, i32('s'), 0.0, 0.0, CTRL)
+    ok = #expect(!dispatch(cs) && line_is(21, "0123456789abcdefghijklmnopqrstuvwxyz", "ctrl text types nothing"), "ctrl text bubbles") && ok
+    input.Event up = (input.EventKind.Key, i32(input.Keycode.Left), 0.0, 0.0, input.KEY_UP)
+    ok = #expect(!dispatch(up), "a release bubbles") && ok
+    ok = #expect(!key(input.Keycode.Escape), "escape bubbles") && ok
+
+    // ── A setter during update is refused ──────────────────────────────────
+    Hooks h
+    h.measure = poke_size
+    h.arrange = nil
+    h.paint = poke_edit
+    h.input = nil
+    h.free = nil
+    (i64 e0, i64 p0) = text_edit_counters(ed)
+    _ = p0
+    cell.TextPos c0 = text_edit_caret(ed)
+    Control pk = create(register_kind("edit_poker", h), NIL, nil)
+    update(g_screen_rect)
+    (i64 e1, i64 p1) = text_edit_counters(ed)
+    _ = p1
+    ok = #expect(g_pokes == 1 && e1 == e0 && text_edit_caret(ed) == c0, "refused during paint") && ok
+    ok = #expect(!is_paint_dirty(ed), "nothing left dirty") && ok
+    remove(pk)
+
+    // Under a parent that paints, a keystroke still repaints one line; when
+    // the parent is marked and repaints, it forces the edit (`paint_forced`)
+    // and the whole view repaints. So does a new screen, whose root repaints
+    // and forces everything under it.
+    remove(ed)
+    h.measure = nil
+    h.paint = panel_paint
+    Control panel = create(register_kind("edit_panel", h), NIL, nil)
+    set_expand(panel, true, true)
+    Control inner = text_edit(panel)
+    text_edit_set_source(inner, tsource())
+    set_focus(inner)
+    _ = frame(inner)
+    _ = typed(i32('z'))
+    ok = #expect(frame(inner) == 1, "under a painting parent a keystroke repaints one line") && ok
+    ok = line_is(0, "zline", "typed under the panel") && ok
+    mark_paint(panel)
+    ok = #expect(frame(inner) == 5, "a repainting parent forces the whole view") && ok
+    _ = typed(i32('y'))
+    mark_paint(panel)
+    ok = #expect(frame(inner) == 5, "forced with damage pending: still the whole view") && ok
+    ok = #expect(frame(inner) == 0, "idle under the panel") && ok
+    g_screen_rect = cell.rect(0, 0, 24, 5)
+    ok = #expect(frame(inner) == 5, "a new screen repaints the view") && ok
+
+    reset()
+    tclear()
+    if g_tdoc.lines != nil:
+        #delete(g_tdoc.lines)
+    ok = #expect(!valid(ed), "gone with the tree") && ok
+    if ok: return 0
+    return 1

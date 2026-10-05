@@ -1,0 +1,834 @@
+// core:os/proc — the Windows half: starting a child with `CreateProcessW`,
+// the pipes to it, waiting for it, and ending it with everything it started.
+//
+// Every public function in this package has a `when #OS == #WINDOWS` arm in
+// its own file, and each arm is written over the private functions here. The
+// surface is the POSIX one, field for field; what differs underneath is said
+// once, here, and where a caller can see it, on the function.
+//
+// **An argv becomes one command line, quoted by Windows' own rule.** A Windows
+// program is handed a single string and splits it itself, and the C runtime
+// and `CommandLineToArgvW` split it the same way: whitespace separates,
+// `"` groups, and a run of backslashes is literal unless a `"` follows it, when
+// each pair is one backslash and an odd one out escapes the quote. `quote_arg`
+// is that rule run backwards, so any argument — empty, holding spaces, quotes
+// or a trailing backslash — arrives as itself. The program name is the
+// exception the parsers make too: it is read up to the next quote with no
+// escapes, so it is quoted when it holds a space or a tab and is refused when
+// it holds a `"`, which no Windows file name can.
+//
+// **Text is UTF-8 in Dado and UTF-16 at the call.** The command line is built
+// as UTF-8 — every byte the quoting rule looks at is ASCII, and UTF-8 never
+// puts an ASCII byte inside a multi-byte character — and converted once with
+// `MultiByteToWideChar(CP_UTF8, …)`. The environment is the parent's, passed
+// as `NULL`, so there is nothing of it to convert. **Unlike the POSIX arm this
+// allocates**: the command line is built on `#heap` and freed before the call
+// that built it returns, because Windows' limit on one is 32,767 UTF-16 units
+// and a frame that size is the wrong thing to put on every caller's stack.
+//
+// **Only the child's three standard handles are inherited.** Every handle
+// this package makes is made non-inheritable; just before `CreateProcessW` the
+// three the child is to have are duplicated as inheritable copies, listed in a
+// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` on a `STARTUPINFOEXW`, and closed again
+// straight after. The list is what makes it exact: without it a child inherits
+// every inheritable handle in the process, including a second child's pipe
+// ends, and never sees end-of-file on its stdin while the second one lives.
+//
+// **The program is looked up by `CreateProcessW`'s own search**: the
+// directory the parent was started from, then the current directory, then the
+// system directories, then `PATH`, with `.exe` appended to a name with no
+// extension. That is Windows' rule and not a shell's, and it is stated because
+// the current directory comes second.
+//
+// **A child and everything it starts are one job.** Each child is created
+// suspended, assigned to a job object of its own, and only then resumed, so
+// nothing it starts can escape the job before it is in it. Ending a child is
+// `TerminateJobObject`, which ends the tree. Where the job cannot be made or
+// joined, ending falls back to `TerminateProcess` on the child alone.
+//
+// **Windows has no signals**, so the POSIX encodings are kept by what this
+// package knows: a child this package ended reads `(false, -9)`, as one killed
+// by `SIGKILL` does, and every other ending is `(true, code)` with the whole
+// 32-bit exit code — so a crash such as `0xC0000005` arrives as a negative
+// status with `exited` true, which no POSIX status can be.
+//
+// **Errors are `GetLastError` codes** where POSIX gives an `errno`.
+// `ERROR_FILE_NOT_FOUND` is 2, as `ENOENT` is, so a missing program reads the
+// same number on both.
+//
+// **The children this package started are in a table** of `CHILD_SLOTS`
+// entries, keyed by process id, because the public records carry an `i32` pid
+// and Windows waits on a handle. The handle is held until the child is reaped,
+// so the id cannot be reused while its entry stands. The table is not locked:
+// starting and reaping children from two threads at once is not supported.
+package proc
+
+import "core:io"
+import "core:time"
+
+when #OS == #WINDOWS:
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        type SECURITY_ATTRIBUTES: (#c.ulong nLength, rawptr lpSecurityDescriptor, #c.int bInheritHandle)
+        type @incomplete @c("struct _PROC_THREAD_ATTRIBUTE_LIST") ProcThreadAttributeList
+        type STARTUPINFOW:
+            #c.ulong cb,
+            ^u16 lpReserved,
+            ^u16 lpDesktop,
+            ^u16 lpTitle,
+            #c.ulong dwX,
+            #c.ulong dwY,
+            #c.ulong dwXSize,
+            #c.ulong dwYSize,
+            #c.ulong dwXCountChars,
+            #c.ulong dwYCountChars,
+            #c.ulong dwFillAttribute,
+            #c.ulong dwFlags,
+            #c.ushort wShowWindow,
+            #c.ushort cbReserved2,
+            ^#c.uchar lpReserved2,
+            rawptr hStdInput,
+            rawptr hStdOutput,
+            rawptr hStdError,
+        type STARTUPINFOEXW: (STARTUPINFOW StartupInfo, ^ProcThreadAttributeList lpAttributeList)
+        type PROCESS_INFORMATION: (rawptr hProcess, rawptr hThread, #c.ulong dwProcessId, #c.ulong dwThreadId)
+        // `OVERLAPPED`'s third member is an anonymous union of an offset pair
+        // and a pointer, both eight bytes; it is restated by the pointer,
+        // which C11 reaches by name through the union.
+        // `HANDLE` by its own name, for the one signature that takes an array
+        // of them, `const HANDLE *`; everywhere else a handle is a `rawptr`.
+        type HANDLE
+        type OVERLAPPED: (#c.ullong Internal, #c.ullong InternalHigh, rawptr Pointer, rawptr hEvent)
+
+        const rawptr INVALID_HANDLE_VALUE
+        const #c.ulong STD_INPUT_HANDLE
+        const #c.ulong STD_OUTPUT_HANDLE
+        const #c.ulong STD_ERROR_HANDLE
+        const #c.ulong INFINITE
+        const #c.ulong WAIT_OBJECT_0
+        const #c.ulong CREATE_SUSPENDED
+        const #c.ulong EXTENDED_STARTUPINFO_PRESENT
+        const #c.ulong STARTF_USESTDHANDLES
+        const #c.ulong DUPLICATE_SAME_ACCESS
+        const #c.ulong STILL_ACTIVE
+        const #c.ulong PIPE_ACCESS_OUTBOUND
+        const #c.ulong FILE_FLAG_OVERLAPPED
+        const #c.ulong FILE_FLAG_FIRST_PIPE_INSTANCE
+        const #c.ulong PIPE_TYPE_BYTE
+        const #c.ulong PIPE_READMODE_BYTE
+        const #c.ulong PIPE_WAIT
+        const #c.ulong PIPE_REJECT_REMOTE_CLIENTS
+        const #c.ulong GENERIC_READ
+        const #c.ulong GENERIC_WRITE
+        const #c.ulong FILE_SHARE_READ
+        const #c.ulong FILE_SHARE_WRITE
+        const #c.ulong OPEN_EXISTING
+        const #c.uint CP_UTF8
+
+        rawptr GetStdHandle(#c.ulong which)
+        rawptr GetCurrentProcess()
+        #c.ulong GetCurrentProcessId()
+        #c.ulong GetLastError()
+        #c.int CloseHandle(rawptr handle)
+        #c.int DuplicateHandle(rawptr from_process, rawptr from, rawptr to_process, ^rawptr to, #c.ulong access, #c.int inherit, #c.ulong options)
+        #c.int CreatePipe(^rawptr read_end, ^rawptr write_end, ^SECURITY_ATTRIBUTES attributes, #c.ulong size)
+        rawptr CreateNamedPipeW(^const u16 name, #c.ulong open_mode, #c.ulong pipe_mode, #c.ulong instances, #c.ulong out_size, #c.ulong in_size, #c.ulong timeout, ^SECURITY_ATTRIBUTES attributes)
+        rawptr CreateFileW(^const u16 name, #c.ulong access, #c.ulong share, ^SECURITY_ATTRIBUTES attributes, #c.ulong disposition, #c.ulong flags, rawptr template)
+        rawptr CreateEventW(^SECURITY_ATTRIBUTES attributes, #c.int manual, #c.int initial, ^const u16 name)
+        #c.int InitializeProcThreadAttributeList(^ProcThreadAttributeList list, #c.ulong count, #c.ulong flags, ^#c.size_t size)
+        #c.int UpdateProcThreadAttribute(^ProcThreadAttributeList list, #c.ulong flags, #c.ullong attribute, rawptr value, #c.size_t size, rawptr previous, ^#c.size_t returned)
+        void DeleteProcThreadAttributeList(^ProcThreadAttributeList list)
+        #c.int CreateProcessW(^const u16 application, ^u16 command_line, ^SECURITY_ATTRIBUTES process, ^SECURITY_ATTRIBUTES thread, #c.int inherit, #c.ulong flags, rawptr environment, ^const u16 directory, ^STARTUPINFOW startup, ^PROCESS_INFORMATION info)
+        #c.ulong ResumeThread(rawptr thread)
+        rawptr CreateJobObjectW(^SECURITY_ATTRIBUTES attributes, ^const u16 name)
+        #c.int AssignProcessToJobObject(rawptr job, rawptr process)
+        #c.int TerminateJobObject(rawptr job, #c.uint code)
+        #c.int TerminateProcess(rawptr process, #c.uint code)
+        #c.ulong WaitForSingleObject(rawptr handle, #c.ulong milliseconds)
+        #c.ulong WaitForMultipleObjects(#c.ulong count, ^const HANDLE handles, #c.int all, #c.ulong milliseconds)
+        #c.int GetExitCodeProcess(rawptr process, ^#c.ulong code)
+        #c.int PeekNamedPipe(rawptr pipe, rawptr buffer, #c.ulong size, ^#c.ulong read, ^#c.ulong available, ^#c.ulong left)
+        #c.int ReadFile(rawptr file, rawptr buffer, #c.ulong count, ^#c.ulong read, ^OVERLAPPED overlapped)
+        #c.int WriteFile(rawptr file, const rawptr buffer, #c.ulong count, ^#c.ulong written, ^OVERLAPPED overlapped)
+        #c.int CancelIoEx(rawptr file, ^OVERLAPPED overlapped)
+        #c.int GetOverlappedResult(rawptr file, ^OVERLAPPED overlapped, ^#c.ulong transferred, #c.int wait)
+        #c.int MultiByteToWideChar(#c.uint code_page, #c.ulong flags, cstring from, #c.int from_count, ^u16 into, #c.int into_count)
+        #c.ulong GetEnvironmentVariableW(^const u16 name, ^u16 into, #c.ulong size)
+        void Sleep(#c.ulong milliseconds)
+
+    // `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` is a macro over an enumerator, so
+    // its C type is `int` and not the `DWORD_PTR` the call takes; it is bound
+    // at its own type and widened at the call.
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        const #c.int PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+
+    // The error codes this package reads by name. `winerror.h` writes each as
+    // a `long` literal (`109L`).
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        const #c.long ERROR_FILE_NOT_FOUND
+        const #c.long ERROR_PATH_NOT_FOUND
+        const #c.long ERROR_BROKEN_PIPE
+        const #c.long ERROR_NO_DATA
+        const #c.long ERROR_IO_PENDING
+        const #c.long ERROR_INVALID_PARAMETER
+        const #c.long ERROR_TOO_MANY_OPEN_FILES
+        const #c.long WAIT_TIMEOUT
+
+    // The C runtime's side of a handle: a descriptor over it, and a `FILE`
+    // over the descriptor, so a pipe can be a `^io.FILE` as on POSIX.
+    private foreign "stdio.h":
+        ^io.FILE _fdopen(i32 fd, cstring mode)
+        i32 _fileno(^io.FILE stream)
+
+    private foreign "io.h":
+        #c.intptr_t _get_osfhandle(i32 fd)
+        i32 _open_osfhandle(#c.intptr_t handle, i32 flags)
+        i32 _close(i32 fd)
+
+    // The C runtime's open flags, which live in its `<fcntl.h>` — a header a
+    // `foreign` block names only at the price of being read as POSIX — so the
+    // values are restated. They are the runtime's ABI: `_O_RDONLY` 0,
+    // `_O_WRONLY` 1, `_O_BINARY` 0x8000.
+    private const i32 CRT_READ = 0x8000
+    private const i32 CRT_WRITE = 0x8001
+
+    // The exit code `TerminateJobObject` leaves on a child this package ended:
+    // 128 + 9, the status a shell reports for a `SIGKILL`.
+    private const #c.uint KILLED_CODE = 137
+
+    // The most children alive at once, started and not yet reaped.
+    private const i32 CHILD_SLOTS = 128
+
+    // The buffer each pipe asks for. A request, which the system may round.
+    private const #c.ulong PIPE_BYTES = 65536
+
+    // The bytes `InitializeProcThreadAttributeList` may ask for, as eight-byte
+    // words so the buffer is pointer-aligned. One attribute needs about fifty.
+    private const i32 ATTRIBUTE_WORDS = 32
+
+    // One child: its id, the handle it is waited on by, its job (nil when it
+    // has none), the stream `read`/`write` handed out for it (nil for the
+    // argv forms), and whether this package ended it. A `duplex` child also
+    // has the write in flight to its stdin (`send_staged`): the bytes, the
+    // `OVERLAPPED` and event it is tracked by, whether it is still pending,
+    // and the stdin descriptor whose close waits for it.
+    private type Slot:
+        i32         pid,
+        rawptr      process,
+        rawptr      job,
+        ^io.FILE    stream,
+        bool        killed,
+        ref []char8 stage,
+        OVERLAPPED  ov,
+        rawptr      event,
+        bool        writing,
+        bool        closing,
+        i32         closing_fd,
+
+    private [CHILD_SLOTS]Slot g_slots
+
+    // Named so the conversions to them are not read as function types.
+    private type AttributeListAt: ^ProcThreadAttributeList
+    private type HandleArray: ^const HANDLE
+
+    // Names the stdin pipes of `duplex` children apart: the process id and a
+    // count, so two children of one parent never ask for the same name.
+    private i64 g_pipe_count
+
+    // ── text ────────────────────────────────────────────────────────────────
+
+    // `count` bytes of UTF-8 at `text` (or up to its `\0` when `count` is
+    // -1), as UTF-16 with a terminating zero. Empty when it could not be
+    // converted, which a caller tests with `#len`.
+    private ref []u16 widen_bytes(cstring text, #c.int count):
+        if text == nil: return #make([]u16, 0, #heap)
+        #c.int units = MultiByteToWideChar(CP_UTF8, 0, text, count, nil, 0)
+        if units <= 0 && count != 0: return #make([]u16, 0, #heap)
+        // A counted conversion has no terminator in its answer; room is made.
+        i64 room = i64(units)
+        if count >= 0: room = room + 1
+        ref []u16 wide = #make([]u16, room, #heap)
+        if #len(wide) != room: return wide
+        if units > 0:
+            #c.int wrote = MultiByteToWideChar(CP_UTF8, 0, text, count, &wide[0], units)
+            if wrote != units:
+                #delete(wide)
+                return #make([]u16, 0, #heap)
+        return wide
+
+    private ref []u16 widen(cstring text):
+        return widen_bytes(text, 0 - 1)
+
+    // Whether a byte ends an unquoted argument for the runtime's parser.
+    private bool splits(char8 c):
+        return c == ' ' || c == '\t' || c == '\n' || c == char8(11)
+
+    // `arg` appended to `line` as the runtime will read it back: bare when it
+    // is non-empty and holds nothing that splits or groups, and otherwise
+    // quoted, with each backslash run doubled where a quote follows it — the
+    // closing quote included — and each `"` escaped.
+    private bool quote_arg(^ref []char8 line, cstring arg):
+        string8 s = string8(arg)
+        i64 n = #len(s)
+        bool bare = n > 0
+        for i in 0..<n:
+            if splits(s[i]) || s[i] == '"': bare = false
+        if bare:
+            for i in 0..<n:
+                if !#append(line^, s[i]): return false
+            return true
+        if !#append(line^, '"'): return false
+        i64 slashes = 0
+        for i in 0..<n:
+            char8 c = s[i]
+            if c == '\\':
+                slashes += 1
+                continue
+            if c == '"':
+                // Each backslash before a quote doubled, then one for the quote.
+                for k in 0..<(slashes * 2 + 1):
+                    if !#append(line^, '\\'): return false
+            else:
+                for k in 0..<slashes:
+                    if !#append(line^, '\\'): return false
+            slashes = 0
+            if !#append(line^, c): return false
+        // A run before the closing quote is doubled, or it would escape it.
+        for k in 0..<(slashes * 2):
+            if !#append(line^, '\\'): return false
+        return #append(line^, '"')
+
+    // The program name as the parsers read it: up to the next quote, with no
+    // escapes. Quoted when it holds a space or a tab; false for one holding a
+    // `"`, which cannot be said and is no Windows file name.
+    private bool quote_program(^ref []char8 line, cstring program):
+        string8 s = string8(program)
+        i64 n = #len(s)
+        bool quoted = n == 0
+        for i in 0..<n:
+            if s[i] == '"': return false
+            if splits(s[i]): quoted = true
+        if quoted && !#append(line^, '"'): return false
+        for i in 0..<n:
+            if !#append(line^, s[i]): return false
+        if quoted && !#append(line^, '"'): return false
+        return true
+
+    // The UTF-8 command line `argv` quotes to: the program, then each
+    // argument after a space. Empty when the program name holds a `"`.
+    // Visible to the package so `windows_test` can hold the rule.
+    ref []char8 command_line_utf8([]cstring argv):
+        ref []char8 line = #make([]char8, 0, #heap)
+        if #len(argv) < 1: return line
+        bool ok = quote_program(&line, argv[0])
+        for i in 1..<#len(argv):
+            if !ok: break
+            ok = #append(line, ' ') && quote_arg(&line, argv[i])
+        if !ok: #truncate(line, 0)
+        return line
+
+    // The same line in UTF-16 with its terminator, ready for
+    // `CreateProcessW`. Empty when it could not be built.
+    private ref []u16 command_line([]cstring argv):
+        ref []char8 line = command_line_utf8(argv)
+        if #len(line) == 0:
+            #delete(line)
+            return #make([]u16, 0, #heap)
+        ref []u16 wide = widen_bytes(cstring(rawptr(&line[0])), #c.int(#len(line)))
+        #delete(line)
+        return wide
+
+    // `cmd.exe /d /s /c "<command>"`: the line a shell form runs. `/d` skips
+    // the AutoRun commands a user may have registered; `/s` makes the quote
+    // rule fixed — the first and the last `"` on the line are removed and
+    // everything between is the command, as written — so the command is never
+    // re-quoted or escaped here. It is a `cmd.exe` line, not a `/bin/sh` one.
+    private ref []u16 shell_line(cstring command):
+        ref []char8 line = #make([]char8, 0, #heap)
+        string8 head = "cmd.exe /d /s /c \""
+        bool ok = true
+        for c in head:
+            ok = ok && #append(line, c)
+        string8 s = string8(command)
+        for c in s:
+            ok = ok && #append(line, c)
+        ok = ok && #append(line, '"')
+        ref []u16 wide = #make([]u16, 0, #heap)
+        if ok:
+            #delete(wide)
+            wide = widen_bytes(cstring(rawptr(&line[0])), #c.int(#len(line)))
+        #delete(line)
+        return wide
+
+    // The command interpreter, from `ComSpec` as `system` reads it. Empty when
+    // it is unset, and `CreateProcessW` then searches for the `cmd.exe` the
+    // line starts with.
+    private ref []u16 interpreter():
+        ref []u16 name = widen("ComSpec")
+        ref []u16 path = #make([]u16, 0, #heap)
+        if #len(name) > 0:
+            #c.ulong need = GetEnvironmentVariableW(&name[0], nil, 0)
+            if need > 0:
+                #delete(path)
+                path = #make([]u16, i64(need), #heap)
+                if #len(path) == i64(need):
+                    #c.ulong got = GetEnvironmentVariableW(&name[0], &path[0], need)
+                    if got == 0 || got >= need: #truncate(path, 0)
+        #delete(name)
+        return path
+
+    // ── handles ─────────────────────────────────────────────────────────────
+
+    // This process's standard handle, or nil when it has none.
+    private rawptr std_handle(#c.ulong which):
+        rawptr h = GetStdHandle(which)
+        if h == INVALID_HANDLE_VALUE: return nil
+        return h
+
+    private void close_handle(rawptr h):
+        if h != nil && h != INVALID_HANDLE_VALUE: _ = CloseHandle(h)
+
+    // An inheritable copy of `h`, for one `CreateProcessW`; nil for nil.
+    private rawptr inheritable(rawptr h):
+        if h == nil: return nil
+        rawptr copy = nil
+        rawptr self = GetCurrentProcess()
+        if DuplicateHandle(self, h, self, &copy, 0, 1, DUPLICATE_SAME_ACCESS) == 0: return nil
+        return copy
+
+    // An anonymous pipe, both ends non-inheritable. `(nil, nil, why)` when it
+    // could not be made.
+    private (rawptr read_end, rawptr write_end, i32 why) anonymous_pipe():
+        rawptr r = nil
+        rawptr w = nil
+        if CreatePipe(&r, &w, nil, PIPE_BYTES) == 0: return (nil, nil, i32(GetLastError()))
+        return (r, w, 0)
+
+    // The pipe a `duplex` child reads its stdin from. Anonymous pipes cannot
+    // be overlapped, and the parent's end has to be, so that a write can be
+    // waited for with a timeout (`send_staged`): this is a named pipe of one
+    // instance, outbound and overlapped on the parent's side, opened by name
+    // for the child's. `FILE_FLAG_FIRST_PIPE_INSTANCE` refuses a name somebody
+    // else already made, and `PIPE_REJECT_REMOTE_CLIENTS` refuses the network.
+    private (rawptr parent_end, rawptr child_end, i32 why) outbound_pipe():
+        g_pipe_count += 1
+        ref []char8 name = #format("\\\\.\\pipe\\dado-proc-", i64(GetCurrentProcessId()), "-", g_pipe_count, char8(0), #heap)
+        ref []u16 wide = widen(cstring(rawptr(&name[0])))
+        #delete(name)
+        if #len(wide) == 0: return (nil, nil, i32(ERROR_INVALID_PARAMETER))
+        rawptr parent = CreateNamedPipeW(&wide[0], PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, PIPE_BYTES, PIPE_BYTES, 0, nil)
+        if parent == INVALID_HANDLE_VALUE:
+            #delete(wide)
+            return (nil, nil, i32(GetLastError()))
+        rawptr child = CreateFileW(&wide[0], GENERIC_READ, 0, nil, OPEN_EXISTING, 0, nil)
+        #delete(wide)
+        if child == INVALID_HANDLE_VALUE:
+            i32 why = i32(GetLastError())
+            close_handle(parent)
+            return (nil, nil, why)
+        return (parent, child, 0)
+
+    // The null device, for `ERRORS_DISCARD`, non-inheritable like every other
+    // handle here. Nil when it could not be opened.
+    private rawptr open_null():
+        ref []u16 name = widen("NUL")
+        rawptr h = nil
+        if #len(name) > 0:
+            h = CreateFileW(&name[0], GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, nil)
+            if h == INVALID_HANDLE_VALUE: h = nil
+        #delete(name)
+        return h
+
+    // A C-runtime descriptor over `h`, which then owns it: closing the
+    // descriptor closes the handle. -1, with `h` closed, when it could not.
+    private i32 descriptor(rawptr h, i32 flags):
+        if h == nil: return 0 - 1
+        i32 fd = _open_osfhandle(#c.intptr_t(#c.uintptr_t(h)), flags)
+        if fd < 0: close_handle(h)
+        return fd
+
+    // The handle under a descriptor, or nil.
+    private rawptr handle_of(i32 fd):
+        if fd < 0: return nil
+        #c.intptr_t h = _get_osfhandle(fd)
+        if h == 0 - 1: return nil
+        return rawptr(#c.uintptr_t(h))
+
+    private void close_fd(i32 fd):
+        if fd >= 0: _ = _close(fd)
+
+    // A `FILE` over `h`, in binary mode, which then owns it. Nil, with `h`
+    // closed, when it could not.
+    private ^io.FILE stream_over(rawptr h, bool reading):
+        i32 flags = CRT_WRITE
+        cstring mode = "wb"
+        if reading:
+            flags = CRT_READ
+            mode = "rb"
+        i32 fd = descriptor(h, flags)
+        if fd < 0: return nil
+        ^io.FILE f = _fdopen(fd, mode)
+        if f == nil: _ = _close(fd)
+        return f
+
+    // ── the table ───────────────────────────────────────────────────────────
+
+    private i32 free_slot():
+        for i in 0..<CHILD_SLOTS:
+            if g_slots[i].process == nil: return i
+        return 0 - 1
+
+    private i32 slot_of_pid(i32 pid):
+        if pid <= 0: return 0 - 1
+        for i in 0..<CHILD_SLOTS:
+            if g_slots[i].process != nil && g_slots[i].pid == pid: return i
+        return 0 - 1
+
+    private i32 slot_of_stream(^io.FILE stream):
+        if stream == nil: return 0 - 1
+        for i in 0..<CHILD_SLOTS:
+            if g_slots[i].process != nil && g_slots[i].stream == stream: return i
+        return 0 - 1
+
+    private void free(i32 at):
+        // A write still in flight is to a child that has ended, or is being
+        // abandoned with it: cancelled, and waited for, because the system
+        // writes its answer into this entry's `OVERLAPPED`.
+        if g_slots[at].writing:
+            rawptr h = handle_of(g_slots[at].closing_fd)
+            _ = CancelIoEx(h, &g_slots[at].ov)
+            #c.ulong moved = 0
+            _ = GetOverlappedResult(h, &g_slots[at].ov, &moved, 1)
+            g_slots[at].writing = false
+        if g_slots[at].closing: close_fd(g_slots[at].closing_fd)
+        g_slots[at].closing = false
+        close_handle(g_slots[at].event)
+        g_slots[at].event = nil
+        if g_slots[at].stage != nil: #delete(g_slots[at].stage)
+        close_handle(g_slots[at].process)
+        close_handle(g_slots[at].job)
+        g_slots[at].pid = 0
+        g_slots[at].process = nil
+        g_slots[at].job = nil
+        g_slots[at].stream = nil
+        g_slots[at].killed = false
+
+    // ── starting ────────────────────────────────────────────────────────────
+
+    // Start the program `line` names with `child_in`, `child_out` and
+    // `child_err` as its standard handles (any may be nil, and two may be
+    // one handle), and enter it in the table. Answers the process id and 0,
+    // or -1 and a `GetLastError` code. The three handles stay the caller's.
+    private (i32 pid, i32 why) launch(^const u16 application, ^u16 line, rawptr child_in, rawptr child_out, rawptr child_err):
+        i32 at = free_slot()
+        if at < 0: return (0 - 1, i32(ERROR_TOO_MANY_OPEN_FILES))
+
+        // The inheritable copies, each handle once: a list naming one handle
+        // twice is refused, and `ERRORS_MERGE` hands stdout and stderr over
+        // as one.
+        rawptr in_copy = inheritable(child_in)
+        rawptr out_copy = inheritable(child_out)
+        rawptr err_copy = out_copy
+        if child_err != child_out: err_copy = inheritable(child_err)
+        [3]rawptr listed
+        u64 count = 0
+        if in_copy != nil:
+            listed[count] = in_copy
+            count += 1
+        if out_copy != nil:
+            listed[count] = out_copy
+            count += 1
+        if err_copy != nil && err_copy != out_copy:
+            listed[count] = err_copy
+            count += 1
+
+        STARTUPINFOEXW info
+        info.StartupInfo.cb = #c.ulong(#size(STARTUPINFOEXW))
+        info.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        info.StartupInfo.hStdInput = in_copy
+        info.StartupInfo.hStdOutput = out_copy
+        info.StartupInfo.hStdError = err_copy
+
+        [ATTRIBUTE_WORDS]u64 words
+        ^ProcThreadAttributeList list = AttributeListAt(rawptr(&words[0]))
+        #c.size_t size = 0
+        _ = InitializeProcThreadAttributeList(nil, 1, 0, &size)
+        i32 why = 0
+        bool listing = false
+        if u64(size) > u64(ATTRIBUTE_WORDS) * 8 || InitializeProcThreadAttributeList(list, 1, 0, &size) == 0:
+            why = i32(GetLastError())
+            if why == 0: why = i32(ERROR_INVALID_PARAMETER)
+        else:
+            listing = true
+            if count > 0 && UpdateProcThreadAttribute(list, 0, #c.ullong(PROC_THREAD_ATTRIBUTE_HANDLE_LIST), rawptr(&listed[0]), #c.size_t(count * 8), nil, nil) == 0:
+                why = i32(GetLastError())
+            info.lpAttributeList = list
+
+        PROCESS_INFORMATION pi
+        if why == 0:
+            #c.int inherit = 0
+            if count > 0: inherit = 1
+            if CreateProcessW(application, line, nil, nil, inherit, CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nil, nil, &info.StartupInfo, &pi) == 0:
+                why = i32(GetLastError())
+                if why == 0: why = i32(ERROR_FILE_NOT_FOUND)
+
+        if listing: DeleteProcThreadAttributeList(list)
+        close_handle(in_copy)
+        close_handle(out_copy)
+        if err_copy != out_copy: close_handle(err_copy)
+        if why != 0: return (0 - 1, why)
+
+        // Into a job before it runs a single instruction, so everything it
+        // starts is in the job too.
+        rawptr job = CreateJobObjectW(nil, nil)
+        if job != nil && AssignProcessToJobObject(job, pi.hProcess) == 0:
+            close_handle(job)
+            job = nil
+        _ = ResumeThread(pi.hThread)
+        close_handle(pi.hThread)
+
+        g_slots[at].pid = i32(pi.dwProcessId)
+        g_slots[at].process = pi.hProcess
+        g_slots[at].job = job
+        g_slots[at].stream = nil
+        g_slots[at].killed = false
+        return (i32(pi.dwProcessId), 0)
+
+    // `launch` for an argv: the line quoted by `command_line`, the program
+    // found by `CreateProcessW`'s search.
+    private (i32 pid, i32 why) launch_argv([]cstring argv, rawptr child_in, rawptr child_out, rawptr child_err):
+        ref []u16 line = command_line(argv)
+        if #len(line) == 0:
+            #delete(line)
+            return (0 - 1, i32(ERROR_INVALID_PARAMETER))
+        (i32 pid, i32 why) = launch(nil, &line[0], child_in, child_out, child_err)
+        #delete(line)
+        return (pid, why)
+
+    // `launch` for a shell line, through `ComSpec`.
+    private (i32 pid, i32 why) launch_shell(cstring command, rawptr child_in, rawptr child_out, rawptr child_err):
+        ref []u16 line = shell_line(command)
+        ref []u16 shell = interpreter()
+        i32 pid = 0 - 1
+        i32 why = i32(ERROR_INVALID_PARAMETER)
+        if #len(line) > 0:
+            ^const u16 application = nil
+            if #len(shell) > 0: application = &shell[0]
+            (pid, why) = launch(application, &line[0], child_in, child_out, child_err)
+        #delete(shell)
+        #delete(line)
+        return (pid, why)
+
+    // Mark the child `pid` as `stream`'s, so `close` finds it.
+    private void own_stream(i32 pid, ^io.FILE stream):
+        i32 at = slot_of_pid(pid)
+        if at >= 0: g_slots[at].stream = stream
+
+    // `read` and `write`: a shell line started with one pipe, its stdout or
+    // its stdin, and a `FILE` over the parent's end, entered in the table so
+    // `close` can find the child by the stream. Nil when the pipe or the start
+    // failed, which is not the command failing.
+    private ^io.FILE open_shell(cstring command, bool reading):
+        (rawptr read_end, rawptr write_end, i32 why) = anonymous_pipe()
+        if why != 0: return nil
+        rawptr child_in = std_handle(STD_INPUT_HANDLE)
+        rawptr child_out = std_handle(STD_OUTPUT_HANDLE)
+        rawptr keep = write_end
+        rawptr give = read_end
+        if reading:
+            child_out = write_end
+            keep = read_end
+            give = write_end
+        else:
+            child_in = read_end
+        (i32 pid, i32 failed) = launch_shell(command, child_in, child_out, std_handle(STD_ERROR_HANDLE))
+        close_handle(give)
+        if failed != 0:
+            close_handle(keep)
+            return nil
+        ^io.FILE f = stream_over(keep, reading)
+        if f == nil:
+            _ = end_tree(pid)
+            _ = reap_pid(pid, 0 - 1)
+            return nil
+        own_stream(pid, f)
+        return f
+
+    // ── waiting and ending ──────────────────────────────────────────────────
+
+    // Wait up to `timeout_ms` (negative: without limit) for the child in slot
+    // `at`. Once it has ended, its entry is freed and the answer is `done`
+    // with `proc.close`'s pair. `(false, false, -1)` while it runs.
+    private (bool done, bool exited, i32 status) reap_slot(i32 at, i32 timeout_ms):
+        if at < 0: return (true, false, 0 - 1)
+        f64 began = time.now()
+        #c.ulong got = 0
+        for:
+            #c.ulong wait = INFINITE
+            if timeout_ms >= 0:
+                i64 left = i64(timeout_ms) - time.ms_since(began)
+                if left < 0: left = 0
+                wait = #c.ulong(left)
+            // A stdin close waiting on its last write is part of the wait: the
+            // child may be reading to its end-of-file before it exits.
+            service(at)
+            if !g_slots[at].closing:
+                got = WaitForSingleObject(g_slots[at].process, wait)
+                break
+            [2]rawptr both
+            both[0] = g_slots[at].process
+            both[1] = g_slots[at].event
+            got = WaitForMultipleObjects(2, HandleArray(rawptr(&both[0])), 0, wait)
+            if got != WAIT_OBJECT_0 + 1: break
+        if got == #c.ulong(WAIT_TIMEOUT): return (false, false, 0 - 1)
+        if got != WAIT_OBJECT_0:
+            free(at)
+            return (true, false, 0 - 1)
+        #c.ulong code = 0
+        bool known = GetExitCodeProcess(g_slots[at].process, &code) != 0
+        bool killed = g_slots[at].killed
+        free(at)
+        if !known: return (true, false, 0 - 1)
+        if killed: return (true, false, 0 - 9)
+        return (true, true, i32(code))
+
+    // `reap_slot` by process id; a pid this package does not hold is a wait
+    // that never happened.
+    private (bool done, bool exited, i32 status) reap_pid(i32 pid, i32 timeout_ms):
+        i32 at = slot_of_pid(pid)
+        if at < 0: return (true, false, 0 - 1)
+        return reap_slot(at, timeout_ms)
+
+    // End the child `pid` and everything it started. False for a pid this
+    // package does not hold, or one that had already ended.
+    private bool end_tree(i32 pid):
+        i32 at = slot_of_pid(pid)
+        if at < 0: return false
+        if WaitForSingleObject(g_slots[at].process, 0) == WAIT_OBJECT_0: return false
+        bool ended = false
+        if g_slots[at].job != nil:
+            ended = TerminateJobObject(g_slots[at].job, KILLED_CODE) != 0
+        if !ended:
+            ended = TerminateProcess(g_slots[at].process, KILLED_CODE) != 0
+        if ended: g_slots[at].killed = true
+        return ended
+
+    // ── reading and writing ─────────────────────────────────────────────────
+
+    // `drain_fd`'s answer for a pipe handle. Anonymous pipes cannot be waited
+    // on — the handle is always signalled — and cannot be overlapped, so the
+    // wait is `PeekNamedPipe`, asked again after naps of 1, 2, 4, 8 and then
+    // 16 ms until there are bytes, the writer is gone, or the time is up; and
+    // the read is one `ReadFile` of no more than the bytes the peek saw, so it
+    // never blocks. The cost is up to 16 ms of latency on a slow child, bought
+    // instead of a reader thread per pipe. A handle that is not a pipe — a
+    // file a `FILE` was opened over — is always ready, and is read directly.
+    private i32 drain_handle(rawptr h, []char8 into, i32 timeout_ms):
+        if h == nil: return BROKE
+        i64 cap = #len(into)
+        if cap <= 0: return BROKE
+        if cap > READ_CAP: cap = READ_CAP
+        f64 began = time.now()
+        i32 step = 1
+        for:
+            #c.ulong available = 0
+            if PeekNamedPipe(h, nil, 0, nil, &available, nil) == 0:
+                #c.ulong e = GetLastError()
+                if e == #c.ulong(ERROR_BROKEN_PIPE): return DRAINED
+                // Not a pipe: a file, which a read never waits on.
+                #c.ulong got = 0
+                if ReadFile(h, rawptr(&into[0]), #c.ulong(cap), &got, nil) == 0:
+                    if GetLastError() == #c.ulong(ERROR_BROKEN_PIPE): return DRAINED
+                    return BROKE
+                if got == 0: return DRAINED
+                return i32(got)
+            if available > 0:
+                i64 want = i64(available)
+                if want > cap: want = cap
+                #c.ulong got = 0
+                if ReadFile(h, rawptr(&into[0]), #c.ulong(want), &got, nil) == 0:
+                    if GetLastError() == #c.ulong(ERROR_BROKEN_PIPE): return DRAINED
+                    return BROKE
+                if got == 0: return DRAINED
+                return i32(got)
+            if timeout_ms >= 0:
+                i64 left = i64(timeout_ms) - time.ms_since(began)
+                if left <= 0: return WAITED
+                if i64(step) > left: step = i32(left)
+            Sleep(#c.ulong(step))
+            if step < 16: step = step * 2
+        return BROKE
+
+    // The most one `send` stages: the size of the stdin pipe's buffer.
+    private const i64 STAGE_BYTES = 65536
+
+    // `send`'s answer for the overlapped end of a `duplex` child's stdin.
+    //
+    // **A write here is never cancelled once it may have moved bytes**,
+    // because Windows does not say how many a cancelled pipe write moved:
+    // Wine answers none after the pipe has taken 64 KiB of it, and the child
+    // reads them anyway. So the bytes are first copied into this child's own
+    // stage of `STAGE_BYTES`, the overlapped `WriteFile` is made from there
+    // and left to finish, and the count answered is what was staged — bytes
+    // this package has taken and will deliver in order, as a POSIX pipe's
+    // buffer would. The next `send` waits at most `timeout_ms` for that write
+    // to finish and answers `WAITED` if it has not; a write is never in flight
+    // from the caller's own buffer.
+    private i32 send_staged(i32 pid, i32 fd, []char8 bytes, i64 n, i32 timeout_ms):
+        i32 at = slot_of_pid(pid)
+        rawptr h = handle_of(fd)
+        if at < 0 || h == nil: return BROKE
+        if g_slots[at].event == nil:
+            g_slots[at].event = CreateEventW(nil, 1, 0, nil)
+            if g_slots[at].event == nil: return BROKE
+        if g_slots[at].stage == nil:
+            g_slots[at].stage = #make([]char8, STAGE_BYTES, #heap)
+            if #len(g_slots[at].stage) != STAGE_BYTES: return BROKE
+        if g_slots[at].writing:
+            #c.ulong wait = INFINITE
+            if timeout_ms >= 0: wait = #c.ulong(timeout_ms)
+            if WaitForSingleObject(g_slots[at].event, wait) != WAIT_OBJECT_0: return WAITED
+            g_slots[at].writing = false
+            #c.ulong moved = 0
+            if GetOverlappedResult(h, &g_slots[at].ov, &moved, 0) == 0: return BROKE
+        i64 take = n
+        if take > STAGE_BYTES: take = STAGE_BYTES
+        for i in 0..<take:
+            g_slots[at].stage[i] = bytes[i]
+        g_slots[at].ov.Internal = 0
+        g_slots[at].ov.InternalHigh = 0
+        g_slots[at].ov.Pointer = nil
+        g_slots[at].ov.hEvent = g_slots[at].event
+        g_slots[at].closing_fd = fd
+        #c.ulong wrote = 0
+        if WriteFile(h, rawptr(&g_slots[at].stage[0]), #c.ulong(take), &wrote, &g_slots[at].ov) != 0:
+            return i32(take)
+        if GetLastError() == #c.ulong(ERROR_IO_PENDING):
+            g_slots[at].writing = true
+            return i32(take)
+        return BROKE
+
+    // Close a `duplex` child's stdin. With a staged write still in flight the
+    // close waits for it — the bytes were answered as sent — and happens at
+    // the first call into this package that finds the write done: `receive`,
+    // `finished`, `finish`, `stop`, or reaping. The caller's record says
+    // closed at once.
+    private void close_staged(i32 pid, i32 fd):
+        i32 at = slot_of_pid(pid)
+        if at < 0 || !g_slots[at].writing:
+            close_fd(fd)
+            return
+        g_slots[at].closing = true
+        g_slots[at].closing_fd = fd
+
+    // Finish the bookkeeping of a write that has completed, and the close
+    // that was waiting on it.
+    private void service(i32 at):
+        if at < 0: return
+        if g_slots[at].writing && WaitForSingleObject(g_slots[at].event, 0) == WAIT_OBJECT_0:
+            g_slots[at].writing = false
+        if g_slots[at].closing && !g_slots[at].writing:
+            close_fd(g_slots[at].closing_fd)
+            g_slots[at].closing = false
+
+    private void service_pid(i32 pid):
+        service(slot_of_pid(pid))

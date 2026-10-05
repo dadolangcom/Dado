@@ -1,0 +1,294 @@
+@test
+// `core:mem` is an *interface* plus two helpers, and the interface
+// itself has nothing to test — a `type` of two slots either holds them or does
+// not. The helpers do:
+//
+//   * **`align_up`**, which is arithmetic with two boundaries in it (a value
+//     already aligned, and a value one past an alignment) and two documented
+//     degenerate inputs (`0` and `1`, both meaning "no constraint");
+//   * **`resize_by_copy`**, which is what an allocator with
+//     nothing clever to do calls, and whose contract has four arms: a nil `old`
+//     is an `Alloc`, a grow copies the old bytes, a shrink copies only what
+//     fits, and **a failed allocation returns `nil` without freeing the block
+//     the caller still holds**. That last one is the arm worth the whole file:
+//     a `resize_by_copy` that freed `old` before discovering it had nothing to
+//     copy into would hand the caller a dangling pointer and *look* correct in
+//     every test that never runs out of memory.
+//
+// Testing it needs an allocator, and this package deliberately ships none — it
+// is the interface, and `core:mem/libc` and `core:mem/bump` are the
+// implementations. So the test file writes one: a cursor over a package-level
+// block, counting its calls, **with a switch that makes it fail on demand**.
+// That is the same thing `tests/cases/pkg_arena` does and for the same reason —
+// an allocation count read off a printout is a habit, not a test — with the
+// starvation switch added, because the failure arm is unreachable from an
+// allocator that always succeeds.
+//
+// One rule is what makes the switch legitimate rather than a hack: **an
+// allocation that fails is a value, not a trap.** `nil` comes back, and the
+// caller decides. A test that cannot reach that value is a test of half the
+// contract.
+package mem
+
+// ── A counting allocator, in the test file ───────────────────────────────────
+//
+// Package-level storage, which is what lets the counters be read after
+// the call rather than threaded through it. `private` because nothing outside
+// this compilation should be able to see the test's own scaffolding — and in a
+// test compilation there is nothing outside it.
+
+private const i64 POOL = 1024
+private type Pool: [1024]u8
+private Pool pool
+
+private u64 pool_used
+private i32 pool_allocs
+private i32 pool_frees
+private i32 pool_free_alls
+// The switch: with this set, `Alloc` answers `nil` the way a real allocator
+// does when it is out of memory. Nothing else changes.
+private bool pool_starved
+
+private void pool_reset():
+    pool_used = 0
+    pool_allocs = 0
+    pool_frees = 0
+    pool_free_alls = 0
+    pool_starved = false
+    return
+
+// The block's base, as a `rawptr`. A binding of its own rather than
+// `Bytes(rawptr(&pool))` written at the use: nested inside the `Bytes(...)`
+// conversion the `rawptr(...)` collapses and the emitted C initialises a
+// `uint8_t *` from a `struct ... *`, which `-Wincompatible-pointer-types
+// -Werror` rejects. Naming the intermediate is what makes the two conversions
+// two conversions.
+private rawptr pool_base():
+    rawptr p = rawptr(&pool)
+    return p
+
+private rawptr pool_at(u64 at):
+    if at > u64(POOL):
+        return nil
+    Bytes b = Bytes(pool_base())
+    []u8 region = b[0..<POOL]
+    return rawptr(&region[at])
+
+private rawptr pool_proc(rawptr data, AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    switch mode:
+        case AllocatorMode.Alloc:
+            pool_allocs = pool_allocs + 1
+            if pool_starved:
+                return nil
+            u64 at = align_up(pool_used, align)
+            if at > u64(POOL) || nbytes > u64(POOL) - at:
+                return nil
+            rawptr out = pool_at(at)
+            if out == nil:
+                return nil
+            pool_used = at + nbytes
+            return out
+        case AllocatorMode.Resize:
+            return nil
+        case AllocatorMode.Free:
+            pool_frees = pool_frees + 1
+            return nil
+        case AllocatorMode.FreeAll:
+            pool_free_alls = pool_free_alls + 1
+            pool_used = 0
+            return nil
+        else:
+            return nil
+
+// An implementer for `ok()` to be asked of: `live` picks whether its two
+// words carry the pool's procedure or only its base.
+type Probe using Allocator:
+    bool live,
+    i32 pad,
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+        if self.live:
+            return pool_allocator()
+        return (nil, pool_base())
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) pool_allocator():
+    return (pool_proc, nil)
+
+// Read and write a block's bytes, which is what a copy test has to be able to
+// do. `Bytes` is the package's own name for "the block, as the run of bytes it
+// is", so the helper is written in the vocabulary the package ships.
+private void poke(rawptr p, i64 n, u8 value):
+    Bytes b = Bytes(p)
+    []u8 span = b[0..<n]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        span[i] = value + u8(i)
+    return
+
+private bool peek_ok(rawptr p, i64 n, u8 value):
+    Bytes b = Bytes(p)
+    []u8 span = b[0..<n]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        if span[i] != value + u8(i):
+            return false
+    return true
+
+i32 test():
+    // The accumulator is `all_ok` and not the usual `ok`, which is the name
+    // the `Allocator` trait's default answers and the claims below are about.
+    bool all_ok = true
+
+    // ── ok() ─────────────────────────────────────────────────────────────────
+    //
+    // Two nil words are what `#default` holds on a freestanding target — so
+    // `ok()`, the trait's default, is the check a program written for both
+    // targets makes. Of two words held as such, the check is `proc != nil`.
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) empty
+    all_ok = #expect(empty.proc == nil, "the zero two words carry a procedure") && all_ok
+    Probe live = (true, 0)
+    all_ok = #expect(live.ok(), "an allocator with a procedure reported itself unusable") && all_ok
+    // A `data` of nil is not the same as a `proc` of nil: the pool's `data` is
+    // nil throughout this file and it is still a usable allocator, which is the
+    // distinction `ok` reads and a `a.data != nil` check would get wrong.
+    Probe half = (false, 0)
+    all_ok = #expect(!half.ok(), "an allocator with data and no procedure reported itself usable") && all_ok
+
+    // ── align_up ─────────────────────────────────────────────────────────────
+    //
+    // The two degenerate alignments first, because they are documented — `0` and
+    // `1` both mean "no constraint" — and because they are the guard's arm.
+    all_ok = #expect(align_up(7, 0) == 7, "align_up(7, 0) was ", align_up(7, 0)) && all_ok
+    all_ok = #expect(align_up(7, 1) == 7, "align_up(7, 1) was ", align_up(7, 1)) && all_ok
+    all_ok = #expect(align_up(0, 0) == 0, "align_up(0, 0) was ", align_up(0, 0)) && all_ok
+
+    // Zero is aligned to everything, which is the identity a bump arena's first
+    // allocation depends on: an arena whose cursor starts at 0 must not waste a
+    // block's first bytes.
+    all_ok = #expect(align_up(0, 16) == 0, "align_up(0, 16) was ", align_up(0, 16)) && all_ok
+    all_ok = #expect(align_up(0, 8) == 0, "align_up(0, 8) was ", align_up(0, 8)) && all_ok
+
+    // **Already aligned** is the boundary: the early return for `rem == 0` is
+    // what stops this from adding a whole alignment to a value that needed
+    // nothing. Get it wrong and every allocation is padded by 16 bytes and
+    // every program still works, which is why it needs a claim rather than an
+    // eye.
+    all_ok = #expect(align_up(16, 16) == 16, "align_up(16, 16) padded an aligned value: ", align_up(16, 16)) && all_ok
+    all_ok = #expect(align_up(32, 16) == 32, "align_up(32, 16) padded an aligned value: ", align_up(32, 16)) && all_ok
+    all_ok = #expect(align_up(8, 8) == 8, "align_up(8, 8) padded an aligned value: ", align_up(8, 8)) && all_ok
+
+    // One past an alignment, and one short of the next — the two ends of a
+    // single rounding step.
+    all_ok = #expect(align_up(17, 16) == 32, "align_up(17, 16) was ", align_up(17, 16)) && all_ok
+    all_ok = #expect(align_up(31, 16) == 32, "align_up(31, 16) was ", align_up(31, 16)) && all_ok
+    all_ok = #expect(align_up(1, 16) == 16, "align_up(1, 16) was ", align_up(1, 16)) && all_ok
+    all_ok = #expect(align_up(15, 8) == 16, "align_up(15, 8) was ", align_up(15, 8)) && all_ok
+    all_ok = #expect(align_up(9, 8) == 16, "align_up(9, 8) was ", align_up(9, 8)) && all_ok
+    all_ok = #expect(align_up(3, 4) == 4, "align_up(3, 4) was ", align_up(3, 4)) && all_ok
+    all_ok = #expect(align_up(1, 2) == 2, "align_up(1, 2) was ", align_up(1, 2)) && all_ok
+
+    // `MAX_ALIGN` is the value every shipped allocator hands out, and the header
+    // states what it is: 16 on every target Dado targets today.
+    all_ok = #expect(MAX_ALIGN == 16, "MAX_ALIGN was ", MAX_ALIGN) && all_ok
+
+    // The two properties, over a sweep rather than a table: the result is a
+    // multiple of the alignment, and it is never below the input and never a
+    // whole alignment above it. Between them they say the function rounds *up*
+    // and rounds *minimally*, which no finite table of pairs quite does.
+    u64 step = 0
+    for n in 0..<40:
+        step = align_up(u64(n), MAX_ALIGN)
+        all_ok = #expect(step % MAX_ALIGN == 0, "align_up(", n, ", 16) was not a multiple of 16: ", step) && all_ok
+        all_ok = #expect(step >= u64(n), "align_up(", n, ", 16) went backwards: ", step) && all_ok
+        all_ok = #expect(step < u64(n) + MAX_ALIGN, "align_up(", n, ", 16) overshot: ", step) && all_ok
+
+    // ── resize_by_copy: a nil `old` is an Alloc ──────────────────────────────
+    //
+    // One `Alloc`, no `Free`. The zero in the free count is the claim: a helper
+    // that called `Free(nil)` on its way through would be invisible in every
+    // output this package produces, and is the same shape of mistake
+    // `pkg_arena`'s nil-`delete` claim exists for.
+    pool_reset()
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = pool_allocator()
+    rawptr first = resize_by_copy(a, nil, 0, 64, MAX_ALIGN)
+    all_ok = #expect(first != nil, "resize_by_copy over a nil old returned nil") && all_ok
+    all_ok = #expect(pool_allocs == 1, "a nil old took ", pool_allocs, " allocations, not 1") && all_ok
+    all_ok = #expect(pool_frees == 0, "a nil old freed ", pool_frees, " blocks, not 0") && all_ok
+
+    // ── resize_by_copy: growing keeps the bytes ──────────────────────────────
+    //
+    // This allocator has no in-place path — its `Resize` mode answers `nil` and
+    // is never reached here — so the block *moves*, and the whole point of the
+    // helper is that the caller cannot tell. `keep` is `min(old_size, nbytes)`,
+    // so a grow carries all 64 bytes across.
+    poke(first, 64, 3)
+    pool_reset()
+    pool_used = 64
+    rawptr grown = resize_by_copy(a, first, 64, 128, MAX_ALIGN)
+    all_ok = #expect(grown != nil, "resize_by_copy failed to grow") && all_ok
+    all_ok = #expect(grown != first, "the block did not move, and this allocator has no in-place path") && all_ok
+    all_ok = #expect(peek_ok(grown, 64, 3), "growing lost the bytes") && all_ok
+    all_ok = #expect(pool_allocs == 1, "a grow took ", pool_allocs, " allocations, not 1") && all_ok
+    all_ok = #expect(pool_frees == 1, "a grow freed ", pool_frees, " blocks, not 1") && all_ok
+
+    // ── resize_by_copy: shrinking copies only what fits ──────────────────────
+    //
+    // `keep` is the *smaller* of the two, which is the line that stops this from
+    // reading 128 bytes out of a 32-byte destination. The bytes that survive are
+    // the leading ones.
+    poke(grown, 128, 5)
+    pool_reset()
+    pool_used = 256
+    rawptr shrunk = resize_by_copy(a, grown, 128, 32, MAX_ALIGN)
+    all_ok = #expect(shrunk != nil, "resize_by_copy failed to shrink") && all_ok
+    all_ok = #expect(peek_ok(shrunk, 32, 5), "shrinking lost the bytes it kept") && all_ok
+    all_ok = #expect(pool_allocs == 1, "a shrink took ", pool_allocs, " allocations, not 1") && all_ok
+    all_ok = #expect(pool_frees == 1, "a shrink freed ", pool_frees, " blocks, not 1") && all_ok
+
+    // ── resize_by_copy: the failure arm ──────────────────────────────────────
+    //
+    // **The arm this file exists for.** An allocation that fails is a
+    // value, not a trap — so a starved allocator answers `nil`, and
+    // `resize_by_copy` must answer `nil` too and must **not** free the block the
+    // caller is still holding. The free count of zero is the claim; a `nil`
+    // return with the old block released would pass any test that only read the
+    // return value.
+    poke(shrunk, 32, 9)
+    pool_reset()
+    pool_starved = true
+    rawptr denied = resize_by_copy(a, shrunk, 32, 64, MAX_ALIGN)
+    all_ok = #expect(denied == nil, "a starved allocator's resize returned a block") && all_ok
+    all_ok = #expect(pool_allocs == 1, "the failing resize tried ", pool_allocs, " allocations, not 1") && all_ok
+    all_ok = #expect(pool_frees == 0, "a failed resize freed the caller's block: ", pool_frees, " frees") && all_ok
+    // And the caller's block is still theirs, with its bytes intact — which is
+    // what "did not free it" means from the caller's side.
+    all_ok = #expect(peek_ok(shrunk, 32, 9), "a failed resize disturbed the caller's bytes") && all_ok
+
+    // A nil `old` **and** a starved allocator: the first arm's failure, which
+    // returns whatever the `Alloc` returned and asks nothing else.
+    pool_reset()
+    pool_starved = true
+    all_ok = #expect(resize_by_copy(a, nil, 0, 64, MAX_ALIGN) == nil, "a starved allocator's fresh alloc returned a block") && all_ok
+    all_ok = #expect(pool_frees == 0, "a failed fresh alloc freed something") && all_ok
+
+    // ── Bytes ────────────────────────────────────────────────────────────────
+    //
+    // The name every byte loop in this collection is written through. It is a
+    // `^u8`, and a window taken over it is what turns one into a `[]u8` of a
+    // written length — so a round trip through it is the claim that the window
+    // is over the block and not over a copy of it.
+    pool_reset()
+    rawptr block = a.proc(a.data, AllocatorMode.Alloc, 16, MAX_ALIGN, nil, 0)
+    all_ok = #expect(block != nil, "the pool would not hand out 16 bytes") && all_ok
+    poke(block, 16, 100)
+    all_ok = #expect(peek_ok(block, 16, 100), "a write through Bytes was not visible through a second window") && all_ok
+
+    // An invariant rather than an expectation: `align_up` must never return a
+    // value below its input, because a bump arena computes its cursor with it
+    // and a backwards answer would hand out memory it had already given away.
+    // If this were false the *package* would be unsafe and there would be
+    // nothing to carry on for.
+    #assert(align_up(1000, MAX_ALIGN) >= 1000)
+
+    if all_ok:
+        return 0
+    return 1

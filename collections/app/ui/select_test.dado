@@ -1,0 +1,687 @@
+@test
+// The text edit's selection from the keyboard and the clipboard, with no
+// window: Shift with the motions across lines and a wide cluster, select-all,
+// the collapse rules, typing, Enter, Backspace and Delete over a selection,
+// the replace as one undo group that restores the selection and keeps the
+// version exact, copy, cut and paste through a fake clipboard (CR LF, a
+// refusal over capacity, read-only), the selection signal, and the lines a
+// selection change repaints.
+package ui
+
+import "app:input"
+import "app:ui/cell"
+
+// ── The document: owned lines behind an edit source ────────────────────────
+
+private type SLine: (ref []char8 text, i32 len)
+private type SDoc: (ref []SLine lines, i64 n)
+private type SDocPtr: ^SDoc
+
+private SDoc g_sdoc
+
+private string8 sline(^SDoc d, i64 i):
+    if i < 0 || i >= d.n || d.lines[i].text == nil || d.lines[i].len == 0:
+        return ""
+    return string8(d.lines[i].text[0..<d.lines[i].len])
+
+// Line `i` becomes `a` then `b`, both copied before the old bytes go.
+private void sset(^SDoc d, i64 i, string8 a, string8 b):
+    i64 n = #len(a) + #len(b)
+    i64 cap = n
+    if cap < 1:
+        cap = 1
+    ref []char8 t = #make([]char8, cap)
+    for k in 0..<#len(a):
+        t[k] = a[k]
+    for k in 0..<#len(b):
+        t[#len(a) + i64(k)] = b[k]
+    if d.lines[i].text != nil:
+        #delete(d.lines[i].text)
+    d.lines[i].text = t
+    d.lines[i].len = i32(n)
+
+private void sopen(^SDoc d, i64 at):
+    if d.lines == nil:
+        d.lines = #make([]SLine, 4)
+    if d.n >= #len(d.lines):
+        _ = #resize(d.lines, #len(d.lines) * 2)
+    i64 k = d.n
+    for k > at:
+        d.lines[k] = d.lines[k - 1]
+        k = k - 1
+    d.lines[at].text = nil
+    d.lines[at].len = 0
+    d.n = d.n + 1
+
+private void spush(string8 s):
+    sopen(&g_sdoc, g_sdoc.n)
+    sset(&g_sdoc, g_sdoc.n - 1, s, "")
+
+private void sclear():
+    for i in 0..<g_sdoc.n:
+        if g_sdoc.lines[i].text != nil:
+            #delete(g_sdoc.lines[i].text)
+            g_sdoc.lines[i].text = nil
+    g_sdoc.n = 0
+
+private i64 scount(rawptr ctx):
+    return SDocPtr(ctx).n
+
+private string8 sline_fn(rawptr ctx, i64 i):
+    return sline(SDocPtr(ctx), i)
+
+private bool svalid(^SDoc d, cell.TextPos p):
+    if p.line < 0 || p.line >= d.n || p.byte < 0:
+        return false
+    return p.byte <= d.lines[p.line].len
+
+// Inserts exactly what it is given: a CR would stay a CR, so the paste test
+// sees the widget's own conversion.
+private cell.TextPos sinsert(rawptr ctx, cell.TextPos p, string8 text):
+    ^SDoc d = SDocPtr(ctx)
+    if !svalid(d, p) || #len(text) == 0:
+        return p
+    string8 line = sline(d, p.line)
+    i64 tn = #len(line) - i64(p.byte)
+    ref []char8 tail = #make([]char8, tn + 1)
+    for k in 0..<tn:
+        tail[k] = line[i64(p.byte) + i64(k)]
+    string8 tail_s = string8(tail[0..<tn])
+    i64 at = p.line
+    i64 start = 0
+    bool first = true
+    cell.TextPos end = p
+    for k in 0..<#len(text):
+        if text[k] == '\n':
+            string8 part = text[start..<i64(k)]
+            if first:
+                string8 whole = sline(d, at)
+                sset(d, at, whole[0..<i64(p.byte)], part)
+                first = false
+            else:
+                sopen(d, at)
+                sset(d, at, part, "")
+            at = at + 1
+            start = i64(k) + 1
+    string8 last = text[start..<#len(text)]
+    if first:
+        string8 whole = sline(d, at)
+        sset(d, at, whole[0..<i64(p.byte)], last)
+        end = cell.pos(at, p.byte + i32(#len(last)))
+        string8 done = sline(d, at)
+        sset(d, at, done, tail_s)
+    else:
+        sopen(d, at)
+        sset(d, at, last, tail_s)
+        end = cell.pos(at, i32(#len(last)))
+    #delete(tail)
+    return end
+
+private bool sremove(rawptr ctx, cell.TextPos from, cell.TextPos to):
+    ^SDoc d = SDocPtr(ctx)
+    if !svalid(d, from) || !svalid(d, to) || !cell.pos_before(from, to):
+        return false
+    string8 head = sline(d, from.line)
+    string8 a = head[0..<i64(from.byte)]
+    string8 b = sline(d, to.line)
+    sset(d, from.line, a, b[i64(to.byte)..<#len(b)])
+    i64 gone = to.line - from.line
+    if gone > 0:
+        for k in (from.line + 1)..<(to.line + 1):
+            if d.lines[k].text != nil:
+                #delete(d.lines[k].text)
+        for k in (to.line + 1)..<d.n:
+            d.lines[k - gone] = d.lines[k]
+        d.n = d.n - gone
+    return true
+
+private EditSource ssource():
+    EditSource s = (scount, sline_fn, sinsert, sremove, rawptr(&g_sdoc))
+    return s
+
+// A fresh document of the given lines, given to `ed`.
+private void sdoc(Control ed, string8 a, string8 b, string8 c):
+    sclear()
+    spush(a)
+    spush(b)
+    spush(c)
+    text_edit_set_source(ed, ssource())
+
+// ── A fake clipboard holding at most `g_fcap` bytes ─────────────────────────
+//
+// It refuses what `display.clipboard_set` refuses: more than it holds, and a
+// NUL byte, which would end the C string the display hands on.
+
+private [256]char8 g_fbuf
+private i32 g_flen
+private i32 g_fcap = 256
+private i32 g_fsets
+
+private bool fake_set(string8 text):
+    g_fsets = g_fsets + 1
+    if #len(text) > i64(g_fcap):
+        return false
+    for k in 0..<#len(text):
+        if u8(text[k]) == 0:
+            return false
+    for k in 0..<#len(text):
+        g_fbuf[k] = text[k]
+    g_flen = i32(#len(text))
+    return true
+
+private string8 fake_get():
+    return string8(g_fbuf[0..<g_flen])
+
+private void fake_put(string8 text):
+    _ = fake_set(text)
+
+// ── Events ─────────────────────────────────────────────────────────────────
+
+private const u32 CTRL = 0x2
+private const u32 SHIFT = 0x1
+private const u32 SUPER = 0x8
+
+private bool key(input.Keycode k):
+    input.Event e = (input.EventKind.Key, i32(k), 0.0, 0.0, 0)
+    return dispatch(e)
+
+private bool skey(input.Keycode k):
+    input.Event e = (input.EventKind.Key, i32(k), 0.0, 0.0, SHIFT)
+    return dispatch(e)
+
+private bool chord(i32 code, u32 mods):
+    input.Event e = (input.EventKind.Key, code, 0.0, 0.0, mods)
+    return dispatch(e)
+
+private bool typed(i32 cp):
+    input.Event e = (input.EventKind.Text, cp, 0.0, 0.0, 0)
+    return dispatch(e)
+
+// ── Observers ──────────────────────────────────────────────────────────────
+
+private i32 g_sels
+private i32 g_refused
+
+private void count_sel(Control c, rawptr ctx):
+    _ = c
+    _ = ctx
+    g_sels = g_sels + 1
+
+private void count_refused(Control c, rawptr ctx):
+    _ = c
+    _ = ctx
+    g_refused = g_refused + 1
+
+private cell.CellRect g_scr
+
+private i64 painted_by(Control c):
+    (i64 e, i64 lines) = text_edit_counters(c)
+    _ = e
+    return lines
+
+private i64 frame(Control c):
+    i64 before = painted_by(c)
+    update(g_scr)
+    return painted_by(c) - before
+
+private bool sel_is(Control c, i64 fl, i32 fb, i64 tl, i32 tb, string8 what):
+    (cell.TextPos f, cell.TextPos t) = text_edit_selection(c)
+    return #expect(f == cell.pos(fl, fb) && t == cell.pos(tl, tb), what, ": selection ", f.line, ",", f.byte, " .. ", t.line, ",", t.byte, " want ", fl, ",", fb, " .. ", tl, ",", tb)
+
+private bool caret_is(Control c, i64 line, i32 byte, string8 what):
+    cell.TextPos p = text_edit_caret(c)
+    return #expect(p.line == line && p.byte == byte, what, ": caret ", p.line, ",", p.byte, " want ", line, ",", byte)
+
+private bool empty_sel(Control c, string8 what):
+    (cell.TextPos f, cell.TextPos t) = text_edit_selection(c)
+    return #expect(f == t && t == text_edit_caret(c) && text_edit_anchor(c) == t, what, ": selection not empty")
+
+private bool line_is(i64 i, string8 want, string8 what):
+    string8 got = sline(&g_sdoc, i)
+    return #expect(got == want, what, ": line ", i, " is '", got, "' want '", want, "'")
+
+private bool selected_is(Control c, string8 want, string8 what):
+    ref []char8 t = text_edit_selected_text(c)
+    string8 got = ""
+    if t != nil:
+        got = string8(t[0..<#len(t)])
+    bool ok = #expect(got == want, what, ": selected '", got, "' want '", want, "'")
+    if t != nil:
+        #delete(t)
+    return ok
+
+private bool clip_is(string8 want, string8 what):
+    string8 got = fake_get()
+    return #expect(got == want, what, ": clipboard '", got, "' want '", want, "'")
+
+private bool history_is(Control c, i32 u, i32 r, string8 what):
+    (i32 hu, i32 hr) = text_edit_history(c)
+    return #expect(hu == u && hr == r, what, ": history ", hu, "/", hr, " want ", u, "/", r)
+
+// ── Replacing across a join, against a reference ───────────────────────────
+//
+// Pieces that make a cluster with what comes before them (a combining mark,
+// U+FE0F, a ZWJ, a skin tone) or start one (letters, emoji), and line breaks
+// to be removed between them, so a removal's join often merges clusters.
+
+private string8 piece(u32 k):
+    if k == 0: return "a"
+    if k == 1: return "e"
+    if k == 2: return "\n"
+    if k == 3: return "\xCC\x81"
+    if k == 4: return "\xEF\xB8\x8F"
+    if k == 5: return "\xE2\x80\x8D"
+    if k == 6: return "\xF0\x9F\x91\x8D"
+    if k == 7: return "\xF0\x9F\x8F\xBD"
+    if k == 8: return "\xE2\x9D\xA4"
+    return "\n"
+
+// The codepoint of each piece, for typing it.
+private i32 piece_cp(u32 k):
+    if k == 0: return i32('a')
+    if k == 1: return i32('e')
+    if k == 3: return 0x301
+    if k == 4: return 0xFE0F
+    if k == 5: return 0x200D
+    if k == 6: return 0x1F44D
+    if k == 7: return 0x1F3FD
+    if k == 8: return 0x2764
+    return 10
+
+private const u32 PIECES = 10
+
+// Park and Miller's generator: a fixed seed, so a failure repeats.
+private i64 g_rng = 20260922
+
+private u32 rnd(u32 n):
+    g_rng = (g_rng * 48271) % 2147483647
+    return u32(g_rng % i64(n))
+
+private [2048]char8 g_ref
+private i32 g_rlen
+private [2048]char8 g_tmp
+private [256]char8 g_ins
+private i32 g_ilen
+
+private void ins_add(string8 p):
+    for k in 0..<#len(p):
+        g_ins[g_ilen] = p[k]
+        g_ilen = g_ilen + 1
+
+// The document as one string, lines joined by "\n", in `g_tmp`.
+private string8 doc_text():
+    i32 n = 0
+    for i in 0..<g_sdoc.n:
+        string8 ln = sline(&g_sdoc, i)
+        for k in 0..<#len(ln):
+            g_tmp[n] = ln[k]
+            n = n + 1
+        if i + 1 < g_sdoc.n:
+            g_tmp[n] = '\n'
+            n = n + 1
+    return string8(g_tmp[0..<n])
+
+private i32 flat(cell.TextPos p):
+    i32 n = 0
+    for i in 0..<p.line:
+        string8 ln = sline(&g_sdoc, i)
+        n = n + i32(#len(ln)) + 1
+    return n + p.byte
+
+// `g_ref[a..<b]` becomes `text`.
+private void ref_replace(i32 a, i32 b, string8 text):
+    i32 tail = g_rlen - b
+    for k in 0..<tail:
+        g_tmp[k] = g_ref[b + k]
+    for k in 0..<#len(text):
+        g_ref[i64(a) + i64(k)] = text[k]
+    i32 at = a + i32(#len(text))
+    for k in 0..<tail:
+        g_ref[at + k] = g_tmp[k]
+    g_rlen = at + tail
+
+// A fresh random document of 6 to 25 pieces, given to `ed` and to the
+// reference.
+private void fresh_doc(Control ed):
+    g_ilen = 0
+    u32 n = 6 + rnd(20)
+    for i in 0..<n:
+        ins_add(piece(rnd(PIECES)))
+    sclear()
+    spush("")
+    _ = sinsert(rawptr(&g_sdoc), cell.pos(0, 0), string8(g_ins[0..<g_ilen]))
+    text_edit_set_source(ed, ssource())
+    g_rlen = 0
+    ref_replace(0, 0, string8(g_ins[0..<g_ilen]))
+
+// `ops` random replaces of a random selection by typing one piece, Enter, a
+// paste or an insert of several; answers the first op whose text differs
+// from the reference, or -1.
+private i32 random_joins(Control ed, i32 ops):
+    fresh_doc(ed)
+    for op in 0..<ops:
+        if g_rlen > 150 || op % 40 == 0:
+            fresh_doc(ed)
+        i64 al = i64(rnd(u32(g_sdoc.n)))
+        string8 la = sline(&g_sdoc, al)
+        cell.TextPos a = cell.pos(al, i32(rnd(u32(#len(la)) + 1)))
+        i64 cl = i64(rnd(u32(g_sdoc.n)))
+        string8 lc = sline(&g_sdoc, cl)
+        cell.TextPos cp = cell.pos(cl, i32(rnd(u32(#len(lc)) + 1)))
+        if rnd(4) == 0:
+            cp = a
+        text_edit_set_selection(ed, a, cp)
+        (cell.TextPos f, cell.TextPos t) = text_edit_selection(ed)
+        i32 ff = flat(f)
+        i32 ft = flat(t)
+        g_ilen = 0
+        u32 mode = rnd(4)
+        if mode == 0:
+            u32 k = rnd(PIECES)
+            ins_add(piece(k))
+            if piece_cp(k) == 10:
+                _ = key(input.Keycode.Enter)
+            else:
+                _ = typed(piece_cp(k))
+        else:
+            u32 m = 1 + rnd(3)
+            for i in 0..<m:
+                ins_add(piece(rnd(PIECES)))
+            if mode == 1:
+                fake_put(string8(g_ins[0..<g_ilen]))
+                _ = text_edit_paste(ed)
+            else:
+                _ = text_edit_insert(ed, string8(g_ins[0..<g_ilen]))
+        ref_replace(ff, ft, string8(g_ins[0..<g_ilen]))
+        if doc_text() != string8(g_ref[0..<g_rlen]):
+            return op
+    return -1
+
+i32 test():
+    bool ok = true
+
+    // ── Pure arithmetic ────────────────────────────────────────────────────
+    (cell.TextPos of, cell.TextPos ot) = edit_order(cell.pos(2, 1), cell.pos(0, 5))
+    ok = #expect(of == cell.pos(0, 5) && ot == cell.pos(2, 1), "order") && ok
+    (i32 la, i32 lb, bool le) = edit_line_selection(cell.pos(1, 2), cell.pos(3, 4), 1, 9)
+    ok = #expect(la == 2 && lb == 9 && le, "first line: from its byte to the end, break included") && ok
+    (i32 ma, i32 mb, bool me) = edit_line_selection(cell.pos(1, 2), cell.pos(3, 4), 2, 0)
+    ok = #expect(ma == 0 && mb == 0 && me, "an empty middle line: only its break") && ok
+    (i32 za, i32 zb, bool ze) = edit_line_selection(cell.pos(1, 2), cell.pos(3, 4), 3, 9)
+    ok = #expect(za == 0 && zb == 4 && !ze, "last line: to the caret, no break") && ok
+    (i32 xa, i32 xb, bool xe) = edit_line_selection(cell.pos(1, 2), cell.pos(3, 4), 4, 9)
+    ok = #expect(xa == 0 && xb == 0 && !xe, "outside") && ok
+    (i32 ea, i32 eb, bool ee) = edit_line_selection(cell.pos(1, 2), cell.pos(1, 2), 1, 9)
+    ok = #expect(ea == 0 && eb == 0 && !ee, "empty selection: nothing") && ok
+    [2]cell.CellRect rs
+    i32 nr = cell.span_rects("ab\xE6\x97\xA5c", 7, cell.LogicalOffset(1), cell.LogicalOffset(5), rs[:])
+    ok = #expect(nr == 1 && rs[0] == cell.rect(1, 7, 3, 1), "the wide cluster's rect is two cells wide") && ok
+    string8 w = "foo_bar1  +=\xC3\xA9t\xCC\x81 x"
+    (i32 w0, i32 w1) = edit_word_at(w, 2)
+    ok = #expect(w0 == 0 && w1 == 8, "a word with _ and a digit: ", w0, "..", w1) && ok
+    (i32 s0, i32 s1) = edit_word_at(w, 9)
+    ok = #expect(s0 == 8 && s1 == 10, "a run of blanks") && ok
+    (i32 p0, i32 p1) = edit_word_at(w, 10)
+    ok = #expect(p0 == 10 && p1 == 12, "a run of punctuation") && ok
+    (i32 u0, i32 u1) = edit_word_at(w, 14)
+    ok = #expect(u0 == 12 && u1 == 17, "non-ASCII and a mark are word: ", u0, "..", u1) && ok
+    (i32 y0, i32 y1) = edit_word_at(w, 99)
+    ok = #expect(y0 == 18 && y1 == 19, "past the end: the last word") && ok
+    (i32 n0, i32 n1) = edit_word_at("", 0)
+    ok = #expect(n0 == 0 && n1 == 0, "empty line") && ok
+
+    text_edit_set_clipboard(fake_set, fake_get)
+    g_scr = cell.rect(0, 0, 20, 5)
+    Control ed = text_edit(NIL)
+    set_focus(ed)
+    on_selection_changed(ed, count_sel, nil)
+    on_clipboard_refused(ed, count_refused, nil)
+
+    // ── Shift with the motions ─────────────────────────────────────────────
+    sdoc(ed, "ab\xE6\x97\xA5c", "xyz", "")
+    update(g_scr)
+    text_edit_set_caret(ed, cell.pos(0, 1))
+    ok = empty_sel(ed, "set_caret") && ok
+    ok = #expect(skey(input.Keycode.Right), "shift+right handled") && ok
+    ok = sel_is(ed, 0, 1, 0, 2, "shift+right") && ok
+    ok = #expect(g_sels == 1, "one selection signal ", g_sels) && ok
+    _ = skey(input.Keycode.Right)
+    ok = sel_is(ed, 0, 1, 0, 5, "shift+right over the wide cluster") && ok
+    _ = skey(input.Keycode.Right)
+    _ = skey(input.Keycode.Right)
+    ok = sel_is(ed, 0, 1, 1, 0, "shift+right across the line end") && caret_is(ed, 1, 0, "caret leads") && ok
+    ok = selected_is(ed, "b\xE6\x97\xA5c\n", "text across the break") && ok
+    _ = skey(input.Keycode.Down)
+    ok = sel_is(ed, 0, 1, 2, 0, "shift+down") && selected_is(ed, "b\xE6\x97\xA5c\nxyz\n", "three lines") && ok
+    _ = skey(input.Keycode.Up)
+    _ = skey(input.Keycode.Up)
+    ok = sel_is(ed, 0, 0, 0, 1, "shift+up past the anchor: the caret now leads backwards") && caret_is(ed, 0, 0, "up to column 0") && ok
+    ok = #expect(text_edit_anchor(ed) == cell.pos(0, 1), "the anchor stayed") && ok
+    _ = skey(input.Keycode.End)
+    ok = sel_is(ed, 0, 1, 0, 6, "shift+end") && ok
+    _ = skey(input.Keycode.Left)
+    ok = sel_is(ed, 0, 1, 0, 5, "shift+left") && ok
+    _ = skey(input.Keycode.Left)
+    ok = sel_is(ed, 0, 1, 0, 2, "shift+left over the wide cluster") && ok
+    _ = skey(input.Keycode.Left)
+    ok = empty_sel(ed, "shift+left back onto the anchor empties it") && caret_is(ed, 0, 1, "on the anchor") && ok
+    _ = skey(input.Keycode.Home)
+    ok = sel_is(ed, 0, 0, 0, 1, "shift+home") && ok
+    _ = chord(i32(input.Keycode.End), CTRL | SHIFT)
+    ok = sel_is(ed, 0, 1, 2, 0, "ctrl+shift+end") && ok
+    _ = chord(i32(input.Keycode.Home), SUPER | SHIFT)
+    ok = sel_is(ed, 0, 0, 0, 1, "super+shift+home") && ok
+    _ = skey(input.Keycode.PageDown)
+    ok = sel_is(ed, 0, 1, 2, 0, "shift+pagedown") && ok
+
+    // ── Collapse rules ─────────────────────────────────────────────────────
+    text_edit_set_selection(ed, cell.pos(1, 2), cell.pos(0, 1))
+    ok = sel_is(ed, 0, 1, 1, 2, "set_selection backwards") && caret_is(ed, 0, 1, "its caret") && ok
+    _ = key(input.Keycode.Right)
+    ok = empty_sel(ed, "right collapses") && caret_is(ed, 1, 2, "right collapses to the end, not past it") && ok
+    text_edit_set_selection(ed, cell.pos(0, 1), cell.pos(1, 2))
+    _ = key(input.Keycode.Left)
+    ok = empty_sel(ed, "left collapses") && caret_is(ed, 0, 1, "left collapses to the start") && ok
+    text_edit_set_selection(ed, cell.pos(0, 1), cell.pos(1, 2))
+    _ = key(input.Keycode.Down)
+    ok = empty_sel(ed, "down collapses") && caret_is(ed, 2, 0, "down moves from the caret") && ok
+    text_edit_set_selection(ed, cell.pos(0, 1), cell.pos(0, 4))
+    ok = sel_is(ed, 0, 1, 0, 2, "set_selection snaps into the wide cluster's start") && ok
+
+    // ── Select all ─────────────────────────────────────────────────────────
+    ok = #expect(chord(i32('A'), CTRL), "ctrl+a handled") && ok
+    ok = sel_is(ed, 0, 0, 2, 0, "select all") && caret_is(ed, 2, 0, "caret at the end") && ok
+    _ = key(input.Keycode.Home)
+    _ = chord(i32('A'), SUPER)
+    ok = sel_is(ed, 0, 0, 2, 0, "super+a") && ok
+
+    // ── Typing over a selection: one group, the selection restored ─────────
+    sdoc(ed, "ab\xE6\x97\xA5c", "xyz", "")
+    i64 v0 = text_edit_version(ed)
+    text_edit_set_caret(ed, cell.pos(0, 1))
+    _ = skey(input.Keycode.Right)
+    _ = skey(input.Keycode.Right)
+    _ = typed(i32('Q'))
+    ok = line_is(0, "aQc", "typed over") && caret_is(ed, 0, 2, "after Q") && empty_sel(ed, "typing collapses") && ok
+    ok = history_is(ed, 2, 0, "a removal and an insert") && ok
+    _ = typed(i32('R'))
+    ok = line_is(0, "aQRc", "typing on joins the replace's insert") && history_is(ed, 2, 0, "still two records") && ok
+    i64 v1 = text_edit_version(ed)
+    ok = #expect(v1 != v0, "the replace moved the version") && ok
+    ok = #expect(chord(i32('Z'), CTRL), "undo") && ok
+    ok = line_is(0, "ab\xE6\x97\xA5c", "one undo restores the text") && history_is(ed, 0, 2, "the whole group undone") && ok
+    ok = sel_is(ed, 0, 1, 0, 5, "and the selection") && caret_is(ed, 0, 5, "with its caret where it was") && ok
+    ok = #expect(text_edit_version(ed) == v0, "undone to the first version") && ok
+    _ = chord(i32('Z'), CTRL | SHIFT)
+    ok = line_is(0, "aQRc", "one redo") && caret_is(ed, 0, 3, "redo leaves the caret after the insert") && empty_sel(ed, "redo collapses") && ok
+    ok = #expect(text_edit_version(ed) == v1, "redone to the group's version") && ok
+    // A replace does not join the typing before it.
+    text_edit_set_caret(ed, cell.pos(0, 4))
+    _ = typed(i32('s'))
+    _ = skey(input.Keycode.Left)
+    _ = typed(i32('t'))
+    ok = line_is(0, "aQRct", "s typed over by t") && history_is(ed, 5, 0, "typing, then a replace of two") && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(0, "aQRcs", "undo the replace only") && sel_is(ed, 0, 4, 0, 5, "s selected again") && ok
+    ok = #expect(text_edit_undo(ed), "undo the typing") && line_is(0, "aQRc", "undo s") && ok
+
+    // Tab and Enter replace; Enter too is one step.
+    text_edit_set_selection(ed, cell.pos(0, 1), cell.pos(0, 3))
+    _ = key(input.Keycode.Tab)
+    ok = line_is(0, "a\tc", "tab over a selection") && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(0, "aQRc", "undo the tab") && sel_is(ed, 0, 1, 0, 3, "tab's selection back") && ok
+    _ = key(input.Keycode.Enter)
+    ok = line_is(0, "a", "enter splits") && line_is(1, "c", "enter's tail") && caret_is(ed, 1, 0, "enter's caret") && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(0, "aQRc", "undo the enter") && ok
+    ok = #expect(g_sdoc.n == 3, "three lines") && ok
+    // text_edit_insert replaces too.
+    ok = #expect(text_edit_insert(ed, "12"), "insert") && line_is(0, "a12c", "programmatic insert replaces") && ok
+    ok = #expect(text_edit_undo(ed), "undo insert") && sel_is(ed, 0, 1, 0, 3, "insert's selection back") && ok
+
+    // ── Backspace and Delete over a multi-line selection ───────────────────
+    sdoc(ed, "hello", "big", "world")
+    text_edit_set_selection(ed, cell.pos(0, 2), cell.pos(2, 3))
+    _ = key(input.Keycode.Backspace)
+    ok = line_is(0, "held", "backspace removes the selection") && ok
+    ok = #expect(g_sdoc.n == 1, "one line left") && ok
+    ok = caret_is(ed, 0, 2, "caret at its start") && history_is(ed, 1, 0, "one record") && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = #expect(g_sdoc.n == 3, "undo: three lines") && line_is(1, "big", "undo: middle") && ok
+    ok = sel_is(ed, 0, 2, 2, 3, "undo: selection back") && caret_is(ed, 2, 3, "caret where it was") && ok
+    _ = key(input.Keycode.Delete)
+    ok = line_is(0, "held", "delete removes it too") && ok
+    _ = chord(i32('Z'), CTRL)
+
+    // ── The clipboard ──────────────────────────────────────────────────────
+    fake_put("before")
+    g_fsets = 0
+    text_edit_set_caret(ed, cell.pos(1, 1))
+    ok = #expect(chord(i32('C'), CTRL), "ctrl+c with nothing selected is still taken") && ok
+    ok = clip_is("before", "nothing selected copies nothing") && ok
+    ok = #expect(g_fsets == 0 && !text_edit_copy(ed), "and calls no setter") && ok
+    text_edit_set_selection(ed, cell.pos(0, 3), cell.pos(1, 2))
+    ok = #expect(chord(i32('C'), SUPER), "super+c") && clip_is("lo\nbi", "copied across the break") && ok
+    ok = line_is(0, "hello", "copy leaves the text") && sel_is(ed, 0, 3, 1, 2, "and the selection") && ok
+    ok = #expect(chord(i32('X'), CTRL), "ctrl+x") && ok
+    ok = line_is(0, "helg", "cut removed it") && ok
+    ok = #expect(g_sdoc.n == 2, "two lines") && ok
+    ok = clip_is("lo\nbi", "cut copied it") && ok
+    (i32 hu, i32 hr) = text_edit_history(ed)
+    _ = hr
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(0, "hello", "one undo restores the cut") && sel_is(ed, 0, 3, 1, 2, "and its selection") && history_is(ed, hu - 1, 1, "one step") && ok
+    // Paste at a caret, CR LF and a lone CR made LF; then over a selection.
+    fake_put("one\r\ntwo\rthree")
+    text_edit_set_caret(ed, cell.pos(2, 5))
+    i64 vp = text_edit_version(ed)
+    ok = #expect(chord(i32('V'), CTRL), "ctrl+v") && ok
+    ok = line_is(2, "worldone", "paste's first line") && line_is(3, "two", "CR LF became LF") && line_is(4, "three", "a lone CR became LF") && ok
+    ok = caret_is(ed, 4, 5, "caret after the paste") && ok
+    ok = #expect(g_sdoc.n == 5, "five lines ", g_sdoc.n) && ok
+    _ = chord(i32('Z'), CTRL)
+    ok = line_is(2, "world", "undo paste") && ok
+    ok = #expect(g_sdoc.n == 3 && text_edit_version(ed) == vp, "version back") && ok
+    fake_put("X")
+    text_edit_set_selection(ed, cell.pos(0, 1), cell.pos(2, 4))
+    ok = #expect(text_edit_paste(ed), "paste over a selection") && ok
+    ok = line_is(0, "hXd", "replaced") && ok
+    ok = #expect(g_sdoc.n == 1, "one line") && ok
+    ok = #expect(text_edit_undo(ed), "one undo") && ok
+    ok = #expect(g_sdoc.n == 3, "three again") && ok
+    ok = sel_is(ed, 0, 1, 2, 4, "paste's selection back") && ok
+    fake_put("")
+    ok = #expect(!text_edit_paste(ed), "an empty clipboard pastes nothing") && ok
+    // Over capacity: refused, reported, and a cut removes nothing.
+    fake_put("kept")
+    g_fcap = 4
+    text_edit_set_selection(ed, cell.pos(0, 0), cell.pos(0, 5))
+    ok = #expect(!text_edit_copy(ed), "five bytes into four: refused") && clip_is("kept", "clipboard untouched") && ok
+    ok = #expect(g_refused == 1, "refusal signalled ", g_refused) && ok
+    ok = #expect(chord(i32('X'), CTRL), "ctrl+x still taken") && line_is(0, "hello", "a refused cut removes nothing") && ok
+    ok = #expect(g_refused == 2, "refusal signalled again") && sel_is(ed, 0, 0, 0, 5, "selection kept") && ok
+    g_fcap = 5
+    ok = #expect(text_edit_copy(ed), "exactly the capacity fits") && clip_is("hello", "copied") && ok
+    g_fcap = 256
+    // Read-only: copy works; cut and paste are refused whole.
+    text_edit_set_read_only(ed, true)
+    fake_put("")
+    ok = #expect(text_edit_copy(ed), "read-only copies") && clip_is("hello", "read-only copy") && ok
+    fake_put("")
+    ok = #expect(!text_edit_cut(ed), "read-only cut refused") && clip_is("", "and copies nothing") && line_is(0, "hello", "text kept") && ok
+    fake_put("zz")
+    ok = #expect(!text_edit_paste(ed) && line_is(0, "hello", "read-only paste"), "read-only paste refused") && ok
+    _ = typed(i32('q'))
+    _ = key(input.Keycode.Backspace)
+    ok = line_is(0, "hello", "read-only typing over a selection") && sel_is(ed, 0, 0, 0, 5, "selection kept") && ok
+    text_edit_set_read_only(ed, false)
+
+    // A NUL in the selection: the clipboard refuses it, as the display's does,
+    // and the cut removes nothing.
+    i32 refused = g_refused
+    sdoc(ed, "ab\x00cd", "x", "y")
+    text_edit_set_selection(ed, cell.pos(0, 0), cell.pos(1, 1))
+    fake_put("kept")
+    ok = #expect(!text_edit_copy(ed), "a NUL is refused") && ok
+    ok = #expect(chord(i32('X'), CTRL), "ctrl+x over a NUL still taken") && ok
+    ok = #expect(g_refused == refused + 2, "both refusals signalled") && ok
+    ok = line_is(0, "ab\x00cd", "the NUL line kept") && ok
+    ok = #expect(g_sdoc.n == 3, "nothing cut") && ok
+    ok = clip_is("kept", "clipboard untouched by a NUL") && ok
+
+    // ── A replace whose removal joins clusters ─────────────────────────────
+    // "e", then a line starting with a combining acute: removing "x\n" makes
+    // "e" and the mark one cluster, and the typed "a" goes where "x" was, not
+    // before the "e".
+    sdoc(ed, "ex", "\xCC\x81bc", "")
+    text_edit_set_selection(ed, cell.pos(0, 1), cell.pos(1, 0))
+    _ = typed(i32('a'))
+    ok = line_is(0, "ea\xCC\x81bc", "typed over a join") && ok
+    ok = caret_is(ed, 0, 4, "caret snapped after the insert, past the mark it took") && ok
+    ok = #expect(text_edit_undo(ed), "undo the join") && ok
+    ok = line_is(0, "ex", "undo: first line") && ok
+    ok = line_is(1, "\xCC\x81bc", "undo: second line") && ok
+    fake_put("QR")
+    ok = #expect(text_edit_paste(ed), "paste over the join") && ok
+    ok = line_is(0, "eQR\xCC\x81bc", "pasted where the selection was") && ok
+    i32 bad = random_joins(ed, 3000)
+    ok = #expect(bad < 0, "a random replace over a join differs from the reference at op ", bad) && ok
+
+    // ── What a selection change repaints ───────────────────────────────────
+    sclear()
+    for i in 0..<20:
+        spush("some line")
+    text_edit_set_source(ed, ssource())
+    g_scr = cell.rect(0, 0, 20, 10)
+    _ = frame(ed)
+    text_edit_set_caret(ed, cell.pos(3, 2))
+    _ = frame(ed)
+    ok = #expect(frame(ed) == 0, "idle") && ok
+    _ = skey(input.Keycode.Down)
+    ok = #expect(frame(ed) == 2, "shift+down repaints the two lines it changed") && ok
+    _ = skey(input.Keycode.Down)
+    ok = #expect(frame(ed) == 2, "extending again: two lines, not the whole selection") && ok
+    _ = skey(input.Keycode.Right)
+    ok = #expect(frame(ed) == 1, "shift+right: one line") && ok
+    _ = skey(input.Keycode.Up)
+    ok = #expect(frame(ed) == 2, "shrinking: two lines") && ok
+    _ = key(input.Keycode.Left)
+    ok = #expect(frame(ed) == 2, "collapsing lines 3..4 repaints them") && ok
+    text_edit_set_selection(ed, cell.pos(1, 0), cell.pos(4, 0))
+    _ = frame(ed)
+    text_edit_set_selection(ed, cell.pos(1, 0), cell.pos(4, 3))
+    ok = #expect(frame(ed) == 1, "moving one end within a line: that line") && ok
+    text_edit_set_selection(ed, cell.pos(2, 0), cell.pos(4, 3))
+    ok = #expect(frame(ed) == 2, "moving the other end a line: lines 1 and 2") && ok
+    _ = chord(i32('A'), CTRL)
+    ok = #expect(frame(ed) == 10, "select all scrolls to the end: the whole view") && ok
+    ok = #expect(frame(ed) == 0, "idle again") && ok
+
+    text_edit_set_clipboard(nil, nil)
+    reset()
+    sclear()
+    if g_sdoc.lines != nil:
+        #delete(g_sdoc.lines)
+    if ok: return 0
+    return 1

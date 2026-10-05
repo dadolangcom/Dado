@@ -1,0 +1,560 @@
+// core:mem/arena — a bump arena that **grows**, behind the allocator interface.
+//
+//     import "core:mem"
+//     import "core:mem/libc"
+//     import "core:mem/arena"
+//
+//     arena.Arena scratch = arena.over(libc.allocator())
+//     defer arena.destroy(&scratch)
+//     using arena.allocator(&scratch):
+//         ...                                  // `#default` is the arena here
+//
+// `core:mem/bump` is a cursor over **one** block and answers `nil` when that
+// block is full. This is the same cursor over a **list** of them: when the head
+// block cannot fit an allocation, another is requested from a backing allocator
+// and becomes the head. Everything else is the same allocator, which is the
+// point — `Alloc` advances a cursor, `Free` is a no-op, and `FreeAll` is O(1)
+// in the number of allocations.
+//
+// It is Odin's default temp allocator, which is the design worth copying: a
+// scratch allocator that is reached for constantly in a frame loop must not
+// have a size the caller has to have guessed right.
+//
+// ## What it does with each mode
+//
+//     Alloc     carve from the head block; request another when it will not fit
+//     Resize    **in place** when the block is the head's last allocation, which
+//               is O(1) and invisible from outside; `mem.resize_by_copy`
+//               otherwise
+//     Free      a no-op — an arena does not reclaim one block
+//     FreeAll   release every block **but the oldest** and reset its cursor.
+//               Keeping one is what makes a frame loop steady-state
+//               allocation-free; releasing the rest is what stops a spike from
+//               being permanent. Every reference into the arena is stale from
+//               that moment, and nothing detects it
+//
+// ## Why this needed a window over a bare pointer
+//
+// Every byte address below is `region[at..<at + n]` over a `[]u8` taken across
+// the block. There used to be no such form: reaching byte `at` meant
+// over-typing it as a `^[65536]u8`, which capped every allocator written in
+// Dado at a 64 KiB heap — and a *growing* arena whose blocks
+// cannot exceed 64 KiB is not one.
+//
+// ## Scoped release is `defer`, and is not automatic
+//
+//     arena.Mark m = arena.begin(&scratch)
+//     defer arena.end(m)
+//
+// Deliberately not emitted at scope exit. `FreeAll` at a scope boundary resets
+// the cursor to zero and therefore frees the **caller's** temp allocations,
+// which is a silent use-after-free; and the commonest thing a temp allocator is
+// used for is a helper that builds a temporary and **returns it**, which an
+// automatic release at block or function exit would break. Mark/release is the
+// correct primitive and where the marks go is the programmer's call.
+package arena
+
+import "core:mem"
+
+// One block: the storage, the cursor into it, and the block allocated *before*
+// it. The list grows at the head, so `next` walks towards the oldest.
+//
+// `last` and `last_size` are the head block's most recent allocation, which is
+// the whole of what `Resize`'s in-place fast path needs to know — the same two
+// fields `core:mem/bump` carries, for the same reason.
+type Block: (
+    rawptr next,
+    rawptr data,
+    u64 cap,
+    u64 used,
+    u64 last,
+    u64 last_size,
+)
+
+// The arena: where new blocks come from, the head of the list, how large the
+// next block will be, and how large the **first** one was.
+//
+// The backing allocator is **captured by value** — two words — so an arena
+// over `libc.allocator()` needs nothing to outlive it. An arena over another
+// arena's allocator borrows that arena by pointer, which is the ordinary
+// raw-pointer bargain.
+//
+// `first_size` is the fifth word and exists for one reason. `next_size`
+// doubles on every block request and nothing used to lower it — not `end`, not
+// `reset`, not `destroy` — so a release that emptied the arena carried the
+// doubling into the next episode of growth. Doubling is an amortization over a
+// **single** growth episode; carrying it across a release that took the arena
+// back to nothing is the defect, and the arena had nothing to restore *to*
+// because `over` and `sized` disagree about where it started. Now it does.
+type Arena: (
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing,
+    rawptr head,
+    u64 next_size,
+    u64 blocks,
+    u64 first_size,
+)
+
+// A cursor position to rewind to. It carries the arena, so `end` takes one
+// argument and `defer arena.end(m)` is one line.
+type Mark: (
+    rawptr arena,
+    rawptr block,
+    u64 used,
+)
+
+// The first block's size, and the one every doubling starts from. 64 KiB
+// because that is a page-multiple a scratch allocator can ask for without
+// thinking about it — and, this milestone, because it is the number that used
+// to be a ceiling and is now a default.
+const u64 BLOCK = 65536
+
+private type BlockPtr: ^Block
+private type ArenaPtr: ^Arena
+
+// ── Lifetime ─────────────────────────────────────────────────────────────────
+
+// An arena that requests blocks from `backing`. **It does not allocate**: the
+// first block is requested by the first allocation, so an arena that is never
+// used costs five words and no call.
+Arena over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing):
+    return (backing, nil, BLOCK, 0, BLOCK)
+
+// The same, with the first block's size written. Later blocks double from it,
+// and a release that empties the arena comes back to it — so `sized(b, 128)`
+// asks for 128 bytes on the first allocation after every full release, not on
+// the first one ever.
+Arena sized((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, u64 first):
+    u64 n = first
+    if n == 0: n = BLOCK
+    return (backing, nil, n, 0, n)
+
+// Request the first block **now** rather than on the first allocation, and say
+// whether one came back. `true` at once when the arena already holds a block.
+//
+// This is the door a caller's block is checked at. `over` and `sized` cannot
+// answer anything — they return an `Arena` and allocate nothing — so an arena
+// over a backing allocator that hands out a **misaligned** block was built
+// without complaint, and `grow`'s refusal surfaced as `#make` answering nil
+// somewhere far from the declaration that caused it. Asked here, the same
+// refusal is an answer at construction: `false` for a backing that cannot
+// supply a block, and `false` for one that supplies a block not aligned to
+// `mem.MAX_ALIGN`, which `grow` hands straight back.
+//
+// A block primed here is an ordinary first block: `reset` keeps it, `destroy`
+// returns it, and the first allocation carves from it without asking again.
+bool prime(^Arena a):
+    if a^.head != nil:
+        return true
+    return grow(ArenaPtr(a), 0, mem.MAX_ALIGN) != nil
+
+// The allocator for `a`. The arena is the allocator's `data`, so it is borrowed
+// by pointer and must outlive every allocation made through it.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Arena a):
+    return (dispatch, rawptr(a))
+
+// The allocator for an arena, as a declaration that takes `mem.Allocator` on:
+// a `ArenaAllocator` is accepted wherever an allocator is asked — `#new`, `using`, a
+// parameter written as the two words, an `Allocator` binder — and the
+// compiler calls its `data()` there. It holds only the pointer, so a
+// one-slot declaration: `self` *is* the `^Arena`.
+//
+//     arena.ArenaAllocator h = &a
+//     using h:
+//         ...
+type ArenaAllocator using mem.Allocator:
+    ^Arena arena,
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+        return (dispatch, rawptr(self))
+
+// Release every allocation, **keeping the oldest block**. One store per block
+// released and one per block, not per allocation.
+//
+// Keeping block 0 is the whole difference between this and `destroy`, and it is
+// what a frame loop wants: after the first frame the arena is the size the
+// program actually needs, and steady state asks the backing allocator for
+// nothing at all.
+void reset(^Arena a):
+    rawptr node = a^.head
+    for node != nil:
+        BlockPtr b = BlockPtr(node)
+        rawptr older = b^.next
+        if older == nil:
+            b^.used = 0
+            b^.last = 0
+            b^.last_size = 0
+            a^.head = node
+            a^.blocks = 1
+            a^.next_size = after(b)
+            return
+        release(a, b)
+        node = older
+    a^.head = nil
+    a^.blocks = 0
+    a^.next_size = a^.first_size
+    return
+
+// Hand every block back, including the oldest. The arena is reusable
+// afterwards — it is exactly what `over` or `sized` returned, block-size growth
+// included, because emptying it restores `next_size`. That last clause
+// used to read *"minus the block-size growth"*, and the growth it was declining
+// to undo was not a rounding error: past a few dozen doublings `next_size` is
+// larger than the backing allocator will ever satisfy, and `grow` does **not**
+// lower it on failure — so a destroyed arena stayed destroyed, answering `nil`
+// to every allocation for the rest of the process with no diagnostic and no
+// failed exit status.
+void destroy(^Arena a):
+    rawptr node = a^.head
+    for node != nil:
+        BlockPtr b = BlockPtr(node)
+        rawptr older = b^.next
+        release(a, b)
+        node = older
+    a^.head = nil
+    a^.blocks = 0
+    a^.next_size = a^.first_size
+    return
+
+// ── Marks ────────────────────────────────────────────────────────────────────
+
+// Where the arena is now. `bump.used` is already this for a single block; a
+// list needs the block as well as the offset into it.
+Mark begin(^Arena a):
+    if a^.head == nil:
+        return (rawptr(a), nil, 0)
+    BlockPtr b = BlockPtr(a^.head)
+    return (rawptr(a), a^.head, b^.used)
+
+// Rewind to `m`: release every block requested since it, and put the cursor
+// back where it was in the block that was the head. **Lifetime-ending** for
+// everything allocated after `m` — using one of those is UB, exactly as using a
+// pointer after `free` is, and nothing detects it.
+//
+// A mark taken while the arena was **empty** names no block, so the rewind
+// releases every block including the base one and the arena is empty again —
+// and that is the path this matters on. `begin`/`end` reads as the natural
+// spelling for a per-frame scratch (`defer arena.end(m)` is one line, and a
+// frame is a scope), and a per-frame scratch is empty at every `begin` by
+// construction. Before `next_size` was restored, each frame therefore asked for
+// a block twice the size of the last frame's: 64 KiB, 128 KiB, 256 KiB, and by
+// about iteration 25 the arena is asking `malloc` for gigabytes. Measured two
+// ways, on two machines, off the same program — a 12-second stall at ~600 MB
+// RSS where the allocator kept saying yes, and silent zero-length allocations
+// forever after where it started saying no. `reset` is still the better call
+// for a frame loop, because it keeps the base block; this one is now merely
+// wasteful rather than unbounded.
+void end(Mark m):
+    ArenaPtr a = ArenaPtr(m.arena)
+    if rawptr(a) == nil:
+        return
+    rawptr node = a^.head
+    for node != nil && node != m.block:
+        BlockPtr b = BlockPtr(node)
+        rawptr older = b^.next
+        release(a, b)
+        node = older
+    a^.head = node
+    if node == nil:
+        a^.blocks = 0
+        a^.next_size = a^.first_size
+        return
+    BlockPtr b = BlockPtr(node)
+    b^.used = m.used
+    b^.last = 0
+    b^.last_size = 0
+    a^.next_size = after(b)
+    return
+
+// Rewind to `m`, as `end` does, but **keep** the `n` bytes at `p` — the arena's last
+// allocation, made after `m` — by moving them down to where `m` was. Answers where
+// they are now: afterwards they are the arena's last allocation, as if made right
+// after `m`, so an in-place `Resize` still works on them, and everything else
+// allocated since `m` is released as `end` releases it.
+//
+// This is how a scope that did heavy work keeps a small result of it without keeping
+// the work: an arena is LIFO, so a result made after the working state sits above it,
+// and a plain rewind would take both. Moving the result down to the mark is the only
+// way to free what lies below it. Nothing can re-point a `ref` that names the old
+// bytes, so the caller reads them at the answered address.
+//
+// Where they go: to the mark's block at the mark (rounded up to `mem.MAX_ALIGN`, but
+// never above where they already are) when they fit there. Otherwise the block that
+// holds them is kept, relinked directly over the mark's block with the bytes moved to
+// its start, and every block in between is released; `next_size` is then `after` the
+// kept block, as every other release that keeps a block sets it. Either way the move
+// is downward or between blocks, so it is a forward copy and allocates nothing.
+// Answers `nil`, and rewinds as `end` does, when `n` is 0 or `p` is not the last
+// allocation (the bytes are then gone).
+rawptr end_keeping(Mark m, rawptr p, u64 n):
+    ArenaPtr a = ArenaPtr(m.arena)
+    if rawptr(a) == nil:
+        return nil
+    if a^.head == nil || n == 0:
+        end(m)
+        return nil
+    BlockPtr h = BlockPtr(a^.head)
+    if h^.last_size < n || p != offset(h, h^.last):
+        end(m)
+        return nil
+    u64 src_at = h^.last
+    if m.block != nil:
+        BlockPtr mb = BlockPtr(m.block)
+        u64 at = mem.align_up(m.used, mem.MAX_ALIGN)
+        if m.block == a^.head && at > src_at:
+            // Within one alignment step of the mark already: they stay where they are.
+            at = src_at
+        if at <= mb^.cap && n <= mb^.cap - at:
+            rawptr dst = offset(mb, at)
+            move_down(dst, p, n)
+            end(m)
+            mb^.used = at + n
+            mb^.last = at
+            mb^.last_size = n
+            return dst
+    // No room at the mark, so the bytes are in a newer block than the mark's, or the
+    // mark names no block: keep the head, which holds them, directly over the mark's
+    // block, and release every block in between.
+    rawptr node = h^.next
+    for node != nil && node != m.block:
+        BlockPtr b = BlockPtr(node)
+        rawptr older = b^.next
+        release(a, b)
+        node = older
+    h^.next = m.block
+    if m.block != nil:
+        BlockPtr kb = BlockPtr(m.block)
+        kb^.used = m.used
+        kb^.last = 0
+        kb^.last_size = 0
+    move_down(h^.data, p, n)
+    h^.used = n
+    h^.last = 0
+    h^.last_size = n
+    a^.next_size = after(h)
+    return h^.data
+
+// ── Reporting ────────────────────────────────────────────────────────────────
+
+// How many bytes are in use, across every block. A test asserting an allocation
+// count reads this rather than eyeballing a printout.
+u64 used(Arena a):
+    u64 total = 0
+    rawptr node = a.head
+    for node != nil:
+        BlockPtr b = BlockPtr(node)
+        total = total + b^.used
+        node = b^.next
+    return total
+
+// How many blocks are live. The number a frame loop watches: it should stop
+// growing.
+u64 blocks(Arena a):
+    return a.blocks
+
+// ── The procedure ────────────────────────────────────────────────────────────
+
+private rawptr dispatch(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    ArenaPtr a = ArenaPtr(data)
+    if rawptr(a) == nil:
+        return nil
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            return carve(a, nbytes, align)
+        case mem.AllocatorMode.Resize:
+            return regrow(a, nbytes, align, old, old_size)
+        case mem.AllocatorMode.Free:
+            // An arena does not reclaim one block, for `core:mem/bump`'s
+            // reason: a `Free` that sometimes reclaims makes "how much is in
+            // use" depend on allocation order.
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            reset(a)
+            return nil
+        else:
+            return nil
+
+// Carve from the head block, and ask for another when it will not fit. The
+// whole allocator.
+private rawptr carve(ArenaPtr a, u64 nbytes, u64 align):
+    // **The ceiling, stated rather than assumed** — `core:mem/bump`'s clause,
+    // for the same reason one level up. Every block here is requested at
+    // `mem.MAX_ALIGN` and at nothing coarser, so aligning a cursor to more than
+    // that yields an offset that is a multiple of `align` from a base that is
+    // not, and an address this allocator would be calling aligned with no
+    // grounds. Refused here rather than in `carve_from`, so that a request
+    // nothing can satisfy does not first cost the backing allocator a block.
+    if align > mem.MAX_ALIGN:
+        return nil
+    if a^.head != nil:
+        rawptr got = carve_from(BlockPtr(a^.head), nbytes, align)
+        if got != nil:
+            return got
+    if grow(a, nbytes, align) == nil:
+        return nil
+    return carve_from(BlockPtr(a^.head), nbytes, align)
+
+// Align the cursor, hand back the run, advance — a window over a bare pointer
+// doing the one job it exists for.
+//
+// `region` is the block and `out` is the carve, and neither is a claim the
+// compiler could have made: the block's extent is `cap`, which is the number
+// the backing allocator was asked for.
+private rawptr carve_from(BlockPtr b, u64 nbytes, u64 align):
+    u64 at = mem.align_up(b^.used, align)
+    if b^.data == nil || at > b^.cap || nbytes > b^.cap - at:
+        return nil
+    mem.Bytes bytes = mem.Bytes(b^.data)
+    []u8 region = bytes[0..<i64(b^.cap)]
+    []u8 out = region[i64(at)..<i64(at) + i64(nbytes)]
+    // Allocation always zeroes, so it is done here and not by a caller.
+    i64 zero = 0
+    for i in zero..<#len(out):
+        out[i] = 0
+    b^.last = at
+    b^.last_size = nbytes
+    b^.used = at + nbytes
+    return rawptr(&region[at])
+
+// `Resize`, with the in-place case that is the reason `Resize` is a mode rather
+// than something the caller synthesizes.
+private rawptr regrow(ArenaPtr a, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    if old == nil:
+        return carve(a, nbytes, align)
+    if a^.head != nil:
+        BlockPtr b = BlockPtr(a^.head)
+        if old == offset(b, b^.last) && old_size == b^.last_size:
+            u64 at = b^.last
+            if at <= b^.cap && nbytes <= b^.cap - at:
+                if nbytes > old_size:
+                    zero_span(b^.data, at + old_size, at + nbytes)
+                b^.last_size = nbytes
+                b^.used = at + nbytes
+                return old
+    // Not on top of the head block, so there is nothing clever to do and the
+    // library helper is what an allocator in that position calls instead.
+    return mem.resize_by_copy((dispatch, rawptr(a)), old, old_size, nbytes, align)
+
+// ── Blocks ───────────────────────────────────────────────────────────────────
+
+// Request another block, at least large enough for one `nbytes` allocation with
+// `align` of slack, and make it the head.
+//
+// Doubling, so N allocations cost O(log N) requests of the backing allocator
+// rather than N. The header is its own allocation: two calls per block instead
+// of one, and no arithmetic to place a payload after a header — which is the
+// trade this package makes everywhere, because the arithmetic is the thing that
+// used to need an invented array bound.
+private rawptr grow(ArenaPtr a, u64 nbytes, u64 align):
+    u64 want = a^.next_size
+    u64 need = nbytes + align
+    if want < need: want = need
+    rawptr head = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Alloc, #size(Block), mem.MAX_ALIGN, nil, 0)
+    if head == nil:
+        return nil
+    // **The contract, checked rather than assumed — and it costs nothing.**
+    //
+    // Both blocks are asked for at `mem.MAX_ALIGN`, and everything below rests
+    // on that being what came back: `BlockPtr(head)` dereferences a struct of
+    // pointers and `u64`s, and `carve_from` aligns an *offset* into `data` and
+    // hands out `data + at`, which is aligned only if `data` was. Until
+    // `#align_forward` existed this package could not look, so it assumed — and
+    // `core:mem/bump`, its most likely backing, was getting it wrong: a Dado run
+    // is emitted as `struct { uint8_t s[N]; }` with C alignment **1**, so a
+    // bump arena over declared storage handed out addresses that were aligned
+    // by luck. That is fixed at the source in `bump.over`; this is the same
+    // claim asked at the door rather than trusted through it.
+    //
+    // **This is not the base being aligned twice**, which is the trap this pair
+    // of packages invites. `#align_forward` on an already-aligned address is
+    // the identity, so a conforming allocator pays nothing and no block loses a
+    // byte to a second rounding. What it buys is that a **non**-conforming one
+    // is refused at the one moment it can be, rather than producing an arena
+    // every allocation of which is quietly misaligned.
+    //
+    // Refused rather than repaired, because repairing it could not be honest:
+    // aligning `data` here means `release` can no longer hand back the pointer
+    // the backing allocator gave out, so `Block` would need a sixth field to
+    // remember the original — a word per block, carried forever, to paper over
+    // a backing allocator that broke its word. An allocation that fails is a
+    // value in this library, and this is one.
+    if head != #align_forward(head, mem.MAX_ALIGN):
+        _ = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Free, 0, 0, head, #size(Block))
+        return nil
+    rawptr data = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Alloc, want, mem.MAX_ALIGN, nil, 0)
+    if data == nil:
+        _ = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Free, 0, 0, head, #size(Block))
+        return nil
+    if data != #align_forward(data, mem.MAX_ALIGN):
+        _ = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Free, 0, 0, data, want)
+        _ = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Free, 0, 0, head, #size(Block))
+        return nil
+    BlockPtr b = BlockPtr(head)
+    b^.next = a^.head
+    b^.data = data
+    b^.cap = want
+    b^.used = 0
+    b^.last = 0
+    b^.last_size = 0
+    a^.head = head
+    a^.blocks = a^.blocks + 1
+    // The doubling, and the only line that raises `next_size`. It is undone by
+    // whatever releases the block — back to `first_size` when that empties the
+    // arena, to `after` the new head when it does not — because a doubling is an
+    // amortization over one growth episode and there is no episode left to
+    // amortize. Nothing lowers it here, on the failure path above: an
+    // arena that could not get its block has not grown, so there is nothing to
+    // carry either way.
+    a^.next_size = want * 2
+    return head
+
+// What `next_size` was just after `b` was requested: the size `grow` sets,
+// re-derived by a release that leaves `b` the head. Emptying the arena went
+// back to `first_size`, but a release that kept a block — `reset`, which keeps
+// the oldest, or `end` to a mark in a primed block — left the doubling of every
+// block it released behind it, so identical frames over a primed scratch asked
+// for a block twice the last frame's until the backing allocator refused
+// (C2-09). A growth episode that was undone is not amortized over.
+private u64 after(BlockPtr b):
+    return b^.cap * 2
+
+// Hand one block's two allocations back. Read `next` before this, not after.
+private void release(ArenaPtr a, BlockPtr b):
+    _ = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Free, 0, 0, b^.data, b^.cap)
+    _ = a^.backing.proc(a^.backing.data, mem.AllocatorMode.Free, 0, 0, rawptr(b), #size(Block))
+    if a^.blocks > 0:
+        a^.blocks = a^.blocks - 1
+    return
+
+// ── Byte work ────────────────────────────────────────────────────────────────
+
+private rawptr offset(BlockPtr b, u64 at):
+    if b^.data == nil || at > b^.cap:
+        return nil
+    mem.Bytes bytes = mem.Bytes(b^.data)
+    []u8 region = bytes[0..<i64(b^.cap)]
+    return rawptr(&region[at])
+
+// Copy `n` bytes from `src` to `dst`, front to back, which is correct when `dst` is not
+// above `src` (an overlapping move downward) or the two do not overlap. The windows are
+// exactly as long as the loop runs, so the subscripts are unchecked.
+private void move_down(rawptr dst, rawptr src, u64 n):
+    if dst == src || n == 0:
+        return
+    i64 total = i64(n)
+    mem.Bytes bs = mem.Bytes(src)
+    mem.Bytes bd = mem.Bytes(dst)
+    []u8 from = bs[0..<total]
+    []u8 into = bd[0..<total]
+    i64 zero = 0
+    for i in zero..<total:
+        into[#no_bounds i] = from[#no_bounds i]
+    return
+
+private void zero_span(rawptr data, u64 from, u64 to):
+    if data == nil || to <= from:
+        return
+    mem.Bytes b = mem.Bytes(data)
+    []u8 span = b[i64(from)..<i64(to)]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        span[i] = 0
+    return

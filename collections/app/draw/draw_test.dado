@@ -1,0 +1,856 @@
+@test
+// app:draw unit test.
+//
+// **Everything here runs headless**, against `init_headless` — the mode that
+// records, walks, orders, tints, clips and counts, and makes no sokol call at
+// all. That is not a weaker test of a weaker thing. The emitters in
+// `device.dado` count first and call sokol second and return between the two
+// lines when the server is headless, so every number asserted below is the
+// number a GPU render of the same tree produces; there is no second traversal
+// for this file to be testing instead of the real one.
+//
+// What it cannot see is pixels. Those are verified separately and by hand,
+// under Xvfb, by `example/drawsmoke`, which renders into an offscreen target
+// and reads the bytes back. This file is what the gate runs; that one is what
+// proves the shader — except that there is no longer a shader of ours to
+// prove, which is what this checkpoint was for.
+//
+// The numbers below are not magic. Each one is the state machine in
+// `device.dado` run by hand: a frame starts with the bound view *unknown*, the
+// blend at `BLEND_MIX`, the topology at triangles, the transform at identity
+// and the scissor at the whole framebuffer, and every assertion that names a
+// `state_changes()` count says which register moved and why.
+package draw
+
+import "core:geom/xform"
+import "core:mem/arena"
+
+private const [4]u8 RED = [255, 0, 0, 255]
+private const [4]u8 BLUE = [0, 0, 255, 255]
+private const [4]u8 GREEN = [0, 255, 0, 255]
+private const [4]u8 HALF = [128, 128, 128, 255]
+
+private const i32 FB_W = 800
+private const i32 FB_H = 600
+
+i32 test():
+    bool ok = true
+
+    // ── the server comes up, headless, and says so ─────────────────────────
+
+    ok = #expect(init_headless(), "init_headless") && ok
+    ok = #expect(ready(), "ready() after init_headless") && ok
+    ok = #expect(headless(), "headless() after init_headless") && ok
+    ok = #expect(capacity() == DEFAULT_MAX_VERTICES,
+                 "the vertex budget is ", capacity()) && ok
+    ok = #expect(command_capacity() == DEFAULT_MAX_COMMANDS,
+                 "the command budget is ", command_capacity()) && ok
+
+    // ── the command record is one flat 64-byte shape ───────────────────────
+    //
+    // The package doc comment argues for the size; this is what keeps the
+    // argument honest. A field added without thinking takes it to 68 and its
+    // array to 72 with alignment, and this line is where that is noticed.
+
+    ok = #expect(#size(Cmd) == 64, "one command is ", #size(Cmd), " bytes") && ok
+    ok = #expect(#size(Vtx) == 20, "one pooled point is ", #size(Vtx), " bytes") && ok
+
+    // ── canvases and items, and a stale handle that is refused ─────────────
+
+    Canvas cv = canvas_create()
+    ok = #expect(canvas_valid(cv), "canvas_create answered a live handle") && ok
+
+    Item a = canvas_item_create(cv)
+    ok = #expect(canvas_item_valid(a), "canvas_item_create answered a live handle") && ok
+    ok = #expect(canvas_item_is_empty(a), "a fresh item has an empty list") && ok
+    ok = #expect(canvas_item_command_count(a) == 0, "and no commands") && ok
+    ok = #expect(canvas_of(a) == cv, "and belongs to the canvas it was made on") && ok
+
+    canvas_item_free(a)
+    ok = #expect(!canvas_item_valid(a), "a freed handle is refused") && ok
+    ok = #expect(canvas_item_command_count(a) == 0, "and reads as empty") && ok
+
+    // The slot comes straight back off the free list, so the next item has the
+    // same index and a different generation. That collision is the whole
+    // reason a handle carries one.
+    Item b = canvas_item_create(cv)
+    ok = #expect(canvas_item_valid(b), "the next item is live") && ok
+    ok = #expect(b.index == a.index, "and reuses the freed slot: ", b.index,
+                 " vs ", a.index) && ok
+    ok = #expect(b.generation != a.generation,
+                 "with a different generation: ", b.generation, " vs ", a.generation) && ok
+    ok = #expect(!canvas_item_valid(a),
+                 "and the stale handle is still refused after the reuse") && ok
+
+    // Recording through the stale handle must not reach the live item.
+    rect(a, (0.0, 0.0, 10.0, 10.0), RED)
+    ok = #expect(canvas_item_command_count(b) == 0,
+                 "a stale handle records into nothing; b holds ",
+                 canvas_item_command_count(b)) && ok
+
+    // ── one call, one command ──────────────────────────────────────────────
+
+    rect(b, (0.0, 0.0, 10.0, 10.0), RED)
+    ok = #expect(canvas_item_command_count(b) == 1, "rect appends one") && ok
+    ok = #expect(!canvas_item_is_empty(b), "and the item is no longer empty") && ok
+    line(b, (0.0, 0.0), (10.0, 10.0), BLUE)
+    push_clip(b, (0.0, 0.0, 4.0, 4.0))
+    pop_clip(b)
+    set_blend(b, BLEND_ADD)
+    reset_blend(b)
+    ok = #expect(canvas_item_command_count(b) == 6,
+                 "every draw_* call appends exactly one, push_clip and set_blend included; got ",
+                 canvas_item_command_count(b)) && ok
+
+    // A point run is still one command, however many points it carries.
+    [5][2]f32 wave = [[0.0, 0.0], [1.0, 1.0], [2.0, 0.0], [3.0, 1.0], [4.0, 0.0]]
+    polyline(b, wave[:], GREEN)
+    ok = #expect(canvas_item_command_count(b) == 7,
+                 "a five-point polyline is one command; got ",
+                 canvas_item_command_count(b)) && ok
+
+    // ── a recorded command reads back ──────────────────────────────────────
+    //
+    // `b`'s list is now rect, line, push_clip, pop_clip, set_blend,
+    // reset_blend, polyline, and every one of those is read back and checked
+    // against what was written. This is the half of the tape that
+    // `painted()`/`paint(i)` does for the tree: a consumer that has to assert
+    // what a command *carries* — `app:text` and its glyph source rectangles,
+    // `example/drawsmoke` and its frame — can only do it through here.
+
+    (i32 ck0, Texture _, [4]f32 ca0, [4]f32 _, [4]u8 cc0, f32 cw0, i32 _, i32 cf0) = canvas_item_command(b, 0)
+    ok = #expect(ck0 == CMD_RECT, "command 0 is a rect; got kind ", ck0) && ok
+    ok = #expect(ca0 == [0.0, 0.0, 10.0, 10.0],
+                 "carrying the rectangle as written: ", ca0[0], " ", ca0[1], " ",
+                 ca0[2], " ", ca0[3]) && ok
+    ok = #expect(cc0 == RED, "and the colour as written; got ", cc0[0], " ", cc0[2]) && ok
+    ok = #expect(cw0 == -1.0, "and Godot's filled sentinel; got ", cw0) && ok
+    ok = #expect((cf0 & FLAG_FILLED) != 0, "and is filled") && ok
+
+    (i32 ck1, Texture _, [4]f32 ca1, [4]f32 _, [4]u8 cc1, f32 _, i32 _, i32 _) = canvas_item_command(b, 1)
+    ok = #expect(ck1 == CMD_LINE && cc1 == BLUE,
+                 "command 1 is a blue line; got kind ", ck1) && ok
+    ok = #expect(ca1 == [0.0, 0.0, 10.0, 10.0],
+                 "with its endpoints in `a`: ", ca1[0], " ", ca1[1], " ", ca1[2],
+                 " ", ca1[3]) && ok
+
+    (i32 ck2, Texture _, [4]f32 ca2, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 _) = canvas_item_command(b, 2)
+    ok = #expect(ck2 == CMD_PUSH_CLIP && ca2 == [0.0, 0.0, 4.0, 4.0],
+                 "command 2 is the clip push and carries its rect; got kind ",
+                 ck2, " rect ", ca2[2], "x", ca2[3]) && ok
+
+    (i32 ck3, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 _) = canvas_item_command(b, 3)
+    ok = #expect(ck3 == CMD_POP_CLIP, "command 3 is the pop; got kind ", ck3) && ok
+
+    (i32 ck4, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 cf4) = canvas_item_command(b, 4)
+    ok = #expect(ck4 == CMD_SET_BLEND && cf4 == BLEND_ADD,
+                 "command 4 is the blend change and `flags` is the mode; got kind ",
+                 ck4, " flags ", cf4) && ok
+
+    (i32 ck5, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 _) = canvas_item_command(b, 5)
+    ok = #expect(ck5 == CMD_RESET_BLEND, "command 5 is the reset; got kind ", ck5) && ok
+
+    // A point run is reported as a count and read one point at a time. There
+    // is no fixed-shape answer that could have carried five points, and the
+    // accessor does not invent one.
+    (i32 ck6, Texture _, [4]f32 _, [4]f32 _, [4]u8 cc6, f32 _, i32 cn6, i32 _) = canvas_item_command(b, 6)
+    ok = #expect(ck6 == CMD_POLYLINE && cc6 == GREEN && cn6 == 5,
+                 "command 6 is a five-point green polyline; got kind ", ck6,
+                 " count ", cn6) && ok
+    (f32 px0, f32 py0, f32 _, f32 _, [4]u8 _) = canvas_item_command_point(b, 6, 0)
+    (f32 px4, f32 py4, f32 _, f32 _, [4]u8 _) = canvas_item_command_point(b, 6, 4)
+    ok = #expect(px0 == 0.0 && py0 == 0.0 && px4 == 4.0 && py4 == 0.0,
+                 "and its first and last points came back: ", px0, ",", py0,
+                 " .. ", px4, ",", py4) && ok
+
+    // Past the end of the run, and on a command that has no run at all.
+    (f32 pxo, f32 _, f32 _, f32 _, [4]u8 _) = canvas_item_command_point(b, 6, 5)
+    ok = #expect(pxo == 0.0, "a point past the run is zero; got ", pxo) && ok
+    (f32 pxn, f32 _, f32 _, f32 _, [4]u8 _) = canvas_item_command_point(b, 0, 0)
+    ok = #expect(pxn == 0.0, "and a rect has no points; got ", pxn) && ok
+
+    // An index past the end is a no-op value, not a trap.
+    (i32 ckz, Texture ctz, [4]f32 caz, [4]f32 _, [4]u8 ccz, f32 cwz, i32 cnz, i32 cfz) = canvas_item_command(b, 99)
+    ok = #expect(ckz == CMD_NONE && ctz == NIL_TEXTURE && caz[2] == 0.0
+                 && ccz[3] == 0 && cwz == 0.0 && cnz == 0 && cfz == 0,
+                 "command 99 reads as nothing; got kind ", ckz) && ok
+    (i32 ckn, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 _) = canvas_item_command(b, -1)
+    ok = #expect(ckn == CMD_NONE, "and so does command -1; got kind ", ckn) && ok
+
+    // ── clear empties the list and keeps every property ────────────────────
+
+    canvas_item_set_modulate(b, HALF)
+    canvas_item_set_z_index(b, 3)
+    canvas_item_set_position(b, (25.0, 0.0))
+    canvas_item_clear(b)
+    ok = #expect(canvas_item_command_count(b) == 0, "clear empties the list") && ok
+    ok = #expect(canvas_item_is_empty(b), "and the item reads as empty") && ok
+    (i32 ckc, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 _) = canvas_item_command(b, 0)
+    ok = #expect(ckc == CMD_NONE,
+                 "so the command that was there reads back as nothing; got kind ",
+                 ckc) && ok
+
+    canvas_render(cv, FB_W, FB_H)
+    ok = #expect(painted() == 1, "an empty item still paints; got ", painted()) && ok
+    (Item pit, i32 pz, [4]u8 ptint, [4]f32 _, bool _) = paint(0)
+    ok = #expect(pit == b, "and it is the item that was cleared") && ok
+    ok = #expect(pz == 3, "clear kept z_index; got ", pz) && ok
+    ok = #expect(ptint == HALF, "clear kept modulate; got ", ptint[0]) && ok
+    ok = #expect(commands() == 0 && primitives() == 0,
+                 "and an empty list draws nothing: ", commands(), " ", primitives()) && ok
+
+    canvas_free(cv)
+    ok = #expect(!canvas_valid(cv), "canvas_free kills the canvas") && ok
+    ok = #expect(!canvas_item_valid(b), "and every item on it") && ok
+    (i32 ckd, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 _, i32 _) = canvas_item_command(b, 0)
+    ok = #expect(ckd == CMD_NONE, "a dead item reads back nothing; got kind ", ckd) && ok
+
+    // ── the walk: roots in order, children in sibling order, depth first ────
+    //
+    // `c` comes off the free list into the slot `cv` just vacated, so this is
+    // also the assertion that a `Canvas` handle is generational and that a
+    // canvas whose tree was torn down is usable again — everything below is
+    // built on a `graph.Graph` that has already been through a `destroy`.
+
+    Canvas c = canvas_create()
+    ok = #expect(c.index == cv.index && c.generation != cv.generation,
+                 "the canvas slot comes back with a new generation: ",
+                 c.index, "/", c.generation, " vs ", cv.index, "/", cv.generation) && ok
+    Item root = canvas_item_create(c)
+    Item k1 = child_of(c, root)
+    Item k2 = child_of(c, root)
+    Item k3 = child_of(c, root)
+    Item root2 = canvas_item_create(c)
+
+    canvas_render(c, FB_W, FB_H)
+    ok = #expect(painted() == 5, "five items are painted; got ", painted()) && ok
+    ok = #expect(order_is(root, k1, k2, k3, root2),
+                 "depth first, siblings in insertion order, roots in root order: ",
+                 ati(0), " ", ati(1), " ", ati(2), " ", ati(3), " ", ati(4)) && ok
+
+    // ── z_index reorders, and equal z keeps sibling order ──────────────────
+
+    canvas_item_set_z_index(k2, -1)
+    canvas_render(c, FB_W, FB_H)
+    ok = #expect(order_is(k2, root, k1, k3, root2),
+                 "a negative z paints first: ",
+                 ati(0), " ", ati(1), " ", ati(2), " ", ati(3), " ", ati(4)) && ok
+    (Item _, i32 z2, [4]u8 _, [4]f32 _, bool _) = paint(0)
+    ok = #expect(z2 == -1, "and resolves to -1; got ", z2) && ok
+
+    // `root`, `k1`, `k2`, `k3` and `root2` are then all z 0 and all keep the
+    // order the walk produced. A sort that was not stable would be free to
+    // shuffle them.
+    canvas_item_set_z_index(k2, 0)
+    canvas_render(c, FB_W, FB_H)
+    ok = #expect(order_is(root, k1, k2, k3, root2),
+                 "equal z keeps sibling order: ",
+                 ati(0), " ", ati(1), " ", ati(2), " ", ati(3), " ", ati(4)) && ok
+
+    // ── z_as_relative is the difference between an offset and a layer ──────
+
+    canvas_item_set_z_index(root, 5)
+    canvas_render(c, FB_W, FB_H)
+    (Item _, i32 zk, [4]u8 _, [4]f32 _, bool _) = paint_of(k1)
+    ok = #expect(zk == 5, "a relative child inherits its parent's layer; got ", zk) && ok
+
+    canvas_item_set_z_as_relative(k1, false)
+    canvas_item_set_z_index(k1, 0)
+    canvas_render(c, FB_W, FB_H)
+    (Item _, i32 zabs, [4]u8 _, [4]f32 _, bool _) = paint_of(k1)
+    ok = #expect(zabs == 0, "an absolute child ignores it; got ", zabs) && ok
+    ok = #expect(order_is(k1, root2, root, k2, k3),
+                 "so it paints under its own parent: ",
+                 ati(0), " ", ati(1), " ", ati(2), " ", ati(3), " ", ati(4)) && ok
+
+    canvas_item_set_z_as_relative(k1, true)
+    canvas_item_set_z_index(root, 0)
+
+    // ── an invisible subtree contributes nothing ───────────────────────────
+
+    rect(k1, (0.0, 0.0, 10.0, 10.0), RED)
+    rect(k2, (0.0, 0.0, 10.0, 10.0), BLUE)
+    canvas_render(c, FB_W, FB_H)
+    ok = #expect(painted() == 5 && primitives() == 2,
+                 "both rectangles are drawn: ", painted(), " ", primitives()) && ok
+
+    canvas_item_set_visible(root, false)
+    canvas_render(c, FB_W, FB_H)
+    ok = #expect(painted() == 1,
+                 "hiding a root prunes its three children with it; got ",
+                 painted()) && ok
+    ok = #expect(commands() == 0 && primitives() == 0,
+                 "and nothing below it is even looked at: ", commands(), " ",
+                 primitives()) && ok
+    (Item vis, i32 _, [4]u8 _, [4]f32 _, bool _) = paint(0)
+    ok = #expect(vis == root2, "the other root is untouched") && ok
+
+    canvas_item_set_visible(root, true)
+
+    // ── modulate composes down the tree; self_modulate does not ────────────
+    //
+    // Half of half is a quarter, rounded: (255*128+127)/255 is 128 and
+    // (128*128+127)/255 is 64.
+
+    canvas_item_set_modulate(root, HALF)
+    canvas_item_set_modulate(k1, HALF)
+    canvas_render(c, FB_W, FB_H)
+    (Item _, i32 _, [4]u8 rt, [4]f32 _, bool _) = paint_of(root)
+    (Item _, i32 _, [4]u8 kt, [4]f32 _, bool _) = paint_of(k1)
+    (Item _, i32 _, [4]u8 st, [4]f32 _, bool _) = paint_of(root2)
+    ok = #expect(rt[0] == 128 && rt[3] == 255,
+                 "the parent's own tint is its modulate: ", rt[0], " ", rt[3]) && ok
+    ok = #expect(kt[0] == 64 && kt[3] == 255,
+                 "the child's is the product: ", kt[0], " ", kt[3]) && ok
+    ok = #expect(st[0] == 255, "a sibling root is untouched: ", st[0]) && ok
+
+    // `self_modulate` reaches the item and stops there.
+    canvas_item_set_self_modulate(root, [255, 255, 255, 128])
+    canvas_render(c, FB_W, FB_H)
+    (Item _, i32 _, [4]u8 rt2, [4]f32 _, bool _) = paint_of(root)
+    (Item _, i32 _, [4]u8 kt2, [4]f32 _, bool _) = paint_of(k1)
+    ok = #expect(rt2[3] == 128, "self_modulate reaches the item: ", rt2[3]) && ok
+    ok = #expect(kt2[3] == 255,
+                 "and is not handed to its children: ", kt2[3]) && ok
+
+    canvas_item_set_modulate(root, [255, 255, 255, 255])
+    canvas_item_set_modulate(k1, [255, 255, 255, 255])
+    canvas_item_set_self_modulate(root, [255, 255, 255, 255])
+
+    // ── clip nesting down the tree ─────────────────────────────────────────
+
+    canvas_item_set_custom_rect(root, true, (100.0, 100.0, 200.0, 200.0))
+    canvas_item_set_custom_rect(k1, true, (50.0, 150.0, 200.0, 200.0))
+    canvas_render(c, FB_W, FB_H)
+    (Item _, i32 _, [4]u8 _, [4]f32 rc, bool ron) = paint_of(root)
+    (Item _, i32 _, [4]u8 _, [4]f32 kc, bool kon) = paint_of(k1)
+    ok = #expect(ron && rc == [100.0, 100.0, 200.0, 200.0],
+                 "the parent clips to its own rect: ", rc[0], " ", rc[1], " ",
+                 rc[2], " ", rc[3]) && ok
+    ok = #expect(kon && kc == [100.0, 150.0, 150.0, 150.0],
+                 "and the child to the meet of the two: ", kc[0], " ", kc[1],
+                 " ", kc[2], " ", kc[3]) && ok
+    (Item _, i32 _, [4]u8 _, [4]f32 sc, bool son) = paint_of(root2)
+    ok = #expect(!son && sc == [0.0, 0.0, f32(FB_W), f32(FB_H)],
+                 "a sibling root is unclipped and carries the whole framebuffer: ",
+                 sc[0], " ", sc[1], " ", sc[2], " ", sc[3]) && ok
+
+    // Turning the clip off through the other spelling leaves the rect alone
+    // and stops it being used.
+    canvas_item_set_clip(root, false)
+    canvas_item_set_clip(k1, false)
+    canvas_render(c, FB_W, FB_H)
+    (Item _, i32 _, [4]u8 _, [4]f32 _, bool roff) = paint_of(root)
+    ok = #expect(!roff, "canvas_item_set_clip(false) stops the clip") && ok
+
+    canvas_free(c)
+
+    // ── what a frame costs, register by register ───────────────────────────
+
+    Canvas d = canvas_create()
+    Item one = canvas_item_create(d)
+
+    // One untextured rectangle. The bound view starts unknown, so the reset to
+    // sokol_gp's white view is one state change; the transform is identity and
+    // the scissor is the whole framebuffer, so neither moves.
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 1 && primitives() == 1 && state_changes() == 1,
+                 "one rectangle: ", commands(), " commands, ", primitives(),
+                 " primitives, ", state_changes(), " state changes") && ok
+
+    // A second rectangle in another colour. **Colour is not a state change** —
+    // sokol_gp writes it into every vertex — so the count does not move.
+    rect(one, (20.0, 0.0, 10.0, 10.0), BLUE)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 2 && primitives() == 2,
+                 "two rectangles: ", commands(), " ", primitives()) && ok
+    ok = #expect(state_changes() == 1,
+                 "a colour change must not move state_changes(); got ",
+                 state_changes()) && ok
+
+    // Binding a texture does move it, and so does going back to untextured.
+    Texture tx = texture_create(4, 4, scratch(4 * 4 * 4))
+    ok = #expect(texture_valid(tx), "a texture was made headless") && ok
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    texture_rect(one, tx, (0.0, 0.0, 4.0, 4.0), [255, 255, 255, 255])
+    rect(one, (20.0, 0.0, 10.0, 10.0), BLUE)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 3, "three primitives; got ", primitives()) && ok
+    ok = #expect(state_changes() == 3,
+                 "reset, bind, reset: three view changes; got ",
+                 state_changes()) && ok
+
+    // A texture that is bound twice running is bound once.
+    canvas_item_clear(one)
+    texture_rect(one, tx, (0.0, 0.0, 4.0, 4.0), [255, 255, 255, 255])
+    texture_rect(one, tx, (8.0, 0.0, 4.0, 4.0), [255, 255, 255, 255])
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(state_changes() == 1,
+                 "one bind serves two textured rectangles; got ",
+                 state_changes()) && ok
+
+    // A dead texture draws nothing and binds nothing.
+    texture_free(tx)
+    ok = #expect(!texture_valid(tx), "the texture is dead") && ok
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 2 && primitives() == 0,
+                 "its commands are still replayed and draw nothing: ",
+                 commands(), " ", primitives()) && ok
+    ok = #expect(state_changes() == 0,
+                 "and nothing is bound for them; got ", state_changes()) && ok
+
+    // ── the scissor moves it, and an in-list clip is what moves the scissor ─
+
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    push_clip(one, (0.0, 0.0, 100.0, 100.0))
+    rect(one, (0.0, 0.0, 10.0, 10.0), BLUE)
+    pop_clip(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 5 && primitives() == 3,
+                 "five commands, three rectangles: ", commands(), " ",
+                 primitives()) && ok
+    ok = #expect(state_changes() == 3,
+                 "one view reset plus narrow and widen; got ",
+                 state_changes()) && ok
+
+    // A push that does not narrow anything costs nothing. That is the whole
+    // proof that a push *intersects* rather than replaces.
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    push_clip(one, (0.0, 0.0, f32(FB_W), f32(FB_H)))
+    rect(one, (0.0, 0.0, 10.0, 10.0), BLUE)
+    pop_clip(one)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(state_changes() == 1,
+                 "a clip that changes no pixel changes no state; got ",
+                 state_changes()) && ok
+
+    // Nested, and disjoint: the meet is empty and nothing inside it is drawn.
+    canvas_item_clear(one)
+    push_clip(one, (100.0, 100.0, 50.0, 50.0))
+    push_clip(one, (400.0, 400.0, 50.0, 50.0))
+    rect(one, (0.0, 0.0, f32(FB_W), f32(FB_H)), RED)
+    pop_clip(one)
+    rect(one, (100.0, 100.0, 10.0, 10.0), BLUE)
+    pop_clip(one)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 6, "six commands; got ", commands()) && ok
+    ok = #expect(primitives() == 1,
+                 "the rectangle inside the empty meet is dropped and the one outside it is not; got ",
+                 primitives()) && ok
+
+    // ── a moved item rebuilds the transform and does NOT break the batch ───
+    //
+    // **Both numbers below are claims about this package's own counters, and
+    // only the first is also a claim about the GPU.** `sokol_gp` multiplies
+    // every vertex by the model-view projection on the CPU as it records it,
+    // so the transform never reaches the merge test and two items at different
+    // positions merge into one draw call. `state_changes()` therefore does not
+    // move, which is what makes it a *tight* upper bound rather than merely a
+    // safe one. `transform_changes()` does move, and what it counts is the
+    // four `sokol_gp` calls that rebuild the matrix — CPU work, not a draw
+    // call. Reading the second as though it predicted a draw call is the
+    // mistake this package made until `example/drawsmoke` measured it.
+
+    Item two = canvas_item_create(d)
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    rect(two, (0.0, 0.0, 10.0, 10.0), BLUE)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(state_changes() == 1,
+                 "two items at the same transform share one batch; got ",
+                 state_changes()) && ok
+    ok = #expect(transform_changes() == 0,
+                 "and neither of them moved the transform off identity; got ",
+                 transform_changes()) && ok
+    canvas_item_set_position(two, (40.0, 0.0))
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(state_changes() == 1,
+                 "moving one of them still costs no batch break; got ",
+                 state_changes()) && ok
+    ok = #expect(transform_changes() == 1,
+                 "but this package's replay rebuilds the transform once for it; got ",
+                 transform_changes()) && ok
+
+    // ── primitives are counted as sokol_gp counts them ─────────────────────
+
+    canvas_item_free(two)
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED, false)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 4,
+                 "a hairline rectangle outline is four lines; got ",
+                 primitives()) && ok
+
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED, false, 2.0)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 4,
+                 "a thick one is four rectangles; got ", primitives()) && ok
+
+    canvas_item_clear(one)
+    polyline(one, wave[:], GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 4,
+                 "a five-point polyline is four segments; got ",
+                 primitives()) && ok
+
+    canvas_item_clear(one)
+    multiline(one, wave[:], GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 2,
+                 "five points taken in pairs is two segments; got ",
+                 primitives()) && ok
+
+    canvas_item_clear(one)
+    colored_polygon(one, wave[:], GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 3,
+                 "a five-point polygon is a three-triangle fan; got ",
+                 primitives()) && ok
+
+    // Mixing topologies is a pipeline change and is counted as one, because
+    // sokol_gp keys its pipeline on the topology and the blend mode together.
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    line(one, (0.0, 0.0), (10.0, 10.0), BLUE)
+    rect(one, (0.0, 0.0, 10.0, 10.0), GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(state_changes() == 3,
+                 "one view reset plus two topology changes; got ",
+                 state_changes()) && ok
+
+    // A blend change is one too, and going back is another.
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    set_blend(one, BLEND_ADD)
+    rect(one, (0.0, 0.0, 10.0, 10.0), BLUE)
+    reset_blend(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(state_changes() == 3,
+                 "one view reset plus two blend changes; got ",
+                 state_changes()) && ok
+
+    // ── circles are tessellated here, and the count is settled once ───────
+    //
+    // `segments_for(10.0)` is `12 + i32(10.0 * 0.75)` = 19, and a headless run
+    // reports the same 19 a GPU run draws because both read the number the
+    // recorder put in the command.
+
+    canvas_item_clear(one)
+    circle(one, (50.0, 50.0), 10.0, RED)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 19,
+                 "a filled circle of radius 10 is a 19-triangle fan; got ",
+                 primitives()) && ok
+    ok = #expect(state_changes() == 1,
+                 "and costs one view reset and no topology change; got ",
+                 state_changes()) && ok
+
+    canvas_item_clear(one)
+    circle(one, (50.0, 50.0), 10.0, RED, false)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 19,
+                 "a hairline one is 19 segments; got ", primitives()) && ok
+    ok = #expect(state_changes() == 2,
+                 "and does change the topology; got ", state_changes()) && ok
+
+    // ── an in-list transform, in both spellings, is one transform ──────────
+    //
+    // `set_transform_matrix` carries the six numbers of the affine map in the
+    // command record itself rather than in a side pool. This is what says the
+    // six are enough: the matrix spelling lands on **exactly** the transform
+    // the TRS spelling did, so the second of the two rebuilds nothing and
+    // `transform_changes()` counts one for the pair rather than two.
+
+    canvas_item_clear(one)
+    rect(one, (0.0, 0.0, 10.0, 10.0), RED)
+    set_transform(one, (7.0, 7.0), 0.5, (2.0, 3.0))
+    rect(one, (0.0, 0.0, 10.0, 10.0), BLUE)
+    set_transform_matrix(one, xform.from_trs((7.0, 7.0), 0.5, (2.0, 3.0)))
+    rect(one, (0.0, 0.0, 10.0, 10.0), GREEN)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 5 && primitives() == 3,
+                 "five commands, three rectangles: ", commands(), " ",
+                 primitives()) && ok
+    ok = #expect(state_changes() == 1,
+                 "one view reset, and neither transform breaks a batch; got ",
+                 state_changes()) && ok
+    ok = #expect(transform_changes() == 1,
+                 "one rebuild for the two spellings, because the matrix one lands on exactly the transform the TRS one did; got ",
+                 transform_changes()) && ok
+
+    // ── a texture region, and the general primitive ────────────────────────
+
+    Texture tr = texture_create(16, 16, scratch(16 * 16 * 4))
+    canvas_item_clear(one)
+    texture_rect_region(one, tr, (0.0, 0.0, 8.0, 8.0), (2.0, 3.0, 4.0, 5.0),
+                        HALF)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 1 && primitives() == 1 && state_changes() == 1,
+                 "a region of a texture is one bind and one rectangle: ",
+                 commands(), " ", primitives(), " ", state_changes()) && ok
+
+    // The claim this read-back exists for. `app:text` hands a glyph the font's
+    // **pixel** rectangle, not the uv rectangle it used to, and a consumer
+    // asserting that against its own helper is one call short of the command
+    // that carries it. Here the source rectangle comes back out of the tape
+    // itself, in the units it was written in.
+    (i32 tk, Texture tt, [4]f32 tdst, [4]f32 tsrc, [4]u8 tcol, f32 _, i32 _,
+     i32 _) = canvas_item_command(one, 0)
+    ok = #expect(tk == CMD_TEXTURE_RECT_REGION,
+                 "a region records its own kind; got ", tk) && ok
+    ok = #expect(tt == tr, "and the texture it was handed") && ok
+    ok = #expect(tdst == [0.0, 0.0, 8.0, 8.0],
+                 "the destination round-trips: ", tdst[0], " ", tdst[1], " ",
+                 tdst[2], " ", tdst[3]) && ok
+    ok = #expect(tsrc == [2.0, 3.0, 4.0, 5.0],
+                 "and so does the source, in image pixels: ", tsrc[0], " ",
+                 tsrc[1], " ", tsrc[2], " ", tsrc[3]) && ok
+    ok = #expect(tcol == HALF,
+                 "and the tint: ", tcol[0], " ", tcol[3]) && ok
+
+    // The whole-image spelling is a different kind, and its `b` is empty
+    // because the source is resolved against the live texture at render time
+    // rather than baked in here — which is what keeps a `texture_update` from
+    // staling a recorded command.
+    canvas_item_clear(one)
+    texture_rect(one, tr, (0.0, 0.0, 8.0, 8.0), HALF)
+    (i32 wk, Texture _, [4]f32 _, [4]f32 wsrc, [4]u8 _, f32 _, i32 _,
+     i32 _) = canvas_item_command(one, 0)
+    ok = #expect(wk == CMD_TEXTURE_RECT,
+                 "the whole-image spelling is its own kind; got ", wk) && ok
+    ok = #expect(wsrc == [0.0, 0.0, 0.0, 0.0],
+                 "and carries no baked-in source: ", wsrc[2], "x", wsrc[3]) && ok
+
+    [4][2]f32 quad = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+    [4][4]u8 quadcols = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
+                         [255, 255, 0, 255]]
+    [4][2]f32 quaduvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+    canvas_item_clear(one)
+    primitive(one, quad[:], quadcols[:], quaduvs[:], tr)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(commands() == 1 && primitives() == 2,
+                 "a four-point primitive is one command and two triangles: ",
+                 commands(), " ", primitives()) && ok
+
+    // The only command that fills all three lanes of a pooled point, read back
+    // one point at a time.
+    (i32 qk, Texture _, [4]f32 _, [4]f32 _, [4]u8 _, f32 _, i32 qn,
+     i32 _) = canvas_item_command(one, 0)
+    ok = #expect(qk == CMD_PRIMITIVE && qn == 4,
+                 "four points recorded; got kind ", qk, " count ", qn) && ok
+    (f32 qx, f32 qy, f32 qu, f32 qv, [4]u8 qc) = canvas_item_command_point(one, 0, 2)
+    ok = #expect(qx == 10.0 && qy == 10.0,
+                 "point 2's position: ", qx, ",", qy) && ok
+    ok = #expect(qu == 1.0 && qv == 1.0,
+                 "its texture coordinate, normalised: ", qu, ",", qv) && ok
+    ok = #expect(qc == [0, 0, 255, 255],
+                 "and its own colour: ", qc[0], " ", qc[2]) && ok
+
+    canvas_item_clear(one)
+    primitive(one, quad[:], quadcols[:], quaduvs[:], NIL_TEXTURE)
+    canvas_render(d, FB_W, FB_H)
+    ok = #expect(primitives() == 2 && state_changes() == 1,
+                 "and NIL_TEXTURE makes it untextured rather than dropping it: ",
+                 primitives(), " ", state_changes()) && ok
+    texture_free(tr)
+
+    // ── paint(i) outside the order is inert, not a fault ───────────────────
+
+    (Item oi, i32 oz, [4]u8 ot, [4]f32 oc, bool oon) = paint(99)
+    ok = #expect(oi == NIL_ITEM && oz == 0 && ot[0] == 255 && oc[2] == 0.0 && !oon,
+                 "paint(99) reads as nothing") && ok
+    (Item ni, i32 _, [4]u8 _, [4]f32 _, bool _) = paint(-1)
+    ok = #expect(ni == NIL_ITEM, "paint(-1) reads as nothing") && ok
+
+    // ── reparenting, and the one refusal ───────────────────────────────────
+
+    Item p = canvas_item_create(d)
+    Item q = canvas_item_create(d)
+    ok = #expect(canvas_item_set_parent(q, p), "q goes under p") && ok
+    ok = #expect(!canvas_item_set_parent(p, q),
+                 "and p may not then go under q") && ok
+    ok = #expect(canvas_item_set_parent(q, NIL_ITEM),
+                 "NIL_ITEM makes it a root again") && ok
+    ok = #expect(!canvas_item_set_parent(NIL_ITEM, p),
+                 "a dead handle is refused rather than asserted on") && ok
+
+    // Freeing a parent frees its children, because `app:graph.remove` frees a
+    // subtree and an item slot naming a dead node would be a handle into
+    // nothing.
+    ok = #expect(canvas_item_set_parent(q, p), "q goes back under p") && ok
+    canvas_item_free(p)
+    ok = #expect(!canvas_item_valid(p) && !canvas_item_valid(q),
+                 "freeing a parent freed its child too") && ok
+
+    canvas_free(d)
+
+    // ── textures ───────────────────────────────────────────────────────────
+
+    Texture w = texture_white()
+    ok = #expect(texture_valid(w), "the white texel is live") && ok
+    ok = #expect(texture_width(w) == 1 && texture_height(w) == 1,
+                 "and is 1x1: ", texture_width(w), "x", texture_height(w)) && ok
+    texture_free(w)
+    ok = #expect(texture_valid(texture_white()), "and cannot be freed") && ok
+
+    Texture t1 = texture_create(8, 8, scratch(8 * 8 * 4))
+    ok = #expect(texture_valid(t1), "an 8x8 RGBA8 texture was made") && ok
+    ok = #expect(texture_width(t1) == 8 && texture_height(t1) == 8,
+                 "with the size it asked for: ", texture_width(t1), "x",
+                 texture_height(t1)) && ok
+    ok = #expect(!texture_is_target(t1), "and is not a render target") && ok
+    ok = #expect(texture_update(t1, scratch(8 * 8 * 4)),
+                 "a full run updates it") && ok
+    ok = #expect(!texture_update(t1, scratch(4)), "a short one is refused") && ok
+
+    ok = #expect(texture_create(8, 8, scratch(16)) == NIL_TEXTURE,
+                 "a short pixel run is refused at creation") && ok
+    ok = #expect(texture_create(0, 8, scratch(64)) == NIL_TEXTURE,
+                 "and so is a zero dimension") && ok
+
+    ok = #expect(texture_target_create(64, 64) == NIL_TEXTURE,
+                 "a headless server has no render targets") && ok
+
+    texture_free(t1)
+    ok = #expect(!texture_valid(t1), "a freed texture is dead") && ok
+    ok = #expect(texture_width(t1) == 0, "and has no size") && ok
+    Texture t2 = texture_create(8, 8, scratch(8 * 8 * 4))
+    ok = #expect(t2.index == t1.index && t2.generation != t1.generation,
+                 "the slot comes back with a new generation") && ok
+    ok = #expect(!texture_valid(t1),
+                 "so the stale texture handle is still refused") && ok
+    texture_free(t2)
+
+    // ── the GPU counter is honest about having nothing to say ──────────────
+
+    ok = #expect(gpu_draw_calls() == 0,
+                 "a headless server reports no GPU draw calls; got ",
+                 gpu_draw_calls()) && ok
+
+    // ── nothing overflowed and nothing failed ──────────────────────────────
+
+    ok = #expect(!overflowed(), "nothing was dropped for want of room") && ok
+    ok = #expect(last_error() == "", "nothing failed: ", last_error()) && ok
+
+    shutdown()
+    ok = #expect(!ready(), "shutdown clears ready()") && ok
+    shutdown()
+    ok = #expect(init_headless(), "and the server comes back up") && ok
+    shutdown()
+
+    // ── `using` is what places every run this server owns ──────────────────
+    //
+    // The package doc comment claims that `init` takes no allocator *and*
+    // that the caller still decides where the storage goes, which is only
+    // true if `using` reaches. Nothing else here proves it, so this does, in
+    // the two places the storage is minted:
+    //
+    //   * eagerly, in `pools` — the canvas, item and paint runs and the
+    //     texture table, all inside the `init_headless` call itself;
+    //   * lazily, in `push_cmd` — an item's command tape, minted on the first
+    //     primitive recorded into it, which is an arbitrary distance from
+    //     `init` and is exactly what `g_alloc` exists for.
+    //
+    // A `Painter` brought up under an arena must spend that arena in both.
+    arena.Arena home = arena.over(#default)
+    u64 empty = arena.used(home)
+    bool up = init_headless() using arena.allocator(&home)
+    ok = #expect(up, "the server did not come up under an arena") && ok
+    u64 after_init = arena.used(home)
+    ok = #expect(after_init > empty,
+                 "init_headless under an arena put its pools somewhere else — the arena holds ",
+                 after_init) && ok
+
+    Canvas ac = canvas_create()
+    Item ai = canvas_item_create(ac)
+    u64 after_tree = arena.used(home)
+    ok = #expect(after_tree > after_init,
+                 "the canvas's node pool did not land in the arena the server came up under") && ok
+
+    rect(ai, (0.0, 0.0, 4.0, 4.0), RED)
+    ok = #expect(canvas_item_command_count(ai) == 1, "the recorded rectangle is not on the tape") && ok
+    ok = #expect(arena.used(home) > after_tree,
+                 "the command tape — minted long after init — did not land in the arena") && ok
+
+    shutdown()
+    arena.destroy(&home)
+
+    if g_scratch != nil:
+        #delete(g_scratch)
+        g_scratch = nil
+
+    // ── a float becoming a count or a pixel, at the edges ─────────────────
+    //
+    // `segments_for` caps before it converts: an absurd radius used to reach
+    // `12 + (2^31 - 1)`, an overflow and a trap. `round_i` is the scissor's
+    // rounding; a coordinate far left saturated to the `i32`'s minimum and the
+    // floor step took it one further.
+    f32 zero = 0.0
+    f32 nan = zero / zero
+    ok = #expect(segments_for(1.0e30) == 64 && segments_for(0.0 - 1.0e30) == 64,
+                 "an absurd radius gave ", segments_for(1.0e30), " segments") && ok
+    ok = #expect(segments_for(nan) == 12, "a NaN radius gave ", segments_for(nan)) && ok
+    ok = #expect(segments_for(69.0) == 63 && segments_for(69.34) == 64 && segments_for(10.0) == 19,
+                 "the cap moved: ", segments_for(69.0), " ", segments_for(69.34)) && ok
+    ok = #expect(round_i(0.0 - 1.0e30) == 0 - 2147483647 - 1,
+                 "a far-left coordinate rounded to ", round_i(0.0 - 1.0e30)) && ok
+    ok = #expect(round_i(1.0e30) == 2147483647, "a far-right coordinate rounded to ", round_i(1.0e30)) && ok
+    ok = #expect(round_i(2.5) == 3 && round_i(0.0 - 2.5) == 0 - 2 && round_i(0.0 - 2.6) == 0 - 3 && round_i(nan) == 0,
+                 "round_i is not round-half-up") && ok
+
+    if ok:
+        return 0
+    return 1
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+// A child of `parent`, created and reparented in one step — three lines at
+// every call site otherwise, and the tests above are about order rather than
+// about attaching.
+private Item child_of(Canvas c, Item parent):
+    Item it = canvas_item_create(c)
+    bool moved = canvas_item_set_parent(it, parent)
+    #assert(moved, "draw_test: child_of could not attach")
+    return it
+
+// Whether the last render's paint order is exactly these five items.
+private bool order_is(Item a, Item b, Item c, Item d, Item e):
+    if painted() != 5:
+        return false
+    return at(0) == a && at(1) == b && at(2) == c && at(3) == d && at(4) == e
+
+private Item at(i32 i):
+    (Item it, i32 _, [4]u8 _, [4]f32 _, bool _) = paint(i)
+    return it
+
+// The i-th painted item's slot index, for a failure message that says what
+// the order actually was rather than only that it was wrong. A position past
+// the end reads as -1, which is what `paint` answers there.
+private i32 ati(i32 i):
+    return at(i).index
+
+// The paint entry for `it`, or an inert one. The order moves under z, so a
+// test that wants one item's tint or clip cannot index by position.
+private (Item item, i32 z, [4]u8 tint, [4]f32 clip, bool clipped) paint_of(Item it):
+    for i in 0..<painted():
+        if at(i32(i)) == it:
+            return paint(i32(i))
+    return (NIL_ITEM, 0, (255, 255, 255, 255), (0.0, 0.0, 0.0, 0.0), false)
+
+// `n` bytes of stand-in pixels. A headless texture never looks at the
+// contents, only at how many there are, which is exactly what the size checks
+// are about.
+private ref []u8 g_scratch
+
+private []u8 scratch(i32 n):
+    if g_scratch != nil:
+        #delete(g_scratch)
+    g_scratch = #make([]u8, n, #default)
+    return g_scratch[:]

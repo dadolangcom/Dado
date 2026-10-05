@@ -1,0 +1,335 @@
+// vendor:tui — the two panes a tool needs: a table, and a log.
+//
+// Both exist because the flagship consumer needs them, and both are shaped by
+// what that consumer actually does: show a list of tests with a status and a
+// time beside each, and stream a compiler's output past while the UI stays
+// live.
+package tui
+
+import "core:chars"
+import "core:fmt"
+
+// ── table ──────────────────────────────────────────────────────────────────
+//
+// A table is a column of rows, and a row hands out **column widths** rather
+// than letting its children ask. That is the whole mechanism, and it is why
+// every widget in the library works as a cell with no table-aware variant of
+// any of them:
+//
+//     for tui.table(HEADERS[:], WIDTHS[:]):
+//         for t, i in tests:
+//             tui.push_id(i)
+//             for tui.table_row():
+//                 tui.text(t.name)
+//                 tui.dot(status_color(t))
+//                 tui.kv_text("", t.elapsed)
+//             tui.pop_id()
+//
+// Widths are given, not computed. A table that measures its own columns needs
+// to see every row before it draws the first one, which is the second pass this
+// library does not have — and a width you wrote is a width that does not jump
+// about when the data changes, which is what you wanted anyway. A width of
+// `REST` takes what the other columns left; at most one column should use it.
+
+private const i32 TABLE_GAP = 1
+
+// `string` -> `[]char8` is a written conversion and a conversion's callee must
+// be a *name*, so `[]char8(s)` is not a spelling the grammar has. One alias,
+// and `type X: T` creates no new type, so this is the same type under a name a
+// conversion can reach.
+private type Bytes: []char8
+
+// Open a table: draws the header row, then leaves a column open for the body.
+bool table([]string8 headers, []i32 widths, i32 height = REST, string8 tag = "table"):
+    if closing(tag):
+        end()
+        return false
+    u32 cand = slot_id(tag)
+    Rect at = place_container(REST, height)
+    if at.w < 4 || at.h < 2: return false
+
+    i32 n = i32(#len(widths))
+    if n > MAX_TABLE_COLS: n = MAX_TABLE_COLS
+
+    // The header. Drawn on the mantle, so the body reads as sitting under a
+    // heading rather than as one more row that happens to be bold.
+    Rect head = (at.x, at.y, at.w, 1)
+    fill_rect(head, (g_theme.subtext, g_theme.mantle, Attr.BOLD))
+    i32 x = head.x
+    i32 fixed = 0
+    for i in 0..<n:
+        if widths[i] != REST: fixed = fixed + widths[i] + TABLE_GAP
+    for i in 0..<n:
+        i32 w = widths[i]
+        if w == REST: w = at.w - fixed
+        if w < 1: w = 1
+        if x + w > head.x + head.w: break
+        if i < i32(#len(headers)):
+            _ = draw_text(x, head.y, headers[i], (g_theme.subtext, g_theme.mantle, Attr.BOLD), w)
+        x = x + w + TABLE_GAP
+
+    Rect body = (at.x, at.y + 1, at.w, at.h - 1)
+    Rect saved = push_clip(at)
+    if !open_region(cand, body, Axis.Down, 0, saved): return false
+    // The widths live on the *table's* region; `table_row` copies them onto the
+    // row it opens, which is where `place` reads them.
+    g_stack[g_depth].ncols = n
+    for i in 0..<n:
+        i32 w = widths[i]
+        if w == REST: w = at.w - fixed
+        if w < 1: w = 1
+        g_stack[g_depth].cols[i] = w
+    return true
+
+// One row of the enclosing table. Zebra striping alternates on the row index,
+// which is what makes a wide table readable across.
+// `selected` tints the row and marks it, which a table needs and a `list` has
+// already: a table whose rows can be acted on individually has to be able to
+// say which one is current, and the caller is what knows.
+bool table_row(i32 height = 1, string8 tag = "tr", bool selected = false):
+    if closing(tag):
+        end()
+        return false
+    if g_depth <= 0: return false
+    Region parent = g_stack[g_depth]
+    i32 ncols = parent.ncols
+    i32 index = parent.seq
+
+    u32 cand = slot_id(tag)
+    Rect at = place_container(REST, height)
+    if empty(at): return false
+
+    Color bg = surface_here()
+    if (index % 2) == 1: bg = mix(bg, g_theme.text, 5)
+    if hovering(at): bg = mix(bg, g_theme.accent, 14)
+    if selected: bg = mix(surface_here(), g_theme.accent, 55)
+    fill_rect(at, (g_theme.text, bg, Attr.NONE))
+
+    Rect saved = push_clip(at)
+    if !open_region(cand, at, Axis.Right, TABLE_GAP, saved): return false
+    region_bg(bg)
+    g_stack[g_depth].ncols = ncols
+    for i in 0..<ncols:
+        g_stack[g_depth].cols[i] = parent.cols[i]
+    return true
+
+// ── log ────────────────────────────────────────────────────────────────────
+//
+// A scrollback pane fed raw bytes.
+//
+// The storage is the library's, not the caller's, because the caller's job here
+// is to hand over whatever a child process just wrote — a chunk that may end
+// mid-line, may contain several lines, or may be one byte. Splitting that into
+// lines is the same code in every program that does it, so it is here.
+//
+//     private tui.Log build_log
+//     ...
+//     build_log = tui.log_open(#heap)
+//     ...
+//     [4096]char8 chunk
+//     i32 n = tui.drain(stream, chunk[:])
+//     if n > 0: tui.log_feed(&build_log, chunk[0..<n])
+//     ...
+//     tui.log(&build_log, height: tui.REST)
+
+// A byte run plus the offset each line starts at. Two growable runs rather than
+// a run of `string`s, because a `string` would point into a buffer that
+// `#append` is free to move — and a slice of moved storage is the one bug this
+// shape cannot have.
+type Log: (
+    ref []char8 bytes,
+    ref []i32 starts,
+    i32 nlines,
+    i32 budget,          // bytes kept before the oldest are dropped
+    bool partial,        // the last line has no newline yet
+)
+
+// A log over `alloc`, keeping roughly `budget` bytes of scrollback.
+Log log_open((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc, i32 budget = 262144):
+    ref []char8 b = #make([]char8, 0, alloc)
+    ref []i32 s = #make([]i32, 0, alloc)
+    return (b, s, 0, budget, false)
+
+void log_close(^Log l):
+    #delete(l.bytes)
+    #delete(l.starts)
+    l.bytes = nil
+    l.starts = nil
+    l.nlines = 0
+
+void log_clear(^Log l):
+    if l.bytes != nil: _ = #resize(l.bytes, 0)
+    if l.starts != nil: _ = #resize(l.starts, 0)
+    l.nlines = 0
+    l.partial = false
+
+// Append a chunk. It may end mid-line, hold several lines, or be one byte —
+// which is what a non-blocking read of a child process hands you.
+void log_feed(^Log l, []char8 chunk):
+    if l.bytes == nil || l.starts == nil: return
+    for c in chunk:
+        if c == '\r': continue          // a CRLF's CR is not part of the line
+        if !l.partial:
+            if !#append(l.starts, i32(#len(l.bytes))): return
+            l.nlines = l.nlines + 1
+            l.partial = true
+        if c == '\n':
+            l.partial = false
+            continue
+        if !#append(l.bytes, c): return
+    trim_log(l)
+
+// One whole line.
+//
+// `string` and `[]char8` are one representation and two types, so the text goes
+// through the same splitter a pipe's bytes do — one line-breaking rule, and a
+// line written by hand cannot behave differently from a line that arrived.
+// Ending the line is `partial = false` rather than feeding a `\n`, because a
+// one-element array *is* its element in this language and there is no `[1]T` to
+// take a window over.
+void log_say(^Log l, string8 s):
+    if l.bytes == nil: return
+    log_feed(l, Bytes(s))
+    l.partial = false
+
+// Drop the oldest lines once the budget is past. Whole lines, and from the
+// front, so a scrollback that overflows loses its history rather than its most
+// recent output — which is the half anybody is looking at.
+private void trim_log(^Log l):
+    i32 used = i32(#len(l.bytes))
+    if used <= l.budget: return
+    i32 want = l.budget / 2
+    i32 drop_from = used - want
+    i32 first = 0
+    for i in 0..<l.nlines:
+        if l.starts[i] >= drop_from:
+            first = i
+            break
+    if first <= 0: return
+    i32 cut = l.starts[first]
+    i32 left = used - cut
+    for i in 0..<left:
+        l.bytes[i] = l.bytes[cut + i]
+    _ = #resize(l.bytes, i64(left))
+    i32 kept = l.nlines - first
+    for i in 0..<kept:
+        l.starts[i] = l.starts[first + i] - cut
+    _ = #resize(l.starts, i64(kept))
+    l.nlines = kept
+
+i32 log_lines(Log l):
+    return l.nlines
+
+// One line, as a `string` window over the log's own bytes.
+//
+// **Valid until the next `log_feed`**, which may move the buffer. Read it, copy
+// it, or hand it straight to a widget; do not keep it. That is the ordinary
+// borrow bargain and it is why a `Log` stores bytes and offsets rather than a
+// run of `string`s that would have the same problem invisibly.
+string8 log_at(^Log l, i32 i):
+    if i < 0 || i >= l.nlines: return ""
+    i32 from = l.starts[i]
+    i32 to = i32(#len(l.bytes))
+    if i + 1 < l.nlines: to = l.starts[i + 1]
+    if to < from: return ""
+    string8 all = l.bytes
+    return all[from..<to]
+
+// The pane. Follows the tail unless the reader has scrolled up, which is the
+// behaviour every log viewer has and nobody thinks about until it is missing:
+// scrolling back to read something and being yanked to the bottom by the next
+// line of output is the whole reason `follow` is not simply "always".
+// What colour a log line should be. A function reference, because there are no
+// closures — and because *which* lines matter is the program's opinion and not
+// the library's: a compiler's `error:` and a test runner's `FAIL` are not a
+// vocabulary a TUI library should be claiming to know.
+//
+//     private tui.Color paint(string line):
+//         if strings.contains(line, "error"): return tui.now().err
+//         return tui.DEFAULT
+//
+//     tui.log(l: &out, paint: paint)
+//
+// `DEFAULT` means "the ordinary log colour", so a painter only has to name the
+// lines it cares about.
+type LogPaint: Color(string8)
+
+// The default painter: every line the ordinary log colour. It exists because
+// `nil` is a pointer rather than a compile-time value and so cannot be a
+// default argument — a named function can, and this one says what "no
+// painting" means out loud instead of leaving a null to be checked.
+Color plain(string8 line):
+    return DEFAULT
+
+bool log(^Log l, i32 height = REST, string8 tag = "log", LogPaint paint = plain):
+    u32 id = slot_id(tag)
+    Rect at = place(REST, height, 0, 6)
+    if empty(at): return false
+    ^Slot st = state_of(id)
+
+    i32 n = l.nlines
+    i32 max_off = n - at.h
+    if max_off < 0: max_off = 0
+
+    bool pinned = st.c == 0            // 0 means "following"; 1 means "held"
+    i32 turned = take_wheel_in(at)
+    if g_log_nudge != 0 && g_log_nudge_tag == tag:
+        turned = turned + g_log_nudge
+        g_log_nudge = 0
+    if turned != 0:
+        if pinned: st.b = max_off
+        st.b = st.b + turned
+        st.c = 1
+        if st.b >= max_off:
+            st.b = max_off
+            st.c = 0                    // scrolled back to the bottom: follow again
+    if st.c == 0: st.b = max_off
+    if st.b > max_off: st.b = max_off
+    if st.b < 0: st.b = 0
+    i32 offset = st.b
+
+    i32 body_w = at.w
+    if n > at.h: body_w = at.w - 1
+
+    Color bg = surface_here()
+    fill_rect(at, (g_theme.subtext, bg, Attr.NONE))
+    for row in 0..<at.h:
+        i32 i = offset + row
+        if i >= n: break
+        string8 line = log_at(l, i)
+        Color fg = g_theme.subtext
+        Color said = paint(line)
+        if !is_default(said): fg = said
+        _ = draw_text(at.x, at.y + row, line, (fg, bg, Attr.NONE), body_w)
+
+    draw_scrollbar(at, n, offset)
+    // A pane that is holding position says so, because a log that has silently
+    // stopped following looks exactly like a build that has stopped producing
+    // output.
+    if st.c != 0 && at.h > 0:
+        string8 mark = " held "
+        i32 w = measure(mark)
+        if w + 2 < at.w:
+            _ = draw_text(at.x + at.w - w - 1, at.y, mark, (g_theme.base, g_theme.warn, Attr.BOLD), w)
+    record(at, hovering(at), false)
+    return false
+
+// A scroll asked for from outside the pane, applied by the next `log` drawn
+// with the same tag. A keyboard binding is written at the top of a frame, far
+// from the pane, and a widget's id depends on where it is placed — so the
+// request is carried to the pane rather than aimed at its id.
+private i32 g_log_nudge
+private string8 g_log_nudge_tag = ""
+
+// Scroll the log pane opened with `tag` by `by` lines, negative for up, as
+// the wheel would: up holds the position, and reaching the bottom follows the
+// tail again. The pane takes no focus, so this is how a program gives it
+// `pgup` and `pgdn`. `tag` must outlive the frame: a literal.
+void log_scroll(string8 tag, i32 by):
+    g_log_nudge_tag = tag
+    g_log_nudge = g_log_nudge + by
+
+// Follow the tail again, from wherever the reader scrolled to.
+void log_follow(string8 tag = "log"):
+    ^Slot st = state_of(slot_id(tag))
+    st.c = 0

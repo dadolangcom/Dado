@@ -1,0 +1,312 @@
+// core:script — signals delivered to a script's handlers: what a script's
+// `connect(hits, handler)` lowers to, the watch at every safe point, and
+// `#script_pump(vm)`.
+//
+// **Dado only polls; the runtime watches.** A signal is Dado's mailbox, one
+// layout for both dialects. A script connects a handler to a package-level
+// signal of the program, and from then on this package is the signal's one
+// consumer: every `#emit`, from any thread, sets the signal's bit in the
+// program's bitmap and the any-signal bit, `SIGNAL_ANY`, in the program's
+// flag word (`dado_rt__flags`) — a word of the program's, never the engine's
+// stop word — and touches nothing else. The engine's thread reads the flag
+// word **only at safe points**: a thunk of a bound Dado function returning
+// into the script, a run — a member call, `#script_run`, `#script_new` —
+// leaving the engine, and `#script_pump(vm)`, the host's frame boundary.
+// When it is set the watch clears it, takes this VM's bits from the bitmap,
+// one word per 64 signals, and walks each signal whose bit it took, calling
+// its handler once a message, in the order they were emitted, on the
+// engine's thread. So a handler never runs in the middle of script code:
+// delivery waits for a safe point, and one handler runs to completion before
+// the next begins. A safe point reached inside a handler delivers nothing —
+// the watch is not entered twice.
+//
+// **One consumer.** A connect claims the signal's owner word for the VM —
+// `8 × (k + 1)` for engine `k`, a multiple of 8 below 1024 that no thread's
+// id can be — so a second connect from another VM answers `BUSY`, as does a
+// connect of a signal a Dado thread walks (a debug build's walk records its
+// thread there), and a Dado walk of a signal a script connected traps in a
+// debug build, naming the engine as its consumer. Connecting again from the
+// same VM replaces the handler. A VM's connections end with its engine: the
+// owner words are cleared, so another VM may connect then.
+//
+// **Several VMs share the bitmap.** A watch takes only its own VM's bits
+// (`fetch_and` with its mask), and when it sees a bit of a signal another VM
+// connected still set, it sets `SIGNAL_ANY` again, so that VM's next safe
+// point looks too. A signal no script connected — one Dado walks — is never
+// touched.
+//
+// **What a message carries.** Scalars: each field crosses as a Dado function's
+// answer does, an integer as an `int`, a float as a `float`, a `bool`, a
+// character as a one-character `string`. A signal carrying a `ref` is
+// refused at the script's `connect` (`ERR1214`): a script holds no Dado
+// allocation, and a copy made and ended for every message would hide a cost
+// the signal exists to avoid; the program drains such a signal in Dado and
+// hands the script what it needs.
+package script
+
+// How many signals of a program scripts may connect to: a VM's connections
+// are one bit each in a `u64`.
+const i32 MAX_SIGNALS = 64
+
+// How many VMs may hold connections at once: an engine's id in an owner word
+// is a multiple of 8 below 1024.
+private const i64 MAX_CONNECTING = 127
+
+// One signal a script connects to, as the glue's table lays it out: its
+// qualified name, the generated function that drains it into a handler —
+// answering 0, or `STOPPED` with the stop pending in the engine, and adding
+// how many messages it delivered to its last argument — its owner word, and
+// its index in the program's signal directory, which names its bit.
+type SignalRow: (cstring name, i32(^JSContext, JSValue, ^i64) deliver, rawptr owner, i64 index)
+
+// The glue's table: the program's flag word and bitmap, and its rows in
+// directory order.
+type SignalTable: (rawptr flags, rawptr bits, i64 count, rawptr rows)
+
+// A VM's connections: a handler per row it connected, which rows those are,
+// its id while it has any (0 for none), whether a watch is delivering, and
+// the depth of the run a `#script_pump` is, whose leaving looks no more.
+type Connections:
+    [MAX_SIGNALS]JSValue handlers,
+    u64 rows,
+    i64 id,
+    bool delivering,
+    i32 pumping,
+
+// The rows any VM has connected, one bit each; read by every watch, written
+// under the handle table's lock.
+private u64 g_connected
+// Which ids a connecting VM holds, by `id - 1`.
+private [MAX_CONNECTING]bool g_ids
+
+private ^SignalTable table_of(Engine e):
+    return ^SignalTable(rawptr(e^.signals))
+
+private SignalRow signal_row(^SignalTable t, i64 i):
+    ^SignalRow at = ^SignalRow(rawptr(#c.uintptr_t(t^.rows) + #c.uintptr_t(i) * #c.uintptr_t(#size(SignalRow))))
+    return at^
+
+private ^u32 flags_of(^SignalTable t):
+    return ^u32(t^.flags)
+
+private ^u64 bits_word(^SignalTable t, i64 w):
+    return ^u64(rawptr(#c.uintptr_t(t^.bits) + #c.uintptr_t(w) * #c.uintptr_t(8)))
+
+private u64 row_bit(i64 r):
+    return u64(1) << u64(r)
+
+private u64 signal_bit(i64 index):
+    return u64(1) << u64(index % 64)
+
+// ── `connect` ───────────────────────────────────────────────────────────────
+
+// A script's `connect(sig, handler)`: the glue's thunk for the signal at row
+// `row` calls this with the handler. Claims the signal for this VM and keeps
+// the handler; answers `undefined`, or throws — `BUSY` when another VM, or a
+// thread of Dado's, consumes the signal.
+JSValue connect_signal(^JSContext ctx, JSValue handler, i64 row):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    ^SignalTable t = table_of(e)
+    SignalRow r = signal_row(t, row)
+    if !JS_IsFunction(ctx, handler):
+        _ = JS_ThrowTypeError(ctx, "`connect` takes the signal and a function to call with each message, and its second argument is no function")
+        return raised()
+    if row >= i64(MAX_SIGNALS):
+        return raise_code(ctx, NO_MEMORY, "`%s` is past the 64 signals a program's scripts may connect to", r.name)
+    if !connecting_id(e):
+        return raise_code(ctx, BUSY, "`%s` cannot be connected: 127 VMs hold connections already", r.name)
+    ^u64 owner = ^u64(r.owner)
+    u64 mine = u64(e^.connections.id) * 8
+    (u64 was, bool claimed) = #atomic_compare_exchange(owner, u64(0), mine, false, #ACQ_REL, #ACQUIRE)
+    if !claimed && was != mine:
+        if was < 1024:
+            return raise_code(ctx, BUSY, "`%s` already has a consumer: another VM's script connected a handler to it — a signal has one consumer, so connect it in one VM, or give each VM a signal of its own", r.name)
+        return raise_code(ctx, BUSY, "`%s` already has a consumer: Dado walks it with `#peek` or `#drain` on a thread of its own — a signal has one consumer, so walk it in Dado or connect a script to it, not both", r.name)
+    if (e^.connections.rows & row_bit(row)) != 0:
+        JS_FreeValue(ctx, e^.connections.handlers[row])
+    e^.connections.handlers[row] = JS_DupValue(ctx, handler)
+    e^.connections.rows = e^.connections.rows | row_bit(row)
+    table_lock()
+    g_connected = g_connected | row_bit(row)
+    table_unlock()
+    // What was emitted before the connect is delivered at the next safe
+    // point, as what comes after it is.
+    _ = #atomic_fetch_or(flags_of(t), u32(1), #RELEASE)
+    return undefined()
+
+// This VM's id for an owner word, taken the first time it connects; false
+// when every id is held.
+private bool connecting_id(Engine e):
+    if e^.connections.id != 0:
+        return true
+    table_lock()
+    for i in 0..<MAX_CONNECTING:
+        if !g_ids[i]:
+            g_ids[i] = true
+            e^.connections.id = i + 1
+            table_unlock()
+            return true
+    table_unlock()
+    return false
+
+// The engine's heap is ending: every handler released and every signal it
+// consumed let go of, so another VM may connect to it.
+private void disconnect_all(Engine e):
+    if e^.signals == nil || e^.connections.id == 0:
+        return
+    ^SignalTable t = table_of(e)
+    u64 mine = u64(e^.connections.id) * 8
+    for r in 0..<t^.count:
+        if r >= i64(MAX_SIGNALS):
+            break
+        if (e^.connections.rows & row_bit(r)) == 0:
+            continue
+        JS_FreeValue(e^.ctx, e^.connections.handlers[r])
+        e^.connections.handlers[r] = undefined()
+        ^u64 owner = ^u64(signal_row(t, r).owner)
+        _ = #atomic_compare_exchange(owner, mine, u64(0), false, #ACQ_REL, #ACQUIRE)
+    table_lock()
+    g_connected = g_connected & ~e^.connections.rows
+    g_ids[e^.connections.id - 1] = false
+    table_unlock()
+    e^.connections.rows = 0
+    e^.connections.id = 0
+
+// ── The watch ───────────────────────────────────────────────────────────────
+
+// Whether a safe point on `e` has anything to look at: the VM connected a
+// handler and the flag word says a mailbox changed. One load when it has.
+private bool signalled(Engine e):
+    if e^.connections.rows == 0 || e^.connections.delivering:
+        return false
+    return (#atomic_load(flags_of(table_of(e)), #RELAXED) & u32(1)) != 0
+
+// A safe point's look: `SIGNAL_ANY` cleared, then this VM's bits taken, a
+// word at a time, and each signal whose bit was taken drained into its
+// handler. Answers 0, or `STOPPED` with the stop pending in the engine — the
+// handler that met it was the last one called; `delivered` counts messages.
+private i32 watch(Engine e, ^i64 delivered):
+    if !signalled(e):
+        return 0
+    ^SignalTable t = table_of(e)
+    _ = #atomic_fetch_and(flags_of(t), ~u32(1), #ACQ_REL)
+    e^.connections.delivering = true
+    table_lock()
+    u64 others = g_connected & ~e^.connections.rows
+    table_unlock()
+    bool again = false
+    i32 got = 0
+    i64 count = t^.count
+    if count > i64(MAX_SIGNALS):
+        count = i64(MAX_SIGNALS)
+    i64 r = 0
+    for r < count && got == 0:
+        i64 w = signal_row(t, r).index / 64
+        u64 mask = 0
+        u64 theirs = 0
+        i64 end = r
+        for end < count && signal_row(t, end).index / 64 == w:
+            u64 b = signal_bit(signal_row(t, end).index)
+            if (e^.connections.rows & row_bit(end)) != 0:
+                mask = mask | b
+            else if (others & row_bit(end)) != 0:
+                theirs = theirs | b
+            end += 1
+        if mask != 0 || theirs != 0:
+            ^u64 word = bits_word(t, w)
+            u64 old = 0
+            if mask != 0:
+                old = #atomic_fetch_and(word, ~mask, #ACQ_REL)
+            else:
+                old = #atomic_load(word, #ACQUIRE)
+            if (old & theirs) != 0:
+                again = true
+            for k in r..<end:
+                if got != 0:
+                    break
+                SignalRow row = signal_row(t, k)
+                if (e^.connections.rows & row_bit(k)) != 0 && (old & signal_bit(row.index)) != 0:
+                    i64 n = 0
+                    got = row.deliver(e^.ctx, e^.connections.handlers[k], &n)
+                    if delivered != nil:
+                        delivered^ += n
+        r = end
+    e^.connections.delivering = false
+    if again:
+        _ = #atomic_fetch_or(flags_of(t), u32(1), #RELEASE)
+    return got
+
+// One message into a handler, from a signal's generated drain: `argv` its
+// fields, which this takes. Answers 0, or `STOPPED` with the stop pending; a
+// handler's own failure is written to the error sink, naming the signal, and
+// the next message goes on.
+i32 deliver_one(^JSContext ctx, JSValue handler, i32 argc, ^JSValue argv, cstring signal):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    JSValue r = JS_Call(ctx, handler, undefined(), argc, argv)
+    for i in 0..<argc:
+        JS_FreeValue(ctx, nth(argv, i))
+    if !is_exception(r):
+        JS_FreeValue(ctx, r)
+        return 0
+    if stop_pending(e):
+        return STOPPED
+    text_begin(e^.err)
+    err_put(e^.err, "script: the handler connected to `")
+    err_put(e^.err, string8(signal))
+    err_put(e^.err, "` failed:\n")
+    report(e)
+    return 0
+
+// Whether the exception pending is the stop — forced, or the polite one the
+// script did not catch — left pending for whoever goes on.
+private bool stop_pending(Engine e):
+    if forced(e):
+        return true
+    JSValue ex = JS_GetException(e^.ctx)
+    bool stopped = false
+    if (word_of(e) & ASK) != 0 && i32(ex.tag) == JS_TAG_OBJECT:
+        JSValue c = JS_GetPropertyStr(e^.ctx, ex, "code")
+        stopped = i32(c.tag) == JS_TAG_INT && c.u.int32 == STOPPED
+        forget_exception(e, c)
+        JS_FreeValue(e^.ctx, c)
+    _ = JS_Throw(e^.ctx, ex)
+    return stopped
+
+// A run leaving: its safe point. A stop met by a handler is the host's own
+// doing, and there is no script frame left to raise it in, so it is dropped.
+private void watch_leaving(Engine e):
+    if e^.connections.pumping != 0 && e^.connections.pumping == e^.stop.running:
+        // A pump's own leaving: it looked already, and what it answers is
+        // what that look delivered.
+        e^.connections.pumping = 0
+        return
+    if !signalled(e) || e^.stop.ended || forced(e):
+        return
+    if watch(e, nil) != 0:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+
+// `#script_pump(vm)`: the host's frame boundary — the VM entered, and every
+// message waiting for its handlers delivered. Answers how many, or, when the
+// VM could not be entered, the reserved code that says why (`THREAD`,
+// `STALE`, `STOPPED`, `BUSY`), a negative number, its text on the error sink.
+i64 pump_engine(rawptr vm):
+    Slot at
+    if !slot_read(vm, &at):
+        no_script(vm)
+        return i64(STALE)
+    Engine e = at.engine
+    try enter(e) else code:
+        return i64(code)
+    // The frame boundary: the crossing counters begin again.
+    frame_begin(e)
+    i64 n = 0
+    i32 got = watch(e, &n)
+    e^.connections.pumping = e^.stop.running
+    if got != 0:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+        leave(e)
+        return i64(STOPPED)
+    leave(e)
+    return n

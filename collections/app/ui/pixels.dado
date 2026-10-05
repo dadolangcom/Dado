@@ -1,0 +1,420 @@
+// app:ui — free pixels inside a cell layout: the ink API, the `PixelBox`
+// widget, and the built-in icons.
+//
+// ── Ink ────────────────────────────────────────────────────────────────────
+//
+// **Ink is what a widget draws in pixels rather than cells**: filled
+// rectangles, lines, triangles, convex polygons, circles and rounded
+// rectangles, in framebuffer pixels (cell `(c, r)` is pixels `c * cell_w` ..
+// across and `r * cell_h` .. down; `cell_pixels` converts). It is tessellated
+// once, into the grid's retained ink list for the node (`grid.ink_make`), and
+// replayed by every drawn frame.
+//
+// **A node's ink is rebuilt by its paint, and only by its paint.** A paint
+// hook opens the node's list with `ink_begin(c, clip)` — which empties it,
+// points it at the node's layer and scissors it to `clip`, the cells this
+// paint may write — then draws with the `ink_*` calls and `draw_icon`, and
+// closes it with `ink_end` (the paint walk closes a list its hook left open).
+// Outside an open list every `ink_*` call does nothing. So ink changes exactly
+// when the node repaints: when it was marked, when its rectangle or clip
+// moved (which repaints it), or when an ancestor repainted over it. An idle
+// frame paints nothing and so tessellates nothing. The tree empties the list
+// of a node that leaves the picture unpainted — it or an ancestor hidden, or
+// clipped away — as it does for a scrolling region (`hide_regions`), and
+// frees it with the node.
+//
+// **Draw order: ink goes over its layer's cells.** The grid draws each layer
+// as its chrome, its cells, its scrolling regions, then its ink, and only
+// then the next layer. Ink under the cells would be hidden by any opaque
+// background, and ink between the backgrounds and the glyphs has no place in
+// a one-pass instanced draw; drawn after, an icon sits on the row's
+// background the way a glyph does — a selected row's highlight runs under
+// it — and a floating layer above still covers it. The scissor is the node's
+// clip in pixels, so no ancestor's cut and no other layer's cells are
+// crossed.
+//
+// ── PixelBox ───────────────────────────────────────────────────────────────
+//
+// A cell-aligned box whose whole interior is a program's picture. Its paint
+// marks every cell of its clip `cell.REGION_PUNCH` with both colours
+// transparent — the grid's shader draws nothing for such a cell — and then
+// runs the program's `PixelDrawFn` into the node's ink list, with the node's
+// rectangle and its visible part in pixels. So what the drawing leaves
+// uncovered shows what lies under the layer's cells (its chrome, and the
+// layers below) rather than a cell background, and a picture that wants a
+// background inks one first. The draw function runs on the box's repaints
+// only: `pixel_box_changed` asks for one; `pixel_box_draws` counts them.
+//
+// ── Icons ──────────────────────────────────────────────────────────────────
+//
+// `draw_icon(kind, rect, colour)` draws one of the `Icon` set with the ink
+// calls, into whatever list is open: inside a pixel box's draw function, or
+// from any widget's paint between `ink_begin` and `ink_end`, one call per
+// icon, with no node per icon. An icon is drawn in the largest square that
+// fits the rect, centred, on a 16-unit design grid; the shading of a folder's
+// back and a page's fold is the colour darkened (`ink_shade`).
+package ui
+
+import "app:ui/cell"
+import "app:ui/grid"
+import "core:math"
+
+// A rectangle in framebuffer pixels.
+type PixelRect: (i32 x, i32 y, i32 w, i32 h)
+
+// A point in framebuffer pixels.
+type InkPoint: (f32 x, f32 y)
+
+// The pixels cell rectangle `r` covers at the grid's cell size now; the
+// empty rectangle at a cell size of zero.
+PixelRect cell_pixels(cell.CellRect r):
+    i32 cw = grid.cell_w()
+    i32 ch = grid.cell_h()
+    PixelRect p = (r.col * cw, r.row * ch, r.cols * cw, r.rows * ch)
+    if cell.is_empty(r) || cw <= 0 || ch <= 0:
+        PixelRect none = (0, 0, 0, 0)
+        return none
+    return p
+
+// ── The open list ──────────────────────────────────────────────────────────
+
+private bool g_ink_open
+private i32  g_ink_id = -1
+
+// From a paint hook: open `c`'s ink list for rebuilding — made at the first
+// call, emptied on every one, drawn with the layer `c` paints into and
+// scissored to `clip`'s pixels — and answer whether it is open. False outside
+// the paint walk, for a dead handle, and when no list can be made (the grid
+// is not up).
+bool ink_begin(Control c, cell.CellRect clip):
+    i32 i = index(c)
+    ink_end()
+    if i < 0 || g_phase != PHASE_PAINT:
+        return false
+    i32 id = g_nodes[i].ink
+    if id >= 0 && !grid.ink_valid(id):
+        g_nodes[i].ink = -1
+        g_ink_nodes = g_ink_nodes - 1
+        watch_sync(i)
+        id = -1
+    if id < 0:
+        id = grid.ink_make(g_nodes[i].layer)
+        if id < 0:
+            return false
+        g_nodes[i].ink = id
+        g_ink_nodes = g_ink_nodes + 1
+        watch_sync(i)
+    grid.ink_set_layer(id, g_nodes[i].layer)
+    grid.ink_clear(id)
+    PixelRect p = cell_pixels(clip)
+    grid.ChromeRect sc = (p.x, p.y, p.w, p.h)
+    grid.ink_set_scissor(id, sc)
+    g_ink_open = true
+    g_ink_id = id
+    return true
+
+// Close the open ink list, if any.
+void ink_end():
+    g_ink_open = false
+    g_ink_id = -1
+
+// The grid ink list `c`'s paint rebuilds, -1 before its first `ink_begin` and
+// for a dead handle: for an instrument or a test to read with `grid.ink_*`.
+i32 node_ink(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return -1
+    return g_nodes[i].ink
+
+// ── The ink calls ──────────────────────────────────────────────────────────
+
+private void tri(f32 ax, f32 ay, f32 bx, f32 by, f32 cx, f32 cy, [4]u8 col):
+    if !g_ink_open || col[3] == 0:
+        return
+    grid.ChromePt a = (ax, ay)
+    grid.ChromePt b = (bx, by)
+    grid.ChromePt c = (cx, cy)
+    grid.ChromeTri t = (a, b, c, col)
+    _ = grid.ink_add(g_ink_id, t)
+
+// A filled axis-aligned rectangle.
+void ink_rect(f32 x, f32 y, f32 w, f32 h, [4]u8 col):
+    if !(w > 0.0) || !(h > 0.0):
+        return
+    tri(x, y, x + w, y, x + w, y + h, col)
+    tri(x, y, x + w, y + h, x, y + h, col)
+
+// A filled triangle.
+void ink_triangle(f32 ax, f32 ay, f32 bx, f32 by, f32 cx, f32 cy, [4]u8 col):
+    tri(ax, ay, bx, by, cx, cy, col)
+
+// A line `width` pixels thick from `(x0, y0)` to `(x1, y1)`, with square caps
+// reaching half the width past each end, so two lines meeting at a point
+// join with no notch. A line of no length or width draws nothing.
+void ink_line(f32 x0, f32 y0, f32 x1, f32 y1, f32 width, [4]u8 col):
+    f64 dx = f64(x1 - x0)
+    f64 dy = f64(y1 - y0)
+    f64 len = math.length(dx, dy)
+    if !(len > 0.0) || !(width > 0.0):
+        return
+    f64 h = f64(width) * 0.5
+    f32 ux = f32(dx / len * h)
+    f32 uy = f32(dy / len * h)
+    // Along the line by `(ux, uy)`, across it by `(-uy, ux)`.
+    f32 ax = x0 - ux - uy
+    f32 ay = y0 - uy + ux
+    f32 bx = x1 + ux - uy
+    f32 by = y1 + uy + ux
+    f32 cx = x1 + ux + uy
+    f32 cy = y1 + uy - ux
+    f32 ex = x0 - ux + uy
+    f32 ey = y0 - uy - ux
+    tri(ax, ay, bx, by, cx, cy, col)
+    tri(ax, ay, cx, cy, ex, ey, col)
+
+// A filled convex polygon, as a fan from its first point: `n - 2` triangles.
+// Fewer than three points draw nothing; a concave outline is drawn as its fan
+// is, which is the caller's to avoid.
+void ink_polygon([]InkPoint pts, [4]u8 col):
+    i64 n = #len(pts)
+    if n < 3:
+        return
+    for i in 1..<(n - 1):
+        tri(pts[0].x, pts[0].y, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y, col)
+
+// A filled circle of radius `r` about `(cx, cy)`: a fan of four times the
+// chords `grid.corner_segments` cuts a quarter of it into, at least eight.
+void ink_circle(f32 cx, f32 cy, f32 r, [4]u8 col):
+    if !(r > 0.0):
+        return
+    i32 segs = grid.corner_segments(r) * 4
+    if segs < 8:
+        segs = 8
+    f64 step = math.PI * 2.0 / f64(segs)
+    f32 px = cx + r
+    f32 py = cy
+    for k in 1..=segs:
+        f64 a = step * f64(k)
+        f32 qx = cx + r * f32(math.cosine(a))
+        f32 qy = cy + r * f32(math.sine(a))
+        tri(cx, cy, px, py, qx, qy, col)
+        px = qx
+        py = qy
+
+// A filled rectangle with corners of radius `r` (held to half its shorter
+// side): the grid's rounded outline, filled as a fan from the centre. A
+// radius of zero is `ink_rect`.
+void ink_round_rect(f32 x, f32 y, f32 w, f32 h, f32 r, [4]u8 col):
+    if !(w > 0.0) || !(h > 0.0):
+        return
+    f32 cr = grid.clamp_radius(r, w, h)
+    if cr == 0.0:
+        ink_rect(x, y, w, h, col)
+        return
+    [grid.MAX_OUTLINE_POINTS]grid.ChromePt pts
+    [4]f32 rr = [cr, cr, cr, cr]
+    i32 m = grid.rounded_outline(x, y, w, h, rr, rr, grid.corner_segments(cr), pts[:])
+    f32 mx = x + w * 0.5
+    f32 my = y + h * 0.5
+    for i in 0..<m:
+        i32 j = (i32(i) + 1) % m
+        tri(mx, my, pts[i].x, pts[i].y, pts[j].x, pts[j].y, col)
+
+// `col` with its red, green and blue scaled by `k` (held to `[0, 1]`), alpha
+// kept: the darker tone an icon shades with.
+[4]u8 ink_shade([4]u8 col, f32 k):
+    f32 f = k
+    if !(f > 0.0):
+        f = 0.0
+    if f > 1.0:
+        f = 1.0
+    [4]u8 o = [u8(f32(col[0]) * f), u8(f32(col[1]) * f), u8(f32(col[2]) * f), col[3]]
+    return o
+
+// ── Icons ──────────────────────────────────────────────────────────────────
+
+enum Icon: (
+    None         = 0,
+    FolderClosed = 1,
+    FolderOpen   = 2,
+    File         = 3,
+    ChevronRight = 4,
+    ChevronDown  = 5,
+)
+
+// The square an icon is drawn in: origin and one design unit (a sixteenth of
+// its side).
+private type IconGrid: (f32 x, f32 y, f32 u)
+
+private IconGrid icon_grid(PixelRect r):
+    i32 s = r.w
+    if r.h < s:
+        s = r.h
+    IconGrid g = (f32(r.x) + f32(r.w - s) * 0.5, f32(r.y) + f32(r.h - s) * 0.5, f32(s) / 16.0)
+    return g
+
+private f32 gx(IconGrid g, f32 v):
+    return g.x + v * g.u
+
+private f32 gy(IconGrid g, f32 v):
+    return g.y + v * g.u
+
+private void icon_rect(IconGrid g, f32 x0, f32 y0, f32 x1, f32 y1, [4]u8 col):
+    ink_rect(gx(g, x0), gy(g, y0), (x1 - x0) * g.u, (y1 - y0) * g.u, col)
+
+private void icon_line(IconGrid g, f32 x0, f32 y0, f32 x1, f32 y1, f32 w, [4]u8 col):
+    ink_line(gx(g, x0), gy(g, y0), gx(g, x1), gy(g, y1), w * g.u, col)
+
+// Draw icon `kind` in the largest square that fits `r`, centred, in `col`,
+// into the open ink list. `Icon.None`, an empty rect and a closed list draw
+// nothing.
+void draw_icon(Icon kind, PixelRect r, [4]u8 col):
+    if !g_ink_open || r.w <= 0 || r.h <= 0:
+        return
+    IconGrid g = icon_grid(r)
+    [4]u8 dark = ink_shade(col, 0.62)
+    if kind == Icon.FolderClosed:
+        // The tab, then the body over its foot.
+        [4]InkPoint tab
+        tab[0] = (gx(g, 1.0), gy(g, 3.0))
+        tab[1] = (gx(g, 6.0), gy(g, 3.0))
+        tab[2] = (gx(g, 7.5), gy(g, 5.0))
+        tab[3] = (gx(g, 1.0), gy(g, 5.0))
+        ink_polygon(tab[:], col)
+        ink_round_rect(gx(g, 1.0), gy(g, 4.5), 14.0 * g.u, 8.5 * g.u, g.u, col)
+        return
+    if kind == Icon.FolderOpen:
+        // The back in shade with its tab, the front leaning open over it.
+        [4]InkPoint tab
+        tab[0] = (gx(g, 1.0), gy(g, 3.0))
+        tab[1] = (gx(g, 6.0), gy(g, 3.0))
+        tab[2] = (gx(g, 7.5), gy(g, 5.0))
+        tab[3] = (gx(g, 1.0), gy(g, 5.0))
+        ink_polygon(tab[:], dark)
+        icon_rect(g, 1.0, 4.5, 14.0, 13.0, dark)
+        [4]InkPoint front
+        front[0] = (gx(g, 3.5), gy(g, 7.0))
+        front[1] = (gx(g, 16.0), gy(g, 7.0))
+        front[2] = (gx(g, 13.5), gy(g, 13.0))
+        front[3] = (gx(g, 1.0), gy(g, 13.0))
+        ink_polygon(front[:], col)
+        return
+    if kind == Icon.File:
+        // A page with its top-right corner folded, and three lines of text.
+        [5]InkPoint page
+        page[0] = (gx(g, 3.0), gy(g, 1.0))
+        page[1] = (gx(g, 9.5), gy(g, 1.0))
+        page[2] = (gx(g, 13.0), gy(g, 4.5))
+        page[3] = (gx(g, 13.0), gy(g, 15.0))
+        page[4] = (gx(g, 3.0), gy(g, 15.0))
+        ink_polygon(page[:], col)
+        ink_triangle(gx(g, 9.5), gy(g, 1.0), gx(g, 13.0), gy(g, 4.5), gx(g, 9.5), gy(g, 4.5), dark)
+        icon_rect(g, 5.0, 7.0, 11.0, 8.0, dark)
+        icon_rect(g, 5.0, 9.5, 11.0, 10.5, dark)
+        icon_rect(g, 5.0, 12.0, 9.0, 13.0, dark)
+        return
+    if kind == Icon.ChevronRight:
+        icon_line(g, 6.0, 4.0, 10.0, 8.0, 1.75, col)
+        icon_line(g, 10.0, 8.0, 6.0, 12.0, 1.75, col)
+        return
+    if kind == Icon.ChevronDown:
+        icon_line(g, 4.0, 6.0, 8.0, 10.0, 1.75, col)
+        icon_line(g, 8.0, 10.0, 12.0, 6.0, 1.75, col)
+        return
+
+// ── PixelBox ───────────────────────────────────────────────────────────────
+
+// A pixel box's picture: given the context the box was made with, the box's
+// whole rectangle and the part of it in view, both in framebuffer pixels. It
+// draws with the `ink_*` calls and `draw_icon`; ink outside the part in view
+// is cut by the scissor.
+type PixelDrawFn: void(rawptr, PixelRect, PixelRect)
+
+private type PixBoxState: (
+    PixelDrawFn draw,
+    rawptr      ctx,
+    i32         cols,
+    i32         rows,
+    i64         draws,
+)
+private type PixBoxPtr: ^PixBoxState
+
+private Kind g_pixbox_kind = NO_KIND
+
+private Kind pixbox_kind():
+    if !kind_ok(g_pixbox_kind):
+        Hooks h
+        h.measure = pixbox_measure
+        h.paint = pixbox_paint
+        g_pixbox_kind = register_kind("pixel_box", h)
+    return g_pixbox_kind
+
+private bool is_pixel_box(Control c):
+    return kind(c) == g_pixbox_kind && state(c) != nil
+
+private cell.CellPoint pixbox_measure(Control c, rawptr st):
+    _ = c
+    ^PixBoxState s = PixBoxPtr(st)
+    cell.CellPoint p = (s.cols, s.rows)
+    return p
+
+private void pixbox_paint(Control c, rawptr st, cell.CellRect clip):
+    ^PixBoxState s = PixBoxPtr(st)
+    [4]u8 none = [0, 0, 0, 0]
+    cell.Cell hole = (0, cell.REGION_PUNCH, none, none)
+    grid.clip(clip)
+    for row in clip.row..<(clip.row + clip.rows):
+        for col in clip.col..<(clip.col + clip.cols):
+            grid.put(i32(col), i32(row), hole)
+    grid.unclip()
+    if !ink_begin(c, clip):
+        return
+    s.draws = s.draws + 1
+    if s.draw != nil:
+        s.draw(s.ctx, cell_pixels(rect(c)), cell_pixels(clip))
+    ink_end()
+
+// A pixel box under `parent` (under the root for `NIL`) with a minimum of
+// `cols` x `rows` cells (negatives read as zero), drawn by `draw` with `ctx`;
+// not focusable, not expanding. `NIL` wherever `create` would answer it.
+Control pixel_box(Control parent, i32 cols, i32 rows, PixelDrawFn draw, rawptr ctx):
+    Control c = create_owned(pixbox_kind(), parent, i64(#size(PixBoxState)))
+    if !valid(c):
+        return NIL
+    ^PixBoxState s = PixBoxPtr(state(c))
+    s.draw = draw
+    s.ctx = ctx
+    s.cols = clamp0(cols)
+    s.rows = clamp0(rows)
+    return c
+
+// Draw the box with `draw` and `ctx` from its next repaint on, and ask for
+// that repaint. Does nothing to anything that is not a pixel box.
+void pixel_box_set_draw(Control c, PixelDrawFn draw, rawptr ctx):
+    if !is_pixel_box(c):
+        return
+    ^PixBoxState s = PixBoxPtr(state(c))
+    s.draw = draw
+    s.ctx = ctx
+    mark_paint(c)
+
+// The picture changed: repaint the box, which runs its draw function again.
+void pixel_box_changed(Control c):
+    if is_pixel_box(c):
+        mark_paint(c)
+
+// Give the box a new minimum, in cells. Does nothing while `update` runs.
+void pixel_box_set_size(Control c, i32 cols, i32 rows):
+    if !is_pixel_box(c) || g_phase != PHASE_IDLE:
+        return
+    ^PixBoxState s = PixBoxPtr(state(c))
+    s.cols = clamp0(cols)
+    s.rows = clamp0(rows)
+    mark_layout(c)
+
+// How many times the box has rebuilt its ink (run its draw function, or would
+// have with none set); 0 for anything that is not a pixel box.
+i64 pixel_box_draws(Control c):
+    if !is_pixel_box(c):
+        return 0
+    return PixBoxPtr(state(c)).draws

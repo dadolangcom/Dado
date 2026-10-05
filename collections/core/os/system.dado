@@ -1,0 +1,331 @@
+// The process's arguments, its environment, who and where it is, and whether
+// a person is at the other end of a stream — every one of them over `string8`,
+// and every one written per system.
+//
+//     i32 main(i32 argc, ^rawptr argv):
+//         for a in os.args(argc, argv):
+//             println(a)
+//         (ref []char8 home, bool found) = os.get_env("HOME")
+//         defer #delete(home)
+//
+// **Names and values are UTF-8 on every system.** Linux and macOS hand a
+// program bytes, which are passed through. Windows keeps its command line and
+// its environment in UTF-16, so the Windows arm asks for the `W` forms and
+// converts with `WideCharToMultiByte(CP_UTF8, …)` on the way in and
+// `MultiByteToWideChar` on the way out. A UTF-16 unit that is half of no pair
+// cannot be UTF-8 and arrives as U+FFFD.
+//
+// **Allocation is the caller's ambient allocator** (`using`), except for
+// `args`, whose answer lives for the whole process and is made once on the
+// heap. A `ref []char8` answer is the caller's to `#delete`.
+//
+// Thread-safety: `args` must be called first from one thread (normally
+// `main`); after that it only reads. The environment is one table per process
+// and neither POSIX nor Windows makes changing it safe while another thread
+// reads it, so `set_env` and `unset_env` belong before threads start. `pid`,
+// `is_terminal` and the directory questions are safe from any thread.
+package os
+
+// ── what the arms share ─────────────────────────────────────────────────────
+
+// Whether `name` is one an environment can hold: not empty, and with no `=`
+// (which ends a name in the table) or `\0` (which ends the string at C).
+private bool env_name_ok(string8 name):
+    if #len(name) == 0: return false
+    for c in name:
+        if c == '=' || c == '\0': return false
+    return true
+
+// `s` with a `\0` after it, for a C call; the caller deletes it.
+private ref []char8 terminated(string8 s):
+    ref []char8 out = #make([]char8, #len(s) + 1)
+    for i in 0..<#len(s):
+        out[i] = s[i]
+    out[#len(s)] = '\0'
+    return out
+
+// An owned copy of `s`; the caller deletes it.
+private ref []char8 owned(string8 s):
+    ref []char8 out = #make([]char8, #len(s))
+    for i in 0..<#len(s):
+        out[i] = s[i]
+    return out
+
+// The process's arguments, made once.
+private ref []string8 g_args
+private bool g_args_made
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+//
+// `<windows.h>` as MinGW-w64 ships it, which is what `zig cc -target
+// x86_64-windows-gnu` compiles against. `DWORD` is `unsigned long` (32 bits),
+// `BOOL` is `int`, a `HANDLE` is a `void *`, and a `WCHAR` is a 16-bit
+// `wchar_t`, `unsigned short` in C and `u16` here. `CommandLineToArgvW` is
+// `<shellapi.h>`'s, which `WIN32_LEAN_AND_MEAN` leaves out of `<windows.h>`, and
+// lives in `shell32`.
+when #OS == #WINDOWS:
+    private foreign wsys "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        const #c.uint CP_UTF8
+        const #c.ulong STD_INPUT_HANDLE
+        const #c.ulong STD_OUTPUT_HANDLE
+        const #c.ulong STD_ERROR_HANDLE
+        const #c.long ERROR_ENVVAR_NOT_FOUND
+        #c.int MultiByteToWideChar(#c.uint code_page, #c.ulong flags, cstring from, #c.int from_count, ^u16 into, #c.int into_count)
+        #c.int WideCharToMultiByte(#c.uint code_page, #c.ulong flags, ^const u16 from, #c.int from_count, ^#c.char into, #c.int into_count, cstring default_char, ^#c.int used_default)
+        ^u16 GetCommandLineW()
+        rawptr LocalFree(rawptr block)
+        #c.ulong GetEnvironmentVariableW(^const u16 name, ^u16 into, #c.ulong size)
+        #c.int SetEnvironmentVariableW(^const u16 name, ^const u16 value)
+        #c.ulong GetTempPathW(#c.ulong size, ^u16 into)
+        #c.ulong GetCurrentProcessId()
+        rawptr GetStdHandle(#c.ulong which)
+        #c.int GetConsoleMode(rawptr console, ^#c.ulong mode)
+        #c.ulong GetLastError()
+        void SetLastError(#c.ulong code)
+
+    private foreign wshell "shellapi.h" link "-lshell32":
+        ^^u16 CommandLineToArgvW(^const u16 line, ^#c.int count)
+
+    // The C runtime keeps a copy of the environment of its own, read by
+    // `getenv` (and so by `env` and `has_env` above), which
+    // `SetEnvironmentVariableW` does not reach. `_wputenv_s` changes that copy
+    // and the system's together, so both readers agree.
+    private foreign wcrt "stdlib.h":
+        #c.int _wputenv_s(^const u16 name, ^const u16 value)
+
+    private foreign wstr "wchar.h":
+        #c.size_t wcslen(^const u16 s)
+
+    // A byte buffer handed to C as the `char *` the header declares.
+    private type CharBuf: ^#c.char
+
+    // `text` as UTF-16 with its terminator. Empty when the conversion failed,
+    // which every caller treats as the call failing.
+    private ref []u16 widen(string8 text):
+        i64 n = #len(text)
+        if n == 0:
+            ref []u16 nothing = #make([]u16, 1)
+            nothing[0] = 0
+            return nothing
+        // A string's bytes have no address to hand out, so C reads a copy.
+        ref []char8 bytes = terminated(text)
+        defer #delete(bytes)
+        #c.int units = wsys.MultiByteToWideChar(wsys.CP_UTF8, 0, cstring(bytes), #c.int(n), nil, 0)
+        if units <= 0: return #make([]u16, 0)
+        ref []u16 wide = #make([]u16, i64(units) + 1)
+        #c.int wrote = wsys.MultiByteToWideChar(wsys.CP_UTF8, 0, cstring(bytes), #c.int(n), &wide[0], units)
+        if wrote != units:
+            #delete(wide)
+            return #make([]u16, 0)
+        wide[i64(units)] = 0
+        return wide
+
+    // `count` UTF-16 units at `wide` as UTF-8, with no terminator.
+    private ref []char8 narrow(^u16 wide, i64 count):
+        if wide == nil || count <= 0: return #make([]char8, 0)
+        #c.int bytes = wsys.WideCharToMultiByte(wsys.CP_UTF8, 0, wide, #c.int(count), nil, 0, nil, nil)
+        if bytes <= 0: return #make([]char8, 0)
+        ref []char8 out = #make([]char8, i64(bytes))
+        _ = wsys.WideCharToMultiByte(wsys.CP_UTF8, 0, wide, #c.int(count), CharBuf(rawptr(&out[0])), bytes, nil, nil)
+        return out
+
+    // The command line Windows kept, split by `CommandLineToArgvW` — the
+    // parser every Windows program's C runtime follows for quotes and
+    // backslashes — and converted from UTF-16. `argv` is not read: on Windows
+    // it is the same line converted to the ANSI code page, which loses every
+    // character outside it.
+    []string8 args(i32 argc, ^rawptr argv):
+        if g_args_made: return g_args[:]
+        using #heap:
+            g_args = #make([]string8, 0)
+            #c.int count = 0
+            ^^u16 list = wshell.CommandLineToArgvW(wsys.GetCommandLineW(), &count)
+            if list != nil:
+                []^u16 items = list[0..<i64(count)]
+                for item in items:
+                    ref []char8 one = narrow(item, i64(wstr.wcslen(item)))
+                    string8 text = one
+                    _ = #append(g_args, text)
+                _ = wsys.LocalFree(rawptr(list))
+        g_args_made = true
+        return g_args[:]
+
+    // `GetEnvironmentVariableW` answers 0 both for a variable that is not set
+    // and for a failure, and tells them apart by the last error, which is
+    // cleared first. A variable set to nothing measures 1 (its terminator).
+    (ref []char8 value, bool found) get_env(string8 name):
+        if !env_name_ok(name): return (#make([]char8, 0), false)
+        ref []u16 wname = widen(name)
+        defer #delete(wname)
+        if #len(wname) == 0: return (#make([]char8, 0), false)
+        // A value can change between the measure and the read; asking again
+        // is the answer, and three tries is more than any real race needs.
+        for _ in 0..<3:
+            wsys.SetLastError(0)
+            #c.ulong need = wsys.GetEnvironmentVariableW(&wname[0], nil, 0)
+            if need == 0:
+                return (#make([]char8, 0), false)
+            ref []u16 buf = #make([]u16, i64(need))
+            #c.ulong got = wsys.GetEnvironmentVariableW(&wname[0], &buf[0], need)
+            if got < need:
+                ref []char8 out = narrow(&buf[0], i64(got))
+                #delete(buf)
+                return (out, true)
+            #delete(buf)
+        return (#make([]char8, 0), false)
+
+    !void set_env(string8 name, string8 value):
+        if !env_name_ok(name): fail INVALID
+        ref []u16 wname = widen(name)
+        defer #delete(wname)
+        ref []u16 wvalue = widen(value)
+        defer #delete(wvalue)
+        if #len(wname) == 0 || #len(wvalue) == 0: fail INVALID
+        // The runtime's copy first: it cannot hold an empty value (an empty
+        // one removes the variable there, and from the system too), so the
+        // system's table is written last and is the one `get_env` reads.
+        _ = wcrt._wputenv_s(&wname[0], &wvalue[0])
+        if wsys.SetEnvironmentVariableW(&wname[0], &wvalue[0]) == 0:
+            fail last_error()
+        return
+
+    // A null value deletes the variable. Deleting one that is not set is
+    // success, as POSIX's `unsetenv` makes it.
+    !void unset_env(string8 name):
+        if !env_name_ok(name): fail INVALID
+        ref []u16 wname = widen(name)
+        defer #delete(wname)
+        if #len(wname) == 0: fail INVALID
+        u16 empty = 0
+        _ = wcrt._wputenv_s(&wname[0], &empty)
+        if wsys.SetEnvironmentVariableW(&wname[0], nil) == 0:
+            if i64(wsys.GetLastError()) == i64(wsys.ERROR_ENVVAR_NOT_FOUND): return
+            fail last_error()
+        return
+
+    i64 pid():
+        return i64(wsys.GetCurrentProcessId())
+
+    // `USERPROFILE`, which Windows sets for every logged-on user.
+    !ref []char8 home_dir():
+        (ref []char8 home, bool found) = get_env("USERPROFILE")
+        if !found || #len(home) == 0:
+            #delete(home)
+            fail NOT_FOUND
+        return home
+
+    // `GetTempPathW`, which reads `TMP`, `TEMP` and `USERPROFILE` in that
+    // order and falls back to the Windows directory. Its trailing `\` is taken
+    // off, so the answer joins like every other directory here; a drive's root
+    // (`C:\`) keeps it, because `C:` alone means that drive's current
+    // directory.
+    ref []char8 temp_dir():
+        [261]u16 buf
+        #c.ulong got = wsys.GetTempPathW(261, &buf[0])
+        if got == 0 || got > 260: return owned("C:\\Windows\\Temp")
+        ref []char8 out = narrow(&buf[0], i64(got))
+        i64 n = #len(out)
+        if n > 3 && (out[n - 1] == '\\' || out[n - 1] == '/'):
+            ref []char8 trimmed = owned(string8(out[0..<n - 1]))
+            #delete(out)
+            return trimmed
+        return out
+
+    // A console answers `GetConsoleMode`; a file, a pipe or `NUL` does not.
+    // `stream` is 0, 1 or 2, the standard input, output and error.
+    bool is_terminal(i32 stream):
+        #c.ulong which = wsys.STD_INPUT_HANDLE
+        if stream == 1: which = wsys.STD_OUTPUT_HANDLE
+        else if stream == 2: which = wsys.STD_ERROR_HANDLE
+        else if stream != 0: return false
+        rawptr handle = wsys.GetStdHandle(which)
+        if handle == nil: return false
+        #c.ulong mode = 0
+        return wsys.GetConsoleMode(handle, &mode) != 0
+
+// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+//
+// `setenv` and `unsetenv` are POSIX.1-2001 and not C, so `<stdlib.h>` declares
+// them only when asked for the POSIX surface — the `define` below, the same
+// one `core:time` writes. `getpid` and `isatty` are `<unistd.h>`'s.
+else:
+    private foreign penv "stdlib.h" define "_POSIX_C_SOURCE=200809L":
+        cstring getenv(cstring name)
+        #c.int setenv(cstring name, cstring value, #c.int overwrite)
+        #c.int unsetenv(cstring name)
+
+    private foreign punistd "unistd.h" define "_POSIX_C_SOURCE=200809L":
+        #c.int getpid()
+        #c.int isatty(#c.int fd)
+
+    // `argv` as the process received it. The bytes are the process's for its
+    // whole life, so each argument is a view of them and nothing is copied.
+    []string8 args(i32 argc, ^rawptr argv):
+        if g_args_made: return g_args[:]
+        using #heap:
+            g_args = #make([]string8, 0)
+            if argc > 0 && argv != nil:
+                for slot in argv[0..<i64(argc)]:
+                    if slot == nil: break
+                    _ = #append(g_args, string8(cstring(slot)))
+        g_args_made = true
+        return g_args[:]
+
+    (ref []char8 value, bool found) get_env(string8 name):
+        if !env_name_ok(name): return (#make([]char8, 0), false)
+        ref []char8 cname = terminated(name)
+        cstring got = penv.getenv(cstring(cname))
+        #delete(cname)
+        if got == nil: return (#make([]char8, 0), false)
+        return (owned(string8(got)), true)
+
+    !void set_env(string8 name, string8 value):
+        if !env_name_ok(name): fail INVALID
+        for c in value:
+            if c == '\0': fail INVALID
+        ref []char8 cname = terminated(name)
+        defer #delete(cname)
+        ref []char8 cvalue = terminated(value)
+        defer #delete(cvalue)
+        if penv.setenv(cstring(cname), cstring(cvalue), 1) != 0:
+            fail last_error()
+        return
+
+    !void unset_env(string8 name):
+        if !env_name_ok(name): fail INVALID
+        ref []char8 cname = terminated(name)
+        defer #delete(cname)
+        if penv.unsetenv(cstring(cname)) != 0:
+            fail last_error()
+        return
+
+    i64 pid():
+        return i64(punistd.getpid())
+
+    // `HOME`, which POSIX requires the login to set.
+    !ref []char8 home_dir():
+        (ref []char8 home, bool found) = get_env("HOME")
+        if !found || #len(home) == 0:
+            #delete(home)
+            fail NOT_FOUND
+        return home
+
+    // `TMPDIR` when it is set and not empty, otherwise `/tmp`. A trailing `/`
+    // is taken off (macOS's `TMPDIR` has one), except from `/` itself.
+    ref []char8 temp_dir():
+        (ref []char8 dir, bool found) = get_env("TMPDIR")
+        if !found || #len(dir) == 0:
+            #delete(dir)
+            return owned("/tmp")
+        i64 n = #len(dir)
+        if n > 1 && dir[n - 1] == '/':
+            ref []char8 trimmed = owned(string8(dir[0..<n - 1]))
+            #delete(dir)
+            return trimmed
+        return dir
+
+    // `stream` is a descriptor: 0, 1 and 2 are the standard input, output and
+    // error.
+    bool is_terminal(i32 stream):
+        if stream < 0: return false
+        return punistd.isatty(#c.int(stream)) != 0

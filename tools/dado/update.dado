@@ -1,0 +1,601 @@
+// Keeping an install's collections current: the check before each command,
+// and `dado update`.
+//
+//     dado update                  move the checkout to the newest tree this dadoc allows
+//     dado update --rollback       back to the tree before the last move
+//
+// **Only an install has anything to update.** A checkout of the repository is
+// the user's own, moved with git: there the check does nothing and the verbs
+// refuse, naming git.
+//
+// **The check** runs before every command but `update`, `upgrade`,
+// `install`, `uninstall` and `help`. It asks the network at most every
+// `UPDATE_INTERVAL` seconds (`defaults`; `DADO_UPDATE_INTERVAL` overrides, 0
+// asks every time): one `git ls-remote <origin> HEAD refs/tags/v*`, given
+// `UPDATE_TIMEOUT` seconds and then abandoned without a word, because a
+// build that waits on a slow network is worse than an update found a quarter
+// of an hour late. A failure counts as a check, so an offline machine pays
+// the timeout once per interval and not once per command. Then:
+//
+// * **the collections moved** (the repository's HEAD is not this checkout's,
+//   and the checkout is behind it): it fetches, reads `DADOC_MIN` from the
+//   fetched tree, and either says the new collections need a newer dadoc,
+//   or asks *Update now?* on a terminal, or prints one line elsewhere, so an
+//   agent, a script or CI is told and never stopped;
+// * **a newer release** (a `v<semver>` tag newer than this dadoc; prerelease
+//   tags only when this dadoc is a prerelease itself): one line naming
+//   `dado upgrade`.
+//
+// What it says, it says only on the run that asked the network, so a
+// reminder comes at most once an interval and not before every command.
+// `--no-update-check`, `DADO_NO_UPDATE_CHECK=1`, `DADO_GATE` and `CI` turn it
+// off. Once it has run, `DADO_NO_UPDATE_CHECK=1` is set in this process, so
+// the `dado build` children that rebuild a tool never check again.
+//
+// **Where it remembers** is the install's `state` file, as `NAME=value`
+// lines beside the tools' lines (`tools.dado`), each kept as it was:
+//
+//     update_checked=<unix seconds>    the last time the network was asked
+//     remote_head=<sha>                the repository's HEAD it answered
+//     remote_release=<version>         the newest release tag it answered
+//     previous_tree=<sha>              the tree before the last move, for --rollback
+//
+// **`dado update`** refuses while the checkout has edits of its own, and
+// lists them: the collections belong to the install, and a move would
+// either lose the edits or mix them into a tree nobody tested. Otherwise it
+// fetches the repository's HEAD and walks back from it to the first commit
+// whose `DADOC_MIN` this dadoc meets (the tip, unless the collections have
+// outrun the compiler), records the move in the journal and in `state`, and
+// checks that commit out, detached. Then it rebuilds `dado` itself, and every
+// tool that is stale (`tools.dado`).
+//
+// **Rebuilding `dado` while it runs.** It is built by the driver's own
+// `build`, as a stale tool is, into a name beside `bin/dado`. On POSIX that
+// file is renamed over `bin/dado`: the running program keeps its open file,
+// and the next run starts the new one. Windows will not replace a running
+// `.exe`, so there the new one waits as `bin/dado.new.exe`, and every run of
+// `dado` on Windows starts by swapping it in (the running one becomes
+// `bin/dado.old.exe`, which Windows lets a running program be renamed to).
+//
+// **The journal** is `<install>/install.journal`, one tab-separated record
+// per line, appended before the change it records. This file writes
+//
+//     update<TAB><old tree sha><TAB><new tree sha>
+//
+// for every move of the checkout, `--rollback` included. `dado uninstall`
+// ignores it; it is the history a rollback and a person read.
+package driver
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+
+// ── the state file's NAME=value lines ───────────────────────────────────────
+
+// The value of `name` in the state file's text, from its `NAME=value` line,
+// and whether there is one.
+(string8 value, bool found) state_value(string8 text, string8 name):
+    for l in lines_of(text):
+        (string8 key, string8 value, bool eq) = strings.split_first(l, "=")
+        if eq && key == name:
+            return (strings.trim(value), true)
+    return ("", false)
+
+// `text` with `name=value` in place of the line for `name`, or added at the
+// end; every other line kept as it was, comments and blank lines included.
+string8 with_state_value(string8 text, string8 name, string8 value):
+    strings.Builder b = strings.builder(#len(text) + #len(name) + #len(value) + 2)
+    bool replaced = false
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        (string8 key, string8 _, bool eq) = strings.split_first(strings.trim(l), "=")
+        if eq && key == name:
+            if !replaced:
+                _ = strings.append(&b, txt(#format(name, "=", value)))
+                _ = strings.append(&b, "\n")
+            replaced = true
+        else:
+            _ = strings.append(&b, l)
+            _ = strings.append(&b, "\n")
+        if !more: break
+        rest = tail
+    if !replaced:
+        _ = strings.append(&b, txt(#format(name, "=", value)))
+        _ = strings.append(&b, "\n")
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+private string8 state_text():
+    return read_or_empty(state_path())
+
+// What the install's state file says for `name`, or "".
+string8 remembered(string8 name):
+    (string8 v, bool _) = state_value(state_text(), name)
+    return v
+
+// Write `name=value` into the install's state file, the whole file at once.
+// A state file that cannot be written costs a repeated check, not a
+// command, so it is a warning.
+void remember(string8 name, string8 value):
+    string8 p = state_path()
+    try fs.write_file(p, with_state_value(state_text(), name, value)) else code:
+        warn(txt(#format("cannot write ", p, ": ", os.message(code), ". The install's folder should be yours to write.")))
+
+// ── the journal ─────────────────────────────────────────────────────────────
+
+// Append one record to the install's journal, its fields joined by tabs.
+// The whole file is rewritten atomically, so a crash leaves the old journal
+// or the new one and never half a line. Fails the command when it cannot be
+// written, because the change it records must not happen unrecorded.
+void journal_record(string8 a, string8 b, string8 c = ""):
+    string8 p = join2(layout().install, "install.journal")
+    string8 old = read_or_empty(p)
+    string8 sep = "" if #len(old) == 0 || strings.ends_with(old, "\n") else "\n"
+    string8 rec = txt(#format(a, "\t", b)) if #len(c) == 0 else txt(#format(a, "\t", b, "\t", c))
+    try fs.write_file(p, txt(#format(old, sep, rec, "\n"))) else code:
+        die(txt(#format("cannot write the install's journal ", p, ": ", os.message(code), ".\n  Nothing was changed. Make the install's folder writable and run the command again.")))
+
+// ── what git and the release tags answer ────────────────────────────────────
+
+// What `git ls-remote <repo> HEAD refs/tags/v*` printed: the repository's
+// HEAD, and every tag that names a version, without its `v`.
+type Remote:
+    string8 head
+    ref []string8 versions
+
+// `out` read as `ls-remote`'s lines, `<sha><TAB><ref>`. A tag's peeled line
+// (`^{}`) and a tag that is not `v` and a semantic version are skipped.
+Remote parse_ls_remote(string8 out):
+    Remote r
+    r.head = ""
+    r.versions = #make([]string8, 0)
+    for l in lines_of(out):
+        (string8 sha, string8 rest, bool _) = strings.field(l)
+        string8 ref_name = strings.trim(rest)
+        if ref_name == "HEAD":
+            r.head = sha
+            continue
+        if !strings.starts_with(ref_name, "refs/tags/v") || strings.ends_with(ref_name, "^{}"):
+            continue
+        string8 v = ref_name[11..<#len(ref_name)]     // after `refs/tags/v`
+        (i64 _, i64 _, i64 _, string8 _, bool ok) = version_parts(v)
+        if ok:
+            _ = #append(r.versions, v)
+    return r
+
+// Whether `v` is a prerelease: something after `-` in `1.0.0-rc.1`.
+bool is_prerelease(string8 v):
+    (i64 _, i64 _, i64 _, string8 pre, bool ok) = version_parts(v)
+    return ok && #len(pre) > 0
+
+// The newest of `versions`, leaving prereleases out unless `prereleases`;
+// `found` false when none is left.
+(string8 newest, bool found) newest_version([]string8 versions, bool prereleases):
+    string8 best = ""
+    bool any = false
+    for v in versions:
+        if !prereleases && is_prerelease(v): continue
+        if !any:
+            best = v
+            any = true
+            continue
+        (i32 order, bool ok) = compare_versions(v, best)
+        if ok && order > 0: best = v
+    return (best, any)
+
+// The version a `DADOC_MIN` file names: its first line that is neither blank
+// nor a `#` comment, or "" when there is none.
+string8 dadoc_min_of(string8 text):
+    for l in lines_of(text):
+        if l[0] != '#': return l
+    return ""
+
+// Whether a dadoc of version `have` may use a tree whose `DADOC_MIN` text is
+// `min_text`. No minimum allows any; a minimum that is not a version allows
+// none, since nothing can say whether this dadoc meets it.
+bool dadoc_allows(string8 have, string8 min_text):
+    string8 min = dadoc_min_of(min_text)
+    if #len(min) == 0: return true
+    (i32 order, bool ok) = compare_versions(have, min)
+    return ok && order >= 0
+
+// Whether the network is due to be asked: always when `interval` is 0 or
+// less, when there is no record of a last check, and when the clock reads
+// earlier than that record (it was set back); otherwise once `interval`
+// seconds have passed.
+bool check_due(i64 now, i64 last, bool has_last, i64 interval):
+    if interval <= 0 || !has_last: return true
+    if now < last: return true
+    return now - last >= interval
+
+// `s` as a whole number of at least 0, and whether it is one.
+(i64 n, bool ok) whole_number(string8 s):
+    string8 t = strings.trim(s)
+    if #len(t) == 0 || #len(t) > 18: return (0, false)
+    i64 n = 0
+    for ch in t:
+        if ch < '0' || ch > '9': return (0, false)
+        n = n * 10 + i64(ch - '0')
+    return (n, true)
+
+// ── running git, with and without a limit ───────────────────────────────────
+
+// `capture`, but given at most `limit_ms`: a command still running then is
+// stopped, and answered as not started-and-finished (`timed_out` true).
+(Captured got, bool timed_out) capture_within(Command c, i32 limit_ms):
+    Captured r
+    r.status = 127
+    r.out = #make([]char8, 0)
+    r.started = false
+    if #len(c.words) > proc.ARG_CAP: return (r, false)
+    ref []cstring argv = #make([]cstring, 0)
+    for w in c.words:
+        ref []char8 z = strings.clone_to_cstring(w, #default)
+        _ = #append(argv, cstring(z))
+    _ = io.flush(io.stdout())
+    _ = io.flush(io.stderr())
+    f64 began = time.now()
+    proc.Duplex d = proc.duplex(argv[:], proc.ERRORS_DISCARD)
+    if !proc.started(d): return (r, false)
+    r.started = true
+    _ = proc.close_input(&d)
+    [16384]char8 chunk
+    for:
+        i64 left = i64(limit_ms) - time.ms_since(began)
+        if left <= 0:
+            _ = proc.stop(&d, 0)
+            return (r, true)
+        i32 n = proc.receive(&d, chunk[:], i32(left))
+        if n == proc.DRAINED || n == proc.BROKE: break
+        if n > 0:
+            for i in 0..<n:
+                _ = #append(r.out, chunk[i])
+    proc.release(&d)
+    i64 left = i64(limit_ms) - time.ms_since(began)
+    (bool done, bool exited, i32 status) = proc.finish(&d, i32(left) if left > 0 else 0)
+    if !done:
+        _ = proc.stop(&d, 0)
+        return (r, true)
+    if exited:
+        r.status = status
+    return (r, false)
+
+// `git -C <the checkout>` and `words`.
+Command git_in(string8 dir, []string8 words):
+    Command c = command("git")
+    add(&c, "-C")
+    add(&c, dir)
+    add_all(&c, words)
+    return c
+
+// What `git -C <root> words…` prints, trimmed, and whether it exited 0. Its
+// standard error is thrown away unless `loud`.
+(string8 out, bool ok) git_out([]string8 words, bool loud = false):
+    Captured r = capture(git_in(root(), words), !loud)
+    string8 s = r.out
+    return (strings.trim(s), r.started && r.status == 0)
+
+// The commit the checkout is at.
+string8 checkout_head():
+    (string8 sha, bool _) = git_out(["rev-parse", "HEAD"])
+    return sha
+
+// The repository the checkout came from: its `origin`.
+string8 checkout_origin():
+    (string8 url, bool _) = git_out(["remote", "get-url", "origin"])
+    return url
+
+// The version of the dadoc at `program`, from the first line of its
+// `--version` (`dadoc 1.0.0-rc.1+<commit>` is `1.0.0-rc.1+<commit>`), or "".
+string8 version_of_dadoc(string8 program):
+    Command c = command(program)
+    add(&c, "--version")
+    return version_word(first_line(c, true))
+
+// The version of the install's own dadoc, the one an update must satisfy,
+// without its build metadata (`1.0.0-rc.1`), which no comparison reads.
+string8 install_dadoc_version():
+    return without_build(version_of_dadoc(join2(layout().install, exe_name("dadoc"))))
+
+// What `DADOC_MIN` says at commit `rev`, or "" when that tree has none.
+string8 dadoc_min_at(string8 rev):
+    (string8 text, bool ok) = git_out(["show", txt(#format(rev, ":DADOC_MIN"))])
+    if !ok: return ""
+    return text
+
+// ── the check ───────────────────────────────────────────────────────────────
+
+// Whether the check is off for this run: a command that moves the install
+// itself, `--no-update-check`, or the environment.
+bool update_check_off(string8 cmd, bool flag_off):
+    if flag_off: return true
+    if listed("update upgrade install uninstall help", cmd): return true
+    (string8 no, bool _) = env("DADO_NO_UPDATE_CHECK")
+    if no == "1": return true
+    (string8 _, bool gate) = env("DADO_GATE")
+    (string8 _, bool ci) = env("CI")
+    return gate || ci
+
+// How long a fetch the check starts may take before it is abandoned: longer
+// than `ls-remote`, which moves no objects, and short enough that a command
+// is never held up by more than this.
+private const i32 CHECK_FETCH_MS = 20000
+
+// The check before command `cmd` (see the head of this file). Silent when
+// the network does not answer; never ends the process.
+void update_check(string8 cmd, bool flag_off):
+    if layout().kind != "install": return
+    bool off = update_check_off(cmd, flag_off)
+    // Whatever this run decides, the `dado` children it starts (a tool's
+    // build, `tools rebuild` after an upgrade) are part of it: they never
+    // check.
+    try os.set_env("DADO_NO_UPDATE_CHECK", "1") else:
+        return
+    if off: return
+    i64 interval = 0
+    (string8 iv, bool iv_set) = env("DADO_UPDATE_INTERVAL")
+    (i64 n_iv, bool iv_ok) = whole_number(iv if iv_set else setting("UPDATE_INTERVAL"))
+    interval = n_iv if iv_ok else 900
+    i64 now = time.unix()
+    (i64 last, bool has_last) = whole_number(remembered("update_checked"))
+    if !check_due(now, last, has_last, interval): return
+    (i64 timeout_s, bool t_ok) = whole_number(setting("UPDATE_TIMEOUT"))
+    i32 limit = i32(timeout_s * 1000) if t_ok && timeout_s > 0 else 2000
+    remember("update_checked", txt(#format(now)))
+    string8 origin = checkout_origin()
+    if #len(origin) == 0: return
+    // A repository that wants a password must fail, not ask: the check runs
+    // before the user's command, on their terminal.
+    (ref []char8 prompt_was, bool prompt_set) = os.get_env("GIT_TERMINAL_PROMPT")
+    string8 prompt_old = txt(#format(txt(prompt_was)))
+    try os.set_env("GIT_TERMINAL_PROMPT", "0") else:
+        return
+    Command ls = command("git")
+    add_all(&ls, ["ls-remote", origin, "HEAD", "refs/tags/v*"])
+    (Captured got, bool timed_out) = capture_within(ls, limit)
+    Remote r = parse_ls_remote(txt(got.out))
+    bool answered = !timed_out && got.started && got.status == 0
+    string8 moved = ""
+    if answered:
+        remember("remote_head", r.head)
+        moved = collections_moved(r.head)
+    if prompt_set:
+        try os.set_env("GIT_TERMINAL_PROMPT", prompt_old) else:
+            return
+    else:
+        try os.unset_env("GIT_TERMINAL_PROMPT") else:
+            return
+    if !answered: return
+    string8 have = install_dadoc_version()
+    if #len(moved) > 0:
+        offer_update(moved, have)
+    (string8 newest, bool any) = newest_version(r.versions[:], is_prerelease(have))
+    if any:
+        remember("remote_release", newest)
+        (i32 order, bool ok) = compare_versions(newest, have)
+        if ok && order > 0:
+            tell(txt(#format("dado: dadoc ", newest, " is available: `dado upgrade`")))
+
+// The number of commits the repository's HEAD `remote` is ahead of the
+// checkout, as text, after fetching it; "" when it is not ahead (the same
+// commit, or one the checkout already holds behind it) or the fetch fails.
+private string8 collections_moved(string8 remote):
+    if #len(remote) == 0: return ""
+    string8 local = checkout_head()
+    if remote == local: return ""
+    (string8 _, bool held) = git_out(["cat-file", "-e", txt(#format(remote, "^{commit}"))])
+    if held:
+        (string8 _, bool behind_us) = git_out(["merge-base", "--is-ancestor", remote, "HEAD"])
+        if behind_us: return ""
+    (Captured f, bool timed_out) = capture_within(git_in(root(), ["fetch", "--quiet", "--no-tags", "origin", "HEAD"]), CHECK_FETCH_MS)
+    if timed_out || !f.started || f.status != 0: return ""
+    (string8 count, bool ok) = git_out(["rev-list", "--count", "HEAD..FETCH_HEAD"])
+    if !ok || count == "0": return ""
+    return count
+
+// What the check does once it knows the collections are `count` commits
+// ahead, with the fetched tree in `FETCH_HEAD`.
+private void offer_update(string8 count, string8 have):
+    string8 min = dadoc_min_of(dadoc_min_at("FETCH_HEAD"))
+    if !dadoc_allows(have, min):
+        tell(txt(#format("dado: new collections need dadoc ", min, ": run `dado upgrade`")))
+        return
+    string8 commits = "commit" if count == "1" else "commits"
+    if os.is_terminal(0) && os.is_terminal(2):
+        if ask(txt(#format("Collections have ", count, " new ", commits, ". Update now? [Y/n] ")), true):
+            _ = update_collections(have)
+        return
+    tell(txt(#format("dado: the collections have ", count, " new ", commits, ": `dado update` applies them")))
+
+// Ask `question` on standard error and read the answer from standard input:
+// `y` or `yes` is yes, `n` or `no` is no, and an empty line (or the end of
+// the input) is `default_yes`.
+bool ask(string8 question, bool default_yes):
+    _ = io.flush(io.stdout())
+    fmt.write(io.stderr_sink(), question)
+    _ = io.flush(io.stderr())
+    [256]char8 buf
+    (i64 n, bool got) = io.read_line_into(io.stdin(), buf[:])
+    if !got: return default_yes
+    string8 a = strings.trim(string8(buf[0..<n]))
+    if #len(a) == 0: return default_yes
+    return a == "y" || a == "Y" || a == "yes" || a == "Yes" || a == "YES"
+
+// ── `dado update` ───────────────────────────────────────────────────────────
+
+// Refuse, naming the repair, unless this is an install: `what` is the verb.
+void need_install(string8 what):
+    if layout().kind == "install": return
+    die(txt(#format("`dado ", what, "` applies to an install, and this is a checkout of the repository\n  (", root(), ").\n  A checkout is moved with git (git pull), and its compiler is built with cargo.")))
+
+// Refuse, listing them, while the checkout has edits of its own.
+void need_clean_checkout():
+    (string8 status, bool ok) = git_out(["status", "--porcelain"], true)
+    if !ok:
+        die(txt(#format("cannot ask git about the install's checkout (", root(), ").\n  `dado doctor` checks git; reinstall if the checkout is damaged.")))
+    if #len(status) == 0: return
+    die(txt(#format("the install's checkout has changes of its own, and an update would lose or mix them:\n\n", status, "\n\n  The collections belong to the install; write your code in a project of your own.\n  To drop the changes:  git -C ", root(), " checkout -- . && git -C ", root(), " clean -fd\n  To keep them:         git -C ", root(), " stash")))
+
+// The newest commit of `FETCH_HEAD`'s history whose `DADOC_MIN` a dadoc of
+// version `have` meets, walking back from the tip and stopping at the
+// checkout's own commit (it is never moved backwards); and the minimum the
+// tip asked for when the tip was refused.
+(string8 sha, string8 refused_min) newest_allowed(string8 have, string8 current):
+    (string8 list, bool ok) = git_out(["rev-list", "FETCH_HEAD"])
+    if !ok: return (current, "")
+    string8 tip_min = ""
+    bool first = true
+    for sha in lines_of(list):
+        if sha == current: return (current, tip_min)
+        string8 min_text = dadoc_min_at(sha)
+        if dadoc_allows(have, min_text): return (sha, tip_min)
+        if first: tip_min = dadoc_min_of(min_text)
+        first = false
+    return (current, tip_min)
+
+// The first twelve characters of a commit, as people read them.
+string8 short_sha(string8 sha):
+    if #len(sha) <= 12: return sha
+    return sha[0..<12]
+
+// Move the checkout to `to`, recording the move first; `why` names it.
+void move_checkout(string8 to):
+    string8 from = checkout_head()
+    journal_record("update", from, to)
+    remember("previous_tree", from)
+    Captured r = capture(git_in(root(), ["-c", "advice.detachedHead=false", "checkout", "--quiet", to]), false)
+    if !r.started || r.status != 0:
+        die(txt(#format("git could not check out ", short_sha(to), " in ", root(), ".\n  The checkout is where git left it; `git -C ", root(), " status` says where, and\n  `dado update --rollback` returns to ", short_sha(from), ".")))
+
+// Move the checkout to the newest collections a dadoc of version `have`
+// allows. Answers whether it moved; `quiet_when_current` leaves out the line
+// saying nothing changed.
+bool move_to_newest(string8 have, bool quiet_when_current):
+    need_clean_checkout()
+    say("fetch  the collections")
+    Captured f = capture(git_in(root(), ["fetch", "--quiet", "--no-tags", "origin", "HEAD"]), false)
+    if !f.started || f.status != 0:
+        die(txt(#format("git could not fetch from ", checkout_origin(), ".\n  Check the network (and that `git -C ", root(), " fetch` works), then run `dado update` again.")))
+    string8 current = checkout_head()
+    (string8 to, string8 refused) = newest_allowed(have, current)
+    if #len(refused) > 0:
+        tell(txt(#format("dado: the newest collections need dadoc ", refused, ", and this one is ", have, ": `dado upgrade`, then `dado update`")))
+    if to == current:
+        if !quiet_when_current:
+            say(txt(#format("the collections are current (", short_sha(current), ")")))
+        return false
+    move_checkout(to)
+    say_green("updated", txt(#format(" the collections: ", short_sha(current), " -> ", short_sha(to))))
+    return true
+
+// Apply the newest collections a dadoc of version `have` allows, then
+// rebuild `dado` and the stale tools. Answers the exit status.
+i32 update_collections(string8 have):
+    if !move_to_newest(have, false): return 0
+    return rebuild_after_move()
+
+// `dado update` and `dado update --rollback`.
+i32 update_command(bool rollback):
+    need_install("update")
+    if !rollback:
+        return update_collections(install_dadoc_version())
+    string8 to = remembered("previous_tree")
+    if #len(to) == 0:
+        die("there is nothing to roll back to: no update has been recorded in this install's state.")
+    need_clean_checkout()
+    string8 from = checkout_head()
+    if to == from:
+        say(txt(#format("the collections are already at ", short_sha(to))))
+        return 0
+    move_checkout(to)
+    say_green("rolled back", txt(#format(" the collections: ", short_sha(from), " -> ", short_sha(to))))
+    return rebuild_after_move()
+
+// After the checkout moved: rebuild `dado`, then each tool that is stale.
+// A tool that fails is reported and the rest go on; the status is 1 if
+// anything failed.
+i32 rebuild_after_move():
+    i32 status = 0
+    if !rebuild_driver(): status = 1
+    for t in discover_tools(tools_dir()):
+        (bool ok, string8 said, string8 why) = ensure_tool(t)
+        if !ok:
+            if #len(said) > 0: tell(strings.trim_right(said))
+            warn(why)
+            status = 1
+    return status
+
+// ── rebuilding `dado` itself ────────────────────────────────────────────────
+
+// Where the new `dado` waits on Windows until the next run swaps it in.
+string8 pending_driver(string8 install):
+    return join3(install, "bin", "dado.new.exe")
+
+// Build the checkout's `tools/dado` with this driver's own `build`, as a
+// stale tool is built, and put it in place of `bin/dado` (see the head of
+// this file). Answers whether it was built.
+bool rebuild_driver():
+    Layout l = layout()
+    string8 bin = join3(l.install, "bin", exe_name("dado"))
+    string8 tmp = txt(#format(bin, ".new-", os.pid()))
+    when #OS == #WINDOWS:
+        tmp = pending_driver(l.install)
+    say("build  dado")
+    Command c = command(executable())
+    add_all(&c, ["build", join3(l.root, "tools", "dado"), "-o", tmp, "--no-c"])
+    if verbose():
+        add(&c, "-v")
+        note(txt(#format("  $ ", shown(c))))
+    Captured r = capture_merged(c)
+    if !r.started || r.status != 0:
+        tell(strings.trim_right(txt(r.out)))
+        remove_quietly(tmp)
+        warn(txt(#format("dado did not build from ", join3(l.root, "tools", "dado"), " (the output above says why);\n  the one that ran this command is still in place. `dado update --rollback` returns\n  the collections to where they were.")))
+        return false
+    when #OS == #WINDOWS:
+        say_green("built", txt(#format(" ", tmp, " (it replaces dado.exe when dado next starts)")))
+        return true
+    else:
+        try fs.rename(tmp, bin) else code:
+            remove_quietly(tmp)
+            warn(txt(#format("cannot put the new dado in place of ", bin, ": ", os.message(code), ".\n  The old one is still there; `dado update` tries again.")))
+            return false
+        say_green("built", txt(#format(" ", bin)))
+        return true
+
+// Remove a file if it is there; answers whether nothing is left at `p`.
+bool cleared(string8 p):
+    if !exists(p): return true
+    try fs.remove_file(p) else:
+        return false
+    return true
+
+// On Windows, the first thing every run does: when a new `dado` is waiting
+// (`rebuild_driver`), swap it in. Renaming a running `.exe` is allowed where
+// replacing it is not, so this run (the old one) moves itself aside to
+// `dado.old.exe` and the new one takes its name; the next run is the new one.
+// Anything that fails leaves the old one in place, and the next run tries
+// again.
+void swap_pending_driver():
+    when #OS == #WINDOWS:
+        try string8 exe = os.executable_path() else:
+            return
+        Layout l = locate(dir_of(exe))
+        if l.kind != "install": return
+        string8 bin = join3(l.install, "bin", "dado.exe")
+        string8 waiting = pending_driver(l.install)
+        string8 old = join3(l.install, "bin", "dado.old.exe")
+        if !is_file(waiting): return
+        if !cleared(old): return
+        try fs.rename(bin, old) else:
+            return
+        try fs.rename(waiting, bin) else:
+            try fs.rename(old, bin) else:
+                return
+            return
+    return

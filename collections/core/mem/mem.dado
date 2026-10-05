@@ -1,0 +1,153 @@
+// core:mem — the allocator interface, and the one helper an allocator with
+// nothing clever to do reaches for.
+//
+//     import "core:mem"
+//     import "core:mem/libc"
+//
+//     (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = libc.allocator()
+//     rawptr p = a.proc(a.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+//     a.proc(a.data, mem.AllocatorMode.Free, 0, 0, p, 64)
+//
+// An allocator is expressible with what the language already
+// has and **needs no compiler support to define**. This file and its two
+// siblings are that claim, cashed: nothing below is privileged, nothing below
+// asks the compiler for anything, and a user writes an allocator exactly the
+// way this package does.
+//
+// What it uses, and all it uses: function values in slots,
+// `rawptr`, enums, and ordinary functions. `new`, `make`,
+// `resize`, `delete` and `copy` are the *verbs* the compiler lowers
+// through this interface; they are not what the interface is made of.
+package mem
+
+// ── The four modes ───────────────────────────────────────────────────────────
+//
+// Odin's eight, minus four. `Alloc_Non_Zeroed` and
+// `Resize_Non_Zeroed` are a boolean wearing a mode and allocation always zeroes;
+// `Query_Features` and `Query_Info` exist so generic code can ask an allocator
+// what it implements, and trying and getting `nil` answers the same question.
+//
+// The procedure returns the block for `Alloc` and `Resize` — `nil` on failure —
+// and `nil` for `Free` and `FreeAll`.
+enum AllocatorMode: (Alloc, Resize, Free, FreeAll)
+
+// ── The interface ────────────────────────────────────────────────────────────
+//
+// **`Allocator` is a trait, and what it answers is two words** (a0.13b):
+// `data()` hands back a procedure plus a data pointer, dispatched on the mode,
+// written as the shape `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64)
+// proc, rawptr data)`. No type names the two words: a program that holds them
+// writes the shape, and a declaration that takes `Allocator` on is accepted
+// wherever an allocator is asked, the compiler calling its `data()` there.
+//
+// The two words are the procedure and `data`, the
+// allocator's own state — an arena's cursor, a pool's free list — and is handed
+// back on every call, which is what lets one procedure serve many arenas.
+//
+// `align` is in the signature because `malloc` returns memory aligned for
+// anything and a bump arena hands out offsets into its own block and must align
+// them itself. It is a **parameter**, never something an allocator computes:
+// the caller knows the type, the allocator knows only bytes.
+//
+// > A bump arena is a procedure that advances a cursor for `Alloc`, ignores
+// > `Free`, and resets for `FreeAll`, plus a `data` pointing at its block.
+//
+// **The parameters are unnamed here, and are usually written with names.** A
+// function *type* is `R(A, B)` and has never had a place for a parameter
+// name; a name is a view and is not part of type identity, so the
+// two spellings denote one type and only one of them parses. The names live in
+// the comment instead, which is the only place they were ever documenting:
+//
+//     data      the allocator's own state, handed back on every call
+//     mode      which of the four operations this call is
+//     size      how many bytes are wanted (`Alloc`, `Resize`)
+//     align     what the block must be aligned to
+//     old       the block being resized or freed, `nil` otherwise
+//     old_size  how large that block was
+trait Allocator:
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self)
+
+    // Whether the allocator has been given a procedure. Two nil words are
+    // what `#default` holds on a freestanding target — so this is the check a
+    // program written for both targets makes. Of two words held as such, ask
+    // `a.proc != nil` directly.
+    bool ok(self):
+        return self.data().proc != nil
+
+// ── Alignment ────────────────────────────────────────────────────────────────
+
+// The alignment every shipped allocator hands out: worst case, always correct,
+// and a few bytes wasted.
+//
+// The compiler computes this exactly, with an `offsetof(struct { char c;
+// T t; }, t)` probe over a union of `long double`, `void *` and `long long` —
+// a spelling every C standard answers, C99's included. **This constant
+// is not that.** It is what an allocator written in Dado has to hand-build when
+// it wants to align something on its own account, and 16 is the value that
+// probe yields on every target Dado targets today.
+//
+// It is a ceiling rather than a measurement, and that is the honest reading:
+// over-aligning is always correct and costs padding, under-aligning is a
+// fault. `align` travels in the signature so precision can arrive later
+// without an ABI break.
+const u64 MAX_ALIGN = 16
+
+// `n` rounded up to a multiple of `align`. `align` must be a power of two,
+// which every alignment is; `0` and `1` both mean "no constraint".
+u64 align_up(u64 n, u64 align):
+    if align <= 1:
+        return n
+    u64 rem = n % align
+    if rem == 0:
+        return n
+    return n + (align - rem)
+
+// ── The fallback `Resize` ────────────────────────────────────────────────────
+//
+// `realloc` is genuinely privileged — it can grow a block **in place** when the
+// heap has adjacent space — but only from *inside* the allocator, which is why
+// `Resize` is a mode rather than something the caller synthesizes. An allocator
+// with nothing clever to do calls this instead of reporting the mode
+// unimplemented and pushing a fallback onto the caller.
+//
+// There is deliberately **no caller-side fallback**: a hidden
+// three-call path inside `resize` would make "did my data move?"
+// unpredictable, and the whole claim is that every disturbance is a call you
+// can see.
+//
+// ## There is no ceiling, and there used to be one
+//
+// This copies bytes through a `[]u8` **taken over the `^u8` the block is**
+// — a window over a bare pointer. There used to be no such form, so the only
+// way to address raw bytes in a language with no pointer arithmetic was to
+// over-type the block as a `^[65536]u8` — and 65 536 is the bound on
+// an *array length*, so every allocator written in Dado inherited a 64 KiB
+// ceiling from a number nobody chose.
+//
+// The bound is now the one the caller passed. `old_size` and `nbytes` are what
+// they say they are, the two windows are that long, and a block of any size
+// round-trips. Nothing else about the helper changed, which is what the ruling
+// predicted: the ceiling was the size of a fib.
+rawptr resize_by_copy((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, rawptr old, u64 old_size, u64 nbytes, u64 align):
+    if old == nil:
+        return a.proc(a.data, AllocatorMode.Alloc, nbytes, align, nil, 0)
+    rawptr fresh = a.proc(a.data, AllocatorMode.Alloc, nbytes, align, nil, 0)
+    if fresh == nil:
+        return nil
+    u64 keep = old_size
+    if nbytes < keep: keep = nbytes
+    i64 n = i64(keep)
+    Bytes src = Bytes(old)
+    Bytes dst = Bytes(fresh)
+    []u8 from = src[0..<n]
+    []u8 into = dst[0..<n]
+    i64 zero = 0
+    for i in zero..<#len(into):
+        into[i] = from[i]
+    _ = a.proc(a.data, AllocatorMode.Free, 0, 0, old, old_size)
+    return fresh
+
+// The block, as the run of bytes it is. One name, used by every byte loop in
+// this collection: a `^u8` is what a `rawptr` converts to for free, and a
+// window taken over it is what turns that into a `[]u8` of a written length.
+type Bytes: ^u8

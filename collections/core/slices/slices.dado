@@ -1,0 +1,592 @@
+// core:slices — ordering, searching and rearranging a run of anything.
+//
+//     import "core:slices"
+//
+//     [6]i32 ns = [5, 3, 9, 1, 7, 2]
+//     slices.sort_ascending(ns[:])
+//     (i64 at, bool found) = slices.find_sorted(ns[:], 7)
+//
+// **There is no array library to write beside this one, and that is the whole
+// shape of the package.** `[N]T` windows to a `[]T` with `v[:]`, and a
+// `ref []T` *lends* one — so a function taking `[]$T` already serves a fixed
+// array, a borrowed window and an owned run, with nothing written at the call
+// beyond the window that was always going to be there. One package, three
+// container kinds, no conversions.
+//
+// ## What an importer pays, measured
+//
+// The emitter writes **every concrete function of every live package** whether
+// it is called or not; its one exemption is an uncalled template. Nearly
+// everything here binds a `$`, so nearly everything is demand-driven, and the
+// three numbers below are what that buys. Measured against a 12-line
+// empty-program baseline:
+//
+//     import and call nothing        12 lines      the package is pruned whole
+//     call `contains` only           98 lines      contains, index_of, depth_budget
+//     call `sort_ascending` only    292 lines      that sort and its five helpers
+//
+// The first line is the pruner rather than this package: *a package no root can
+// reach contributes nothing at all*. The interesting one is the third — sorting
+// brings the sort, and not the comparator sort beside it, not the equality
+// half, not the predicates, not the searches.
+//
+// **`depth_budget` is the one concrete function here, and it is the whole floor
+// an importer pays** — eight lines, present in the second measurement above
+// even though `contains` has no use for it. It is left concrete rather than
+// contorted into a template to make the headline rounder: eight lines is a fair
+// price for a function that reads `i64 -> i64`, and stating the floor is worth
+// more than hiding it.
+//
+// The sharpened half of the rule shapes everything else: **a template is free
+// only when nothing concrete in its own package calls it.** `depth_budget`
+// calls no template, so nothing is dragged in behind it.
+//
+// ## No `foreign` block, no import, no allocation
+//
+// This package emits no `#include`, so a program on a target whose OS is
+// `#NONE` may use every line of it. Nothing here allocates: everything sorts,
+// searches and rearranges **in place**, or writes into a slice the caller
+// already owns. A stable sort needs O(n) scratch and is therefore not here —
+// when it lands it takes an allocator, written last and mandatory, the way
+// `#format` already settles that question.
+//
+// It imports nothing, `core:strings` included, and that is worth one sentence
+// because ordering text is the obvious thing to want. `<` on a `string` is
+// deliberately undefined — the language declines to have an opinion about
+// collation — and `core:strings` already owns one. So the answer is the
+// comparator you were going to pass anyway:
+//
+//     slices.sort(names, strings.before)
+//
+// which needs no dependency here and keeps the collation decision in the one
+// package that has made it.
+//
+// ## Three doors to an ordering, and why not one
+//
+// A template **can** ask whether `T` is ordered now — `where T has <` — but the
+// functions below predate it and keep their domains: the category-bound ones
+// take `[]T where T is scalar`, and widening them to every type `<` applies to (a `char8`,
+// an enum, a pointer, a `#c` scalar) is a change to what they accept, not a
+// respelling. A comparator stays the universal mechanism. What is sugar over
+// it:
+//
+//   * `sort(xs, less)` — universal, one instantiation per element type;
+//   * `sort_ascending(xs)` — over `[]T where T is scalar`, whose category carries the six
+//     comparisons, so the commonest case needs no comparator at all;
+//   * `slices.sort(xs, strings.before)` — for text, above.
+//
+// A `less` is a **strict weak ordering**: `less(a, b)` is true exactly when `a`
+// sorts before `b`, and `less(a, a)` must be false. A comparator that says an
+// element precedes itself makes the partition below run past the end of the
+// slice, and nothing here checks it — it is the one thing a caller owes.
+package slices
+
+// ── swapping and moving ─────────────────────────────────────────────────────
+
+// Exchange two elements. The right-hand side of a parenthesised place list is
+// materialised before any store, which is what makes this a swap and not two
+// assignments that lose a value.
+public void swap([]$T xs, i64 i, i64 j):
+    (xs[i], xs[j]) = (xs[j], xs[i])
+    return
+
+// Reverse in place.
+public void reverse([]$T xs):
+    i64 lo = 0
+    i64 hi = #len(xs) - 1
+    for lo < hi:
+        swap(xs, lo, hi)
+        lo = lo + 1
+        hi = hi - 1
+    return
+
+// Rotate left by `n`, so the element at `n` becomes the first. A negative `n`
+// rotates right, and `n` past the length wraps — both because the count is
+// reduced modulo the length before anything moves, which makes the function
+// total for every `n` a caller can produce.
+//
+// Three reversals and no scratch: the classic, and the reason this needs no
+// allocator where a rotate-by-copy would.
+public void rotate([]$T xs, i64 n):
+    i64 count = #len(xs)
+    if count <= 1:
+        return
+    i64 by = n % count
+    if by < 0:
+        by = by + count
+    if by == 0:
+        return
+    reverse(xs[0..<by])
+    reverse(xs[by..<count])
+    reverse(xs)
+    return
+
+// Set every element to `v`.
+public void fill([]$T xs, T v):
+    for i in i64(0)..<#len(xs):
+        xs[i] = v
+    return
+
+// Copy `from` into `into`, and answer how many elements moved — the shorter of
+// the two lengths, so neither side has to be measured by the caller.
+//
+// **The two must not overlap.** Nothing here checks it and the loop runs
+// forwards, so a copy into a window that starts later inside the same run
+// smears its first element. Use `rotate` for a shift within one run.
+public i64 copy_into([]$T from, []T into):
+    i64 count = #len(from)
+    i64 room = #len(into)
+    if room < count:
+        count = room
+    for i in i64(0)..<count:
+        into[i] = from[i]
+    return count
+
+// ── equality ────────────────────────────────────────────────────────────────
+//
+// Each of these carries `where #has_eq(T)`: `==` applies to `T`, which is
+// exactly what their bodies ask of an element, and the word is answered by the
+// same rule the operator is, so a `T` these admit is a `T` whose `xs[i] == probe`
+// compiles. A float slice is admitted — `==` is IEEE equality, so a NaN probe is
+// never found. Stating the domain is what makes a call over elements with no
+// `==`, such as maps, fail at the **call**, naming it, rather than failing
+// inside a body the caller did not write.
+
+// The first index holding `probe`, or -1.
+public i64 index_of([]$T xs, T probe) where #has_eq(T):
+    for i in i64(0)..<#len(xs):
+        if xs[i] == probe:
+            return i
+    return 0 - 1
+
+// The last index holding `probe`, or -1.
+public i64 last_index_of([]$T xs, T probe) where #has_eq(T):
+    i64 i = #len(xs) - 1
+    for i >= 0:
+        if xs[i] == probe:
+            return i
+        i = i - 1
+    return 0 - 1
+
+// Whether `probe` is anywhere in `xs`.
+public bool contains([]$T xs, T probe) where #has_eq(T):
+    return index_of(xs, probe) >= 0
+
+// How many elements equal `probe`.
+public i64 count_of([]$T xs, T probe) where #has_eq(T):
+    i64 seen = 0
+    for i in i64(0)..<#len(xs):
+        if xs[i] == probe:
+            seen = seen + 1
+    return seen
+
+// Whether two runs hold the same elements in the same order. Different lengths
+// are never equal, and two empty runs are.
+public bool equal([]$T a, []T b) where #has_eq(T):
+    i64 count = #len(a)
+    i64 other = #len(b)
+    if count != other:
+        return false
+    for i in i64(0)..<count:
+        if a[i] != b[i]:
+            return false
+    return true
+
+// Whether `xs` begins with `prefix`.
+public bool starts_with([]$T xs, []T prefix) where #has_eq(T):
+    i64 count = #len(prefix)
+    i64 room = #len(xs)
+    if count > room:
+        return false
+    return equal(xs[0..<count], prefix)
+
+// Collapse runs of adjacent equal elements to one, in place, and answer the new
+// length. The elements past it are left as they were and are the caller's to
+// window off: `xs[0..<slices.unique(xs)]`.
+//
+// **Adjacent, not global** — this is `uniq` and not a set, so a caller who wants
+// every duplicate gone sorts first. Saying so is the whole documentation, and
+// making it allocate a set instead would be a different function with a
+// different cost.
+public i64 unique([]$T xs) where #has_eq(T):
+    i64 count = #len(xs)
+    if count <= 1:
+        return count
+    i64 kept = 1
+    for i in i64(1)..<count:
+        if xs[i] != xs[kept - 1]:
+            xs[kept] = xs[i]
+            kept = kept + 1
+    return kept
+
+// ── predicates ──────────────────────────────────────────────────────────────
+
+// Whether every element satisfies `pred`. True for an empty run, which is the
+// convention every language with this function has and the one that makes
+// `all(a) && all(b)` equal `all(a ++ b)`.
+public bool all([]$T xs, bool(T) pred):
+    for i in i64(0)..<#len(xs):
+        if !pred(xs[i]):
+            return false
+    return true
+
+// Whether any element satisfies `pred`. False for an empty run.
+public bool any([]$T xs, bool(T) pred):
+    for i in i64(0)..<#len(xs):
+        if pred(xs[i]):
+            return true
+    return false
+
+// Whether no element satisfies `pred`.
+public bool none([]$T xs, bool(T) pred):
+    return !any(xs, pred)
+
+// How many elements satisfy `pred`.
+public i64 count_if([]$T xs, bool(T) pred):
+    i64 seen = 0
+    for i in i64(0)..<#len(xs):
+        if pred(xs[i]):
+            seen = seen + 1
+    return seen
+
+// The first index satisfying `pred`, or -1.
+public i64 find_if([]$T xs, bool(T) pred):
+    for i in i64(0)..<#len(xs):
+        if pred(xs[i]):
+            return i
+    return 0 - 1
+
+// Move every element satisfying `pred` to the front, in place, and answer how
+// many there are. **Not stable** — relative order within each group is not
+// preserved, because a stable partition needs scratch and this needs none.
+public i64 partition([]$T xs, bool(T) pred):
+    i64 kept = 0
+    for i in i64(0)..<#len(xs):
+        if pred(xs[i]):
+            swap(xs, i, kept)
+            kept = kept + 1
+    return kept
+
+// ── ordering ────────────────────────────────────────────────────────────────
+
+// The index of the smallest element under `less`, or -1 for an empty run. The
+// **first** such index when several compare equal, which is what makes it a
+// stable choice and the reason the test is `less(xs[i], xs[at])` rather than
+// `!less(xs[at], xs[i])`.
+public i64 min_index([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    if count <= 0:
+        return 0 - 1
+    i64 at = 0
+    for i in i64(1)..<count:
+        if less(xs[i], xs[at]):
+            at = i
+    return at
+
+// The index of the largest element under `less`, or -1. The first such index.
+public i64 max_index([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    if count <= 0:
+        return 0 - 1
+    i64 at = 0
+    for i in i64(1)..<count:
+        if less(xs[at], xs[i]):
+            at = i
+    return at
+
+// Whether `xs` is ordered under `less`. True for a run of fewer than two.
+public bool is_sorted([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    if count < 2:
+        return true
+    for i in i64(1)..<count:
+        if less(xs[i], xs[i - 1]):
+            return false
+    return true
+
+// Sort in place under `less`.
+//
+// **Introsort**: quicksort with a median-of-three pivot, an insertion sort under
+// `SMALL`, and a heapsort fallback once the recursion has gone deeper than
+// `2·log2(n)`. That last part is what makes the worst case O(n log n) rather
+// than O(n²), and it is not decoration — a plain quicksort's worst case is
+// reachable from ordinary input, not only from an adversary, and a library
+// whose sort degrades on sorted-then-appended data is a library people stop
+// trusting.
+//
+// **It is not stable.** Equal elements may be reordered. A stable sort needs
+// O(n) scratch, so it takes an allocator, and it is a separate function that is
+// not written yet rather than a flag on this one.
+public void sort([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    if count < 2:
+        return
+    introsort(xs, depth_budget(count), less)
+    return
+
+// Ascending, with no comparator at all.
+//
+// **The `scalar` category carries the six comparisons**, which is the whole of
+// what an ordering needs, so this is the same algorithm with `<` written where
+// the call would have been — and it costs a caller nothing to reach for. Every
+// numeric width is one instantiation of one source.
+public void sort_ascending([]$T xs) where T is scalar:
+    i64 count = #len(xs)
+    if count < 2:
+        return
+    intro_up(xs, depth_budget(count))
+    return
+
+// Descending. A separate template rather than a `bool` on the one above,
+// because a flag tested inside the innermost comparison of a sort is a branch
+// per comparison, and two instantiations of a template cost nothing when only
+// one is called.
+public void sort_descending([]$T xs) where T is scalar:
+    sort_ascending(xs)
+    reverse(xs)
+    return
+
+// ── searching a sorted run ──────────────────────────────────────────────────
+
+// The first index at which `probe` could be inserted with the order preserved —
+// i.e. the first element not ordered before it. `xs` must be sorted under
+// `less`; nothing here checks that, and on an unsorted run the answer is
+// meaningless rather than wrong.
+public i64 lower_bound([]$T xs, T probe, bool(T, T) less):
+    i64 lo = 0
+    i64 hi = #len(xs)
+    for lo < hi:
+        i64 mid = lo + ((hi - lo) / 2)
+        if less(xs[mid], probe):
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+// The last index at which `probe` could be inserted — i.e. the first element
+// `probe` is ordered before. `upper_bound - lower_bound` is how many copies of
+// `probe` the run holds.
+public i64 upper_bound([]$T xs, T probe, bool(T, T) less):
+    i64 lo = 0
+    i64 hi = #len(xs)
+    for lo < hi:
+        i64 mid = lo + ((hi - lo) / 2)
+        if less(probe, xs[mid]):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+// Find `probe` in a sorted run.
+//
+// **`at` is meaningful whether or not it was found**: on a hit it is where the
+// element is, and on a miss it is where one would be inserted. That is what
+// makes this useful for *building* a sorted run and not only for probing one,
+// and it is why the answer is a pair rather than an index with -1 for absent.
+//
+// Equality is asked as `!less(probe, xs[at])` and not with `==`, so the element
+// type needs no equality of its own — the ordering is the only thing this
+// template requires, which is what lets it serve a `T` that has no `#has_eq`.
+public (i64 at, bool found) binary_search([]$T xs, T probe, bool(T, T) less):
+    i64 at = lower_bound(xs, probe, less)
+    i64 count = #len(xs)
+    if at < count && !less(probe, xs[at]):
+        return (at, true)
+    return (at, false)
+
+// The same, over a run sorted ascending, with no comparator.
+public (i64 at, bool found) find_sorted([]$T xs, T probe) where T is scalar:
+    i64 lo = 0
+    i64 hi = #len(xs)
+    for lo < hi:
+        i64 mid = lo + ((hi - lo) / 2)
+        if xs[mid] < probe:
+            lo = mid + 1
+        else:
+            hi = mid
+    i64 count = #len(xs)
+    if lo < count && !(probe < xs[lo]):
+        return (lo, true)
+    return (lo, false)
+
+// ── the machinery ───────────────────────────────────────────────────────────
+//
+// Everything below is private and every one of it is a template, so an importer
+// that never sorts carries none of it.
+
+// A run shorter than this is insertion-sorted, which beats quicksort's
+// bookkeeping at small sizes and is where the recursion stops.
+private const i64 SMALL = 16
+
+// `2 · floor(log2(n))`, the depth at which introsort gives up on quicksort.
+//
+// `#clz` answers how many leading zero bits a value has, so `63 - #clz(n)` is
+// `floor(log2(n))` for a `u64` — the bit verb doing the one job it is for. It is
+// asked of an unsigned value because a bit count is a question about a *bit
+// pattern* and C admits three representations of a negative one; `n` is a length
+// and cannot be negative, so the conversion is free of consequence.
+private i64 depth_budget(i64 n):
+    if n < 2:
+        return 1
+    i64 levels = 63 - #clz(u64(n))
+    return 2 * levels
+
+// ── the comparator-driven half ──────────────────────────────────────────────
+
+private void introsort([]$T xs, i64 budget, bool(T, T) less):
+    i64 count = #len(xs)
+    if count < 2:
+        return
+    if count <= SMALL:
+        insertion(xs, less)
+        return
+    if budget <= 0:
+        heapsort(xs, less)
+        return
+    i64 cut = partition_at(xs, less)
+    introsort(xs[0..<cut], budget - 1, less)
+    introsort(xs[cut + 1..<count], budget - 1, less)
+    return
+
+private void insertion([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    for i in i64(1)..<count:
+        T key = xs[i]
+        i64 j = i - 1
+        for j >= 0 && less(key, xs[j]):
+            xs[j + 1] = xs[j]
+            j = j - 1
+        xs[j + 1] = key
+    return
+
+// Median of first, middle and last, moved to the end, then Lomuto. The median
+// is what keeps an already-sorted run off quicksort's worst case, which is the
+// input a naive last-element pivot is worst on and the one real programs hand
+// it most often.
+private i64 partition_at([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    i64 last = count - 1
+    i64 mid = count / 2
+    if less(xs[mid], xs[0]):
+        swap(xs, 0, mid)
+    if less(xs[last], xs[0]):
+        swap(xs, 0, last)
+    if less(xs[last], xs[mid]):
+        swap(xs, mid, last)
+    swap(xs, mid, last)
+    T pivot = xs[last]
+    i64 store = 0
+    for i in i64(0)..<last:
+        if less(xs[i], pivot):
+            swap(xs, i, store)
+            store = store + 1
+    swap(xs, store, last)
+    return store
+
+private void heapsort([]$T xs, bool(T, T) less):
+    i64 count = #len(xs)
+    i64 start = count / 2
+    i64 i = start - 1
+    for i >= 0:
+        sift(xs, i, count, less)
+        i = i - 1
+    i64 end = count - 1
+    for end > 0:
+        swap(xs, 0, end)
+        sift(xs, 0, end, less)
+        end = end - 1
+    return
+
+private void sift([]$T xs, i64 root, i64 end, bool(T, T) less):
+    i64 at = root
+    for:
+        i64 child = (2 * at) + 1
+        if child >= end:
+            return
+        if child + 1 < end && less(xs[child], xs[child + 1]):
+            child = child + 1
+        if !less(xs[at], xs[child]):
+            return
+        swap(xs, at, child)
+        at = child
+
+// ── the comparator-free half ────────────────────────────────────────────────
+//
+// The same three algorithms with `<` written where the call was. They are
+// duplicated rather than shared, and that is the honest cost of the category
+// binding: a `scalar` has the comparisons but no way to name one as a value, so
+// there is no comparator to hand `introsort` that would make these one source.
+// What is bought is that `sort_ascending(xs)` needs nothing at the call.
+
+private void intro_up([]$T xs, i64 budget) where T is scalar:
+    i64 count = #len(xs)
+    if count < 2:
+        return
+    if count <= SMALL:
+        insertion_up(xs)
+        return
+    if budget <= 0:
+        heapsort_up(xs)
+        return
+    i64 cut = partition_up(xs)
+    intro_up(xs[0..<cut], budget - 1)
+    intro_up(xs[cut + 1..<count], budget - 1)
+    return
+
+private void insertion_up([]$T xs) where T is scalar:
+    i64 count = #len(xs)
+    for i in i64(1)..<count:
+        T key = xs[i]
+        i64 j = i - 1
+        for j >= 0 && key < xs[j]:
+            xs[j + 1] = xs[j]
+            j = j - 1
+        xs[j + 1] = key
+    return
+
+private i64 partition_up([]$T xs) where T is scalar:
+    i64 count = #len(xs)
+    i64 last = count - 1
+    i64 mid = count / 2
+    if xs[mid] < xs[0]:
+        swap(xs, 0, mid)
+    if xs[last] < xs[0]:
+        swap(xs, 0, last)
+    if xs[last] < xs[mid]:
+        swap(xs, mid, last)
+    swap(xs, mid, last)
+    T pivot = xs[last]
+    i64 store = 0
+    for i in i64(0)..<last:
+        if xs[i] < pivot:
+            swap(xs, i, store)
+            store = store + 1
+    swap(xs, store, last)
+    return store
+
+private void heapsort_up([]$T xs) where T is scalar:
+    i64 count = #len(xs)
+    i64 start = count / 2
+    i64 i = start - 1
+    for i >= 0:
+        sift_up(xs, i, count)
+        i = i - 1
+    i64 end = count - 1
+    for end > 0:
+        swap(xs, 0, end)
+        sift_up(xs, 0, end)
+        end = end - 1
+    return
+
+private void sift_up([]$T xs, i64 root, i64 end) where T is scalar:
+    i64 at = root
+    for:
+        i64 child = (2 * at) + 1
+        if child >= end:
+            return
+        if child + 1 < end && xs[child] < xs[child + 1]:
+            child = child + 1
+        if !(xs[at] < xs[child]):
+            return
+        swap(xs, at, child)
+        at = child

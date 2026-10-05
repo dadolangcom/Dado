@@ -1,0 +1,146 @@
+@test
+// The container half of the glue, with no emitter in front of it: thunks
+// written in Dado here the way the compiler writes them in C, over the
+// functions a generated reader and writer call — `read_length`, `element`,
+// `read_int`, `read_exactly`, `scratch`, `new_array`, `put` — and the lend
+// lock's error. What each part proves:
+//
+// * **An array is read by each element's tag.** `[1, "two"]` throws
+//   `TypeError` naming the function, the parameter and the element's place,
+//   `at [1]`; a value that is no array says so; nothing is coerced.
+// * **An array's length is checked, never padded or cut**: `four` takes
+//   exactly four, and three throws naming both lengths.
+// * **A buffer for the call comes from the engine's allocator and goes
+//   back**: the counting allocator is empty once the engine is destroyed.
+// * **An array is built element by element**, and a fingerprint tells two
+//   values apart by their bits.
+package script
+
+import "core:mem"
+import "core:mem/libc"
+
+private const cstring VALUES_JS = """
+    import { sum, four, upto, locked } from "dado:values";
+    export function run() {
+        const out = [String(sum([1, 2, 3, 4294967296]))];
+        try { sum([1, "two"]); } catch (e) { out.push(String(e)); }
+        try { sum(7); } catch (e) { out.push(String(e)); }
+        out.push(String(four([1, 2, 3, 4])));
+        try { four([1, 2, 3]); } catch (e) { out.push(String(e)); }
+        out.push(String(upto(3)) + " " + String(upto(0).length));
+        try { locked([1]); } catch (e) { out.push(String(e)); }
+        return out.join("|");
+    }
+    """
+
+// `sum([]i64 xs)`, as a generated reader reads it: the length, a buffer for
+// the call on the engine's allocator, each element by its tag.
+private JSValue sum(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    thunk_entered(ctx)
+    [2]i64 path
+    ^i64 at = ^i64(rawptr(&path))
+    JSValue v = nth(argv, 0)
+    try i64 n = read_length(ctx, v, "values.sum", "parameter `xs`", at, 0) else:
+        return raised()
+    try rawptr block = scratch(ctx, u64(n) * 8) else:
+        return raised()
+    i64 total = 0
+    for i in 0..<n:
+        try JSValue e = element(ctx, v, i) else:
+            unscratch(ctx, block, u64(n) * 8)
+            return raised()
+        path[0] = i
+        i64 x = 0
+        try x = read_int(ctx, e, "values.sum", "parameter `xs`", at, 1) else:
+            free_value(ctx, e)
+            unscratch(ctx, block, u64(n) * 8)
+            return raised()
+        free_value(ctx, e)
+        total += x
+    unscratch(ctx, block, u64(n) * 8)
+    return give_int(ctx, total)
+
+// `four([4]i64 v)`: exactly four elements.
+private JSValue four(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    [1]i64 path
+    ^i64 at = ^i64(rawptr(&path))
+    try read_exactly(ctx, nth(argv, 0), 4, "values.four", "parameter `v`", at, 0) else:
+        return raised()
+    return give_int(ctx, 4)
+
+// `upto(n)` answering `[]i64`: a new array, built element by element.
+private JSValue upto(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    try i64 n = take_int(ctx, argv, 0, "values.upto", "n") else:
+        return raised()
+    JSValue a = new_array(ctx)
+    for i in 0..<n:
+        try put(ctx, a, i, give_int(ctx, i + 1)) else:
+            return raised()
+    return a
+
+// What a thunk throws when the array it lent was written during the call.
+private JSValue locked(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    return lent_written(ctx, "values.locked", "xs")
+
+private type Blocks:
+    i64 blocks,
+
+private Blocks tally
+
+private rawptr counting_values(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) c = libc.allocator()
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            rawptr p = c.proc(c.data, mode, nbytes, align, old, old_size)
+            if p != nil:
+                tally.blocks += 1
+            return p
+        case mem.AllocatorMode.Free:
+            tally.blocks -= 1
+            return c.proc(c.data, mode, nbytes, align, old, old_size)
+        case mem.AllocatorMode.Resize, mem.AllocatorMode.FreeAll:
+            return c.proc(c.data, mode, nbytes, align, old, old_size)
+        else:
+            return c.proc(c.data, mode, nbytes, align, old, old_size)
+
+i32 test():
+    bool ok = true
+    try Engine e = create((counting_values, nil)) else code:
+        _ = #expect(false, "create failed with ", code)
+        return 1
+    [5]Bound rows
+    rows[0] = ("dado:values", "sum", sum, 1)
+    rows[1] = ("dado:values", "four", four, 1)
+    rows[2] = ("dado:values", "upto", upto, 1)
+    rows[3] = ("dado:values", "locked", locked, 1)
+    e^.bound = rawptr(&rows)
+    try add_module(e, "values", VALUES_JS) else code:
+        _ = #expect(false, "add_module failed with ", code)
+        return 1
+    try Handle m = load(e, "values") else code:
+        _ = #expect(false, "load failed with ", code)
+        return 1
+    i64 entered = e^.entries
+    try call(e, m, "run") else code:
+        _ = #expect(false, "run failed with ", code)
+        return 1
+    ok = #expect(e^.entries == entered + 1, "a call entered the engine ", e^.entries - entered, " times") && ok
+    ok = #expect(e^.thunks == 3, "the sum thunk ran ", e^.thunks, " times, not 3") && ok
+    try string8 said = result_string(e) else code:
+        _ = #expect(false, "result_string failed with ", code)
+        return 1
+    string8 want = "4294967302|TypeError: `values.sum`'s parameter `xs` at [1] takes an int, and was given a string|TypeError: `values.sum`'s parameter `xs` takes an array, and was given an int|4|TypeError: `values.four`'s parameter `v` takes an array of exactly 4 elements, and was given one of 3|1,2,3 0|Error: the value passed as `values.locked`'s parameter `xs` was written while it was lent for the call: a structure lent across is locked until the call returns, so don't write it from code that `values.locked` calls back into, or pass a copy (`.copy()`)"
+    ok = #expect(said == want, "the glue answered \"", said, "\"") && ok
+    release(e, m)
+    destroy(e)
+    ok = #expect(tally.blocks == 0, "after destroy the allocator still holds ", tally.blocks, " block(s)") && ok
+
+    // ── the lend lock's fingerprint: two values apart by their bits ────────
+    u64 seed = 14695981039346656037
+    ok = #expect(mix(seed, 1) != mix(seed, 2), "1 and 2 fingerprint alike") && ok
+    ok = #expect(mix_float(seed, 0.0) != mix_float(seed, 0.0 * (0.0 - 1.0)), "0.0 and -0.0 fingerprint alike") && ok
+    ok = #expect(mix_string(seed, "ab") != mix_string(seed, "ba"), "\"ab\" and \"ba\" fingerprint alike") && ok
+    ok = #expect(mix_string(seed, "wörld") == mix_string(seed, "wörld"), "a fingerprint is not deterministic") && ok
+    if ok:
+        return 0
+    return 1

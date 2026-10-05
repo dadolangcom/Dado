@@ -1,0 +1,755 @@
+// app:ui — the list widgets. `Tree` for now; `ItemList` and `Table` will join
+// it here.
+//
+// ## Tree
+//
+// A virtualised tree over rows it does not own. The rows come from a
+// **source** (`TreeSource`), like a `TextView`'s lines: functions answering,
+// for the rows in view now — the visible-row model, with every collapsed
+// folder's descendants already left out — how many there are, and for row
+// `i` its depth, its label, whether it has children, whether it is expanded
+// and its icon; and one that expands or collapses row `i`. Each is given the
+// context pointer the source was set with. **The tree holds no rows and has
+// no cap**: a paint asks the count once and the per-row functions only for the
+// rows it draws, so a million rows cost what the rows on screen cost.
+//
+// **A row** is `depth * TREE_INDENT` blank cells, the chevron's
+// `TREE_CHEVRON_COLS` cells (blank for a row with no children), the icon's
+// `TREE_ICON_COLS` cells, `TREE_LABEL_GAP` blank cells and the label, cut at
+// the tree's right edge to end in `TAB_ELLIPSIS`. The chevron and the icon
+// are ink (`draw_icon`), rebuilt with the rows on every paint of the tree,
+// over the row's cells, so the selected row's highlight runs under them. Its
+// cells take `TreeTheme`'s look for the row: `selected` (or
+// `selected_unfocused` while focus is not in the tree), else `hover` for the
+// row under the pointer, else `row`. Cells below the last row take `row`.
+//
+// **Scrolling is by whole rows.** The top row is an index, not a pixel
+// offset. A grid region would give a sub-row offset the way `TextEdit` has
+// one, but the ink is in screen pixels: every offset change would have to
+// rebuild it (or the grid would have to shift ink by the offset too), and the
+// chevron's hit test would have to read the offset back. A row is one cell
+// tall, so whole-row steps are what a list of names wants anyway. The wheel
+// moves `WHEEL_LINES` rows a notch, and a fraction of a notch (a trackpad) is
+// kept until it adds up to a whole row. The top is held to the range where
+// the last row can reach the bottom and no further.
+//
+// **Keys**, while the tree has focus: Up and Down move the selection one row,
+// PageUp and PageDown one screen less one row, Home and End to the first and
+// the last. Left collapses an expanded row, or else selects its parent (the
+// nearest row above it that is shallower — found by walking up, so it costs
+// the rows between). Right expands a collapsed row, or else selects its first
+// child. Enter toggles a row with children and activates any other. Every
+// move that changes the selection brings it into view and emits
+// `tree_selected`.
+//
+// **The mouse.** A left press on a row's chevron toggles it and changes
+// nothing else. A left press anywhere else on a row selects it, brings it
+// into view and emits `tree_selected` — on every such click, the row already
+// selected included, so a program can open a file on a single click. A second
+// press on the same row within `DOUBLE_CLICK_S` toggles a row with children
+// and activates a leaf (`tree_activated`). The wheel scrolls without moving
+// the selection. The row under the pointer takes the hover look: a motion
+// repaints when it crosses to another row, and every paint finds the row at
+// the last mouse event's cell, so a wheel, a key or a toggle that moves the
+// rows under a still pointer moves the look with them. There are no leave
+// events, so a pointer that leaves the tree leaves that look lit until the
+// tree next repaints (a repaint with the pointer elsewhere drops it).
+//
+// **Signals.** `tree_selected`, `tree_activated` and `tree_toggled`;
+// `tree_signal_index` answers the row the last one was about, and
+// `tree_signal_by_mouse` whether a press made it rather than a key — so a
+// program can open a file on a click and not on every row the arrow keys pass
+// over. A toggle keeps
+// the selection on the same row: rows after the toggled one move by as many
+// rows as it gained or lost, and a selection inside a collapsed subtree moves
+// to the collapsed row (`tree_index_after_toggle`). Calls (`tree_select`,
+// `tree_toggle`, ...) emit nothing.
+//
+// The tree is focusable, expands both ways, repaints on every focus move (its
+// selected row's look follows focus) and answers the arrow cursor.
+//
+// ## A flat list with a detail column: the tree as a picker
+//
+// Three switches make the tree a list a program filters — a command palette —
+// and none of them costs a row more than it did:
+//
+//   - **flat** (`tree_set_flat`): no chevron and no icon; a row is one blank
+//     cell, then `depth * TREE_INDENT` blank cells and the label. No ink is
+//     drawn, and a press is never on a chevron;
+//   - **detail** (`tree_set_detail`): a second function of the source's shape
+//     answering row `i`'s detail — a key chord — drawn right-aligned, one
+//     blank cell in from the right edge, in `TreeTheme.detail` on the row's
+//     background. The label is cut to end one cell before it; a detail wider
+//     than the row leaves room for no label and is itself cut;
+//   - **focus proxy** (`tree_set_focus_proxy`): focus inside another subtree
+//     counts as focus in the tree, for its selected row's look — a list
+//     driven from a line edit (`line_edit_set_key_target`) shows its
+//     selection as focused while the keyboard is in the field. The tree
+//     already repaints on every focus move, so the proxy needs nothing more.
+package ui
+
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+import "core:time"
+
+// Cells one level of depth indents a row.
+const i32 TREE_INDENT = 2
+// A row's chevron, its icon, and the blank before its label, in cells.
+const i32 TREE_CHEVRON_COLS = 2
+const i32 TREE_ICON_COLS = 2
+const i32 TREE_LABEL_GAP = 1
+
+// ── The source ─────────────────────────────────────────────────────────────
+
+// How many rows are in view now (every collapsed folder's descendants left
+// out).
+type TreeCountFn: i64(rawptr)
+// Row `i`'s depth: 0 for a top-level row.
+type TreeDepthFn: i32(rawptr, i64)
+// Row `i`'s label, as a view the tree does not keep past the paint.
+type TreeLabelFn: string8(rawptr, i64)
+// Whether row `i` has children; whether it is expanded.
+type TreeFlagFn: bool(rawptr, i64)
+// Row `i`'s icon.
+type TreeIconFn: Icon(rawptr, i64)
+// Expand row `i` if it is collapsed, collapse it if it is expanded: the rows
+// after it change, and the count with them.
+type TreeToggleFn: void(rawptr, i64)
+
+// A tree's rows. Every function is given `ctx`. `count` nil is no rows;
+// `depth`, `label`, `has_children` and `expanded` nil answer 0, "", false and
+// false; `icon` nil draws a folder, open or closed, for a row with children
+// and a file for any other; `toggle` nil makes nothing expand.
+type TreeSource: (
+    TreeCountFn  count,
+    TreeDepthFn  depth,
+    TreeLabelFn  label,
+    TreeFlagFn   has_children,
+    TreeFlagFn   expanded,
+    TreeIconFn   icon,
+    TreeToggleFn toggle,
+    rawptr       ctx,
+)
+
+// ── Pure arithmetic ────────────────────────────────────────────────────────
+
+// The top row held to `[0, max(0, n - rows)]`.
+i64 tree_clamp_top(i64 top, i64 n, i32 rows):
+    i64 max = n - i64(rows)
+    if max < 0:
+        max = 0
+    if top > max:
+        return max
+    if top < 0:
+        return 0
+    return top
+
+// The least change to `top` that shows row `sel` in a view `rows` tall; `top`
+// unchanged for no selection (`sel` < 0).
+i64 tree_follow(i64 top, i64 sel, i32 rows):
+    if sel < 0:
+        return top
+    i64 h = i64(rows)
+    if h < 1:
+        h = 1
+    if sel < top:
+        return sel
+    if sel >= top + h:
+        return sel - h + 1
+    return top
+
+// Where row index `r` goes when row `at` is toggled and the count changes by
+// `delta` rows: unchanged at or before `at`; moved to `at` when a collapse
+// took it away; else moved by `delta`. A negative `r` (no row) stays.
+i64 tree_index_after_toggle(i64 r, i64 at, i64 delta):
+    if r <= at:
+        return r
+    if delta < 0 && r <= at - delta:
+        return at
+    return r + delta
+
+// The screen columns of a row's chevron, icon and label, for a tree whose
+// left edge is `left` and a row at `depth` (negative reads as zero).
+(i32 chevron, i32 icon, i32 label) tree_row_columns(i32 left, i32 depth):
+    i64 d = i64(clamp0(depth)) * i64(TREE_INDENT)
+    if d > 1000000:
+        d = 1000000
+    i32 ch = left + i32(d)
+    return (ch, ch + TREE_CHEVRON_COLS, ch + TREE_CHEVRON_COLS + TREE_ICON_COLS + TREE_LABEL_GAP)
+
+// A flat row's label column, for a list whose left edge is `left` and a row at
+// `depth`: one blank cell, then the indent. Pure.
+i32 tree_flat_label_column(i32 left, i32 depth):
+    i64 d = i64(clamp0(depth)) * i64(TREE_INDENT)
+    if d > 1000000:
+        d = 1000000
+    return left + 1 + i32(d)
+
+// Where a row's label ends and its detail begins, for a row whose cells run
+// from column `lx` (the label's first) to `right` (exclusive) and a detail
+// `detail_cols` wide: the detail is right-aligned one cell in from `right`,
+// and the label ends one cell before it. With no detail the label runs to
+// `right`. The detail's start is held to `lx`, and so is the label's end. Pure.
+(i32 label_end, i32 detail_at) tree_detail_columns(i32 lx, i32 right, i32 detail_cols):
+    if detail_cols <= 0:
+        return (right, right)
+    i32 at = right - 1 - detail_cols
+    if at < lx:
+        at = lx
+    i32 end = at - 1
+    if end < lx:
+        end = lx
+    return (end, at)
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+private type TreeState: (
+    TreeSource src,
+    i64        top,
+    i64        selected,
+    i64        hover,
+    i64        sig_index,
+    bool       sig_mouse,
+    f64        wheel_rest,
+    bool       has_press,
+    f64        press_t,
+    i64        press_row,
+    i64        rows_painted,
+    i64        paints,
+    bool       flat,
+    TreeLabelFn detail,
+    Control    proxy,
+)
+private type TreePtr: ^TreeState
+
+private Kind g_tree_kind = NO_KIND
+private i32  g_sig_tree_selected = -1
+private i32  g_sig_tree_activated = -1
+private i32  g_sig_tree_toggled = -1
+
+// The clock a double-click is timed on; nil means `time.now`. Tests set it.
+private type TreeClockFn: f64()
+private TreeClockFn g_tree_clock
+
+private f64 tree_now():
+    if g_tree_clock != nil:
+        return g_tree_clock()
+    return time.now()
+
+private Kind tree_kind():
+    if !kind_ok(g_tree_kind):
+        Hooks h
+        h.measure = tree_measure_hook
+        h.paint = tree_paint_hook
+        h.input = tree_input_hook
+        h.cursor = tree_cursor_hook
+        g_tree_kind = register_kind("tree", h)
+    return g_tree_kind
+
+private bool is_tree(Control c):
+    return kind(c) == g_tree_kind && state(c) != nil
+
+// A tree that may be changed now: not while `update` runs.
+private bool tree_changeable(Control c):
+    return is_tree(c) && g_phase == PHASE_IDLE
+
+// ── Reading the source ─────────────────────────────────────────────────────
+
+private i64 tree_n(^TreeState s):
+    if s.src.count == nil:
+        return 0
+    i64 n = s.src.count(s.src.ctx)
+    if n < 0:
+        return 0
+    return n
+
+private i32 tree_depth_of(^TreeState s, i64 i):
+    if s.src.depth == nil:
+        return 0
+    return clamp0(s.src.depth(s.src.ctx, i))
+
+private bool tree_has_children(^TreeState s, i64 i):
+    return s.src.has_children != nil && s.src.has_children(s.src.ctx, i)
+
+private bool tree_is_expanded(^TreeState s, i64 i):
+    return s.src.expanded != nil && s.src.expanded(s.src.ctx, i)
+
+private Icon tree_icon_of(^TreeState s, i64 i, bool has, bool open):
+    if s.src.icon != nil:
+        return s.src.icon(s.src.ctx, i)
+    if has && open:
+        return Icon.FolderOpen
+    if has:
+        return Icon.FolderClosed
+    return Icon.File
+
+// The nearest row above `i` that is shallower than it; -1 for a top-level row.
+private i64 tree_parent_of(^TreeState s, i64 i):
+    i32 d = tree_depth_of(s, i)
+    if d <= 0:
+        return -1
+    i64 j = i - 1
+    for j >= 0:
+        if tree_depth_of(s, j) < d:
+            return j
+        j = j - 1
+    return -1
+
+// ── Hooks ──────────────────────────────────────────────────────────────────
+
+private cell.CellPoint tree_measure_hook(Control c, rawptr st):
+    _ = c
+    _ = st
+    cell.CellPoint p = (1, 1)
+    return p
+
+private i32 tree_cursor_hook(Control c, rawptr st, cell.CellPoint p):
+    _ = c
+    _ = st
+    _ = p
+    return CURSOR_DEFAULT
+
+private void tree_paint_hook(Control c, rawptr st, cell.CellRect clip):
+    ^TreeState s = TreePtr(st)
+    s.paints = s.paints + 1
+    TreeTheme th = theme_tree()
+    cell.CellRect r = rect(c)
+    i64 n = tree_n(s)
+    s.top = tree_clamp_top(s.top, n, r.rows)
+    if s.selected >= n:
+        s.selected = n - 1
+    bool focus_in = focus_within(c) || (s.proxy != NIL && focus_within(s.proxy))
+    bool hover_live = hovered() == c
+    // The hover is the row under the pointer now, not the one it was over at
+    // the last motion: a wheel, a key or a toggle moves the rows under a
+    // pointer that stays put.
+    if hover_live:
+        (i64 hr, bool hc) = tree_hit(c, g_pointer)
+        _ = hc
+        s.hover = hr
+    i32 right = r.col + r.cols
+    grid.clip(clip)
+    defer grid.unclip()
+    bool inked = !s.flat && ink_begin(c, clip)
+    for row in clip.row..<(clip.row + clip.rows):
+        i64 i = s.top + i64(row - r.row)
+        cell.CellRect band = cell.rect(clip.col, i32(row), clip.cols, 1)
+        if i >= n:
+            grid.fill(band, th.row.fg, th.row.bg)
+            continue
+        CellLook look = th.row
+        if i == s.selected && focus_in:
+            look = th.selected
+        else if i == s.selected:
+            look = th.selected_unfocused
+        else if hover_live && i == s.hover:
+            look = th.hover
+        grid.fill(band, look.fg, look.bg)
+        (i32 cx, i32 ix, i32 lx) = tree_row_columns(r.col, tree_depth_of(s, i))
+        if s.flat:
+            lx = tree_flat_label_column(r.col, tree_depth_of(s, i))
+        bool has = tree_has_children(s, i)
+        bool open = has && tree_is_expanded(s, i)
+        string8 t = ""
+        if s.src.label != nil:
+            t = s.src.label(s.src.ctx, i)
+        i32 label_end = right
+        if s.detail != nil:
+            string8 dt = s.detail(s.src.ctx, i)
+            i32 dcols = cell.columns(dt)
+            (i32 le, i32 da) = tree_detail_columns(lx, right, dcols)
+            label_end = le
+            if dcols > 0:
+                _ = grid.text(da, i32(row), dt, right - da, th.detail, look.bg)
+        i32 room = label_end - lx
+        if room > 0:
+            if cell.columns(t) > room:
+                string8 head = tab_prefix(t, room - 1)
+                i32 used = grid.text(lx, i32(row), head, room - 1, look.fg, look.bg)
+                _ = grid.text(lx + used, i32(row), TAB_ELLIPSIS, 1, look.fg, look.bg)
+            else:
+                _ = grid.text(lx, i32(row), t, room, look.fg, look.bg)
+        s.rows_painted = s.rows_painted + 1
+        if inked:
+            if has:
+                Icon mark = Icon.ChevronRight
+                if open:
+                    mark = Icon.ChevronDown
+                draw_icon(mark, cell_pixels(cell.rect(cx, i32(row), TREE_CHEVRON_COLS, 1)), th.chevron)
+            Icon kind = tree_icon_of(s, i, has, open)
+            [4]u8 col = th.folder
+            if kind == Icon.File:
+                col = th.file
+            draw_icon(kind, cell_pixels(cell.rect(ix, i32(row), TREE_ICON_COLS, 1)), col)
+    ink_end()
+
+private bool tree_input_hook(Control c, rawptr st, input.Event e):
+    ^TreeState s = TreePtr(st)
+    f32 wheel = input.wheel_amount(e)
+    if wheel != 0.0:
+        tree_wheel(c, s, wheel)
+        return true
+    if e.kind == input.EventKind.Mouse:
+        return tree_mouse(c, s, e)
+    if !input.is_key_press(e):
+        return false
+    return tree_key(c, s, e.code)
+
+private void tree_wheel(Control c, ^TreeState s, f32 amount):
+    i64 n = tree_n(s)
+    f64 lines = f64(amount) * f64(WHEEL_LINES) + s.wheel_rest
+    if !(lines == lines):
+        s.wheel_rest = 0.0
+        return
+    f64 cap = f64(n + 1)
+    if lines > cap:
+        lines = cap
+    if lines < 0.0 - cap:
+        lines = 0.0 - cap
+    i64 whole = i64(lines)
+    s.wheel_rest = lines - f64(whole)
+    if whole != 0:
+        _ = tree_scroll_to(c, s.top + whole)
+
+private bool tree_mouse(Control c, ^TreeState s, input.Event e):
+    input.MouseKind mk = input.mouse_kind(e)
+    cell.CellPoint p = event_cell(e)
+    (i64 row, bool on_chevron) = tree_hit(c, p)
+    if mk == input.MouseKind.Motion:
+        if row != s.hover:
+            s.hover = row
+            mark_paint(c)
+        return false
+    if mk != input.MouseKind.Press || input.mouse_button(e) != 0:
+        return false
+    if row < 0:
+        s.has_press = false
+        return true
+    if on_chevron:
+        s.has_press = false
+        tree_toggle_emit(c, s, row, true)
+        return true
+    f64 now = tree_now()
+    f64 gap = now - s.press_t
+    if s.has_press && s.press_row == row && gap >= 0.0 && gap < DOUBLE_CLICK_S:
+        s.has_press = false
+        if tree_has_children(s, row):
+            tree_toggle_emit(c, s, row, true)
+        else:
+            s.sig_index = row
+            s.sig_mouse = true
+            _ = emit(c, tree_activated_signal())
+        return true
+    s.has_press = true
+    s.press_t = now
+    s.press_row = row
+    tree_move(c, s, row)
+    s.sig_index = row
+    s.sig_mouse = true
+    _ = emit(c, tree_selected_signal())
+    return true
+
+// Select `i` (held to the rows) and bring it into view; answers whether the
+// selection changed.
+private bool tree_move(Control c, ^TreeState s, i64 i):
+    i64 n = tree_n(s)
+    if n <= 0:
+        return false
+    i64 to = i
+    if to < 0:
+        to = 0
+    if to >= n:
+        to = n - 1
+    i32 rows = rect(c).rows
+    i64 top = tree_clamp_top(tree_follow(s.top, to, rows), n, rows)
+    bool changed = to != s.selected
+    if changed || top != s.top:
+        s.selected = to
+        s.top = top
+        mark_paint(c)
+    return changed
+
+// A key moved the selection to `i`: move it, and emit when it changed.
+private void tree_key_move(Control c, ^TreeState s, i64 i):
+    if tree_move(c, s, i):
+        s.sig_index = s.selected
+        s.sig_mouse = false
+        _ = emit(c, tree_selected_signal())
+
+private bool tree_key(Control c, ^TreeState s, i32 k):
+    i64 n = tree_n(s)
+    i64 sel = s.selected
+    if sel >= n:
+        sel = n - 1
+    i64 page = i64(rect(c).rows) - 1
+    if page < 1:
+        page = 1
+    if k == i32(input.Keycode.Up):
+        if sel < 0:
+            tree_key_move(c, s, 0)
+        else:
+            tree_key_move(c, s, sel - 1)
+        return true
+    if k == i32(input.Keycode.Down):
+        tree_key_move(c, s, sel + 1)
+        return true
+    if k == i32(input.Keycode.PageUp):
+        tree_key_move(c, s, sel - page)
+        return true
+    if k == i32(input.Keycode.PageDown):
+        if sel < 0:
+            sel = 0
+        tree_key_move(c, s, sel + page)
+        return true
+    if k == i32(input.Keycode.Home):
+        tree_key_move(c, s, 0)
+        return true
+    if k == i32(input.Keycode.End):
+        tree_key_move(c, s, n - 1)
+        return true
+    if sel < 0:
+        return false
+    bool has = tree_has_children(s, sel)
+    if k == i32(input.Keycode.Left):
+        if has && tree_is_expanded(s, sel):
+            tree_toggle_emit(c, s, sel, false)
+            return true
+        i64 up = tree_parent_of(s, sel)
+        if up >= 0:
+            tree_key_move(c, s, up)
+        return true
+    if k == i32(input.Keycode.Right):
+        if has && !tree_is_expanded(s, sel):
+            tree_toggle_emit(c, s, sel, false)
+            return true
+        if has && sel + 1 < n && tree_depth_of(s, sel + 1) > tree_depth_of(s, sel):
+            tree_key_move(c, s, sel + 1)
+        return true
+    if k == i32(input.Keycode.Enter) || k == i32(input.Keycode.KpEnter):
+        if has:
+            tree_toggle_emit(c, s, sel, false)
+        else:
+            s.sig_index = sel
+            s.sig_mouse = false
+            _ = emit(c, tree_activated_signal())
+        return true
+    return false
+
+// Toggle row `i` through the source, keep the selection on its row, and
+// answer whether anything was toggled.
+private bool tree_do_toggle(Control c, ^TreeState s, i64 i):
+    if s.src.toggle == nil || i < 0 || i >= tree_n(s) || !tree_has_children(s, i):
+        return false
+    i64 before = tree_n(s)
+    s.src.toggle(s.src.ctx, i)
+    i64 delta = tree_n(s) - before
+    s.selected = tree_index_after_toggle(s.selected, i, delta)
+    s.hover = -1
+    s.has_press = false
+    mark_paint(c)
+    return true
+
+private void tree_toggle_emit(Control c, ^TreeState s, i64 i, bool mouse):
+    if tree_do_toggle(c, s, i):
+        s.sig_index = i
+        s.sig_mouse = mouse
+        _ = emit(c, tree_toggled_signal())
+
+// ── The surface ────────────────────────────────────────────────────────────
+
+// A tree under `parent` (under the root for `NIL`), focusable, expanding
+// both ways, with no source (it shows no rows until `tree_set_source`) and
+// nothing selected; `NIL` wherever `create` would answer it.
+Control tree_view(Control parent):
+    Control c = create_owned(tree_kind(), parent, i64(#size(TreeState)))
+    if !valid(c):
+        return NIL
+    ^TreeState s = TreePtr(state(c))
+    s.selected = -1
+    s.hover = -1
+    s.sig_index = -1
+    s.proxy = NIL
+    set_expand(c, true, true)
+    set_focusable(c, true)
+    set_focus_repaint(c, true)
+    return c
+
+// Give the tree its rows. Scrolls to the top, selects nothing, and repaints.
+// Does nothing to anything that is not a tree, or while `update` runs.
+void tree_set_source(Control c, TreeSource src):
+    if !tree_changeable(c):
+        return
+    ^TreeState s = TreePtr(state(c))
+    s.src = src
+    s.top = 0
+    s.selected = -1
+    s.hover = -1
+    s.has_press = false
+    s.wheel_rest = 0.0
+    mark_paint(c)
+
+// Tell the tree its source's rows changed; it repaints, and a selection past
+// the last row moves to it.
+void tree_changed(Control c):
+    if is_tree(c):
+        mark_paint(c)
+
+// Draw rows flat (on) — no chevron, no icon — or as a tree (off, the
+// default); see "A flat list" in the package comment. Repaints. Does nothing
+// to anything that is not a tree, or while `update` runs.
+void tree_set_flat(Control c, bool on):
+    if !tree_changeable(c):
+        return
+    ^TreeState s = TreePtr(state(c))
+    s.flat = on
+    mark_paint(c)
+
+bool tree_flat(Control c):
+    return is_tree(c) && TreePtr(state(c)).flat
+
+// Draw `fn(ctx, i)` — `ctx` the source's — right-aligned on row `i`; nil for
+// no detail. Repaints. Does nothing to anything that is not a tree, or while
+// `update` runs.
+void tree_set_detail(Control c, TreeLabelFn fn):
+    if !tree_changeable(c):
+        return
+    ^TreeState s = TreePtr(state(c))
+    s.detail = fn
+    mark_paint(c)
+
+// Count focus inside `other`'s subtree as the tree's own, for its selected
+// row's look; `NIL` for no proxy. Repaints. Does nothing to anything that is
+// not a tree.
+void tree_set_focus_proxy(Control c, Control other):
+    if !tree_changeable(c):
+        return
+    ^TreeState s = TreePtr(state(c))
+    s.proxy = other
+    mark_paint(c)
+
+// The selected row, -1 for none and for anything that is not a tree.
+i64 tree_selection(Control c):
+    if !is_tree(c):
+        return -1
+    ^TreeState s = TreePtr(state(c))
+    if s.selected >= tree_n(s):
+        return tree_n(s) - 1
+    return s.selected
+
+// Select row `i`, held to the rows, and bring it into view; -1 selects
+// nothing. Emits nothing. Does nothing while `update` runs.
+void tree_select(Control c, i64 i):
+    if !tree_changeable(c):
+        return
+    ^TreeState s = TreePtr(state(c))
+    if i < 0:
+        if s.selected >= 0:
+            s.selected = -1
+            mark_paint(c)
+        return
+    _ = tree_move(c, s, i)
+
+// Expand or collapse row `i` through the source, as a click on its chevron
+// would, but emitting nothing; answers whether it did (a row with children and
+// a source that can toggle).
+bool tree_toggle(Control c, i64 i):
+    if !tree_changeable(c):
+        return false
+    return tree_do_toggle(c, TreePtr(state(c)), i)
+
+// The first row in view; 0 for anything that is not a tree.
+i64 tree_top(Control c):
+    if !is_tree(c):
+        return 0
+    return TreePtr(state(c)).top
+
+// Put row `top` at the top, held to the rows; repaints and answers true when
+// that changed the top.
+bool tree_scroll_to(Control c, i64 top):
+    if !tree_changeable(c):
+        return false
+    ^TreeState s = TreePtr(state(c))
+    i64 t = tree_clamp_top(top, tree_n(s), rect(c).rows)
+    if t == s.top:
+        return false
+    s.top = t
+    mark_paint(c)
+    return true
+
+// The row at screen cell `p` as the tree lays out now, and whether `p` is on
+// that row's chevron (only a row with children has one); `(-1, false)` off the
+// tree, below the last row, and for anything that is not a tree.
+(i64 row, bool chevron) tree_hit(Control c, cell.CellPoint p):
+    if !is_tree(c):
+        return (-1, false)
+    ^TreeState s = TreePtr(state(c))
+    cell.CellRect r = rect(c)
+    if !cell.contains(r, p.col, p.row):
+        return (-1, false)
+    i64 i = s.top + i64(p.row - r.row)
+    if i < 0 || i >= tree_n(s):
+        return (-1, false)
+    if s.flat:
+        return (i, false)
+    (i32 cx, i32 ix, i32 lx) = tree_row_columns(r.col, tree_depth_of(s, i))
+    _ = ix
+    _ = lx
+    bool on = p.col >= cx && p.col < cx + TREE_CHEVRON_COLS && tree_has_children(s, i)
+    return (i, on)
+
+// The row the pointer last hovered as the tree saw it; -1 for none.
+i64 tree_hover(Control c):
+    if !is_tree(c):
+        return -1
+    return TreePtr(state(c)).hover
+
+// Emitted when a click or a key selected a row; `tree_signal_index` is it.
+i32 tree_selected_signal():
+    if g_sig_tree_selected < 0:
+        g_sig_tree_selected = signal("tree_selected")
+    return g_sig_tree_selected
+
+// Emitted when a double-click or Enter activated a row with no children.
+i32 tree_activated_signal():
+    if g_sig_tree_activated < 0:
+        g_sig_tree_activated = signal("tree_activated")
+    return g_sig_tree_activated
+
+// Emitted when a click, a double-click or a key expanded or collapsed a row.
+i32 tree_toggled_signal():
+    if g_sig_tree_toggled < 0:
+        g_sig_tree_toggled = signal("tree_toggled")
+    return g_sig_tree_toggled
+
+void on_tree_selected(Control c, SignalFn fn, rawptr ctx):
+    connect(c, tree_selected_signal(), fn, ctx)
+
+void on_tree_activated(Control c, SignalFn fn, rawptr ctx):
+    connect(c, tree_activated_signal(), fn, ctx)
+
+void on_tree_toggled(Control c, SignalFn fn, rawptr ctx):
+    connect(c, tree_toggled_signal(), fn, ctx)
+
+// The row the tree's last signal was about; -1 before any, and for anything
+// that is not a tree.
+i64 tree_signal_index(Control c):
+    if !is_tree(c):
+        return -1
+    return TreePtr(state(c)).sig_index
+
+// Whether the tree's last signal came from a mouse press (a click, a
+// double-click, a chevron) rather than a key; false before any, and for
+// anything that is not a tree.
+bool tree_signal_by_mouse(Control c):
+    if !is_tree(c):
+        return false
+    return TreePtr(state(c)).sig_mouse
+
+// Rows painted and paints made since the tree was made — the counters an
+// instrument reads.
+(i64 rows_painted, i64 paints) tree_counters(Control c):
+    if !is_tree(c):
+        return (0, 0)
+    ^TreeState s = TreePtr(state(c))
+    return (s.rows_painted, s.paints)

@@ -1,0 +1,172 @@
+@test
+// app:config unit test. `core:cfg`'s own test already covers parsing edge
+// cases (round-trip, malformed lines, sections, comments, missing keys); what
+// is this package's own judgement is the self-provisioning flow, and that
+// is what is claimed here:
+//
+//   * **no file yet** — `load` calls `DefaultsFn`, writes the file, and
+//     answers `created` true.
+//   * **the file now exists** — a second `load` at the same path answers
+//     `created` false and the values it seeded read back unchanged.
+//   * **`defaults` may be `nil`** — an empty file, not a crash.
+//   * **`save` persists a runtime change** — set after load, save, reload,
+//     see the new value.
+//   * **the typed forwarders** (`get_i32`/`get_f64`/`get_bool`/`get_string`,
+//     and their `set_*` counterparts) actually reach `core:cfg` with
+//     `app.allocator()`, not just compile.
+//   * **`destroy` ends a `Config`**, and every one this file loads outside
+//     an arena is destroyed — so it runs clean under LeakSanitizer
+//     (`detect_leaks=1`), which it did not before values became freeable
+//     (28,496 B in 255 allocations). The two loaded under
+//     `using arena.allocator(&home)` are not destroyed: `arena.destroy` is
+//     their free.
+package config
+
+import "core:io"
+import "core:mem/libc"
+import "core:mem/arena"
+
+private const cstring PATH = "/tmp/dado_app_config_test.ini"
+private const cstring PATH_NIL = "/tmp/dado_app_config_test_nil.ini"
+private const cstring PATH_CTL = "/tmp/dado_app_config_test_ctl.ini"
+private const cstring PATH_ARENA = "/tmp/dado_app_config_test_arena.ini"
+
+private void seed_defaults(^Config c):
+    set_string(c, "", "app", "toytest")
+    set_i32(c, "window", "width", 1280)
+    set_i32(c, "window", "height", 720)
+    set_f64(c, "window", "scale", 1.5)
+    set_bool(c, "window", "fullscreen", false)
+    // Twelve more sections, and the count is the whole point of them. A
+    // `Config`'s outer map holds one entry per section and grows when its
+    // entries would pass three quarters of its slots, and this function is
+    // where a seed reaches one: two sections never came near the growth, so
+    // this ran under ASan on every gate run and proved nothing about it.
+    // Fourteen reaches it, and the `^Config` above is what makes reaching it
+    // the caller's growth rather than a copy's.
+    set_i32(c, "audio", "volume", 100)
+    set_i32(c, "input", "deadzone", 15)
+    set_i32(c, "video", "vsync", 1)
+    set_i32(c, "network", "port", 7777)
+    set_i32(c, "debug", "level", 2)
+    set_i32(c, "ui", "theme", 0)
+    set_i32(c, "log", "rotate", 7)
+    set_i32(c, "paths", "depth", 3)
+    set_i32(c, "physics", "steps", 60)
+    set_i32(c, "render", "msaa", 4)
+    set_i32(c, "save", "slots", 8)
+    set_i32(c, "misc", "seed", 1)
+
+i32 test():
+    bool ok = true
+
+    // Every run starts from a clean slate: `load` only self-provisions a
+    // path with *nothing* there, and `--cc gcc` re-runs this file against
+    // whatever the unsanitized run already wrote to `/tmp`. `io.delete` is a
+    // no-op on a path that isn't there, so this is safe on a first run too.
+    _ = io.delete(PATH)
+    _ = io.delete(PATH_NIL)
+
+    // ── no file yet: load self-provisions it ──────────────────────────────
+
+    (Config c1, bool created1, bool ok1, i32 bad1) = load(PATH, seed_defaults)
+    ok = #expect(created1, "first load() of a missing file did not report created") && ok
+    ok = #expect(ok1, "first load() reported bad lines: ", bad1) && ok
+    ok = #expect(get_string(c1, "", "app", "?") == "toytest", "seeded app was ", get_string(c1, "", "app", "?")) && ok
+    ok = #expect(get_i32(c1, "window", "width", 0) == 1280, "seeded width was ", get_i32(c1, "window", "width", 0)) && ok
+    destroy(&c1)
+    ok = #expect(get_i32(c1, "window", "width", 0) == 0, "a destroyed Config still answered") && ok
+
+    // ── the file now exists: a second load reads it back ──────────────────
+
+    (Config c2, bool created2, bool ok2, i32 bad2) = load(PATH, seed_defaults)
+    ok = #expect(!created2, "second load() of an existing file reported created") && ok
+    ok = #expect(ok2 && bad2 == 0, "second load() reported bad lines: ", bad2) && ok
+    ok = #expect(get_string(c2, "", "app", "?") == "toytest", "reloaded app was ", get_string(c2, "", "app", "?")) && ok
+    ok = #expect(get_i32(c2, "window", "width", 0) == 1280, "reloaded width was ", get_i32(c2, "window", "width", 0)) && ok
+    ok = #expect(get_i32(c2, "window", "height", 0) == 720, "reloaded height was ", get_i32(c2, "window", "height", 0)) && ok
+    f64 scale = get_f64(c2, "window", "scale", 0.0)
+    ok = #expect(scale > 1.4999 && scale < 1.5001, "reloaded scale was ", scale) && ok
+    ok = #expect(get_bool(c2, "window", "fullscreen", true) == false, "reloaded fullscreen was true") && ok
+
+    // ── a missing key still answers the caller's fallback ─────────────────
+
+    ok = #expect(get_string(c2, "window", "title", "untitled") == "untitled", "missing-key fallback was wrong") && ok
+
+    // ── defaults may be nil: an empty file, not a crash ────────────────────
+
+    (Config c3, bool created3, bool ok3, i32 bad3) = load(PATH_NIL, nil)
+    ok = #expect(created3, "load() with nil defaults did not report created") && ok
+    ok = #expect(ok3 && bad3 == 0, "load() with nil defaults reported bad lines: ", bad3) && ok
+    ok = #expect(get_string(c3, "", "anything", "fallback") == "fallback", "an empty self-provisioned file answered something other than the fallback") && ok
+    destroy(&c3)
+
+    // ── save() persists a runtime change ───────────────────────────────────
+
+    set_i32(&c2, "window", "width", 1920)
+    bool saved = save(c2, PATH)
+    ok = #expect(saved, "save() returned false") && ok
+
+    (Config c4, bool created4, bool ok4, i32 bad4) = load(PATH, seed_defaults)
+    ok = #expect(!created4, "post-save reload reported created") && ok
+    ok = #expect(ok4 && bad4 == 0, "post-save reload reported bad lines: ", bad4) && ok
+    ok = #expect(get_i32(c4, "window", "width", 0) == 1920, "post-save width was ", get_i32(c4, "window", "width", 0)) && ok
+    // The keys save() didn't touch are still there.
+    ok = #expect(get_i32(c4, "window", "height", 0) == 720, "height survived the save() of a different key: ", get_i32(c4, "window", "height", 0)) && ok
+    destroy(&c2)
+    destroy(&c4)
+
+    // ── `using` is what places a Config ───────────────────────────────────
+    //
+    // `load_with` lost its `mem.Allocator` parameter, and the package doc
+    // comment now claims the caller decides with `using` instead. That claim
+    // is worth exactly what an assertion about it is worth, so here it is
+    // twice over: the self-provisioning path, where the only allocation is the
+    // fresh `Config` `load_with` mints, and the reading path, where it is the
+    // parse. Each with a control — the same call with no `using` — because "an
+    // arena grew" says nothing on its own.
+    arena.Arena home = arena.over(libc.allocator())
+    u64 empty = arena.used(home)
+
+    // Self-provisioning, with `nil` defaults so that the fresh map is the
+    // whole of what gets allocated and nothing else can be what moved.
+    _ = io.delete(PATH_CTL)
+    _ = io.delete(PATH_ARENA)
+
+    (Config nc, bool nc_new, bool nc_ok, i32 nc_bad) = load_with(PATH_CTL, nil)
+    ok = #expect(nc_new && nc_ok && nc_bad == 0, "the control load_with did not self-provision") && ok
+    ok = #expect(get_string(nc, "", "anything", "fallback") == "fallback",
+                 "the control Config does not read back") && ok
+    ok = #expect(arena.used(home) == empty,
+                 "a self-provisioning load_with with no `using` still spent the arena: ",
+                 arena.used(home)) && ok
+    destroy(&nc)
+
+    (Config fc, bool fc_new, bool fc_ok, i32 fc_bad) = load_with(PATH_ARENA, nil) using arena.allocator(&home)
+    ok = #expect(fc_new && fc_ok && fc_bad == 0, "the arena load_with did not self-provision") && ok
+    u64 provisioned = arena.used(home)
+    ok = #expect(provisioned > empty,
+                 "the fresh Config did not land in the arena load_with was called under") && ok
+    ok = #expect(get_string(fc, "", "anything", "fallback") == "fallback",
+                 "the Config minted in the arena does not read back") && ok
+
+    // Reading an existing file, which is the other half of the same call.
+    (Config ctl, bool ctl_new, bool ctl_ok, i32 ctl_bad) = load_with(PATH, seed_defaults)
+    ok = #expect(ctl_ok && !ctl_new && ctl_bad == 0, "the control load_with did not read the file") && ok
+    ok = #expect(get_i32(ctl, "window", "width", 0) == 1920, "the control load_with read nothing") && ok
+    ok = #expect(arena.used(home) == provisioned,
+                 "a reading load_with with no `using` still spent the arena: ", arena.used(home)) && ok
+    destroy(&ctl)
+
+    (Config ac, bool a_new, bool a_ok, i32 a_bad) = load_with(PATH, seed_defaults) using arena.allocator(&home)
+    ok = #expect(a_ok && !a_new && a_bad == 0, "the arena load_with did not read the file") && ok
+    ok = #expect(get_i32(ac, "window", "width", 0) == 1920,
+                 "the config parsed into the arena does not read back: ",
+                 get_i32(ac, "window", "width", 0)) && ok
+    ok = #expect(arena.used(home) > provisioned,
+                 "the parsed Config did not land in the arena load_with was called under") && ok
+    arena.destroy(&home)
+
+    if ok:
+        return 0
+    return 1

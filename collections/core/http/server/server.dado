@@ -1,0 +1,438 @@
+// core:http/server — a small web server that reads like Python's.
+//
+//     import "core:http/server"
+//
+//     server.Response index(server.Request req):
+//         return server.html("<h1>hello</h1>")
+//
+//     server.Response user(server.Request req):
+//         return server.text(#format("user ", req.param("id"), "\n"))
+//
+//     i32 main():
+//         server.App app = server.app()
+//         app.get("/", index)
+//         app.get("/users/{id}", user)
+//         app.files("/static", "public")
+//         return app.run(port: 8000)
+//
+// **The high level is a handler that takes a `Request` and returns a
+// `Response`.** A route pattern is a path whose `{name}` segments capture
+// (`req.param("name")`) and whose last segment may be `{name...}`, which
+// captures the rest of the path. The query and form fields decode on asking
+// (`req.query("q")`, `req.form("name")`), headers are asked by name in any case
+// (`req.header("content-type")`), and the response is made by one call —
+// `text`, `html`, `json`, `redirect`, `status` — and adjusted by chaining
+// (`.with_header(…)`, `.with_status(…)`). HEAD is answered for every GET
+// route; a path that matches a route of another method is answered 405 with
+// `Allow`; anything else is 404, or what `app.fallback` returns.
+//
+// **The low level is a route whose handler writes the response itself**:
+// `app.raw("GET", "/events", stream)` hands it the request and a `^Writer`
+// that sets the status and the headers and then writes the body in as many
+// pieces as it likes, flushed to the connection as they come — no
+// `Content-Length`, the body ends when the connection closes. And the `App`'s
+// slots are its configuration, set before `run`: the most bytes a request may
+// take, how long to wait for them, whether to log.
+//
+// **Memory is per request and is nobody's job.** Each request runs inside its
+// own `core:runtime` scratch frame, installed as `#default`, so everything a
+// handler allocates — a `#format`ted body, a decoded query value, a file it
+// read — is reclaimed when the response has been sent. A handler never frees
+// anything, and must not keep a view of anything past its return.
+//
+// **One request at a time**, on the thread that calls `run` or `step`: the
+// accept is non-blocking and the read waits at most `read_timeout_ms`. A
+// connection is answered and closed (`Connection: close`); there is no
+// keep-alive, no TLS and no chunked request body. That is the server this is:
+// a tool's dashboard, a dev server for a web build, a webhook — not a front
+// door on the internet.
+package server
+
+import "core:http"
+import "core:strings"
+import "core:runtime"
+import "core:time"
+import "core:fmt"
+import "core:io"
+import "core:os/fs"
+
+// A handler: the request in, the response out.
+type Handler: Response(Request)
+
+// A raw handler: the request, and the writer it answers through.
+type RawHandler: void(Request, ^Writer)
+
+private const i32 KIND_HANDLER = 0
+private const i32 KIND_RAW     = 1
+private const i32 KIND_FILES   = 2
+
+type Route:
+    string8 method      // "" answers every method
+    string8 pattern
+    i32 kind
+    Handler handler
+    RawHandler raw
+    string8 dir         // KIND_FILES: the directory served
+
+type App:
+    ref []Route routes
+    ref []Header always         // sent with every response (`header`)
+    Handler fallback            // answers what no route matches; 404 when unset
+    bool has_fallback
+    i64 max_request             // the most bytes one request may take: 413 past it
+    i32 read_timeout_ms         // how long to wait for a request's bytes: 408 past it
+    bool quiet                  // no log line per request
+    http.Server listener
+    bool listening
+    i64 served
+
+    // ── routes ──────────────────────────────────────────────────────────────
+
+    void get(^self, string8 pattern, Handler h):
+        self.route("GET", pattern, h)
+
+    void post(^self, string8 pattern, Handler h):
+        self.route("POST", pattern, h)
+
+    void put(^self, string8 pattern, Handler h):
+        self.route("PUT", pattern, h)
+
+    void patch(^self, string8 pattern, Handler h):
+        self.route("PATCH", pattern, h)
+
+    void delete(^self, string8 pattern, Handler h):
+        self.route("DELETE", pattern, h)
+
+    // A route for `method` — any method's name, or "" for every method.
+    void route(^self, string8 method, string8 pattern, Handler h):
+        Route r
+        r.method = method
+        r.pattern = pattern
+        r.kind = KIND_HANDLER
+        r.handler = h
+        self.add(r)
+
+    // A route whose handler writes the response itself, through a `Writer`.
+    void raw(^self, string8 method, string8 pattern, RawHandler h):
+        Route r
+        r.method = method
+        r.pattern = pattern
+        r.kind = KIND_RAW
+        r.raw = h
+        self.add(r)
+
+    // Serve the files under `dir` at `prefix`: `/static/app.js` is
+    // `<dir>/app.js`, a directory answers its `index.html`, and a path that
+    // climbs out of `dir` is 404. The content type is the extension's.
+    void files(^self, string8 prefix, string8 dir):
+        Route r
+        r.method = "GET"
+        r.pattern = prefix
+        r.kind = KIND_FILES
+        r.dir = dir
+        self.add(r)
+
+    // Send `name: value` with every response this app makes — a policy
+    // header, `Cache-Control` for a dev server, the cross-origin isolation a
+    // threaded web build needs. Sent before the response's own headers.
+    void header(^self, string8 name, string8 value):
+        if self.always == nil:
+            self.always = #make([]Header, 0)
+        Header pair = (name, value)
+        if self.always != nil:
+            _ = #append(self.always, pair)
+
+    // What answers a request no route matches, in place of the 404.
+    void on_not_found(^self, Handler h):
+        self.fallback = h
+        self.has_fallback = true
+
+    private void add(^self, Route r):
+        if self.routes == nil:
+            self.routes = #make([]Route, 0)
+        if self.routes != nil:
+            _ = #append(self.routes, r)
+
+    // ── serving ─────────────────────────────────────────────────────────────
+
+    // Serve on `port` until `max_requests` have been answered or `seconds`
+    // have passed (0 is no limit for either). Answers 0, or 1 when the port
+    // could not be bound.
+    i32 run(^self, u16 port = 8000, i64 max_requests = 0, f64 seconds = 0.0):
+        if !self.listen(port):
+            fmt.println("server: could not listen on port ", i32(port), " (already in use?)")
+            return 1
+        if !self.quiet:
+            fmt.println("server: serving on http://localhost:", i32(port), "/")
+            _ = io.flush(io.stdout())
+        f64 started = time.now()
+        for max_requests == 0 || self.served < max_requests:
+            if seconds > 0.0 && time.since(started) >= seconds:
+                break
+            if !self.step():
+                time.nap(2)
+        self.close()
+        return 0
+
+    // Start listening on `port`, for a caller that runs its own loop with
+    // `step`. Answers false when the port could not be bound.
+    bool listen(^self, u16 port):
+        self.listener = http.listen(port)
+        self.listening = http.valid(self.listener)
+        return self.listening
+
+    // Answer at most one waiting request, and say whether there was one. Never
+    // waits for a connection; a connection that arrived waits up to
+    // `read_timeout_ms` for its bytes.
+    bool step(^self):
+        if !self.listening:
+            return false
+        http.Conn c = http.accept(self.listener)
+        if !http.open(c):
+            return false
+        self.serve_connection(c)
+        return true
+
+    void close(^self):
+        if self.listening:
+            http.stop(self.listener)
+            self.listening = false
+
+    // Free what the app holds. It is not usable after.
+    void destroy(^self):
+        self.close()
+        #delete(self.routes)
+        #delete(self.always)
+
+    // Answer one complete request given as bytes, without a socket — the whole
+    // of what `run` does with a connection's bytes, for a test or an embedding.
+    // The answer is on `#default`.
+    ref []char8 handle(^self, string8 raw):
+        Writer w = buffered_writer()
+        self.dispatch(raw, &w)
+        return w.out
+
+    // ── one connection ──────────────────────────────────────────────────────
+
+    private void serve_connection(^self, http.Conn c):
+        f64 started = time.now()
+        using runtime.enter_temp():
+            http.set_read_timeout(c, self.read_timeout_ms)
+            (ref []char8 raw, i32 problem) = read_request(c, self.max_request, self.read_timeout_ms)
+            Writer w = connection_writer(c)
+            w.extra = self.always
+            if problem != 0:
+                w.send_response(status(problem), false)
+            else:
+                string8 bytes = raw
+                self.dispatch(bytes, &w)
+            w.finish()
+            if !self.quiet:
+                fmt.println(w.method, " ", w.path, " ", w.status_sent, "  ", time.ms_since(started), " ms")
+                // A line per request as it happens, even when stdout is a
+                // pipe or a file and would otherwise hold it.
+                _ = io.flush(io.stdout())
+        _ = runtime.close_temp()
+        http.close_conn(c)
+        self.served = self.served + 1
+
+    // Parse `raw`, find its route, and answer through `w`.
+    private void dispatch(^self, string8 raw, ^Writer w):
+        w.extra = self.always
+        (Request req, i32 outcome) = parse(raw)
+        if outcome == PARSE_PARTIAL:
+            w.send_response(status(400), false)
+            return
+        if outcome != PARSE_DONE:
+            w.send_response(status(outcome), false)
+            return
+        w.method = req.method
+        w.path = req.path
+        bool head = req.method == "HEAD"
+
+        // The first route whose pattern matches and whose method answers.
+        // HEAD is answered by a GET route, without the body.
+        strings.Builder allowed = strings.builder()
+        for r in self.routes:
+            (bool hit, ref []Header params) = match(r.pattern, req.path, r.kind == KIND_FILES)
+            if !hit:
+                continue
+            bool method_ok = #len(r.method) == 0 || r.method == req.method || (head && r.method == "GET")
+            if !method_ok:
+                if strings.text(allowed) != "":
+                    _ = strings.append(&allowed, ", ")
+                _ = strings.append(&allowed, r.method)
+                continue
+            req.params = params
+            if r.kind == KIND_RAW:
+                w.head_only = head
+                r.raw(req, w)
+                return
+            if r.kind == KIND_FILES:
+                w.send_response(serve_file(r.dir, req.param("path"), req.path), head)
+                return
+            w.send_response(r.handler(req), head)
+            return
+
+        string8 allow = strings.text(allowed)
+        if #len(allow) > 0:
+            w.send_response(status(405).with_header("Allow", allow), head)
+            return
+        if self.has_fallback:
+            w.send_response(self.fallback(req), head)
+            return
+        w.send_response(not_found(), head)
+
+// A new app with the default configuration: 1 MiB requests, a 5 s read.
+App app():
+    App a
+    a.max_request = 1048576
+    a.read_timeout_ms = 5000
+    a.listener = http.Server(0 - 1)
+    return a
+
+// ── matching a route ─────────────────────────────────────────────────────────
+
+// Whether `path` matches `pattern`, and what its `{name}`s captured. Segments
+// are compared one by one; `{name}` takes one segment and `{name...}`, last,
+// takes the rest. A `prefix` match — a `files` route — matches the pattern and
+// anything under it, capturing what is under it as `path`. A trailing `/` is
+// not a segment.
+(bool hit, ref []Header params) match(string8 pattern, string8 path, bool prefix = false):
+    ref []Header params = #make([]Header, 0)
+    string8 p = trim_slashes(pattern)
+    string8 q = trim_slashes(path)
+    for:
+        if #len(p) == 0:
+            if prefix:
+                Header rest = ("path", q)
+                _ = #append(params, rest)
+                return (true, params)
+            return (#len(q) == 0, params)
+        (string8 want, string8 p_rest, bool _) = strings.split_first(p, "/")
+        p = p_rest
+        if strings.starts_with(want, "{") && strings.ends_with(want, "...}"):
+            Header rest = (strings.substring(want, 1, i64(#len(want)) - 5), q)
+            _ = #append(params, rest)
+            return (true, params)
+        if #len(q) == 0:
+            return (false, params)
+        (string8 got, string8 q_rest, bool _) = strings.split_first(q, "/")
+        q = q_rest
+        if strings.starts_with(want, "{") && strings.ends_with(want, "}"):
+            Header one = (strings.substring(want, 1, i64(#len(want)) - 2), got)
+            _ = #append(params, one)
+        else if want != got:
+            return (false, params)
+    return (false, params)
+
+private string8 trim_slashes(string8 s):
+    string8 t = s
+    for #len(t) > 0 && t[0] == '/':
+        t = strings.rest(t, 1)
+    for #len(t) > 0 && t[#len(t) - 1] == '/':
+        t = strings.substring(t, 0, i64(#len(t)) - 1)
+    return t
+
+// ── reading a request off a connection ───────────────────────────────────────
+
+// Read one request from `c` into a buffer on `#default`. Answers the bytes and
+// 0, or the status to answer instead: 408 when the bytes stop before the
+// request is whole, 413 when it is larger than `limit`.
+private (ref []char8 raw, i32 problem) read_request(http.Conn c, i64 limit, i32 timeout_ms):
+    ref []char8 buf = #make([]char8, 0)
+    if buf == nil:
+        return (buf, 500)
+    _ = #reserve(buf, 8192)
+    [8192]char8 chunk
+    f64 started = time.now()
+    for:
+        string8 have = buf
+        (i64 want, bool known) = expected_size(have)
+        if known && i64(#len(buf)) >= want:
+            return (buf, 0)
+        if known && want > limit:
+            return (buf, 413)
+        if i64(#len(buf)) > limit:
+            return (buf, 413)
+        if time.ms_since(started) > i64(timeout_ms):
+            return (buf, 408)
+        i64 n = http.receive(c, chunk[:])
+        if n == 0:
+            return (buf, 400)
+        if n < 0:
+            continue
+        for i in 0..<n:
+            if !#append(buf, chunk[i]):
+                return (buf, 500)
+    return (buf, 500)
+
+// ── static files ─────────────────────────────────────────────────────────────
+
+// The file `rel` under `dir`, or 404 when there is none or `rel` climbs out.
+// A directory asked for without its trailing slash is redirected to
+// `asked` with one, so the page's relative links resolve inside it.
+private Response serve_file(string8 dir, string8 rel, string8 asked):
+    string8 clean = decode(rel)
+    string8 rest = clean
+    for #len(rest) > 0:
+        (string8 seg, string8 more, bool _) = strings.split_first(rest, "/")
+        rest = more
+        if seg == ".." || strings.has_byte(seg, '\\') || strings.has_byte(seg, char8(0)):
+            return not_found()
+    ref []char8 full = #format(dir, "/", clean)
+    string8 path = full
+    ref []char8 cpath = strings.clone_to_cstring(path, #default)
+    if cpath == nil:
+        return status(500)
+    if fs.is_dir(cstring(cpath)):
+        if !strings.ends_with(asked, "/"):
+            return redirect(#format(asked, "/"), 301)
+        full = #format(dir, "/", clean, "index.html")
+        path = full
+        cpath = strings.clone_to_cstring(path, #default)
+        if cpath == nil:
+            return status(500)
+    if !fs.is_file(cstring(cpath)):
+        return not_found()
+    i64 size = fs.bytes(cstring(cpath))
+    if size < 0:
+        return not_found()
+    ref []char8 body = #make([]char8, size)
+    if body == nil:
+        return status(500)
+    ^io.FILE f = io.open_read(cstring(cpath))
+    if !io.opened(f):
+        return status(403)
+    i64 got = 0
+    if size > 0:
+        got = io.read_bytes(f, body[:])
+    _ = io.close(f)
+    if got != size:
+        return status(500)
+    string8 bytes = body
+    return respond(bytes, content_type(path))
+
+// The content type for `path`'s extension.
+string8 content_type(string8 path):
+    i64 dot = strings.last_index_of(path, '.')
+    if dot < 0:
+        return "application/octet-stream"
+    string8 ext = strings.rest(path, dot + 1)
+    if same_fold(ext, "html") || same_fold(ext, "htm"): return "text/html; charset=utf-8"
+    if same_fold(ext, "css"): return "text/css; charset=utf-8"
+    if same_fold(ext, "js") || same_fold(ext, "mjs"): return "text/javascript; charset=utf-8"
+    if same_fold(ext, "json") || same_fold(ext, "map"): return "application/json"
+    if same_fold(ext, "wasm"): return "application/wasm"
+    if same_fold(ext, "txt") || same_fold(ext, "md"): return "text/plain; charset=utf-8"
+    if same_fold(ext, "svg"): return "image/svg+xml"
+    if same_fold(ext, "png"): return "image/png"
+    if same_fold(ext, "jpg") || same_fold(ext, "jpeg"): return "image/jpeg"
+    if same_fold(ext, "gif"): return "image/gif"
+    if same_fold(ext, "webp"): return "image/webp"
+    if same_fold(ext, "ico"): return "image/x-icon"
+    if same_fold(ext, "woff"): return "font/woff"
+    if same_fold(ext, "woff2"): return "font/woff2"
+    if same_fold(ext, "xml"): return "application/xml"
+    if same_fold(ext, "pdf"): return "application/pdf"
+    return "application/octet-stream"

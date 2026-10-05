@@ -1,0 +1,918 @@
+// `app:body2d` — Godot's `CharacterBody2D`: an axis-aligned box swept against
+// solid geometry the caller describes, moved as far as it can go on each axis
+// and reporting what it touched.
+//
+//     import "app:body2d"
+//
+//     body2d.Solids map  = body2d.solids(is_solid, nil, 16.0, 16.0)
+//     body2d.Body   hero = body2d.body((64.0, 0.0), (12.0, 16.0))
+//
+//     void step(f32 dt):
+//         hero.velocity.y = hero.velocity.y + GRAVITY * dt
+//         hero.velocity.x = axis() * RUN
+//         if jump_pressed && body2d.is_on_floor(&hero):
+//             hero.velocity.y = -JUMP
+//         body2d.move_and_slide(&hero, map, dt)
+//
+// That is the whole contract, and it is Godot's: the caller owns `velocity`,
+// `move_and_slide` resolves it against the world, and `is_on_floor` afterwards
+// says what the move found. A platformer character controller is about fifteen
+// lines on top of it, which is the point — the *sliding* is the part that is
+// hard to get right, and it is written once here rather than badly in every
+// game.
+//
+// ## Why this package exists at all
+//
+// Everything above the seam is easy and everything below it is not. Reading a
+// jump button, choosing a run speed, deciding what a double jump costs: those
+// are a game, they are ten lines each, and no two games want the same ones.
+// *Moving a box through a tilemap without it snagging, jittering, sinking or
+// falling through the floor* is none of those things. It is a dozen boundary
+// conditions with one right answer each, every one of which looks like a
+// physics bug when it is wrong and is arithmetic when it is right:
+//
+//   * a body walking along a floor made of two adjacent tiles catches on the
+//     seam between them;
+//   * a body resting on the floor accumulates a downward velocity and after
+//     four minutes is inside it;
+//   * a body that falls far enough passes through a one-tile floor and keeps
+//     going, and nobody notices until somebody builds a tall level;
+//   * a body pushed exactly onto a tile boundary oscillates between two cells
+//     forever, one pixel a frame.
+//
+// Each of those is a line of arithmetic, and each of them is why this is a
+// package rather than a snippet. What is in here is the resolution and the
+// contact report. What is not in here is the game.
+//
+// ## What it collides against: one seam, and it is a callback
+//
+//     type SolidFn: bool(rawptr, i32, i32)     // (user, tile_x, tile_y)
+//
+// — *is the tile at this grid cell solid?* — plus a tile width and height. That
+// is the entire description of the world this package takes.
+//
+// **It costs nothing.** No allocation, no ownership, no broadphase, no shape
+// system, no lifetime to get wrong, and no `init`/`shutdown` pair. A `Solids`
+// is four words the caller builds at the call site and throws away, and a
+// `Body` is forty bytes the caller keeps wherever its entities already live.
+// This package allocates not one byte and holds not one global.
+//
+// **It covers the thing this is for.** A 2D platformer is a tilemap. Asking a
+// grid a question per cell is what a tilemap is *already* good at, and the
+// query count is small and bounded: one `solid` call per cell of the swept
+// box's cross-section, per cell it advances. A 12×16 body in a 16-pixel grid
+// crossing one tile asks at most two.
+//
+// **A second seam was considered and refused, and the reason is that the
+// callback already contains it.** The obvious second one is an explicit list of
+// solid rectangles, and it earns nothing here, because a caller holding a list
+// of rectangles writes:
+//
+//     bool solid(rawptr user, i32 tx, i32 ty):
+//         ^Level lv = ^Level(user)
+//         for r in lv.blocks:
+//             if overlaps_cell(r, tx, ty, lv.tile_w, lv.tile_h):
+//                 return true
+//         return false
+//
+// — and has a rectangle world, at whatever cost their own data structure
+// charges, with **no second resolution path in this package**. The sweeping,
+// the ordering, the substepping and the contact classification are the hard
+// part and there is one copy of them; a rectangle seam would be a second
+// broadphase, a second set of boundary cases, and a second place for the flush
+// seam to come back. The grid is the coordinate system the resolution is
+// written in, and letting the caller decide what a cell *means* is strictly
+// more general than letting them hand over a list.
+//
+// The one thing the caller gives up is sub-cell geometry: a solid that is half
+// a tile tall has to be its own cell size, or be rounded. That is stated rather
+// than papered over, and it is the price of the seam being one function.
+//
+// ## The body is a value, and deliberately not a handle
+//
+// `app:` is full of servers — `app:draw` hands out `Texture`, `Item` and
+// `Canvas`, and `app:graph` hands out `Node`, all of them `(i32 index, u32
+// generation)` over a pool with a free list. **This package hands out nothing**,
+// and that is a decision rather than an omission.
+//
+// A handle exists to name something the client cannot hold: a GPU texture, a
+// node whose storage moves when a `ref` grows under it, a canvas item whose
+// list the server owns. A `Body` is none of those. It is plain data with no
+// allocation, no lifetime, no identity and nothing behind it — so a pool would
+// add a free list, a generation counter, an `init`/`shutdown` pair and a
+// brand-new failure mode (the dead handle) in exchange for nothing at all, and
+// it would take away the thing that makes this shape good: a `Body` sits
+// *inside* the caller's own entity struct, beside its sprite and its health,
+// and is copied, serialised and rewound with it.
+//
+// So every function here takes `^Body` and the fields are public. Godot's
+// `velocity` is a property and it is a field here; `is_on_floor()` is a method
+// there and a function taking `^Body` here. What the surface does not have is a
+// server to bring up before any of it works.
+//
+// ## The axes are resolved separately, and the up axis goes first
+//
+// A diagonal move is resolved as two axis-aligned moves, because an
+// axis-aligned move against an axis-aligned grid has an exact answer and a
+// diagonal one does not. Each axis is a **sweep**: the box's whole path along
+// that axis is a rectangle, the cells that rectangle covers are exactly the
+// cells the body passes through, and the first blocking one clamps the move.
+// There is no "move and then push out of whatever you landed in" anywhere in
+// this file, and most of the bugs in the list at the top of this comment are
+// symptoms of that pattern rather than of anything about ordering.
+//
+// **The flush seam is worth being exact about, because it is the bug this
+// package is most likely to be blamed for.** A body walking along a floor of
+// two adjacent tiles catches on the join between them when the horizontal sweep
+// is run while the body is *inside* the floor by a fraction of a pixel: the
+// floor row then reads as a wall and the body stops against a seam that is not
+// there. The fix is not an ordering. The fix is that the body is **never inside
+// anything**: a blocked sweep assigns the resting coordinate out of the grid —
+// `f32(row) * tile_h - height`, one multiply and one subtract from integers —
+// rather than subtracting a penetration depth from a position that has already
+// drifted. With that invariant, the horizontal sweep's row range simply does
+// not contain the floor row, and it does not contain it at any speed or after
+// any number of frames. `body2d_test.dado` walks a body across the join of two
+// tiles and checks it arrives, because a future edit that reintroduces
+// penetrate-then-resolve will pass every other test in that file.
+//
+// **What the order actually decides is the corner clip**, and it decides it
+// alone. When a diagonal step's destination overlaps a cell that neither
+// single-axis move would have touched — clipping the corner of a tile — one
+// axis survives and the other is refused, and which one is the order. So:
+//
+// > **The axis parallel to `up_direction` is resolved first.**
+//
+// Two reasons, and the second is the one that matters.
+//
+//   * The up axis is the one carrying the acceleration the caller applies every
+//     single frame and the one whose contact zeroes it. Resolving it first
+//     means the horizontal sweep of a step runs against a vertical coordinate
+//     that was assigned out of the grid *this step*, not one left over from the
+//     last.
+//   * On a corner clip, this order keeps the **vertical** component and refuses
+//     the horizontal. A body falling past the corner of a ledge keeps falling
+//     and loses a frame of drift; under the other order it keeps drifting and
+//     loses a frame of fall, which reads on screen as the character catching on
+//     the corner and hanging there. Players have a word for that and it is not
+//     a kind one.
+//
+// `up_direction` must be one of `UP`, `DOWN`, `LEFT` or `RIGHT`, and that is
+// asserted rather than documented-and-hoped. An AABB against an axis-aligned
+// grid has exactly four possible contact normals; an `up_direction` that is not
+// one of them would classify every contact in the world as a wall, which is not
+// a degraded answer but a useless one.
+//
+// This is also why there is no `floor_max_angle`. Godot needs one because a
+// collision shape can rest on a slope at any angle and somebody has to say
+// where "floor" stops and "wall" begins. Here the angle between a contact
+// normal and `up_direction` is 0°, 90° or 180° and nothing else, so the
+// classification is the sign of a dot product and a maximum angle would be a
+// knob with two settings that both mean the same thing.
+//
+// ## Speed: there is no speed limit, and the substepping is not what buys that
+//
+// A body moving faster than its own width in one step passes through a wall —
+// in an implementation that tests the *destination*. This one tests the
+// **path**: a single-axis move's swept box is a rectangle, the cell range it
+// covers is computed from its two ends, and every cell in it is asked. A body
+// falling ten thousand pixels in one step lands on the first solid row under
+// it, and a body falling ten million pixels lands on the same row. **There is
+// no vertical speed at which the floor is missed, and there is no cap on the
+// speed this package supports.**
+//
+// So what is the substepping for? The *diagonal*. Two axis-aligned moves are a
+// right angle, and a right angle is a good approximation of a diagonal only
+// while it is short: over a long step the L-shaped path visits cells the true
+// path never does and misses cells it does. A body crossing a tilemap in one
+// step at 45° can therefore pass *diagonally* through a single tile that a
+// shorter step would have hit — which is a tunnelling bug, just not the one
+// people look for.
+//
+// The motion is therefore cut into substeps of at most `min(tile, extent)` on
+// each axis:
+//
+//   * **one tile** bounds the divergence between the L-path and the true
+//     diagonal to one cell, because between two substeps the body's cell
+//     footprint advances by at most one;
+//   * **the body's own extent**, where it is smaller, bounds it further — a 4×4
+//     projectile in a 16-pixel grid would otherwise cross most of a tile in a
+//     substep and clip corners a slower one would have struck.
+//
+// The count is capped at `MAX_SUBSTEPS` (64) so that an absurd velocity, a
+// tiny body or a division by a small tile size cannot turn one frame into an
+// unbounded loop. **Above the cap the substeps get longer, and the only thing
+// that degrades is diagonal fidelity** — a very fast diagonal may clip a corner
+// it should have hit. The per-axis sweep stays exact, so the floor is still
+// never missed. `substeps(&b)` reports what the last move took, so a caller who
+// cares can see the cap being reached rather than guess.
+//
+// The cost is stated: a sweep is O(cells crossed), and substepping walks the
+// same cells in chunks, so a long move costs what the distance costs and not
+// what the substep count costs. Sixty-three substeps of a thousand-pixel fall
+// is sixty-three sweeps over one or two cells each, not sixty-three sweeps of
+// the whole fall.
+//
+// ## `is_on_floor` is a report of the last move, not a question about now
+//
+// This is Godot's semantics and it is kept deliberately, so it is worth a
+// paragraph rather than a footnote: **`is_on_floor`, `is_on_wall` and
+// `is_on_ceiling` answer what the last `move_and_slide` found. They do not look
+// at the geometry.** Move a body by assigning `position` and `is_on_floor` does
+// not change. Change the tilemap under a standing body and `is_on_floor` does
+// not change. Call `move_and_slide` and all three are recomputed from scratch.
+//
+// The storage is spelled `last_on_floor`, `last_floor_normal` and so on for
+// exactly that reason: the field says what it is at every place it is read, and
+// a line that *writes* one reads as the mistake it is.
+//
+// A caller that expects a live query writes a subtly wrong jump check — one
+// that works, because a platformer calls `move_and_slide` every frame anyway,
+// right up until the frame it does not. If a live question is genuinely wanted,
+// `overlaps` is one: it asks the geometry, now, whether the body is inside
+// anything. It is not the floor test and it is not spelled like one.
+//
+// `move_and_collide` does **not** touch the contact state either, for the same
+// reason Godot's does not: it is a one-shot probe a caller uses to ask a
+// question, and having it overwrite the answer `move_and_slide` left would make
+// the two uninterleavable.
+//
+// ## Contact stability, which is the whole of the floating-point story
+//
+// Three failures, one rule each, and the third was found by a test rather than
+// argued for in advance.
+//
+// **A body at rest must not sink.** The caller adds gravity every frame, so
+// there is downward velocity every frame, so there is a downward sweep every
+// frame. Each one finds the floor at distance zero and does two things: it
+// **assigns** `position` the grid coordinate `f32(row) * tile_h - height`, and
+// it **zeroes** the velocity component on that axis — Godot's own rule. The
+// assignment is the important half. A resting body's coordinate is recomputed
+// from two integers every frame and is therefore bit-identical every frame;
+// nothing is subtracted from it, so nothing accumulates into it. A thousand
+// steps at rest leave a body on the same bit pattern it started on, and the
+// test asserts exactly that with `==` rather than a tolerance, because a
+// tolerance would hide the drift this is here to prevent.
+//
+// **A body exactly on a boundary must not oscillate.** Cell ranges are computed
+// with `floor` on the near edge and `ceil(x) - 1` on the far one, which is a
+// half-open rule with no epsilon in it: a box whose edge lies exactly on a tile
+// boundary does not overlap the cell across that boundary, and a box pushed up
+// against a wall is therefore not inside it. Pushing again finds the same
+// blocking cell, computes the same coordinate, and moves the body by exactly
+// zero. There is no separation epsilon anywhere in this file, so there is
+// nothing to oscillate around.
+//
+// **A body that hits nothing must arrive exactly where it was sent**, and the
+// substepping is what threatens that. Each sweep answers a *coordinate* and the
+// body is assigned it, never advanced by a distance, because `lo + (stop - lo)`
+// is not `stop` in binary; and each substep aims at `start + motion * (i+1)/n`
+// rather than adding `motion / n` to what is there, because the last such
+// fraction is exactly 1 and the sum of `n` roundings is not. Without both, an
+// unobstructed hundred-unit move over seven substeps lands a few units in the
+// last place short, every frame, for ever — a drift nothing downstream
+// corrects. `body2d_test.dado` checks a free move through an empty world with
+// `==` for exactly that reason, and that assertion is what found this: the
+// first draft of this package added `motion / n` up and was wrong by it.
+//
+// The one place a body is moved *towards* geometry rather than away from it is
+// `floor_snap_length`, and it is bounded in the same way: the probe is a normal
+// sweep, so it finds the floor at distance zero when the body is already
+// resting and moves it by zero.
+//
+// ## Coyote time and jump buffering are not this package's job
+//
+// They are both good, both nearly universal, both about four lines, and both
+// **game policy**. Coyote time is a rule about how long after leaving a ledge a
+// jump is still allowed; jump buffering is a rule about how long before landing
+// a press still counts. Their durations are tuning, their interaction with
+// double jumps and wall jumps is design, and a game that wants neither — a
+// physics puzzle, a top-down game, a moving platform — would have to work
+// around them.
+//
+// A body that invented them would be unusable for anything but the one game it
+// was tuned for. `is_on_floor()` is the input they are both written in terms
+// of, this package answers it honestly, and the four lines belong in the
+// caller.
+//
+// ## What it does not do
+//
+// The scope is "one axis-aligned box against static geometry", and naming what
+// that excludes is what stops the next reader expecting a physics engine.
+//
+// **No gravity.** It is `velocity.y += g * dt` in the caller and it is one
+// line. A body that applied its own would need a direction, a magnitude, a
+// switch to turn it off for the swimming level, and an opinion about terminal
+// velocity — four knobs to replace one line.
+//
+// **No rotation, ever.** It is an axis-aligned box. The name says so, the
+// `size` field is two numbers, and there is no angle anywhere in the file. A
+// rotating collider is a different shape system with a different sweep and a
+// different contact classification, and it would take slopes and normals and
+// an inertia tensor with it.
+//
+// **No slopes.** Every surface is an axis of the grid. A slope wants a floor
+// angle, a slide-along-the-surface step, a stop-on-slope rule, a
+// constant-speed-on-slope rule and a max-angle — Godot has all five and they
+// are most of what `move_and_slide` is. A tile platformer built on square tiles
+// does not need them, and adding them would change every decision above.
+//
+// **No one-way platforms.** They are a genuine tilemap feature and they are
+// deliberately out: a one-way tile is solid only to a body moving towards it
+// from one side, which makes solidity a function of the body's velocity and not
+// of the cell. That is a different `SolidFn` signature, and changing the
+// signature for a feature nobody has asked for yet is how a seam stops being
+// one.
+//
+// **No other bodies.** Static geometry only. Two `Body` values do not collide,
+// because doing it properly needs an order of resolution, a rule for who pushes
+// whom, and a broadphase, and doing it improperly needs none of those and is
+// worse than not doing it.
+//
+// **No mass, no restitution, no friction, no impulses, no joints, no areas or
+// triggers, no raycasts, no queries beyond `overlaps`, no layers or masks, and
+// no `max_slides`.** Several of those are one line in the caller
+// (`velocity.x *= 0.8` is friction); the rest are a physics engine, and this is
+// not one.
+package body2d
+
+import "core:math"
+
+// ── the world ──────────────────────────────────────────────────────────────
+
+// *Is the tile at this grid cell solid?* Called with the `user` pointer the
+// `Solids` was built with, and a cell index that may be **negative or
+// arbitrarily large** — a sweep asks about the cells it crosses, and a body
+// outside the map crosses cells outside the map. Answer `false` for anything
+// out of range, or `true` to make the edges of the map solid; both are
+// ordinary answers and this package has no opinion.
+//
+// It is called once per cell examined and is on the hot path of every move, so
+// it should be a lookup rather than a search where the caller has the choice.
+//
+// A function type carries no parameter names in this language — a name is a
+// view and a function type has nothing to hang one on — so the three are named
+// in the comment: `(user, tile_x, tile_y)`.
+type SolidFn: bool(rawptr, i32, i32)
+
+// The description of solid geometry: a predicate, its context pointer, and the
+// size of one cell. Built at the call site and thrown away; this package holds
+// no reference to it between calls.
+//
+// A `solid` of `nil` is a world with nothing in it, which is what makes a body
+// with no map yet fall rather than trap.
+type Solids: (
+    SolidFn solid,
+    rawptr  user,
+    f32     tile_w,
+    f32     tile_h,
+)
+
+Solids solids(SolidFn solid, rawptr user, f32 tile_w, f32 tile_h):
+    return (solid, user, tile_w, tile_h)
+
+// ── up ─────────────────────────────────────────────────────────────────────
+//
+// `up_direction` is one of these four and `move_and_slide` asserts it. See the
+// package comment: an AABB against an axis-aligned grid has four possible
+// contact normals, so an up direction that is not one of them classifies every
+// contact as a wall.
+//
+// `UP` is `(0, -1)` because this tree's 2D coordinates are `app:draw`'s —
+// origin top-left, y increasing downwards — and it is Godot's `Vector2.UP` for
+// the same reason.
+
+const [2]f32 UP    = (0.0, -1.0)
+const [2]f32 DOWN  = (0.0, 1.0)
+const [2]f32 LEFT  = (-1.0, 0.0)
+const [2]f32 RIGHT = (1.0, 0.0)
+
+// The most substeps one `move_and_slide` or `move_and_collide` will take. See
+// the package comment: above this the substeps get longer and diagonal
+// fidelity degrades, and nothing else does.
+const i32 MAX_SUBSTEPS = 64
+
+// The furthest cell from the origin, either way, that `cell_lo` and `cell_hi`
+// answer: 2^30, so one step past it still fits an `i32`.
+private const f64 CELL_LIMIT = 1073741824.0
+
+// ── the body ───────────────────────────────────────────────────────────────
+
+// An axis-aligned box with a velocity and a memory of its last move.
+//
+// **The first five fields are inputs the caller owns.** `position` is the
+// box's top-left corner and `size` is its extent, both in the same units the
+// tile size is in. `velocity` is Godot's: the caller writes it, and a contact
+// zeroes the component on the contacting axis.
+//
+// **The `last_*` fields are the report of the most recent `move_and_slide`**,
+// and are spelled that way so that reading one says what it is. Read them
+// through `is_on_floor`, `get_floor_normal` and the rest; writing one is a
+// statement about a move that did not happen.
+type Body: (
+    [2]f32 position,           // top-left corner of the box
+    [2]f32 size,               // width, height
+    [2]f32 velocity,           // the caller sets it; a contact zeroes an axis
+    [2]f32 up_direction,       // UP / DOWN / LEFT / RIGHT
+    f32    floor_snap_length,  // keeps a body glued to the ground; 0 disables
+
+    bool   last_on_floor,
+    bool   last_on_wall,
+    bool   last_on_ceiling,
+    [2]f32 last_floor_normal,
+    [2]f32 last_wall_normal,
+    [2]f32 last_ceiling_normal,
+    i32    last_substeps,
+)
+
+// A body at `position` of `size`, standing still, with `UP` for up and a one
+// unit floor snap — Godot's own default, and the value that keeps a resting
+// body reporting `is_on_floor` on a frame where nothing pushed it into the
+// ground.
+Body body([2]f32 position, [2]f32 size):
+    f32 zero = 0.0
+    Body b
+    b.position = position
+    b.size = size
+    b.velocity = (zero, zero)
+    b.up_direction = UP
+    b.floor_snap_length = 1.0
+    clear_contacts(&b)
+    b.last_substeps = 0
+    return b
+
+// What one `move_and_collide` found. `travel` is what the body actually moved,
+// `remainder` is what is left of the motion it was given, and `tile_x`/`tile_y`
+// name the cell that stopped it. All four are meaningless when `hit` is false,
+// except `travel`, which is then the whole motion.
+type Collision: (
+    bool   hit,
+    [2]f32 normal,
+    [2]f32 travel,
+    [2]f32 remainder,
+    i32    tile_x,
+    i32    tile_y,
+)
+
+// ── the two verbs ──────────────────────────────────────────────────────────
+
+// Move by `velocity * delta`, resolving each axis against `w` and sliding along
+// whatever blocks it, then update the contact report.
+//
+// A contact **zeroes `velocity` on the contacting axis**, which is Godot's rule
+// and is what keeps a resting body from accumulating the gravity the caller
+// adds each frame into a fall it eventually wins. The caller adds it again next
+// frame and the same thing happens again, which is the intended steady state.
+//
+// Afterwards, if nothing was found under the body and it is not moving away
+// from the ground, a downward probe of `floor_snap_length` looks for a floor
+// and glues the body to it — Godot's `floor_snap_length`, and what stops a body
+// walking down a step from spending every other frame in the air. The probe is
+// an ordinary sweep, so a body already resting moves by exactly zero.
+void move_and_slide(^Body b, Solids w, f32 delta):
+    [2]f32 motion = (b.velocity.x * delta, b.velocity.y * delta)
+    slide(b, w, motion)
+    snap_to_floor(b, w)
+
+// Move by `motion` once, stopping at the first thing hit, and report it.
+//
+// **It does not slide and it does not touch the contact report.** A caller uses
+// this to ask a question — can I get there, what is in the way — and having it
+// overwrite what the last `move_and_slide` found would make the two impossible
+// to interleave. `velocity` is not read and not written either: the motion is
+// the argument.
+//
+// The body is still moved, up to the contact, which is what makes `travel` and
+// `remainder` worth having. A caller that wants to ask without moving saves
+// `position` and puts it back.
+//
+// It substeps exactly as `move_and_slide` does, for the same reason, and
+// therefore does update `substeps()` — that is a count of work done and not
+// part of the contact report.
+Collision move_and_collide(^Body b, Solids w, [2]f32 motion):
+    f32 zero = 0.0
+    [2]f32 start = b.position
+    Collision c
+    c.hit = false
+    c.normal = (zero, zero)
+    c.tile_x = 0
+    c.tile_y = 0
+    i32 n = substep_count(b, w, motion)
+    b.last_substeps = n
+    i32 ua = up_axis(b)
+    i32 oa = 1 - ua
+    i32 i = 0
+    for i < n:
+        f32 frac = f32(i + 1) / f32(n)
+        (bool hu, [2]f32 nu, i32 xu, i32 yu) = probe_axis(b, w, ua,
+                                                          start[ua] + motion[ua] * frac)
+        if hu:
+            c.hit = true
+            c.normal = nu
+            c.tile_x = xu
+            c.tile_y = yu
+            break
+        (bool ho, [2]f32 no, i32 xo, i32 yo) = probe_axis(b, w, oa,
+                                                          start[oa] + motion[oa] * frac)
+        if ho:
+            c.hit = true
+            c.normal = no
+            c.tile_x = xo
+            c.tile_y = yo
+            break
+        i = i + 1
+    c.travel = (b.position.x - start.x, b.position.y - start.y)
+    c.remainder = (motion.x - c.travel.x, motion.y - c.travel.y)
+    return c
+
+// ── the contact report ─────────────────────────────────────────────────────
+//
+// Every one of these reads a `last_*` field and asks the world nothing. See the
+// package comment: this is Godot's semantics and it is the one thing about this
+// surface that surprises people.
+
+// Whether the last `move_and_slide` ended against a surface whose normal points
+// along `up_direction`.
+bool is_on_floor(^Body b):
+    return b.last_on_floor
+
+// Whether the last `move_and_slide` ended against a surface whose normal is
+// perpendicular to `up_direction`.
+bool is_on_wall(^Body b):
+    return b.last_on_wall
+
+// Whether the last `move_and_slide` ended against a surface whose normal points
+// against `up_direction`.
+bool is_on_ceiling(^Body b):
+    return b.last_on_ceiling
+
+// The floor's normal as of the last `move_and_slide`, or `(0, 0)` where it
+// found no floor. One of the four axis units, always: see the package comment
+// on why there is no `floor_max_angle`.
+[2]f32 get_floor_normal(^Body b):
+    return b.last_floor_normal
+
+[2]f32 get_wall_normal(^Body b):
+    return b.last_wall_normal
+
+[2]f32 get_ceiling_normal(^Body b):
+    return b.last_ceiling_normal
+
+// How many substeps the last `move_and_slide` or `move_and_collide` took.
+// Reported so that a caller meeting `MAX_SUBSTEPS` can see it happening rather
+// than infer it from a corner it clipped.
+i32 substeps(^Body b):
+    return b.last_substeps
+
+// ── two small queries ──────────────────────────────────────────────────────
+
+// The body's box as `(x, y, w, h)` — the shape `app:draw`'s `rect` takes, so a
+// debug overlay is one call.
+[4]f32 aabb(^Body b):
+    return (b.position.x, b.position.y, b.size.x, b.size.y)
+
+// **This one is a live question**, unlike the three above it: is the body, right
+// now, overlapping a solid cell? True only of a body that was placed inside
+// geometry or had geometry placed around it — a move never leaves one here.
+//
+// It is what a spawn point is validated with, and what a level editor asks
+// after it paints a tile. It is deliberately not spelled like a floor test.
+bool overlaps(^Body b, Solids w):
+    if !(w.tile_w > 0.0) || !(w.tile_h > 0.0):
+        return false
+    i32 c0 = cell_lo(b.position.x, w.tile_w)
+    i32 c1 = cell_hi(b.position.x + b.size.x, w.tile_w)
+    i32 r0 = cell_lo(b.position.y, w.tile_h)
+    i32 r1 = cell_hi(b.position.y + b.size.y, w.tile_h)
+    i32 r = r0
+    for r <= r1:
+        i32 c = c0
+        for c <= c1:
+            if solid_at(w, c, r):
+                return true
+            c = c + 1
+        r = r + 1
+    return false
+
+// ── cells ──────────────────────────────────────────────────────────────────
+//
+// The half-open rule, and the only two places a coordinate becomes a cell
+// index. `cell_lo` is the cell a near edge is in; `cell_hi` is the last cell a
+// far edge reaches, which for an edge lying exactly on a boundary is the cell
+// *before* it. `ceil(x) - 1` says that with no epsilon in it, which is the
+// whole of why a body pushed flush against a wall is not inside the wall.
+//
+// **Both are total**, because a float becoming an `i32` saturates and that is
+// not an answer a caller can use: a saturated `cell_hi(...) + 1` or
+// `cell_lo(...) - 1` is an `i32` overflow, which traps. So:
+//
+//   * **a cell size that is not positive — zero, negative or NaN — gives
+//     `cell_lo` 0 and `cell_hi` -1**, the empty range, and an empty range
+//     collides with nothing. The callers refuse such a world before they get
+//     here; this is what keeps the refusal from being load-bearing. Zero was a
+//     division giving ±inf, and NaN passed a `<= 0.0` guard;
+//   * **a NaN coordinate gives the same empty range**, for the same reason;
+//   * **a quotient is clamped to ±2^30 cells**, which leaves the `+ 1` and
+//     `- 1` above room in an `i32`. Nothing is lost there that `f32` had: at
+//     2^30 cells of even one unit the spacing between `f32` coordinates is
+//     already 128 units, so no body out there can be placed within a cell.
+private i32 cell_lo(f32 v, f32 t):
+    if !(t > 0.0): return 0
+    return i32(cell_clamp(math.down(f64(v) / f64(t))))
+
+private i32 cell_hi(f32 v, f32 t):
+    if !(t > 0.0): return 0 - 1
+    f64 q = f64(v) / f64(t)
+    if q != q: return 0 - 1
+    return i32(cell_clamp(math.up(q))) - 1
+
+// A quotient of cells, clamped into the range `cell_lo` and `cell_hi` answer
+// in. NaN is 0, which `cell_lo` takes as-is and `cell_hi` has already refused.
+private f64 cell_clamp(f64 q):
+    if q != q: return 0.0
+    if q > CELL_LIMIT: return CELL_LIMIT
+    if q < 0.0 - CELL_LIMIT: return 0.0 - CELL_LIMIT
+    return q
+
+private bool solid_at(Solids w, i32 tx, i32 ty):
+    SolidFn f = w.solid
+    if f == nil:
+        return false
+    return f(w.user, tx, ty)
+
+// Is any cell of the line `k` solid, over the perpendicular range `o0..o1`?
+// `k` is a column when `axis` is 0 and a row when it is 1, and `o` is the other
+// one — one function for both axes, because the sweep below is one function for
+// both axes and a second copy of either is a second place to get the argument
+// order wrong.
+private (bool hit, i32 tx, i32 ty) line_solid(Solids w, i32 axis, i32 k, i32 o0, i32 o1):
+    i32 o = o0
+    for o <= o1:
+        i32 tx = k
+        i32 ty = o
+        if axis == 1:
+            tx = o
+            ty = k
+        if solid_at(w, tx, ty):
+            return (true, tx, ty)
+        o = o + 1
+    return (false, 0, 0)
+
+// ── the sweep ──────────────────────────────────────────────────────────────
+
+// Sweep the body along one axis towards the coordinate `want` and answer where
+// it actually ends up, whether something stopped it there, and which cell did.
+//
+// **This is the whole of the collision resolution**, and it is exact. The box's
+// path along one axis is a rectangle; the cells that rectangle covers are
+// computed from its two ends; the nearest blocking line clamps the move to a
+// coordinate derived from the grid. Nothing is tested at the destination,
+// nothing is pushed out of anything, and there is no speed at which a line is
+// stepped over.
+//
+// **It answers a coordinate rather than a distance, and that is load-bearing.**
+// A caller that took a distance would write `position = position + moved`, and
+// `lo + (stop - lo)` is not `stop` in binary floating point — so a body resting
+// on a floor would land on a coordinate one unit in the last place away from
+// the grid's, a different one each frame, and the "never inside anything"
+// invariant the flush seam depends on would hold only approximately. Answering
+// `f32(row) * tile - height` and assigning it makes a resting body's coordinate
+// the same bit pattern every frame for ever.
+//
+// The candidate range is the other argument worth reading. Moving positively,
+// the first line that can block is the one just past the box's far edge —
+// `cell_hi(edge) + 1` — which is the line the edge is *exactly on* when it is
+// on a boundary, giving a contact at distance zero, and the line after the cell
+// the edge is inside when it is not. The last is `cell_lo(target_edge)`, so a
+// move that lands exactly on a line counts as touching it: a body falling
+// precisely onto a tile top lands rather than floats. The negative direction is
+// the mirror of both.
+private (f32 stop, bool blocked, i32 tx, i32 ty) sweep(^Body b, Solids w, i32 axis,
+                                                       f32 want):
+    f32 lo = b.position[axis]
+    if want == lo:
+        return (lo, false, 0, 0)
+    f32 t = w.tile_h
+    f32 ot = w.tile_w
+    if axis == 0:
+        t = w.tile_w
+        ot = w.tile_h
+    if !(t > 0.0) || !(ot > 0.0):
+        return (want, false, 0, 0)
+
+    i32 other = 1 - axis
+    f32 ext = b.size[axis]
+    f32 olo = b.position[other]
+    f32 oext = b.size[other]
+
+    // The perpendicular cell range the box occupies. A degenerate extent makes
+    // this empty, and an empty range collides with nothing, which is the right
+    // answer for a box of no width.
+    i32 o0 = cell_lo(olo, ot)
+    i32 o1 = cell_hi(olo + oext, ot)
+    if o1 < o0:
+        return (want, false, 0, 0)
+
+    if want > lo:
+        i32 k = cell_hi(lo + ext, t) + 1
+        i32 last = cell_lo(want + ext, t)
+        for k <= last:
+            (bool hit, i32 hx, i32 hy) = line_solid(w, axis, k, o0, o1)
+            if hit:
+                return (f32(k) * t - ext, true, hx, hy)
+            k = k + 1
+        return (want, false, 0, 0)
+
+    i32 k = cell_lo(lo, t) - 1
+    i32 last = cell_hi(want, t)
+    for k >= last:
+        (bool hit, i32 hx, i32 hy) = line_solid(w, axis, k, o0, o1)
+        if hit:
+            return (f32(k + 1) * t, true, hx, hy)
+        k = k - 1
+    return (want, false, 0, 0)
+
+// ── one axis of one substep ────────────────────────────────────────────────
+
+// The normal of a surface a move along `axis` in direction `d` ran into: it
+// points back along the motion, and it is a unit axis because every surface
+// here is one.
+private [2]f32 normal_for(i32 axis, f32 d):
+    f32 zero = 0.0
+    f32 n = -1.0
+    if d < 0.0:
+        n = 1.0
+    if axis == 0:
+        return (n, zero)
+    return (zero, n)
+
+// File the contact under floor, wall or ceiling by the sign of its normal's dot
+// with `up_direction`. With four possible normals and an axis up direction the
+// dot is exactly 1, -1 or 0, so this is a three-way split and not a threshold.
+private void register(^Body b, [2]f32 n):
+    f32 d = n.x * b.up_direction.x + n.y * b.up_direction.y
+    if d > 0.0:
+        b.last_on_floor = true
+        b.last_floor_normal = n
+        return
+    if d < 0.0:
+        b.last_on_ceiling = true
+        b.last_ceiling_normal = n
+        return
+    b.last_on_wall = true
+    b.last_wall_normal = n
+
+private void clear_contacts(^Body b):
+    f32 zero = 0.0
+    b.last_on_floor = false
+    b.last_on_wall = false
+    b.last_on_ceiling = false
+    b.last_floor_normal = (zero, zero)
+    b.last_wall_normal = (zero, zero)
+    b.last_ceiling_normal = (zero, zero)
+
+private void set_position(^Body b, i32 axis, f32 v):
+    [2]f32 p = b.position
+    p[axis] = v
+    b.position = p
+
+private void zero_velocity(^Body b, i32 axis):
+    f32 zero = 0.0
+    [2]f32 v = b.velocity
+    v[axis] = zero
+    b.velocity = v
+
+// Sweep to `want`, move there or to wherever it was stopped, and record the
+// contact. Answers whether something blocked.
+private bool step_axis(^Body b, Solids w, i32 axis, f32 want):
+    f32 from = b.position[axis]
+    (f32 stop, bool blocked, i32 _, i32 _) = sweep(b, w, axis, want)
+    set_position(b, axis, stop)
+    if blocked:
+        register(b, normal_for(axis, want - from))
+    return blocked
+
+// The same, reporting the contact instead of recording it. What
+// `move_and_collide` is built out of, and the reason it leaves the `last_*`
+// fields alone.
+private (bool blocked, [2]f32 normal, i32 tx, i32 ty) probe_axis(^Body b, Solids w,
+                                                                 i32 axis, f32 want):
+    f32 from = b.position[axis]
+    (f32 stop, bool blocked, i32 tx, i32 ty) = sweep(b, w, axis, want)
+    set_position(b, axis, stop)
+    return (blocked, normal_for(axis, want - from), tx, ty)
+
+// ── substepping ────────────────────────────────────────────────────────────
+
+private f32 absf(f32 x):
+    if x < 0.0:
+        return -x
+    return x
+
+private i32 up_axis(^Body b):
+    if b.up_direction.x != 0.0:
+        return 0
+    return 1
+
+private bool axial([2]f32 v):
+    if v.x == 0.0 && absf(v.y) == 1.0:
+        return true
+    if v.y == 0.0 && absf(v.x) == 1.0:
+        return true
+    return false
+
+// The most one substep may move on an axis: one cell, or the body's own extent
+// where that is smaller. See the package comment for what each half bounds.
+private f32 cap_for(f32 tile, f32 ext):
+    f32 c = tile
+    if ext > 0.0 && ext < c:
+        c = ext
+    return c
+
+// The conversion saturates, and here that is the right answer: the count is
+// capped at `MAX_SUBSTEPS` by the one caller, so an infinite distance is
+// `i32`'s end and then 64, and a NaN one is 0 and then the caller's floor of 1.
+// A cap that is not positive (NaN included) takes one step, as a world with no
+// cell size has nothing to cross.
+private i32 axis_steps(f32 dist, f32 cap):
+    if !(cap > 0.0):
+        return 1
+    return i32(math.up(f64(dist) / f64(cap)))
+
+private i32 substep_count(^Body b, Solids w, [2]f32 motion):
+    i32 n = 1
+    i32 nx = axis_steps(absf(motion.x), cap_for(w.tile_w, b.size.x))
+    i32 ny = axis_steps(absf(motion.y), cap_for(w.tile_h, b.size.y))
+    if nx > n:
+        n = nx
+    if ny > n:
+        n = ny
+    if n > MAX_SUBSTEPS:
+        n = MAX_SUBSTEPS
+    return n
+
+// ── the slide ──────────────────────────────────────────────────────────────
+
+// The loop the whole package is for. The up axis first, then the other; a
+// blocked axis stops being stepped and has its velocity component zeroed, so a
+// body pressed into a wall spends the rest of the step moving along it rather
+// than re-testing it substep after substep.
+//
+// **A substep aims at a fraction of the whole motion, not at an increment of
+// it.** Substep `i` of `n` wants `start + motion * (i + 1) / n`, so the last
+// one wants `start + motion` — the very coordinate an unsubstepped move would
+// have produced, computed the same way. Stepping by `motion / n` and adding it
+// up `n` times is a different number: sixty-four roundings of a hundred-unit
+// move leave a body several units in the last place from where it was told to
+// go, every frame, which is a drift nothing ever corrects. The cost of the
+// fraction is one multiply and one divide per axis per substep.
+private void slide(^Body b, Solids w, [2]f32 motion):
+    #assert(axial(b.up_direction),
+            "app:body2d: up_direction must be one of UP, DOWN, LEFT, RIGHT")
+    clear_contacts(b)
+    i32 n = substep_count(b, w, motion)
+    b.last_substeps = n
+    i32 ua = up_axis(b)
+    i32 oa = 1 - ua
+    [2]f32 start = b.position
+    bool done_u = motion[ua] == 0.0
+    bool done_o = motion[oa] == 0.0
+    i32 i = 0
+    for i < n:
+        f32 frac = f32(i + 1) / f32(n)
+        if !done_u:
+            if step_axis(b, w, ua, start[ua] + motion[ua] * frac):
+                done_u = true
+                zero_velocity(b, ua)
+        if !done_o:
+            if step_axis(b, w, oa, start[oa] + motion[oa] * frac):
+                done_o = true
+                zero_velocity(b, oa)
+        if done_u && done_o:
+            break
+        i = i + 1
+
+// Godot's floor snapping: where the move found no floor and the body is not
+// travelling away from the ground, probe down by `floor_snap_length` and glue
+// the body to whatever is there.
+//
+// It does **not** zero the velocity, because nothing was hit during the move —
+// the body was already where it ended up, and a snap that zeroed the fall a
+// caller had just begun would cancel jumps that cleared the ground by less than
+// the snap length. That is also why a body moving *along* `up_direction` is
+// skipped outright: a jump is not a missed floor.
+private void snap_to_floor(^Body b, Solids w):
+    if b.last_on_floor:
+        return
+    if b.floor_snap_length <= 0.0:
+        return
+    f32 vu = b.velocity.x * b.up_direction.x + b.velocity.y * b.up_direction.y
+    if vu > 0.0:
+        return
+    i32 ua = up_axis(b)
+    f32 probe = -b.up_direction[ua] * b.floor_snap_length
+    (f32 stop, bool blocked, i32 _, i32 _) = sweep(b, w, ua, b.position[ua] + probe)
+    if !blocked:
+        return
+    set_position(b, ua, stop)
+    register(b, normal_for(ua, probe))

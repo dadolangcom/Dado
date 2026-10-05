@@ -1,0 +1,171 @@
+@test
+// The interesting behaviour is `parse`'s tolerance and `save`'s
+// round-trip, not the C calls underneath — `core:io`'s own test already
+// covers those. What is claimed here:
+//
+//   * **the default section** — everything before the first `[header]`
+//     lands in `""`, so a flat key=value file with no header still parses.
+//   * **comments and blank lines** are ignored, `;` and `#` both.
+//   * **whitespace** around `=` and around a section name is trimmed.
+//   * **malformed lines are skipped, not fatal** — `bad_lines` counts them,
+//     `ok` is false, and every well-formed line around a bad one still
+//     parses: boot anyway, rather than fail hard on a malformed file.
+//   * **missing keys** answer the caller's fallback, at every typed getter.
+//   * **round-trip through disk** — `set_*`, `save`, `load`, and the values
+//     read back equal to the values written, for string/i32/f64/bool alike.
+//   * **values don't borrow from the source** — `parse`'s `text` (or
+//     `load`'s read buffer) can be freed the moment it returns and the
+//     `Config` is still good, because every value is its own allocation.
+//   * **every `Config` is ended by `destroy`**, and this file ends every one
+//     it makes — so it runs clean under LeakSanitizer (`detect_leaks=1`),
+//     which it did not before values became freeable (19,696 B in 169
+//     allocations).
+//     `destroy` of a `fresh` config and a second `destroy` are both safe.
+//     `roundtrip64_test.dado` is the 64-section, thousand-round claim.
+package cfg
+
+import "core:strings"
+
+private const cstring PATH = "/tmp/dado_core_cfg_test.ini"
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = #default
+
+    // ── the default section, comments, blank lines, whitespace ────────────
+
+    string8 text1 = "; a leading comment\nname = camp\n  count =   3  \n\n# another comment\n[window]\nwidth=800\nheight = 600\n"
+
+    (Config c1, bool ok1, i32 bad1) = parse(text1, alloc)
+    ok = #expect(ok1, "text1 reported bad lines: ", bad1) && ok
+    ok = #expect(bad1 == 0, "text1 bad_lines was ", bad1) && ok
+    ok = #expect(get_string(c1, "", "name", "?") == "camp", "default-section name was ", get_string(c1, "", "name", "?")) && ok
+    ok = #expect(get_string(c1, "", "count", "?") == "3", "default-section count was ", get_string(c1, "", "count", "?")) && ok
+    ok = #expect(get_string(c1, "window", "width", "?") == "800", "window.width was ", get_string(c1, "window", "width", "?")) && ok
+    ok = #expect(get_string(c1, "window", "height", "?") == "600", "window.height was ", get_string(c1, "window", "height", "?")) && ok
+    // A key that exists in one section must not leak into another.
+    (string8 leaked, bool leaked_found) = get(c1, "window", "name")
+    ok = #expect(!leaked_found, "window.name should not exist, found ", leaked) && ok
+    destroy(&c1)
+    ok = #expect(get_string(c1, "", "name", "gone") == "gone", "a destroyed Config still answered") && ok
+    // Twice is nothing: `destroy` leaves the zero `Config`.
+    destroy(&c1)
+
+    // ── malformed lines: counted, not fatal, neighbours still parse ───────
+
+    string8 text2 = "good = 1\nthis line has no equals sign\n[]\n[   ]\nalso_good = 2\n= no key\n[section]\nstill_good = 3\n"
+
+    (Config c2, bool ok2, i32 bad2) = parse(text2, alloc)
+    ok = #expect(!ok2, "text2 with malformed lines reported ok") && ok
+    ok = #expect(bad2 == 4, "text2 bad_lines was ", bad2) && ok
+    ok = #expect(get_string(c2, "", "good", "?") == "1", "good was ", get_string(c2, "", "good", "?")) && ok
+    ok = #expect(get_string(c2, "", "also_good", "?") == "2", "also_good was ", get_string(c2, "", "also_good", "?")) && ok
+    ok = #expect(get_string(c2, "section", "still_good", "?") == "3", "still_good was ", get_string(c2, "section", "still_good", "?")) && ok
+    // The bad `= no key` line must not have landed anywhere as key "".
+    (string8 _, bool nokey_found) = get(c2, "", "")
+    ok = #expect(!nokey_found, "an empty key should not exist") && ok
+    destroy(&c2)
+
+    // ── a key repeated in the text overwrites, and frees what it replaced ──
+    //
+    // The first value is freed by `put`; LeakSanitizer is what would say if
+    // it were not. The last one read wins.
+    (Config dup, bool okd, i32 badd) = parse("k = one\nk = two\nk = three\n", alloc)
+    ok = #expect(okd && badd == 0, "the repeated-key text reported bad lines") && ok
+    ok = #expect(get_string(dup, "", "k", "?") == "three", "a repeated key read back ", get_string(dup, "", "k", "?")) && ok
+    destroy(&dup)
+
+    // ── missing keys answer the fallback, every typed getter ──────────────
+
+    Config empty = fresh(alloc)
+    ok = #expect(get_string(empty, "x", "y", "fallback") == "fallback", "get_string fallback was wrong") && ok
+    ok = #expect(get_i32(empty, "x", "y", 42, alloc) == 42, "get_i32 fallback was wrong") && ok
+    f64 fb = get_f64(empty, "x", "y", 1.5, alloc)
+    ok = #expect(fb > 1.4999 && fb < 1.5001, "get_f64 fallback was wrong: ", fb) && ok
+    ok = #expect(get_bool(empty, "x", "y", true), "get_bool fallback was wrong") && ok
+    destroy(&empty)
+
+    // ── values don't borrow from the source ────────────────────────────────
+    //
+    // Build the text in an owned buffer, parse it, then overwrite the buffer
+    // before reading the Config back. If a value were a window into it, this
+    // would read the overwritten bytes instead.
+    i64 blen = #len(text1)
+    ref []char8 tbuf = #make([]char8, blen, alloc)
+    for i in 0..<blen:
+        tbuf[i] = text1[i]
+    string8 owned_text = string8(tbuf[:])
+    (Config c3, bool ok3, i32 bad3) = parse(owned_text, alloc)
+    ok = #expect(ok3 && bad3 == 0, "owned-buffer parse reported bad lines") && ok
+    for i in 0..<blen:
+        tbuf[i] = 'Z'
+    ok = #expect(get_string(c3, "", "name", "?") == "camp", "a value borrowed from a freed/overwritten buffer") && ok
+    #delete(tbuf)
+    destroy(&c3)
+
+    // ── typed setters, and a round trip through disk ───────────────────────
+
+    Config out = fresh(alloc)
+    set_string(&out, "", "app", "toy", alloc)
+    set_i32(&out, "window", "width", 1024, alloc)
+    set_i32(&out, "window", "height", 768, alloc)
+    set_f64(&out, "window", "scale", 1.25, alloc)
+    set_bool(&out, "window", "fullscreen", false, alloc)
+    set_bool(&out, "window", "vsync", true, alloc)
+    // An overwrite, of every kind: each frees the value it replaces.
+    set_string(&out, "", "app", "toy-overwritten", alloc)
+    set_string(&out, "", "app", "toy", alloc)
+    set_i32(&out, "window", "width", 1, alloc)
+    set_i32(&out, "window", "width", 1024, alloc)
+    set_f64(&out, "window", "scale", 9.5, alloc)
+    set_f64(&out, "window", "scale", 1.25, alloc)
+    set_bool(&out, "window", "vsync", false, alloc)
+    set_bool(&out, "window", "vsync", true, alloc)
+    // Twelve more sections. A `Config`'s outer map holds one entry per
+    // section and grows when its entries would pass three quarters of its
+    // slots; with two sections this round trip exercised the setters and
+    // never the growth, which is the one thing about a map that a setter can
+    // get wrong. `&out` at every call is ERR0819's repair, and it is what
+    // makes the growth happen in `out` rather than in a copy.
+    set_i32(&out, "audio", "volume", 100, alloc)
+    set_i32(&out, "input", "deadzone", 15, alloc)
+    set_i32(&out, "video", "gamma", 1, alloc)
+    set_i32(&out, "network", "port", 7777, alloc)
+    set_i32(&out, "debug", "level", 2, alloc)
+    set_i32(&out, "ui", "theme", 0, alloc)
+    set_i32(&out, "log", "rotate", 7, alloc)
+    set_i32(&out, "paths", "depth", 3, alloc)
+    set_i32(&out, "physics", "steps", 60, alloc)
+    set_i32(&out, "render", "msaa", 4, alloc)
+    set_i32(&out, "save", "slots", 8, alloc)
+    set_i32(&out, "misc", "seed", 1, alloc)
+
+    bool saved = save(out, PATH, alloc)
+    ok = #expect(saved, "save() returned false") && ok
+
+    ok = #expect(exists(PATH), "exists() was false right after save()") && ok
+
+    (Config back, bool ok4, i32 bad4) = load(PATH, alloc)
+    ok = #expect(ok4, "loading the saved file reported bad lines: ", bad4) && ok
+    ok = #expect(bad4 == 0, "loading the saved file had bad_lines ", bad4) && ok
+    ok = #expect(get_string(back, "", "app", "?") == "toy", "app was ", get_string(back, "", "app", "?")) && ok
+    ok = #expect(get_i32(back, "window", "width", 0, alloc) == 1024, "width was ", get_i32(back, "window", "width", 0, alloc)) && ok
+    ok = #expect(get_i32(back, "window", "height", 0, alloc) == 768, "height was ", get_i32(back, "window", "height", 0, alloc)) && ok
+    f64 scale = get_f64(back, "window", "scale", 0.0, alloc)
+    ok = #expect(scale > 1.2499 && scale < 1.2501, "scale was ", scale) && ok
+    ok = #expect(get_bool(back, "window", "fullscreen", true) == false, "fullscreen was true") && ok
+    ok = #expect(get_bool(back, "window", "vsync", false) == true, "vsync was false") && ok
+    destroy(&out)
+    destroy(&back)
+
+    // ── a missing file loads clean, rather than failing ────────────────────
+
+    ok = #expect(!exists("/tmp/dado_core_cfg_test.does_not_exist"), "the does-not-exist fixture unexpectedly exists") && ok
+    (Config missing_cfg, bool ok5, i32 bad5) = load("/tmp/dado_core_cfg_test.does_not_exist", alloc)
+    ok = #expect(ok5 && bad5 == 0, "loading a missing file was not clean") && ok
+    ok = #expect(get_string(missing_cfg, "", "anything", "fallback") == "fallback", "a missing-file Config answered something other than the fallback") && ok
+    destroy(&missing_cfg)
+
+    if ok:
+        return 0
+    return 1

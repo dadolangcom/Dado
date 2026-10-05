@@ -1,0 +1,766 @@
+// The commands: `where`, `clean`, and the four that take a package —
+// `check`, `emit`, `build` and `run`.
+//
+// **Where a package's artifacts go is decided by the package**, not by this
+// driver: a package inside a checkout (a directory holding a `dado` file and
+// a `collections/` directory, walking up) builds into that checkout's
+// `build/`, and one outside every checkout into `build/` beside itself. Under
+// it the artifacts mirror the package's own path, so two packages never share
+// a name: `dado build corpus/tour` writes `build/corpus/tour` and
+// `build/corpus/tour.c`. `DADO_BUILD_DIR` overrides the directory outright.
+//
+// **The `#line` paths in the C are relative**: the checkout's root maps to
+// nothing (and a package's own build base, and the collections when they live
+// elsewhere), so the C is the same bytes in any checkout.
+package driver
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+// ── where, clean ────────────────────────────────────────────────────────────
+
+// This toolchain's paths, one `key=value` per line, for an editor or a
+// person: which layout, the root, the compiler, the language server, the
+// collections, the build directory and the C compiler a build would use. An
+// empty value is one that is not there.
+//
+// JSON: {"query": "where", "root": ..., "compiler": ..., "lsp": ...,
+// "collections": ..., "layout": "monorepo"|"install", "build": ..., "cc": ...},
+// the same keys and values.
+i32 where(bool json = false):
+    Layout l = layout()
+    string8 cc = ""
+    Compiler c = compiler("", true)
+    if c.found: cc = shown(command_of(c.words[:]))
+    ref []string8 keys = #make([]string8, 0)
+    ref []string8 values = #make([]string8, 0)
+    _ = #append(keys, "root")
+    _ = #append(values, l.root)
+    _ = #append(keys, "compiler")
+    _ = #append(values, find_dadoc())
+    _ = #append(keys, "lsp")
+    _ = #append(values, lsp_path())
+    _ = #append(keys, "collections")
+    _ = #append(values, collections())
+    _ = #append(keys, "layout")
+    _ = #append(values, l.kind)
+    _ = #append(keys, "build")
+    _ = #append(values, build_dir())
+    _ = #append(keys, "cc")
+    _ = #append(values, cc)
+    if json:
+        ref []string8 f = #make([]string8, 0)
+        _ = #append(f, json_text("query", "where"))
+        for i in 0..<#len(keys):
+            _ = #append(f, json_text(keys[i], values[i]))
+        fmt.println(json_object(f[:]))
+        return 0
+    for i in 0..<#len(keys):
+        fmt.println(keys[i], "=", values[i])
+    return 0
+
+// Remove the build directory.
+i32 clean():
+    string8 dir = build_dir()
+    if exists(dir):
+        try fs.remove_all(dir) else code:
+            die(txt(#format("cannot remove ", dir, ": ", os.message(code))))
+            return 1
+    say_green("cleaned", txt(#format(" ", dir)))
+    return 0
+
+// ── the package's place ─────────────────────────────────────────────────────
+
+// The working directory as the shell names it: `PWD` when it is the same
+// directory (so a path through a symlink stays the path the person used),
+// else the system's answer.
+string8 working_dir():
+    string8 here = strings.borrow_from_cstring(fs.cwd())
+    ref []char8 own = #format(here)
+    string8 real_here = real(txt(own))
+    (string8 pwd, bool set) = env("PWD")
+    if set && path.is_abs(pwd) && real(pwd) == real_here:
+        return pwd
+    return txt(own)
+
+private string8 real(string8 p):
+    ref []char8 c = strings.clone_to_cstring(p, #default)
+    ref []char8 out = #make([]char8, 32768)
+    i64 n = fs.real_path(cstring(c), out[:])
+    if n < 0: return p
+    return string8(cstring(rawptr(&out[0])))
+
+// `p` made absolute against the working directory, as typed: no symlink
+// followed and nothing cleaned, since it is the person's own name for it.
+string8 absolute(string8 p, string8 cwd):
+    if path.is_abs(p): return p
+    when #OS == #WINDOWS:
+        return txt(#format(cwd, "\\", p))
+    else:
+        return txt(#format(cwd, "/", p))
+
+// The checkout a package belongs to: the nearest directory at or above `dir`
+// that holds a file `dado` and a directory `collections`, or "".
+string8 build_root(string8 dir):
+    string8 at = clean_path(dir)
+    for:
+        if is_file(join2(at, "dado")) && is_dir(join2(at, "collections")):
+            return at
+        string8 up = dir_of(at)
+        if up == at || #len(up) == 0 || up == ".": return ""
+        at = up
+    return ""
+
+string8 clean_path(string8 p):
+    ref []char8 c = path.clean(p)
+    return txt(c)
+
+// Where under the build directory a package's artifacts go: its path,
+// cleaned, relative to `base` when it is inside it, else the absolute path
+// with its root taken off. A trailing `.dado` is dropped.
+string8 build_stem(string8 pkg, string8 base):
+    string8 norm = clean_path(pkg)
+    string8 stem = norm
+    string8 b = clean_path(base)
+    if #len(norm) > #len(b) + 1 && strings.starts_with(norm, b) && path.is_separator(norm[#len(b)]):
+        stem = norm[#len(b) + 1..<#len(norm)]
+    else:
+        i64 skip = 0
+        string8 vol = path.volume(norm)
+        skip = #len(vol)
+        for skip < #len(norm) && path.is_separator(norm[skip]):
+            skip += 1
+        stem = norm[skip..<#len(norm)]
+        if #len(vol) > 0:
+            // `C:\x` keeps its drive as a directory name, without the colon.
+            stem = txt(#format(vol[0..<1], "/", stem))
+    if strings.ends_with(stem, ".dado"):
+        stem = stem[0..<#len(stem) - 5]
+    return stem
+
+// ── the package commands ────────────────────────────────────────────────────
+
+// What every package command works out before it runs anything.
+type Plan:
+    string8 pkg_abs
+    string8 name
+    string8 build_base
+    string8 build_dir
+    string8 stem
+    ref []string8 prefix_map
+    string8 target_flag
+    string8 dadoc
+    string8 collections
+
+// The `--target=` dadoc is told: `DADO_TARGET`, or what the C compiler says
+// it builds for, or nothing when there is no compiler to ask.
+private string8 target_flag(Compiler c):
+    (string8 t, bool set) = env("DADO_TARGET")
+    if set: return txt(#format("--target=", t))
+    if !c.found: return ""
+    Command ask = command_of(c.words[:])
+    add(&ask, "-dumpmachine")
+    string8 triple = first_line(ask, true)
+    if #len(triple) == 0: return ""
+    return txt(#format("--target=", triple))
+
+// The start of every dadoc command for this package: the collections, the
+// target, and the web, shader, define and strip flags the command line gave.
+private Command dadoc_command(^Plan p, ^Options o, bool shader, bool strip):
+    Command c = command(p.dadoc)
+    add(&c, txt(#format("--collections=", p.collections)))
+    if #len(p.target_flag) > 0: add(&c, p.target_flag)
+    if o.web_threads: add(&c, "--web-threads")
+    if shader && #len(o.shader) > 0: add(&c, txt(#format("--shader=", o.shader)))
+    add_all(&c, o.defines[:])
+    if strip: add_all(&c, o.strip[:])
+    if strip && o.explain: add(&c, "--explain")
+    return c
+
+private bool targets_web():
+    (string8 t, bool set) = env("DADO_TARGET")
+    return set && t == "wasm32-unknown-web"
+
+i32 package_command(^Options o):
+    string8 cmd = o.cmd
+    // `--target=web` is the web's triple, told to dadoc as any other is and
+    // to every program this one starts.
+    if o.target == "web":
+        try os.set_env("DADO_TARGET", "wasm32-unknown-web") else:
+            die("cannot set DADO_TARGET for --target=web")
+    g_html_flag = web_flags(o)
+    if #len(o.pkg) == 0:
+        die(txt(#format("no package given. Try: dado ", cmd, " corpus/tour")))
+    if !exists(o.pkg):
+        die(txt(#format("no such package: ", o.pkg)))
+
+    Plan p
+    p.dadoc = dadoc()
+    p.collections = collections()
+    string8 cwd = working_dir()
+    string8 pkg_abs = absolute(o.pkg, cwd)
+    for #len(pkg_abs) > 1 && path.is_separator(pkg_abs[#len(pkg_abs) - 1]):
+        pkg_abs = pkg_abs[0..<#len(pkg_abs) - 1]
+    p.pkg_abs = pkg_abs
+    string8 name = path.base(pkg_abs)
+    if strings.ends_with(name, ".dado"): name = name[0..<#len(name) - 5]
+    p.name = name
+    (string8 over, bool set) = env("DADO_BUILD_DIR")
+    if set:
+        p.build_base = root()
+        p.build_dir = over
+    else:
+        string8 br = build_root(dir_of(pkg_abs))
+        if #len(br) == 0:
+            br = dir_of(clean_path(pkg_abs))
+        p.build_base = br
+        p.build_dir = join2(br, "build")
+    p.stem = build_stem(pkg_abs, p.build_base)
+
+    // Narrowest first: the collections when they live outside the root, the
+    // package's own build base when it is not the root, then the root.
+    ref []string8 map = #make([]string8, 0)
+    string8 r = root()
+    string8 coll = p.collections
+    bool coll_inside = #len(coll) > #len(r) + 1 && strings.starts_with(coll, r) && path.is_separator(coll[#len(r)])
+    if !coll_inside:
+        _ = #append(map, txt(#format("--source-prefix-map=", coll, "=collections")))
+    if p.build_base != r:
+        _ = #append(map, txt(#format("--source-prefix-map=", p.build_base, "=")))
+    _ = #append(map, txt(#format("--source-prefix-map=", r, "=")))
+    p.prefix_map = map
+
+    // Asked before `check` and `emit` too: a `when #OS` decides which
+    // declarations exist, so every command asks the question a build does.
+    Compiler quiet_cc = compiler(o.cc, true)
+    p.target_flag = target_flag(quiet_cc)
+
+    if cmd == "emit":
+        Command c = dadoc_command(&p, o, true, true)
+        if #len(o.emit) > 0: add(&c, txt(#format("--emit=", o.emit)))
+        add(&c, p.pkg_abs)
+        return run_quietly(c)
+
+    if #len(o.manifest) > 0 && cmd != "build":
+        die(txt(#format("--manifest= writes files beside a build, which `dado ", cmd, "` does not make. Try: dado build ", o.pkg, " --manifest=", o.manifest)))
+    if #len(o.manifest) > 0:
+        check_extensions(o.manifest)
+
+    if cmd == "check":
+        return check(&p, o)
+    if o.target == "js":
+        return js_library(&p, o)
+    if cmd == "test":
+        return test_command(&p, o)
+    return build(&p, o)
+
+// The `--html=` flag dadoc is told when checking and transpiling a web build
+// with a page template, or "".
+private string8 g_html_flag = ""
+
+// ── check ───────────────────────────────────────────────────────────────────
+
+private i32 check(^Plan p, ^Options o):
+    Command c = dadoc_command(p, o, true, true)
+    if o.strict: add(&c, "--strict")
+    // A package that is not `package main` is a library: it has no entry
+    // point to check for, and its surface is what it declares.
+    if is_library(p.pkg_abs): add(&c, "--library")
+    if #len(g_html_flag) > 0: add(&c, g_html_flag)
+    Command first = command_of(c.words[:])
+    add(&first, "--emit=diagnostics")
+    add(&first, p.pkg_abs)
+    Captured r = capture(first, false)
+    if r.started && r.status == 0:
+        say_green("ok", txt(#format(" ", p.name)))
+        return 0
+    // Again without `--emit=diagnostics`, with the same flags, so the
+    // diagnostics are printed: the first run's answer is its status.
+    add(&c, p.pkg_abs)
+    _ = capture(c, false)
+    return 1
+
+// Whether the package at `pkg` names itself something other than `main`: the
+// first `package` line of its first source file that has one. A package that
+// writes none is `main`.
+bool is_library(string8 pkg):
+    if !is_dir(pkg): return library_named(pkg)
+    string8 dir = clean_path(pkg)
+    fs.Listing l = fs.walk(dir, #default)
+    defer fs.release(l)
+    for e in l.entries:
+        if !e.is_dir && strings.ends_with(e.path, ".dado") && clean_path(dir_of(e.path)) == dir:
+            string8 f = e.path
+            try ref []char8 text = fs.read_file(f) else:
+                continue
+            (bool named, bool library) = package_line(txt(text))
+            if named: return library
+    return false
+
+private bool library_named(string8 file):
+    try ref []char8 text = fs.read_file(file) else:
+        return false
+    (bool _, bool library) = package_line(txt(text))
+    return library
+
+// The file's `package` line, if it opens with one (after comments and an
+// `@test`), and whether it names anything but `main`.
+private (bool named, bool library) package_line(string8 text):
+    for l in lines_of(text):
+        string8 t = strings.trim(l)
+        if strings.starts_with(t, "package "):
+            return (true, strings.trim(t[8..<#len(t)]) != "main")
+        if #len(t) > 0 && !strings.starts_with(t, "//") && !strings.starts_with(t, "@"):
+            break
+    return (false, false)
+
+// ── the manifest's extensions ───────────────────────────────────────────────
+
+private void check_extensions(string8 list):
+    string8 rest = list
+    for:
+        (string8 ext, string8 tail, bool more) = split_byte(rest, ',')
+        bool official = ext == "h" || ext == "dts"
+        if !official && (strings.has_byte(ext, '/') || strings.has_byte(ext, '.')):
+            if !is_file(ext):
+                die(txt(#format("the manifest extension `", ext, "` is not a file. The official ones are `h` and `dts`; anything else is a path to a program that reads the manifest on standard input")))
+        else if !official:
+            die(txt(#format("unknown manifest extension `", ext, "`: the official ones are `h` (a C header) and `dts` (TypeScript declarations); a third-party one is named by its path, e.g. --manifest=h,./tools/mine.mjs")))
+        if !more: break
+        rest = tail
+
+// Whether the manifest describes a package of scripts (`--target=js`).
+private bool g_manifest_package
+
+void set_manifest_package(bool on):
+    g_manifest_package = on
+
+// `dadoc --emit=manifest` beside the build, then each extension over it.
+private void write_manifest_outputs(^Plan p, ^Options o):
+    if #len(o.manifest) == 0: return
+    string8 json = txt(#format(p.build_dir, "/", p.stem, ".manifest.json"))
+    _ = fs.make_dirs(dir_of(json), #default)
+    Command c = command(p.dadoc)
+    add(&c, txt(#format("--collections=", p.collections)))
+    if #len(p.target_flag) > 0: add(&c, p.target_flag)
+    if o.web_threads: add(&c, "--web-threads")
+    add_all(&c, o.defines[:])
+    if o.strict: add(&c, "--strict")
+    if g_manifest_package: add(&c, "--package")
+    add(&c, "--emit=manifest")
+    add(&c, "-o")
+    add(&c, json)
+    add(&c, p.pkg_abs)
+    if run(c) != 0:
+        die(txt(#format("the manifest was not written; what was built is in ", p.build_dir)))
+    say_green("built", txt(#format(" ", json)))
+    try ref []char8 manifest_text = fs.read_file(json) else code:
+        die(txt(#format("cannot read ", json, " back: ", os.message(code))))
+        return
+    string8 rest = o.manifest
+    for:
+        (string8 ext, string8 tail, bool more) = split_byte(rest, ',')
+        string8 script = ""
+        string8 out = ""
+        if ext == "h":
+            script = join3(root(), "tools", join2("manifest", "h.mjs"))
+            out = txt(#format(p.build_dir, "/", p.stem, ".h"))
+        else if ext == "dts":
+            script = join3(root(), "crates", join3("dadoc", "src", "dts.mjs"))
+            out = txt(#format(p.build_dir, "/", p.stem, ".d.ts"))
+            if !is_file(script):
+                die(txt(#format("the `dts` manifest extension is a script of the compiler's source, and this toolchain has none at\n    ", script, "\n  Build the manifest alone (--manifest=h), or run from a checkout of the repository.")))
+        else:
+            script = ext
+            string8 base = path.base(ext)
+            string8 e = path.ext(base)
+            out = txt(#format(p.build_dir, "/", p.stem, ".", base[0..<#len(base) - #len(e)]))
+        Command x = command("")
+        if strings.ends_with(script, ".mjs") || strings.ends_with(script, ".js"):
+            (string8 node, bool nset) = env("DADO_NODE")
+            if !nset: node = "node"
+            string8 node_path = on_path(node)
+            if #len(node_path) == 0:
+                die(txt(#format("the `", ext, "` manifest extension is a JavaScript program, and `", node, "` is not on this machine: install node, or name it with DADO_NODE=<path>")))
+            x = command(node)
+            add(&x, script)
+        else:
+            ref []char8 sc = strings.clone_to_cstring(script, #default)
+            if !fs.executable(cstring(sc)):
+                die(txt(#format("the manifest extension `", script, "` is not executable: chmod +x it, or write it as a .mjs file node runs")))
+            x = command(script)
+        if verbose():
+            note(txt(#format("  $ ", shown(x), " < ", json, " > ", out)))
+        Captured r = capture(x, false, txt(manifest_text))
+        if !r.started || r.status != 0:
+            die(txt(#format("the manifest extension `", ext, "` failed; the manifest it read is ", json)))
+        try fs.write_file(out, txt(r.out)) else code:
+            die(txt(#format("cannot write ", out, ": ", os.message(code))))
+            return
+        say_green("built", txt(#format(" ", out)))
+        if !more: break
+        rest = tail
+
+// ── build and run ───────────────────────────────────────────────────────────
+
+// Homebrew's prefix, asked once: `brew --prefix` when `brew` is on `PATH`.
+// Apple's clang does not search `/opt/homebrew`, so a library `brew`
+// installed is not found without it.
+private string8 g_brew = ""
+private bool g_brew_asked
+
+private string8 brew_prefix():
+    if g_brew_asked: return g_brew
+    g_brew_asked = true
+    string8 brew = on_path("brew")
+    if #len(brew) == 0: return ""
+    Command c = command(brew)
+    add(&c, "--prefix")
+    g_brew = first_line(c, true)
+    return g_brew
+
+// The compile and link flags a sanitized build takes with compiler `cc`, or
+// none: `on` false, or this compiler cannot build and run a sanitized
+// program here. `kind` is `address` or `thread`. A missing runtime is a
+// warning and an unsanitized build for `address`, and an error for `thread`,
+// which somebody asked for by name. Each runtime's options are defaulted in
+// the environment, never forced.
+(ref []string8 cflags, ref []string8 ldflags, bool on) configure_sanitizers(Compiler cc, bool on, string8 kind):
+    ref []string8 none_c = #make([]string8, 0)
+    ref []string8 none_l = #make([]string8, 0)
+    if !on: return (none_c, none_l, false)
+    if kind == "thread":
+        (ref []string8 tc, ref []string8 tl) = sanitizer_words(setting("CFLAGS_SANITIZE_THREAD"), setting("LDFLAGS_SANITIZE_THREAD"), cc.zig)
+        if !sanitizers_available(cc, tc[:], tl[:]):
+            die(txt(#format(cc.name, " cannot build and run a -fsanitize=thread program here.\n  install its runtime (Ubuntu: libtsan2 for gcc, libclang-rt-dev for clang), or --cc the other.")))
+        default_env("TSAN_OPTIONS", setting("TSAN_OPTIONS_DEFAULT"))
+        default_env("UBSAN_OPTIONS", setting("UBSAN_OPTIONS_DEFAULT"))
+        return (tc, tl, true)
+    (ref []string8 ac, ref []string8 al) = sanitizer_words(setting("CFLAGS_SANITIZE"), setting("LDFLAGS_SANITIZE"), cc.zig)
+    i32 probe = sanitizer_probe(cc, ac[:], al[:])
+    if probe == PROBE_HUNG && !cc.zig:
+        // AddressSanitizer that links but never lets `main` start. Seen with
+        // Apple clang 17 on macOS 26, where an empty program hangs at start-up
+        // under -fsanitize=address whatever ASAN_OPTIONS says. UBSan alone
+        // still runs there, so the tests keep the checks that work.
+        (ref []string8 uc, ref []string8 ul) = sanitizer_words(setting("CFLAGS_SANITIZE"), setting("LDFLAGS_SANITIZE"), true)
+        if sanitizer_probe(cc, uc[:], ul[:]) == PROBE_RAN:
+            warn(txt(#format(cc.name, "'s AddressSanitizer hangs at start-up here: an empty program built with it did not exit in ", PROBE_LIMIT_MS / 1000, " s.\n  sanitizing with UBSan alone. For out-of-bounds checks, --cc another compiler (Homebrew's llvm, or gcc).")))
+            g_ubsan_only = true
+            default_env("UBSAN_OPTIONS", setting("UBSAN_OPTIONS_DEFAULT"))
+            return (uc, ul, true)
+    if probe != PROBE_RAN:
+        warn(txt(#format(cc.name, " has no sanitizer runtime here — running unsanitized.\n  `dado test` asks for -fsanitize=address,undefined by default:\n  install it (Ubuntu: libclang-rt-dev, libasan8), or --cc gcc, or --no-sanitize.")))
+        return (none_c, none_l, false)
+    if cc.zig:
+        warn("the pinned zig has no AddressSanitizer runtime: sanitizing with UBSan alone.\n  Pass --cc clang or --cc gcc for out-of-bounds checks.")
+    else:
+        default_env("ASAN_OPTIONS", setting("ASAN_OPTIONS_DEFAULT"))
+    default_env("UBSAN_OPTIONS", setting("UBSAN_OPTIONS_DEFAULT"))
+    return (ac, al, true)
+
+void default_env(string8 name, string8 value):
+    (string8 _, bool set) = env(name)
+    if set: return
+    try os.set_env(name, value) else:
+        return
+
+// Whether this run sanitizes with UBSan alone: always under the pinned zig,
+// which has no AddressSanitizer, and when the compiler's AddressSanitizer
+// hung at start-up here.
+private bool g_ubsan_only
+bool ubsan_only(Compiler cc): return cc.zig || g_ubsan_only
+
+// What running the probe program answered: it ran and exited 0, it could not
+// be built or failed, or it was still running at `PROBE_LIMIT_MS` and was
+// killed. An empty program needs well under a second, sanitized or not.
+const i32 PROBE_RAN = 0
+const i32 PROBE_FAILED = 1
+const i32 PROBE_HUNG = 2
+const i32 PROBE_LIMIT_MS = 20000
+
+bool sanitizers_available(Compiler cc, []string8 cflags, []string8 ldflags):
+    return sanitizer_probe(cc, cflags, ldflags) == PROBE_RAN
+
+// Whether `cc` can compile, link **and run** a program with these flags: the
+// link is where a missing runtime shows, and the run is where one that links
+// but cannot map its shadow memory does, or one that never starts.
+i32 sanitizer_probe(Compiler cc, []string8 cflags, []string8 ldflags):
+    ref []char8 tmp = os.temp_dir()
+    string8 probe_c = txt(#format(txt(tmp), "/dado-san-probe-", os.pid(), ".c"))
+    string8 probe_bin = txt(#format(txt(tmp), "/dado-san-probe-", os.pid()))
+    try fs.write_file(probe_c, "int main(void) { return 0; }\n") else:
+        return PROBE_FAILED
+    Command c = command_of(cc.words[:])
+    add_all(&c, cflags)
+    add(&c, probe_c)
+    add(&c, "-o")
+    add(&c, probe_bin)
+    add_all(&c, ldflags)
+    i32 answer = PROBE_FAILED
+    if succeeds(c):
+        (bool ran, bool hung) = succeeds_within(command(probe_bin), PROBE_LIMIT_MS)
+        if ran: answer = PROBE_RAN
+        else if hung: answer = PROBE_HUNG
+    remove_quietly(probe_c)
+    if exists(probe_bin):
+        remove_quietly(probe_bin)
+    return answer
+
+// The script engine's archive directory for this compiler, target and
+// flags, built on a miss by `tools/quickjs/build.sh` and cached by it.
+private string8 engine_archive(Compiler cc, string8 target_flag, []string8 san_c):
+    Command c = command(join3(root(), "tools", join2("quickjs", "build.sh")))
+    add(&c, "--cc")
+    // One argument, as the build script reads it: `zig cc` and its `-target`
+    // are several words, which the script splits where it runs the compiler.
+    ref []char8 words = strings.join(cc.words[:], " ")
+    add(&c, txt(words))
+    // Under zig the target is already among the words.
+    if !cc.zig && strings.starts_with(target_flag, "--target="):
+        add(&c, "--triple")
+        add(&c, target_flag[9..<#len(target_flag)])
+    if #len(san_c) > 0:
+        add(&c, "--extra")
+        ref []char8 j = strings.join(san_c, " ")
+        add(&c, txt(j))
+    add(&c, "--quiet")
+    if verbose():
+        note(txt(#format("  $ ", shown(c))))
+    Captured r = capture(c, false)
+    if !r.started || r.status != 0: return ""
+    ref []string8 ls = lines_of(txt(r.out))
+    if #len(ls) == 0: return ""
+    string8 dir = ls[#len(ls) - 1]
+    if !is_file(join2(dir, "libquickjs.a")): return ""
+    return dir
+
+private i32 build(^Plan p, ^Options o):
+    string8 cmd = o.cmd
+    // A web build compiles with clang for wasm32 (`web.dado`), so it asks
+    // for no native compiler and no sanitizer.
+    bool web = targets_web()
+    Compiler cc = no_compiler("")
+    ref []string8 san_c = #make([]string8, 0)
+    ref []string8 san_l = #make([]string8, 0)
+    bool sanitized = false
+    if !web:
+        cc = need_compiler(o.cc)
+        (ref []string8 sc, ref []string8 sl, bool son) = configure_sanitizers(cc, o.sanitize, o.sanitize_kind)
+        san_c = sc
+        san_l = sl
+        sanitized = son
+
+    // `-o` moves both artifacts: the C goes beside the program, named for
+    // the package.
+    string8 c_file = ""
+    string8 out = o.out
+    if o.out_given:
+        c_file = join2(dir_of(o.out), txt(#format(p.name, ".c")))
+    else:
+        c_file = txt(#format(p.build_dir, "/", p.stem, ".c"))
+        out = txt(#format(p.build_dir, "/", p.stem))
+    _ = fs.make_dirs(dir_of(c_file), #default)
+
+    say(txt(#format("dadoc  ", o.pkg)))
+    // The transpile's own order: `--release` before the shader, the
+    // defines and the strip flags.
+    Command t = command(p.dadoc)
+    add(&t, txt(#format("--collections=", p.collections)))
+    if #len(p.target_flag) > 0: add(&t, p.target_flag)
+    if o.web_threads: add(&t, "--web-threads")
+    if o.release: add(&t, "--release")
+    if #len(o.shader) > 0: add(&t, txt(#format("--shader=", o.shader)))
+    add_all(&t, o.defines[:])
+    add_all(&t, o.strip[:])
+    if o.strict: add(&t, "--strict")
+    if #len(g_html_flag) > 0: add(&t, g_html_flag)
+    if o.line_directives: add(&t, "--line-directives")
+    add_all(&t, p.prefix_map[:])
+    // On the web, the scripts' directory beside the module, emptied first,
+    // and this compile's manifest, which alone lists the files it wrote.
+    string8 scripts_build = txt(#format(c_file, ".scripts.build"))
+    if web:
+        string8 scripts_dir = txt(#format(p.build_dir, "/", p.stem, ".scripts"))
+        if o.out_given:
+            scripts_dir = o.out
+            if strings.ends_with(scripts_dir, ".wasm"): scripts_dir = scripts_dir[0..<#len(scripts_dir) - 5]
+            scripts_dir = txt(#format(scripts_dir, ".scripts"))
+        remove_tree_quietly(scripts_dir)
+        add(&t, txt(#format("--scripts-out=", scripts_dir)))
+        add(&t, txt(#format("--build-manifest=", scripts_build)))
+    string8 tmp_c = txt(#format(c_file, ".tmp"))
+    add(&t, "-o")
+    add(&t, tmp_c)
+    add(&t, p.pkg_abs)
+    if run(t) != 0:
+        if exists(tmp_c):
+            remove_quietly(tmp_c)
+        die("transpiling failed. Nothing was written.")
+    try fs.rename(tmp_c, c_file) else code:
+        die(txt(#format("cannot move ", tmp_c, " to ", c_file, ": ", os.message(code))))
+        return 1
+    note(txt(#format("       -> ", c_file)))
+
+    // What the program needs beyond its own C, from the compiler.
+    Command mc = dadoc_command(p, o, true, true)
+    add(&mc, "--emit=build")
+    add(&mc, p.pkg_abs)
+    Captured mr = capture(mc, false)
+    string8 manifest_text = ""
+    if mr.started && mr.status == 0: manifest_text = txt(mr.out)
+    if web:
+        strings.Builder joined = strings.builder(#len(manifest_text) + 256)
+        _ = strings.append(&joined, strings.trim_right(manifest_text))
+        string8 st = read_or_empty(scripts_build)
+        remove_quietly(scripts_build)
+        for l in lines_of(st):
+            if strings.starts_with(l, "js-module "):
+                _ = strings.append_char(&joined, '\n')
+                _ = strings.append(&joined, l)
+        manifest_text = txt(strings.finish(&joined))
+    (Manifest m, bool mok, string8 why) = parse_manifest(manifest_text)
+    if !mok: die(why)
+
+    ref []string8 includes = #make([]string8, 0)
+    for inc in m.includes:
+        _ = #append(includes, txt(#format("-I", inc)))
+    ref []string8 libs = #make([]string8, 0)
+    for l in o.libs:
+        _ = #append(libs, l)
+    for l in m.links:
+        _ = #append(libs, l)
+
+    if #len(m.engine) > 0: engine_refusals(m.engine, m.os)
+    if #len(m.engine) > 0 && m.os != "#WEB":
+        string8 engine_dir = engine_archive(cc, p.target_flag, san_c[:])
+        if #len(engine_dir) == 0:
+            die(txt(#format("the DadoScript engine did not build, and this program runs scripts.\n  tools/quickjs/build.sh --cc ", cc.name, " builds it and says why it did not.")))
+        note(txt(#format("       + engine: ", engine_dir)))
+        _ = #append(includes, txt(#format("-I", engine_dir)))
+        _ = #append(libs, join2(engine_dir, "libquickjs.a"))
+        _ = #append(libs, "-lm")
+
+    if m.os == "#WEB":
+        return web_build(p, o, &m, manifest_text, c_file, g_html_flag)
+
+    string8 brew = brew_prefix()
+    if #len(brew) > 0 && is_dir(join2(brew, "include")):
+        _ = #append(includes, txt(#format("-I", join2(brew, "include"))))
+    (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+    for w in words_of(user_cflags):
+        _ = #append(includes, w)
+    ref []string8 all_libs = #make([]string8, 0)
+    if #len(brew) > 0 && is_dir(join2(brew, "lib")):
+        _ = #append(all_libs, txt(#format("-L", join2(brew, "lib"))))
+    for l in libs:
+        _ = #append(all_libs, l)
+
+    if #len(m.sources) > 0:
+        ref []char8 listed_c = strings.join(m.sources[:], " ")
+        note(txt(#format("       + C: ", txt(listed_c))))
+
+    Link k = new_link()
+    k.cc = command_of(cc.words[:]).words
+    k.base = words_of(setting("CFLAGS_BASE"))
+    k.interop = words_of(setting("CFLAGS_INTEROP"))
+    if o.werror: k.werror = words_of(setting("CFLAGS_WERROR"))
+    if o.debug:
+        k.opt = words_of("-g -O0")
+    else:
+        k.opt = words_of("-O2")
+    k.extra = m.flags
+    k.san_c = san_c
+    k.includes = includes
+    k.c_file = c_file
+    k.sources = m.sources
+    k.out = out
+    k.libs = all_libs
+    k.exports = export_flags(m.os, m.exports[:], cc.zig)
+    k.san_l = san_l
+    (string8 user_ldflags, bool _) = env("DADO_LDFLAGS")
+    k.ldflags = words_of(user_ldflags)
+
+    Failure f
+    f.cc = cc
+    f.cmd = cmd
+    f.pkg = o.pkg
+    f.c_file = c_file
+    f.headers = m.headers
+    f.sources = m.sources
+    f.extra = m.flags
+    f.includes = includes
+
+    // A freestanding target: compile, and stop at the object file.
+    if m.os == "#NONE" && !o.link:
+        if cmd != "build":
+            die(txt(#format("`dado ", cmd, "` cannot run a freestanding build.\n\n  The resolved target's `#OS` is `#NONE`, which is the assertion that there\n  is no operating system and no libc here — so there is no process for this\n  machine to start. A freestanding implementation's entry point is\n  implementation-defined (C99 §5.1.2.1) and this driver has none to supply.\n\n  The generated C is at\n    ", c_file, "\n  `dado build ", o.pkg, "` compiles it and stops at the object file, which is the\n  thing to hand your own linker. `--link` links it here anyway, with your own\n  DADO_LDFLAGS — a linker script and an entry point are then yours to pass.")))
+        if !o.out_given: out = txt(#format(p.build_dir, "/", p.stem, ".o"))
+        say(txt(#format("cc     ", cc.name, " (freestanding: compile only)")))
+        strings.Builder objects = strings.builder(128)
+        ref []string8 units = #make([]string8, 0)
+        _ = #append(units, c_file)
+        for s in m.sources:
+            _ = #append(units, s)
+        for tu in units:
+            string8 obj = out
+            if tu != c_file:
+                string8 b = path.base(tu)
+                if strings.ends_with(b, ".c"): b = b[0..<#len(b) - 2]
+                obj = join2(dir_of(c_file), txt(#format(b, ".o")))
+            if run(object_command(&k, tu, obj)) != 0:
+                explain_cc_failure(&f)
+            note(txt(#format("       -> ", obj)))
+            _ = strings.append(&objects, " ")
+            _ = strings.append(&objects, obj)
+        if !o.keep_c: remove_quietly(c_file)
+        note("       not linked: a freestanding entry point is implementation-defined")
+        note("       (C99 §5.1.2.1). Link it with your own script, or pass --link.")
+        say_green("compiled", strings.text(objects))
+        return 0
+
+    if m.os == "#NONE":
+        k.freestanding = words_of("-ffreestanding")
+
+    say(txt(#format("cc     ", cc.name)))
+    if run(link_command(&k)) != 0:
+        explain_cc_failure(&f)
+    note(txt(#format("       -> ", out)))
+    if !o.keep_c: remove_quietly(c_file)
+
+    if cmd == "build":
+        say_green("built", txt(#format(" ", out)))
+        write_manifest_outputs(p, o)
+        return 0
+
+    // run
+    say(txt(#format("run    ", out)))
+    rule()
+    (string8 runner, bool _) = env("DADO_RUNNER")
+    ref []string8 runner_words = words_of(runner)
+    Command prog = command_of(runner_words[:])
+    add(&prog, out)
+    add_all(&prog, o.args[:])
+    default_sigpipe()
+    i32 status = run_quietly(prog)
+    rule()
+    if status == 0:
+        say_green(txt(#format("exit ", status)), "")
+    else:
+        say(txt(#format("exit ", status)))
+    _ = sanitized
+    return status
+
+// The text of the file at `p`, or "" when it cannot be read.
+string8 read_or_empty(string8 p):
+    try ref []char8 t = fs.read_file(p) else:
+        return ""
+    return txt(t)
+
+void remove_quietly(string8 p):
+    try fs.remove_file(p) else:
+        return

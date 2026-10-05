@@ -1,0 +1,122 @@
+@test
+// The ambient allocator is per thread.
+//
+// A `using` suite is a save, a store and a restore on the ambient, and until
+// the ambient was `_Thread_local` there was one of it per process. Two
+// consequences, each claimed here and each deterministic on the old emission
+// rather than a race that sometimes shows:
+//
+//   * **a spawned thread starts at the root**, not at its spawner's current
+//     `using` — before, a thread spawned inside a suite allocated out of the
+//     spawner's allocator (counted: 2 calls where 0 are wanted);
+//   * **two overlapping suites on two threads each restore their own** —
+//     before, the first to close wrote the root back under the second, the
+//     second allocated from the root, and its close wrote the first's
+//     allocator back as the process's ambient, so the next top-level `#make`
+//     went to an allocator whose suite had ended (counted: the second suite's
+//     allocator 0 calls where 2 are wanted, the first's more than its 2).
+//
+// The order of the second is forced by a step counter under `#SEQ_CST`, so
+// the interleaving is the same every run and the accesses are ordered — the
+// test fails on the old emission by its counts, under any sanitizer or none.
+// A counting allocator stands in for an arena: it forwards to C's heap and
+// counts every call it is handed, which is the question — *whose allocator
+// did this `#make` reach*. Each suite frees what it made before it closes, so a
+// `#delete` is counted too — two calls per suite — and the test is leak-clean
+// under LSan.
+package threads
+
+import "core:mem"
+import "core:mem/libc"
+
+private type I32Ptr: ^i32
+
+// One count per allocator: [0] the spawner's, [1] and [2] the two suites'.
+private [3]i32 g_counts
+
+// The overlapping pair's schedule: each thread waits for a step and takes one.
+private i32 g_step
+
+private rawptr counting(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    _ = #atomic_fetch_add(I32Ptr(data), 1, #SEQ_CST)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) h = libc.allocator()
+    return h.proc(h.data, mode, nbytes, align, old, old_size)
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) counter(i64 i):
+    return (counting, rawptr(&g_counts[i]))
+
+private i32 count(i64 i):
+    return #atomic_load(&g_counts[i], #SEQ_CST)
+
+// ── a spawned thread starts at the root ──────────────────────────────────────
+
+private rawptr bare_make(rawptr arg):
+    ref []i32 xs = #make([]i32, 16)
+    xs[0] = 7
+    #delete(xs)
+    return nil
+
+private bool spawned_thread_starts_at_the_root():
+    bool ok = true
+    using counter(0):
+        rawptr t = spawn(bare_make, nil)
+        ok = #expect(t != nil, "spawn") && ok
+        _ = join(t)
+    ok = #expect(count(0) == 0, "the spawned thread's #make reached the spawner's `using`: ", count(0), " calls") && ok
+    return ok
+
+// ── two overlapping suites restore their own ─────────────────────────────────
+
+private void wait_for(i32 step):
+    for #atomic_load(&g_step, #SEQ_CST) < step:
+        _ = #atomic_load(&g_step, #SEQ_CST)
+
+private void advance():
+    _ = #atomic_fetch_add(&g_step, 1, #SEQ_CST)
+
+// Opens first, closes first. It frees before it lets `second` open, so both of
+// its calls land while it is the only suite open anywhere.
+private rawptr first(rawptr arg):
+    using counter(1):
+        ref []i32 xs = #make([]i32, 4)
+        xs[0] = 1
+        #delete(xs)
+        advance()
+        wait_for(2)
+    advance()
+    return nil
+
+// Opens inside `first`'s suite and closes after it, allocating after `first`
+// has closed — the one moment a shared ambient held the root.
+private rawptr second(rawptr arg):
+    wait_for(1)
+    using counter(2):
+        advance()
+        wait_for(3)
+        ref []i32 xs = #make([]i32, 4)
+        xs[0] = 2
+        #delete(xs)
+    return nil
+
+private bool overlapping_suites_restore_their_own():
+    bool ok = true
+    rawptr a = spawn(first, nil)
+    rawptr b = spawn(second, nil)
+    ok = #expect(a != nil && b != nil, "spawn") && ok
+    _ = join(a)
+    _ = join(b)
+    // No suite is open on this thread, so this is the root's: C's heap, and
+    // neither thread's counter.
+    ref []i32 after = #make([]i32, 4)
+    after[0] = 3
+    #delete(after)
+    ok = #expect(count(1) == 2, "the first suite's allocator was handed ", count(1), " calls, want 2") && ok
+    ok = #expect(count(2) == 2, "the second suite's allocator was handed ", count(2), " calls, want 2") && ok
+    return ok
+
+i32 test():
+    bool ok = spawned_thread_starts_at_the_root()
+    ok = overlapping_suites_restore_their_own() && ok
+    if ok:
+        return 0
+    return 1

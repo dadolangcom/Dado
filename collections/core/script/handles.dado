@@ -1,0 +1,371 @@
+// core:script — the host's handles: what a Dado value of a script class's type
+// holds, and the table every one of them is checked against.
+//
+// **A handle is a number, never an address.** A host's `npc.Goblin` is eight
+// bytes, `{u32 slot, u32 gen}` — the slot's index in the low half, its
+// generation in the high — or, where an address is four bytes (wasm32, the
+// web), `{u16 slot, u16 gen}` (`pack`), into one table shared by every engine and every
+// thread of the process. A slot holds Dado's counted reference to one instance
+// (none, for the handle `#script_vm` answered, which is the VM's own), the
+// engine — the VM — the instance lives in, whether the handle is the VM's
+// own, and the VM's failure policy. Every use of a handle reads
+// its slot under the table's lock and goes on only when the slot is live and
+// its generation is the handle's.
+//
+// **Freeing a slot bumps its generation**, so every copy of the handle Dado
+// made — in a local, a field, a slice — reads as stale at once: `#delete` of an
+// instance's handle frees its slot, and the end of an engine's state (`#delete`
+// of its VM's handle) frees every slot on it. A stale handle fails `STALE`,
+// never reads freed memory, and never matches another instance: a slot is
+// reused only with a new generation, so a handle could meet a live slot it
+// does not name only after 2³² reuses of that one slot. The table is the
+// process's, not a thread's or an engine's, so a handle names one instance
+// wherever it is used — on another thread, or handed to a run of another
+// engine, where it is refused by name rather than read as something else.
+//
+// **One object, one handle.** An instance that crosses into Dado more than
+// once — answered by two runs, or handed to two calls of a Dado function —
+// crosses as the same handle: the slot's number is kept on the object, in a
+// property no script names (`$h`), and read back before a new slot is made.
+// So `==` on two Dado handles is identity, as it is on two script references,
+// and `#delete` of one is `#delete` of every copy. Dado's hold is one counted
+// reference however often the instance crossed; the script's own references
+// are untouched by it, and the instance lives while either holds it.
+//
+// **A stop releases the values, not the handles.** `#script_stop` ends an
+// engine's heap while its state stays for `#delete`: the values the handles
+// hold are released with the heap, and the slots stay, so a run through one
+// answers `STOPPED`; `#delete` of the VM's handle then frees the state and
+// every slot with it.
+package script
+
+import "core:mem"
+import "core:threads"
+
+// One handle's slot. A free slot is on the free list, by `next`.
+type Slot:
+    u32 gen,
+    bool live,
+    bool owner,
+    i32 on_error,
+    i64 next,
+    Engine engine,
+    JSValue value,
+    // The instance's class as Dado typed it where it crossed — a program's
+    // constant — which a failure's last line names.
+    cstring class,
+    // A free slot's last engine, while that engine lives: what a call
+    // through a handle `#delete` ended finds the VM's error sink by
+    // (`slot_was_err`). Nil for a slot never freed, and once the engine's
+    // state ends.
+    Engine was,
+
+// How many slots a chunk holds, and how many chunks the table may grow to: a
+// chunk is made the first time a slot in it is, and never moves, so a slot's
+// address is good while the lock is held. 65 535 handles at once, slot 0
+// never used, so a handle of all zero bits is none.
+private const i64 CHUNK = 1024
+private const i64 CHUNKS = 64
+
+// Each chunk is `CHUNK` slots of raw memory, reached by address: an array
+// type of a thousand `Slot`s costs the compiler more than it is worth.
+private [CHUNKS]rawptr g_chunks
+// Slots below this have been handed out at least once; slot 0 never is.
+private i64 g_used = 1
+// The first free slot, 0 for none.
+private i64 g_free
+// The table's lock, made by the first thread that needs it.
+private rawptr g_table_mutex
+
+// The property an instance keeps its handle's number in, for one object to
+// cross as one handle: no script names it, since `$` is no identifier
+// character in a script.
+private const string8 MARK = "$h"
+
+// ── The lock ────────────────────────────────────────────────────────────────
+
+private void table_lock():
+    rawptr m = #atomic_load(&g_table_mutex, #ACQUIRE)
+    if m == nil:
+        rawptr made = threads.mutex_new()
+        (rawptr was, bool swapped) = #atomic_compare_exchange(&g_table_mutex, nil, made, false, #ACQ_REL, #ACQUIRE)
+        if swapped:
+            m = made
+        else:
+            threads.mutex_free(made)
+            m = was
+    threads.lock(m)
+
+private void table_unlock():
+    threads.unlock(#atomic_load(&g_table_mutex, #ACQUIRE))
+
+// ── Slots, under the lock ───────────────────────────────────────────────────
+
+// A handle's bits as the `rawptr` the verbs pass a handle as, and back: the
+// eight bytes of a Dado handle, which are never an address.
+private rawptr as_handle(u64 bits):
+    return rawptr(#c.uintptr_t(bits))
+
+private u64 bits_of(rawptr s):
+    return u64(#c.uintptr_t(s))
+
+// A handle's bits from a slot's index and generation, and back. A `rawptr`
+// of four bytes holds sixteen bits of each: the table never holds more than
+// 65 535 slots, and a generation then wraps after 65 535 reuses of one slot
+// rather than 2³² − 1.
+private bool narrow():
+    return #size(rawptr) == 4
+
+private u64 pack(i64 i, u32 gen):
+    if narrow():
+        return u64(i) | (u64(gen) << 16)
+    return u64(i) | (u64(gen) << 32)
+
+private i64 index_of(u64 bits):
+    if narrow():
+        return i64(bits & 0xFFFF)
+    return i64(bits & 0xFFFFFFFF)
+
+private u32 gen_of(u64 bits):
+    if narrow():
+        return u32((bits >> 16) & 0xFFFF)
+    return u32(bits >> 32)
+
+// The last generation a slot has before it wraps to 1.
+private u32 last_gen():
+    if narrow():
+        return 0xFFFF
+    return 0xFFFFFFFF
+
+private ^Slot slot_at(i64 i):
+    rawptr c = g_chunks[i / CHUNK]
+    return ^Slot(rawptr(#c.uintptr_t(c) + #c.uintptr_t(i % CHUNK) * #c.uintptr_t(#size(Slot))))
+
+// The slot `bits` names while it is live and its generation is the handle's;
+// 0 otherwise.
+private i64 live_index(u64 bits):
+    i64 i = index_of(bits)
+    u32 gen = gen_of(bits)
+    if i <= 0 || i >= g_used:
+        return 0
+    ^Slot at = slot_at(i)
+    if !at^.live || at^.gen != gen:
+        return 0
+    return i
+
+// A slot let go of: its generation moves on, so every copy of its handle is
+// stale from here, and it goes on the free list.
+private void slot_free(i64 i):
+    ^Slot at = slot_at(i)
+    at^.live = false
+    at^.owner = false
+    at^.was = at^.engine
+    at^.engine = nil
+    at^.value = undefined()
+    at^.class = nil
+    if at^.gen >= last_gen():
+        at^.gen = 1
+    else:
+        at^.gen += 1
+    at^.next = g_free
+    g_free = i
+
+// A free slot, made live; 0 when the table is full or a chunk could not be
+// made.
+private i64 slot_claim():
+    if g_free > 0:
+        i64 i = g_free
+        g_free = slot_at(i)^.next
+        return i
+    if g_used >= CHUNK * CHUNKS:
+        return 0
+    i64 c = g_used / CHUNK
+    if g_chunks[c] == nil:
+        (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = #heap
+        rawptr p = a.proc(a.data, mem.AllocatorMode.Alloc, u64(CHUNK) * #size(Slot), mem.MAX_ALIGN, nil, 0)
+        if p == nil:
+            return 0
+        g_chunks[c] = p
+    i64 i = g_used
+    g_used += 1
+    return i
+
+// ── What the rest of the package asks ───────────────────────────────────────
+
+// A new handle on `e` holding `value`, which it takes: the engine's own when
+// `owner` says so. Nil when the table is full, having said so and released
+// the value.
+private rawptr slot_new(Engine e, JSValue value, bool owner, cstring class):
+    table_lock()
+    i64 i = slot_claim()
+    if i == 0:
+        table_unlock()
+        JS_FreeValue(e^.ctx, value)
+        say(e, "script: more than 65535 handles held at once, or no memory for the handle table")
+        return nil
+    ^Slot at = slot_at(i)
+    if at^.gen == 0:
+        at^.gen = 1
+    at^.live = true
+    at^.owner = owner
+    at^.on_error = e^.on_error
+    at^.engine = e
+    at^.was = nil
+    at^.value = value
+    at^.class = class
+    u64 bits = pack(i, at^.gen)
+    table_unlock()
+    return as_handle(bits)
+
+// A copy of the slot `s` names, and whether it is live: a nil or stale handle
+// answers false.
+private bool slot_read(rawptr s, ^Slot out):
+    if s == nil:
+        return false
+    table_lock()
+    i64 i = live_index(bits_of(s))
+    if i != 0:
+        out^ = slot_at(i)^
+    table_unlock()
+    return i != 0
+
+// Dado's hold on `s` let go of: the slot as it was, and whether it was live.
+// Every copy of `s` is stale from here.
+private bool slot_take(rawptr s, ^Slot out):
+    if s == nil:
+        return false
+    table_lock()
+    i64 i = live_index(bits_of(s))
+    if i != 0:
+        out^ = slot_at(i)^
+        slot_free(i)
+    table_unlock()
+    return i != 0
+
+// `e`'s heap is ending: every value a handle on it holds is released now,
+// while its runtime is still there. The handles stay live, and a run through
+// one answers `STOPPED`; `slots_drop` ends them with the engine's state.
+private void slots_release(Engine e):
+    table_lock()
+    for i in 1..<g_used:
+        ^Slot at = slot_at(i)
+        if at^.live && at^.engine == e:
+            JS_FreeValue(e^.ctx, at^.value)
+            at^.value = undefined()
+    table_unlock()
+
+// `e`'s state is ending: every handle on it is stale from here, and no free
+// slot names it any more.
+private void slots_drop(Engine e):
+    table_lock()
+    for i in 1..<g_used:
+        ^Slot at = slot_at(i)
+        if at^.live && at^.engine == e:
+            slot_free(i)
+        if at^.was == e:
+            at^.was = nil
+    table_unlock()
+
+// Whether `s` is a handle whose slot `#delete` let go of — the slot free, its
+// generation the next after the handle's — while the engine it was on lives;
+// if so, that engine's error sink, or the one a `using err:` scope put in
+// force, into `out`. Read under the table's lock, which the engine's end
+// takes before its state goes.
+private bool slot_was_err(rawptr s, ^Sink out):
+    if s == nil:
+        return false
+    u64 bits = bits_of(s)
+    i64 i = index_of(bits)
+    u32 gen = gen_of(bits)
+    u32 next = gen + 1
+    if gen >= last_gen():
+        next = 1
+    bool found = false
+    table_lock()
+    if i > 0 && i < g_used:
+        ^Slot at = slot_at(i)
+        if !at^.live && at^.was != nil && at^.gen == next:
+            out^ = err_of(at^.was)
+            found = true
+    table_unlock()
+    return found
+
+// The first instance a live handle on `e` holds at a slot from `from` on, as
+// a counted reference the caller now owns, and the slot after it to go on
+// from; `next` 0 when there is none. A reload walks the instances Dado holds
+// with it (`reload.dado`): one slot under the lock at a time, so the engine is
+// called into — the walk's array grown — with the table's lock not held. A
+// handle with no instance (a VM's own handle
+// arguments, or one whose engine was stopped) is passed over.
+private (JSValue value, i64 next) slot_held_from(Engine e, i64 from):
+    table_lock()
+    i64 i = from
+    if i < 1:
+        i = 1
+    for i < g_used:
+        ^Slot at = slot_at(i)
+        if at^.live && at^.engine == e && i32(at^.value.tag) == JS_TAG_OBJECT:
+            JSValue v = JS_DupValue(e^.ctx, at^.value)
+            table_unlock()
+            return (v, i + 1)
+        i += 1
+    table_unlock()
+    return (undefined(), 0)
+
+// How many handles are live, on every engine: what a test reads.
+i64 live_handles():
+    table_lock()
+    i64 n = 0
+    for i in 1..<g_used:
+        if slot_at(i)^.live:
+            n += 1
+    table_unlock()
+    return n
+
+// ── One object, one handle ──────────────────────────────────────────────────
+
+// The handle Dado holds the instance `v` of `e` by, borrowing `v` — `class`
+// what Dado types it as: the one its mark names while that is live and holds this very object, or a new one,
+// which takes a counted reference and is written into the mark. Nil when the
+// table is full, having said so.
+private rawptr adopt(Engine e, JSValue v, cstring class):
+    JSValue mark = JS_GetPropertyStr(e^.ctx, v, cstring(rawptr(MARK)))
+    forget_exception(e, mark)
+    i32 tag = i32(mark.tag)
+    if tag == JS_TAG_FLOAT64 || tag == JS_TAG_INT:
+        f64 d = mark.u.float64
+        if tag == JS_TAG_INT:
+            d = f64(mark.u.int32)
+        if d >= 0.0 && d < 281474976710656.0:
+            i64 n = i64(d)
+            u64 bits = pack(n % 65536, u32(n / 65536))
+            Slot at
+            if slot_read(as_handle(bits), &at) && at.engine == e && at.value.u.ptr == v.u.ptr:
+                return as_handle(bits)
+    JS_FreeValue(e^.ctx, mark)
+    rawptr s = slot_new(e, JS_DupValue(e^.ctx, v), false, class)
+    if s != nil:
+        mark_object(e, v, s)
+    return s
+
+// `v`'s mark written: the handle's number, `gen × 65536 + slot`, exact in a
+// double. Not enumerable, so nothing a script walks meets it.
+private void mark_object(Engine e, JSValue v, rawptr s):
+    u64 bits = bits_of(s)
+    f64 number = f64(gen_of(bits)) * 65536.0 + f64(index_of(bits))
+    i32 flags = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
+    if JS_DefinePropertyValueStr(e^.ctx, v, cstring(rawptr(MARK)), JS_NewFloat64(e^.ctx, number), flags) < 0:
+        // A frozen object keeps no mark: it crosses as a new handle each
+        // time, and `==` on two of them is false.
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+
+// The value engine `e` holds at `h` moved into a new handle of an instance
+// of `class`, marked; nil when the table is full.
+private rawptr hold_object(Engine e, Handle h, cstring class):
+    JSValue v = e^.handles[h]
+    e^.handles[h] = undefined()
+    rawptr s = slot_new(e, v, false, class)
+    if s != nil:
+        mark_object(e, v, s)
+    return s

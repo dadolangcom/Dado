@@ -1,0 +1,421 @@
+// `dado doctor`: whether this toolchain works here, one check at a time, and
+// what to do about each one that does not.
+//
+//     dado doctor                      a line per check, its repair under it
+//     dado doctor --format=json        the same checks, for a program
+//
+// Each check has a `name`, a `status` (`ok`, `warn`, `fail` or `note`), a
+// `detail` and a `repair`, which is empty when there is nothing to do. A
+// `fail` is something builds need and do not have; a `warn` is something
+// that works less well than it should (an editor without diagnostics, the
+// script engine to build on first use); a `note` is information, including
+// what only the web needs. The exit status is 1 when anything fails, else 0.
+//
+// The JSON is one object, `{"layout": ..., "root": ..., "checks": [...]}`,
+// each check an object of the four strings above, in the order they ran.
+// The names are stable: `dadoc`, `dado-lsp`, `zig`, `zig-archive`,
+// `collections`, `dadoc-min`, `hello`, `quickjs`, `git`, `curl`, `node`,
+// `clang`, `wasm-ld`, then one per editor found (`editors.dado`): `vscode`,
+// `vscode-insiders`, `vscodium`, `cursor`, `windsurf`, `claude-code`, `zed`,
+// `neovim`, `helix`, `emacs`; `vscode` alone, as a note, when none is.
+package driver
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+// One check's answer.
+type Check:
+    string8 name
+    string8 status
+    string8 detail
+    string8 repair
+
+private Check check_of(string8 name, string8 status, string8 detail, string8 repair):
+    Check c
+    c.name = name
+    c.status = status
+    c.detail = detail
+    c.repair = repair
+    return c
+
+// ── versions ────────────────────────────────────────────────────────────────
+
+// The version a `--version` first line names: its second word,
+// `1.0.0-dev+2d3720de7bb9` of `dadoc 1.0.0-dev+2d3720de7bb9`.
+string8 version_word(string8 line):
+    (string8 _, string8 after, bool _) = strings.field(line)
+    (string8 v, string8 _, bool _) = strings.field(after)
+    return v
+
+// A semantic version's parts: `major.minor.patch`, the prerelease after `-`
+// and the build metadata after `+` dropped. `ok` false when it is not one.
+(i64 major, i64 minor, i64 patch, string8 pre, bool ok) version_parts(string8 v):
+    (string8 core_pre, string8 _, bool _) = strings.split_first(strings.trim(v), "+")
+    (string8 nums, string8 pre, bool _) = strings.split_first(core_pre, "-")
+    (string8 a, string8 r1, bool d1) = strings.split_first(nums, ".")
+    (string8 b, string8 c, bool d2) = strings.split_first(r1, ".")
+    if !d1 || !d2: return (0, 0, 0, "", false)
+    (i64 x, bool okx) = whole(a)
+    (i64 y, bool oky) = whole(b)
+    (i64 z, bool okz) = whole(c)
+    if !okx || !oky || !okz: return (0, 0, 0, "", false)
+    return (x, y, z, pre, true)
+
+private (i64 n, bool ok) whole(string8 s):
+    if #len(s) == 0 || #len(s) > 18: return (0, false)
+    i64 n = 0
+    for ch in s:
+        if ch < '0' || ch > '9': return (0, false)
+        n = n * 10 + i64(ch - '0')
+    return (n, true)
+
+// `a` against `b` as semantic versions: -1 when `a` is older, 1 when newer,
+// 0 when they are the same version (build metadata is not compared). A
+// prerelease is older than its release; two prereleases compare by their
+// dot-separated parts, numbers as numbers and the rest as text. `ok` false
+// when either is not a version.
+(i32 order, bool ok) compare_versions(string8 a, string8 b):
+    (i64 a1, i64 a2, i64 a3, string8 ap, bool aok) = version_parts(a)
+    (i64 b1, i64 b2, i64 b3, string8 bp, bool bok) = version_parts(b)
+    if !aok || !bok: return (0, false)
+    if a1 != b1: return (-1 if a1 < b1 else 1, true)
+    if a2 != b2: return (-1 if a2 < b2 else 1, true)
+    if a3 != b3: return (-1 if a3 < b3 else 1, true)
+    if ap == bp: return (0, true)
+    if #len(ap) == 0: return (1, true)
+    if #len(bp) == 0: return (-1, true)
+    string8 ra = ap
+    string8 rb = bp
+    for:
+        (string8 x, string8 tx, bool mx) = strings.split_first(ra, ".")
+        (string8 y, string8 ty, bool my) = strings.split_first(rb, ".")
+        if x != y:
+            (i64 nx, bool numx) = whole(x)
+            (i64 ny, bool numy) = whole(y)
+            if numx && numy: return (-1 if nx < ny else 1, true)
+            if numx: return (-1, true)
+            if numy: return (1, true)
+            return (-1 if strings.before(x, y) else 1, true)
+        if !mx && !my: return (0, true)
+        if !mx: return (-1, true)
+        if !my: return (1, true)
+        ra = tx
+        rb = ty
+    return (0, true)
+
+// ── the report ──────────────────────────────────────────────────────────────
+
+// `s` as a JSON string, quotes included.
+string8 json_quote(string8 s):
+    strings.Builder b = strings.builder(#len(s) + 2)
+    _ = strings.append_char(&b, '"')
+    for c in s:
+        if c == '"':
+            _ = strings.append(&b, "\\\"")
+        else if c == '\\':
+            _ = strings.append(&b, "\\\\")
+        else if c == '\n':
+            _ = strings.append(&b, "\\n")
+        else if c == '\r':
+            _ = strings.append(&b, "\\r")
+        else if c == '\t':
+            _ = strings.append(&b, "\\t")
+        else if u8(c) < 0x20:
+            string8 digits = "0123456789abcdef"
+            _ = strings.append(&b, "\\u00")
+            _ = strings.append_char(&b, digits[i64(u8(c) >> 4)])
+            _ = strings.append_char(&b, digits[i64(u8(c) & 0xF)])
+        else:
+            _ = strings.append_char(&b, c)
+    _ = strings.append_char(&b, '"')
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// The report as JSON: the layout, the root and every check, one per line.
+string8 checks_json(string8 kind, string8 at, []Check checks):
+    strings.Builder b = strings.builder(1024)
+    _ = strings.append(&b, txt(#format("{\n  \"layout\": ", json_quote(kind), ",\n  \"root\": ", json_quote(at), ",\n  \"checks\": [")))
+    i64 i = 0
+    for c in checks:
+        _ = strings.append(&b, "\n    " if i == 0 else ",\n    ")
+        _ = strings.append(&b, txt(#format("{\"name\": ", json_quote(c.name), ", \"status\": ", json_quote(c.status), ", \"detail\": ", json_quote(c.detail), ", \"repair\": ", json_quote(c.repair), "}")))
+        i += 1
+    _ = strings.append(&b, "\n  ]\n}\n" if i > 0 else "]\n}\n")
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// The report as text: a line per check, `status  name  detail`, its repair
+// on the line under it, then the count of each status.
+string8 checks_text(string8 kind, string8 at, []Check checks):
+    strings.Builder b = strings.builder(1024)
+    _ = strings.append(&b, txt(#format("dado doctor: the ", kind, " at ", at, "\n\n")))
+    i64 width = 4
+    for c in checks:
+        if #len(c.name) > width: width = #len(c.name)
+    i64 ok = 0
+    i64 warns = 0
+    i64 fails = 0
+    i64 notes = 0
+    for c in checks:
+        if c.status == "ok": ok += 1
+        if c.status == "warn": warns += 1
+        if c.status == "fail": fails += 1
+        if c.status == "note": notes += 1
+        _ = strings.append(&b, txt(#format("  ", padded(c.status, 4), "  ", padded(c.name, width), "  ", c.detail, "\n")))
+        if #len(c.repair) > 0:
+            _ = strings.append(&b, txt(#format("  ", padded("", 4), "  ", padded("", width), "  -> ", c.repair, "\n")))
+    _ = strings.append(&b, txt(#format("\n", ok, " ok, ", warns, " to look at, ", fails, " failed, ", notes, " notes\n")))
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// The exit status a report earns: 1 when any check failed, else 0.
+i32 doctor_status([]Check checks):
+    for c in checks:
+        if c.status == "fail": return 1
+    return 0
+
+// ── the checks ──────────────────────────────────────────────────────────────
+
+// Every check, in order, then the report on standard output.
+i32 doctor(bool json):
+    ref []Check checks = #make([]Check, 0)
+    Layout l = layout()
+    bool install = l.kind == "install"
+
+    string8 dc = find_dadoc()
+    string8 dc_line = ""
+    _ = #append(checks, check_dadoc(dc, install, &dc_line))
+    _ = #append(checks, check_lsp(dc, dc_line, install))
+    (Check zig, Check archive) = check_zig(install)
+    _ = #append(checks, zig)
+    _ = #append(checks, archive)
+    (Check coll, Check min) = check_collections(dc_line, install)
+    _ = #append(checks, coll)
+    _ = #append(checks, min)
+    _ = #append(checks, check_hello(dc))
+    _ = #append(checks, check_quickjs())
+    _ = #append(checks, check_program("git", "git", "warn", "dado update fetches the collections with git", "install git (macOS: xcode-select --install; Debian or Ubuntu: apt install git; Windows: https://git-scm.com)"))
+    _ = #append(checks, check_program("curl", "curl", "warn", "dado upgrade downloads releases with curl", "install curl (Debian or Ubuntu: apt install curl; macOS and Windows 10+ ship it)"))
+    (string8 node, bool node_set) = env("DADO_NODE")
+    if !node_set: node = "node"
+    _ = #append(checks, check_program("node", node, "note", "only the web needs node: dado run and dado test with --target=web", "install node from https://nodejs.org, or name one with DADO_NODE=<path>"))
+    _ = #append(checks, check_clang())
+    (string8 wasm_ld, bool ld_set) = env("DADO_WASM_LD")
+    if !ld_set: wasm_ld = "wasm-ld"
+    _ = #append(checks, check_program("wasm-ld", wasm_ld, "note", "only a web build with --cc clang needs wasm-ld; the pinned zig links the web itself", "install lld (macOS: brew install lld; Debian or Ubuntu: apt install lld), or name one with DADO_WASM_LD=<path>"))
+    for e in editor_checks(install):
+        _ = #append(checks, e)
+
+    if json:
+        fmt.print(checks_json(l.kind, l.root, checks[:]))
+    else:
+        fmt.print(checks_text(l.kind, l.root, checks[:]))
+    _ = io.flush(io.stdout())
+    return doctor_status(checks[:])
+
+private string8 rebuild_toolchain(bool install):
+    if install:
+        return "reinstall the toolchain for this machine (download the release and run ./dadoc bootstrap)"
+    return "build it for this machine at the root of the checkout: ./dado_build.sh"
+
+private Check check_dadoc(string8 dc, bool install, ^string8 line_out):
+    if #len(dc) == 0:
+        (string8 over, bool set) = env("DADO_DADOC")
+        if set:
+            return check_of("dadoc", "fail", txt(#format("DADO_DADOC names a compiler that will not run here: ", over)), "unset DADO_DADOC to use the toolchain's own, or point it at a dadoc that runs")
+        ref []string8 candidates = dadoc_candidates()
+        ref []char8 looked = strings.join(candidates[:], ", ")
+        return check_of("dadoc", "fail", txt(#format("no dadoc that runs here; looked at ", txt(looked))), rebuild_toolchain(install))
+    Command c = command(dc)
+    add(&c, "--version")
+    string8 line = first_line(c, true)
+    line_out^ = line
+    return check_of("dadoc", "ok", txt(#format(line, " at ", dc)), "")
+
+private Check check_lsp(string8 dc, string8 dc_line, bool install):
+    string8 lsp = lsp_path()
+    string8 where_from = ""
+    (string8 _, bool over) = env("DADO_DADOC")
+    if !is_file(lsp) && over && #len(dc) > 0:
+        string8 beside = join2(dir_of(dc), exe_name("dado-lsp"))
+        if is_file(beside):
+            lsp = beside
+            where_from = " (beside DADO_DADOC's dadoc; editors are told the toolchain's own place, `dado where`'s lsp=)"
+    if !is_file(lsp):
+        return check_of("dado-lsp", "warn", txt(#format("not at ", lsp, ": editors get no diagnostics")), rebuild_toolchain(install))
+    Command c = command(lsp)
+    add(&c, "--version")
+    string8 line = first_line(c, true)
+    if #len(line) == 0:
+        return check_of("dado-lsp", "fail", txt(#format(lsp, " is there and does not run here: it was built for another system")), rebuild_toolchain(install))
+    if #len(dc_line) == 0:
+        return check_of("dado-lsp", "ok", txt(#format(line, " at ", lsp, where_from, "; no dadoc to compare it with")), "")
+    if version_word(line) != version_word(dc_line):
+        string8 status = "fail" if install else "warn"
+        return check_of("dado-lsp", status, txt(#format(lsp, " is ", version_word(line), " and dadoc is ", version_word(dc_line), ": an editor's diagnostics and a build can disagree")), rebuild_toolchain(install))
+    return check_of("dado-lsp", "ok", txt(#format(line, " at ", lsp, where_from, ", the same build as dadoc")), "")
+
+// The first line of `why` as a check's detail, the rest as its repair.
+private (string8 detail, string8 repair) split_message(string8 why):
+    ref []string8 ls = lines_of(why)
+    if #len(ls) == 0: return ("", "")
+    ref []string8 rest = #make([]string8, 0)
+    for i in 1..<#len(ls):
+        _ = #append(rest, ls[i])
+    ref []char8 j = strings.join(rest[:], " ")
+    return (ls[0], txt(j))
+
+private (Check zig, Check archive) check_zig(bool install):
+    Compiler cc = compiler("", true)
+    Check archive = check_of("zig-archive", "note", "zig on PATH is your own: the toolchain downloads and verifies one only in an install", "")
+    if install:
+        archive = check_of("zig-archive", "note", "dadoc bootstrap checked the zig archive's size and SHA-256 against ZIG_PIN when it downloaded it, or linked a zig on PATH that says it is the pinned version", "")
+    if !cc.found:
+        (string8 detail, string8 repair) = split_message(cc.why)
+        return (check_of("zig", "fail", detail, repair), archive)
+    string8 v = ""
+    for l in lines_of(read_or_empty(join2(root(), "ZIG_PIN"))):
+        (string8 key, string8 value, bool _) = strings.field(l)
+        if key == "version": v = strings.trim(value)
+    return (check_of("zig", "ok", txt(#format("zig ", v, " (ZIG_PIN) at ", cc.words[0], ": the default C compiler")), ""), archive)
+
+private (Check coll, Check min) check_collections(string8 dc_line, bool install):
+    string8 coll = collections()
+    Check c = check_of("collections", "ok", txt(#format(coll)), "")
+    if !is_dir(join2(coll, "core")):
+        (string8 _, bool set) = env("DADO_COLLECTIONS")
+        string8 repair = "restore the checkout: git checkout -- collections"
+        if set: repair = "DADO_COLLECTIONS is set: unset it, or point it at a directory holding core/"
+        else if install: repair = txt(#format("restore the install's checkout: git -C ", root(), " checkout -- collections"))
+        c = check_of("collections", "fail", txt(#format("no core/ under ", coll)), repair)
+    string8 min_path = join2(root(), "DADOC_MIN")
+    if !is_file(min_path):
+        if install:
+            return (c, check_of("dadoc-min", "note", txt(#format("no DADOC_MIN in ", root(), ": nothing to hold this dadoc against")), ""))
+        return (c, check_of("dadoc-min", "note", "a checkout of the repository: DADOC_MIN is written by a release, and there is none here", ""))
+    string8 min = ""
+    for l in lines_of(read_or_empty(min_path)):
+        if l[0] != '#':
+            min = l
+            break
+    if #len(dc_line) == 0:
+        return (c, check_of("dadoc-min", "note", txt(#format("the collections need dadoc ", min, " or newer; there is no dadoc to compare")), ""))
+    string8 have = version_word(dc_line)
+    (i32 order, bool ok) = compare_versions(have, min)
+    if !ok:
+        return (c, check_of("dadoc-min", "warn", txt(#format("cannot compare dadoc ", have, " with DADOC_MIN's ", min)), txt(#format("DADOC_MIN holds one version, major.minor.patch: restore ", min_path))))
+    if order < 0:
+        return (c, check_of("dadoc-min", "fail", txt(#format("the collections need dadoc ", min, " or newer, and this one is ", have)), "dado upgrade"))
+    return (c, check_of("dadoc-min", "ok", txt(#format("dadoc ", have, " is at least ", min, ", the oldest the collections work with")), ""))
+
+private const string8 HELLO = "package hello\n\nimport \"core:fmt\"\n\ni32 main():\n    fmt.println(\"hello from dado doctor\")\n    return 0\n"
+
+private Check check_hello(string8 dc):
+    if #len(dc) == 0:
+        return check_of("hello", "fail", "not tried: there is no dadoc", "fix the dadoc check first")
+    try ref []char8 made = fs.make_temp_dir("dado-doctor") else code:
+        return check_of("hello", "fail", txt(#format("no temporary directory to build in: ", os.message(code))), "set TMPDIR to a directory you can write")
+    string8 tmp = txt(made)
+    string8 pkg = join2(tmp, "hello")
+    string8 bin = join2(tmp, exe_name("hello-program"))
+    _ = fs.make_dirs(pkg, #default)
+    try fs.write_file(join2(pkg, "main.dado"), HELLO) else code:
+        return check_of("hello", "fail", txt(#format("cannot write ", pkg, ": ", os.message(code))), "set TMPDIR to a directory you can write")
+    Command b = command(executable())
+    add(&b, "build")
+    add(&b, pkg)
+    add(&b, "-o")
+    add(&b, bin)
+    Captured r = capture_merged(b)
+    if !r.started || r.status != 0:
+        return check_of("hello", "fail", txt(#format("a hello-world program did not build: ", last_lines(txt(r.out), 3))), txt(#format("dado build ", pkg, " shows the whole output (the program is kept there)")))
+    (string8 runner, bool _) = env("DADO_RUNNER")
+    ref []string8 rw = words_of(runner)
+    Command p = command_of(rw[:])
+    add(&p, bin)
+    Captured ran = capture_merged(p)
+    string8 said = strings.trim(txt(ran.out))
+    if !ran.started || ran.status != 0 || said != "hello from dado doctor":
+        return check_of("hello", "fail", txt(#format("a hello-world program built and did not run right (exit ", ran.status, ", said `", said, "`)")), txt(#format("run ", bin, " to see it (the program is kept there)")))
+    try fs.remove_all(tmp) else:
+        return check_of("hello", "ok", txt(#format("a hello-world program built and ran (", tmp, " could not be removed)")), "")
+    return check_of("hello", "ok", "a hello-world program built with this driver and ran", "")
+
+// The last `n` lines of `text`, joined with ` / `.
+string8 last_lines(string8 text, i64 n):
+    ref []string8 ls = lines_of(text)
+    i64 from = #len(ls) - n
+    if from < 0: from = 0
+    ref []string8 tail = #make([]string8, 0)
+    for i in from..<#len(ls):
+        _ = #append(tail, ls[i])
+    ref []char8 j = strings.join(tail[:], " / ")
+    return txt(j)
+
+private Check check_quickjs():
+    when #OS == #WINDOWS:
+        return check_of("quickjs", "note", "the script engine's build script is POSIX shell, which this system does not run; programs that run DadoScript cannot be built here yet", "")
+    else:
+        string8 script = join3(root(), "tools", join2("quickjs", "build.sh"))
+        if !is_file(script):
+            return check_of("quickjs", "warn", txt(#format("no engine build script at ", script)), "restore tools/quickjs from the repository")
+        // The engine a build links is built with that build's compiler, the
+        // pinned zig by default (its words, one argument, as the script takes
+        // them); without one, clang or gcc, which a build would need `--cc` for.
+        string8 cc = "clang"
+        string8 cc_name = "clang"
+        Compiler zig = compiler("", true)
+        if zig.found:
+            ref []char8 words = strings.join(zig.words[:], " ")
+            cc = txt(words)
+            cc_name = "the pinned zig"
+        string8 clang = on_path("clang")
+        string8 gcc = on_path("gcc")
+        if !zig.found && #len(clang) == 0:
+            cc = "gcc"
+            cc_name = "gcc"
+            if #len(gcc) == 0:
+                return check_of("quickjs", "warn", "no zig, clang or gcc: programs that run DadoScript build their engine with one", "install clang (macOS: xcode-select --install; Debian or Ubuntu: apt install clang)")
+        Command c = command(script)
+        add(&c, "--cc")
+        add(&c, cc)
+        add(&c, "--print-key")
+        Captured r = capture(c, true)
+        ref []string8 ls = lines_of(txt(r.out))
+        string8 build_it = txt(#format(script, " --cc '", cc, "'"))
+        if !r.started || r.status != 0 || #len(ls) == 0:
+            return check_of("quickjs", "warn", "the engine's build script did not say where its archive goes", txt(#format(build_it, " says why")))
+        string8 dir = ls[#len(ls) - 1]
+        if !is_file(join2(dir, "libquickjs.a")):
+            return check_of("quickjs", "warn", txt(#format("the script engine is not built for this host with ", cc_name, ": the first program that runs DadoScript builds it (20 to 55 s)")), txt(#format("build it now: ", build_it)))
+        return check_of("quickjs", "ok", txt(#format("the script engine is built for this host with ", cc_name, " at ", dir)), "")
+
+// A program the toolchain uses but builds do not: found and its version, or
+// `missing` (a status) with why it matters and how to get it.
+private Check check_program(string8 name, string8 program, string8 missing, string8 why, string8 repair):
+    string8 p = on_path(program)
+    if #len(p) == 0:
+        return check_of(name, missing, txt(#format(program, " is not on PATH: ", why)), repair)
+    Command c = command(p)
+    add(&c, "--version")
+    string8 v = first_line(c, true)
+    if #len(v) == 0:
+        return check_of(name, missing, txt(#format(p, " is there and `--version` does not run: ", why)), repair)
+    return check_of(name, "ok", txt(#format(v, " at ", p)), "")
+
+private Check check_clang():
+    string8 p = on_path("clang")
+    string8 repair = "install clang with the wasm32 target (macOS: brew install llvm, since Apple's has none; Debian or Ubuntu: apt install clang)"
+    if #len(p) == 0:
+        return check_of("clang", "note", "clang is not on PATH: nothing needs it by default (the pinned zig builds the web too); --target=web --cc clang would", repair)
+    Command t = command(p)
+    add(&t, "--print-targets")
+    Captured r = capture(t, true)
+    if !strings.contains(txt(r.out), "wasm32"):
+        return check_of("clang", "note", txt(#format(p, " has no wasm32 target: only --target=web --cc clang needs one")), repair)
+    Command v = command(p)
+    add(&v, "--version")
+    return check_of("clang", "ok", txt(#format(first_line(v, true), " at ", p, ", with the wasm32 target")), "")

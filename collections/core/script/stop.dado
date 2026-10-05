@@ -1,0 +1,392 @@
+// core:script — stopping, pausing and asking after a running script: what
+// `#script_stop(vm, timeout)`, `#script_pause(vm)`, `#script_resume(vm)`,
+// `#script_is_running(vm)` and `#script_is_paused(vm)` lower to, and the
+// engine's interrupt hook beneath them.
+//
+// **The engine word.** Every engine holds one atomic `u32`, `Stopper.word`,
+// with a bit each for ASK (stop, politely), STOP (stop, now), PAUSE and
+// RELOADING (new code waiting for the run in progress to leave, `reload.dado`). `create` installs `interrupt` as the
+// engine's interrupt hook once, and QuickJS-ng calls it at back-edges and
+// calls every 10,000 polls whether a hook is installed or not, so the hook
+// costs one relaxed load of the word and an answer of 0 while the word is 0.
+//
+// **Two phases.** `#script_stop(vm, timeout)` sets ASK. The hook, at the
+// running script's next poll, delivers it once as a DadoScript `Error` of code
+// `STOPPED`, thrown into the script by the fork's patch 0007
+// (`JS_INTERRUPT_RAISE`: a hook that has thrown an exception of its own has
+// it raised, catchable, where the engine would otherwise raise its
+// uncatchable "interrupted") — so the script's `defer`s run and a `try`
+// reaches it. A run that leaves the engine within `timeout` milliseconds has
+// stopped politely. One that has not — a script that caught the `Error` and
+// went on — is forced: STOP makes the hook answer 1, and the engine's
+// uncatchable error skips every `catch` and `finally`, a DadoScript `defer`
+// included, out to the host. **A force cannot interrupt Dado code**: a script
+// inside a Dado function it called is stopped once that function returns.
+//
+// **Then the engine ends**, in one step: every value it holds for Dado is
+// released, its context and runtime are freed — its whole heap, which lives
+// on its one allocator — and every host handle on it reads the engine as
+// ended, so a run through one fails `STOPPED`. The engine's state itself, and
+// the handle records, stay until `#delete` of the VM's handle, so a handle
+// that outlives the stop is a failure and never a use of freed memory.
+//
+// **Threads.** An engine — a VM — is run only by the thread that made it
+// (`THREAD` from any other); stopping, pausing and the two queries come from
+// any thread. The runs inside this package for an engine are counted under
+// its lock (`enter`, `leave`), and the stopper frees nothing until the count
+// is 0 — after the run's own reading of its answer is done. A run on a paused
+// engine answers `BUSY` rather than racing it.
+package script
+
+import "core:mem"
+import "core:threads"
+import "core:time"
+
+// The codes a stop and a busy engine answer, `STOPPED` and `BUSY`, are among
+// the reserved codes (`failure.dado`).
+
+// ── The engine word ─────────────────────────────────────────────────────────
+
+// Stop at the next poll, politely: the `Error` the script sees.
+private const u32 ASK = 1
+// Stop at the next poll, now: the engine's uncatchable error.
+private const u32 STOP = 2
+// Wait at the next poll until resumed.
+private const u32 PAUSE = 4
+// New code waits for the run in progress to leave (`reload.dado`).
+private const u32 RELOADING = 8
+private const u32 UNRELOADING = 0xFFFFFFF7
+// ASK has been raised into the script: it is raised once.
+private const u32 ASKED = 16
+// Every bit but PAUSE, for clearing it.
+private const u32 UNPAUSED = 0xFFFFFFFB
+
+// What a stop, a pause and the runs of one engine share: the word the hook
+// reads, and under `lock` how many runs are inside this package for the
+// engine and which thread they are on, whether it has ended, and whether its
+// own run asked for it to end when that run leaves — and, when its loaded
+// handle was deleted from inside that run, that handle, freed with the
+// engine then — and the instances let go of from inside a run, released when
+// it leaves. `wake` is signalled when the last run leaves and when a pause
+// ends.
+type Stopper:
+    u32 word,
+    rawptr lock,
+    rawptr wake,
+    i32 running,
+    u64 runner,
+    u64 last,
+    // The thread that made the engine, which alone may run it.
+    u64 owner,
+    bool ended,
+    bool end_on_exit,
+    bool doomed,
+    i32 nreleases,
+    [MAX_HANDLES]JSValue releases,
+
+// The thread a run is on, as the address of a word of its own: a thread-local
+// has one address per thread.
+private @thread_local u8 g_here
+
+private u64 this_thread():
+    return u64(#c.uintptr_t(rawptr(&g_here)))
+
+// ── Setting up and tearing down ─────────────────────────────────────────────
+
+// The lock and the condition a new engine's stops wait on, and the hook.
+private bool stopper_open(Engine e):
+    e^.stop.lock = threads.mutex_new()
+    e^.stop.wake = threads.cond_new()
+    if e^.stop.lock == nil || e^.stop.wake == nil:
+        stopper_close(e)
+        return false
+    JS_SetInterruptHandler(e^.rt, interrupt, rawptr(e))
+    web_word(e)
+    return true
+
+private void stopper_close(Engine e):
+    threads.cond_free(e^.stop.wake)
+    threads.mutex_free(e^.stop.lock)
+    e^.stop.wake = nil
+    e^.stop.lock = nil
+
+private void hold_lock(Engine e):
+    threads.lock(e^.stop.lock)
+
+private void drop_lock(Engine e):
+    threads.unlock(e^.stop.lock)
+
+private void broadcast(Engine e):
+    threads.cond_broadcast(e^.stop.wake)
+
+// On the web a script's own code polls, and on a worker it reads the word
+// itself at every back-edge before it asks the hook: the web runtime is told
+// where the word is. Natively the engine calls the hook, and there is nothing
+// to tell.
+when #OS == #WEB:
+    private foreign "quickjs.h":
+        void JS_SetInterruptWord(^JSRuntime rt, ^u32 word)
+
+    private void web_word(Engine e):
+        JS_SetInterruptWord(e^.rt, &e^.stop.word)
+
+else:
+    private void web_word(Engine e):
+        pass
+
+private u32 word_of(Engine e):
+    return #atomic_load(&e^.stop.word, #ACQUIRE)
+
+// ── The interrupt hook ──────────────────────────────────────────────────────
+
+// Called by the engine at a poll, on the thread running it. 0 is *go on*,
+// and the word is 0 unless a stop or a pause is pending.
+private i32 interrupt(^JSRuntime rt, rawptr opaque):
+    Engine e = Engine(opaque)
+    u32 w = #atomic_load(&e^.stop.word, #RELAXED)
+    if w == 0:
+        return 0
+    return interrupted(e)
+
+// The slow path: a pause waits here until resumed or stopped; STOP answers
+// the engine's uncatchable error; ASK, once, throws the `Error` the script
+// can catch and answers `JS_INTERRUPT_RAISE`, which raises it.
+private i32 interrupted(Engine e):
+    u32 w = word_of(e)
+    if (w & PAUSE) != 0 && (w & (STOP | ASK)) == 0:
+        hold_lock(e)
+        for (word_of(e) & PAUSE) != 0 && (word_of(e) & (STOP | ASK)) == 0:
+            threads.cond_wait(e^.stop.wake, e^.stop.lock)
+        drop_lock(e)
+        w = word_of(e)
+    if (w & STOP) != 0:
+        return 1
+    if (w & ASK) != 0 && (w & ASKED) == 0:
+        _ = #atomic_fetch_or(&e^.stop.word, ASKED, #ACQ_REL)
+        _ = JS_ThrowPlainError(e^.ctx, "the host stopped this script")
+        JSValue ex = JS_GetException(e^.ctx)
+        _ = JS_SetPropertyStr(e^.ctx, ex, "code", JS_NewInt32(e^.ctx, STOPPED))
+        _ = JS_Throw(e^.ctx, ex)
+        return JS_INTERRUPT_RAISE
+    return 0
+
+// Whether the exception pending now is the stop: always once forced — the
+// engine's uncatchable error, or anything after it — and while asked, a
+// thrown value whose `code` is `STOPPED`. A stop's exception is consumed and
+// says nothing on the error sink: a stop is the host's own doing.
+private bool quiet_stop(Engine e):
+    u32 w = word_of(e)
+    if (w & STOP) != 0:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+        return true
+    if (w & ASK) == 0:
+        return false
+    JSValue ex = JS_GetException(e^.ctx)
+    bool stopped = false
+    if i32(ex.tag) == JS_TAG_OBJECT:
+        JSValue c = JS_GetPropertyStr(e^.ctx, ex, "code")
+        stopped = i32(c.tag) == JS_TAG_INT && c.u.int32 == STOPPED
+        forget_exception(e, c)
+        JS_FreeValue(e^.ctx, c)
+    if stopped:
+        JS_FreeValue(e^.ctx, ex)
+        return true
+    _ = JS_Throw(e^.ctx, ex)
+    return false
+
+// Whether the engine has been forced: no more of its script runs, not even
+// the jobs a finished call queued.
+private bool forced(Engine e):
+    return (word_of(e) & STOP) != 0
+
+// ── Runs ────────────────────────────────────────────────────────────────────
+
+// A run, a construction or a handle operation coming in: counted, on this
+// thread. It fails `THREAD` from a thread that did not make the engine,
+// `STOPPED` on an engine that has ended or is being stopped, and `BUSY` on
+// one paused — saying so on the engine's error sink.
+private !void enter(Engine e):
+    hold_lock(e)
+    u64 me = this_thread()
+    if e^.stop.owner != me:
+        drop_lock(e)
+        not_owner(e)
+        fail THREAD
+    if e^.stop.ended || (word_of(e) & (ASK | STOP)) != 0:
+        drop_lock(e)
+        fail stopped(e)
+    if (word_of(e) & PAUSE) != 0 || (e^.stop.running > 0 && e^.stop.runner != me):
+        bool paused = (word_of(e) & PAUSE) != 0
+        drop_lock(e)
+        busy(e, paused)
+        fail BUSY
+    if e^.stop.running >= MAX_NEST:
+        drop_lock(e)
+        say_to(err_of(e), "script: more than 64 runs nested in one engine — a script calling Dado that runs the script again, and so on")
+        fail NO_MEMORY
+    if e^.stop.running == 0:
+        e^.stop.runner = me
+        // The engine measures its stack from where it was made: on another
+        // thread it measures from here.
+        if e^.stop.last != me:
+            if e^.stop.last != 0:
+                JS_UpdateStackTop(e^.rt)
+            e^.stop.last = me
+    // The sinks this run may displace, saved at its depth, and a scope's
+    // put in force for it (`sinks.dado`).
+    sinks_push(e, e^.stop.running)
+    scope_take(e)
+    e^.stop.running += 1
+    drop_lock(e)
+
+// The engine belongs to the thread that made it, which is also its `last`.
+private void stopper_made_here(Engine e):
+    e^.stop.last = this_thread()
+    e^.stop.owner = this_thread()
+
+// A run going out, the last thing it does with the engine: its sinks are
+// put back, and a stop waiting for it may end the engine as soon as this
+// returns. The outermost run leaving an engine its own run deleted frees the
+// engine, its state and the deleted handle here.
+private void leave(Engine e):
+    // A safe point: the messages waiting for this VM's handlers delivered
+    // (`signals.dado`).
+    watch_leaving(e)
+    if e^.stop.running == 1 && e^.reloading.waiting != 0:
+        reload_at_exit(e)
+    hold_lock(e)
+    e^.stop.running -= 1
+    sinks_pop(e, e^.stop.running)
+    bool doomed = false
+    if e^.stop.running == 0:
+        e^.stop.runner = 0
+        if !e^.stop.ended:
+            release_waiting(e)
+        if e^.stop.end_on_exit && !e^.stop.ended:
+            end_engine(e)
+            e^.stop.ended = true
+        doomed = e^.stop.doomed
+        broadcast(e)
+    drop_lock(e)
+    if doomed:
+        destroy(e)
+
+// Whether `#delete` of the VM's handle came from inside its engine's own
+// run, which `finish` has forced: if so, the engine and its handles are freed
+// when that run leaves, and `close` frees nothing now.
+private bool delete_on_exit(Engine e):
+    hold_lock(e)
+    bool inside = e^.stop.running > 0 && e^.stop.runner == this_thread()
+    if inside:
+        e^.stop.doomed = true
+    drop_lock(e)
+    return inside
+
+// `leave`, passing a failure's code on.
+private i32 leaving(Engine e, i32 code):
+    leave(e)
+    return code
+
+private void not_owner(Engine e):
+    say_to(err_of(e), "script: this VM belongs to the thread that made it, and this call comes from another: run its instances on that thread, or make a VM on this one with `#script_vm`")
+
+private void busy(Engine e, bool paused):
+    if paused:
+        say_to(err_of(e), "script: the engine is paused, so it is busy: `#script_resume` it first")
+    else:
+        say_to(err_of(e), "script: another thread is running this engine, so it is busy: an engine runs on one thread at a time")
+
+// ── What the verbs lower to ─────────────────────────────────────────────────
+
+// `#script_stop(vm, timeout)`: ask the script running on the handle's engine
+// to stop, wait up to `timeout` milliseconds for its run to leave the engine,
+// force it if it has not, wait for that, and end the engine — releasing every
+// value it holds and freeing its heap. A timeout of 0 or less forces at once.
+// An engine with no run in progress ends at once. A paused engine is resumed
+// into its polite phase. Called from inside the engine's own run (a script
+// calling Dado that stops it) it cannot wait for itself: it forces, and the
+// engine ends when that run leaves. A nil handle, or one whose engine has
+// ended, does nothing.
+void stop_engine(rawptr vm, i64 timeout):
+    Engine e = engine_of(vm)
+    if e == nil:
+        return
+    finish(e, timeout)
+
+// The stop itself, on an engine that may be running on another thread.
+private void finish(Engine e, i64 timeout):
+    hold_lock(e)
+    if e^.stop.ended:
+        drop_lock(e)
+        return
+    u32 ask = ASK
+    if timeout <= 0:
+        ask = ASK | STOP
+    if e^.stop.running > 0 && e^.stop.runner == this_thread():
+        _ = #atomic_fetch_or(&e^.stop.word, ASK | STOP, #ACQ_REL)
+        _ = #atomic_fetch_and(&e^.stop.word, UNPAUSED, #ACQ_REL)
+        e^.stop.end_on_exit = true
+        drop_lock(e)
+        return
+    _ = #atomic_fetch_or(&e^.stop.word, ask, #ACQ_REL)
+    _ = #atomic_fetch_and(&e^.stop.word, UNPAUSED, #ACQ_REL)
+    broadcast(e)
+    if e^.stop.running > 0 && timeout > 0:
+        f64 deadline = time.now() + f64(timeout) / 1000.0
+        for e^.stop.running > 0:
+            f64 left = deadline - time.now()
+            if left <= 0.0:
+                break
+            _ = threads.cond_wait_for(e^.stop.wake, e^.stop.lock, i64(left * 1000.0) + 1)
+    if e^.stop.running > 0:
+        _ = #atomic_fetch_or(&e^.stop.word, STOP, #ACQ_REL)
+        broadcast(e)
+        for e^.stop.running > 0:
+            threads.cond_wait(e^.stop.wake, e^.stop.lock)
+    end_engine(e)
+    e^.stop.ended = true
+    drop_lock(e)
+
+// `#script_pause(vm)`: the run in progress on the handle's engine waits at its
+// next poll until `#script_resume`, and until then the engine is busy. Does
+// nothing on an ended engine or a nil handle.
+void pause_engine(rawptr vm):
+    Engine e = engine_of(vm)
+    if e == nil:
+        return
+    hold_lock(e)
+    if !e^.stop.ended:
+        _ = #atomic_fetch_or(&e^.stop.word, PAUSE, #ACQ_REL)
+    drop_lock(e)
+
+// `#script_resume(vm)`: a paused engine goes on.
+void resume_engine(rawptr vm):
+    Engine e = engine_of(vm)
+    if e == nil:
+        return
+    hold_lock(e)
+    _ = #atomic_fetch_and(&e^.stop.word, UNPAUSED, #ACQ_REL)
+    broadcast(e)
+    drop_lock(e)
+
+// `#script_is_running(vm)`: whether a run is in progress on the handle's
+// engine, on any thread — paused or not.
+bool engine_running(rawptr vm):
+    Engine e = engine_of(vm)
+    if e == nil:
+        return false
+    hold_lock(e)
+    bool r = !e^.stop.ended && e^.stop.running > 0
+    drop_lock(e)
+    return r
+
+// `#script_is_paused(vm)`: whether the handle's engine is paused.
+bool engine_paused(rawptr vm):
+    Engine e = engine_of(vm)
+    if e == nil:
+        return false
+    hold_lock(e)
+    bool r = !e^.stop.ended && (word_of(e) & PAUSE) != 0
+    drop_lock(e)
+    return r

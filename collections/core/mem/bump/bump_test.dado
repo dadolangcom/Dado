@@ -1,0 +1,443 @@
+@test
+// A bump arena is a cursor over a block, and almost everything worth
+// claiming about it is at an **edge of that block**:
+//
+//   * `FreeAll` is one store — the property that is the whole reason to reach
+//     for this allocator, and the one that makes the pair with `core:mem/libc`
+//     exercise the interface rather than agree with it. C's heap has no notion
+//     of "everything this allocator handed out" and answers `nil` permanently;
+//     this one resets the cursor and every byte is available again. Both are
+//     correct implementations of the same mode, and a test that only ever ran
+//     one of them would not have noticed that the mode means two different
+//     things.
+//   * **An arena that is deliberately exhausted.** *An allocation
+//     that fails is a value, not a trap.* So a request that will not fit
+//     answers `nil`, the arena is **unchanged** by the refusal, and the next
+//     request that does fit still succeeds. All three are claimed; the middle
+//     one is the one that would be silently wrong if `carve` advanced the cursor
+//     before checking, and no program that never runs out would ever see it.
+//   * The **wrap** the header calls out by name: the two tests in `carve` are
+//     written as one subtraction rather than as `at + nbytes > cap`, because
+//     `at + nbytes` is a `u64` sum that can wrap and a wrapped sum compares
+//     small. An allocation of very nearly 2⁶⁴ bytes is the input that tells the
+//     two spellings apart, and it is claimed below.
+//
+// The arena here is over a package-level block rather than a stack one,
+// so its address is stable across every helper in this file.
+package bump
+
+import "core:mem"
+
+private const i64 CAP = 256
+// **Exactly `CAP`, because the alignment is stated rather than bought with
+// spare bytes.** This run used to be 288 bytes long: `over` aligns its base to
+// `mem.MAX_ALIGN` and charges the block for the move, and a Dado run is emitted
+// as `struct { uint8_t s[N]; }`, whose C alignment is **1** — all three
+// package-level runs in a probe landed unaligned under clang 18.1 and gcc 13.3
+// — so a block of exactly `CAP` bytes gave an arena of fewer than `CAP` and
+// every capacity claim below was about where the linker put a `[N]u8`.
+// `@align(mem.MAX_ALIGN)` says that, `over` now charges nothing, and the
+// arithmetic below is exact with no slack to pay for it.
+private type Block: [256]u8
+private @align(mem.MAX_ALIGN) Block storage
+
+// The base, as a `rawptr`, bound rather than written at the use — nested inside
+// a conversion the `rawptr(...)` collapses and the emitted C initialises a
+// `uint8_t *` from a `struct ... *`, which `-Werror` rejects.
+//
+// **Aligned before `over` sees it** — by the declaration above, so `over`
+// charges nothing and the arithmetic below is exact. That is not the test
+// dodging the case it should be making: the misaligned base has its own section
+// at the bottom of this file, where it is the claim rather than a nuisance in
+// the background of every other one.
+private rawptr base():
+    rawptr p = rawptr(&storage)
+    return p
+
+// A base that is deliberately **not** aligned: one byte past an aligned one, so
+// `over` must move it fifteen bytes forward and the block loses exactly that.
+// This is the worst case a linker can hand `over`, and — before the base was
+// aligned at all — the case that made every allocation from it misaligned.
+private rawptr odd_base():
+    mem.Bytes b = mem.Bytes(base())
+    []u8 span = b[0..<2]
+    return rawptr(&span[1])
+
+// Read one byte of a block. Zeroing is a rule and therefore a claim, not
+// an assumption: `carve` calls `zero_range` on everything it hands out.
+private u8 byte_at(rawptr p, i64 i):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i + 1]
+    return span[i]
+
+// The slot is addressed through `#len(span) - 1` rather than through `i`, and
+// that is LNT0412 rather than taste: a name whose only mention is an *assignment
+// to a slot of it* is declared-and-never-read, so `span[i] = v` alone
+// does not count as using `span`. Every byte loop in this collection reads the
+// window's length for its bound and so never meets the rule; a single-slot write
+// has to read it deliberately.
+private void set_byte(rawptr p, i64 i, u8 v):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i + 1]
+    i64 last = #len(span) - 1
+    span[last] = v
+    return
+
+// `[from, to)` of a block, all zero. Separate from `all_zero` because the
+// zeroing claims that matter are about a **tail** — the bytes a grow moved into
+// — and a window that always starts at 0 cannot ask about one.
+private bool zero_between(rawptr p, i64 from, i64 to):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[from..<to]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        if span[i] != 0:
+            return false
+    return true
+
+private bool all_zero(rawptr p, i64 n):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<n]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        if span[i] != 0:
+            return false
+    return true
+
+i32 test():
+    bool ok = true
+
+    // ── over ─────────────────────────────────────────────────────────────────
+    //
+    // It **does not allocate**, which is what makes it the freestanding answer:
+    // a fresh arena has handed out nothing and has its whole block available.
+    Arena a = over(base(), u64(CAP))
+    ok = #expect(used(a) == 0, "a fresh arena had used ", used(a)) && ok
+    ok = #expect(available(a) == u64(CAP), "a fresh arena had available ", available(a)) && ok
+
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al = allocator(&a)
+    // The implementer, as a `mem.Allocator` trait value: it keeps its
+    // declaration (one slot, a pointer), and `data()` through the pair's
+    // dispatch answers the same two words `allocator` does.
+    BumpAllocator handle = &a
+    mem.Allocator tv = handle
+    ok = #expect(tv.ok() && tv.data().data == al.data, "the BumpAllocator trait value did not answer the allocator's words") && ok
+    ok = #expect(al.proc != nil, "bump.allocator did not produce a usable allocator") && ok
+
+    // ── Alloc ────────────────────────────────────────────────────────────────
+    //
+    // Align the cursor, hand back the block, advance. The cursor is read through
+    // `used`, which is what the header says a test asserting an allocation count
+    // does instead of eyeballing a printout.
+    rawptr p1 = al.proc(al.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(p1 != nil, "the first allocation from a fresh arena failed") && ok
+    ok = #expect(used(a) == 32, "used after a 32-byte allocation was ", used(a)) && ok
+    ok = #expect(available(a) == u64(CAP) - 32, "available after a 32-byte allocation was ", available(a)) && ok
+    // Allocation always zeroes, and the block came out of static storage that is
+    // already zero — so this claim is written *after* the bytes below have been
+    // dirtied as well, further down, where it can fail.
+    ok = #expect(all_zero(p1, 32), "a fresh allocation was not zeroed") && ok
+
+    // ── alignment ────────────────────────────────────────────────────────────
+    //
+    // `align` is a **parameter**, never something the allocator computes: the
+    // caller knows the type and the allocator knows only bytes. An unaligned
+    // cursor followed by an aligned request is what makes that visible — the
+    // cursor jumps to the next multiple and the skipped bytes are lost.
+    rawptr p2 = al.proc(al.data, mem.AllocatorMode.Alloc, 1, 1, nil, 0)
+    ok = #expect(p2 != nil, "a one-byte allocation failed") && ok
+    ok = #expect(used(a) == 33, "used after a one-byte allocation was ", used(a)) && ok
+
+    rawptr p3 = al.proc(al.data, mem.AllocatorMode.Alloc, 8, 16, nil, 0)
+    ok = #expect(p3 != nil, "an aligned allocation failed") && ok
+    // 33 rounded up to 48, plus 8. The three skipped bytes are the padding an
+    // alignment costs, and `used` is where it shows.
+    ok = #expect(used(a) == 56, "an aligned allocation left used at ", used(a), ", not 56") && ok
+
+    // An alignment of 0 or 1 is "no constraint", so the cursor does not move.
+    u64 before_unaligned = used(a)
+    rawptr p4 = al.proc(al.data, mem.AllocatorMode.Alloc, 4, 0, nil, 0)
+    ok = #expect(p4 != nil, "an unconstrained allocation failed") && ok
+    ok = #expect(used(a) == before_unaligned + 4, "an alignment of 0 moved the cursor to ", used(a)) && ok
+
+    // ── Free is a no-op, and that is not a gap ───────────────────────────────
+    //
+    // The shipped set already contains an allocator that does not honour
+    // `delete`. The claim is the *absence* of a change — a `Free` that sometimes
+    // reclaimed would make "how much is in use" depend on allocation order, and
+    // it would be invisible in any output this package produces.
+    u64 before_free = used(a)
+    rawptr freed = al.proc(al.data, mem.AllocatorMode.Free, 0, 0, p4, 4)
+    ok = #expect(freed == nil, "Free returned something other than nil") && ok
+    ok = #expect(used(a) == before_free, "Free reclaimed: used went from ", before_free, " to ", used(a)) && ok
+
+    // ── FreeAll — the reason to reach for this allocator ─────────────────────
+    //
+    // One store, O(1), no matter how many allocations there were. Contrast
+    // `core:mem/libc`, whose `FreeAll` is permanently unimplemented and answers
+    // `nil` with nothing released: C's heap has no notion of "everything this
+    // allocator handed out". The two are the same mode and the pair is what
+    // exercises the interface.
+    ok = #expect(used(a) > 0, "nothing had been handed out before FreeAll: ", used(a)) && ok
+    rawptr none = al.proc(al.data, mem.AllocatorMode.FreeAll, 0, 0, nil, 0)
+    ok = #expect(none == nil, "FreeAll returned something other than nil") && ok
+    ok = #expect(used(a) == 0, "FreeAll left used at ", used(a)) && ok
+    ok = #expect(available(a) == u64(CAP), "FreeAll left available at ", available(a)) && ok
+
+    // And the block is usable again from the start — which is what "every
+    // reference into the arena is stale from that moment" means from the
+    // arena's side.
+    rawptr again = al.proc(al.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(again == p1, "the first allocation after FreeAll was not the block's start") && ok
+
+    // `reset` is the same store, reached directly rather than through the mode.
+    reset(&a)
+    ok = #expect(used(a) == 0, "reset left used at ", used(a)) && ok
+
+    // ── zeroing, after the bytes have been dirtied ───────────────────────────
+    //
+    // The claim above ran over static storage that was already zero, so it could
+    // not have failed. This one can: the block is written full of 0xAB, reset,
+    // and handed out again — and what comes back is zeroed.
+    rawptr dirty = al.proc(al.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    i64 zero = 0
+    for i in zero..<64:
+        set_byte(dirty, i, 171)
+    ok = #expect(byte_at(dirty, 0) == 171, "the block would not take a byte") && ok
+    reset(&a)
+    rawptr clean = al.proc(al.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    ok = #expect(clean == dirty, "the reset arena handed out a different block") && ok
+    ok = #expect(all_zero(clean, 64), "a reused block was not zeroed: this allocator always zeroes") && ok
+
+    // ── exhaustion: an allocation that fails is a value, not a trap ──────────
+    //
+    // A second arena, small and separate, so the claims below are about a block
+    // whose size is written here rather than about whatever the first arena has
+    // left. 64 bytes, and the requests are chosen to land on either side of it.
+    Arena small = over(base(), 64)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) sm = allocator(&small)
+
+    // Too large outright: `nil`, and **the arena is untouched**. The second
+    // claim is the one that matters — a `carve` that advanced the cursor before
+    // discovering it could not fit would leak the whole request out of a block
+    // it never handed out, and the return value alone would look identical.
+    rawptr too_big = sm.proc(sm.data, mem.AllocatorMode.Alloc, 128, 16, nil, 0)
+    ok = #expect(too_big == nil, "an over-large allocation returned a block") && ok
+    ok = #expect(used(small) == 0, "a refused allocation moved the cursor to ", used(small)) && ok
+    ok = #expect(available(small) == 64, "a refused allocation cost ", 64 - available(small), " bytes") && ok
+
+    // And the arena still works. A refusal is not a poisoning.
+    rawptr fits = sm.proc(sm.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(fits != nil, "the arena stopped working after refusing one request") && ok
+    ok = #expect(used(small) == 16, "used after the recovery allocation was ", used(small)) && ok
+
+    // **Exactly full** is the boundary: 48 bytes remain and 48 are asked for, so
+    // this must succeed and leave nothing. A `>=` where the code has `>` fails
+    // here and nowhere else.
+    rawptr exact = sm.proc(sm.data, mem.AllocatorMode.Alloc, 48, 1, nil, 0)
+    ok = #expect(exact != nil, "an allocation of exactly the remaining bytes was refused") && ok
+    ok = #expect(used(small) == 64, "the exactly-full arena had used ", used(small)) && ok
+    ok = #expect(available(small) == 0, "the exactly-full arena had available ", available(small)) && ok
+
+    // One byte past full. This is the first request an exhausted arena refuses,
+    // and the smallest one it can refuse.
+    rawptr one_too_many = sm.proc(sm.data, mem.AllocatorMode.Alloc, 1, 1, nil, 0)
+    ok = #expect(one_too_many == nil, "a full arena handed out one more byte") && ok
+    ok = #expect(used(small) == 64, "the refusal moved a full arena's cursor to ", used(small)) && ok
+
+    // A zero-byte request from a full arena still succeeds — there is nothing to
+    // fit, and `nbytes > cap - at` is `0 > 0`, which is false. Worth pinning
+    // because it is the one request an exhausted arena can still answer.
+    rawptr nothing_at_all = sm.proc(sm.data, mem.AllocatorMode.Alloc, 0, 1, nil, 0)
+    ok = #expect(nothing_at_all != nil, "a full arena refused a zero-byte request") && ok
+    ok = #expect(used(small) == 64, "a zero-byte request moved the cursor to ", used(small)) && ok
+
+    // And FreeAll brings the whole block back, which is exhaustion's cure and
+    // is what a frame loop does at the top of every frame.
+    _ = sm.proc(sm.data, mem.AllocatorMode.FreeAll, 0, 0, nil, 0)
+    ok = #expect(available(small) == 64, "FreeAll on an exhausted arena left available at ", available(small)) && ok
+    ok = #expect(sm.proc(sm.data, mem.AllocatorMode.Alloc, 64, 1, nil, 0) != nil, "an exhausted arena did not recover after FreeAll") && ok
+
+    // ── the wrap the header names ────────────────────────────────────────────
+    //
+    // `at + nbytes` is a `u64` sum that can wrap, and a wrapped sum compares
+    // small — so an arena whose test was written that way would hand out a block
+    // for a request of nearly 2⁶⁴ bytes. The code is written as `nbytes > cap -
+    // at` instead, and this is the input that tells the two spellings apart.
+    //
+    // **The cursor has to be off zero for the sum to wrap**, and getting that
+    // wrong makes the claim unfalsifiable rather than merely weak. With `at` at
+    // 0, `at + nbytes` is `nbytes` and cannot overflow for any `nbytes` a `u64`
+    // can hold, so the wrapping spelling refuses too and the claim passes
+    // against the bug it was written for. Measured: an earlier draft of these
+    // three lines reset the arena first, `carve` was then deliberately rewritten
+    // to `at + nbytes > a^.cap`, and this file stayed green.
+    //
+    // So: 16 bytes are taken first, which puts `at` at 16. The request is
+    // `2⁶⁴ − 16`, and `16 + (2⁶⁴ − 16)` is exactly 2⁶⁴, which is 0 in a `u64` —
+    // and `0 > 64` is false, so the wrapping spelling hands out a block for a
+    // request larger than all of memory. The subtraction spelling asks whether
+    // `2⁶⁴ − 16 > 64 − 16` and refuses.
+    reset(&small)
+    rawptr anchor = sm.proc(sm.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(anchor != nil, "the anchoring allocation failed") && ok
+    ok = #expect(used(small) == 16, "the cursor was not moved off zero: ", used(small)) && ok
+
+    u64 sixteen = 16
+    u64 nearly_all_of_memory = u64(0) - sixteen
+    rawptr wrapped = sm.proc(sm.data, mem.AllocatorMode.Alloc, nearly_all_of_memory, 16, nil, 0)
+    ok = #expect(wrapped == nil, "a request of 2^64 - 16 bytes was granted: the bounds test wrapped") && ok
+    ok = #expect(used(small) == 16, "the wrapping request moved the cursor to ", used(small)) && ok
+
+    // ── Resize, in place ─────────────────────────────────────────────────────
+    //
+    // The block is the arena's last allocation exactly when its offset is
+    // `last`, and then growing it is moving the cursor: O(1), no copy, and **the
+    // pointer does not change** — which is what matters, because a
+    // reference that did not move leaves every pointer and slice into it valid.
+    // The block is dirtied to its full 64 bytes **first**, and only then reset
+    // and re-carved at 16. Without that, the bytes past the cursor are the
+    // static storage's own zeroes and the tail-zeroing claim below could not
+    // fail — which is the difference between a test and a description.
+    reset(&a)
+    rawptr canvas = al.proc(al.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    for j in zero..<64:
+        set_byte(canvas, j, 171)
+    reset(&a)
+
+    rawptr r1 = al.proc(al.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(all_zero(r1, 16), "the re-carved 16 bytes were not zeroed") && ok
+    // The bytes the arena has *not* handed out are still 0xAB, which is what
+    // makes the next claim mean something.
+    ok = #expect(byte_at(r1, 16) == 171, "the bytes past the cursor were not left alone") && ok
+    set_byte(r1, 0, 7)
+
+    rawptr r2 = al.proc(al.data, mem.AllocatorMode.Resize, 32, 16, r1, 16)
+    ok = #expect(r2 == r1, "growing the last allocation moved it") && ok
+    ok = #expect(used(a) == 32, "the in-place grow left used at ", used(a)) && ok
+    ok = #expect(byte_at(r2, 0) == 7, "the in-place grow lost the bytes") && ok
+    // The grown tail is zeroed, which `regrow` does explicitly because
+    // allocation always zeroes and the bytes past `used` are whatever the last
+    // user of the block left there — 0xAB, three lines up.
+    ok = #expect(zero_between(r2, 16, 32), "the grown tail was not zeroed") && ok
+    ok = #expect(byte_at(r2, 31) == 0, "the last byte of the grown tail was not zeroed") && ok
+    // And the grow stopped where it said it did: byte 32 is past the new block
+    // and is still the 0xAB nobody asked it to touch.
+    ok = #expect(byte_at(r2, 32) == 171, "the grow zeroed past the block it was given") && ok
+
+    // Shrinking in place moves the cursor back, which is the one case where a
+    // bump arena reclaims anything at all.
+    rawptr r3 = al.proc(al.data, mem.AllocatorMode.Resize, 8, 16, r2, 32)
+    ok = #expect(r3 == r2, "shrinking the last allocation moved it") && ok
+    ok = #expect(used(a) == 8, "the in-place shrink left used at ", used(a)) && ok
+
+    // ── Resize, not on top ───────────────────────────────────────────────────
+    //
+    // There is nothing clever to do, so the library helper is what an
+    // allocator in that position calls: a fresh block, the bytes copied, and the
+    // old one "freed" — which for an arena means nothing happens to it. The
+    // pointer therefore **does** change, and the caller cannot tell the two
+    // paths apart except by comparing it.
+    reset(&a)
+    rawptr b1 = al.proc(al.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    set_byte(b1, 0, 42)
+    set_byte(b1, 15, 99)
+    rawptr b2 = al.proc(al.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(b2 != nil, "the second allocation failed") && ok
+    rawptr moved = al.proc(al.data, mem.AllocatorMode.Resize, 24, 16, b1, 16)
+    ok = #expect(moved != nil, "resizing a buried block failed") && ok
+    ok = #expect(moved != b1, "a buried block was grown in place, which would overwrite its neighbour") && ok
+    ok = #expect(byte_at(moved, 0) == 42, "the copy lost the first byte") && ok
+    ok = #expect(byte_at(moved, 15) == 99, "the copy lost the last byte") && ok
+
+    // A `Resize` of a nil block is an `Alloc`, which is the arm that makes
+    // `resize` usable as "grow this, and make it if it does not exist".
+    reset(&a)
+    rawptr from_nothing = al.proc(al.data, mem.AllocatorMode.Resize, 16, 16, nil, 0)
+    ok = #expect(from_nothing != nil, "resizing from nil did not allocate") && ok
+    ok = #expect(used(a) == 16, "resizing from nil left used at ", used(a)) && ok
+
+    // A `Resize` that will not fit is refused the same way an `Alloc` is: a
+    // value, not a trap.
+    reset(&small)
+    rawptr s1 = sm.proc(sm.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(s1 != nil, "the small arena would not hand out 16 bytes") && ok
+    rawptr s2 = sm.proc(sm.data, mem.AllocatorMode.Resize, 256, 16, s1, 16)
+    ok = #expect(s2 == nil, "an over-large resize was granted") && ok
+
+    // ── the degenerate arenas ────────────────────────────────────────────────
+    //
+    // An arena over no block at all, and an allocator with a nil `data`. Both
+    // are reachable — the first is what a program gets from `over(nil, n)` after
+    // a failed allocation upstream, the second is what a zero `Allocator`'s
+    // procedure would be handed — and both must answer `nil` rather than
+    // dereference.
+    Arena nowhere = over(nil, 64)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) nw = allocator(&nowhere)
+    ok = #expect(nw.proc(nw.data, mem.AllocatorMode.Alloc, 8, 8, nil, 0) == nil, "an arena over no block handed out memory") && ok
+
+    Arena zero_cap = over(base(), 0)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) zc = allocator(&zero_cap)
+    ok = #expect(zc.proc(zc.data, mem.AllocatorMode.Alloc, 1, 1, nil, 0) == nil, "an arena of zero capacity handed out a byte") && ok
+    ok = #expect(available(zero_cap) == 0, "an arena of zero capacity had available ", available(zero_cap)) && ok
+
+    // The procedure reached with a nil `data`, which is the guard at the top of
+    // `dispatch` and is not reachable through `allocator(&arena)`.
+    ok = #expect(nw.proc(nil, mem.AllocatorMode.Alloc, 8, 8, nil, 0) == nil, "dispatch with nil data handed out memory") && ok
+    ok = #expect(nw.proc(nil, mem.AllocatorMode.FreeAll, 0, 0, nil, 0) == nil, "dispatch with nil data did not answer nil") && ok
+
+    // ââ the base is aligned, and that used to be an assumption ââââââââââ
+    //
+    // `carve` aligns the **cursor** â an offset â and hands back `block + at`,
+    // so what it hands out is aligned only if the block was. Until
+    // `#align_forward` existed the language could not say that, and the
+    // assumption was wrong in the ordinary case rather than the exotic one.
+    //
+    // **The claim cannot be written directly and this is the shape it takes
+    // instead.** `u64(p)` on a `rawptr` is ERR0504 and there is no `uintptr`,
+    // so no program can assert *this address is a multiple of 16*. What it can
+    // ask is whether rounding the address up moves it, which is the same
+    // question from the other side â `tests/cases/align_forward.dado` is built
+    // on that identity and this borrows it.
+    Arena skewed = over(odd_base(), 64)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) sk = allocator(&skewed)
+
+    // `odd_base()` is one byte past an aligned address, so rounding it up to 16
+    // costs exactly fifteen and the arena is fifteen bytes smaller than its
+    // block. Exact rather than the ceiling: `over` finds how far the base moved
+    // by asking the block, which is what a pointer difference would answer in a
+    // language that had one.
+    ok = #expect(available(skewed) == 64 - 15, "an arena over a misaligned base had available ", available(skewed)) && ok
+
+    // And the block it hands out is aligned, which is the whole point and the
+    // assertion that fails on every version of this package before today.
+    rawptr skew_out = sk.proc(sk.data, mem.AllocatorMode.Alloc, 8, 16, nil, 0)
+    ok = #expect(skew_out != nil, "an arena over a misaligned base handed out nothing") && ok
+    ok = #expect(#align_forward(skew_out, 16) == skew_out, "an arena over a misaligned base handed out a misaligned block") && ok
+    ok = #expect(#align_forward(skew_out, 8) == skew_out, "the block was not 8-aligned either") && ok
+
+    // A block so small the alignment costs more than it holds is an arena of
+    // zero capacity â `over(nil, n)`'s answer, reached by a second road, and
+    // the arm that would otherwise subtract past zero.
+    Arena tiny = over(odd_base(), 8)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) ty = allocator(&tiny)
+    ok = #expect(available(tiny) == 0, "an arena whose alignment costs more than its block had available ", available(tiny)) && ok
+    ok = #expect(ty.proc(ty.data, mem.AllocatorMode.Alloc, 1, 1, nil, 0) == nil, "an arena with no room after alignment handed out a byte") && ok
+
+    // **`MAX_ALIGN` is a ceiling this allocator states rather than assumes.**
+    // `over` aligned the base to 16 and to nothing coarser, so a request for 32
+    // is refused rather than answered with an offset that is a multiple of 32
+    // from a base that is not. An allocator that quietly under-aligns is the
+    // worst of the three answers available here.
+    ok = #expect(sk.proc(sk.data, mem.AllocatorMode.Alloc, 8, 32, nil, 0) == nil, "an allocation above MAX_ALIGN was granted") && ok
+    ok = #expect(sk.proc(sk.data, mem.AllocatorMode.Alloc, 8, 16, nil, 0) != nil, "the ceiling refused an allocation at MAX_ALIGN itself") && ok
+
+    // An invariant rather than an expectation: an arena must never report more
+    // in use than its block holds. If it did the *package* would be handing out
+    // memory it does not own, and there would be nothing to carry on for.
+    #assert(used(a) <= u64(CAP), "the arena reported ", used(a), " of ", CAP, " bytes in use")
+    #assert(used(small) + available(small) == 64, "used and available did not add up to the block")
+
+    if ok:
+        return 0
+    return 1

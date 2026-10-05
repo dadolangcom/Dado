@@ -1,0 +1,600 @@
+// `dado test`: build and run a package's `@test` files, one process each.
+//
+// **One process per test**, because a test's result is its exit status: a
+// failed `assert` aborts, and nothing here could catch that and carry on.
+// `@test <status>` names the status a file passes with, so a test of a
+// deliberate failure is written `@test 134` (an abort).
+//
+// The compiler says which files are tests (`dadoc --emit=tests`, one
+// `test <path> <status>` line each), and each is transpiled with
+// `--test=<path>` and its own build manifest, because a test file may be the
+// only thing importing a package and so reach headers, `.c` files and link
+// clauses the ordinary build does not.
+//
+// **Sanitized by default** with the `defaults` flags, because Dado
+// bounds-checks nothing and a test is where an out-of-bounds goes unwatched.
+// A compiler with no runtime here warns once and runs unsanitized;
+// `--sanitize=thread` swaps AddressSanitizer for ThreadSanitizer and is an
+// error where it cannot run. The pinned zig has no AddressSanitizer on Linux
+// and links a combined list without it, so under zig `address` is dropped,
+// the build says so once, the binaries are named `.ubsan`, and the summary
+// says `(sanitized: ubsan)` rather than claim a check that did not run.
+//
+// **The summary counts what ran.** `(sanitized…)` is printed only when every
+// test that ran was built with a sanitizer, a web test (run under node) never
+// is, and a test's standard error is shown only when it failed.
+package driver
+
+import "core:fmt"
+import "core:os"
+import "core:os/fs"
+import "core:os/proc"
+import "core:path"
+import "core:strings"
+
+// What `--filter` and `--shard` asked for, set before the command runs.
+private string8 g_filter = ""
+private string8 g_shard = ""
+private bool g_sanitize_asked
+
+// What `test` reads off the command line beyond the shared options: the
+// filter, the slice, and whether `--sanitize` was written (a web test
+// refuses it, where the default is dropped quietly).
+void set_test_selection(string8 filter, string8 shard, bool sanitize_asked):
+    g_filter = filter
+    g_shard = shard
+    g_sanitize_asked = sanitize_asked
+
+// `FAIL …`, its first word in red.
+void say_red(string8 word, string8 rest):
+    colour()
+    fmt.println(g_red, word, g_reset, rest)
+
+// Remove `p` and everything under it, if it is there.
+void remove_tree_quietly(string8 p):
+    if !exists(p): return
+    try fs.remove_all(p) else:
+        return
+
+// The refusals for a program that embeds the script engine `engine` on a
+// target whose `#OS` is `os`: only quickjs is built, and a freestanding
+// target has no C library for it.
+void engine_refusals(string8 engine, string8 os):
+    if engine != "quickjs":
+        die(txt(#format("the build manifest asks for an engine called `", engine, "`, and the only one this driver builds is quickjs.\n  The compiler and the driver disagree about what a DadoScript program runs on: rebuild dadoc from this tree.")))
+    if os == "#NONE":
+        die("this program runs DadoScript scripts, and the resolved target's `#OS` is `#NONE`.\n  Scripting needs a hosted C library: QuickJS-ng allocates, formats numbers and\n  reads the clock through one, even with its allocator routed through Dado's, so\n  there is no engine for a freestanding target. Build the scripting half for a\n  hosted target, or keep the freestanding build from reaching `core:script`.")
+
+// ── the pure parts ──────────────────────────────────────────────────────────
+
+// `text` read as a non-negative decimal number, and whether it was one.
+(i64 n, bool ok) decimal(string8 text):
+    if #len(text) == 0 || #len(text) > 9: return (0, false)
+    i64 n = 0
+    for c in text:
+        if c < '0' || c > '9': return (0, false)
+        n = n * 10 + i64(c - '0')
+    return (n, true)
+
+// `--shard`'s `<k>/<n>`, with `1 <= k <= n`.
+(i64 k, i64 n, bool ok) parse_shard(string8 text):
+    (string8 a, string8 b, bool slash) = split_byte(text, '/')
+    if !slash: return (0, 0, false)
+    (i64 k, bool kok) = decimal(a)
+    (i64 n, bool nok) = decimal(b)
+    if !kok || !nok || k < 1 || n < 1 || k > n: return (0, 0, false)
+    return (k, n, true)
+
+// Whether the `i`-th test (from 0, in manifest order) is in slice `k` of `n`;
+// every test is when `n` is 0.
+bool in_slice(i64 i, i64 k, i64 n):
+    if n == 0: return true
+    return i % n == k - 1
+
+// One line of `dadoc --emit=tests`.
+type TestEntry:
+    string8 path
+    i32 status
+
+// `text` read as the tests manifest. `ok` false, and `why` the line, at a
+// line that is not `test <path> <status>`.
+(ref []TestEntry tests, bool ok, string8 why) parse_tests(string8 text):
+    ref []TestEntry out = #make([]TestEntry, 0)
+    for l in lines_of(text):
+        ref []string8 w = words_of(l)
+        if #len(w) == 0: continue
+        if w[0] != "test" || #len(w) != 3:
+            return (out, false, txt(#format("unrecognised test manifest line: ", l)))
+        (i64 status, bool sok) = decimal(w[2])
+        if !sok:
+            return (out, false, txt(#format("unrecognised test manifest line: ", l)))
+        TestEntry e
+        e.path = w[1]
+        e.status = i32(status)
+        _ = #append(out, e)
+    return (out, true, "")
+
+// A test file's name in the report: its base name without `.dado`.
+string8 test_name(string8 file):
+    string8 n = path.base(file)
+    if strings.ends_with(n, ".dado"): n = n[0..<#len(n) - 5]
+    return n
+
+// What the summary says about the sanitizers: nothing unless the tests that
+// ran were sanitized (the sanitizers are chosen once per run, so one
+// sanitized run means all were); `thread` for ThreadSanitizer; `ubsan` under the
+// pinned zig, which has no AddressSanitizer, or when the compiler's hung at
+// start-up; otherwise plain `(sanitized)`.
+string8 sanitizer_marker(i64 sanitized_runs, string8 kind, bool zig):
+    if sanitized_runs == 0: return ""
+    if kind == "thread": return " (sanitized: thread)"
+    if zig: return " (sanitized: ubsan)"
+    return " (sanitized)"
+
+// The result line: `P passed, F failed`, the slice when sharded, how many
+// `--filter` left out when it left any out, and the sanitizer marker.
+string8 summary_line(i64 passed, i64 failed, i64 filtered, i64 k, i64 n, i64 other_slices, string8 marker):
+    strings.Builder b = strings.builder(96)
+    _ = strings.append(&b, txt(#format(passed, " passed, ", failed, " failed")))
+    if n > 0:
+        _ = strings.append(&b, txt(#format(" (slice ", k, "/", n, "; ", other_slices, " in the other slices)")))
+    if filtered > 0:
+        _ = strings.append(&b, txt(#format(", ", filtered, " filtered out")))
+    _ = strings.append(&b, marker)
+    return txt(strings.finish(&b))
+
+// `text` with every line, blank ones too, indented by seven spaces, each
+// ending in a newline: a failing test's standard error under its line.
+string8 indented(string8 text):
+    strings.Builder b = strings.builder(#len(text) + 64)
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        _ = strings.append(&b, "       ")
+        _ = strings.append(&b, l)
+        _ = strings.append_char(&b, '\n')
+        if !more: break
+        rest = tail
+    return txt(strings.finish(&b))
+
+// A build manifest as a web module's loader reads it beside the module:
+// each `js-module` line's first directory replaced by `scripts`, the
+// directory the module's scripts were copied to. Every line ends in a
+// newline.
+string8 web_manifest(string8 text, string8 scripts):
+    strings.Builder b = strings.builder(#len(text) + 64)
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        string8 line = l
+        if strings.starts_with(l, "js-module "):
+            string8 value = l[10..<#len(l)]
+            i64 slash = strings.index_of(value, '/')
+            if slash >= 0:
+                line = txt(#format("js-module ", scripts, "/", value[slash + 1..<#len(value)]))
+        _ = strings.append(&b, line)
+        _ = strings.append_char(&b, '\n')
+        if !more: break
+        rest = tail
+    return txt(strings.finish(&b))
+
+// ── running one test ────────────────────────────────────────────────────────
+
+// Run `c` with its standard output thrown away and its standard error kept,
+// and answer its status and what it said there.
+private (i32 status, string8 said) run_test_binary(Command c):
+    ref []char8 err = #make([]char8, 0)
+    if #len(c.words) > proc.ARG_CAP: return (127, txt(err))
+    ref []cstring argv = #make([]cstring, 0)
+    for w in c.words:
+        ref []char8 z = strings.clone_to_cstring(w, #default)
+        _ = #append(argv, cstring(z))
+    proc.Duplex d = proc.duplex(argv[:], proc.ERRORS_PIPE)
+    if !proc.started(d): return (127, txt(err))
+    _ = proc.close_input(&d)
+    [16384]char8 chunk
+    bool out_open = true
+    bool err_open = true
+    for out_open || err_open:
+        if out_open:
+            i32 got = proc.receive(&d, chunk[:], 10 if err_open else 0 - 1)
+            if got == proc.DRAINED || got == proc.BROKE: out_open = false
+        if err_open:
+            i32 got = proc.receive_errors(&d, chunk[:], 10 if out_open else 0 - 1)
+            if got == proc.DRAINED || got == proc.BROKE:
+                err_open = false
+            else if got > 0:
+                for i in 0..<got:
+                    _ = #append(err, chunk[i])
+    proc.release(&d)
+    (bool done, bool exited, i32 status) = proc.finish(&d, 0 - 1)
+    i32 s = 127
+    if done:
+        if exited: s = status
+        else if status < 0 && status != 0 - 1: s = 128 - status
+    return (s, txt(err))
+
+private void report(string8 name, i32 status, i32 wanted, string8 said, ^i64 passed, ^i64 failed):
+    if status == wanted:
+        say_green("ok", txt(#format(" ", name)))
+        passed^ += 1
+        return
+    if wanted == 0:
+        say_red("FAIL", txt(#format(" ", name, " (exit ", status, ")")))
+    else:
+        say_red("FAIL", txt(#format(" ", name, " (exit ", status, ", wanted ", wanted, ")")))
+    failed^ += 1
+    if #len(said) > 0:
+        fmt.print(indented(said))
+
+// Every file under `from` copied to the same place under `to`.
+private void copy_tree(string8 from, string8 to):
+    _ = fs.make_dirs(to, #default)
+    fs.Listing l = fs.walk(from, #default)
+    for e in l.entries:
+        string8 rel = e.path[#len(from)..<#len(e.path)]
+        for #len(rel) > 0 && path.is_separator(rel[0]):
+            rel = rel[1..<#len(rel)]
+        string8 dest = join2(to, rel)
+        if e.is_dir:
+            _ = fs.make_dirs(dest, #default)
+        else:
+            try fs.copy_file(e.path, dest) else:
+                continue
+
+// `p` removed, when it is there.
+private void remove_if_there(string8 p):
+    if exists(p): remove_quietly(p)
+
+// `from` renamed to `to`, or the run ends saying why.
+private void move_or_die(string8 from, string8 to):
+    try fs.rename(from, to) else code:
+        die(txt(#format("cannot move ", from, " to ", to, ": ", os.message(code))))
+
+// When the file at `p` was last changed, in nanoseconds, if it can be asked.
+private (i64 t, bool ok) file_mtime(string8 p):
+    try i64 t = fs.mtime(p) else:
+        return (0, false)
+    return (t, true)
+
+// The link line's compile half without the `-I` list: the compiler, the
+// driver's flags, the `flags` clauses and the sanitizer.
+private Command compile_flags(^Link k):
+    Command c = command_of(k.cc[:])
+    add_all(&c, k.base[:])
+    add_all(&c, k.interop[:])
+    add_all(&c, k.werror[:])
+    add_all(&c, k.opt[:])
+    add_all(&c, k.extra[:])
+    add_all(&c, k.san_c[:])
+    return c
+
+// ── the command ─────────────────────────────────────────────────────────────
+
+i32 test_command(^Plan p, ^Options o):
+    if #len(o.strip) > 0:
+        ref []char8 j = strings.join(o.strip[:], " ")
+        die(txt(#format("`dado test` will not strip claims: a test build with its assertions\n  removed tests nothing. Drop ", txt(j), ".")))
+    i64 shard_k = 0
+    i64 shard_n = 0
+    if #len(g_shard) > 0:
+        (i64 k, i64 n, bool sok) = parse_shard(g_shard)
+        if !sok:
+            die(txt(#format("--shard takes <k>/<n> with 1 <= k <= n, not `", g_shard, "`")))
+        shard_k = k
+        shard_n = n
+
+    bool web = targets_web()
+    Compiler cc = no_compiler("")
+    if !web: cc = need_compiler(o.cc)
+    // Which build a binary is, in its name, so two configurations of one
+    // package never overwrite each other's between the link and the run.
+    string8 cfg = "web"
+    if !web:
+        cfg = path.base(cc.words[0])
+        if o.sanitize && o.sanitize_kind == "thread":
+            cfg = txt(#format(cfg, ".tsan"))
+        else if o.sanitize && cc.zig:
+            cfg = txt(#format(cfg, ".ubsan"))
+        else if o.sanitize:
+            cfg = txt(#format(cfg, ".asan"))
+    _ = fs.make_dirs(p.build_dir, #default)
+
+    Command tc = dadoc_command(p, o, true, false)
+    add(&tc, "--emit=tests")
+    add(&tc, p.pkg_abs)
+    Captured listed_tests = capture(tc, false)
+    if !listed_tests.started || listed_tests.status != 0:
+        die(txt(#format("cannot read the tests of ", o.pkg)))
+    (ref []TestEntry tests, bool tok, string8 twhy) = parse_tests(txt(listed_tests.out))
+    if !tok: die(twhy)
+
+    i64 passed = 0
+    i64 failed = 0
+    i64 filtered = 0
+    i64 sanitized_runs = 0
+    i64 index = 0 - 1
+    i64 other_slices = 0
+    bool san_ready = false
+    ref []string8 san_c = #make([]string8, 0)
+    ref []string8 san_l = #make([]string8, 0)
+    bool sanitized = false
+    string8 engine_dir = ""
+    string8 web_cc = ""
+    string8 web_node = ""
+
+    // Once per run: what `emit_key` calls this `dadoc`. A digest that cannot
+    // be taken turns the caches off for the run rather than keying them on
+    // nothing; the compiler's identity is asked at the first native test.
+    string8 cache = join2(p.build_dir, ".dado-cache")
+    Digest dd = digest()
+    put_file(&dd, p.dadoc)
+    string8 dadoc_id = finish_digest(&dd)
+    bool caching = #len(dadoc_id) > 0
+    string8 cc_id = ""
+
+    for t in tests:
+        string8 name = test_name(t.path)
+        index += 1
+        if !in_slice(index, shard_k, shard_n):
+            other_slices += 1
+            continue
+        if #len(g_filter) > 0 && !strings.contains(name, g_filter):
+            filtered += 1
+            continue
+
+        string8 t_c = txt(#format(p.build_dir, "/", p.stem, ".", name, ".c"))
+        _ = fs.make_dirs(dir_of(t_c), #default)
+
+        // **One transpile per test for every pass that asks the same
+        // question** — see `emit_slot`. The slot holds the C, its manifest
+        // and, when there is one, the implementation unit, all from one
+        // `dadoc` run; without the caches it is this test's own and never
+        // reused.
+        Command x = dadoc_command(p, o, true, false)
+        if o.strict: add(&x, "--strict")
+        add(&x, txt(#format("--test=", t.path)))
+        if o.line_directives: add(&x, "--line-directives")
+        add_all(&x, p.prefix_map[:])
+        add(&x, p.pkg_abs)
+        ref []string8 args = #make([]string8, 0)
+        for i in 1..<#len(x.words):
+            _ = #append(args, x.words[i])
+        string8 slot = txt(#format(t_c, ".d"))
+        if caching: slot = emit_slot(cache, args[:])
+        string8 slot_c = join2(slot, "prog.c")
+        string8 slot_build = join2(slot, "build")
+        string8 slot_impl = join2(slot, "impl.c")
+        string8 slot_key = join2(slot, "key")
+        string8 t_scripts = join2(slot, "scripts")
+        if !caching || !emit_fresh(slot, dadoc_id, args[:]):
+            _ = fs.make_dirs(slot, #default)
+            i64 pid = os.pid()
+            // A mark taken before `dadoc` reads anything: a `.dado` file in
+            // the loaded set newer than it was edited *while* this run read
+            // it, so the C may be the old text's and must not be stored
+            // under the new text's key, which is only computed afterwards.
+            string8 started = join2(slot, txt(#format("started.", pid)))
+            write_quietly(started, "")
+            (i64 mark, bool marked) = file_mtime(started)
+            string8 tmp_c = txt(#format(slot_c, ".", pid))
+            string8 tmp_build = txt(#format(slot_build, ".", pid))
+            string8 tmp_impl = txt(#format(slot_impl, ".", pid))
+            string8 tmp_scripts = txt(#format(t_scripts, ".", pid))
+            add(&x, "-o")
+            add(&x, tmp_c)
+            add(&x, txt(#format("--build-manifest=", tmp_build)))
+            if caching: add(&x, txt(#format("--implementations=", tmp_impl)))
+            if web: add(&x, txt(#format("--scripts-out=", tmp_scripts)))
+            if run(x) != 0:
+                remove_if_there(tmp_c)
+                remove_if_there(tmp_build)
+                remove_if_there(tmp_impl)
+                remove_if_there(slot_key)
+                remove_if_there(started)
+                remove_tree_quietly(tmp_scripts)
+                say_red("FAIL", txt(#format(" ", name, " (did not compile)")))
+                failed += 1
+                continue
+            // The key last, so a slot whose key matches is never half-written.
+            remove_if_there(slot_key)
+            move_or_die(tmp_c, slot_c)
+            move_or_die(tmp_build, slot_build)
+            if exists(tmp_impl):
+                move_or_die(tmp_impl, slot_impl)
+            else:
+                remove_if_there(slot_impl)
+            remove_tree_quietly(t_scripts)
+            if exists(tmp_scripts): move_or_die(tmp_scripts, t_scripts)
+            string8 written = read_or_empty(slot_build)
+            bool moved = !marked || sources_moved(written, mark)
+            remove_if_there(started)
+            if caching && !moved:
+                string8 key = emit_key(dadoc_id, args[:], written)
+                if #len(key) > 0:
+                    string8 tmp_key = txt(#format(slot_key, ".", pid))
+                    try fs.write_file(tmp_key, key) else:
+                        key = ""
+                    if #len(key) > 0:
+                        try fs.rename(tmp_key, slot_key) else:
+                            remove_if_there(tmp_key)
+        // Where a person looks for the C, as before; the build reads the slot.
+        string8 t_c_tmp = txt(#format(t_c, ".", os.pid()))
+        try fs.copy_file(slot_c, t_c_tmp) else code:
+            die(txt(#format("cannot copy ", slot_c, " to ", t_c, ": ", os.message(code))))
+            return 1
+        move_or_die(t_c_tmp, t_c)
+        try ref []char8 mtext = fs.read_file(slot_build) else code:
+            die(txt(#format("cannot read the build manifest ", slot_build, ": ", os.message(code))))
+            return 1
+        (Manifest m, bool mok, string8 mwhy) = parse_manifest(txt(mtext))
+        if !mok: die(mwhy)
+        bool has_impl = caching && is_file(slot_impl)
+
+        if m.os == "#NONE":
+            string8 from = ""
+            (string8 dt, bool dset) = env("DADO_TARGET")
+            if dset:
+                from = txt(#format("DADO_TARGET=", dt))
+            else:
+                from = txt(#format("`", cc.name, " -dumpmachine`"))
+            die(txt(#format("`dado test` cannot run a freestanding build.\n\n  The resolved target's `#OS` is `#NONE`, which is the assertion that there\n  is no operating system and no libc here — so there is nothing on this\n  machine to start the test with, and a test's result *is* its exit status.\n  Linking it against this host's libc anyway would report a tick for a\n  hosted run.\n\n  The target came from ", from, ".\n  Run the tests for the machine you are on, and use `dado build` for the\n  freestanding one — it compiles and stops at the object file.")))
+        if #len(m.engine) > 0: engine_refusals(m.engine, m.os)
+
+        ref []string8 includes = #make([]string8, 0)
+        for inc in m.includes:
+            _ = #append(includes, txt(#format("-I", inc)))
+        ref []string8 libs = #make([]string8, 0)
+        for l in o.libs:
+            _ = #append(libs, l)
+        for l in m.links:
+            _ = #append(libs, l)
+
+        // A web test: a module, run under node, unsanitized.
+        if m.os == "#WEB":
+            if g_sanitize_asked:
+                die("`dado test --target=web` cannot sanitize: there is no sanitizer runtime for wasm.\n  Drop --sanitize; the tests run under node unsanitized, and the summary says so by omission.")
+            if #len(libs) > 0:
+                ref []char8 lj = strings.join(libs[:], " ")
+                die(txt(#format("a web build cannot link native libraries, and this test's build asks for: ", txt(lj))))
+            if #len(web_cc) == 0: web_cc = web_compiler(o.cc)
+            if #len(web_node) == 0: web_node = web_node_program(o.cmd)
+            string8 wasm = txt(#format(p.build_dir, "/", p.stem, ".", name, ".wasm"))
+            (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+            for w in words_of(user_cflags):
+                _ = #append(includes, w)
+            // The vendored bodies `dadoc` split out, when it did: one more
+            // unit of the module, uncached, since a web test is compiled by
+            // a different compiler for a different target.
+            ref []string8 web_sources = #make([]string8, 0)
+            for src in m.sources:
+                _ = #append(web_sources, src)
+            if has_impl: _ = #append(web_sources, slot_impl)
+            if !web_module(web_cc, o, t_c, web_sources[:], m.flags[:], includes[:], wasm):
+                say_red("FAIL", txt(#format(" ", name, " (the C did not build for wasm32)")))
+                failed += 1
+                continue
+            string8 scripts_name = txt(#format(path.base(wasm[0..<#len(wasm) - 5]), ".scripts"))
+            try fs.write_file(txt(#format(wasm, ".build")), web_manifest(txt(mtext), scripts_name)) else code:
+                die(txt(#format("cannot write ", wasm, ".build: ", os.message(code))))
+                return 1
+            string8 beside = wasm[0..<#len(wasm) - 5]
+            string8 scripts_dir = txt(#format(beside, ".scripts"))
+            remove_tree_quietly(scripts_dir)
+            if is_dir(t_scripts): copy_tree(t_scripts, scripts_dir)
+            Command nr = command(web_node)
+            add(&nr, join3(root(), "tools", join2("web", "load.mjs")))
+            add(&nr, wasm)
+            (i32 wstatus, string8 wsaid) = run_test_binary(nr)
+            report(name, wstatus, t.status, wsaid, &passed, &failed)
+            continue
+
+        if !san_ready:
+            (ref []string8 sc, ref []string8 sl, bool son) = configure_sanitizers(cc, o.sanitize, o.sanitize_kind)
+            san_c = sc
+            san_l = sl
+            sanitized = son
+            san_ready = true
+
+        if #len(m.engine) > 0:
+            if #len(engine_dir) == 0:
+                engine_dir = engine_archive(cc, p.target_flag, san_c[:])
+            if #len(engine_dir) == 0:
+                say_red("FAIL", txt(#format(" ", name, " (the DadoScript engine did not build: tools/quickjs/build.sh --cc ", cc.name, " says why)")))
+                failed += 1
+                continue
+            _ = #append(includes, txt(#format("-I", engine_dir)))
+            _ = #append(libs, join2(engine_dir, "libquickjs.a"))
+            _ = #append(libs, "-lm")
+
+        string8 brew = brew_prefix()
+        if #len(brew) > 0 && is_dir(join2(brew, "include")):
+            _ = #append(includes, txt(#format("-I", join2(brew, "include"))))
+        (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+        for w in words_of(user_cflags):
+            _ = #append(includes, w)
+        ref []string8 all_libs = #make([]string8, 0)
+        if #len(brew) > 0 && is_dir(join2(brew, "lib")):
+            _ = #append(all_libs, txt(#format("-L", join2(brew, "lib"))))
+        for l in libs:
+            _ = #append(all_libs, l)
+
+        string8 bin = txt(#format(p.build_dir, "/", p.stem, ".", name, ".", cfg))
+        Link k = new_link()
+        k.cc = command_of(cc.words[:]).words
+        k.base = words_of(setting("CFLAGS_BASE"))
+        k.interop = words_of(setting("CFLAGS_INTEROP"))
+        if o.werror: k.werror = words_of(setting("CFLAGS_WERROR"))
+        if o.debug:
+            k.opt = words_of("-g -O0")
+        else:
+            k.opt = words_of("-O2")
+        k.extra = m.flags
+        k.san_c = san_c
+        k.includes = includes
+        k.c_file = slot_c
+        k.sources = m.sources
+        k.out = bin
+        k.libs = all_libs
+        k.exports = export_flags(m.os, m.exports[:], cc.zig)
+        k.san_l = san_l
+        (string8 user_ldflags, bool _) = env("DADO_LDFLAGS")
+        k.ldflags = words_of(user_ldflags)
+
+        // The objects: the vendored bodies, shared by every test that
+        // includes them, and the test's own C, from the caches when nothing
+        // they are made of has moved (`cached_object`). Without the caches
+        // the C is compiled in the link command, as it always was.
+        if caching && #len(cc_id) == 0: cc_id = compiler_identity(cc)
+        ObjectJob job
+        job.cache = cache
+        job.cc_id = cc_id
+        job.flags = compile_flags(&k)
+        job.includes = includes
+        ref []string8 own_objects = #make([]string8, 0)
+        bool built = true
+        if has_impl:
+            job.sub = "impl"
+            job.unsay = true
+            job.unit = slot_impl
+            (string8 io, bool iok, bool itemp) = cached_object(&job)
+            if iok:
+                _ = #append(k.sources, io)
+                if itemp: _ = #append(own_objects, io)
+            built = iok
+        if built && caching:
+            job.sub = "obj"
+            job.unsay = false
+            job.unit = slot_c
+            (string8 po, bool pok, bool ptemp) = cached_object(&job)
+            if pok:
+                k.c_file = po
+                if ptemp: _ = #append(own_objects, po)
+            built = pok
+        if built: built = run(link_command(&k)) == 0
+        for own in own_objects:
+            remove_if_there(own)
+        if !built:
+            say_red("FAIL", txt(#format(" ", name, " (the C did not build)")))
+            failed += 1
+            continue
+        if sanitized: sanitized_runs += 1
+
+        (string8 runner, bool _) = env("DADO_RUNNER")
+        ref []string8 runner_words = words_of(runner)
+        Command r = command_of(runner_words[:])
+        add(&r, bin)
+        (i32 status, string8 said) = run_test_binary(r)
+        report(name, status, t.status, said, &passed, &failed)
+
+    if passed + failed == 0:
+        string8 matching = ""
+        if #len(g_filter) > 0: matching = txt(#format(" matching '", g_filter, "'"))
+        if shard_n > 0:
+            die(txt(#format("--shard ", shard_k, "/", shard_n, " of ", o.pkg, " selects no test", matching, " (", index + 1, " in the package)")))
+        note(txt(#format("no @test files in ", o.pkg, matching)))
+        return 0
+    string8 marker = sanitizer_marker(sanitized_runs, o.sanitize_kind, ubsan_only(cc))
+    fmt.println(summary_line(passed, failed, filtered, shard_k, shard_n, other_slices, marker))
+    if failed > 0: return 1
+    return 0

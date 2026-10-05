@@ -1,0 +1,261 @@
+@test
+// The gap buffer, checked two ways.
+//
+// **Against a shadow.** A plain run edited by naive shifting is obviously right
+// and slow; the gap buffer is supposed to be the same thing, fast. Two random
+// churns of 100 000 operations each — inserts, removes, sets, gets and bare gap
+// moves at random positions — are run on both and compared, element by element,
+// every 1 000 operations and at the end. One churn is over a two-field record
+// and one over a plain `i64`, so a `T` wider than a word and one that is not are
+// both exercised.
+//
+// **Against derived numbers.** The byte counters are the reason the container
+// exists, so they are asserted exactly: each expected figure below is worked
+// out beside it from the gap's position and `#size(T)`, never read back from a
+// run and pasted in.
+package slices
+
+import "core:mem/libc"
+
+// Two slots of different meaning, the way an editor's line record is: an
+// identity and a measurement.
+private type GapLine: (i64 id, i64 width)
+
+private type LineGap: (ref []GapLine data, Gap gap)
+
+private type IntGap: (ref []i64 data, Gap gap)
+
+// A xorshift64 stream: deterministic, so a failure reproduces.
+private u64 gap_next(^u64 state):
+    u64 s = state^
+    s = s ~ (s << 13)
+    s = s ~ (s >> 7)
+    s = s ~ (s << 17)
+    state^ = s
+    return s
+
+// A value in `0 ..< bound`, for `bound > 0`.
+private i64 gap_below(^u64 state, i64 bound):
+    return i64(gap_next(state) % u64(bound))
+
+private GapLine line_of(i64 k):
+    return (k, k * 3 + 1)
+
+private i64 int_of(i64 k):
+    return k * 7 - 5
+
+// The shadow's capacity. The churn keeps the length under it by removing
+// whenever it gets close, so the shadow never needs to grow.
+private const i64 SHADOW = 2048
+
+// Whether the gap buffer holds exactly `shadow[0 ..< n]`.
+private bool gap_same(^(ref []$T, Gap) g, []T shadow, i64 n, string8 label) where #has_eq(T):
+    if !#expect(gap_len(g) == n, label, ": length ", gap_len(g), ", shadow ", n):
+        return false
+    for i in i64(0)..<n:
+        (T v, bool ok) = gap_get(g, i)
+        if !#expect(ok && v == shadow[i], label, ": element ", i, " differs"):
+            return false
+    return true
+
+// `ops` random edits applied to both, compared as it goes.
+private bool gap_churn(^(ref []$T, Gap) g, T(i64) value_of, u64 seed, i64 ops, string8 label) where #has_eq(T):
+    ref []T shadow = #make([]T, SHADOW, #heap)
+    i64 n = 0
+    u64 state = seed
+    bool ok = true
+    for op in i64(0)..<ops:
+        i64 kind = gap_below(&state, 10)
+        if n > SHADOW - 16:
+            kind = 4
+        if kind <= 3:
+            // insert 1..4 at a position in 0 ..= n, then fill them
+            i64 at = gap_below(&state, n + 1)
+            i64 m = 1 + gap_below(&state, 4)
+            ok = #expect(gap_insert(g, at, m), label, ": insert refused at op ", op) && ok
+            i64 k = n - 1
+            for k >= at:
+                shadow[k + m] = shadow[k]
+                k = k - 1
+            for j in i64(0)..<m:
+                T v = value_of(op * 4 + j)
+                shadow[at + j] = v
+                _ = gap_set(g, at + j, v)
+            n = n + m
+        else if kind <= 6 && n > 0:
+            // remove 1..4, clipped to what exists after `at`
+            i64 at = gap_below(&state, n)
+            i64 m = 1 + gap_below(&state, 4)
+            if m > n - at:
+                m = n - at
+            ok = #expect(gap_remove(g, at, m), label, ": remove refused at op ", op) && ok
+            for k in at..<(n - m):
+                shadow[k] = shadow[k + m]
+            n = n - m
+        else if kind == 7 && n > 0:
+            i64 at = gap_below(&state, n)
+            T v = value_of(op)
+            shadow[at] = v
+            ok = #expect(gap_set(g, at, v), label, ": set refused at op ", op) && ok
+        else if kind == 8 && n > 0:
+            i64 at = gap_below(&state, n)
+            (T v, bool got) = gap_get(g, at)
+            ok = #expect(got && v == shadow[at], label, ": get at op ", op) && ok
+        else:
+            gap_move(g, gap_below(&state, n + 1))
+        if op % 1000 == 999:
+            ok = gap_same(g, shadow[:], n, label) && ok
+            if !ok:
+                #delete(shadow)
+                return false
+    ok = gap_same(g, shadow[:], n, label) && ok
+    #delete(shadow)
+    return ok
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = libc.allocator()
+    u64 word = u64(#size(i64))
+    u64 wide = u64(#size(GapLine))
+
+    // ── the shadow churns ────────────────────────────────────────────────────
+    LineGap lines
+    ok = #expect(gap_init(&lines, 4, a), "init lines") && ok
+    ok = gap_churn(&lines, line_of, 88172645463325252, 100000, "line churn") && ok
+    gap_free(&lines)
+
+    IntGap ints
+    ok = #expect(gap_init(&ints, 0, a), "init ints") && ok
+    ok = gap_churn(&ints, int_of, 2463534242, 100000, "int churn") && ok
+    gap_free(&ints)
+
+    // ── inserting at the front, the back and the middle ─────────────────────
+    IntGap g
+    ok = #expect(gap_init(&g, 16, a), "init 16") && ok
+    for i in i64(0)..<10:
+        ok = #expect(gap_push(&g, i), "push ", i) && ok
+    // Each push inserts at the length, which is where the previous one left the
+    // gap: ten inserts, nothing crosses it.
+    ok = #expect(gap_bytes_moved(&g) == 0, "pushes moved ", gap_bytes_moved(&g)) && ok
+
+    // Insert at 3 from a gap at 10: the seven elements 3..9 cross it.
+    ok = #expect(gap_insert(&g, 3, 2), "insert 3") && ok
+    ok = #expect(g.gap.shifted == 7 * word, "insert at 3 shifted ", g.gap.shifted) && ok
+    // At 5, which is where that insert left the gap: free.
+    ok = #expect(gap_insert(&g, 5, 1), "insert 5") && ok
+    ok = #expect(g.gap.shifted == 7 * word, "insert at 5 shifted ", g.gap.shifted) && ok
+    // Contents: 0 1 2 _ _ _ 3 4 5 6 7 8 9, the three new ones zero.
+    [13]i64 mid = [0, 1, 2, 0, 0, 0, 3, 4, 5, 6, 7, 8, 9]
+    ok = gap_same(&g, mid[:], 13, "middle") && ok
+
+    // At 0: the gap is at 6, so elements 0..5 cross it — six more.
+    ok = #expect(gap_insert(&g, 0, 1), "insert 0") && ok
+    ok = #expect(g.gap.shifted == 13 * word, "insert at 0 shifted ", g.gap.shifted) && ok
+    // At the end, 14, from a gap at 1: the thirteen after it cross.
+    ok = #expect(gap_insert(&g, 14, 1), "insert end") && ok
+    ok = #expect(g.gap.shifted == 26 * word, "insert at end shifted ", g.gap.shifted) && ok
+    ok = #expect(gap_len(&g) == 15 && gap_cap(&g) == 16, "len ", gap_len(&g), " cap ", gap_cap(&g)) && ok
+    [15]i64 ends = [0, 0, 1, 2, 0, 0, 0, 3, 4, 5, 6, 7, 8, 9, 0]
+    ok = gap_same(&g, ends[:], 15, "ends") && ok
+
+    // An explicit move is exactly distance · size, in either direction.
+    gap_move(&g, 4)
+    ok = #expect(g.gap.shifted == 37 * word, "move to 4 shifted ", g.gap.shifted) && ok
+    gap_move(&g, 12)
+    ok = #expect(g.gap.shifted == 45 * word, "move to 12 shifted ", g.gap.shifted) && ok
+    gap_move(&g, 12)
+    ok = #expect(g.gap.shifted == 45 * word, "move in place shifted ", g.gap.shifted) && ok
+    // Clamped, not refused: -5 is 0 (twelve cross) and 99 is 15 (fifteen).
+    gap_move(&g, 0 - 5)
+    ok = #expect(g.gap.start == 0 && g.gap.shifted == 57 * word, "clamp low ", g.gap.start) && ok
+    gap_move(&g, 99)
+    ok = #expect(g.gap.start == 15 && g.gap.shifted == 72 * word, "clamp high ", g.gap.start) && ok
+    ok = gap_same(&g, ends[:], 15, "after moves") && ok
+
+    // ── growth ───────────────────────────────────────────────────────────────
+    // Fifteen in sixteen; five more at 7 do not fit, so the block doubles to 32
+    // and all fifteen are copied once — and none of them is counted as motion,
+    // though the gap was at 15 and the insert at 7.
+    ok = #expect(gap_insert(&g, 7, 5), "insert past capacity") && ok
+    ok = #expect(gap_cap(&g) == 32, "grew to ", gap_cap(&g)) && ok
+    ok = #expect(g.gap.grown == 15 * word, "growth copied ", g.gap.grown) && ok
+    ok = #expect(g.gap.shifted == 72 * word, "growth shifted ", g.gap.shifted) && ok
+    ok = #expect(g.gap.start == 12, "gap left at ", g.gap.start) && ok
+    [20]i64 grown = [0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6, 7, 8, 9, 0]
+    ok = gap_same(&g, grown[:], 20, "grown") && ok
+
+    // ── removing across the gap ──────────────────────────────────────────────
+    ok = #expect(gap_set(&g, 0, 100) && gap_set(&g, 13, 104), "sets") && ok
+    gap_move(&g, 10)
+    u64 before = g.gap.shifted
+    // `[8, 14)` straddles the gap at 10. The gap moves back to 8 (two elements)
+    // and widens by six.
+    ok = #expect(gap_remove(&g, 8, 6), "remove across") && ok
+    ok = #expect(g.gap.shifted - before == 2 * word, "remove shifted ", g.gap.shifted - before) && ok
+    [14]i64 cut = [100, 0, 1, 2, 0, 0, 0, 0, 5, 6, 7, 8, 9, 0]
+    ok = gap_same(&g, cut[:], 14, "removed") && ok
+    // Removing again at the same place is free: the gap is already there.
+    before = g.gap.shifted
+    ok = #expect(gap_remove(&g, 8, 1), "remove again") && ok
+    ok = #expect(g.gap.shifted == before, "second remove shifted ", g.gap.shifted - before) && ok
+
+    // ── out of range, refused or clamped, never aborting ─────────────────────
+    i64 count = gap_len(&g)
+    (i64 lo, bool lo_ok) = gap_get(&g, 0 - 1)
+    (i64 hi, bool hi_ok) = gap_get(&g, count)
+    ok = #expect(!lo_ok && lo == 0 && !hi_ok && hi == 0, "get out of range answered") && ok
+    ok = #expect(!gap_set(&g, count, 1) && !gap_set(&g, 0 - 1, 1), "set out of range accepted") && ok
+    ok = #expect(gap_at(&g, count) == nil && gap_at(&g, 0 - 1) == nil, "at out of range") && ok
+    ok = #expect(!gap_insert(&g, count + 1, 1) && !gap_insert(&g, 0 - 1, 1), "insert out of range") && ok
+    ok = #expect(!gap_insert(&g, 0, 0 - 1), "negative insert") && ok
+    ok = #expect(!gap_remove(&g, count - 1, 2) && !gap_remove(&g, 0 - 1, 1), "remove out of range") && ok
+    ok = #expect(!gap_remove(&g, 0, 0 - 1), "negative remove") && ok
+    ok = #expect(gap_insert(&g, count, 0) && gap_remove(&g, count, 0), "empty edits at the end") && ok
+    ok = #expect(gap_len(&g) == count, "a refusal changed the length") && ok
+    gap_free(&g)
+
+    // ── a zero-capacity start, and the zero pair ─────────────────────────────
+    IntGap z
+    ok = #expect(gap_init(&z, 0, a), "init 0") && ok
+    ok = #expect(gap_cap(&z) == 0 && gap_len(&z) == 0, "zero start holds ", gap_cap(&z)) && ok
+    // The first push grows to the floor of 8 and copies nothing; the ninth
+    // doubles to 16 and copies the eight.
+    for i in i64(0)..<9:
+        ok = #expect(gap_push(&z, i), "zero push ", i) && ok
+    ok = #expect(gap_cap(&z) == 16 && z.gap.grown == 8 * word, "zero start grew ", z.gap.grown) && ok
+    ok = #expect(z.gap.shifted == 0, "zero start shifted ", z.gap.shifted) && ok
+    [9]i64 nine = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    ok = gap_same(&z, nine[:], 9, "zero start") && ok
+    gap_clear(&z)
+    ok = #expect(gap_len(&z) == 0 && gap_cap(&z) == 16, "clear kept the block") && ok
+    gap_free(&z)
+    ok = #expect(!gap_init(&z, 0 - 1, a), "negative capacity") && ok
+
+    IntGap none
+    ok = #expect(!gap_push(&none, 1), "the zero pair has no allocator to grow from") && ok
+    ok = #expect(gap_len(&none) == 0, "zero pair length") && ok
+    gap_free(&none)
+
+    // ── a record, changed in place ───────────────────────────────────────────
+    LineGap doc
+    ok = #expect(gap_init(&doc, 2, a), "init doc") && ok
+    for i in i64(0)..<5:
+        ok = #expect(gap_push(&doc, line_of(i)), "doc push ", i) && ok
+    // Cap 2, then 8 when the third push found no room, copying two lines.
+    ok = #expect(doc.gap.grown == 2 * wide, "doc grew ", doc.gap.grown) && ok
+    ^GapLine p = gap_at(&doc, 3)
+    p.width = 999
+    (GapLine third, bool got) = gap_get(&doc, 3)
+    ok = #expect(got && third.id == 3 && third.width == 999, "in place gave ", third) && ok
+    // An Enter at line 1, then another below it. The gap was at 5, so lines
+    // 1..4 cross for the first — four lines — and none cross for the second,
+    // which is where the first left the gap.
+    ok = #expect(gap_insert(&doc, 1, 1), "enter 1") && ok
+    ok = #expect(doc.gap.shifted == 4 * wide, "enter shifted ", doc.gap.shifted) && ok
+    ok = #expect(gap_insert(&doc, 2, 1), "enter 2") && ok
+    ok = #expect(doc.gap.shifted == 4 * wide, "second enter shifted ", doc.gap.shifted) && ok
+    gap_free(&doc)
+
+    if ok:
+        return 0
+    return 1

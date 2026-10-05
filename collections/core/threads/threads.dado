@@ -1,0 +1,302 @@
+// core:threads — portable threads, locks, condition variables and atomics.
+//
+// A thin, framework-agnostic wrapper over POSIX threads, and the foundation
+// core:jobs builds its worker pool on. Handles are opaque `rawptr`s; a thread
+// entry is an ordinary Dado function reference passed to C as a function
+// pointer.
+//
+// **It is Dado over the C library, with no C of its own.** A `foreign` block
+// names the header's own types and functions and cc checks the restatement
+// against `<pthread.h>`; the atomics are the language's `#atomic_*` verbs.
+//
+// `pthread_join` takes a `pthread_t` **by value**, and that is the call this
+// package carried a two-file C shim for. It does not need one: a bodiless
+// `foreign` type is complete in C, so `pthread_t` crosses by value and `cc`
+// supplies the size — which is the only place the size was ever a question,
+// since restating it as an integer is true of glibc and false of Darwin,
+// where it is a pointer.
+//
+// This is a `core:` library, not `app:` — it owes tests, because it wraps
+// lower-level C and OS code: a concurrency engine is exactly what a test is
+// for.
+//
+// ## What a spawned thread shares, and what it does not
+//
+// **Its own:** the ambient allocator — a new thread starts at the root, C's
+// heap, never at the `using` its spawner has open, and a `using` it opens is
+// undone on it alone — and `core:runtime`'s scratch, whose depth, checkpoints
+// and arena are per thread (its first temp scope configures it). Any
+// package-level variable declared `@thread_local` is per thread the same way,
+// starting at its initializer.
+//
+// **Shared, and not synchronised by anything but you:** every other
+// package-level variable, everything a pointer reaches, and every map — two
+// threads writing one `{K: V}`, even on disjoint keys, corrupt its table. Guard
+// those with `mutex_new`/`lock`/`unlock`, or hand each thread its own. Build a
+// test that spawns with `./dado test --sanitize=thread` as well as the default.
+package threads
+
+// A thread entry: takes the argument pointer it was spawned with, returns a
+// result pointer (or nil). Matches C's `void *(*)(void *)`.
+type ThreadFn: rawptr(rawptr)
+
+// **On the web** a thread is a worker on the module's shared memory, and the
+// calls below are the runtime the compiler emits into a `#WEB` program,
+// through its `dado/web.h` (not a C header: the runtime's own). A module has
+// threads only when built with `--web-threads`; without it `spawn` is refused
+// at compile time (ERR1033) and the rest works on the one thread there is. A
+// browser's main thread cannot wait, so a `join` there answers false and
+// says why on standard error; join from a worker. Node's main thread can.
+when #OS == #WEB:
+    private foreign "dado/web.h":
+        rawptr dado_rt__web_thread_spawn(ThreadFn entry, rawptr arg)
+        bool dado_rt__web_thread_join(rawptr handle)
+        i32 dado_rt__web_thread_cores()
+        rawptr dado_rt__web_mutex_new()
+        void dado_rt__web_mutex_lock(rawptr m)
+        void dado_rt__web_mutex_unlock(rawptr m)
+        void dado_rt__web_mutex_free(rawptr m)
+        rawptr dado_rt__web_cond_new()
+        void dado_rt__web_cond_wait(rawptr c, rawptr m)
+        bool dado_rt__web_cond_wait_for(rawptr c, rawptr m, i64 ms)
+        void dado_rt__web_cond_signal(rawptr c)
+        void dado_rt__web_cond_broadcast(rawptr c)
+        void dado_rt__web_cond_free(rawptr c)
+
+    rawptr spawn(ThreadFn fn, rawptr arg): return dado_rt__web_thread_spawn(fn, arg)
+
+    bool join(rawptr t): return dado_rt__web_thread_join(t)
+
+    i32 hardware_concurrency(): return dado_rt__web_thread_cores()
+
+    rawptr mutex_new(): return dado_rt__web_mutex_new()
+
+    void lock(rawptr m): dado_rt__web_mutex_lock(m)
+
+    void unlock(rawptr m): dado_rt__web_mutex_unlock(m)
+
+    void mutex_free(rawptr m): dado_rt__web_mutex_free(m)
+
+    rawptr cond_new(): return dado_rt__web_cond_new()
+
+    void cond_wait(rawptr c, rawptr m): dado_rt__web_cond_wait(c, m)
+
+    // At most `ms` milliseconds; true when woken. A single-threaded module
+    // has nobody to wake it, so there the time runs out at once.
+    bool cond_wait_for(rawptr c, rawptr m, i64 ms): return dado_rt__web_cond_wait_for(c, m, ms)
+
+    void cond_signal(rawptr c): dado_rt__web_cond_signal(c)
+
+    void cond_broadcast(rawptr c): dado_rt__web_cond_broadcast(c)
+
+    void cond_free(rawptr c): dado_rt__web_cond_free(c)
+
+else:
+    // A handle is C's heap, `malloc`ed at the size cc gives the pthreads object,
+    // and not a Dado allocation: the API hands out a `rawptr`, and there is no way
+    // back from one to the reference `#delete` needs. Each alias is how that
+    // `rawptr` becomes the typed pointer a call takes: a conversion is written
+    // with a type's name, and `^pthread_t(t)` would read as a function type.
+    private type PThread: ^pthread_t
+
+    private type PMutex: ^pthread_mutex_t
+
+    private type PCond: ^pthread_cond_t
+
+    // The feature-test macros are emitted above every `#include`, because glibc's
+    // `<features.h>` fixes the feature set the first time any header pulls it in.
+    private foreign "pthread.h" define "_POSIX_C_SOURCE=200809L":
+        type pthread_t
+
+        type pthread_mutex_t
+
+        type pthread_cond_t
+
+        // The three attribute objects, which this package never builds — every
+        // call below passes `nil` for the default. Declared so the parameters say
+        // the `const pthread_attr_t *` the header does: a `rawptr` there is a
+        // `void *` and a different C type, which the `_Generic` assertion over
+        // each foreign signature refuses.
+        type pthread_attr_t
+
+        type pthread_mutexattr_t
+
+        type pthread_condattr_t
+
+        #c.int pthread_create(^pthread_t thread, ^const pthread_attr_t attr, ThreadFn entry, rawptr arg)
+
+        // **The one pthreads call that takes its object by value.** It is why
+        // `systhreads.c` existed and why it does not any more: a bodiless
+        // `foreign` type is complete in C, so `pthread_t` crosses here exactly as
+        // the header declares it and `cc` supplies the size.
+        #c.int pthread_join(pthread_t thread, ^rawptr retval)
+
+        #c.int pthread_mutex_init(^pthread_mutex_t mutex, ^const pthread_mutexattr_t attr)
+
+        #c.int pthread_mutex_lock(^pthread_mutex_t mutex)
+
+        #c.int pthread_mutex_unlock(^pthread_mutex_t mutex)
+
+        #c.int pthread_mutex_destroy(^pthread_mutex_t mutex)
+
+        #c.int pthread_cond_init(^pthread_cond_t cond, ^const pthread_condattr_t attr)
+
+        #c.int pthread_cond_wait(^pthread_cond_t cond, ^pthread_mutex_t mutex)
+
+        #c.int pthread_cond_timedwait(^pthread_cond_t cond, ^pthread_mutex_t mutex, ^const ThreadsTimespec abstime)
+
+        #c.int pthread_cond_signal(^pthread_cond_t cond)
+
+        #c.int pthread_cond_broadcast(^pthread_cond_t cond)
+
+        #c.int pthread_cond_destroy(^pthread_cond_t cond)
+
+    // C11's wall clock, which `pthread_cond_timedwait`'s deadline is read on;
+    // `ThreadsTimespec` names `struct timespec`, which POSIX declares tagged.
+    private foreign "time.h" define "ThreadsTimespec=struct timespec":
+        type ThreadsTimespec:
+            #c.long tv_sec,
+            #c.long tv_nsec,
+
+        const #c.int TIME_UTC
+
+        #c.int timespec_get(^ThreadsTimespec ts, #c.int base)
+
+    // `_SC_NPROCESSORS_ONLN` is not POSIX, and Darwin hides it under
+    // `_POSIX_C_SOURCE` unless `_DARWIN_C_SOURCE` is defined too. Each macro is
+    // inert on the platform it is not for.
+    private foreign "unistd.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        const #c.int _SC_NPROCESSORS_ONLN
+
+        #c.long sysconf(#c.int name)
+
+    // `#c.size_t` and not `u64`: the same width, and on Darwin not the same type
+    // (`uint64_t` is `unsigned long long` there), which the emitter's `_Generic`
+    // assertion on this restatement would refuse.
+    private foreign "stdlib.h":
+        rawptr malloc(#c.size_t nbytes)
+
+        void free(rawptr ptr)
+
+    // ── threads ─────────────────────────────────────────────────────────────────
+
+    // Spawn a thread running `fn(arg)`. Returns an opaque handle, or nil on failure.
+    // The handle is consumed by `join`.
+    rawptr spawn(ThreadFn fn, rawptr arg):
+        rawptr t = malloc(#c.size_t(#size(pthread_t)))
+        if t != nil && pthread_create(PThread(t), nil, fn, arg) != 0:
+            free(t)
+            return nil
+
+        return t
+
+    // Join and free a thread handle. True on success; a nil handle is a failure.
+    bool join(rawptr t):
+        if t == nil:
+            return false
+
+        // The handle is a `rawptr` to C's heap, so the thread is read back out of
+        // it by dereferencing the alias — `PThread(t)^` — and handed over by
+        // value, which is what the header asks for. The exit value is not wanted:
+        // `join`'s answer is whether the join succeeded.
+        #c.int rc = pthread_join(PThread(t)^, nil)
+        free(t)
+        return rc == 0
+
+    // The online processor count, at least 1.
+    i32 hardware_concurrency():
+        #c.long n = sysconf(_SC_NPROCESSORS_ONLN)
+        if n >= 1:
+            return i32(n)
+
+        return 1
+
+    // ── mutex ────────────────────────────────────────────────────────────────────
+    // A nil handle is ignored by every call that takes one, and `mutex_new`
+    // answers nil when it cannot allocate or initialise.
+
+    rawptr mutex_new():
+        rawptr m = malloc(#c.size_t(#size(pthread_mutex_t)))
+        if m != nil && pthread_mutex_init(PMutex(m), nil) != 0:
+            free(m)
+            return nil
+
+        return m
+
+    void lock(rawptr m):
+        if m != nil:
+            _ = pthread_mutex_lock(PMutex(m))
+
+    void unlock(rawptr m):
+        if m != nil:
+            _ = pthread_mutex_unlock(PMutex(m))
+
+    void mutex_free(rawptr m):
+        if m == nil:
+            return
+
+        _ = pthread_mutex_destroy(PMutex(m))
+        free(m)
+
+    // ── condition variable ───────────────────────────────────────────────────────
+    // Wait releases `m` while blocked and re-acquires it before returning, so a
+    // caller holds `m`, loops on its predicate, and `cond_wait`s inside the loop.
+    // Nil handles are ignored, as for a mutex.
+
+    rawptr cond_new():
+        rawptr c = malloc(#c.size_t(#size(pthread_cond_t)))
+        if c != nil && pthread_cond_init(PCond(c), nil) != 0:
+            free(c)
+            return nil
+
+        return c
+
+    void cond_wait(rawptr c, rawptr m):
+        if c != nil && m != nil:
+            _ = pthread_cond_wait(PCond(c), PMutex(m))
+
+    // `cond_wait` for at most `ms` milliseconds: true when woken, false when
+    // the time ran out first (or `ms` is not positive, which waits not at
+    // all). Like `cond_wait` it may wake for nothing, so a caller loops on
+    // its predicate and on its own deadline.
+    bool cond_wait_for(rawptr c, rawptr m, i64 ms):
+        if c == nil || m == nil || ms <= 0:
+            return false
+
+        ThreadsTimespec at = (0, 0)
+        _ = timespec_get(&at, TIME_UTC)
+        i64 ns = i64(at.tv_nsec) + ms % 1000 * 1000000
+        at.tv_sec = #c.long(i64(at.tv_sec) + ms / 1000 + ns / 1000000000)
+        at.tv_nsec = #c.long(ns % 1000000000)
+        return pthread_cond_timedwait(PCond(c), PMutex(m), &at) == 0
+
+    void cond_signal(rawptr c):
+        if c != nil:
+            _ = pthread_cond_signal(PCond(c))
+
+    void cond_broadcast(rawptr c):
+        if c != nil:
+            _ = pthread_cond_broadcast(PCond(c))
+
+    void cond_free(rawptr c):
+        if c == nil:
+            return
+
+        _ = pthread_cond_destroy(PCond(c))
+        free(c)
+
+// ── atomics on a caller-owned i32 cell ───────────────────────────────────────
+// The cell is an ordinary `i32` the caller keeps alive (in a heap allocation
+// shared between threads). These are sequentially consistent: each is one
+// `#atomic_*` verb at `#SEQ_CST`, for a caller that holds a cell and not an
+// ordering. A caller choosing its own ordering writes the verb itself, as
+// core:jobs does.
+
+i32 atomic_load(^i32 p): return #atomic_load(p, #SEQ_CST)
+void atomic_store(^i32 p, i32 v): #atomic_store(p, v, #SEQ_CST)
+i32 atomic_fetch_add(^i32 p, i32 d): return #atomic_fetch_add(p, d, #SEQ_CST)
+
+bool atomic_cas(^i32 p, i32 expected, i32 desired):
+    (i32 _, bool swapped) = #atomic_compare_exchange(p, expected, desired,
+        false, #SEQ_CST, #SEQ_CST)
+    return swapped

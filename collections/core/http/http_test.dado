@@ -1,0 +1,98 @@
+@test
+// core:http — lifecycle and a real loopback round trip.
+//
+// The round trip runs a `curl` in the background through `core:os/proc` (popen
+// starts the child immediately, so it runs concurrently with our accept loop),
+// then accepts the connection it makes and answers it. The whole accept loop is
+// **wall-clock bounded** (`time.since` < 5s) so a missing `curl`, a firewall, or
+// any other reason a connection never arrives fails the test rather than hanging
+// the gate. `--retry-connrefused` rides out the gap before the server is polling.
+//
+// PORT is a literal here and in the curl command below; keep the two equal.
+package http
+
+import "core:os/proc"
+import "core:io"
+import "core:strings"
+import "core:time"
+
+const u16 PORT = 18973
+
+i32 test():
+    bool ok = true
+
+    Server s = listen(PORT)
+    ok = #expect(valid(s), "listen on ", i32(PORT)) && ok
+    if !valid(s):
+        return 1
+
+    // a second bind on the same port must fail — proves the bind is real and
+    // not a stub that hands back an unbound descriptor
+    Server dup = listen(PORT)
+    ok = #expect(!valid(dup), "second bind on the same port is refused") && ok
+    if valid(dup):
+        stop(dup)
+
+    // non-blocking: with no client waiting, poll answers "nothing" at once
+    Accepted empty = poll(s)
+    ok = #expect(!empty.ok, "poll with no client returns nothing") && ok
+
+    // the client, running concurrently
+    ^io.FILE cli = proc.read(
+        "curl -s --retry 3 --retry-delay 1 --retry-connrefused http://127.0.0.1:18973/ping 2>/dev/null")
+    ok = #expect(proc.opened(cli), "curl launched") && ok
+
+    f64 t0 = time.now()
+    bool served = false
+    for time.since(t0) < 5.0 && !served:
+        Accepted a = poll(s)
+        if a.ok:
+            ok = #expect(method() == Method.Get, "request method is GET") && ok
+            ok = #expect(strings.starts_with(path(), "/ping"),
+                        "request path starts with /ping (got ", path(), ")") && ok
+            respond(a.conn, 200, "OK", "text/plain", "pong")
+            served = true
+        else:
+            time.nap(5)
+    ok = #expect(served, "server accepted and answered within 5s") && ok
+
+    // curl's stdout is exactly the body we sent
+    (cstring pong, bool got) = io.read_line(cli)
+    ok = #expect(got, "curl produced a body") && ok
+    if got:
+        string8 pong_s = strings.borrow_from_cstring(pong)
+        ok = #expect(#len(pong_s) == 4, "body is 4 bytes ('pong'), got ", #len(pong_s)) && ok
+    _ = proc.close(cli)
+
+    // ── a POST with a body, answered with CORS ────────────────────────────────
+    // curl -si prints the response headers; grep keeps only the CORS one, so a
+    // non-empty line back proves respond_cors sent it.
+    ^io.FILE cli2 = proc.read(
+        "curl -si --retry 3 --retry-connrefused -X POST --data '{\"events\":[{\"type\":\"log\",\"text\":\"hi\"}]}' http://127.0.0.1:18973/ingest 2>/dev/null | grep -i 'access-control-allow-origin'")
+    ok = #expect(proc.opened(cli2), "curl POST launched") && ok
+
+    f64 t1 = time.now()
+    bool posted = false
+    for time.since(t1) < 5.0 && !posted:
+        Accepted a = poll(s)
+        if a.ok:
+            ok = #expect(method() == Method.Post, "method is POST") && ok
+            ok = #expect(strings.starts_with(path(), "/ingest"), "path /ingest, got ", path()) && ok
+            ok = #expect(strings.contains(body(), "\"text\":\"hi\""),
+                        "the POST body reached body()") && ok
+            respond_cors(a.conn, 204, "No Content", "text/plain", "")
+            posted = true
+        else:
+            time.nap(5)
+    ok = #expect(posted, "server received the POST within 5s") && ok
+
+    (cstring hdr, bool gh) = io.read_line(cli2)
+    string8 hdr_s = strings.borrow_from_cstring(hdr)
+    ok = #expect(gh && #len(hdr_s) > 0, "response carried the CORS header") && ok
+    _ = proc.close(cli2)
+
+    stop(s)
+
+    if ok:
+        return 0
+    return 1

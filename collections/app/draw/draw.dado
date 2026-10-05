@@ -1,0 +1,1545 @@
+// app:draw — a retained 2D graphics server over `vendor:sokol/sokol_gp`.
+//
+// This package is a **server**, in Godot's sense of the word: it owns
+// resources, it owns a tree of canvas items, and a client talks to it entirely
+// through handles. Nothing is drawn when a `draw_*` call is made. A call
+// *records*, and `canvas_render` is what turns a whole tree into draw calls.
+//
+//     draw.init() using alloc                            // after sg_setup
+//     draw.Canvas c = draw.canvas_create()
+//     draw.Item bg = draw.canvas_item_create(c)
+//     draw.rect(bg, (0.0, 0.0, 800.0, 600.0), [26, 30, 38, 255])
+//     draw.Item label = draw.canvas_item_create(c)
+//     _ = draw.canvas_item_set_parent(label, bg)
+//     draw.canvas_item_set_position(label, (8.0, 8.0))
+//     ...
+//     sg_begin_pass(&pass)
+//     draw.canvas_render(c, fb_w, fb_h)                  // inside the pass
+//     sg_end_pass()
+//
+// The two lines worth staring at are the ones that are *not* in the frame
+// loop. `rect` is written once and the rectangle is drawn every frame
+// thereafter; a frame that changes nothing re-records nothing. That is the
+// whole difference from what this package used to be, and it is why the
+// command tape below is the architecture rather than a testability device.
+//
+// ── Why `sokol_gp` ─────────────────────────────────────────────────────────
+//
+// What it deletes: **every hand-written shader string.** This package used to
+// carry GLSL 4.10, GLSL ES 3.00 and MSL as source strings chosen off
+// `sg_query_backend()`, of which one was pixel-verified, one had never been
+// compiled by any machine in this tree, and three further backends had no
+// string at all, so `init` answered `false` on them. `sokol_gp` ships shaders
+// for every backend it supports. Nine string constants, two shaders, two
+// pipelines, one sampler, one vertex buffer, one index buffer and the whole
+// backend switch are gone, and what replaced them is `sgp_setup`.
+//
+// The two models turned out to be one model, which is the argument for the
+// swap rather than a happy accident:
+//
+// | | this package, before | `sokol_gp` |
+// |---|---|---|
+// | coordinates | f32 pixels, origin top-left, y down | `sgp_begin`'s default projection, identically |
+// | colour | `[4]u8` RGBA, straight alpha | `sgp_color_ub4`, straight |
+// | blend | `SRC_ALPHA / ONE_MINUS_SRC_ALPHA`, alpha `ONE / ONE_MINUS_SRC_ALPHA` | `SGP_BLENDMODE_BLEND`, byte for byte |
+//
+// The alpha source factor being `ONE` rather than `SRC_ALPHA` is a choice this
+// file wrote a parenthetical to justify — so an offscreen target accumulates a
+// correct coverage — and `sokol_gp` had made the same one independently.
+//
+// **Three things it costs**, each written down rather than papered over.
+//
+// 1. `sgp_draw_filled_rects` gives its vertices texcoords spanning the *whole*
+//    bound texture, so an untextured rectangle drawn while an atlas view is
+//    bound samples the atlas. Every untextured primitive here issues
+//    `sgp_reset_view(0)` first. That is not a defect; it is why `app:font`'s
+//    reserved opaque texel still earns its place.
+// 2. `sokol_gp` exposes no command count of its own.
+// 3. `sgp_setup` needs a live `sokol_gfx` context, so `init_headless` — which
+//    makes no sokol call at all — cannot sit on top of it.
+//
+// (2) and (3) are answered by the tape.
+//
+// ── The tape is the canvas item ────────────────────────────────────────────
+//
+// A canvas item **is** a command list. Recording is appending to it. Headless
+// is record-and-do-not-replay, and the recorded list is the same list the GPU
+// path replays, so a headless test proves the live path rather than a stand-in
+// for it — every number `commands()`, `primitives()` and `state_changes()`
+// answer is computed by the same walk in both modes, because the emitters in
+// `device.dado` count first and call sokol second, and headless returns between
+// the two lines. There is no second copy of the traversal to drift.
+//
+// Counting is then honest in two numbers instead of one invented one.
+// `state_changes()` is an **upper bound** — the optimiser only ever merges,
+// never splits — and `gpu_draw_calls()` is `sg_query_stats().prev_frame.num_draw`,
+// the truth, one frame late. The gap between them is the diagnostic: it says
+// what the optimiser saved.
+//
+// That only works while the bound is **tight**, which is why `state_changes()`
+// counts exactly the four things `sokol_gp`'s merge test reads and not one
+// thing more. It briefly counted a fifth — the item transform — on the false
+// belief that the model-view projection was a uniform; the bound stayed
+// correct and the gap stopped meaning anything, which is a worse failure for a
+// diagnostic than being wrong in a way somebody notices.
+//
+// **The cost, stated.** A primitive is written twice: once into the tape, once
+// into `sokol_gp`'s vertices. The immediate path wrote it once. For a
+// re-recorded frame that is strictly more CPU work; for an unchanged frame it
+// is strictly less, because nothing is recorded at all. **Nothing here has
+// been measured on a GPU** — the container this was written in has none — so
+// the crossover is unknown and is a row, not a claim.
+//
+// ── The command record is one shape, and it is 64 bytes ────────────────────
+//
+// One `Cmd` per recorded call, uniform across every kind, with a `kind` field
+// selecting how the rest is read. `#size(Cmd)` is **64** — the test asserts it
+// — which is a cache line, and no slot is padding under any of the fifteen
+// kinds:
+//
+//     kind  4   the discriminant
+//     tex   8   (i32 index, u32 generation)
+//     a    16   dest rect / line endpoints / clip rect / the matrix's 2x2
+//     b    16   source rect / centre+radius / the matrix's translation
+//     col   4   the recorded colour, before the tree's tint
+//     width 4   Godot's filled/hairline sentinel, negative for either
+//     first 4   where this command's point run starts
+//     count 4   how many points it has
+//     flags 4   filled, or the blend mode under CMD_SET_BLEND
+//
+// A **union would have been smaller and is not what this is.** A tagged union
+// over fifteen members costs fifteen `switch` arms in every function that
+// touches a command — the recorder, the replayer, the counter — where one flat
+// shape costs fifteen arms in exactly one of them. And a `Cmd` array is
+// walked linearly, so the win from a 40-byte record would be bandwidth on a
+// pass that is already dominated by what it hands to `sokol_gp`.
+//
+// It is also the shape that makes the record **readable from outside**, which
+// is what `canvas_item_command` is: one answer of fixed slots, with a public
+// discriminant saying how to read them. A union would have had to be
+// destructured into exactly this on the way out anyway.
+//
+// **A point run does not fit and gets a side pool.** `polyline`, `multiline`,
+// `colored_polygon` and `primitive` each take an arbitrary number of points,
+// and a fixed record cannot hold them; `first`/`count` name a run in the
+// item's own `Vtx` pool instead. The pool is **per item**, not global, which
+// is what makes `canvas_item_clear` O(1): a global pool would leak every
+// cleared item's points until something compacted it, and compaction wants a
+// second pass over every command in the system to fix up indices.
+//
+// One `Vtx` is 20 bytes — position, texcoord and colour — and a `polyline`
+// uses only the first two of the three, so it pays 12 bytes a point it does
+// not need. **One pool rather than three** is the trade: three parallel pools
+// (positions, colours, texcoords) would save that on the two commands that are
+// all-position and cost three allocations, three growth policies and three
+// bounds checks on the one command — `primitive` — that needs all three.
+//
+// `set_transform_matrix` has no pool at all, because a `Transform2D` is a 3x3
+// whose third column is `(0, 0, 1)` by construction, so the six numbers that
+// mean anything fit in `a` and `b` exactly.
+//
+// ── Where the tree lives ───────────────────────────────────────────────────
+//
+// **In `app:graph`.** The dependency runs `app:draw` → `app:graph` and never
+// the other way. A `Canvas` owns a `graph.Graph`; an `Item` is a graph node
+// plus a command list, and the node's `payload` — the opaque `u32` that
+// package stores and never interprets — is what names the list.
+//
+// `app:graph` already had generational handles over a growable arena with a
+// free list, a parent/child tree, composed 2D transforms and a per-node
+// payload, and S1 added `visible`, `modulate`, `self_modulate`, `z_index`,
+// `z_as_relative`, `clip`, `custom_rect` and `update_transforms`. What it must
+// never learn is what a command is. The moment it imports a vendor package it
+// stops being the backend-neutral thing that made it reusable — so the command
+// list, the texture handles the opcodes name, the scissor and the traversal
+// that replays all live here, and `app:graph` holds a `u32` it never
+// dereferences.
+//
+// The `payload` this package writes is `item index + 1`, so zero keeps meaning
+// "no list". The item and its list share one index because the list lives *on*
+// the item slot; naming one names the other, and there is no second table to
+// keep in step.
+//
+// ── Handles ────────────────────────────────────────────────────────────────
+//
+// Godot has one untyped `RID` and finds a mistake at run time. Three
+// `distinct` types find it at compile time at no cost, because a name is a
+// view and `distinct` is the one construct whose whole job is to add an
+// identity. Each is `(i32 index, u32 generation)` — generational, because
+// items are created and freed constantly and a stale handle that silently
+// addresses a reused slot is the bug this shape exists to not have. Every
+// function below re-derives its own slot from a handle immediately before use;
+// a stale handle reads as dead and the call is a no-op or a `false`, never a
+// write to somebody else's item.
+//
+// ── Paint order ────────────────────────────────────────────────────────────
+//
+// `canvas_render` is four passes and they are all cheap:
+//
+//   1. `graph.update_transforms` — every node's global transform, with **no
+//      `on_process` fired**. A renderer must not tick game logic to find out
+//      where things are.
+//   2. The walk. Depth-first from `first_root` in root order, children in
+//      sibling order (which S1 made insertion order for exactly this reason).
+//      An invisible node prunes its whole subtree. Each visited item comes out
+//      of the walk with an absolute `z`, a composed tint and a screen-space
+//      clip rectangle.
+//   3. A **stable** sort of the visible items by `z`, so equal `z` keeps the
+//      order the walk produced. Insertion sort: it is stable, it is in place,
+//      and on the overwhelmingly common input — every `z` equal — it is
+//      `n - 1` comparisons and zero moves. A comparison sort with a better
+//      worst case has a worse best case, and the best case is the one every
+//      frame of a UI hits.
+//   4. Replay, in that order.
+//
+// So a frame is **O(N + V + I + C)**, where N is every node in the tree, V the
+// visible items, I the number of `z` inversions among them, and C the total
+// commands those items hold. Nothing here allocates: the paint list is a
+// package-level run that grows once and is reused every frame.
+//
+// **Clipping is resolved in the walk and not in the replay**, because the sort
+// moves items away from their ancestors. An item that clips contributes the
+// axis-aligned bounding box of its `custom_rect` under its own global
+// transform, met with whatever its ancestors contributed; the result travels
+// with the paint entry. A rotated clip rectangle therefore clips to its
+// bounding box and not to itself — the scissor is an axis-aligned integer
+// rectangle in `sokol_gfx` and in every API underneath it, and a rotated
+// scissor is not a thing that exists.
+//
+// `push_clip`/`pop_clip` are **commands inside a list** as well as a per-item
+// property, because `app:ui`'s `item_draw` pushes a second clip *inside* its
+// node's own clip to keep rows out of the scrollbar gutter, and a per-item
+// flag alone cannot express that. An in-list clip is given in the item's own
+// coordinates and is met with the clip the walk computed.
+//
+// ── Tints compose, and `self_modulate` does not ────────────────────────────
+//
+// `modulate` multiplies down the tree; `self_modulate` multiplies the item
+// alone and is not handed to its children. That is Godot's split and it is
+// kept because "fade this one thing" and "fade this whole branch" are
+// different edits. The product is per channel, `(a * b + 127) / 255`, which is
+// the rounding form — `a * b / 255` loses a level on every multiply and two
+// nested 50% fades come out visibly darker than one 25% one.
+//
+// A recorded colour is multiplied by the item's tint at replay, never at
+// record time. That is the point of retaining: `canvas_item_set_modulate`
+// changes what a frame looks like without touching a single command.
+//
+// ── Allocation ─────────────────────────────────────────────────────────────
+//
+// `init` takes **no** `Allocator`, and every run this package owns comes from
+// the ambient one — `#default` — as it stood at the line that brought the
+// server up. `shutdown` gives it all back.
+//
+// That is a sentence about the *caller*, not about this file. A server whose
+// storage should land somewhere particular is brought up there and says so
+// once:
+//
+//     draw.init()                              // the caller's own default
+//     draw.init() using arena.allocator(&a)    // every run below comes from `a`
+//
+// Writing the allocator into the parameter list, which is what this package
+// used to do, put that decision in the callee's signature and made every
+// client thread a value through its own call graph to reach it. One word at
+// one call site reaches the whole dynamic extent instead, however deep it
+// goes — `pools` and `tex_table` below mention no allocator at all, and
+// `canvas_create` hands the ambient on to `app:graph`, which mentions none
+// either.
+//
+// **`g_alloc` survives that change, and it is not there so `shutdown` can
+// free.** Freeing never needed it: `#delete` and `#resize` use the allocator
+// the `ref` itself carries, so every line of `shutdown` would work with the
+// global gone. It is there because two of this package's runs are **lazy** and
+// are minted nowhere near `init` — an item's command tape in `push_cmd` and
+// its point pool in `push_pt`, both on the first `rect` or `polyline` recorded
+// into that item, and a `graph.Graph`'s node pool on the first
+// `canvas_item_create`. Without it those `#make`s would read whatever ambient
+// was live at the *recording* call, so a client that records inside a scratch
+// frame would put a retained tape in the scratch arena and have it rolled back
+// under the tree that still points at it. `pools` reads `#default` once and
+// every later mint answers to that, which is the same fact the parameter used
+// to carry.
+package draw
+
+import "app:graph"
+import "core:geom/xform"
+
+// ── Handles ────────────────────────────────────────────────────────────────
+
+// A texture. Slot 0 is the built-in white 1x1 texel, which is what
+// `texture_white()` answers; every other slot is something a caller made.
+distinct type Texture: (i32 index, u32 generation)
+
+// A canvas item: one node of a `Canvas`'s tree, plus the command list hanging
+// off it.
+distinct type Item: (i32 index, u32 generation)
+
+// A canvas: one tree of items, rendered by one `canvas_render`.
+distinct type Canvas: (i32 index, u32 generation)
+
+// The handle that names nothing. `canvas_item_set_parent(item, NIL_ITEM)`
+// makes `item` a root of its canvas; every reader answers a zero for a handle
+// that is `NIL_*` or stale, and every writer is a no-op on one.
+const Texture NIL_TEXTURE = Texture((-1, 0))
+const Item NIL_ITEM = Item((-1, 0))
+const Canvas NIL_CANVAS = Canvas((-1, 0))
+
+// ── Blend modes ────────────────────────────────────────────────────────────
+//
+// This package's own constants rather than re-exported `sgp_blend_mode`
+// values, so a client does not import a vendor package to name a blend mode.
+// `BLEND_MIX` is what a canvas renders under unless a `set_blend` command says
+// otherwise, and it is `SGP_BLENDMODE_BLEND` — the straight-alpha state this
+// package has documented since it had a hand-written pipeline.
+
+const i32 BLEND_NONE = 0
+const i32 BLEND_MIX = 1
+const i32 BLEND_PREMULTIPLIED = 2
+const i32 BLEND_ADD = 3
+const i32 BLEND_ADD_PREMULTIPLIED = 4
+const i32 BLEND_MOD = 5
+const i32 BLEND_MUL = 6
+
+// ── Budgets ────────────────────────────────────────────────────────────────
+
+// What `init` asks `sokol_gp` for. These are `sokol_gp`'s own defaults, said
+// out loud so that `capacity()` has something to answer before a frame has
+// run and so that `init_headless` — which never calls `sgp_setup` — reports
+// the same number a GPU surface would.
+const i32 DEFAULT_MAX_VERTICES = 65536
+const i32 DEFAULT_MAX_COMMANDS = 16384
+
+// The most nested in-list `push_clip`s honoured inside one item. Beyond this a
+// push still pairs with its pop but clips to the enclosing rectangle instead
+// of a narrower one. Thirty-two is far past any UI that has ever been written.
+const i32 CLIP_DEPTH = 32
+
+// ── The command record ─────────────────────────────────────────────────────
+//
+// See the package doc comment for why this is one flat 64-byte shape rather
+// than a union, and for what each slot carries under each kind.
+//
+// **The kinds are public because `canvas_item_command` is.** A read-back whose
+// discriminant is an undocumented integer is not a read-back, so there is one
+// constant per recording call and the two spellings carry the same name:
+// `texture_rect_region` records `CMD_TEXTURE_RECT_REGION` and nothing else
+// does. That rule is what cost the flag bit below its second member — the
+// whole-image source used to be `CMD_TEXTURE_RECT` plus a `FLAG_WHOLE_SRC`,
+// which is the same fact written in a place a caller would have had to be told
+// about separately.
+//
+// `CMD_NONE` is zero and no recorded command ever carries it. It is what
+// `canvas_item_command` answers for an index past the end, so an overrun reads
+// as "no command" rather than as a rectangle, which is what a zero would have
+// meant had the numbering started at `CMD_RECT`.
+
+const i32 CMD_NONE = 0
+const i32 CMD_RECT = 1
+const i32 CMD_TEXTURE_RECT = 2
+const i32 CMD_TEXTURE_RECT_REGION = 3
+const i32 CMD_LINE = 4
+const i32 CMD_MULTILINE = 5
+const i32 CMD_POLYLINE = 6
+const i32 CMD_CIRCLE = 7
+const i32 CMD_POLYGON = 8
+const i32 CMD_PRIMITIVE = 9
+const i32 CMD_SET_TRANSFORM = 10
+const i32 CMD_SET_TRANSFORM_MATRIX = 11
+const i32 CMD_PUSH_CLIP = 12
+const i32 CMD_POP_CLIP = 13
+const i32 CMD_SET_BLEND = 14
+const i32 CMD_RESET_BLEND = 15
+
+// `flags` is a bit set rather than a second field, because `Cmd` is at 64
+// bytes and another `i32` would take it to 68 and its array to 72 with
+// alignment. One bit is defined: whether a shape that can be filled was asked
+// to be. Under `CMD_SET_BLEND` the whole field is the blend mode instead,
+// which is what `canvas_item_command`'s doc comment says out loud.
+const i32 FLAG_FILLED = 1
+
+private type Cmd: (
+    i32     kind,
+    Texture tex,
+    [4]f32  a,
+    [4]f32  b,
+    [4]u8   col,
+    f32     width,
+    i32     first,
+    i32     count,
+    i32     flags,
+)
+
+// One point of a point run: position, texture coordinate and colour. Only
+// `primitive` fills all three; the rest fill `x`/`y` and leave the others
+// zeroed. See the package doc comment for why there is one pool and not three.
+private type Vtx: (f32 x, f32 y, f32 u, f32 v, [4]u8 col)
+
+// ── Storage ────────────────────────────────────────────────────────────────
+
+// One canvas: a `graph.Graph` and the generational bookkeeping around it. The
+// graph is held **by value** inside the slot rather than behind a `ref`,
+// because `app:graph` is written to be a value a caller owns and hands around
+// by pointer, and a `^Graph` into this run is re-derived at every use — the
+// run moves when it grows.
+private type CanvasSlot: (
+    bool        live,
+    u32         generation,
+    i32         free_next,
+    graph.Graph g,
+)
+
+// One item: which canvas it belongs to, which node of that canvas's tree it
+// is, its command tape, its point pool, and what the last `canvas_render`
+// decided about it.
+//
+// `ncmds` and `npts` are lengths and `#len` of the two runs is capacity.
+// `#append` grows a run by exactly one element per call, which is a realloc
+// per recorded command and quadratic over a frame; and clearing a run with
+// `#resize(r, 0)` gives the block back, so the next frame's first command
+// allocates again. A retained tape wants the opposite of both: doubling on
+// growth, and a clear that keeps the block so that an item re-recorded every
+// frame allocates once in its life. So the length is carried beside the run
+// and the run is a capacity.
+private type ItemSlot: (
+    bool       live,
+    u32        generation,
+    i32        free_next,
+    i32        canvas,        // slot index of the owning canvas
+    graph.Node node,
+    ref []Cmd  cmds,
+    i32        ncmds,
+    ref []Vtx  pts,
+    i32        npts,
+)
+
+// One visible item, as the walk found it and as the sort orders it.
+private type Paint: (
+    Item   item,
+    i32    z,
+    [4]u8  tint,
+    [4]f32 clip,
+    bool   clipped,
+)
+
+// Where every run this package owns goes: the ambient as it stood when `init`
+// ran. Read by the lazy mints — an item's tape, an item's point pool, a
+// canvas's `graph.Graph` — and by nothing that frees. See "Allocation" in the
+// package doc comment.
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) g_alloc
+private bool g_ready
+private bool g_headless
+private string8 g_error
+
+private ref []CanvasSlot g_canvases
+private i32 g_canvases_used
+private i32 g_canvases_free
+
+private ref []ItemSlot g_items
+private i32 g_items_used
+private i32 g_items_free
+
+private ref []Paint g_paint
+private i32 g_npaint
+
+private i32 g_max_vertices
+private i32 g_max_commands
+private bool g_overflow
+
+private i32 g_commands
+private i32 g_primitives
+private i32 g_changes
+private i32 g_xforms
+
+// ── Lifecycle ──────────────────────────────────────────────────────────────
+
+// Bring the server up with `sokol_gp`'s default budgets. `sg_setup` must
+// already have run — `sgp_setup` reads its pixel formats and sample count off
+// a live `sokol_gfx` context. Answers false and sets `last_error()` if an
+// allocation fails or the painter refuses to start.
+//
+// Everything this server allocates, now and later, comes from the ambient
+// allocator at this line: `init() using a` puts the lot in `a`. See
+// "Allocation" in the package doc comment.
+bool init():
+    return init_capacity(DEFAULT_MAX_VERTICES, DEFAULT_MAX_COMMANDS)
+
+// As `init`, with explicit `sokol_gp` budgets. `max_vertices` is how many
+// vertices one `canvas_render` may produce and `max_commands` how many
+// commands `sokol_gp` may queue; overrunning either is `overflowed()` and a
+// dropped primitive, not a trap.
+bool init_capacity(i32 max_vertices, i32 max_commands):
+    if !pools(max_vertices, max_commands):
+        return false
+    g_headless = false
+    if !painter_up():
+        shutdown()
+        return false
+    g_ready = true
+    return true
+
+// Bring the server up with **no GPU at all**: every `draw_*` call records,
+// `canvas_render` walks the tree, orders it, resolves clips and tints and
+// counts exactly what the GPU path would issue, and not one sokol function is
+// called. This is what the gate runs, and it is what a `Painter` test draws
+// into with no window and no context.
+bool init_headless():
+    if !pools(DEFAULT_MAX_VERTICES, DEFAULT_MAX_COMMANDS):
+        return false
+    g_headless = true
+    g_ready = true
+    return true
+
+private bool pools(i32 max_vertices, i32 max_commands):
+    shutdown()
+    g_error = ""
+    // The one read of the ambient. Everything below, and every lazy mint after
+    // this call returns, answers to what the caller had installed here.
+    g_alloc = #default
+    g_max_vertices = max_vertices
+    if g_max_vertices < 8:
+        g_max_vertices = 8
+    g_max_commands = max_commands
+    if g_max_commands < 8:
+        g_max_commands = 8
+    g_canvases = #make([]CanvasSlot, 4)
+    g_items = #make([]ItemSlot, 16)
+    g_paint = #make([]Paint, 16)
+    if g_canvases == nil || g_items == nil || g_paint == nil:
+        g_error = "app:draw could not allocate its canvas, item and paint runs"
+        return false
+    g_canvases_used = 0
+    g_canvases_free = -1
+    g_items_used = 0
+    g_items_free = -1
+    g_npaint = 0
+    if !tex_table():
+        g_error = "app:draw could not allocate its texture table"
+        return false
+    return true
+
+// Release everything `init` took, including every canvas, every item and every
+// texture. Safe on a server that was never brought up, and safe twice — the
+// runs are nilled as they go, which is what makes the second call a no-op
+// rather than a double free, and `init` calls this first.
+void shutdown():
+    if g_items != nil:
+        for i in 0..<g_items_used:
+            if g_items[i].cmds != nil:
+                #delete(g_items[i].cmds)
+                g_items[i].cmds = nil
+            if g_items[i].pts != nil:
+                #delete(g_items[i].pts)
+                g_items[i].pts = nil
+        #delete(g_items)
+        g_items = nil
+    if g_canvases != nil:
+        for i in 0..<g_canvases_used:
+            if g_canvases[i].live:
+                graph.destroy(&g_canvases[i].g)
+                g_canvases[i].live = false
+        #delete(g_canvases)
+        g_canvases = nil
+    if g_paint != nil:
+        #delete(g_paint)
+        g_paint = nil
+    painter_down()
+    tex_table_down()
+    g_items_used = 0
+    g_items_free = -1
+    g_canvases_used = 0
+    g_canvases_free = -1
+    g_npaint = 0
+    g_ready = false
+    g_headless = false
+    g_overflow = false
+    g_commands = 0
+    g_primitives = 0
+    g_changes = 0
+    g_xforms = 0
+
+// Whether `init` succeeded and the server will record.
+bool ready():
+    return g_ready
+
+// Whether this server is the no-GPU one `init_headless` builds.
+bool headless():
+    return g_headless
+
+// Why the last `init` answered false. Empty when nothing has failed.
+string8 last_error():
+    return g_error
+
+// ── Canvases ───────────────────────────────────────────────────────────────
+
+// A fresh, empty canvas. Allocates nothing beyond its slot: `app:graph`'s own
+// pool is lazy and is not made until the first item.
+Canvas canvas_create():
+    if !g_ready:
+        return NIL_CANVAS
+    i32 idx = -1
+    if g_canvases_free >= 0:
+        idx = g_canvases_free
+        g_canvases_free = g_canvases[idx].free_next
+    else:
+        if g_canvases_used >= i32(#len(g_canvases)):
+            if !grow_canvases():
+                return NIL_CANVAS
+        idx = g_canvases_used
+        g_canvases_used = g_canvases_used + 1
+    g_canvases[idx].live = true
+    g_canvases[idx].free_next = -1
+    // `graph.init` takes no allocator either; `using` is how it is told where
+    // its own lazy node pool goes, and what it is told is where this server's
+    // runs live rather than wherever the client happened to be standing.
+    g_canvases[idx].g = graph.init() using g_alloc
+    return Canvas((idx, g_canvases[idx].generation))
+
+// A grown run's new tail is not promised to be zeroed the way a `#make`d one
+// is, and every pool here reads `live` and a `ref` out of a slot before it
+// writes one. So a grow clears what it added, explicitly, in all three pools.
+private bool grow_canvases():
+    i32 old = i32(#len(g_canvases))
+    i32 want = old * 2
+    if want < 4:
+        want = 4
+    if !#resize(g_canvases, want):
+        g_overflow = true
+        return false
+    for i in old..<want:
+        g_canvases[i].live = false
+        g_canvases[i].generation = 0
+        g_canvases[i].free_next = -1
+    return true
+
+// Free a canvas, every item on it and every node of its tree. Every handle
+// into it reads as dead from here on.
+//
+// The item slots go first and `graph.destroy` second, and the order is not
+// arbitrary: `destroy` tears the tree down through `remove`, so every node
+// still in it fires `on_exit_tree` on the way out, and a hook is caller code
+// that may reach back into the `Graph`. Nothing can be looking: this package
+// sets no hook and exposes no way to set one, because a `Canvas`'s `Graph` is
+// private and there is no accessor for it. Releasing the items first keeps
+// that true even if one is ever added.
+//
+// **A stale `Item` is refused by this package's generation, not by
+// `app:graph`'s**, and the difference matters because `app:graph`'s
+// generations live in the run `destroy` gives back — a `create` on an emptied
+// `Graph` mints `(0, 0)` again, so a `graph.Node` held across a `destroy` is
+// refused rather than detected and a later node can wear its spelling. No
+// `graph.Node` is ever handed out of this package, so no client can hold one;
+// what a client holds is an `Item`, whose generation lives in this package's
+// own table and is bumped by `release_item` before the tree is touched.
+void canvas_free(Canvas c):
+    i32 ci = canvas_index(c)
+    if ci < 0:
+        return
+    for i in 0..<g_items_used:
+        if g_items[i].live && g_items[i].canvas == ci:
+            release_item(i32(i))
+    graph.destroy(&g_canvases[ci].g)
+    g_canvases[ci].live = false
+    g_canvases[ci].generation = g_canvases[ci].generation + 1
+    g_canvases[ci].free_next = g_canvases_free
+    g_canvases_free = ci
+
+// Whether the handle still names a live canvas.
+bool canvas_valid(Canvas c):
+    return canvas_index(c) >= 0
+
+private i32 canvas_index(Canvas c):
+    if g_canvases == nil:
+        return -1
+    if c.index < 0 || c.index >= g_canvases_used:
+        return -1
+    if !g_canvases[c.index].live || g_canvases[c.index].generation != c.generation:
+        return -1
+    return c.index
+
+// ── Items ──────────────────────────────────────────────────────────────────
+
+// A new item on `c`, attached as its **last root**. Godot makes a canvas item
+// detached and requires `canvas_item_set_parent` before it is drawn; here the
+// canvas is already chosen by this call, so there is nothing a detached state
+// would express except "created and invisible", which `set_visible` already
+// says. A fresh item draws, and `canvas_item_set_parent` moves it.
+Item canvas_item_create(Canvas c):
+    i32 ci = canvas_index(c)
+    if ci < 0:
+        return NIL_ITEM
+    i32 idx = -1
+    if g_items_free >= 0:
+        idx = g_items_free
+        g_items_free = g_items[idx].free_next
+    else:
+        if g_items_used >= i32(#len(g_items)):
+            i32 old = i32(#len(g_items))
+            i32 want = old * 2
+            if want < 16:
+                want = 16
+            if !#resize(g_items, want):
+                g_overflow = true
+                return NIL_ITEM
+            for i in old..<want:
+                g_items[i].live = false
+                g_items[i].generation = 0
+                g_items[i].free_next = -1
+                g_items[i].cmds = nil
+                g_items[i].ncmds = 0
+                g_items[i].pts = nil
+                g_items[i].npts = 0
+        idx = g_items_used
+        g_items_used = g_items_used + 1
+    g_items[idx].live = true
+    g_items[idx].free_next = -1
+    g_items[idx].canvas = ci
+    g_items[idx].ncmds = 0
+    g_items[idx].npts = 0
+    // A recycled slot comes back with nil runs: `release_item` gave them back.
+    // `canvas_item_clear` keeps a run and `canvas_item_free` does not, and the
+    // difference is the whole distinction between the two calls — an item that
+    // is cleared is about to be re-recorded, and one that is freed is not
+    // coming back.
+    graph.Node n = graph.create(&g_canvases[ci].g)
+    graph.add_child(&g_canvases[ci].g, graph.INVALID, n)
+    graph.set_payload(&g_canvases[ci].g, n, u32(idx + 1))
+    g_items[idx].node = n
+    return Item((idx, g_items[idx].generation))
+
+// Free an item, its command list, and **every item below it in the tree**.
+// `app:graph.remove` frees a whole subtree, so the alternative — freeing this
+// node and orphaning its children — is not on offer, and a renderer that left
+// item slots naming dead nodes would hand out handles into nothing.
+void canvas_item_free(Item it):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return
+    i32 ci = g_items[ii].canvas
+    release_subtree(ci, g_items[ii].node)
+    graph.remove(&g_canvases[ci].g, g_items[ii].node)
+
+private void release_subtree(i32 ci, graph.Node n):
+    graph.Node child = graph.first_child_of(&g_canvases[ci].g, n)
+    for graph.valid(child):
+        graph.Node next = graph.next_sibling_of(&g_canvases[ci].g, child)
+        release_subtree(ci, child)
+        child = next
+    i32 ii = i32(graph.payload(&g_canvases[ci].g, n)) - 1
+    if ii >= 0 && ii < g_items_used && g_items[ii].live:
+        release_item(ii)
+
+// Give one item slot back. The runs go with it — an item that is freed is not
+// coming back, unlike one that is cleared.
+private void release_item(i32 ii):
+    if g_items[ii].cmds != nil:
+        #delete(g_items[ii].cmds)
+        g_items[ii].cmds = nil
+    if g_items[ii].pts != nil:
+        #delete(g_items[ii].pts)
+        g_items[ii].pts = nil
+    g_items[ii].ncmds = 0
+    g_items[ii].npts = 0
+    g_items[ii].live = false
+    g_items[ii].generation = g_items[ii].generation + 1
+    g_items[ii].free_next = g_items_free
+    g_items_free = ii
+
+// Empty an item's list and **keep every property it has** — its transform, its
+// visibility, its tint, its z, its clip, its place in the tree and its
+// children. This is the call a client makes at the top of a re-record, and it
+// keeps the two runs it has already allocated, so an item re-recorded every
+// frame allocates once in its life.
+void canvas_item_clear(Item it):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return
+    g_items[ii].ncmds = 0
+    g_items[ii].npts = 0
+
+// Move `it` under `parent`, or to the end of the canvas's root list when
+// `parent` is `NIL_ITEM`. Answers whether the move happened.
+//
+// **This departs from the surface as first written, which answered `void`**,
+// and it departs the same way S1's `graph.set_parent` did and for the same
+// reason: a reparent that would make a node its own ancestor has to be
+// refused, an `#assert` aborts where a caller dragging a node in a tree view
+// can genuinely recover, and a test cannot watch an abort. A dead handle is
+// still just a `false` here rather than an abort, because this package answers
+// a value for every other bad handle and one exception would be the surprise.
+//
+// Reparenting across canvases is refused: the two nodes live in two different
+// `graph.Graph`s and there is nothing to link.
+bool canvas_item_set_parent(Item it, Item parent):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return false
+    i32 ci = g_items[ii].canvas
+    if parent == NIL_ITEM:
+        return graph.set_parent(&g_canvases[ci].g, g_items[ii].node, graph.INVALID)
+    i32 pi = item_index(parent)
+    if pi < 0 || g_items[pi].canvas != ci:
+        return false
+    return graph.set_parent(&g_canvases[ci].g, g_items[ii].node, g_items[pi].node)
+
+// The item's own transform, which composes with its ancestors'.
+void canvas_item_set_transform(Item it, xform.Transform2D t):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_transform(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, t)
+
+void canvas_item_set_position(Item it, [2]f32 p):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_position(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, p)
+
+void canvas_item_set_rotation(Item it, f32 r):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_rotation(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, r)
+
+void canvas_item_set_scale(Item it, [2]f32 s):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_scale(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, s)
+
+// Hide or show. An invisible item contributes nothing **and neither does
+// anything below it** — the walk prunes the subtree rather than visiting it
+// and discarding the result.
+void canvas_item_set_visible(Item it, bool v):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_visible(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, v)
+
+// The tint this item and everything below it is multiplied by.
+void canvas_item_set_modulate(Item it, [4]u8 c):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_modulate(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, c)
+
+// The tint this item alone is multiplied by, and which its children never see.
+void canvas_item_set_self_modulate(Item it, [4]u8 c):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_self_modulate(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, c)
+
+void canvas_item_set_z_index(Item it, i32 z):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_z_index(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, z)
+
+// Whether `z_index` is an offset from the parent's layer (the default, and
+// Godot's) or an absolute one.
+//
+// **This setter is not in the surface as first written**, which listed
+// `z_as_relative` as a property `app:graph` gained and gave no way to move it.
+// A property with a getter and no setter is a property a test cannot exercise
+// and a client cannot use, and the paint order is the one thing here a caller
+// is most likely to want absolute control of.
+void canvas_item_set_z_as_relative(Item it, bool rel):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_z_as_relative(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, rel)
+
+// Whether this item clips itself and its subtree to its custom rectangle.
+void canvas_item_set_clip(Item it, bool on):
+    i32 ii = item_index(it)
+    if ii >= 0:
+        graph.set_clip(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, on)
+
+// The rectangle `canvas_item_set_clip` clips to, in the item's own
+// coordinates, and whether to use it.
+//
+// **Godot's third bit is not carried.** There, a custom rect is also a culling
+// rectangle, so "use a custom rect" and "clip to it" are two flags. There is
+// no culling here — a canvas is walked whole and `sokol_gp`'s own optimiser
+// discards a primitive whose region is off screen — so the two flags would be
+// one bit with two names. `use` writes the clip flag; `canvas_item_set_clip`
+// writes the same bit without touching the rectangle, which is what a caller
+// that toggles clipping on a rect it already set wants.
+void canvas_item_set_custom_rect(Item it, bool use, [4]f32 r):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return
+    graph.set_custom_rect(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, r)
+    graph.set_clip(&g_canvases[g_items[ii].canvas].g, g_items[ii].node, use)
+
+// Whether the item's list holds no commands. Properties and children are not
+// commands, so an item that is empty may still clip, tint and position a whole
+// subtree.
+bool canvas_item_is_empty(Item it):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return true
+    return g_items[ii].ncmds == 0
+
+// How many commands the item's list holds. Every `draw_*` call appends exactly
+// one, `push_clip` and `set_blend` included.
+i32 canvas_item_command_count(Item it):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return 0
+    return g_items[ii].ncmds
+
+// One recorded command, read back.
+//
+// **The tape is the architecture, so it is readable.** `painted()`/`paint(i)`
+// exposes the paint order precisely so the tree's decisions are assertable
+// with no GPU; this is the same argument one level down. Without it the most
+// important claim a consumer makes about a command — that `app:text` hands a
+// glyph its **pixel** source rectangle and not the uv rectangle it used to —
+// can be asserted only against the caller's own helper, one call short of the
+// command that carries it, and a regression that stopped calling that helper
+// would be caught by nothing. It is also half of what `example/drawsmoke` is
+// for: that program asserts what a frame costs and then reads the framebuffer
+// back, and until now it could only check the second half.
+//
+// What each slot carries depends on `kind`, and this is the whole table:
+//
+// | kind | a | b | col | width | count | flags |
+// |---|---|---|---|---|---|---|
+// | `CMD_RECT` | the rectangle | — | colour | outline width | — | `FLAG_FILLED` |
+// | `CMD_TEXTURE_RECT` | destination | — (the whole image, resolved at render time) | modulate | — | — | — |
+// | `CMD_TEXTURE_RECT_REGION` | destination | source, **in image pixels** | modulate | — | — | — |
+// | `CMD_LINE` | `(x0, y0, x1, y1)` | — | colour | thickness | — | — |
+// | `CMD_MULTILINE`, `CMD_POLYLINE` | — | — | colour | thickness | points | — |
+// | `CMD_CIRCLE` | `(cx, cy, radius, segments)` | — | colour | outline width | — | `FLAG_FILLED` |
+// | `CMD_POLYGON` | — | — | colour | — | points | — |
+// | `CMD_PRIMITIVE` | — | — | — | — | points | — |
+// | `CMD_SET_TRANSFORM` | `(px, py, sx, sy)` | `(rotation, 0, 0, 0)` | — | — | — | — |
+// | `CMD_SET_TRANSFORM_MATRIX` | the 2x2 linear part | the translation | — | — | — | — |
+// | `CMD_PUSH_CLIP` | the rectangle | — | — | — | — | — |
+// | `CMD_POP_CLIP`, `CMD_RESET_BLEND` | — | — | — | — | — | — |
+// | `CMD_SET_BLEND` | — | — | — | — | — | the `BLEND_*` mode |
+//
+// A **point run is not handed out through this answer and is not faked into
+// one.** `count` is how many points the command carries and nothing here is
+// the points; `canvas_item_command_point` reads them one at a time, which is
+// the run's real shape rather than a fixed-width guess at it. `tex` is
+// `NIL_TEXTURE` for every kind that samples nothing.
+//
+// An index outside `0..<canvas_item_command_count(item)` answers `CMD_NONE`
+// with everything else zeroed, the way `paint(i)` answers for an overrun, so a
+// loop that runs past the end reads something inert rather than trapping.
+(i32 kind, Texture tex, [4]f32 a, [4]f32 b, [4]u8 col, f32 width, i32 count,
+ i32 flags) canvas_item_command(Item it, i32 i):
+    i32 ii = item_index(it)
+    if ii < 0 || i < 0 || i >= g_items[ii].ncmds:
+        return (CMD_NONE, NIL_TEXTURE, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0),
+                (0, 0, 0, 0), 0.0, 0, 0)
+    Cmd c = g_items[ii].cmds[i]
+    return (c.kind, c.tex, c.a, c.b, c.col, c.width, c.count, c.flags)
+
+// Point `k` of command `i`'s run, in the coordinates it was recorded in.
+//
+// Only `multiline`, `polyline`, `colored_polygon` and `primitive` have a run,
+// and only `primitive` fills `u`, `v` and `col` — the other three record the
+// position and leave the rest zeroed, which is what the shared point pool
+// costs them and what the package doc comment argues is worth it.
+//
+// A `k` outside `0..<count` of that command, or a command that has no run at
+// all, answers zeroes. One call per point rather than a run handed out whole:
+// a `[]Vtx` window into this package's storage would be a handle that a
+// `canvas_item_clear` two lines later silently invalidates, and a copy would
+// be an allocation a reader has no reason to expect. Everything this package
+// mints, it frees in `shutdown`; a getter that quietly minted a run the caller
+// then had to free is not that bargain, whoever's ambient it came out of.
+(f32 x, f32 y, f32 u, f32 v, [4]u8 col) canvas_item_command_point(Item it, i32 i,
+                                                                 i32 k):
+    i32 ii = item_index(it)
+    if ii < 0 || i < 0 || i >= g_items[ii].ncmds:
+        return (0.0, 0.0, 0.0, 0.0, (0, 0, 0, 0))
+    Cmd c = g_items[ii].cmds[i]
+    if k < 0 || k >= c.count:
+        return (0.0, 0.0, 0.0, 0.0, (0, 0, 0, 0))
+    i32 at = c.first + k
+    if at < 0 || at >= g_items[ii].npts:
+        return (0.0, 0.0, 0.0, 0.0, (0, 0, 0, 0))
+    Vtx v = g_items[ii].pts[at]
+    return (v.x, v.y, v.u, v.v, v.col)
+
+// Whether the handle still names a live item. A handle held past
+// `canvas_item_free` — or past the free and reuse of its slot — answers false,
+// which is the whole reason the handle carries a generation.
+bool canvas_item_valid(Item it):
+    return item_index(it) >= 0
+
+// The canvas an item belongs to, or `NIL_CANVAS`.
+Canvas canvas_of(Item it):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return NIL_CANVAS
+    i32 ci = g_items[ii].canvas
+    return Canvas((ci, g_canvases[ci].generation))
+
+private i32 item_index(Item it):
+    if g_items == nil:
+        return -1
+    if it.index < 0 || it.index >= g_items_used:
+        return -1
+    if !g_items[it.index].live || g_items[it.index].generation != it.generation:
+        return -1
+    // The canvas is checked by slot rather than by handle: an item names a
+    // canvas *index*, and every item of a canvas is released by `canvas_free`
+    // before the canvas's own generation moves, so a live item on a dead
+    // canvas is a state this package cannot reach. The check is here anyway,
+    // because `shutdown` is the one path that unwinds in the other order.
+    i32 ci = g_items[it.index].canvas
+    if ci < 0 || ci >= g_canvases_used || !g_canvases[ci].live:
+        return -1
+    return it.index
+
+// ── Recording ──────────────────────────────────────────────────────────────
+//
+// Godot's `CanvasItem.draw_*` surface, argument order and defaults preserved
+// where Dado can express them, minus the `draw_` prefix, which the package
+// qualifier already supplies: `draw.rect(item, ...)` rather than
+// `draw.draw_rect(item, ...)`. The stutter buys nothing and the call site
+// reads as Godot's does.
+//
+// **A negative `width` is Godot's filled/hairline sentinel and is kept**,
+// because a caller porting from Godot writes `-1.0` without thinking and
+// getting a different answer here would be the worst kind of surprise. For a
+// shape that can be filled it means filled; for a line it means a one-pixel
+// hairline, which is what `sokol_gp` draws a line as.
+//
+// Every call below appends exactly one command and answers nothing. A call on
+// a dead handle is dropped; a call on a server that is not up is dropped. This
+// is a recording surface and a client that checked a return value after every
+// rectangle would be writing a different program.
+
+// A rectangle, filled or outlined.
+void rect(Item it, [4]f32 r, [4]u8 col, bool filled = true, f32 width = -1.0):
+    Cmd c
+    c.kind = CMD_RECT
+    c.a = r
+    c.col = col
+    c.width = width
+    if filled:
+        c.flags = FLAG_FILLED
+    push_cmd(it, c)
+
+// A texture, stretched over `r` and multiplied by `modulate`. The whole image
+// is sampled, and "the whole image" is resolved at render time rather than
+// here, so a `texture_update` that changes nothing but the pixels does not
+// stale a recorded command.
+void texture_rect(Item it, Texture t, [4]f32 r, [4]u8 modulate):
+    Cmd c
+    c.kind = CMD_TEXTURE_RECT
+    c.tex = t
+    c.a = r
+    c.col = modulate
+    push_cmd(it, c)
+
+// A region of a texture, stretched over `r`. **`src` is in image pixels, not
+// uv** — that is `sgp_draw_textured_rect`'s own convention, and it is the
+// reason `app:font`'s `Glyph` carries `px`/`py`/`pw`/`ph` and no longer
+// carries four uv fields: a pixel rectangle is invariant under an atlas grow
+// and a uv rectangle is not.
+void texture_rect_region(Item it, Texture t, [4]f32 r, [4]f32 src, [4]u8 modulate):
+    Cmd c
+    c.kind = CMD_TEXTURE_RECT_REGION
+    c.tex = t
+    c.a = r
+    c.b = src
+    c.col = modulate
+    push_cmd(it, c)
+
+// A line. A negative width is a hairline; a positive one is a quad centred on
+// the segment.
+void line(Item it, [2]f32 from, [2]f32 to, [4]u8 col, f32 width = -1.0):
+    Cmd c
+    c.kind = CMD_LINE
+    c.a = (from.x, from.y, to.x, to.y)
+    c.col = col
+    c.width = width
+    push_cmd(it, c)
+
+// Disconnected segments, taken in pairs. An odd trailing point is dropped,
+// which is Godot's own behaviour.
+void multiline(Item it, [][2]f32 points, [4]u8 col, f32 width = -1.0):
+    Cmd c
+    c.kind = CMD_MULTILINE
+    c.col = col
+    c.width = width
+    push_points(it, &c, points)
+    push_cmd(it, c)
+
+// A connected run of segments.
+void polyline(Item it, [][2]f32 points, [4]u8 col, f32 width = -1.0):
+    Cmd c
+    c.kind = CMD_POLYLINE
+    c.col = col
+    c.width = width
+    push_points(it, &c, points)
+    push_cmd(it, c)
+
+// A circle, filled or outlined. `sokol_gp` has no circle, so this is
+// tessellated at render time into triangles or segments; how many is a
+// function of the radius and is settled once, in `segments_for`, so that the
+// count a headless run reports and the count a GPU run draws cannot disagree.
+void circle(Item it, [2]f32 centre, f32 radius, [4]u8 col, bool filled = true,
+            f32 width = -1.0):
+    Cmd c
+    c.kind = CMD_CIRCLE
+    c.a = (centre.x, centre.y, radius, f32(segments_for(radius)))
+    c.col = col
+    c.width = width
+    if filled:
+        c.flags = FLAG_FILLED
+    push_cmd(it, c)
+
+// A convex polygon in one colour, drawn as a fan. A concave outline is drawn
+// as though it were convex, which is Godot's own caveat on `draw_colored_polygon`.
+void colored_polygon(Item it, [][2]f32 points, [4]u8 col):
+    Cmd c
+    c.kind = CMD_POLYGON
+    c.col = col
+    push_points(it, &c, points)
+    push_cmd(it, c)
+
+// The general form: a point run with its own colours and texture coordinates,
+// drawn as a triangle fan over `t`. `cols` and `uvs` may be shorter than
+// `points` — a missing colour is opaque white and a missing coordinate is the
+// image's top-left corner, so `primitive(it, pts, none, none, t)` is a
+// flat-shaded polygon and needs no filler arrays built by the caller.
+// `NIL_TEXTURE` draws it untextured rather than dropping it.
+//
+// **Its `uvs` are normalised 0..1, where `texture_rect_region`'s `src` is in
+// image pixels.** That asymmetry is `sokol_gp`'s and not this package's:
+// `sgp_draw_textured_rect` divides by the bound image's size itself, and
+// `sgp_draw` — the only entry point that takes a per-vertex colour, which is
+// the whole reason this call exists — copies the coordinate into the vertex
+// verbatim. Restating one in the other's units here would mean dividing by an
+// atlas size at record time, which is exactly the staleness hazard S2 deleted
+// from `app:font`.
+void primitive(Item it, [][2]f32 points, [][4]u8 cols, [][2]f32 uvs, Texture t):
+    Cmd c
+    c.kind = CMD_PRIMITIVE
+    c.tex = t
+    // No `col`: every colour this command draws with is in its point run, and
+    // a flat one written here would be a value `canvas_item_command` handed
+    // out and nothing ever read.
+    i32 ii = item_index(it)
+    if ii < 0:
+        return
+    i32 n = i32(#len(points))
+    if n < 3:
+        return
+    i32 base = g_items[ii].npts
+    for i in 0..<n:
+        Vtx v
+        v.x = points[i].x
+        v.y = points[i].y
+        v.col = (255, 255, 255, 255)
+        if i32(i) < i32(#len(cols)):
+            v.col = cols[i]
+        if i32(i) < i32(#len(uvs)):
+            v.u = uvs[i].x
+            v.v = uvs[i].y
+        if !push_pt(ii, v):
+            return
+    c.first = base
+    c.count = n
+    push_cmd(it, c)
+
+// An extra transform, in the item's own coordinates, applied to every command
+// after it in this list. A second `set_transform` replaces the first rather
+// than composing with it, which is Godot's `draw_set_transform`.
+void set_transform(Item it, [2]f32 position, f32 rotation, [2]f32 scale):
+    Cmd c
+    c.kind = CMD_SET_TRANSFORM
+    c.a = (position.x, position.y, scale.x, scale.y)
+    c.b = (rotation, 0.0, 0.0, 0.0)
+    push_cmd(it, c)
+
+// The same, from a matrix. A `Transform2D`'s third column is `(0, 0, 1)` by
+// construction, so the six numbers that mean anything are carried in the
+// record itself and there is no side pool for matrices.
+void set_transform_matrix(Item it, xform.Transform2D t):
+    xform.Mat3 m = xform.Mat3(t)
+    Cmd c
+    c.kind = CMD_SET_TRANSFORM_MATRIX
+    c.a = (m[0][0], m[0][1], m[1][0], m[1][1])
+    c.b = (m[2][0], m[2][1], 0.0, 0.0)
+    push_cmd(it, c)
+
+// Narrow the clip region to the meet of the region in force and `r`, given in
+// the item's own coordinates. Pairs with `pop_clip`.
+void push_clip(Item it, [4]f32 r):
+    Cmd c
+    c.kind = CMD_PUSH_CLIP
+    c.a = r
+    push_cmd(it, c)
+
+// Undo the matching `push_clip`. An unmatched one is dropped at render time
+// rather than unwinding into the item's own clip, and an unclosed push is
+// closed when the item's list ends.
+void pop_clip(Item it):
+    Cmd c
+    c.kind = CMD_POP_CLIP
+    push_cmd(it, c)
+
+// Change the blend mode for the rest of this list. A mode outside `BLEND_NONE
+// .. BLEND_MUL` is recorded as `BLEND_MIX`.
+void set_blend(Item it, i32 mode):
+    Cmd c
+    c.kind = CMD_SET_BLEND
+    c.flags = mode
+    if mode < BLEND_NONE || mode > BLEND_MUL:
+        c.flags = BLEND_MIX
+    push_cmd(it, c)
+
+// Go back to `BLEND_MIX` for the rest of this list.
+void reset_blend(Item it):
+    Cmd c
+    c.kind = CMD_RESET_BLEND
+    push_cmd(it, c)
+
+// ── Appending to a tape ────────────────────────────────────────────────────
+
+private void push_cmd(Item it, Cmd c):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return
+    if g_items[ii].cmds == nil:
+        g_items[ii].cmds = #make([]Cmd, 8, g_alloc)
+        if g_items[ii].cmds == nil:
+            g_overflow = true
+            return
+    if g_items[ii].ncmds >= i32(#len(g_items[ii].cmds)):
+        if !#resize(g_items[ii].cmds, i32(#len(g_items[ii].cmds)) * 2):
+            g_overflow = true
+            return
+    g_items[ii].cmds[g_items[ii].ncmds] = c
+    g_items[ii].ncmds = g_items[ii].ncmds + 1
+
+private void push_points(Item it, ^Cmd c, [][2]f32 points):
+    i32 ii = item_index(it)
+    if ii < 0:
+        return
+    i32 base = g_items[ii].npts
+    i32 n = 0
+    for p in points:
+        Vtx v
+        v.x = p.x
+        v.y = p.y
+        if !push_pt(ii, v):
+            break
+        n = n + 1
+    c.first = base
+    c.count = n
+
+private bool push_pt(i32 ii, Vtx v):
+    if g_items[ii].pts == nil:
+        g_items[ii].pts = #make([]Vtx, 8, g_alloc)
+        if g_items[ii].pts == nil:
+            g_overflow = true
+            return false
+    if g_items[ii].npts >= i32(#len(g_items[ii].pts)):
+        if !#resize(g_items[ii].pts, i32(#len(g_items[ii].pts)) * 2):
+            g_overflow = true
+            return false
+    g_items[ii].pts[g_items[ii].npts] = v
+    g_items[ii].npts = g_items[ii].npts + 1
+    return true
+
+// How many segments a circle of this radius is drawn with. Twelve at a radius
+// of one pixel, rising as the square root so that the error against the true
+// circle stays near a fixed fraction of a pixel, capped at 64 — past which the
+// vertices cost more than the roundness is worth at any UI scale.
+//
+// The cap is applied before the conversion and not after: a float becoming an
+// `i32` saturates, so an absurd radius used to reach `12 + (2^31 - 1)`, which
+// is an overflow and a trap. A NaN radius is the twelve of radius zero.
+private i32 segments_for(f32 radius):
+    f32 r = radius
+    if r < 0.0:
+        r = 0.0 - r
+    f32 extra = r * 0.75
+    if extra >= 52.0:
+        return 64
+    return 12 + i32(extra)
+
+// ── Rendering ──────────────────────────────────────────────────────────────
+
+// Walk `c`, order it, and draw it. Must be called **inside an open
+// `sg_begin_pass`/`sg_end_pass` pair**: recording into `sokol_gp` is pure CPU
+// work, but `sgp_flush` issues the draw calls into whatever pass is open.
+//
+// On a headless server every step below runs except the sokol calls, so
+// `commands()`, `primitives()` and `state_changes()` answer what a GPU render
+// of this same tree would have cost.
+void canvas_render(Canvas c, i32 fb_w, i32 fb_h):
+    g_commands = 0
+    g_primitives = 0
+    g_changes = 0
+    g_xforms = 0
+    g_npaint = 0
+    i32 ci = canvas_index(c)
+    if ci < 0:
+        return
+    i32 w = fb_w
+    i32 h = fb_h
+    if w < 1:
+        w = 1
+    if h < 1:
+        h = 1
+
+    graph.update_transforms(&g_canvases[ci].g)
+
+    [4]u8 white = (255, 255, 255, 255)
+    [4]f32 full = (0.0, 0.0, f32(w), f32(h))
+    graph.Node root = graph.first_root(&g_canvases[ci].g)
+    for graph.valid(root):
+        graph.Node next = graph.next_root(&g_canvases[ci].g, root)
+        collect(ci, root, 0, white, full, false)
+        root = next
+
+    order_paint()
+    replay(ci, w, h)
+
+// Depth-first, roots in root order and children in sibling order. Answers
+// nothing and writes into `g_paint`; an invisible node returns before it looks
+// at its children, which is the pruning the doc comment promises.
+private void collect(i32 ci, graph.Node n, i32 pz, [4]u8 ptint, [4]f32 pclip,
+                     bool pclipped):
+    if !graph.visible(&g_canvases[ci].g, n):
+        return
+    i32 z = graph.z_index(&g_canvases[ci].g, n)
+    if graph.z_as_relative(&g_canvases[ci].g, n):
+        z = pz + z
+    [4]u8 tint = modulate_by(ptint, graph.modulate(&g_canvases[ci].g, n))
+    [4]f32 clip = pclip
+    bool clipped = pclipped
+    if graph.clip(&g_canvases[ci].g, n):
+        [4]f32 own = world_rect(ci, n, graph.custom_rect(&g_canvases[ci].g, n))
+        if clipped:
+            clip = meet(clip, own)
+        else:
+            clip = own
+        clipped = true
+
+    i32 ii = i32(graph.payload(&g_canvases[ci].g, n)) - 1
+    if ii >= 0 && ii < g_items_used && g_items[ii].live:
+        Paint p
+        p.item = Item((ii, g_items[ii].generation))
+        p.z = z
+        p.tint = modulate_by(tint, graph.self_modulate(&g_canvases[ci].g, n))
+        p.clip = clip
+        p.clipped = clipped
+        push_paint(p)
+
+    graph.Node child = graph.first_child_of(&g_canvases[ci].g, n)
+    for graph.valid(child):
+        graph.Node next = graph.next_sibling_of(&g_canvases[ci].g, child)
+        collect(ci, child, z, tint, clip, clipped)
+        child = next
+
+private void push_paint(Paint p):
+    if g_npaint >= i32(#len(g_paint)):
+        i32 want = i32(#len(g_paint)) * 2
+        if want < 16:
+            want = 16
+        if !#resize(g_paint, want):
+            g_overflow = true
+            return
+    g_paint[g_npaint] = p
+    g_npaint = g_npaint + 1
+
+// A stable sort by `z`. Insertion sort, for the reason the package doc comment
+// gives: every `z` equal is the common case and it is `n - 1` comparisons and
+// no moves, and equal keys keep the order the walk produced without a
+// tie-breaking sequence number having to be carried.
+private void order_paint():
+    for i in 1..<g_npaint:
+        Paint key = g_paint[i]
+        i32 j = i32(i) - 1
+        for j >= 0 && g_paint[j].z > key.z:
+            g_paint[j + 1] = g_paint[j]
+            j = j - 1
+        g_paint[j + 1] = key
+
+// The axis-aligned bounding box of `r`, given in `n`'s coordinates, in
+// framebuffer pixels. A rotated rectangle clips to its bounding box, because
+// the scissor is axis-aligned everywhere underneath this.
+private [4]f32 world_rect(i32 ci, graph.Node n, [4]f32 r):
+    return aabb_of(graph.global_transform(&g_canvases[ci].g, n), r)
+
+// The same, for a transform already in hand — which is what an in-list
+// `push_clip` has, since it is given in whatever coordinates the commands
+// beside it are written in.
+private [4]f32 aabb_of(xform.Transform2D t, [4]f32 r):
+    [2]f32 p0 = xform.transform_point(t, (r[0], r[1]))
+    [2]f32 p1 = xform.transform_point(t, (r[0] + r[2], r[1]))
+    [2]f32 p2 = xform.transform_point(t, (r[0] + r[2], r[1] + r[3]))
+    [2]f32 p3 = xform.transform_point(t, (r[0], r[1] + r[3]))
+    f32 x0 = min4(p0.x, p1.x, p2.x, p3.x)
+    f32 y0 = min4(p0.y, p1.y, p2.y, p3.y)
+    f32 x1 = max4(p0.x, p1.x, p2.x, p3.x)
+    f32 y1 = max4(p0.y, p1.y, p2.y, p3.y)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+private f32 min4(f32 a, f32 b, f32 c, f32 d):
+    f32 m = a
+    if b < m:
+        m = b
+    if c < m:
+        m = c
+    if d < m:
+        m = d
+    return m
+
+private f32 max4(f32 a, f32 b, f32 c, f32 d):
+    f32 m = a
+    if b > m:
+        m = b
+    if c > m:
+        m = c
+    if d > m:
+        m = d
+    return m
+
+// The intersection of two rectangles, never negative in either extent.
+private [4]f32 meet([4]f32 a, [4]f32 b):
+    f32 x0 = a[0]
+    if b[0] > x0:
+        x0 = b[0]
+    f32 y0 = a[1]
+    if b[1] > y0:
+        y0 = b[1]
+    f32 x1 = a[0] + a[2]
+    f32 bx1 = b[0] + b[2]
+    if bx1 < x1:
+        x1 = bx1
+    f32 y1 = a[1] + a[3]
+    f32 by1 = b[1] + b[3]
+    if by1 < y1:
+        y1 = by1
+    if x1 < x0:
+        x1 = x0
+    if y1 < y0:
+        y1 = y0
+    return (x0, y0, x1 - x0, y1 - y0)
+
+// One channel at a time, rounded rather than truncated. See the package doc
+// comment: `a * b / 255` loses a level per multiply and nested fades go dark.
+private [4]u8 modulate_by([4]u8 a, [4]u8 b):
+    [4]u8 o
+    for i in 0..<4:
+        o[i] = u8((i32(a[i]) * i32(b[i]) + 127) / 255)
+    return o
+
+// ── Accounting ─────────────────────────────────────────────────────────────
+
+// How many commands the last `canvas_render` replayed. A command that was
+// clipped away is still replayed — it is looked at and skipped — and so is
+// still counted here; what it did not do shows up in `primitives()`.
+i32 commands():
+    return g_commands
+
+// How many primitives those commands handed to `sokol_gp`: rectangles,
+// triangles and line segments, counted as `sokol_gp` counts them. A filled
+// circle of 32 segments is 32 triangles; a hairline rectangle outline is 4
+// lines; a filled rectangle is 1.
+i32 primitives():
+    return g_primitives
+
+// How many times the last render changed something `sokol_gp` keys a batch on
+// — an **UPPER BOUND** on the draw calls it cost, never the number itself.
+// The optimiser only ever merges, never splits, so the truth is this or lower,
+// and `gpu_draw_calls()` is where it is read.
+//
+// **Four things are counted, and they are exactly `sokol_gp`'s merge test.**
+// `_sgp_merge_batch_command` folds a draw into a previous one when the
+// pipeline id and the bound textures both match, and its look-back stops dead
+// at any command that is not a draw. So:
+//
+//   * the **bound view** is the textures half;
+//   * the **blend mode** and the **primitive topology** are the pipeline half,
+//     together — `_sgp_lookup_pipeline` indexes on `primitive_type *
+//     _SGP_BLENDMODE_NUM + blend_mode`, so a rectangle followed by a hairline
+//     is two pipeline ids and two draw calls with nothing else having moved.
+//     This package uses exactly two topologies, triangles and lines;
+//   * the **scissor** is the barrier — a scissor command is not a draw, so the
+//     look-back stops at it and nothing merges across one.
+//
+// Two things are deliberately **not** counted, and one of them used to be.
+//
+// A **colour change** is not: `sokol_gp` writes colour into every vertex it
+// builds, so a run of differently coloured rectangles is one call.
+//
+// A **transform change** is not, and this file claimed the opposite until the
+// ported `example/drawsmoke` measured it. The claim was that the model-view
+// projection is a uniform and that two items at different positions are
+// therefore two draw calls. It is not a uniform. `sokol_gp` applies the MVP
+// **per vertex on the CPU** — `_sgp_mat3_vec2_mul`, called out of every
+// `_sgp_draw_*` — and bakes the result into the vertex positions; the
+// `uniform` the merge test compares is `NULL` unless a caller has installed a
+// pipeline of its own through `sgp_set_pipeline`, which this package never
+// does. Two items at different positions merge freely.
+//
+// Counting it kept the number an upper bound, because counting something that
+// costs nothing always does. What it cost was **tightness**: the measured
+// scene counted six where the GPU issued one, and a bound whose distance from
+// the truth is mostly noise says nothing about what the optimiser saved —
+// which is the one thing this number and `gpu_draw_calls()` exist to be read
+// against.
+//
+// A transform change is still real work, so it is reported under its own name
+// by `transform_changes()` rather than deleted.
+i32 state_changes():
+    return g_changes
+
+// How many times the last render rebuilt `sokol_gp`'s transform — once per
+// item whose global transform differs from the previous item's in paint order,
+// plus once per in-list `set_transform` or `set_transform_matrix` that moves
+// it.
+//
+// **This is not a draw-call cost and is deliberately not part of
+// `state_changes()`.** See that function: the transform is baked into the
+// vertices on the CPU, so two items at different positions still merge into
+// one call. What a change here costs is the four `sokol_gp` calls that rebuild
+// the matrix, and a fresh multiply for every vertex recorded after it — which
+// is the number a caller wondering whether to flatten a deep tree, or to bake
+// a static subtree into one item, actually wants.
+i32 transform_changes():
+    return g_xforms
+
+// How many items the last `canvas_render` painted, in the order it painted
+// them — every visible item of the canvas, after pruning and after the sort.
+i32 painted():
+    return g_npaint
+
+// The `i`-th item of the last render's paint order, with the `z` it resolved
+// to, the tint it was drawn under and the clip rectangle it was drawn through.
+// An index outside `0..<painted()` answers `NIL_ITEM` with an opaque white
+// tint and an empty rectangle, so a loop that overruns reads something inert
+// rather than reading off the end.
+//
+// This is the `batches()`/`batch(i)` pair of the immediate-mode surface,
+// restated for a tree: `state_changes()` says what a frame cost and this says
+// **what was in it and in what order**, which is the question a client has
+// when an item it expected to see is not on the screen. The data was always
+// there — one `Paint` per visible item — and reading it used to need a
+// `println` inside this package.
+(Item item, i32 z, [4]u8 tint, [4]f32 clip, bool clipped) paint(i32 i):
+    if g_paint == nil || i < 0 || i >= g_npaint:
+        return (NIL_ITEM, 0, (255, 255, 255, 255), (0.0, 0.0, 0.0, 0.0), false)
+    Paint p = g_paint[i]
+    return (p.item, p.z, p.tint, p.clip, p.clipped)
+
+// Whether anything has been dropped for want of room — an allocation that
+// failed while recording, or a `sokol_gp` vertex or command budget that ran
+// out during a render. A value rather than a trap: a program that overruns its
+// budget has something to do about it next frame.
+bool overflowed():
+    return g_overflow
+
+// The vertex budget `sokol_gp` is running under, which is what a render can
+// produce before `overflowed()` says so.
+i32 capacity():
+    return g_max_vertices
+
+// The command budget `sokol_gp` is running under.
+i32 command_capacity():
+    return g_max_commands

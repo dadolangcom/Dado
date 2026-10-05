@@ -1,0 +1,762 @@
+// core:os/proc — a child you write to *and* read from, without a shell and
+// without ever waiting on it longer than you said.
+//
+//     import "core:os/proc"
+//
+//     [2]cstring argv
+//     argv[0] = "toy-lsp"
+//     argv[1] = "--stdio"
+//     proc.Duplex lsp = proc.duplex(argv[:], proc.ERRORS_DISCARD)
+//     if !proc.started(lsp): complain(lsp.failure)       // an errno; 2 is ENOENT
+//
+//     (i64 sent, i32 stopped) = proc.send_all(&lsp, request[:], 50)
+//     [4096]char8 chunk
+//     i32 n = proc.receive(&lsp, chunk[:], 0)            // bytes, or DRAINED / WAITED / BROKE
+//     ...
+//     (bool exited, i32 status) = proc.stop(&lsp, 500)   // EOF, grace, SIGKILL, reap, close
+//
+// `exec.dado`'s `spawn` gives one direction; this is both, for a program that
+// holds a conversation with its child — a language server speaking JSON-RPC on
+// stdio is the case it was written for. Everything here is `pipe` and
+// `posix_spawnp`, with the argv rules `exec.dado` states (`runnable`,
+// `ARG_CAP`, `PATH` lookup), and the answers are `drain`'s: a byte count, or
+// `DRAINED` / `WAITED` / `BROKE`.
+//
+// ── THE FIVE DECISIONS ─────────────────────────────────────────────────────
+//
+// **1. Writes are non-blocking, one `poll(POLLOUT)` then one `write`.** The
+// parent's end of the child's stdin is `O_NONBLOCK`, so `send` can never be
+// stuck in `write` however much it is handed: it waits at most `timeout_ms`
+// for room, writes what fits, and answers the count. That is the design that
+// makes a conversation deadlock-free — a child like `cat` stops reading its
+// stdin while its stdout is full, so a parent that blocked in `write` with its
+// own reads queued behind it would wait forever. Measured by `duplex_test`:
+// 1 MiB through `cat`, sent and received interleaved, sixteen times a 64 KiB
+// Linux pipe. The alternative, a blocking `write` bounded by `poll`, is not
+// bounded at all: `POLLOUT` promises room for one byte (`PIPE_BUF` on Linux),
+// and a larger blocking write then sleeps until *all* of it fits.
+//
+// **2. `SIGPIPE` is set to ignored, once, and only if nobody chose otherwise.**
+// A `write` to a pipe whose reader has exited raises `SIGPIPE`, and its default
+// action kills the parent — an IDE would vanish because its language server
+// crashed. Checking with `poll` first does not help: the child can die between
+// the check and the write. `send` on a socket has `MSG_NOSIGNAL`, but these
+// are pipes and that flag is Linux-only anyway. So the first `duplex` installs
+// `SIG_IGN` if the disposition was `SIG_DFL`, and puts back whatever was there
+// otherwise — a program with its own handler keeps it, and gets its handler
+// called before the `write` answers `BROKE`.
+//   *The cost*, which is process-wide and is the reason this is written down:
+//   after the first `duplex`, a `write` to *any* broken pipe in this process
+//   answers `EPIPE` instead of killing it — so a filter run as `prog | head`
+//   that ignores write errors keeps running after `head` exits. And an ignored
+//   signal survives `exec`, so every child started afterwards would inherit
+//   it; `duplex`'s own child is started with `SIGPIPE` at its default
+//   (`POSIX_SPAWN_SETSIGDEF`), but `exec`, `spawn` and `popen` children are
+//   not. `ignoring_sigpipe` is the reader.
+//
+// **3. Every descriptor the parent makes is close-on-exec, set straight after
+// `pipe`, and numbered 3 or above.** Without the flag a child inherits the
+// write end of its own stdin — and a second child the first one's — and never
+// sees end-of-file however often the parent closes its copy. `duplex_test`
+// broke this on purpose, the flag removed: every `cat` whose input it closed
+// was still running when its 2 s deadline expired; restored, each exits at
+// once. The numbering is for a parent started
+// with stdin or stdout closed, whose pipe ends would otherwise be 0 or 1: the
+// child's `dup2` onto 0 would overwrite its stdout end before it was moved, or
+// with source and target equal would leave the close-on-exec flag on the
+// child's stdin (`above_stdio`).
+// **What the flag does not cover:** a thread that forks between `pipe` and
+// `fcntl` in this function leaks the pair into its child. Linux has `pipe2` to
+// close that window and Darwin does not, and this package does not start
+// threads, so the window is stated and left open.
+//
+// **4. The child is started with `posix_spawnp`, not `fork`, because `fork`
+// costs the parent in proportion to its own size.** `fork` copies the
+// parent's page tables, and marks every private page copy-on-write, so the
+// parent's next write to each page it owns faults once more — and the wait for
+// the child to reach `exec` is a wait on a child doing its half of the same
+// copy. `posix_spawnp` on glibc (2.24 on) is `clone(CLONE_VM | CLONE_VFORK)`
+// running the file actions and `execvp` in the parent's memory, and on Darwin
+// a system call: no copy, and the parent waits only for the child's `exec`.
+// Measured in the 2-core Linux sandbox by a scratch program (not kept): a
+// process holding 150 MiB of touched heap started `dadoc --emit=lexicon` eight
+// times, then wrote one byte in every page of that heap. `fork` + `execvp`
+// with a report pipe read to end-of-file (this file's previous form) took
+// 4.4–7.2 ms in `duplex`, and the page walk after it 38.6–40.3 ms, nearly all
+// of it copy-on-write faults; `posix_spawnp` took 0.16–0.53 ms (the first run
+// the slowest), and the walk 0.56–1.1 ms, which is the walk alone. A missing
+// program was answered in 0.15–0.29 ms against 6.3–8.3 ms. A C program of
+// the same shape agreed: `fork` 2.6–2.9 ms plus 2.6–3.3 ms waiting for the
+// child's `exec`, against 0.35–0.39 ms for `posix_spawnp`.
+//
+// **5. A failed `exec` is reported, not guessed.** `posix_spawnp` answers the
+// `errno` of an `execvp` that failed, so `failure` is `ENOENT` for a program
+// that is not there, rather than a child that ran and exited 127 — the thing
+// `exec` cannot tell apart. That answer is synchronous on both platforms: on
+// glibc because the `CLONE_VFORK` child writes it where the parent reads it
+// before `posix_spawnp` returns, on Darwin because the system call does the
+// `exec`. **What that costs**: `duplex` returns only once the child has
+// exec'd, so it waits for the kernel to load the program — the figure above,
+// hundreds of microseconds and not milliseconds, and the reason no
+// asynchronous form is offered. An implementation that reported the failure
+// as a child exiting 127 instead (POSIX allows it; glibc before 2.24 did)
+// would make `started` true and `finished` say `(true, true, 127)`; one that
+// answers an error with a pid is reaped here before the error is answered.
+
+// ── MACOS ──────────────────────────────────────────────────────────────────
+//
+// **Every flag and signal number is a `foreign const`**, so the header gives
+// the value on each platform and none is restated here. They differ, which is
+// why that matters: `O_NONBLOCK` is 04000 on Linux and 4 on Darwin, `O_CLOEXEC`
+// 02000000 and 0x1000000, `EAGAIN` 11 and 35, `F_DUPFD_CLOEXEC` 1030 and 67;
+// `WNOHANG`, `F_SETFD`, `FD_CLOEXEC`, `SIGPIPE`, `SIGTERM` and `SIGKILL` happen
+// to agree (1, 2, 1, 13, 15, 9). The Linux values were read from glibc's
+// headers in the sandbox; the Darwin ones are from memory of the SDK and were
+// not compiled — nothing here depends on them being right, since none is
+// written down. `pid_t` is `int` on both; `nfds_t`, which differs, is
+// `drain.dado`'s arm and `send` calls the `poll` declared there. The feature
+// macros are written unconditionally, which is `proc.dado`'s rule: each is
+// inert where it is not for, and `_DARWIN_C_SOURCE` is what keeps
+// `_POSIX_C_SOURCE` from hiding `F_DUPFD_CLOEXEC` on Darwin.
+// **Two `when #OS` arms**, both for `posix_spawnp`: the environment it is
+// handed is `environ`, which glibc declares only under `_GNU_SOURCE` (a define
+// that, like every one, reaches the whole translation unit) and Darwin not at
+// all, where `_NSGetEnviron` in `<crt_externs.h>` is the way to it; and
+// `sigemptyset` / `sigaddset`, which Darwin's `<signal.h>` defines as macros
+// and glibc as functions. **Not run on a Mac**, the Darwin arms included.
+package proc
+
+import "core:time"
+
+// ── the handle ─────────────────────────────────────────────────────────────
+
+// What `duplex` does with the child's standard error.
+const i32 ERRORS_INHERIT = 0    // the parent's own stderr, untouched
+const i32 ERRORS_PIPE = 1       // a third pipe, read with `receive_errors`
+const i32 ERRORS_MERGE = 2      // into the stdout pipe, as `2>&1`
+const i32 ERRORS_DISCARD = 3    // `/dev/null`
+
+// **`ERRORS_PIPE` is a promise to read it.** A child whose stderr pipe fills
+// (64 KiB on Linux) blocks in its next `write` to stderr, and a parent that is
+// only reading stdout waits for output that is never coming. Discard or merge
+// unless you will drain both.
+
+// A running child and the three pipes to it. Fields are readable; change them
+// only through the verbs below.
+//
+// `input`, `output` and `errors` are the parent's descriptors, -1 when closed
+// or never opened. `failure` is the `errno` of whatever stopped `duplex` —
+// `ENOENT` for a missing program, as `posix_spawnp` answered it — or -1 for an argv or
+// `errors` mode refused before anything ran, and 0 for a child that started.
+// `reaped`, `exited` and `status` are the wait's answer once there is one, in
+// `proc.close`'s encoding.
+type Duplex:
+    bool open,
+    i32  pid,
+    i32  input,
+    i32  output,
+    i32  errors,
+    i32  failure,
+    bool reaped,
+    bool exited,
+    i32  status,
+
+// Where each end sits in `duplex`'s one array of six: read end, then write
+// end, for stdin, stdout and stderr, in that order. Under `ERRORS_DISCARD`
+// the stderr write end is `/dev/null`, opened by the parent.
+private const i32 IN_R = 0
+private const i32 IN_W = 1
+private const i32 OUT_R = 2
+private const i32 OUT_W = 3
+private const i32 ERR_R = 4
+private const i32 ERR_W = 5
+private const i32 ENDS = 6
+
+// The most one `send` hands to `write`, so the count fits its `i32` answer.
+private const i64 WRITE_CAP = 1073741824     // 2^30
+
+// Whether this package installed `SIG_IGN` for `SIGPIPE` — so `duplex`'s child
+// knows to put `SIG_DFL` back — and whether it has looked yet.
+private bool g_sigpipe_checked
+private bool g_sigpipe_ours
+
+// ── the verbs written once, over each arm's ─────────────────────────────────
+
+// Whether `duplex` started a child. A `Duplex` that did not holds no
+// descriptor and no pid, and every verb below answers it `BROKE` or `false`.
+bool started(Duplex d): return d.open
+
+// Whether the first `duplex` in this process set `SIGPIPE` to ignored — false
+// before any `duplex`, and false if the program had already chosen a
+// disposition of its own.
+bool ignoring_sigpipe(): return g_sigpipe_ours
+
+// `send` until all of `bytes` is gone, or nothing moved for `timeout_ms`.
+//
+// `sent` is how much was written and `stopped` why it stopped short: 0 when
+// all of it went, else `WAITED` or `BROKE` as from `send`. The timeout is a
+// *stall* bound, per wait, and not a bound on the whole call — a child reading
+// one byte a millisecond keeps it going, and each byte is progress. **Only
+// for a message that fits the pipe, or a child that reads without writing
+// back:** a child that answers as it reads, with nobody reading its answers,
+// fills its stdout and stops reading, and this then stops with `WAITED`. The
+// deadlock-free shape for a large exchange is `send` and `receive` in turn.
+(i64 sent, i32 stopped) send_all(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+    if !has_input(d): return (0, BROKE)
+    i64 total = #len(bytes)
+    i64 done = 0
+    for done < total:
+        i32 n = send(d, bytes[done..<total], timeout_ms)
+        if n == BROKE || n == WAITED: return (done, n)
+        done += i64(n)
+    return (done, 0)
+
+// The whole ending in one call: close every pipe, give the child `grace_ms` to
+// exit, `SIGKILL` it if it has not, reap it. Answers `proc.close`'s pair, and
+// `(false, -1)` for a `Duplex` never started.
+//
+// **Unread output is thrown away**, on purpose: the read ends are closed
+// first, so a child still writing gets `EPIPE` (or its default `SIGPIPE`)
+// instead of blocking on a full pipe until the grace runs out. Read to
+// `DRAINED` first if the tail matters.
+(bool exited, i32 status) stop(^Duplex d, i32 grace_ms):
+    if d == nil || !d.open: return (false, 0 - 1)
+    release(d)
+    (bool done, bool exited, i32 status) = finish(d, grace_ms)
+    if done: return (exited, status)
+    _ = kill(d)
+    (_, bool exited2, i32 status2) = finish(d, 0 - 1)
+    return (exited2, status2)
+
+private Duplex unstarted(i32 why):
+    Duplex d
+    d.open = false
+    d.pid = 0 - 1
+    d.input = 0 - 1
+    d.output = 0 - 1
+    d.errors = 0 - 1
+    d.failure = why
+    d.status = 0 - 1
+    return d
+
+private bool has_input(^Duplex d):
+    return d != nil && d.open && d.input >= 0
+
+// ── WINDOWS ────────────────────────────────────────────────────────────────
+//
+// The same five decisions, against Win32 (`windows.dado` has the mechanics):
+//
+// **1. Writes never wait longer than the timeout.** An anonymous pipe cannot
+// be overlapped, so the child's stdin is a named pipe of one instance whose
+// parent end is overlapped. `send` copies up to 64 KiB into a stage of this
+// package's and starts one overlapped `WriteFile` from there, answering the
+// count staged; the next `send` waits at most `timeout_ms` for that write and
+// answers `WAITED` if it is still going. A write is never cancelled, because
+// Windows does not report what a cancelled pipe write moved (`windows.dado`'s
+// `send_staged`). Reads are `drain`'s, `PeekNamedPipe` then one `ReadFile` of
+// what is there.
+// **2. There is no `SIGPIPE`.** A write to a pipe whose reader has gone fails
+// with `ERROR_NO_DATA` or `ERROR_BROKEN_PIPE`, and `send` answers `BROKE`;
+// `ignoring_sigpipe` is false, because nothing was changed.
+// **3. Only the child's three ends are inherited**, by the handle list
+// `windows.dado` describes, so a second child never holds the first one's
+// stdin open. A parent with no standard handle passes the child none.
+// **4. `CreateProcessW` is the only way there is**, and costs the parent
+// nothing in proportion to its size.
+// **5. A failed start is reported, not guessed**: `failure` is the
+// `GetLastError` code, `ERROR_FILE_NOT_FOUND` (2, as `ENOENT` is) for a
+// program that is not there.
+//
+// **`terminate` and `kill` are one thing**, because Windows has no request a
+// process must be asked by: both end the child and every process it started,
+// through its job, and the answer is `(false, -9)`, `SIGKILL`'s. `finish`
+// waits on the process handle with the timeout, so it does not poll.
+// `input`, `output` and `errors` are C-runtime descriptors over the pipe
+// handles, so a closed one is -1 as on POSIX.
+when #OS == #WINDOWS:
+    Duplex duplex([]cstring argv, i32 errors = ERRORS_INHERIT):
+        Duplex d = unstarted(0 - 1)
+        if !runnable(argv): return d
+        if errors < ERRORS_INHERIT || errors > ERRORS_DISCARD: return d
+
+        (rawptr in_parent, rawptr in_child, i32 why) = outbound_pipe()
+        rawptr out_parent = nil
+        rawptr out_child = nil
+        if why == 0: (out_parent, out_child, why) = anonymous_pipe()
+        rawptr err_parent = nil
+        rawptr err_child = nil
+        bool err_ours = false
+        if why == 0 && errors == ERRORS_PIPE:
+            (err_parent, err_child, why) = anonymous_pipe()
+            err_ours = true
+        if why == 0 && errors == ERRORS_DISCARD:
+            err_child = open_null()
+            err_ours = true
+            if err_child == nil: why = i32(ERROR_FILE_NOT_FOUND)
+        if errors == ERRORS_INHERIT: err_child = std_handle(STD_ERROR_HANDLE)
+        if errors == ERRORS_MERGE: err_child = out_child
+
+        i32 pid = 0 - 1
+        if why == 0: (pid, why) = launch_argv(argv, in_child, out_child, err_child)
+
+        // The child's ends are the child's copies now, or nobody's.
+        close_handle(in_child)
+        close_handle(out_child)
+        if err_ours: close_handle(err_child)
+        if why != 0:
+            close_handle(in_parent)
+            close_handle(out_parent)
+            close_handle(err_parent)
+            d.failure = why
+            return d
+
+        d.input = descriptor(in_parent, CRT_WRITE)
+        d.output = descriptor(out_parent, CRT_READ)
+        if err_parent != nil: d.errors = descriptor(err_parent, CRT_READ)
+        if d.input < 0 || d.output < 0 || (err_parent != nil && d.errors < 0):
+            close_fd(d.input)
+            close_fd(d.output)
+            close_fd(d.errors)
+            _ = end_tree(pid)
+            _ = reap_pid(pid, 0 - 1)
+            return unstarted(i32(ERROR_TOO_MANY_OPEN_FILES))
+        d.open = true
+        d.pid = pid
+        d.failure = 0
+        return d
+
+    i32 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+        if !has_input(d): return BROKE
+        i64 n = #len(bytes)
+        if n <= 0: return 0
+        if n > WRITE_CAP: n = WRITE_CAP
+        return send_staged(d.pid, d.input, bytes, n, timeout_ms)
+
+    i32 receive(^Duplex d, []char8 into, i32 timeout_ms = 0):
+        if d == nil || !d.open: return BROKE
+        if !d.reaped: service_pid(d.pid)
+        return drain_handle(handle_of(d.output), into, timeout_ms)
+
+    i32 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0):
+        if d == nil || !d.open: return BROKE
+        return drain_handle(handle_of(d.errors), into, timeout_ms)
+
+    bool close_input(^Duplex d):
+        if !has_input(d): return false
+        if d.reaped: close_fd(d.input)
+        else: close_staged(d.pid, d.input)
+        d.input = 0 - 1
+        return true
+
+    bool terminate(^Duplex d): return end_child(d)
+
+    bool kill(^Duplex d): return end_child(d)
+
+    (bool done, bool exited, i32 status) finished(^Duplex d):
+        return finish(d, 0)
+
+    (bool done, bool exited, i32 status) finish(^Duplex d, i32 timeout_ms):
+        if d == nil || !d.open: return (false, false, 0 - 1)
+        if d.reaped: return (true, d.exited, d.status)
+        (bool done, bool exited, i32 status) = reap_pid(d.pid, timeout_ms)
+        if !done: return (false, false, 0 - 1)
+        d.reaped = true
+        d.exited = exited
+        d.status = status
+        return (true, exited, status)
+
+    void release(^Duplex d):
+        if d == nil || !d.open: return
+        _ = close_input(d)
+        close_fd(d.output)
+        d.output = 0 - 1
+        close_fd(d.errors)
+        d.errors = 0 - 1
+
+    private bool end_child(^Duplex d):
+        if d == nil || !d.open || d.reaped || d.pid <= 0: return false
+        return end_tree(d.pid)
+
+// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+else:
+    // ── bindings ───────────────────────────────────────────────────────────────
+
+    // `write` joins `drain.dado`'s and `exec.dado`'s `sys` block — this package
+    // declares a `write` of its own, the one that opens a shell line. C's types
+    // and not `i64`/`u64`, for `drain.dado`'s reason: Darwin's `int64_t` is not
+    // its `ssize_t`.
+    private foreign sys "unistd.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        #c.long write(i32 fd, rawptr buf, #c.size_t count)
+
+    // `fcntl` and `open` are variadic in C and restated as such; a `foreign` call
+    // emits no prototype, so the header's declaration is the one checked.
+    private foreign sys "fcntl.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        const i32 F_GETFL
+        const i32 F_SETFL
+        const i32 F_SETFD
+        const i32 F_DUPFD_CLOEXEC
+        const i32 FD_CLOEXEC
+        const i32 O_NONBLOCK
+        const i32 O_WRONLY
+        const i32 O_CLOEXEC
+        i32 fcntl(i32 fd, i32 cmd, ...)
+        i32 open(cstring path, i32 flags, ...)
+
+    // The two records `posix_spawnp` is configured through are bodiless foreign
+    // types: complete in C, opaque here, so a local of each is a real object and
+    // `&fa` is the pointer the calls take. `argv` and `envp` are `char *const *`,
+    // restated as `exec.dado`'s `execvp` restates its argv and converted at the call
+    // the same way. `setflags` takes a C `short`.
+    private foreign "spawn.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        type posix_spawn_file_actions_t
+        type posix_spawnattr_t
+        const i32 POSIX_SPAWN_SETSIGDEF
+        i32 posix_spawn_file_actions_init(^posix_spawn_file_actions_t fa)
+        i32 posix_spawn_file_actions_destroy(^posix_spawn_file_actions_t fa)
+        i32 posix_spawn_file_actions_adddup2(^posix_spawn_file_actions_t fa, i32 fd, i32 to)
+        i32 posix_spawnattr_init(^posix_spawnattr_t attr)
+        i32 posix_spawnattr_destroy(^posix_spawnattr_t attr)
+        i32 posix_spawnattr_setflags(^posix_spawnattr_t attr, i16 flags)
+        i32 posix_spawnattr_setsigdefault(^posix_spawnattr_t attr, ^SigSet set)
+        i32 posix_spawnp(^i32 pid, cstring file, ^posix_spawn_file_actions_t fa, ^posix_spawnattr_t attr, ^const ^#c.char argv, ^const ^#c.char envp)
+
+    // The environment the child is given: this process's own, as `execvp` would
+    // have passed it (see the file's head for the two spellings).
+    when #OS == #DARWIN:
+        // `_NSGetEnviron` answers `char ***` — the address of the environment
+        // block — and is restated as that: a `rawptr` return is `void *`, which
+        // the emitter's `_Generic` assertion on this declaration refuses at macOS.
+        private foreign "crt_externs.h":
+            ^^^#c.char _NSGetEnviron()
+
+        private rawptr environment():
+            return rawptr(_NSGetEnviron()^)
+
+        private foreign "signal.h":
+            type @c("sigset_t") SigSet
+            @macro i32 sigemptyset(^SigSet set)
+            @macro i32 sigaddset(^SigSet set, i32 signum)
+    else:
+        private foreign "unistd.h" define "_GNU_SOURCE=1":
+            const rawptr environ
+
+        private rawptr environment():
+            return environ
+
+        private foreign "signal.h" define "_POSIX_C_SOURCE=200809L":
+            type @c("sigset_t") SigSet
+            i32 sigemptyset(^SigSet set)
+            i32 sigaddset(^SigSet set, i32 signum)
+
+    // `errno` is a macro expanding to an lvalue; a foreign constant is read at the
+    // use site and declares nothing, which is all reading it needs.
+    // `EWOULDBLOCK` is not bound because it equals `EAGAIN` on both platforms.
+    private foreign "errno.h":
+        const i32 errno
+        const i32 EINTR
+        const i32 EAGAIN
+
+    private foreign wait_for "sys/wait.h":
+        const i32 WNOHANG
+
+    // `SIG_IGN` and `SIG_DFL` are values of the handler type rather than numbers —
+    // glibc writes `((__sighandler_t) 1)` — so they bind as constants of it, the
+    // way `vendor:tui` binds `SIG_DFL`. `kill` is bound as `sig` because this
+    // file declares a `kill` of its own.
+    private type SigHandler: void(i32)
+
+    private foreign sig "signal.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        const i32 SIGPIPE
+        const i32 SIGTERM
+        const i32 SIGKILL
+        const SigHandler SIG_IGN
+        const SigHandler SIG_DFL
+        SigHandler signal(i32 signum, SigHandler handler)
+        i32 kill(i32 pid, i32 signum)
+
+    // `POLLOUT` is 4 on both platforms and bound rather than restated anyway; the
+    // `poll` it goes to, and `PollFd`, are `drain.dado`'s.
+    private foreign "poll.h" define "_POSIX_C_SOURCE=200809L":
+        const i16 POLLOUT
+
+    // ── starting ───────────────────────────────────────────────────────────────
+
+    // Start `argv` with its stdin and stdout on pipes to this process, and its
+    // stderr as `errors` says. Blocks only until the child has exec'd (the file's
+    // head has the cost), and never aborts: `started` answers whether it worked
+    // and `failure` says why not.
+    Duplex duplex([]cstring argv, i32 errors = ERRORS_INHERIT):
+        Duplex d = unstarted(0 - 1)
+        if !runnable(argv): return d
+        if errors < ERRORS_INHERIT || errors > ERRORS_DISCARD: return d
+        ignore_sigpipe_once()
+
+        [ENDS]i32 fds
+        for i in 0..<ENDS:
+            fds[i] = 0 - 1
+        bool piped = open_pipe(fds[:], IN_R) && open_pipe(fds[:], OUT_R)
+        if piped && errors == ERRORS_PIPE: piped = open_pipe(fds[:], ERR_R)
+        if piped && errors == ERRORS_DISCARD:
+            fds[ERR_W] = above_stdio(sys.open("/dev/null", sys.O_WRONLY | sys.O_CLOEXEC))
+            piped = fds[ERR_W] >= 0
+        if !piped:
+            d.failure = errno
+            close_ends(fds[:])
+            return d
+
+        (i32 pid, i32 why) = spawn_child(argv, fds[:], errors)
+
+        // The child's ends are the child's copies now, or nobody's: the parent's
+        // are closed either way, so its stdout read end sees end-of-file when the
+        // child exits.
+        close_end(fds[:], IN_R)
+        close_end(fds[:], OUT_W)
+        close_end(fds[:], ERR_W)
+        if why != 0:
+            close_ends(fds[:])
+            d.failure = why
+            return d
+
+        // Non-blocking on the one end the parent writes. The read ends stay
+        // blocking: `drain_fd` reads only after `poll` says there is something, and
+        // a pipe with one reader keeps that promise.
+        i32 flags = sys.fcntl(fds[IN_W], sys.F_GETFL)
+        if flags >= 0: _ = sys.fcntl(fds[IN_W], sys.F_SETFL, flags | sys.O_NONBLOCK)
+
+        d.open = true
+        d.pid = pid
+        d.input = fds[IN_W]
+        d.output = fds[OUT_R]
+        d.errors = fds[ERR_R]
+        d.failure = 0
+        return d
+
+    // ── talking ────────────────────────────────────────────────────────────────
+
+    // Write as much of `bytes` as the pipe will take, waiting at most `timeout_ms`
+    // for room (0 waits not at all, negative waits indefinitely).
+    //
+    // Answers the count written — possibly fewer than `#len(bytes)`, and the rest
+    // is the caller's to send again — or `WAITED` when there was no room in time,
+    // or `BROKE` when the child's stdin is closed (it exited, or `close_input`
+    // ran) or `d` is not a started child. Empty `bytes` answers 0.
+    i32 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+        if !has_input(d): return BROKE
+        i64 n = #len(bytes)
+        if n <= 0: return 0
+        if n > WRITE_CAP: n = WRITE_CAP
+
+        // `POLLERR` on a write end is the reader gone, and it counts as ready: the
+        // `write` below is what turns it into `EPIPE` and `BROKE`.
+        PollFd one = (d.input, POLLOUT, 0)
+        i32 ready = poll(&one, 1, timeout_ms)
+        if ready <= 0: return WAITED
+        i64 wrote = i64(sys.write(d.input, rawptr(&bytes[0]), #c.size_t(n)))
+        if wrote > 0: return i32(wrote)
+        if wrote < 0:
+            i32 e = errno
+            if e == EAGAIN || e == EINTR: return WAITED
+        return BROKE
+
+    // Whatever the child has written to stdout, waiting at most `timeout_ms`:
+    // the byte count, or `DRAINED` (it closed its stdout — every later call says
+    // so again), `WAITED` or `BROKE`, exactly as `drain`.
+    i32 receive(^Duplex d, []char8 into, i32 timeout_ms = 0):
+        if d == nil || !d.open: return BROKE
+        return drain_fd(d.output, into, timeout_ms)
+
+    // `receive` for the stderr pipe, which exists only under `ERRORS_PIPE`;
+    // `BROKE` otherwise.
+    i32 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0):
+        if d == nil || !d.open: return BROKE
+        return drain_fd(d.errors, into, timeout_ms)
+
+    // Close the child's stdin, so its next read sees end-of-file. True if this
+    // closed it; false if it was already closed or `d` is not a started child.
+    bool close_input(^Duplex d):
+        if !has_input(d): return false
+        _ = sys.close(d.input)
+        d.input = 0 - 1
+        return true
+
+    // ── ending ─────────────────────────────────────────────────────────────────
+
+    // Ask the child to stop (`SIGTERM`). False for a child already reaped — its
+    // pid may belong to someone else by now — and for a `Duplex` never started.
+    bool terminate(^Duplex d): return signal_child(d, sig.SIGTERM)
+
+    // Stop the child whether it agrees or not (`SIGKILL`). Same refusals.
+    bool kill(^Duplex d): return signal_child(d, sig.SIGKILL)
+
+    // Whether the child has ended, without waiting. `done` false is "still
+    // running" and the other two are then meaningless; once `done`, every later
+    // call answers the same triple from the record without asking the kernel.
+    // `(exited, status)` is `proc.close`'s encoding: an exit code, or a negated
+    // signal number with `exited` false.
+    (bool done, bool exited, i32 status) finished(^Duplex d):
+        if d == nil || !d.open: return (false, false, 0 - 1)
+        if d.reaped: return (true, d.exited, d.status)
+        i32 raw = 0
+        i32 got = wait_for.waitpid(d.pid, &raw, wait_for.WNOHANG)
+        if got == 0: return (false, false, 0 - 1)
+        return settle(d, got, raw)
+
+    // `finished`, waiting up to `timeout_ms` for it (negative waits indefinitely).
+    //
+    // The bounded wait polls: `waitpid` has no timeout, so this asks with `WNOHANG`
+    // and naps 1, 2, 4, 8 and then 16 ms between asks. The cost is up to 16 ms of
+    // latency after a slow child exits, bought instead of a `SIGCHLD` handler,
+    // which would be process-wide state this package does not want to own.
+    (bool done, bool exited, i32 status) finish(^Duplex d, i32 timeout_ms):
+        if d == nil || !d.open: return (false, false, 0 - 1)
+        if d.reaped: return (true, d.exited, d.status)
+        if timeout_ms < 0:
+            i32 raw = 0
+            i32 got = 0 - 1
+            for:
+                got = wait_for.waitpid(d.pid, &raw, 0)
+                if got >= 0 || errno != EINTR: break
+            return settle(d, got, raw)
+
+        f64 began = time.now()
+        i32 step = 1
+        for:
+            (bool done, bool exited, i32 status) = finished(d)
+            if done: return (true, exited, status)
+            i64 left = i64(timeout_ms) - time.ms_since(began)
+            if left <= 0: break
+            if i64(step) > left: step = i32(left)
+            time.nap(step)
+            if step < 16: step = step * 2
+        return (false, false, 0 - 1)
+
+    // Close every descriptor the parent still holds, without waiting. The child
+    // is not reaped — `finished` and `finish` still work after this — and a second
+    // call does nothing.
+    void release(^Duplex d):
+        if d == nil || !d.open: return
+        _ = close_input(d)
+        if d.output >= 0: _ = sys.close(d.output)
+        d.output = 0 - 1
+        if d.errors >= 0: _ = sys.close(d.errors)
+        d.errors = 0 - 1
+
+    // ── the halves nobody outside this file should have to write ──────────────
+
+    private bool signal_child(^Duplex d, i32 signum):
+        if d == nil || !d.open || d.reaped || d.pid <= 0: return false
+        return sig.kill(d.pid, signum) == 0
+
+    // Record a `waitpid` answer. -1 is `ECHILD` in practice — the child was reaped
+    // by someone else, or `SIGCHLD` is ignored and the kernel reaped it — and is
+    // recorded as done with `(false, -1)`, the wait-that-never-happened pair,
+    // because asking again would answer the same.
+    private (bool done, bool exited, i32 status) settle(^Duplex d, i32 got, i32 raw):
+        d.reaped = true
+        if got < 0:
+            d.exited = false
+            d.status = 0 - 1
+        else:
+            (bool exited, i32 status) = decode(raw)
+            d.exited = exited
+            d.status = status
+        return (true, d.exited, d.status)
+
+    // `pipe` into `fds[at]` and `fds[at + 1]`, both close-on-exec at once and
+    // both numbered 3 or above (`above_stdio`) — the child's ends too, since
+    // `dup2` onto 0, 1 or 2 makes a copy without the flag and the originals are
+    // then closed by the `exec` itself. False, with `errno` saying why, when
+    // either could not be made; whatever was made is in `fds` for the caller to
+    // close.
+    private bool open_pipe([]i32 fds, i32 at):
+        [2]i32 two
+        if sys.pipe(&two[0]) != 0: return false
+        _ = sys.fcntl(two[0], sys.F_SETFD, sys.FD_CLOEXEC)
+        _ = sys.fcntl(two[1], sys.F_SETFD, sys.FD_CLOEXEC)
+        fds[at] = above_stdio(two[0])
+        fds[at + 1] = above_stdio(two[1])
+        return fds[at] >= 0 && fds[at + 1] >= 0
+
+    private void close_end([]i32 fds, i32 at):
+        if fds[at] >= 0: _ = sys.close(fds[at])
+        fds[at] = 0 - 1
+
+    private void close_ends([]i32 fds):
+        for i in 0..<ENDS:
+            close_end(fds, i)
+
+    // The first `duplex` in the process, and only if the program left `SIGPIPE`
+    // at its default. `signal` answers the previous disposition, so a program that
+    // had chosen one gets it put straight back.
+    private void ignore_sigpipe_once():
+        if g_sigpipe_checked: return
+        g_sigpipe_checked = true
+        SigHandler before = sig.signal(sig.SIGPIPE, sig.SIG_IGN)
+        if before == sig.SIG_DFL:
+            g_sigpipe_ours = true
+            return
+        _ = sig.signal(sig.SIGPIPE, before)
+
+    // `fd` moved above 0..2, close-on-exec, and the original closed — or `fd`
+    // itself when it already is above, and -1 when it is -1 or the move failed
+    // (the original is closed then too, so nothing leaks).
+    //
+    // This is what makes the child's `dup2`s order-independent: a parent started
+    // with stdin or stdout closed gets pipe ends numbered 0 or 1, and `dup2(in, 0)`
+    // would otherwise overwrite the stdout end before it was moved — or, with
+    // source and target equal, do nothing and leave the close-on-exec flag on the
+    // child's stdin.
+    private i32 above_stdio(i32 fd):
+        if fd < 0 || fd > 2: return fd
+        i32 moved = sys.fcntl(fd, sys.F_DUPFD_CLOEXEC, 3)
+        _ = sys.close(fd)
+        return moved
+
+    // Start the child: `argv` null-terminated in a frame array (`exec.dado`'s
+    // `ARGV_SLOTS`), its stdin, stdout and stderr as file actions onto the ends in
+    // `fds`, `SIGPIPE` back at its default when this package ignored it, and
+    // `posix_spawnp`. Answers the pid and 0, or -1 and the error number — of the
+    // set-up, or of the `execvp` that failed. A pid answered beside an error (an
+    // implementation that forked before it failed) is reaped here: that child is
+    // exiting 127, so the wait is bounded by its exit.
+    private (i32 pid, i32 why) spawn_child([]cstring argv, []i32 fds, i32 errors):
+        [ARGV_SLOTS]cstring c_argv
+        i32 n = i32(#len(argv))
+        for i in 0..<n:
+            c_argv[i] = argv[i]
+        c_argv[n] = nil
+
+        posix_spawn_file_actions_t fa
+        posix_spawnattr_t attr
+        i32 why = posix_spawn_file_actions_init(&fa)
+        if why != 0: return (0 - 1, why)
+        why = posix_spawnattr_init(&attr)
+        if why != 0:
+            _ = posix_spawn_file_actions_destroy(&fa)
+            return (0 - 1, why)
+
+        why = posix_spawn_file_actions_adddup2(&fa, fds[IN_R], 0)
+        if why == 0: why = posix_spawn_file_actions_adddup2(&fa, fds[OUT_W], 1)
+        if why == 0 && (errors == ERRORS_PIPE || errors == ERRORS_DISCARD):
+            why = posix_spawn_file_actions_adddup2(&fa, fds[ERR_W], 2)
+        if why == 0 && errors == ERRORS_MERGE:
+            why = posix_spawn_file_actions_adddup2(&fa, 1, 2)
+        if why == 0 && g_sigpipe_ours:
+            SigSet dfl
+            _ = sigemptyset(&dfl)
+            _ = sigaddset(&dfl, sig.SIGPIPE)
+            why = posix_spawnattr_setsigdefault(&attr, &dfl)
+            if why == 0: why = posix_spawnattr_setflags(&attr, i16(POSIX_SPAWN_SETSIGDEF))
+
+        i32 pid = 0 - 1
+        if why == 0:
+            why = posix_spawnp(&pid, c_argv[0], &fa, &attr, Argv(rawptr(&c_argv[0])), Argv(environment()))
+        _ = posix_spawnattr_destroy(&attr)
+        _ = posix_spawn_file_actions_destroy(&fa)
+        if why != 0 && pid > 0:
+            i32 raw = 0
+            for:
+                if wait_for.waitpid(pid, &raw, 0) >= 0 || errno != EINTR: break
+            pid = 0 - 1
+        if why != 0: return (0 - 1, why)
+        return (pid, 0)

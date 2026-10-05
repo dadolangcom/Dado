@@ -1,0 +1,752 @@
+// app:graphical — the graphical runtime: a real sokol backend, a window, a
+// drawing surface and a root canvas, on the app singleton.
+//
+//     import app "app:graphical"
+//     import "app:draw"
+//
+//     !void ready():
+//         draw.Item bg = draw.canvas_item_create(app.canvas())
+//         draw.rect(bg, (0.0, 0.0, 800.0, 600.0), (26, 30, 38, 255))
+//
+//     !void process(f32 dt): ...
+//
+//     !i32 main():
+//         try app.init(800, 600, "my app")
+//         app.hook(ready: ready, process: process)
+//         try app.run() else code:
+//             fmt.println("app.run failed: ", code)
+//             return 1
+//         return 0
+//
+// **There is no `draw.init` in that program, no `canvas_create`, no
+// `canvas_render` and no `input.clear_edges`.** The runtime does all four, and
+// the argument for each is at the declaration that does it. `main` is `!i32`
+// because both `init` and `run` are failable — `init` refuses a window size
+// that is not one, and `run` carries out a failure raised inside the frame
+// loop, which is where every other thing that can go wrong goes wrong.
+//
+// ## The front door is this package, and the door is an import alias
+//
+// A graphical program used to open with two imports, and with one line that
+// reached past the facade it had just bound:
+//
+//     import "app:app"
+//     import gx "app:graphical"
+//     ...
+//     gx.new(1024, 576, "Kettle Hollow")
+//     app.on_ready(ready)
+//     app.on_process(process)
+//     app.on_draw(draw_frame)
+//     app.run()
+//
+// One package, imported under a name of its own, touched **once**, for one
+// line, and never again for the rest of the program. Sam's reading of that was
+// that it is weird to reach into `gx` to get your window going, and it is: the
+// thing a program names `gx` is not a thing it uses, it is a thing it opens
+// with.
+//
+// So this package now carries the whole surface a program writes — `init`,
+// `hook`, `run`, `quit`, `canvas`, the two allocators, the redraw knobs, the
+// four individual `on_*` setters — and a program binds **it** under the name
+// `app`:
+//
+//     import app "app:graphical"
+//
+// **`app:app` could not have grown a window call instead**, and that is what
+// forced an alias rather than a re-export. This package imports `app:app` (see
+// the import below), so `app:app` importing this one is `ERR0302` — the import
+// graph is acyclic and that edge is the cycle. Handing the window call up to
+// the core would also mean the core knowing what a window is, which is the one
+// thing it is built not to know: it is the same core under `app:headless`.
+// And a `type X: app.Y` re-export is not a workaround either: a cross-package
+// type re-export compiles or does not according to the *root* package's
+// import order, which the re-exporting file does not mention.
+//
+// So `app:app` is untouched by the window and stays the substrate-agnostic
+// runtime core. Every name in the forwarding section below is one line that
+// calls it, and a program that wants the core directly still writes
+// `import "app:app"` and gets exactly what it always got. What the alias buys
+// is that the **body** of a program is identical under either facade: swap
+// `import app "app:graphical"` for `import app "app:headless"`, change the one
+// `init` line — which differs because a headless program has no window size —
+// and nothing else moves.
+//
+// **What an alias cannot carry is a type.** `app.Capability`, `app.JobArgs`,
+// `app.JobFn` and `app.Handle` are types and the `ROLE` seat is a `@const`, and
+// none of the five can be re-exported here: a re-exported type is the
+// import-order defect named above, and a
+// second `@const ROLE` in this package would make `-D ROLE=server` name two
+// declarations (`ERR1103`) and break the build seat for everybody. So a program
+// that asks `app.supports(...)`, submits jobs or reads `ROLE` imports `app:app`
+// beside this one, under its own name, and writes `core.supports(...)`.
+//
+// **`canvas()` is the one place this is visible in the new surface.** It
+// answers a `draw.Canvas`, which is `app:draw`'s type and not this package's,
+// so a program that touches the canvas imports `app:draw` for the type — which
+// it was going to import anyway, because everything it does with the canvas is
+// an `app:draw` call.
+//
+// ## What this facade fills the five service slots with
+//
+// `app:app` drives five services it may not import (the argument is in its own
+// package comment). This facade is what fills them:
+//
+//   surface_up    `draw.init()` under the runtime's allocator, then one
+//                 `draw.canvas_create()` — the root canvas, which `canvas()`
+//                 answers and which the program never has to make.
+//   surface_down  `draw.shutdown()`.
+//   render        `draw.canvas_render(root, w, h)` at the window's current
+//                 size, inside the pass, after the program's draw hook.
+//   end_input     `input.clear_edges()`.
+//   deliver       `input.deliver()` — the frame's one drain point, before
+//                 `process`.
+//
+// **That is the whole of what changed here, and it moved four calls out of
+// every graphical program in the tree.**
+//
+// ## One runtime, and which one won
+//
+// There used to be two. `app:app` is the singleton runtime — four hooks, one
+// ambient temp arena rolled back at the barrier, `core:jobs` started and stopped
+// around it, and a `Backend` vtable whose `begin_frame`/`end_frame` bracket the
+// draw hook. `app:display` had grown a second one: its own frame loop, its own
+// five hooks carrying an `Allocator` each, a separate `draw` phase, and a
+// second per-frame arena of its own. Nothing imported both, so the two never had
+// to agree.
+//
+// **`app:app`'s shape wins, whole.** It is what every other `app:` package and
+// every example is written against, it is the one with a job system attached to
+// its barrier, and its `Backend` vtable is the only seat a facade can install
+// into. `app:display`'s hook shape is now four callbacks that carry no
+// allocator and make no policy — the seam this package drives, and nothing a
+// program writes against. There is exactly one frame loop (sokol's, entered
+// through `sapp_run`), exactly one temp arena (`app.temp()`, rolled back in
+// `app.tick`), one root canvas and one hook shape.
+//
+// ## Where the pass goes, and why the existing bracket is the right seat
+//
+// Something has to sit between `sg_begin_pass` and `sg_end_pass` or nothing is
+// ever drawn. `app.Backend.begin_frame`/`end_frame` are the one bracket in the
+// runtime, so the pass goes there: `begin_frame` is `display.begin_pass()`,
+// `end_frame` is `display.end_pass()`, and what `app.tick` puts between them is
+// the program's `draw` hook and then the runtime's own `render`.
+//
+// It is the right seat and not merely an available one, on three counts. The
+// bracket is *already* nil-checked per frame, so a backend with no pass (see
+// `app:headless`) costs nothing. It is inside `app.tick`, so the temp rollback
+// lands after `end_frame` — a draw hook may allocate temporaries. And
+// it is the only bracket in the runtime, so there is no second place a drawing
+// call could be legal, which is what `display.drawing()` reports.
+//
+// ## Idling, and what sokol will not do (E7)
+//
+// `_sapp_linux_run` is a busy loop: `XPending` (non-blocking), drain, frame
+// callback, `XFlush`, again. There is no wait-for-event mode on GLX, no
+// `sapp_desc` field that adds one, and the only thing in the loop that ever
+// blocks is the buffer swap under vsync — which stops blocking under software
+// Mesa or an unmapped window. **sokol cannot idle**, and this package does not
+// pretend it can.
+//
+// What it does instead is skip the expensive part and then give the core back:
+// `app.set_redraw_on_demand(true)` makes `app.tick` skip the whole bracket on a
+// frame nothing asked for, and `set_idle_frame_time` makes an iteration that
+// drew nothing last at least a few milliseconds. Neither is on by default. See
+// `app:app`'s conditional-frames section for why the default is off.
+//
+// **A skipped frame still swaps.** `_sapp_linux_frame` calls
+// `glXSwapBuffers` after every frame callback, drawn or not, so under vsync
+// an undrawn iteration still waits up to a refresh in the swap. A fixed nap
+// on top of that would stack the two waits — an 8 ms nap plus a refresh is
+// about 25 ms an iteration at 60 Hz, a 40 Hz poll. So the nap is a budget, not
+// a fixed sleep: `_frame` measures the time since the previous iteration's
+// callback returned (the swap, the event drain and this tick) and naps only
+// for what is left of `set_idle_frame_time` (`idle_nap_ms`). Where the swap
+// blocks, it paces the loop and the nap is zero or nearly; where it does not
+// (software Mesa, Xvfb, an unmapped window), the nap brings each iteration up
+// to the budget. An idle loop therefore polls at the slower of the display's
+// refresh and the budget, and an event waits at most that one period before
+// its frame begins.
+//
+// ## The capability set is what this backend can do today
+//
+//   Input      — yes. `app:input/sokol` decodes sokol's event stream into
+//                `app:input`'s queue; the wiring is `_event` below. File drops
+//                are part of it and are the one input the window has to *ask*
+//                for — see `set_file_drop`.
+//   Windowing  — yes. sokol_app opens, sizes, titles and fullscreens a window,
+//                and `app:display` exposes all of it.
+//   Clipboard  — yes. `desc.enable_clipboard` is set in `display`'s substrate,
+//                which is what makes `sapp_get_clipboard_string` return
+//                anything at all, and `display.clipboard_get`/`_set` reach it.
+//   Threads    — yes. `core:jobs` gets a real worker pool, same as `app:headless`.
+//   VectorDraw — **yes, and this is new.** The old entry said no, and the
+//                reason it gave was exact: *"this backend neither imports nor
+//                installs `app:draw`: a program calls `draw.init` itself and
+//                `draw.init` can fail and say so. A capability is a promise the
+//                backend keeps; this one would be a promise about a package it
+//                does not own and a call it cannot make."* Every clause of that
+//                is now false. This package imports `app:draw`, installs it in
+//                `surface_up`, owns the root canvas, renders it every frame,
+//                and carries `draw.init`'s refusal out to `main` as
+//                `E_DRAW_UP`. The promise is one it keeps.
+//   Audio      — **no.** `sokol_audio` is neither bound nor imported.
+//
+// This package used to advertise all six and then `#panic` in `run_loop` having
+// honoured none of them. The set is still the honest one: five, because five is
+// what it does.
+package graphical
+
+import "app:app"
+import "app:display"
+import "app:draw"
+import "app:input"
+import sokol_input "app:input/sokol"
+import "core:time"
+
+// The window this facade will open, remembered between `init` and `app.run()`
+// because sokol fuses window creation with the loop — there is nothing to open
+// until the loop is entered.
+private i32    g_width
+private i32    g_height
+private string8 g_title
+
+// The root canvas: made in `_surface_up`, rendered in `_render`, freed with the
+// rest of `app:draw` in `_surface_down`. See `canvas()`.
+private draw.Canvas g_canvas = draw.NIL_CANVAS
+
+// The least milliseconds an iteration that drew nothing takes (E7). 0
+// disables the nap.
+private i32 g_idle_ms = 8
+// When `_frame` last returned, on `time.now`'s clock; 0 before the first.
+private f64 g_loop_end
+
+// Whether `EventKind.Quit` is a question the program answers (E8).
+private bool g_close_confirm
+
+// Whether the window advertises that files may be dropped on it.
+private bool g_file_drop
+
+// ── failure codes ───────────────────────────────────────────────────────────
+//
+// Three, and each is one thing this facade can actually see. A failure that
+// reaches an `!i32 main()` unhandled **becomes the process exit status**, so
+// these are small, fixed and named rather than computed: a gate script compares
+// a number, and a number that moved between builds would be worse than no
+// number.
+//
+// `1` is deliberately not taken: it is what a `main` returns by convention when
+// its own assertions failed, and a runtime's refusal should not be confusable
+// with the program's own verdict. `app:headless` starts its own codes at the
+// same `2` for the same reason, and `E_DRAW_UP`/`E_ROOT_CANVAS` are `3` and `4`
+// in both facades so that one gate script reads both.
+const i32 E_WINDOW_SIZE = 2
+const i32 E_DRAW_UP     = 3
+const i32 E_ROOT_CANVAS = 4
+
+// Open a window `width` x `height` titled `title`: remember the window and
+// install the sokol backend on the app singleton. This is the first line of a
+// graphical program, and `run` is what actually opens the window.
+//
+// ## What this can fail with, and what it deliberately cannot
+//
+// **One reportable failure, and it is still the only one this call can see.**
+// sokol fuses window creation with the loop — nothing is opened until
+// `sapp_run` is entered from `run`, and `sapp_run` answers nothing about
+// whether the window opened — so *"the display refused us"*, *"there is no
+// GL"* and *"there is no `DISPLAY`"* are not failures this call could detect,
+// and it does not pretend to by taking a `!` and answering success to all
+// three. Everything it does is three stores and a `set_backend`.
+//
+// What it *can* see is a size that is not a size: `E_WINDOW_SIZE` for a width
+// or a height at or below zero. That is worth refusing rather than passing on,
+// because sokol reads a `0` as *"use your own default"* and a negative as
+// whatever the arithmetic gives it — so a program whose window size came out of
+// a computation that went wrong gets a window it did not ask for and no word
+// about it anywhere. This is the call that still knows what was asked for.
+//
+// **Bringing `app:draw` up is not on this list, and that is not an omission.**
+// `draw.init` needs a live `sokol_gfx` context — `sgp_setup` reads its pixel
+// formats and sample count off one — and there is no context until `sapp_run`
+// has built it. So the surface comes up inside the loop, in `_surface_up`, and
+// its refusal is `E_DRAW_UP` out of `run` rather than out of here. **The two
+// halves fit together**: `init` reports what is knowable before the window
+// exists and `run` reports everything that is only knowable after, and between
+// them nothing that can go wrong is silent.
+!void init(i32 width, i32 height, string8 title):
+    if width <= 0 || height <= 0:
+        fail E_WINDOW_SIZE
+    install_backend(width, height, title)
+
+// Install the sokol backend on the app singleton. Call before `app.run()`.
+//
+// **Kept, unchanged, and not deprecated.** `init` is the same call with the
+// size check and the `!`; this one is what a program that does not want a
+// failable `main` for its *window size* still writes. It buys less than it used
+// to: `run` is failable now whatever this is called, so a program that writes
+// `new` still needs an `!i32 main()` — what it saves is one `try`. The two share
+// `install_backend` below rather than one calling the other, because a bare
+// `new(...)` written *inside* package `graphical` is `ERR0805` for one
+// milestone longer — the bare spelling of the create verb stays retired even
+// though the name here is an ordinary function. External callers write
+// `gx.new(...)` and are unaffected.
+void new(i32 width, i32 height, string8 title):
+    install_backend(width, height, title)
+
+// The `Backend` literal is written out one slot per line with the slot's name
+// above it, because seven of the ten slots are `void()` and therefore one type —
+// a swapped pair would compile. See `app:app`'s vtable section.
+private void install_backend(i32 width, i32 height, string8 title):
+    g_width = width
+    g_height = height
+    g_title = title
+    app.set_backend((nil,                      // data
+                     run_loop,                 // run
+                     begin_frame,              // begin_frame
+                     end_frame,                // end_frame
+                     app.caps(app.Capability.Input,
+                              app.Capability.VectorDraw,
+                              app.Capability.Windowing,
+                              app.Capability.Clipboard,
+                              app.Capability.Threads),
+                     _surface_up,              // surface_up
+                     _surface_down,            // surface_down
+                     _render,                  // render
+                     _end_input,               // end_input
+                     _deliver))                // deliver
+
+// ── the root canvas ─────────────────────────────────────────────────────────
+
+// The runtime's root canvas. Valid from the first line of `ready` until
+// `shutdown` returns, and `draw.NIL_CANVAS` outside that window.
+//
+// ## Why the runtime owns one rather than handing a program a constructor
+//
+// Because every graphical program in this tree made exactly one and made it the
+// same way. `example/hellotext`, `example/platformer`, `example/edit` and
+// `example/uismoke` each wrote `draw.init(...)`, a `#panic` on its refusal, one
+// `canvas_create`, a `canvas_render` in the draw hook and a `draw.shutdown` in
+// the shutdown hook — five lines, four programs, character for character the
+// same. A runtime that leaves that to the program is a runtime that has decided
+// its users should write the same five lines, and the whole argument for this
+// package being opinionated is that they should not.
+//
+// ## May a program still call `draw.init` itself? Yes, and it should not
+//
+// It is not refused, because refusing it would mean this package policing a
+// package it does not own, and `app:draw` is public surface that a program is
+// entitled to drive by hand — just not while also letting a runtime drive it.
+//
+// **What happens is specific and it is detected.** `draw.init` calls
+// `draw.shutdown` first, so a second `init` destroys every canvas including
+// this one; the handle here goes stale, and `draw.canvas_render` on a stale
+// handle returns without drawing. The ending that used to be on offer was a
+// window that stayed at the clear colour with no message anywhere, which is the
+// failure this project calls silent-until-somebody-notices. So `_render` asks
+// `draw.canvas_valid` first and `#panic`s by name on the first frame after —
+// loud, immediate, and naming `app.canvas()` as the repair.
+//
+// **A program that genuinely wants its own `app:draw` should not use this
+// facade.** Import `app:display`, `app:draw` and `app:input` and write the
+// forty lines below; they are all public and none of them needs this package.
+draw.Canvas canvas():
+    return g_canvas
+
+// ── and why there is no `app.font()` beside it ──────────────────────────────
+//
+// It was the obvious next thing to package and it is deliberately not here.
+//
+// **A canvas has a correct default and a font does not.** There is one root
+// canvas because a canvas is a tree and a program has one picture; there is
+// nothing to choose. A font is a *face at a size*, and the size is a design
+// decision the runtime has no way to make — the three programs in this tree
+// that draw text pick 16.0, 18.0 and 20.0, none of them wrong. A default font
+// would be a runtime picking one of those for everybody, and the first thing
+// every program would write is the line replacing it.
+//
+// **It would cost every program, including the ones with no text.**
+// `app:font` pulls in `vendor:stb/stb_truetype`; measured on a minimal headless
+// program, adding the import alone is **+65 808 bytes** of binary and
+// **+164 KB** of emitted C. On top of that a runtime-owned face has to build an
+// atlas and hand it to `draw.texture_create`, so every program would also pay a
+// GPU texture upload in `surface_up` for glyphs it may never draw. The
+// `app:draw` bring-up is worth its cost because a program that uses this facade
+// at all draws; a font is used by some of them.
+//
+// **And the default face is a guess about the machine.** `font.default_path()`
+// answers a per-OS path — DejaVu Sans Mono on Linux, SF NS Mono on macOS,
+// Consolas on Windows — and a machine without that file gets `font.fallback()`,
+// a built-in bitmap face. A program choosing that fallback is a program that
+// decided; a *runtime* choosing it silently turns *"why is my text a bitmap"*
+// into a mystery about somebody's font directory rather than a line in the
+// source.
+//
+// So a program that wants text writes the three lines `example/hellotext`
+// writes — `font.load_file(font.default_path(), 18.0)`, `font.atlas_size`,
+// `draw.texture_create` — and they are three lines it would have had to
+// understand anyway, because the second and third are how a face reaches a
+// canvas.
+
+// ── the forwarding surface ──────────────────────────────────────────────────
+//
+// Everything below is `app:app`, reached through this package so that a program
+// which binds this one as `app` never has to import the core. Each is one line
+// and adds no behaviour whatever; where a name needs an argument, the argument
+// is the same argument. The exceptions — and the whole of them — are `init`
+// above, `canvas` above, `run` below, and the five names an alias cannot carry,
+// which the package comment lists.
+
+// The "omitted" sentinels this package's `hook` compares against.
+//
+// **This is the one forward in the file that is not one line, and there are two
+// separate reasons it is not.** `app:app`'s own sentinels are `private` — that
+// is deliberate there, so that no program can hand in the value that means
+// *unset* — so this package cannot default to them and forward the four
+// arguments straight through; it has to own sentinels of its own and set
+// through `app.on_*` instead, four `if`s rather than one call.
+//
+// And it could not have defaulted to them even had they been public. A
+// package-level default naming another package's function resolves or does not
+// according to whether that package has already been entered — the same
+// import-order defect reaching a default rather than a type, whose
+// root-package case is *"nothing can precede the root's own declarations"*.
+// Measured in `app:headless`, which has a `@test` file and is therefore its own
+// root: `= app.nothing` there is four times `error[ERR0408]: 'app' is not a
+// value in scope`, on lines that compile perfectly from `example/log`. This
+// package has no test file today and would meet the same wall on the day it
+// gets one.
+//
+// The semantics are identical either way: an argument that *is* the sentinel is
+// an omitted parameter, and an omitted parameter leaves that hook alone. The
+// `!` on both is the hook types' — a sentinel has to be the hook type to be
+// comparable with one — and not a claim that either can fail.
+private !void nothing():               return
+private !void nothing_process(f32 dt): _ = dt
+
+// Assign any subset of the four lifecycle hooks in one call. An omitted
+// parameter leaves that hook alone.
+//
+// **Write it all-named** — `app.hook(ready: ready, process: process,
+// draw: draw_frame, shutdown: shutdown)`. Three of the four parameters are the
+// same type (`!void()`), so a positional call cannot be checked and a swap of
+// two of them compiles silently with no diagnostic anywhere. The argument, the
+// `distinct` alternative that was considered and rejected, and what a swapped
+// call looks like at run time are all written out in `app:app`'s own `hook`
+// section, and every word of it applies here.
+//
+// **All four hooks are failable now** (`!void()`, `!void(f32)`). A `void()`
+// function handed to one of these is `ERR0504` on this line, naming both
+// shapes; the repair is a `!` on the hook's return type. `app:app`'s hook
+// section has the arithmetic on why the non-failable shapes were not kept
+// beside them.
+void hook(app.ReadyFn    ready    = nothing,
+          app.ProcessFn  process  = nothing_process,
+          app.DrawFn     draw     = nothing,
+          app.ShutdownFn shutdown = nothing):
+    if ready != nothing:
+        app.on_ready(ready)
+    if process != nothing_process:
+        app.on_process(process)
+    if draw != nothing:
+        app.on_draw(draw)
+    if shutdown != nothing:
+        app.on_shutdown(shutdown)
+
+// The four hooks, one at a time. Unchanged in meaning; see `app:app`.
+void on_ready(app.ReadyFn f):       app.on_ready(f)
+void on_process(app.ProcessFn f):   app.on_process(f)
+void on_draw(app.DrawFn f):         app.on_draw(f)
+void on_shutdown(app.ShutdownFn f): app.on_shutdown(f)
+
+// Open the window and run the frame loop until it closes, then report whatever
+// went wrong inside it.
+//
+// ## Failable now, and the old argument for `void` is what made it so
+//
+// This was `void` for one reason, written out at length where this comment
+// used to be: *"`app.run` `#panic`s on two conditions and neither one can arise
+// through this door … **a `?` here would be a mark on a function with nothing
+// to report**, and the one thing worse than a missing failure is a declared one
+// that never happens."* That was correct and it is exactly why the `!` is here
+// now — there is something to report.
+//
+// **What there is to report is everything the frame loop can see and `init`
+// cannot.** `draw.init` refusing because the live `sokol_gfx` backend has no
+// shader; the root canvas refusing to allocate; any of the four hooks failing
+// with a code of the program's own. None of those exists until `sapp_run` has
+// built a context and started calling back, and none of them can unwind out of
+// it: the loop is inside C. `app:app` records the code and asks the loop to
+// stop, and this call is the one still on the stack when the loop returns. The
+// mechanism is written out at `app:app`'s frame-steps section.
+//
+// **The cost is the one the old comment priced, and it is now worth paying.**
+// Every call site writes `try`, and `example/log`, `example/net` (twice),
+// `example/graph` and `example/parjobs` are five of them that previously handled
+// nothing. They handle something now: a hook's failure, which under the old
+// `void` shape had nowhere to go at all.
+!void run():
+    try app.run()
+
+// Ask the loop to stop after this frame.
+void quit():        app.quit()
+
+// Whether something has asked the loop to stop — the program with `quit()`, or
+// the runtime because a hook failed.
+bool quitting():    return app.quitting()
+
+// The two allocators, and the temp arena's checkpoints.
+//
+// **A program usually writes none of these.** Which arena is ambient depends on
+// which hook is running: `ready` and `shutdown` run under `allocator()`, the
+// persistent one, and `process` and `draw` run under `temp()`, which is rolled
+// back at the end of every frame. So a bare `#make` lands in the right place in
+// all four, and these names are for the two cases that are not the default —
+// something allocated in `process` that has to outlive the frame
+// (`using app.allocator():`), and a big transient that should not raise the temp
+// arena's high-water mark for the rest of the run (`using app.enter_temp():` …
+// `app.close_temp()`).
+//
+// `app:app`'s allocator and temp sections carry the whole argument, the
+// dangling-reference hazard the arrangement accepts, and why this is the app's
+// own temp arena rather than `core:runtime`'s.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(): return app.allocator()
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) temp():      return app.temp()
+
+// Open a temp frame and install it; close the innermost one.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) enter_temp(bool escaping = false): return app.enter_temp(escaping)
+bool close_temp():                           return app.close_temp()
+
+// How many bytes the temp arena is holding (`0` at the top of every frame), and
+// how many temp frames are open (`0` everywhere a correct program looks).
+u64 temp_used():   return app.temp_used()
+i32 temp_depth():  return app.temp_depth()
+
+// Swap the persistent allocator. **Before `run`** — it refuses afterwards, and
+// `app:app`'s own declaration says why a mid-run swap is not a thing that can
+// quietly work now that the runtime installs the ambient.
+void set_allocator((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a): app.set_allocator(a)
+
+// The conditional-frame knobs (E7). See `app:app`'s own section for what sokol
+// will and will not do about idling.
+void request_redraw():                  app.request_redraw()
+void set_redraw_on_demand(bool on):     app.set_redraw_on_demand(on)
+bool redraw_pending():                  return app.redraw_pending()
+
+// The program's own state pointer, for a library that has to reach it through
+// the app rather than through package scope.
+void set_user(rawptr p): app.set_user(p)
+rawptr user():           return app.user()
+
+// The colour the frame is cleared to, before anything a program draws. Settable
+// before `init` or from any hook.
+void set_background(f32 r, g, b, a):
+    display.set_background(r, g, b, a)
+
+// The least time, in milliseconds, one loop iteration takes when its frame
+// opened no pass: after such a frame `_frame` naps for whatever of this the
+// iteration has not already spent since the previous one — mostly in the
+// buffer swap, which sokol makes even on a skipped frame and which blocks
+// under vsync (`idle_nap_ms`, and the package comment).
+//
+// **This is the only part of E7 that gives the CPU back**, and it is worth
+// nothing on its own: a frame is only ever skipped when a program has called
+// `app.set_redraw_on_demand(true)`, so a program that has not opted in never
+// naps. The default of 8 ms is a poll rate rather than a frame rate — where
+// the swap does not block, an idle program wakes ~125 times a second to read
+// the event queue; where it does, the refresh paces it and the nap adds
+// nothing past the budget. `0` turns it off and spins, which is what a
+// benchmark wants.
+void set_idle_frame_time(i32 milliseconds):
+    g_idle_ms = milliseconds
+
+// Make `input.EventKind.Quit` a decision the program takes, rather than an
+// announcement it watches go by.
+//
+// **Off by default, and it has to be**: with it on, a close request is refused
+// until the program calls `app.quit()`, so a program that does not handle
+// `Quit` would have a close button that does nothing — which is worse than the
+// thing this fixes.
+//
+// **Off, the `Quit` event is not merely un-answerable, it is unobservable.**
+// Measured with `example/window`: with this off, the program asks its own
+// window to close and shuts down on that same tick having drained **zero**
+// `Quit` events. sokol pushes the event through the callback and orders the
+// close before the next frame, so the queue is never polled again. Every
+// `case EventKind.Quit` arm in the tree is dead code until this is on.
+//
+// With it on, a close request is held open at the sokol event callback (which
+// is where sokol's own deadline is — it orders the close in the same loop
+// iteration, before the next frame runs, so `display.cancel_close()` called
+// from `process` was always exactly one frame too late) and the `Quit` event
+// reaches the program's `process` on the next frame with the window still
+// alive. `app.quit()` from there is "yes, close"; doing nothing is "no", and
+// the program carries on. That is what an *"unsaved changes"* prompt needs, and
+// it needs no new `EventKind` — see `input.dado`'s section on it.
+void set_close_confirm(bool on):
+    g_close_confirm = on
+
+// Let files be dropped on the window. Call before `app.run()`; sokol reads it
+// out of `sapp_desc` when the window is created and there is no runtime setter
+// behind it.
+//
+// **Off by default, and the default is the safe one.** With it off the window
+// carries no `XdndAware` property, so no drag source offers it a drop and the
+// gesture is declined visibly — measured under `Xvfb`,
+// `XGetWindowProperty(XdndAware)` answers `nitems=0`. With it on the same
+// window answers `version=5`, completes the XDND handshake, and every dropped
+// path reaches `input.poll` as an `input.EventKind.Drop`. A program that turns
+// this on and writes no `Drop` arm has a window that eats the user's file
+// silently, which is why this is a call a program makes rather than something
+// it gets.
+//
+// **A `bool` and not a file count**, deliberately. The count is not the
+// program's to choose: the paths land in `app:input`'s fixed table, so asking
+// sokol for more files than `input.MAX_DROPPED` would only produce a drop
+// whose tail is silently discarded one layer down. This asks sokol for exactly
+// what the table holds, and `input.MAX_DROPPED` is public for a program that
+// wants the number.
+void set_file_drop(bool on):
+    g_file_drop = on
+
+// ── backend vtable implementation ───────────────────────────────────────────
+
+private void run_loop():
+    // The two drop numbers are `app:input`'s, not this package's: they size the
+    // table the decode copies into, and this is the one package that can see
+    // both sides. `DROP_PATH_MAX + 1` because sokol counts the terminator in
+    // `max_dropped_file_path_length` and `app:input`'s table does not.
+    i32 drop_files = 0
+    i32 drop_path_bytes = 0
+    if g_file_drop:
+        drop_files = input.MAX_DROPPED
+        drop_path_bytes = input.DROP_PATH_MAX + 1
+    display.Config cfg = (g_width, g_height, g_title, drop_files, drop_path_bytes)
+    display.Hooks hooks = (_ready, _frame, _event, _finish)
+    display.run(cfg, hooks)
+
+// `sapp_run` does not return until the window is closed, so everything below is
+// called from inside it.
+
+private void _ready():
+    app.startup()
+
+private void _frame(f32 dt):
+    // The whole frame: the program's `process`, the pass (through
+    // begin_frame/end_frame) around its `draw` and the runtime's render, the
+    // temp rollback, the job-pool reset, the input barrier.
+    app.tick(dt)
+    // `app.quit()` is the program's way of saying stop and a failed hook is the
+    // runtime's; `app.quitting()` answers for both, and sokol's loop is the one
+    // that has to hear it. Checked after the tick so the frame that asked to
+    // quit is still a complete frame.
+    if app.quitting():
+        display.request_close()
+        return
+    // E7: nothing was painted. sokol still swaps after this returns, and has
+    // no wait-for-event mode — see the package comment — so the nap tops the
+    // iteration up to the idle budget, counting the time the last swap (and
+    // everything since) already took, rather than adding to it.
+    if !app.drew() && g_idle_ms > 0:
+        f64 spent = 0.0
+        if g_loop_end > 0.0:
+            spent = time.now() - g_loop_end
+        time.nap(idle_nap_ms(g_idle_ms, spent))
+    g_loop_end = time.now()
+
+// Milliseconds left to nap of an idle budget of `budget_ms` when `spent_s`
+// seconds of the iteration have gone already: never negative, whole
+// milliseconds rounded down (a nap is whole milliseconds, and a short nap is
+// the side to err on). A NaN or negative `spent_s` spends nothing. Pure.
+i32 idle_nap_ms(i32 budget_ms, f64 spent_s):
+    if budget_ms <= 0:
+        return 0
+    f64 spent_ms = spent_s * 1000.0
+    if !(spent_ms > 0.0):
+        return budget_ms
+    f64 left = f64(budget_ms) - spent_ms
+    if left <= 0.0:
+        return 0
+    return i32(left)
+
+private void _finish():
+    app.teardown()
+
+private void _event(rawptr ev):
+    // The decode answers whether this was a close request, because *here* —
+    // inside sokol's event callback — is the only place the answer is still
+    // useful: sokol checks `quit_requested` the instant this returns.
+    bool close = sokol_input.decode(ev)
+    if close && g_close_confirm && !app.quitting():
+        // Hold the window open for one frame so the program's `process` can
+        // see the `Quit` event and decide. `app.quit()` from there sets the
+        // quitting flag, `_frame` re-requests the close, and the second
+        // request is not held — the `!app.quitting()` above is what stops this
+        // being a loop that can never close.
+        display.cancel_close()
+
+private void begin_frame():
+    display.begin_pass()
+
+private void end_frame():
+    display.end_pass()
+
+// ── the five service slots ──────────────────────────────────────────────────
+
+// Bring `app:draw` up and make the root canvas.
+//
+// **Called from inside `app.startup`, which opens `using app.allocator()`
+// around everything it calls.** So `draw.init()` — which takes no allocator and
+// allocates to `#default` — puts its canvas pool, its item pool, its paint run
+// and its texture table in the runtime's persistent allocator, with no
+// allocator written on either side of the call. That is the allocator rule —
+// *don't thread allocators as parameters; change the ambient with `using`* —
+// paying out across a package boundary: the callee names no allocator and the
+// caller decides where it lands.
+//
+// Both failures are things a program has to hear about and neither is a thing
+// `init` could have seen. `draw.init` answers false when `sgp_setup` refuses —
+// there is no `sokol_gp` shader for some `sokol_gfx` backends — or when a pool
+// will not allocate; `draw.last_error()` says which, and a program that wants
+// the sentence rather than the code can ask for it in its own `else` arm.
+private !void _surface_up():
+    if !draw.init():
+        fail E_DRAW_UP
+    g_canvas = draw.canvas_create()
+    if !draw.canvas_valid(g_canvas):
+        fail E_ROOT_CANVAS
+
+// Tear `app:draw` down. Called after the program's `shutdown` hook, so a
+// program's own release runs while its canvas is still valid.
+private void _surface_down():
+    draw.shutdown()
+    g_canvas = draw.NIL_CANVAS
+
+// Render the root canvas, at the window's current size, inside the pass.
+//
+// The size is asked every frame rather than remembered from `init`, because a
+// window is resizable and `canvas_render`'s `fb_w`/`fb_h` are what the root
+// clip rectangle is built from — a remembered size would clip the picture to
+// the window's opening dimensions for ever.
+//
+// **The `canvas_valid` check is the detector described at `canvas()`.** It is
+// true on every frame of every correct program and costs three comparisons; it
+// is false only when something outside the runtime tore `app:draw` down, and
+// the panic is what stops that being a black window with no message.
+private void _render():
+    if !draw.canvas_valid(g_canvas):
+        #panic("app:graphical: the runtime's root canvas is gone — something called draw.init() or draw.shutdown() behind the runtime's back. Record into app.canvas() instead, or drive app:draw yourself without this facade.")
+    (i32 w, i32 h) = display.window_get_size()
+    draw.canvas_render(g_canvas, w, h)
+
+// End the input frame. Called last in `app.tick`, outside the pass bracket, on
+// every frame including a skipped one — `app:app`'s `tick` has the argument for
+// the position, and `app:input`'s `clear_edges` has the argument for why there
+// must be exactly one of these and why it must be at an *end*.
+private void _end_input():
+    input.clear_edges()
+
+// Deliver what the event callbacks queued since the last frame. Called first in
+// `app.tick`, before `process`, on every frame — `app:app`'s `tick` has the
+// argument for one drain point, and `app:input`'s queue section has what it
+// takes.
+private void _deliver():
+    input.deliver()

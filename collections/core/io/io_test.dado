@@ -1,0 +1,596 @@
+@test
+// This package is a thin skin over `<stdio.h>`, and testing that
+// `fputs` writes bytes would be testing the C library. What is worth testing is
+// the part that is **this package's own judgement**, and almost all of it is in
+// one function:
+//
+//   * **`read_line_into`'s three line rules**, written out in its header and
+//     written nowhere else: the `\n` is not stored; a `\r` immediately before it
+//     is dropped, so a CRLF file reads the same as an LF one; a line longer than
+//     the buffer is truncated **and the rest of it consumed**, so the tail does
+//     not arrive as a phantom next line; and `ok` is false only at end of input,
+//     which makes a blank line `(0, true)` and distinguishes it from the end.
+//     Every one of those is a decision somebody made, and every one of them
+//     would still compile if it were reversed.
+//   * **`read_line`'s shared buffer.** The header calls it out in bold and calls
+//     it silent: *reading two lines and holding both gives you the second one
+//     twice.* A documented hazard that no test pins is a hazard that gets
+//     quietly fixed into a different one, so it is claimed here as the
+//     behaviour it is.
+//   * **`read_bytes`/`write_bytes`' zero-length guard**, which exists because a
+//     zero-length slice has no element 0 to take the address of.
+//
+//   * **The Windows arm's own claims**, which run under Wine: `move` replaces
+//     an existing destination (C's `rename` there refuses one, and that is the
+//     failure this file first caught on Windows); a path with characters
+//     outside ASCII opens, moves and deletes, because paths cross as UTF-16;
+//     the standard streams are in binary mode once handed out; and a UTF-8
+//     line written to a console sink in pieces that split its characters
+//     arrives as the right UTF-16. The splitting and holding is portable Dado
+//     and is checked on every platform; only the conversion is Windows'.
+//
+// The files it works on live in `/tmp` on POSIX, and in the working directory
+// on Windows, which has no `/tmp`; each has a name of this package's own and is
+// rewritten from scratch on every run, and every one is deleted at the end
+// through `delete`, which is itself a claim.
+package io
+
+import "core:strings"
+
+private const i64 SMALL = 8
+private type Small: [8]char8
+
+private const i64 ROOM = 64
+private type Room: [64]char8
+
+// `cstring` and not `string`, because every function they are handed to takes
+// one — a literal is already a `cstring` where one is wanted, so the constants
+// cost nothing and say what they are for.
+when #OS == #WINDOWS:
+    private const cstring PATH = "dado_core_io_test.txt"
+    private const cstring MOVED = "dado_core_io_test.moved"
+    private const cstring MISSING = "dado_core_io_test.does_not_exist"
+    private const cstring WIDE_FROM = "dado_core_io_test_été.txt"
+    private const cstring WIDE_TO = "dado_core_io_test_€日.txt"
+else:
+    private const cstring PATH = "/tmp/dado_core_io_test.txt"
+    private const cstring MOVED = "/tmp/dado_core_io_test.moved"
+    private const cstring MISSING = "/tmp/dado_core_io_test.does_not_exist"
+    private const cstring WIDE_FROM = "/tmp/dado_core_io_test_été.txt"
+    private const cstring WIDE_TO = "/tmp/dado_core_io_test_€日.txt"
+
+// A line with a character of each UTF-8 length: ASCII, two bytes (é), three
+// (€) and four (U+1D11E, the G clef, which is a surrogate pair in UTF-16).
+private const string8 LINE = "héllo €𝄞"
+
+i32 test():
+    bool ok = true
+
+    // ── the streams a program already has ────────────────────────────────────
+    //
+    // Never `nil` on a hosted implementation, so there is no `opened` check to
+    // write here — but until 2026-08-14 this package could not reach them at
+    // all, so a program could not read its own standard input through
+    // `core:io`. Claimed because their absence was the whole defect.
+    //
+    // **The three `#expect(… != nil)` lines that stood here are gone, and the
+    // reason is worth keeping because it will look like a lost check.** They
+    // duplicated the `#assert` at the foot of this file, and once `streams.c`
+    // was deleted the duplicate stopped compiling: the shim used to be an
+    // opaque external call that gcc could not see through, and `stderr` is now
+    // the macro itself. So gcc propagates the value, proves that on the failing
+    // arm of `stderr() != nil` the stream *is* null, and reports the `#expect`
+    // message's own write to it —
+    //
+    //     error: argument 4 null where non-null expected [-Werror=nonnull]
+    //     note: in a call to built-in function '__builtin_fwrite'
+    //
+    // which is correct and is about the branch that cannot happen. Only the
+    // `stderr` line failed, because only that one makes the *message's*
+    // destination the null stream. An expectation whose failure path cannot be
+    // written is not an expectation; the invariant at the foot of the file is
+    // the right shape for a claim the C compiler can prove, and it is already
+    // there.
+    //
+    // Three different streams, which a shim that returned the same one for all
+    // three would fail and three separate nil checks would not.
+    ok = #expect(stdout() != stderr(), "stdout() and stderr() were the same stream") && ok
+    ok = #expect(stdin() != stdout(), "stdin() and stdout() were the same stream") && ok
+
+    // ── opening ──────────────────────────────────────────────────────────────
+    //
+    // `nil` when it could not be opened, which is C's answer and is passed
+    // through rather than dressed up: Dado has no way to carry a reason yet.
+    ^FILE missing = open_read(MISSING)
+    ok = #expect(missing == nil, "opening a file that is not there returned a stream") && ok
+    ok = #expect(!opened(missing), "opened() disagreed with the nil it was given") && ok
+
+    // ── writing ──────────────────────────────────────────────────────────────
+    //
+    // The file is built here, and every line in it is chosen for a claim
+    // further down:
+    //
+    //     one\r\n      a CRLF line — the \r must be dropped
+    //     two\n        an ordinary line
+    //     \n           a blank line — (0, true), not the end
+    //     0123456789\n longer than the 8-byte buffer below — truncated, and the
+    //                  tail consumed rather than left to arrive as a phantom
+    //     last\n       so the phantom, if there were one, would be visible here
+    ^FILE w = open_write(PATH)
+    ok = #expect(opened(w), "could not open the test file for writing") && ok
+
+    _ = write(w, "one")
+    _ = write_byte(w, '\r')
+    _ = write_byte(w, '\n')
+    _ = write_line(w, "two")
+    _ = write_byte(w, '\n')
+    _ = write_line(w, "0123456789")
+    _ = write_line(w, "last")
+    ok = #expect(flush(w) == 0, "flush reported a failure") && ok
+    ok = #expect(close(w) == 0, "close reported a failure") && ok
+
+    // ── read_line_into: the three rules ──────────────────────────────────────
+    //
+    // An 8-byte buffer, which is what makes the fourth line a truncation.
+    ^FILE r = open_read(PATH)
+    ok = #expect(opened(r), "could not reopen the test file") && ok
+
+    Small small
+    []char8 window = small[0..<SMALL]
+
+    // Rule one: the `\n` is not stored, and **a `\r` immediately before it is
+    // dropped** — so a CRLF file reads the same as an LF one. Three bytes, not
+    // four, and not five.
+    (i64 n1, bool ok1) = read_line_into(r, window)
+    ok = #expect(ok1, "the first line did not arrive") && ok
+    ok = #expect(n1 == 3, "the CRLF line was ", n1, " bytes, not 3") && ok
+    ok = #expect(window[0] == 'o' && window[1] == 'n' && window[2] == 'e', "the CRLF line was not \"one\"") && ok
+
+    // An ordinary LF line reads the same length, which is what "the same as an
+    // LF one" means and is the other half of the claim.
+    (i64 n2, bool ok2) = read_line_into(r, window)
+    ok = #expect(ok2, "the second line did not arrive") && ok
+    ok = #expect(n2 == 3, "the LF line was ", n2, " bytes, not 3") && ok
+    ok = #expect(window[0] == 't' && window[1] == 'w' && window[2] == 'o', "the LF line was not \"two\"") && ok
+
+    // Rule three: **a blank line is `(0, true)`**, which is the distinction a
+    // byte count alone could not have made — `ok` is false only at end of
+    // input, and a reader that returned `(0, false)` here would stop three
+    // lines early on any file with a blank line in it.
+    (i64 n3, bool ok3) = read_line_into(r, window)
+    ok = #expect(ok3, "a blank line reported the end of input") && ok
+    ok = #expect(n3 == 0, "a blank line was ", n3, " bytes, not 0") && ok
+
+    // Rule two: **truncated, and the rest consumed.** Eight bytes land, and the
+    // remaining two of "0123456789" are eaten rather than left to arrive as a
+    // phantom next line — which is the failure mode the header says would be
+    // hard to see, and the next claim is what sees it.
+    (i64 n4, bool ok4) = read_line_into(r, window)
+    ok = #expect(ok4, "the long line did not arrive") && ok
+    ok = #expect(n4 == 8, "the long line was truncated to ", n4, " bytes, not 8") && ok
+    ok = #expect(window[0] == '0' && window[7] == '7', "the truncated line was not the first eight bytes") && ok
+
+    // The line after the truncated one is `last`, not `89`. This is the claim
+    // the whole file is arranged around.
+    (i64 n5, bool ok5) = read_line_into(r, window)
+    ok = #expect(ok5, "the line after the truncated one did not arrive") && ok
+    ok = #expect(n5 == 4, "the line after the truncated one was ", n5, " bytes, not 4") && ok
+    ok = #expect(window[0] == 'l' && window[3] == 't', "the truncated line's tail arrived as a phantom line") && ok
+
+    // End of input: `(0, false)`, and only here.
+    (i64 n6, bool ok6) = read_line_into(r, window)
+    ok = #expect(!ok6, "there was a line after the last one") && ok
+    ok = #expect(n6 == 0, "the end of input carried ", n6, " bytes") && ok
+
+    // ── at_end, failed, clear_errors ─────────────────────────────────────────
+    //
+    // A read that hits the end **latches** the EOF flag, and every later read
+    // then answers without asking the filesystem — which is why clearing it is
+    // the one call that makes tailing a growing file possible with nothing else.
+    ok = #expect(at_end(r), "the stream did not report end of file after reading past it") && ok
+    ok = #expect(!failed(r), "reading a file to its end reported an error") && ok
+    ok = #expect(read_byte(r) == end_of_file(), "a read past the end did not answer EOF") && ok
+    clear_errors(r)
+    ok = #expect(!at_end(r), "clear_errors did not clear the end-of-file flag") && ok
+    _ = close(r)
+
+    // ── read_bytes and write_bytes ───────────────────────────────────────────
+    //
+    // The bytes are the caller's, which is the whole difference between these
+    // and `read_line`: nothing is shared and nothing is overwritten by the next
+    // call. A slice is the pointer **and** the count, so passing one
+    // cannot get the pair out of step.
+    ^FILE bw = open_write(PATH)
+    ok = #expect(opened(bw), "could not open the test file for a byte write") && ok
+
+    Room out
+    []char8 payload = out[0..<10]
+    i64 zero = 0
+    for i in zero..<#len(payload):
+        payload[i] = char8(i64('A') + i)
+    ok = #expect(write_bytes(bw, payload) == 10, "write_bytes did not write ten bytes") && ok
+
+    // **The zero-length guard**, which exists because a zero-length slice has no
+    // element 0 to take the address of. It answers 0 without touching the
+    // stream, at both ends.
+    []char8 nothing = out[0..<0]
+    ok = #expect(write_bytes(bw, nothing) == 0, "write_bytes of an empty slice did not answer 0") && ok
+    _ = close(bw)
+
+    ^FILE br = open_read(PATH)
+    ok = #expect(opened(br), "could not reopen the test file for a byte read") && ok
+    ok = #expect(read_bytes(br, nothing) == 0, "read_bytes into an empty slice did not answer 0") && ok
+
+    []char8 into = out[16..<26]
+    ok = #expect(read_bytes(br, into) == 10, "read_bytes did not read ten bytes back") && ok
+    ok = #expect(into[0] == 'A' && into[9] == 'J', "the bytes did not round trip: ", into[0], "..", into[9]) && ok
+
+    // **Short means end of file**, which `fread` cannot tell from an error and
+    // neither can this — so the pair `at_end`/`failed` is what tells them apart,
+    // and a short read that reported an error would be wrong here.
+    []char8 more = out[32..<48]
+    i64 short_read = read_bytes(br, more)
+    ok = #expect(short_read == 0, "a read past the end returned ", short_read, " bytes") && ok
+    ok = #expect(at_end(br), "a short read did not set the end-of-file flag") && ok
+    ok = #expect(!failed(br), "a short read at the end was reported as an error") && ok
+    _ = close(br)
+
+    // ── read_line, and the buffer it shares ──────────────────────────────────
+    //
+    // **The documented hazard, pinned as behaviour.** The bytes are this
+    // package's and the next call overwrites them, so reading two lines and
+    // holding both gives you the second one twice. The header says this is
+    // silent; a test is what stops it from being silently *fixed* into something
+    // else, and it is the reason `read_line_into` exists.
+    //
+    // The result is a `cstring`, so what can be asked of it is its length and
+    // whether it is `nil`. The lines are chosen so the length is enough: "first"
+    // is five bytes and "second" is six, and no wrong answer here has the right
+    // length.
+    ^FILE lw = open_write(PATH)
+    _ = write_line(lw, "first")
+    _ = write_line(lw, "second")
+    _ = close(lw)
+
+    ^FILE lr = open_read(PATH)
+    (cstring a, bool got_a) = read_line(lr)
+    ok = #expect(got_a, "the first line did not arrive through read_line") && ok
+    string8 a_s = strings.borrow_from_cstring(a)
+    ok = #expect(#len(a_s) == 5, "the first line was \"", a, "\"") && ok
+
+    (cstring b, bool got_b) = read_line(lr)
+    ok = #expect(got_b, "the second line did not arrive through read_line") && ok
+    string8 b_s = strings.borrow_from_cstring(b)
+    ok = #expect(#len(b_s) == 6, "the second line was \"", b, "\"") && ok
+
+    // And now the hazard: `a` was never reassigned, and it is no longer five
+    // bytes long. Holding a line across a second `read_line` holds nothing.
+    a_s = strings.borrow_from_cstring(a)
+    ok = #expect(#len(a_s) == 6, "the shared buffer did not clobber the held line: a is \"", a, "\"") && ok
+
+    // **`a` and `b` are the same pointer**, which is the hazard stated exactly:
+    // one buffer, one address, and every line read through this function is the
+    // same `cstring` wearing different bytes. A `cstring`'s `==` is the address
+    // — an operator never hides a walk — so this claim is the identity and
+    // not a coincidence of contents.
+    //
+    // Under the old `string` return this was worse and quieter: only the bytes
+    // were shared, `a` kept the length it was read with, and the first line came
+    // back as the second one cut to five bytes — a plausible-looking string with
+    // no relationship to anything the program read. The length going away took
+    // that failure mode with it.
+    ok = #expect(a == b, "the two lines were not the same pointer, so the buffer is no longer shared") && ok
+
+    (cstring c, bool got_c) = read_line(lr)
+    ok = #expect(!got_c, "there was a third line") && ok
+    // End of input is `nil` and not an empty line — the two are different
+    // events, and a `cstring` can say so where the old empty string could not.
+    ok = #expect(c == nil, "the end of input carried \"", c, "\"") && ok
+    _ = close(lr)
+
+    // The capacity `read_line` truncates to is one short of its buffer, because
+    // the `\0` needs somewhere to go — and that terminator is what makes the
+    // result a `cstring` at all. `read_line_into` has no such limit; its
+    // capacity is the caller's slice.
+    ok = #expect(line_capacity() == 8191, "line_capacity() was ", line_capacity()) && ok
+
+    // ── read_byte ────────────────────────────────────────────────────────────
+    //
+    // Keeps its `i32` deliberately: C returns an `int` because the sentinel has
+    // to be a value no byte can be, and narrowing here would fold EOF into a
+    // real byte and lose the only way to tell the stream ended. So the check is
+    // against `end_of_file()` **first**, and `char8(c)` after.
+    ^FILE cw = open_write(PATH)
+    _ = write(cw, "Xy")
+    _ = close(cw)
+
+    ^FILE cr = open_read(PATH)
+    i32 first_byte = read_byte(cr)
+    ok = #expect(first_byte != end_of_file(), "the first byte was EOF") && ok
+    ok = #expect(char8(first_byte) == 'X', "the first byte was ", char8(first_byte)) && ok
+    ok = #expect(char8(read_byte(cr)) == 'y', "the second byte was wrong") && ok
+    ok = #expect(read_byte(cr) == end_of_file(), "the third read was not EOF") && ok
+    _ = close(cr)
+
+    // ── the filesystem ───────────────────────────────────────────────────────
+    //
+    // `move` is POSIX `rename`, or `MoveFileExW` on Windows, whose contract this
+    // package documents at length because C's own is weaker than everybody
+    // assumes. What is claimed here is the part every platform promises: the
+    // name moves, and **an existing destination is replaced** — which is what makes
+    // write-to-a-temporary-then-`move` the way to publish a file.
+    ^FILE mw = open_write(PATH)
+    _ = write(mw, "moved")
+    _ = close(mw)
+
+    // A destination that already exists, so the replacement is the thing being
+    // claimed rather than a bare rename into empty space.
+    ^FILE dw = open_write(MOVED)
+    _ = write(dw, "old")
+    _ = close(dw)
+
+    ok = #expect(move(PATH, MOVED), "move reported a failure") && ok
+    ok = #expect(open_read(PATH) == nil, "the source still existed after a move") && ok
+
+    ^FILE mr = open_read(MOVED)
+    ok = #expect(opened(mr), "the destination was not there after a move") && ok
+    // Five bytes and not three: the destination held "old" before the move, so
+    // the length alone says which file is there now — which is as much as a
+    // `cstring` can be asked, and enough for this claim.
+    (cstring moved_text, bool got_moved) = read_line(mr)
+    string8 moved_s = strings.borrow_from_cstring(moved_text)
+    ok = #expect(got_moved && #len(moved_s) == 5, "the destination held \"", moved_text, "\"") && ok
+    _ = close(mr)
+
+    // `false` is every failure at once — the signature cannot say which, and
+    // `errno` is a macro Dado has no route to. Moving something that is not
+    // there is the one failure a test can produce without a permissions dance.
+    ok = #expect(!move(MISSING, MOVED), "moving a file that is not there succeeded") && ok
+
+    // An invariant rather than an expectation: the three standard streams must
+    // exist, because every other function in this package takes a `^FILE` and a
+    // hosted program that could not name one could not use the package at all.
+    // If this were false the *package* would be unusable and there would be
+    // nothing to carry on for.
+    #assert(stdout() != nil && stderr() != nil && stdin() != nil)
+
+    // ── streams as sinks ────────────────────────────────────────────────────
+    //
+    // `sink` is what connects `#render` to a file, so the claim under test is
+    // that bytes rendered into one arrive in the stream — which is checked by
+    // reading them back rather than by trusting the count. `#render` is a
+    // builtin, so this needs no import: the seam is between the compiler's
+    // renderer and this package, and nothing else is in the middle.
+    [ROOM]char8 line_buffer
+    ^FILE sw = open_write(PATH)
+    ok = #expect(opened(sw), "the sink's file did not open for writing") && ok
+    Sink into_file = sink(sw)
+    i64 rendered = #render("n=", into_file)
+    i32 seven = 7
+    rendered = rendered + #render(seven, into_file)
+    ok = #expect(rendered == 3, "rendering into a stream reported ", rendered, " bytes and wrote 3") && ok
+    _ = close(sw)
+
+    ^FILE sr = open_read(PATH)
+    (i64 back, bool had) = read_line_into(sr, line_buffer[0..<ROOM])
+    ok = #expect(had && string8(line_buffer[0..<back]) == "n=7", "a rendered stream held \"", string8(line_buffer[0..<back]), "\"") && ok
+    _ = close(sr)
+
+    // The two the process already has. They are checked for being sinks at all
+    // rather than written to, because a test that printed would put its own
+    // bytes in the harness's output and a test's result is its exit status.
+    Sink to_out = stdout_sink()
+    Sink to_err = stderr_sink()
+    ok = #expect(to_out.proc != nil, "io.stdout_sink() is not a sink") && ok
+    ok = #expect(to_err.proc != nil, "io.stderr_sink() is not a sink") && ok
+
+    // The procedure's three guards, each reached through a sink a caller could
+    // really hold: a nil stream, and a zero-length render.
+    Sink nowhere = sink(nil)
+    ok = #expect(#render("", nowhere) == 0, "a sink over a nil stream took bytes") && ok
+    ok = #expect(#render("", to_out) == 0, "rendering nothing to stdout took bytes") && ok
+
+    ok = unicode_paths() && ok
+    ok = whole_characters() && ok
+    ok = file_sink_bytes() && ok
+    ok = platform_checks() && ok
+
+    // ── delete, and the files left behind ────────────────────────────────────
+    //
+    // Every file this test made, so a run leaves nothing; and `delete` of one
+    // already gone is `false`, which is the other half of its answer.
+    ok = #expect(delete(PATH), "delete(PATH) failed") && ok
+    ok = #expect(delete(MOVED), "delete(MOVED) failed") && ok
+    ok = #expect(open_read(PATH) == nil, "PATH was still there after delete") && ok
+    ok = #expect(!delete(PATH), "deleting a file twice succeeded the second time") && ok
+
+    if ok:
+        return 0
+    return 1
+
+// ── paths outside ASCII ─────────────────────────────────────────────────────
+//
+// On POSIX a path is bytes and this is a check that nothing on the way mangles
+// them. On Windows it is the claim that a path is UTF-8 in Dado and UTF-16 at
+// the call: `fopen`, `rename` and `remove` read a path in the ANSI code page,
+// where `€` and `日` are not, so only the `W` functions get this right. The
+// move is onto an existing file, which is the replacement claim again with
+// both names wide.
+private bool unicode_paths():
+    bool ok = true
+    ^FILE a = open_write(WIDE_FROM)
+    ok = #expect(opened(a), "a UTF-8 path did not open for writing") && ok
+    if !opened(a): return false
+    _ = write(a, "new!")
+    _ = close(a)
+    ^FILE b = open_write(WIDE_TO)
+    ok = #expect(opened(b), "a second UTF-8 path did not open for writing") && ok
+    if !opened(b): return false
+    _ = write(b, "x")
+    _ = close(b)
+
+    ok = #expect(move(WIDE_FROM, WIDE_TO), "moving between UTF-8 paths over an existing file failed") && ok
+    ok = #expect(open_read(WIDE_FROM) == nil, "the UTF-8 source was still there after a move") && ok
+    ^FILE r = open_read(WIDE_TO)
+    ok = #expect(opened(r), "the UTF-8 destination was not there after a move") && ok
+    if opened(r):
+        [16]char8 back
+        (i64 n, bool got) = read_line_into(r, back[0..<16])
+        ok = #expect(got && string8(back[0..<n]) == "new!", "the UTF-8 destination held \"", string8(back[0..<n]), "\"") && ok
+        _ = close(r)
+    ok = #expect(delete(WIDE_TO), "a UTF-8 path did not delete") && ok
+    ok = #expect(open_read(WIDE_TO) == nil, "a UTF-8 path was still there after delete") && ok
+    return ok
+
+// ── whole characters ────────────────────────────────────────────────────────
+//
+// `write_characters` is what a Windows console sink hands its bytes through,
+// and it is portable Dado, so it is checked here on every platform with a
+// recorder in place of the console. The line goes in five writes, four of
+// which end inside a character — after `é`'s lead byte, after `€`'s lead, in
+// the middle of `€`, and inside the G clef — and the claims are that **no
+// piece handed on ends inside a character**, that the pieces put back
+// together are the line exactly, and that nothing is left held at the end.
+private type Recorder: ([64]char8 bytes, i64 used, i64 pieces, bool split)
+
+private bool record_piece(rawptr target, []char8 piece):
+    ^Recorder r = ^Recorder(target)
+    if utf8_complete(piece) != #len(piece): r^.split = true
+    for c in piece:
+        if r^.used >= 64: return false
+        r^.bytes[r^.used] = c
+        r^.used = r^.used + 1
+    r^.pieces = r^.pieces + 1
+    return true
+
+private bool whole_characters():
+    bool ok = true
+    []char8 bytes = strings.bytes(LINE)
+    ok = #expect(#len(bytes) == 14, "the test line is ", #len(bytes), " bytes, not 14") && ok
+    Recorder rec
+    Carry carry
+    // Bytes: h 0, é 1-2, llo 3-5, space 6, € 7-9, the clef 10-13. Cuts at
+    // 2, 8, 9 and 12: inside é, inside €, inside € again, inside the clef.
+    i64 total = 0
+    total = total + write_characters(record_piece, rawptr(&rec), &carry, rawptr(&bytes[0]), 2)
+    total = total + write_characters(record_piece, rawptr(&rec), &carry, rawptr(&bytes[2]), 6)
+    total = total + write_characters(record_piece, rawptr(&rec), &carry, rawptr(&bytes[8]), 1)
+    total = total + write_characters(record_piece, rawptr(&rec), &carry, rawptr(&bytes[9]), 3)
+    total = total + write_characters(record_piece, rawptr(&rec), &carry, rawptr(&bytes[12]), 2)
+    ok = #expect(total == 14, "write_characters took ", total, " of 14 bytes") && ok
+    ok = #expect(!rec.split, "a piece handed on ended inside a character") && ok
+    ok = #expect(carry.count == 0, "bytes were still held after the last write: ", carry.count) && ok
+    ok = #expect(string8(rec.bytes[0..<rec.used]) == LINE, "the pieces put back together were \"", string8(rec.bytes[0..<rec.used]), "\"") && ok
+
+    // A write that is only the start of a character takes it all and hands
+    // nothing on; a byte that does not continue it releases it, as is, for the
+    // conversion to replace, and is then written itself.
+    Recorder rec2
+    Carry carry2
+    []char8 lone = strings.bytes("€!")
+    ok = #expect(write_characters(record_piece, rawptr(&rec2), &carry2, rawptr(&lone[0]), 1) == 1, "a lone lead byte was not taken") && ok
+    ok = #expect(rec2.pieces == 0 && carry2.count == 1, "a lone lead byte was handed on rather than held") && ok
+    ok = #expect(write_characters(record_piece, rawptr(&rec2), &carry2, rawptr(&lone[3]), 1) == 1, "the byte after a held lead was not taken") && ok
+    ok = #expect(rec2.used == 2 && carry2.count == 0, "an interrupted character was not released: ", rec2.used, " bytes, ", carry2.count, " held") && ok
+
+    // With no carry the tail is handed on as it is: nothing is ever kept back
+    // where there is nowhere to keep it.
+    Recorder rec3
+    ok = #expect(write_characters(record_piece, rawptr(&rec3), nil, rawptr(&bytes[0]), 2) == 2, "a carry-less write was short") && ok
+    ok = #expect(rec3.used == 2, "a carry-less write held bytes back") && ok
+
+    // The boundary rule itself, at each length and at the edges.
+    ok = #expect(utf8_complete(bytes[0..<0]) == 0, "an empty run is not complete") && ok
+    ok = #expect(utf8_complete(bytes[0..<1]) == 1, "ASCII is not complete") && ok
+    ok = #expect(utf8_complete(bytes[0..<2]) == 1, "a lone two-byte lead was kept") && ok
+    ok = #expect(utf8_complete(bytes[0..<3]) == 3, "a whole two-byte character was cut") && ok
+    ok = #expect(utf8_complete(bytes[0..<9]) == 7, "two-thirds of a three-byte character was kept") && ok
+    ok = #expect(utf8_complete(bytes[0..<13]) == 10, "three-quarters of a four-byte character was kept") && ok
+    ok = #expect(utf8_complete(bytes[0..<14]) == 14, "the whole line was cut") && ok
+    ok = #expect(utf8_complete(bytes[11..<14]) == 3, "stray continuation bytes were held back") && ok
+    ok = #expect(utf8_length(bytes[0]) == 1 && utf8_length(bytes[1]) == 2 && utf8_length(bytes[7]) == 3 && utf8_length(bytes[10]) == 4, "a lead byte's length was wrong") && ok
+    return ok
+
+// ── a sink over a file writes the bytes ─────────────────────────────────────
+//
+// On Windows a sink checks for a console and, finding a file, writes what it
+// was handed unchanged: the UTF-8 line and its `\n` come back byte for byte,
+// with no `\r` added and nothing converted.
+private bool file_sink_bytes():
+    bool ok = true
+    ^FILE w = open_write(PATH)
+    if !opened(w): return #expect(false, "the sink's file did not open")
+    Sink to_file = sink(w)
+    i64 n = #render(LINE, to_file) + #render("\n", to_file)
+    _ = close(w)
+    ok = #expect(n == 15, "rendering the line took ", n, " bytes") && ok
+    ^FILE r = open_read(PATH)
+    [32]char8 back
+    i64 got = read_bytes(r, back[0..<32])
+    _ = close(r)
+    ok = #expect(got == 15, "the file held ", got, " bytes, not 15") && ok
+    ok = #expect(got == 15 && string8(back[0..<14]) == LINE && back[14] == '\n', "the file did not hold the line byte for byte") && ok
+    return ok
+
+// ── what only Windows has ───────────────────────────────────────────────────
+when #OS == #WINDOWS:
+    // The package's own bindings are its file's, so the calls this file makes
+    // are declared again here, under names of this file's.
+    private foreign twin "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        const #c.uint CP_UTF8
+        #c.int MultiByteToWideChar(#c.uint code_page, #c.ulong flags, cstring from, #c.int from_count, ^u16 into, #c.int into_count)
+
+    private foreign tcrt "stdio.h":
+        i32 _fileno(^FILE stream)
+
+    private foreign tcrt "io.h":
+        i32 _setmode(i32 fd, i32 mode)
+
+    private type WideRecord: ([32]u16 units, i64 used)
+
+    // The conversion a console sink makes, into a buffer instead of onto a
+    // screen: the same `MultiByteToWideChar` call `console_put` makes.
+    private bool record_wide(rawptr target, []char8 piece):
+        ^WideRecord r = ^WideRecord(target)
+        i64 room = 32 - r^.used
+        if #len(piece) == 0: return true
+        #c.int units = twin.MultiByteToWideChar(twin.CP_UTF8, 0, cstring(rawptr(&piece[0])), #c.int(#len(piece)), &r^.units[r^.used], #c.int(room))
+        if units <= 0: return false
+        r^.used = r^.used + i64(units)
+        return true
+
+    private bool platform_checks():
+        bool ok = true
+
+        // A UTF-8 line through the console path in pieces that split its
+        // characters arrives as exactly its UTF-16: no U+FFFD anywhere, and
+        // the G clef as its surrogate pair.
+        []char8 bytes = strings.bytes(LINE)
+        WideRecord rec
+        Carry carry
+        _ = write_characters(record_wide, rawptr(&rec), &carry, rawptr(&bytes[0]), 2)
+        _ = write_characters(record_wide, rawptr(&rec), &carry, rawptr(&bytes[2]), 6)
+        _ = write_characters(record_wide, rawptr(&rec), &carry, rawptr(&bytes[8]), 4)
+        _ = write_characters(record_wide, rawptr(&rec), &carry, rawptr(&bytes[12]), 2)
+        ok = #expect(rec.used == 9, "the line came out as ", rec.used, " UTF-16 units, not 9") && ok
+        if rec.used == 9:
+            ok = #expect(rec.units[0] == 0x68 && rec.units[1] == 0xE9 && rec.units[5] == 0x20, "the ASCII and é units were wrong") && ok
+            ok = #expect(rec.units[6] == 0x20AC, "€ came out as ", rec.units[6]) && ok
+            ok = #expect(rec.units[7] == 0xD834 && rec.units[8] == 0xDD1E, "the G clef was not its surrogate pair") && ok
+
+        // `widen` ends in the terminator the `W` functions read to.
+        ref []u16 wide = widen("é")
+        ok = #expect(#len(wide) == 2 && wide[0] == 0xE9 && wide[1] == 0, "widen(\"é\") was not é and a terminator") && ok
+        #delete(wide)
+
+        // The standard streams are in binary mode once handed out: `_setmode`
+        // answers the mode it replaces, so setting binary again answers binary.
+        Sink to_out = stdout_sink()
+        ok = #expect(to_out.proc != nil, "stdout_sink() is not a sink") && ok
+        ok = #expect(tcrt._setmode(tcrt._fileno(stdout()), O_BINARY) == O_BINARY, "stdout was not in binary mode") && ok
+        ok = #expect(tcrt._setmode(tcrt._fileno(stderr()), O_BINARY) == O_BINARY, "stderr was not in binary mode") && ok
+        ok = #expect(tcrt._setmode(tcrt._fileno(stdin()), O_BINARY) == O_BINARY, "stdin was not in binary mode") && ok
+        return ok
+else:
+    private bool platform_checks():
+        return true

@@ -1,0 +1,583 @@
+@test
+// A slab is claimed on two sides, and a test that only looked at one would pass
+// a broken allocator:
+//
+//   * what the **caller** sees — every block aligned, zeroed, distinct, and
+//     holding its bytes across `Resize`; checked by filling every block with a
+//     pattern and reading it back, a million operations deep, against a shadow
+//     of what each block should hold;
+//   * what the **backing allocator** sees — how many calls a load costs, that a
+//     free-and-reallocate costs none, and that `reset` and `destroy` hand back
+//     what they say. None of that is visible in a returned pointer, so the
+//     backing allocator below is written here to count, as `core:mem/arena`'s
+//     test writes its pool.
+package slab
+
+import "core:mem"
+import "core:mem/libc"
+
+// ── The counting, starvable, skewable backing allocator ──────────────────────
+//
+// C's heap underneath, so a slab over it can hold megabytes; counted, so every
+// claim about backing calls is a number; and with two switches, because the
+// arms where a chunk cannot be had, or comes back misaligned, are unreachable
+// from a backing allocator that keeps its word.
+
+private i64 back_allocs
+private i64 back_frees
+private i64 back_resizes
+private i64 back_live
+private u64 back_bytes
+// −1 means never fail; otherwise the `Alloc` with this ordinal, and every one
+// after it, answers nil.
+private i64 back_fail_at
+// Hand out every block one byte past an aligned address.
+private bool back_skew
+// Answer nil to every `Resize`, as a backing that does not implement it does.
+private bool back_no_resize
+// Answer every `Resize` one byte past an aligned address, contents moved with it.
+private bool back_skew_resize
+
+private void back_reset():
+    back_allocs = 0
+    back_frees = 0
+    back_resizes = 0
+    back_live = 0
+    back_bytes = 0
+    back_fail_at = 0 - 1
+    back_skew = false
+    back_no_resize = false
+    back_skew_resize = false
+    return
+
+private rawptr back_proc(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) c = libc.allocator()
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            i64 ordinal = back_allocs
+            back_allocs = back_allocs + 1
+            if back_fail_at >= 0 && ordinal >= back_fail_at:
+                return nil
+            if back_skew:
+                rawptr p = c.proc(c.data, mem.AllocatorMode.Alloc, nbytes + 16, align, nil, 0)
+                back_live = back_live + 1
+                back_bytes = back_bytes + nbytes
+                return p + 1
+            rawptr p = c.proc(c.data, mem.AllocatorMode.Alloc, nbytes, align, nil, 0)
+            if p != nil:
+                back_live = back_live + 1
+                back_bytes = back_bytes + nbytes
+            return p
+        case mem.AllocatorMode.Resize:
+            back_resizes = back_resizes + 1
+            if back_no_resize:
+                return nil
+            if back_skew_resize:
+                rawptr q = c.proc(c.data, mem.AllocatorMode.Resize, nbytes + 16, align, old, old_size)
+                shift_up(q, nbytes)
+                back_bytes = back_bytes - old_size + nbytes
+                return q + 1
+            rawptr p = c.proc(c.data, mem.AllocatorMode.Resize, nbytes, align, old, old_size)
+            if p != nil:
+                back_bytes = back_bytes - old_size + nbytes
+            return p
+        case mem.AllocatorMode.Free:
+            back_frees = back_frees + 1
+            back_live = back_live - 1
+            back_bytes = back_bytes - old_size
+            rawptr p = old
+            if p != #align_forward(p, 16):
+                p = p - 1
+            _ = c.proc(c.data, mem.AllocatorMode.Free, 0, 0, p, old_size)
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            return nil
+        else:
+            return nil
+
+// Move the first `n` bytes at `p` one byte up.
+private void shift_up(rawptr p, u64 n):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 w = b[0..<i64(n) + 1]
+    i64 i = i64(n)
+    for i > 0:
+        w[i] = w[i - 1]
+        i = i - 1
+    return
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing():
+    return (back_proc, nil)
+
+private i64 back_calls():
+    return back_allocs + back_frees + back_resizes
+
+// ── Bytes ────────────────────────────────────────────────────────────────────
+
+// The pattern a block of seed `seed` holds at byte `i`.
+private u8 pattern(u64 seed, i64 i):
+    return u8((seed + u64(i) * 131) % 251)
+
+private void fill(rawptr p, u64 n, u64 seed):
+    if n == 0:
+        return
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i64(n)]
+    for i in i64(0)..<#len(span):
+        span[i] = pattern(seed, i)
+    return
+
+private bool holds(rawptr p, u64 n, u64 seed):
+    if n == 0:
+        return true
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i64(n)]
+    for i in i64(0)..<#len(span):
+        if span[i] != pattern(seed, i):
+            return false
+    return true
+
+private bool zero_between(rawptr p, u64 from, u64 to):
+    if to <= from:
+        return true
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[i64(from)..<i64(to)]
+    for i in i64(0)..<#len(span):
+        if span[i] != 0:
+            return false
+    return true
+
+// **Aligned, asked of the address as a number.** `#c.uintptr_t` is the one
+// crossing from an address to an integer, and a multiple of 16 is a remainder.
+private bool aligned16(rawptr p):
+    return #c.uintptr_t(p) % #c.uintptr_t(16) == #c.uintptr_t(0)
+
+// ── xorshift64, so every failure reproduces ─────────────────────────────────
+
+private u64 next(^u64 state):
+    u64 s = state^
+    s = s ~ (s << 13)
+    s = s ~ (s >> 7)
+    s = s ~ (s << 17)
+    state^ = s
+    return s
+
+private u64 below(^u64 state, u64 bound):
+    return next(state) % bound
+
+// ── Shorthand over the interface ─────────────────────────────────────────────
+
+private rawptr alloc((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, u64 n):
+    return a.proc(a.data, mem.AllocatorMode.Alloc, n, 16, nil, 0)
+
+private rawptr re((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, rawptr p, u64 old, u64 n):
+    return a.proc(a.data, mem.AllocatorMode.Resize, n, 16, p, old)
+
+private void free((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, rawptr p, u64 n):
+    _ = a.proc(a.data, mem.AllocatorMode.Free, 0, 0, p, n)
+    return
+
+// ── The shadow model's state ─────────────────────────────────────────────────
+
+private const i64 SLOTS = 1024
+private type Ptrs: [1024]rawptr
+private type Nums: [1024]u64
+private Ptrs slot_ptr
+private Nums slot_size
+private Nums slot_seed
+
+// A size for the churn: mostly line-sized, sometimes across the upper classes,
+// rarely large — so every `Resize` arm is reached many times over.
+private u64 churn_size(^u64 st):
+    u64 roll = below(st, 1000)
+    if roll < 978:
+        return below(st, 301)
+    if roll < 998:
+        return 300 + below(st, 4800)
+    return 4097 + below(st, 16000)
+
+i32 test():
+    bool ok = true
+
+    // ── the classes ──────────────────────────────────────────────────────────
+    //
+    // Every class a multiple of 16 (which is what makes a carved block
+    // aligned), strictly increasing, ending at `MAX_CLASS`; and every size maps
+    // to the smallest class that holds it.
+    u64 prev = 0
+    for c in u64(0)..<CLASSES:
+        u64 cs = class_size(c)
+        ok = #expect(cs % 16 == 0, "class ", c, " is ", cs, " bytes, not a multiple of 16") && ok
+        ok = #expect(cs > prev, "class ", c, " (", cs, ") does not grow past ", prev) && ok
+        prev = cs
+    ok = #expect(class_size(CLASSES - 1) == MAX_CLASS, "the last class is ", class_size(CLASSES - 1)) && ok
+    ok = #expect(class_size(CLASSES) == 0, "a class out of range has a size") && ok
+    for n in u64(0)..<MAX_CLASS + 1:
+        u64 c = class_of(n)
+        bool fits = c < CLASSES && class_size(c) >= n
+        bool least = c == 0 || class_size(c - 1) < n
+        if !fits || !least:
+            ok = #expect(false, "size ", n, " went to class ", c) && ok
+    ok = #expect(class_of(MAX_CLASS + 1) == CLASSES, "a large size got a class") && ok
+    ok = #expect(#size(Large) == LARGE_HEADER, "Large is ", #size(Large), " bytes, the header ", LARGE_HEADER) && ok
+    ok = #expect(#size(Chunk) == CHUNK_HEADER, "Chunk is ", #size(Chunk), " bytes, the header ", CHUNK_HEADER) && ok
+
+    // ── over does not allocate; nil is total ─────────────────────────────────
+    back_reset()
+    Slab s = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = allocator(&s)
+    // The implementer, as a `mem.Allocator` trait value: it keeps its
+    // declaration (one slot, a pointer), and `data()` through the pair's
+    // dispatch answers the same two words `allocator` does.
+    SlabAllocator handle = &s
+    mem.Allocator tv = handle
+    ok = #expect(tv.ok() && tv.data().data == a.data, "the SlabAllocator trait value did not answer the allocator's words") && ok
+    ok = #expect(back_allocs == 0, "over took ", back_allocs, " allocations") && ok
+    ok = #expect(reserved(&s) == 0 && chunks(&s) == 0 && backing_calls(&s) == 0, "a fresh slab holds something") && ok
+
+    ^Slab none = nil
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) na = allocator(none)
+    ok = #expect(alloc(na, 16) == nil, "a nil slab allocated") && ok
+    ok = #expect(re(na, nil, 0, 16) == nil, "a nil slab resized") && ok
+    free(na, nil, 0)
+    reset(none)
+    destroy(none)
+    ok = #expect(reserved(none) == 0 && in_use(none) == 0 && requested(none) == 0, "a nil slab reported bytes") && ok
+    ok = #expect(chunks(none) == 0 && large_blocks(none) == 0 && backing_calls(none) == 0 && live(none, 0) == 0, "a nil slab reported blocks") && ok
+
+    // A slab over the zero allocator refuses everything and calls nothing.
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) zero_alloc
+    Slab dead = over(zero_alloc)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) da = allocator(&dead)
+    ok = #expect(alloc(da, 16) == nil && alloc(da, 10000) == nil, "a slab over no backing allocated") && ok
+    destroy(&dead)
+    ok = #expect(backing_calls(&dead) == 0, "a slab over no backing counted calls") && ok
+
+    // ── zero bytes: distinct, non-nil, and round-trips ───────────────────────
+    rawptr z1 = alloc(a, 0)
+    rawptr z2 = alloc(a, 0)
+    ok = #expect(z1 != nil && z2 != nil, "a zero-byte allocation answered nil") && ok
+    ok = #expect(z1 != z2, "two zero-byte allocations shared an address") && ok
+    ok = #expect(live(&s, 0) == 2, "two zero-byte blocks left ", live(&s, 0), " live in class 0") && ok
+    ok = #expect(back_allocs == 1 && chunks(&s) == 1, "the first allocations took ", back_allocs, " backing calls, not 1 chunk") && ok
+    free(a, z2, 0)
+    free(a, z1, 0)
+    ok = #expect(live(&s, 0) == 0, "freed zero-byte blocks still live") && ok
+
+    // ── many small blocks across every class ─────────────────────────────────
+    //
+    // One of each class, each filled, and every one aligned, still holding its
+    // bytes after all the others were written — so no two overlap.
+    Ptrs held
+    for c in u64(0)..<CLASSES:
+        u64 n = class_size(c)
+        rawptr p = alloc(a, n)
+        ok = #expect(p != nil, "class ", c, " refused a block") && ok
+        ok = #expect(aligned16(p), "class ", c, " handed out a misaligned block") && ok
+        ok = #expect(zero_between(p, 0, n), "class ", c, " handed out a block not zeroed") && ok
+        fill(p, n, c + 1)
+        held[c] = p
+        ok = #expect(live(&s, c) == 1, "class ", c, " has ", live(&s, c), " live") && ok
+    for c in u64(0)..<CLASSES:
+        ok = #expect(holds(held[c], class_size(c), c + 1), "class ", c, "'s block was overwritten by another") && ok
+    for c in u64(0)..<CLASSES:
+        free(a, held[c], class_size(c))
+    ok = #expect(in_use(&s) == 0 && requested(&s) == 0, "all freed and ", in_use(&s), " bytes in use") && ok
+
+    // ── free and reuse: LIFO, and no backing call ────────────────────────────
+    i64 calls_before = back_calls()
+    rawptr f1 = alloc(a, 40)
+    rawptr f2 = alloc(a, 40)
+    fill(f1, 40, 7)
+    free(a, f1, 40)
+    free(a, f2, 40)
+    rawptr r1 = alloc(a, 45)
+    rawptr r2 = alloc(a, 33)
+    ok = #expect(r1 == f2, "the last block freed was not the first reused") && ok
+    ok = #expect(r2 == f1, "the second reuse was not the block freed before it") && ok
+    ok = #expect(zero_between(r2, 0, 33), "a reused block kept its old tenant's bytes") && ok
+    ok = #expect(back_calls() == calls_before, "free-and-reuse made ", back_calls() - calls_before, " backing calls") && ok
+    free(a, r1, 45)
+    free(a, r2, 33)
+
+    // ── resize within a class keeps the pointer ─────────────────────────────
+    rawptr w = alloc(a, 40)
+    fill(w, 40, 9)
+    rawptr w2 = re(a, w, 40, 48)
+    ok = #expect(w2 == w, "an in-class grow moved the block") && ok
+    ok = #expect(holds(w2, 40, 9) && zero_between(w2, 40, 48), "an in-class grow lost bytes or did not zero") && ok
+    // Shrink within the class, write past the new end, grow back: the bytes
+    // past the shrunk end must read zero, because the caller never asked for
+    // them since.
+    rawptr w3 = re(a, w2, 48, 34)
+    ok = #expect(w3 == w, "an in-class shrink moved the block") && ok
+    rawptr w4 = re(a, w3, 34, 48)
+    ok = #expect(w4 == w && holds(w4, 34, 9) && zero_between(w4, 34, 48), "shrink-then-grow kept stale bytes") && ok
+
+    // ── resize across classes copies ────────────────────────────────────────
+    fill(w4, 48, 11)
+    rawptr up = re(a, w4, 48, 1000)
+    ok = #expect(up != nil && up != w, "a cross-class grow did not move") && ok
+    ok = #expect(holds(up, 48, 11) && zero_between(up, 48, 1000), "a cross-class grow lost bytes") && ok
+    ok = #expect(live(&s, class_of(48)) == 0 && live(&s, class_of(1000)) == 1, "the cross-class grow left the old class live") && ok
+    fill(up, 1000, 12)
+    rawptr down = re(a, up, 1000, 20)
+    ok = #expect(down != nil && holds(down, 20, 12), "a cross-class shrink lost bytes") && ok
+    ok = #expect(requested(&s) == 20, "requested after the resizes was ", requested(&s)) && ok
+    free(a, down, 20)
+    // A `Resize` of nil is an `Alloc`.
+    rawptr from_nil = re(a, nil, 0, 64)
+    ok = #expect(from_nil != nil && live(&s, class_of(64)) == 1, "resizing nil did not allocate") && ok
+    free(a, from_nil, 64)
+
+    // ── large blocks ─────────────────────────────────────────────────────────
+    i64 allocs_before = back_allocs
+    rawptr big = alloc(a, 10000)
+    ok = #expect(big != nil && aligned16(big), "a large block was refused or misaligned") && ok
+    ok = #expect(back_allocs == allocs_before + 1, "a large block took ", back_allocs - allocs_before, " backing allocations") && ok
+    ok = #expect(large_blocks(&s) == 1 && zero_between(big, 0, 10000), "the large block was not counted or not zeroed") && ok
+    fill(big, 10000, 21)
+    rawptr bigger = re(a, big, 10000, 50000)
+    ok = #expect(bigger != nil && aligned16(bigger), "a large grow failed") && ok
+    ok = #expect(back_resizes == 1, "a large grow made ", back_resizes, " backing resizes, not 1") && ok
+    ok = #expect(holds(bigger, 10000, 21) && zero_between(bigger, 10000, 50000), "a large grow lost bytes") && ok
+    rawptr other = alloc(a, 8000)
+    rawptr third = alloc(a, 9000)
+    ok = #expect(large_blocks(&s) == 3, "three large blocks counted as ", large_blocks(&s)) && ok
+    // Freeing the middle of the list and then the rest: the unlinking reaches
+    // head, middle and tail.
+    free(a, other, 8000)
+    fill(bigger, 50000, 22)
+    rawptr small_again = re(a, bigger, 50000, 100)
+    ok = #expect(small_again != nil && holds(small_again, 100, 22), "large-to-small lost bytes") && ok
+    ok = #expect(large_blocks(&s) == 1, "large-to-small left ", large_blocks(&s), " large blocks") && ok
+    rawptr large_again = re(a, small_again, 100, 6000)
+    ok = #expect(large_again != nil && holds(large_again, 100, 22) && zero_between(large_again, 100, 6000), "small-to-large lost bytes") && ok
+    ok = #expect(large_blocks(&s) == 2, "small-to-large left ", large_blocks(&s), " large blocks") && ok
+    free(a, third, 9000)
+    free(a, large_again, 6000)
+    ok = #expect(large_blocks(&s) == 0, "freed large blocks still counted") && ok
+    ok = #expect(reserved(&s) == CHUNK, "after the large blocks, reserved is ", reserved(&s), ", not one chunk") && ok
+    // A size that would wrap with its header is refused, not wrapped.
+    ok = #expect(alloc(a, 0 - u64(1)) == nil, "a request of 2^64 - 1 bytes was granted") && ok
+
+    // ── alignment above MAX_ALIGN is refused before any call ─────────────────
+    i64 calls_at_ceiling = back_calls()
+    ok = #expect(a.proc(a.data, mem.AllocatorMode.Alloc, 16, 32, nil, 0) == nil, "align 32 was granted") && ok
+    ok = #expect(a.proc(a.data, mem.AllocatorMode.Alloc, 10000, 64, nil, 0) == nil, "a large align 64 was granted") && ok
+    ok = #expect(back_calls() == calls_at_ceiling, "a refused alignment still called the backing allocator") && ok
+    ok = #expect(a.proc(a.data, mem.AllocatorMode.Alloc, 16, 1, nil, 0) != nil, "align 1 was refused") && ok
+
+    // ── FreeAll keeps the oldest chunk; destroy hands everything back ───────
+    for i in 0..<5000:
+        fill(alloc(a, 500), 500, u64(i) + 1)
+    _ = alloc(a, 20000)
+    ok = #expect(chunks(&s) > 1 && large_blocks(&s) == 1, "the fill did not grow: ", chunks(&s), " chunks") && ok
+    _ = a.proc(a.data, mem.AllocatorMode.FreeAll, 0, 0, nil, 0)
+    ok = #expect(in_use(&s) == 0 && requested(&s) == 0, "FreeAll left ", in_use(&s), " bytes in use") && ok
+    ok = #expect(chunks(&s) == 1 && large_blocks(&s) == 0, "FreeAll left ", chunks(&s), " chunks and ", large_blocks(&s), " large") && ok
+    ok = #expect(back_live == 1 && back_bytes == CHUNK, "after FreeAll the backing holds ", back_live, " blocks of ", back_bytes, " bytes") && ok
+    ok = #expect(reserved(&s) == back_bytes, "reserved ", reserved(&s), " disagrees with the backing's ", back_bytes) && ok
+    // Steady state: the kept chunk serves the next allocation with no call.
+    i64 calls_after_reset = back_calls()
+    rawptr again = alloc(a, 100)
+    ok = #expect(again != nil && back_calls() == calls_after_reset, "the first allocation after FreeAll called the backing allocator") && ok
+    // And the kept chunk was carved and filled before, so a fresh carve from it
+    // is zero only because `reset` zeroed it: every block of it, checked.
+    bool rezeroed = zero_between(again, 0, 100)
+    for i in 0..<120:
+        rawptr p = alloc(a, 500)
+        rezeroed = p != nil && zero_between(p, 0, 500) && rezeroed
+    ok = #expect(rezeroed && back_calls() == calls_after_reset, "a block carved from the kept chunk held a previous tenant's bytes") && ok
+    destroy(&s)
+    ok = #expect(back_live == 0 && back_bytes == 0, "destroy left the backing holding ", back_live, " blocks, ", back_bytes, " bytes") && ok
+    ok = #expect(reserved(&s) == 0 && chunks(&s) == 0 && in_use(&s) == 0, "a destroyed slab reports holdings") && ok
+    destroy(&s)
+    ok = #expect(back_live == 0, "destroying twice freed something") && ok
+    // Reusable: it allocates again, from a first-sized chunk.
+    rawptr revived = alloc(a, 100)
+    ok = #expect(revived != nil && reserved(&s) == CHUNK, "a destroyed slab did not revive at one chunk") && ok
+    destroy(&s)
+
+    // ── starvation: a refusal is a value, and not a poisoning ────────────────
+    back_reset()
+    Slab st = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) sa = allocator(&st)
+    back_fail_at = 0
+    ok = #expect(alloc(sa, 100) == nil && alloc(sa, 10000) == nil, "a starved slab produced a block") && ok
+    ok = #expect(chunks(&st) == 0 && large_blocks(&st) == 0 && reserved(&st) == 0, "a refused grow changed the slab") && ok
+    back_fail_at = 0 - 1
+    rawptr ok_now = alloc(sa, 100)
+    ok = #expect(ok_now != nil && chunks(&st) == 1, "the slab did not recover from a refusal") && ok
+    // A starved resize leaves the old block intact: small to large, which needs
+    // a backing call whatever the chunk's tail holds, and large to large, where
+    // the backing's own `Resize` succeeds unless it too is refused — this pool
+    // refuses only `Alloc`, so that one is reached through the fallback below.
+    fill(ok_now, 100, 5)
+    back_fail_at = back_allocs
+    rawptr refused = re(sa, ok_now, 100, 10000)
+    ok = #expect(refused == nil && holds(ok_now, 100, 5), "a refused resize lost the old block") && ok
+    ok = #expect(large_blocks(&st) == 0 && live(&st, class_of(100)) == 1, "a refused resize changed the counts") && ok
+    back_fail_at = 0 - 1
+    destroy(&st)
+    ok = #expect(back_live == 0, "the starved slab leaked ", back_live, " backing blocks") && ok
+
+    // ── a backing allocator that under-aligns is refused, without a leak ─────
+    back_reset()
+    back_skew = true
+    Slab liar = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) la = allocator(&liar)
+    ok = #expect(alloc(la, 100) == nil && alloc(la, 10000) == nil, "a slab over a misaligning backing handed out a block") && ok
+    ok = #expect(back_live == 0 && back_frees == back_allocs, "the refusal leaked: ", back_allocs, " allocs, ", back_frees, " frees") && ok
+    back_skew = false
+    destroy(&liar)
+
+    // ── a large resize the backing will not do, or does crookedly ──────────
+    //
+    // `regrow_large`'s two arms that a conforming `realloc` never reaches: the
+    // backing answering nil (the block is still its own, so allocate, copy,
+    // free), and the backing moving the block somewhere misaligned (the block
+    // is valid but cannot be handed out, so it is relinked where it landed,
+    // copied out of and freed).
+    back_reset()
+    Slab lr = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) lra = allocator(&lr)
+    rawptr lb = alloc(lra, 5000)
+    rawptr neighbour = alloc(lra, 6000)
+    fill(lb, 5000, 31)
+    back_no_resize = true
+    rawptr lb2 = re(lra, lb, 5000, 9000)
+    ok = #expect(lb2 != nil && aligned16(lb2) && holds(lb2, 5000, 31) && zero_between(lb2, 5000, 9000), "the fallback for a refused large resize lost bytes") && ok
+    ok = #expect(back_resizes == 1 && large_blocks(&lr) == 2, "the refused large resize left ", large_blocks(&lr), " large blocks") && ok
+    back_no_resize = false
+    fill(lb2, 9000, 32)
+    back_skew_resize = true
+    rawptr lb3 = re(lra, lb2, 9000, 12000)
+    back_skew_resize = false
+    ok = #expect(lb3 != nil && aligned16(lb3) && holds(lb3, 9000, 32) && zero_between(lb3, 9000, 12000), "the fallback for a misaligned large resize lost bytes") && ok
+    ok = #expect(large_blocks(&lr) == 2 && reserved(&lr) == back_bytes, "the misaligned resize left ", large_blocks(&lr), " large blocks, reserved ", reserved(&lr), " against ", back_bytes) && ok
+    free(lra, neighbour, 6000)
+    free(lra, lb3, 12000)
+    ok = #expect(back_live == 0 && large_blocks(&lr) == 0 && reserved(&lr) == 0, "the crooked resizes leaked ", back_live, " backing blocks") && ok
+    destroy(&lr)
+
+    // ── through the verbs ────────────────────────────────────────────────────
+    //
+    // What a caller writes: `#make`, `#resize`, `#delete` with the slab's
+    // allocator. The verbs pass `cap * #size(T)` as `old_size`, which is the
+    // size last asked for — the whole of what a headerless block needs.
+    back_reset()
+    Slab vs = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) va = allocator(&vs)
+    ref []u8 run = #make([]u8, 10, va)
+    ref []u8 nothing = #make([]u8, 0, va)
+    ok = #expect(#len(run) == 10 && #len(nothing) == 0, "the verbs made runs of ", #len(run), " and ", #len(nothing)) && ok
+    ok = #expect(live(&vs, 0) == 2, "a 10-byte and a 0-byte run left ", live(&vs, 0), " live in class 0") && ok
+    run[9] = 65
+    bool grew = #resize(run, 100)
+    ok = #expect(grew && #len(run) == 100 && run[9] == 65 && run[99] == 0, "#resize through the slab lost the run") && ok
+    ok = #expect(live(&vs, 0) == 1 && live(&vs, class_of(100)) == 1, "#resize left the old class live") && ok
+    bool huge = #resize(run, 20000)
+    ok = #expect(huge && run[9] == 65 && large_blocks(&vs) == 1, "#resize to a large block lost the run") && ok
+    #delete(run)
+    #delete(nothing)
+    ok = #expect(in_use(&vs) == 0 && requested(&vs) == 0 && large_blocks(&vs) == 0, "#delete left ", in_use(&vs), " bytes in use") && ok
+    destroy(&vs)
+    ok = #expect(back_live == 0, "the verbs' slab leaked ", back_live, " backing blocks") && ok
+
+    // ── a file's worth of lines ──────────────────────────────────────────────
+    //
+    // 100 000 lines of 0..200 bytes, the load this allocator exists for, and
+    // then 100 000 edits — each frees one line's run and allocates its
+    // replacement. The numbers asserted are the ones measured.
+    back_reset()
+    Slab ed = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) ea = allocator(&ed)
+    ref []rawptr line = #make([]rawptr, 100000, #heap)
+    ref []u64 lens = #make([]u64, 100000, #heap)
+    u64 rng = 88172645463325252
+    for i in i64(0)..<100000:
+        u64 n = below(&rng, 201)
+        line[i] = alloc(ea, n)
+        lens[i] = n
+        if line[i] == nil || !aligned16(line[i]):
+            ok = #expect(false, "line ", i, " was refused or misaligned") && ok
+    i64 load_calls = back_calls()
+    ok = #expect(load_calls == 15, "loading 100 000 lines took ", load_calls, " backing calls") && ok
+    ok = #expect(chunks(&ed) == 15, "loading 100 000 lines took ", chunks(&ed), " chunks") && ok
+    ok = #expect(requested(&ed) == 9956453, "the load requested ", requested(&ed), " bytes") && ok
+    ok = #expect(in_use(&ed) == 11928624, "the load's blocks came to ", in_use(&ed), " bytes") && ok
+    ok = #expect(reserved(&ed) == 12517376, "the load reserved ", reserved(&ed), " bytes") && ok
+    for i in i64(0)..<100000:
+        i64 at = i64(below(&rng, 100000))
+        free(ea, line[at], lens[at])
+        u64 n = below(&rng, 201)
+        line[at] = alloc(ea, n)
+        lens[at] = n
+    ok = #expect(back_calls() == load_calls, "100 000 edits took ", back_calls() - load_calls, " backing calls") && ok
+    destroy(&ed)
+    ok = #expect(back_live == 0 && back_bytes == 0, "destroying the file left ", back_live, " backing blocks") && ok
+    #delete(line)
+    #delete(lens)
+
+    // ── a million operations against a shadow ────────────────────────────────
+    //
+    // Every slot is empty or holds a block of a known size filled with a known
+    // pattern. An operation allocates into an empty slot, or frees or resizes a
+    // full one — and every free and resize first checks the whole block still
+    // holds its pattern, every resize that the kept prefix survived and the
+    // grown tail is zero. Under ASan, a block that overlapped another, or a
+    // free list that handed a block out twice, shows up here as a wrong byte.
+    back_reset()
+    Slab ch = over(backing())
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) ca = allocator(&ch)
+    u64 cr = 2463534242
+    i64 bad = 0
+    for i in i64(0)..<SLOTS:
+        slot_ptr[i] = nil
+    for op in i64(0)..<1000000:
+        i64 k = i64(below(&cr, u64(SLOTS)))
+        rawptr p = slot_ptr[k]
+        if p == nil:
+            u64 n = churn_size(&cr)
+            rawptr q = alloc(ca, n)
+            if q == nil || !aligned16(q) || !zero_between(q, 0, n):
+                bad = bad + 1
+            fill(q, n, u64(op))
+            slot_ptr[k] = q
+            slot_size[k] = n
+            slot_seed[k] = u64(op)
+        else:
+            u64 n = slot_size[k]
+            if !holds(p, n, slot_seed[k]):
+                bad = bad + 1
+            if below(&cr, 2) == 0:
+                free(ca, p, n)
+                slot_ptr[k] = nil
+            else:
+                u64 m = churn_size(&cr)
+                rawptr q = re(ca, p, n, m)
+                u64 keep = n
+                if m < keep: keep = m
+                if q == nil || !aligned16(q) || !holds(q, keep, slot_seed[k]) || !zero_between(q, keep, m):
+                    bad = bad + 1
+                fill(q, m, u64(op))
+                slot_ptr[k] = q
+                slot_size[k] = m
+                slot_seed[k] = u64(op)
+    ok = #expect(bad == 0, "the churn found ", bad, " blocks that disagreed with the shadow") && ok
+    u64 live_total = 0
+    for c in u64(0)..<CLASSES:
+        live_total = live_total + live(&ch, c)
+    i64 held_slots = 0
+    for i in i64(0)..<SLOTS:
+        if slot_ptr[i] != nil:
+            held_slots = held_slots + 1
+    ok = #expect(i64(live_total + large_blocks(&ch)) == held_slots, "the slab counts ", live_total + large_blocks(&ch), " live blocks, the shadow ", held_slots) && ok
+    ok = #expect(back_live == i64(chunks(&ch) + large_blocks(&ch)), "the backing holds ", back_live, " blocks, the slab ", chunks(&ch) + large_blocks(&ch)) && ok
+    ok = #expect(reserved(&ch) == back_bytes, "reserved ", reserved(&ch), ", the backing holds ", back_bytes) && ok
+    destroy(&ch)
+    ok = #expect(back_live == 0 && back_bytes == 0, "destroying the churn left ", back_live, " backing blocks") && ok
+
+    if ok:
+        return 0
+    return 1

@@ -1,0 +1,116 @@
+@test
+// `write_line`/`stdout_sink` reach `core:io`, which is already
+// tested elsewhere (`core:io`'s own suite), so what's claimed here is this
+// package's own judgement:
+//
+//   * **`level_name`** answers all five levels, and the ordering `Level`
+//     being a plain `i32`-backed enum promises (`Level.Warn > Level.Info`).
+//   * **`tag_of`/`msg_of`'s truncation boundary** — a tag/message that fits
+//     exactly, and one one byte over the cap, which is the input a
+//     `<=`-that-should-be-`<` gets wrong.
+//   * **`emit` actually dispatches** — a sink's `fn` is called with the
+//     record and `data` it was given, and a `nil` `fn` is a safe no-op
+//     rather than a crash (a program building a `Sink` by hand can leave
+//     `fn` unset without special-casing it).
+package log
+
+import "core:strings"
+
+private i32 g_calls
+private Level g_last_level
+private string8 g_last_tag
+private string8 g_last_msg
+private rawptr g_last_data
+
+private void probe_fn(^Record r, rawptr data):
+    g_calls = g_calls + 1
+    g_last_level = r.level
+    g_last_tag = tag_str(&r.tag, r.tag_len)
+    g_last_msg = msg_str(&r.message, r.msg_len)
+    g_last_data = data
+
+// A `cstring` compares against `nil` and takes no other operator —
+// a raw `==` between two `cstring`s is an unspecified pointer
+// compare (and clang flags it, `-Wstring-compare`). `level_name` returns
+// `cstring` on purpose (zero-allocation for `write_line`'s hot path), so
+// checking its *text* here goes through `clone_from_cstring` instead, same
+// as any other caller that needs to compare C bytes by content.
+// Not `delete`d — `string(run[:])` is a *borrowed window* over `run`'s
+// bytes, taken for free and not copied, so freeing `run` before the
+// caller reads the result would hand back a dangling view. A one-call test
+// helper's small leak is the trade; `core:strings`' own suite `delete`s
+// after it's done reading, which this can't do and still return a `string`.
+private string8 cstr_text(cstring c, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 run = strings.clone_from_cstring(c, alloc)
+    return string8(run[:])
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = #default
+
+    // ── level_name, and the ordering a plain enum gives for free ──────────
+
+    ok = #expect(cstr_text(level_name(Level.Trace), alloc) == "TRACE", "level_name(Trace)") && ok
+    ok = #expect(cstr_text(level_name(Level.Debug), alloc) == "DEBUG", "level_name(Debug)") && ok
+    ok = #expect(cstr_text(level_name(Level.Info), alloc) == "INFO", "level_name(Info)") && ok
+    ok = #expect(cstr_text(level_name(Level.Warn), alloc) == "WARN", "level_name(Warn)") && ok
+    ok = #expect(cstr_text(level_name(Level.Error), alloc) == "ERROR", "level_name(Error)") && ok
+    ok = #expect(Level.Error > Level.Warn, "Error should outrank Warn") && ok
+    ok = #expect(Level.Warn > Level.Info, "Warn should outrank Info") && ok
+    ok = #expect(Level.Trace < Level.Debug, "Trace should be the lowest") && ok
+
+    // ── tag_of / msg_of: exact fit and one byte over ───────────────────────
+
+    string8 exact_tag = "abcdefghijklmnopqrstuvwx"  // exactly TAG_CAP (24) bytes
+    ok = #expect(#len(exact_tag) == TAG_CAP, "fixture: exact_tag is not TAG_CAP bytes") && ok
+    (Tag t1, i32 tn1) = tag_of(exact_tag)
+    ok = #expect(tn1 == TAG_CAP, "tag_of at exactly TAG_CAP truncated: ", tn1) && ok
+    ok = #expect(tag_str(&t1, tn1) == exact_tag, "tag_of at exactly TAG_CAP changed the bytes") && ok
+
+    string8 over_tag = "abcdefghijklmnopqrstuvwxy"  // TAG_CAP + 1 bytes
+    ok = #expect(#len(over_tag) == TAG_CAP + 1, "fixture: over_tag is not TAG_CAP+1 bytes") && ok
+    (Tag t2, i32 tn2) = tag_of(over_tag)
+    ok = #expect(tn2 == TAG_CAP, "tag_of one byte over TAG_CAP did not clamp: ", tn2) && ok
+    ok = #expect(tag_str(&t2, tn2) == exact_tag, "tag_of one byte over TAG_CAP kept the wrong prefix") && ok
+
+    (Tag t3, i32 tn3) = tag_of("")
+    ok = #expect(tn3 == 0, "tag_of(\"\") was ", tn3) && ok
+    ok = #expect(tag_str(&t3, tn3) == "", "tag_str of an empty tag was not empty") && ok
+
+    string8 msg_short = "the quick brown fox jumps over the lazy dog"
+    i64 msg_short_len = #len(msg_short)
+    ok = #expect(msg_short_len < MSG_CAP, "fixture: msg_short does not fit under MSG_CAP") && ok
+    (Msg m1, i32 mn1) = msg_of(msg_short)
+    ok = #expect(mn1 == msg_short_len, "msg_of of a short message truncated: ", mn1) && ok
+    ok = #expect(msg_str(&m1, mn1) == msg_short, "msg_of round-trip changed the bytes") && ok
+
+    // ── record() composes both ─────────────────────────────────────────────
+
+    Record r = record(Level.Warn, "net", "retrying connect")
+    ok = #expect(r.level == Level.Warn, "record().level was wrong") && ok
+    ok = #expect(tag_str(&r.tag, r.tag_len) == "net", "record().tag was ", tag_str(&r.tag, r.tag_len)) && ok
+    ok = #expect(msg_str(&r.message, r.msg_len) == "retrying connect", "record().message was ", msg_str(&r.message, r.msg_len)) && ok
+
+    // ── emit dispatches to the sink's fn with its data ─────────────────────
+
+    i32 marker = 7
+    Sink probe = (probe_fn, rawptr(&marker))
+    emit(probe, &r)
+    ok = #expect(g_calls == 1, "emit() did not call the sink exactly once") && ok
+    ok = #expect(g_last_level == Level.Warn, "emit() passed the wrong level") && ok
+    ok = #expect(g_last_tag == "net", "emit() passed the wrong tag: ", g_last_tag) && ok
+    ok = #expect(g_last_msg == "retrying connect", "emit() passed the wrong message: ", g_last_msg) && ok
+    ok = #expect(g_last_data == rawptr(&marker), "emit() did not pass the sink's own data through") && ok
+
+    // A nil fn is a safe no-op, not a crash.
+    Sink blank
+    emit(blank, &r)
+    ok = #expect(g_calls == 1, "emit() on a nil-fn sink called something") && ok
+
+    // stdout_sink() doesn't crash. Its actual output isn't captured here —
+    // core:io's own suite covers the stream primitives underneath it.
+    emit(stdout_sink(), &r)
+
+    if ok:
+        return 0
+    return 1

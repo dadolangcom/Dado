@@ -1,0 +1,706 @@
+// core:strings/parse — text to numbers.
+//
+//     import "core:strings/parse"
+//
+//     try f64 x = parse.to_f64("6.02214076e23") else code:
+//         ...                                    // not a number
+//     i32 n = parse.to_i32("42")
+//
+// **This package includes nothing.** It had a `private foreign "stdlib.h"`
+// block, for `atoi` and `atof`, and that block made it hosted-only: a `foreign`
+// block's `#include` reaches every importer, `<stdlib.h>` is not one of the
+// C11 §4 freestanding headers, and `#NONE` and `#WEB` have no C library to
+// supply `strtod` anyway. Both parsers are Dado now, so every line here compiles at
+// every target, and the import line no longer decides one.
+//
+// ## `to_f64` and `to_f32` are strict and correctly rounded
+//
+// The text must be a number and nothing else: `to_f64("12abc")`,
+// `to_f64(" 1")` and `to_f64("")` fail, through `!`, with `MALFORMED`. A
+// number that parses is the **nearest** `f64` (or `f32`) to the decimal the
+// text names, ties to even — what C's `strtod` answers in the default
+// rounding mode, whatever the number of digits. The grammar:
+//
+//     [+|-] digits [. [digits]] [(e|E) [+|-] digits]
+//     [+|-] . digits [(e|E) [+|-] digits]
+//     [+|-] inf | infinity | nan          (any case)
+//
+// Not accepted, where `strtod` would: leading space, C's hex floats
+// (`0x1p-3`), and `nan(...)` with a payload. A magnitude past the largest
+// finite value is an infinity and one below half the smallest subnormal is a
+// zero of the text's sign — that is the correct rounding, so neither fails.
+// `-nan` is a NaN with its sign bit set, which is what `strtod` answers.
+//
+// Reading a single-precision value with `to_f32` is not `f32(to_f64(s))`:
+// rounding to 53 bits and then to 24 rounds twice, and a decimal that lands
+// near an `f32` halfway point can come out one unit wrong that way. `to_f32`
+// rounds once.
+//
+// ## How
+//
+// Three stages, the first that can answer does:
+//
+// 1. **The text is scanned once** (`scan`), keeping the first nineteen
+//    significant digits in a `u64` and the decimal exponent. A value whose
+//    exponent puts it certainly past the range is answered here.
+// 2. **Eisel-Lemire** (`eisel_lemire`): those digits times a 128-bit
+//    approximation of the power of ten (`POW10`, `powers.dado`), which settles
+//    all but a vanishing fraction of inputs with two 64×64 multiplications.
+//    It declines, rather than guessing, when the product sits too close to a
+//    rounding boundary, when the answer is subnormal, and when more than
+//    nineteen digits were written and the answer depends on the rest.
+// 3. **Exact arithmetic** (`exact`) for everything it declines: the decimal
+//    as a big integer, divided or multiplied by the power of five exactly,
+//    rounded once from the true quotient and remainder. The first 800
+//    significant digits are kept and the rest recorded only as "something
+//    non-zero followed"; that loses nothing, because every `f64` and every
+//    halfway point between two of them is written exactly in at most 767
+//    significant digits, so digits past the 800th can move the value off such
+//    a point but never across one.
+//
+// Stage 2 is a port of the Go standard library's `eiselLemire64` and
+// `eiselLemire32` (`strconv/eisel_lemire.go`), which follow Wuffs' C
+// implementation of the algorithm Michael Eisel and Daniel Lemire published in
+// 2020. That code is under the licence below, and the port keeps its
+// structure and its step names so the two can be read side by side. Stages 1
+// and 3 are this package's own.
+//
+//     Copyright 2020 The Go Authors. All rights reserved.
+//
+//     Redistribution and use in source and binary forms, with or without
+//     modification, are permitted provided that the following conditions are
+//     met:
+//
+//        * Redistributions of source code must retain the above copyright
+//     notice, this list of conditions and the following disclaimer.
+//        * Redistributions in binary form must reproduce the above
+//     copyright notice, this list of conditions and the following disclaimer
+//     in the documentation and/or other materials provided with the
+//     distribution.
+//        * Neither the name of Google LLC nor the names of its
+//     contributors may be used to endorse or promote products derived from
+//     this software without specific prior written permission.
+//
+//     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+//     "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+//     LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+//     A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+//     OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+//     SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+//     LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+//     DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+//     THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+//     (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+//     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// The table the algorithm reads is generated, not transcribed:
+// `scripts/float-tables.py` writes `powers.dado` from exact integer
+// arithmetic and checks it row for row against Go's.
+//
+// ## `to_i32` is C's `atoi`, still forgiving
+//
+// It keeps the contract it had when it was `atoi` through `foreign`: leading
+// white space skipped, a sign, the digits up to the first non-digit, and 0 for
+// text with no number at the front — no failure, ever. Only its implementation
+// moved, so that the header went with it. It still takes a `cstring`.
+package parse
+
+// The code `to_f64` and `to_f32` fail with: the text is not a number, or is a
+// number with something before or after it.
+const i32 MALFORMED = 1
+
+// ── the formats ─────────────────────────────────────────────────────────────
+
+// What the two widths differ in, so one scanner, one Eisel-Lemire and one
+// exact path serve both. `bits` counts the hidden bit (53, 24); a finite value
+// is `m * 2^e` with `m < 2^bits` and `emin <= e <= emax`, and `emin` is the
+// exponent of the smallest subnormal. `dp_min`/`dp_max` bound the decimal
+// point: a value written `0.d… × 10^dp` with `dp` below `dp_min` is under half
+// the smallest subnormal, and one with `dp` above `dp_max` is past the largest
+// finite value plus half an ulp. `el_mask`/`el_shift` are Eisel-Lemire's
+// width-specific constants, as Go writes them, and `sign_at` is the sign bit.
+private type Format:
+    i32 bits,
+    i32 emin,
+    i32 emax,
+    i64 bias,
+    u64 exp_all,
+    i64 dp_min,
+    i64 dp_max,
+    u64 el_mask,
+    u64 el_shift,
+    i32 sign_at,
+
+private const Format F64 = (53, 0 - 1074, 971, 1023, 0x7FF, 0 - 324, 310, 0x1FF, 9, 63)
+private const Format F32 = (24, 0 - 149, 104, 127, 0xFF, 0 - 45, 40, 0x3FFFFFFFFF, 38, 31)
+
+private cunion Bits64: (f64 f, u64 u)
+private cunion Bits32: (f32 f, u32 u)
+
+// ── the public surface ──────────────────────────────────────────────────────
+
+// The `f64` nearest the decimal `s` names, ties to even; `MALFORMED` when `s`
+// is not exactly a number. The header above has the grammar.
+!f64 to_f64(string8 s):
+    try u64 bits = read(s, F64)
+    Bits64 b = Bits64(bits)
+    return b.f
+
+// The `f32` nearest the decimal `s` names, rounded once; `MALFORMED` when `s`
+// is not exactly a number.
+!f32 to_f32(string8 s):
+    try u64 bits = read(s, F32)
+    Bits32 b = Bits32(u32(bits))
+    return b.f
+
+// `atoi`'s answer: white space skipped, an optional sign, then decimal digits
+// up to the first byte that is not one. Text with no digits there is 0. A
+// value past `i32`'s range wraps, where `atoi`'s behaviour is undefined.
+i32 to_i32(cstring c):
+    string8 s = string8(c)
+    i64 n = #len(s)
+    i64 i = 0
+    for i < n && is_space(s[i]):
+        i += 1
+
+    bool neg = false
+    if i < n && (s[i] == '+' || s[i] == '-'):
+        neg = s[i] == '-'
+        i += 1
+
+    i32 acc = 0
+    for i < n && s[i] >= '0' && s[i] <= '9':
+        acc = acc * 10 + i32(s[i] - '0')
+        i += 1
+
+    if neg:
+        return 0 - acc
+
+    return acc
+
+// C's `isspace` in the "C" locale.
+private bool is_space(char8 c):
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0B' || c == '\x0C'
+
+// ── stage 1: the scan ───────────────────────────────────────────────────────
+
+private const i32 BAD = 0
+private const i32 FINITE = 1
+private const i32 INF = 2
+private const i32 NAN = 3
+
+// What one pass over the text found. `man` holds the first nineteen
+// significant digits and `exp10` the power of ten that scales them; `trunc`
+// says a non-zero digit past the nineteenth was dropped. `dp` places the
+// decimal point: the value is `0.d1d2… × 10^dp` with `d1` the first non-zero
+// digit. `first..<stop` is the run of digits and point, for the exact path to
+// read again.
+private type Text:
+    i32  kind,
+    bool neg,
+    u64  man,
+    i64  exp10,
+    bool trunc,
+    i64  dp,
+    i64  first,
+    i64  stop,
+
+private char8 lower(char8 c):
+    if c >= 'A' && c <= 'Z':
+        return c + 32
+
+    return c
+
+// Whether `s` is `word`, in any case. `word` is lower case.
+private bool spells(string8 s, string8 word):
+    if #len(s) != #len(word):
+        return false
+
+    for c, i in word:
+        if lower(s[i]) != c:
+            return false
+
+    return true
+
+private Text scan(string8 s):
+    Text t
+    i64 n = #len(s)
+    i64 i = 0
+    if i < n && (s[i] == '+' || s[i] == '-'):
+        t.neg = s[i] == '-'
+        i += 1
+
+    string8 rest = s[i..<n]
+    if spells(rest, "inf") || spells(rest, "infinity"):
+        t.kind = INF
+        return t
+
+    if spells(rest, "nan"):
+        t.kind = NAN
+        return t
+
+    t.first = i
+    bool sawdot = false
+    bool sawdigits = false
+    i64 nd = 0
+    i32 nd_man = 0
+    i64 dp = 0
+    for i < n:
+        char8 c = s[i]
+        if c == '.':
+            if sawdot:
+                break
+
+            sawdot = true
+            dp = nd
+            i += 1
+            continue
+
+        if c < '0' || c > '9':
+            break
+
+        sawdigits = true
+        i += 1
+        if c == '0' && nd == 0:
+            dp -= 1
+            continue
+
+        nd += 1
+        if nd_man < 19:
+            t.man = t.man * 10 + u64(c - '0')
+            nd_man += 1
+        else if c != '0':
+            t.trunc = true
+
+    t.stop = i
+    if !sawdigits:
+        return t
+
+    if !sawdot:
+        dp = nd
+
+    if i < n && (s[i] == 'e' || s[i] == 'E'):
+        i += 1
+        bool eneg = false
+        if i < n && (s[i] == '+' || s[i] == '-'):
+            eneg = s[i] == '-'
+            i += 1
+
+        if i >= n || s[i] < '0' || s[i] > '9':
+            return t
+
+        // Clamped rather than accumulated without bound: past a hundred
+        // million the answer is an infinity or a zero whatever the digits,
+        // and the clamp keeps `dp` far from `i64`'s edge.
+        i64 e = 0
+        for i < n && s[i] >= '0' && s[i] <= '9':
+            if e < 100000000:
+                e = e * 10 + i64(s[i] - '0')
+
+            i += 1
+
+        if eneg:
+            e = 0 - e
+
+        dp += e
+
+    if i != n:
+        return t
+
+    t.kind = FINITE
+    t.dp = dp
+    t.exp10 = dp - i64(nd_man)
+    return t
+
+// The bits of the value `s` names, in format `f`, as a `u64` whichever the
+// width.
+private !u64 read(string8 s, Format f):
+    Text t = scan(s)
+    if t.kind == BAD:
+        fail MALFORMED
+
+    u64 sign = 0
+    if t.neg:
+        sign = u64(1) << f.sign_at
+
+    if t.kind == NAN:
+        return sign | (f.exp_all << (f.bits - 1)) | (u64(1) << (f.bits - 2))
+
+    if t.kind == INF:
+        return sign | (f.exp_all << (f.bits - 1))
+
+    return sign | finite(s, t, f)
+
+private u64 finite(string8 s, Text t, Format f):
+    if t.man == 0:
+        return 0
+
+    if t.dp > f.dp_max:
+        return f.exp_all << (f.bits - 1)
+
+    if t.dp < f.dp_min:
+        return 0
+
+    (u64 bits, bool ok) = eisel_lemire(t.man, t.exp10, f)
+    if ok:
+        if !t.trunc:
+            return bits
+
+        // More digits were written than `man` holds, so the value is in
+        // `[man, man + 1) × 10^exp10`. Both ends rounding to one answer means
+        // everything between does too.
+        (u64 up, bool up_ok) = eisel_lemire(t.man + 1, t.exp10, f)
+        if up_ok && up == bits:
+            return bits
+
+    return exact(s, t, f)
+
+// ── stage 2: Eisel-Lemire ───────────────────────────────────────────────────
+
+// The full 128-bit product of two `u64`s, from four 32×32 products.
+private (u64 hi, u64 lo) mul64(u64 a, u64 b):
+    u64 a_lo = a & 0xFFFFFFFF
+    u64 a_hi = a >> 32
+    u64 b_lo = b & 0xFFFFFFFF
+    u64 b_hi = b >> 32
+    u64 p00 = a_lo * b_lo
+    u64 p01 = a_lo * b_hi
+    u64 p10 = a_hi * b_lo
+    u64 p11 = a_hi * b_hi
+    u64 mid1 = p10 + (p00 >> 32)
+    u64 mid2 = p01 + (mid1 & 0xFFFFFFFF)
+    u64 hi = p11 + (mid1 >> 32) + (mid2 >> 32)
+    u64 lo = (mid2 << 32) | (p00 & 0xFFFFFFFF)
+    return (hi, lo)
+
+// `man × 10^exp10` in format `f`, or `ok` false when the 128-bit product
+// cannot decide the rounding — never a wrong answer. `man` is non-zero. The
+// step names are Go's, which are the sections of Nigel Tao's write-up of the
+// algorithm.
+private (u64 bits, bool ok) eisel_lemire(u64 man_in, i64 exp10, Format f):
+    // Exp10 Range.
+    if exp10 < i64(POW10_MIN_Q) || exp10 > i64(POW10_MAX_Q):
+        return (0, false)
+
+    // Normalization.
+    i64 clz = #clz(man_in)
+    u64 man = man_in << clz
+    i64 ret_exp2 = ((217706 * exp10) >> 16) + 64 + f.bias - clz
+
+    // Multiplication.
+    i64 row = exp10 - i64(POW10_MIN_Q)
+    (u64 x_hi, u64 x_lo) = mul64(man, POW10[row][1])
+
+    // Wider Approximation.
+    if x_hi & f.el_mask == f.el_mask && x_lo + man < man:
+        (u64 y_hi, u64 y_lo) = mul64(man, POW10[row][0])
+        u64 merged_hi = x_hi
+        u64 merged_lo = x_lo + y_hi
+        if merged_lo < x_lo:
+            merged_hi += 1
+
+        if merged_hi & f.el_mask == f.el_mask && merged_lo + 1 == 0 && y_lo + man < man:
+            return (0, false)
+
+        x_hi = merged_hi
+        x_lo = merged_lo
+
+    // Shifting to 54 Bits (25 for `f32`).
+    u64 msb = x_hi >> 63
+    u64 ret_man = x_hi >> (msb + f.el_shift)
+    ret_exp2 -= i64(1 - msb)
+
+    // Half-way Ambiguity.
+    if x_lo == 0 && x_hi & f.el_mask == 0 && ret_man & 3 == 1:
+        return (0, false)
+
+    // From 54 to 53 Bits (25 to 24).
+    ret_man += ret_man & 1
+    ret_man = ret_man >> 1
+    if ret_man >> f.bits > 0:
+        ret_man = ret_man >> 1
+        ret_exp2 += 1
+
+    // A biased exponent of zero or below is subnormal, and one at `exp_all`
+    // or above is an infinity: both are the exact path's.
+    if ret_exp2 <= 0 || ret_exp2 >= i64(f.exp_all):
+        return (0, false)
+
+    u64 frac = ret_man & ((u64(1) << (f.bits - 1)) - 1)
+    return ((u64(ret_exp2) << (f.bits - 1)) | frac, true)
+
+// ── stage 3: exact ──────────────────────────────────────────────────────────
+
+// Enough for the largest integer the exact path forms: 800 decimal digits
+// (2658 bits) shifted against `5^1124` (2612 bits) plus the 55-bit quotient —
+// under 2730 bits — with room over.
+private const i32 LIMBS = 96
+
+// Significant digits kept; see the header for why 800 is enough.
+private const i32 KEPT = 800
+
+// A non-negative integer in base 2^32, least significant limb first; `n`
+// limbs are in use and every limb above them is zero.
+private type Big:
+    [LIMBS]u32 w,
+    i32 n,
+
+// `b = b * m + add`.
+private void big_mul_add(^Big b, u32 m, u32 add):
+    u64 carry = u64(add)
+    i32 zero = 0
+    for i in zero..<b.n:
+        u64 p = u64(b.w[i]) * u64(m) + carry
+        b.w[i] = u32(p)
+        carry = p >> 32
+
+    if carry != 0:
+        #assert(b.n < LIMBS, "parse: a big integer outgrew its limbs")
+        b.w[b.n] = u32(carry)
+        b.n += 1
+
+// `b = b * 5^k`, thirteen factors of five at a time (`5^13` is the largest
+// power of five below `2^32`).
+private void big_mul_pow5(^Big b, i64 k):
+    i64 left = k
+    for left >= 13:
+        big_mul_add(b, 1220703125, 0)
+        left -= 13
+
+    u32 m = 1
+    for left > 0:
+        m = m * 5
+        left -= 1
+
+    if m != 1:
+        big_mul_add(b, m, 0)
+
+// `b = b * 2^k`.
+private void big_shl(^Big b, i64 k):
+    if b.n == 0 || k <= 0:
+        return
+
+    i32 limbs = i32(k / 32)
+    i32 bits = i32(k % 32)
+    #assert(b.n + limbs < LIMBS, "parse: a big integer outgrew its limbs")
+    i32 top = b.n + limbs
+    b.w[top] = 0
+    i32 i = b.n - 1
+    for i >= 0:
+        u64 v = u64(b.w[i]) << bits
+        b.w[i + limbs + 1] = b.w[i + limbs + 1] | u32(v >> 32)
+        b.w[i + limbs] = u32(v)
+        i -= 1
+
+    i32 j = 0
+    for j < limbs:
+        b.w[j] = 0
+        j += 1
+
+    b.n = top + 1
+    for b.n > 0 && b.w[b.n - 1] == 0:
+        b.n -= 1
+
+// `b = b / 2`, the dropped bit being zero wherever this is called.
+private void big_shr1(^Big b):
+    i32 zero = 0
+    for i in zero..<b.n:
+        u32 hi = 0
+        if i + 1 < b.n:
+            hi = b.w[i + 1] << 31
+        b.w[i] = (b.w[i] >> 1) | hi
+
+    if b.n > 0 && b.w[b.n - 1] == 0:
+        b.n -= 1
+
+private i64 big_bitlen(^Big b):
+    if b.n == 0:
+        return 0
+
+    return i64(b.n) * 32 - #clz(b.w[b.n - 1])
+
+// -1, 0 or 1 as `a` is below, equal to or above `b`.
+private i32 big_cmp(^Big a, ^Big b):
+    if a.n != b.n:
+        if a.n < b.n:
+            return 0 - 1
+
+        return 1
+
+    i32 i = a.n - 1
+    for i >= 0:
+        if a.w[i] != b.w[i]:
+            if a.w[i] < b.w[i]:
+                return 0 - 1
+
+            return 1
+
+        i -= 1
+
+    return 0
+
+// `a = a - b`, where `a >= b`.
+private void big_sub(^Big a, ^Big b):
+    u64 borrow = 0
+    i32 zero = 0
+    for i in zero..<a.n:
+        u64 sub = borrow
+        if i < b.n:
+            sub += u64(b.w[i])
+
+        u64 have = u64(a.w[i])
+        if have >= sub:
+            a.w[i] = u32(have - sub)
+            borrow = 0
+        else:
+            a.w[i] = u32(have + 0x100000000 - sub)
+            borrow = 1
+
+    for a.n > 0 && a.w[a.n - 1] == 0:
+        a.n -= 1
+
+// Bits `lo..<lo + count` of `b`, `count` at most 64.
+private u64 big_bits(^Big b, i64 lo, i64 count):
+    u64 v = 0
+    i64 k = count - 1
+    for k >= 0:
+        i64 at = lo + k
+        i32 limb = i32(at / 32)
+        u64 bit = 0
+        if limb < b.n:
+            bit = u64(b.w[limb] >> (at % 32)) & 1
+
+        v = (v << 1) | bit
+        k -= 1
+
+    return v
+
+// Whether any of `b`'s bits below `lo` is set.
+private bool big_any_below(^Big b, i64 lo):
+    i32 limb = i32(lo / 32)
+    i32 i = 0
+    for i < limb && i < b.n:
+        if b.w[i] != 0:
+            return true
+
+        i += 1
+
+    if limb < b.n:
+        u32 mask = u32((u64(1) << (lo % 32)) - 1)
+        return b.w[limb] & mask != 0
+
+    return false
+
+// The value `t` describes, rounded once. The decimal `D × 10^e` (`D` the
+// kept digits as an integer) becomes `q × 2^e2` plus a remainder, with `q`
+// holding exactly `bits + 2` bits and `sticky` saying the remainder is not
+// zero; `assemble` rounds that.
+private u64 exact(string8 s, Text t, Format f):
+    Big d
+    i32 kept = 0
+    bool tail = false
+    bool started = false
+    u32 chunk = 0
+    u32 scale = 1
+    for i in t.first..<t.stop:
+        char8 c = s[i]
+        if c == '.':
+            continue
+
+        if !started && c == '0':
+            continue
+
+        started = true
+        if kept < KEPT:
+            chunk = chunk * 10 + u32(c - '0')
+            scale = scale * 10
+            kept += 1
+            if scale == 1000000000:
+                big_mul_add(&d, scale, chunk)
+                chunk = 0
+                scale = 1
+        else if c != '0':
+            tail = true
+
+    if scale != 1:
+        big_mul_add(&d, scale, chunk)
+
+    i64 width = i64(f.bits) + 2
+    i64 e = t.dp - i64(kept)
+    u64 q = 0
+    i64 e2 = 0
+    bool sticky = tail
+    if e >= 0:
+        big_mul_pow5(&d, e)
+        i64 len = big_bitlen(&d)
+        if len > width:
+            q = big_bits(&d, len - width, width)
+            sticky = sticky || big_any_below(&d, len - width)
+            e2 = e + len - width
+        else:
+            q = big_bits(&d, 0, len) << (width - len)
+            e2 = e - (width - len)
+    else:
+        i64 k = 0 - e
+        Big den
+        den.w[0] = 1
+        den.n = 1
+        big_mul_pow5(&den, k)
+
+        // `D × 2^shift / 5^k` then lies in `[2^(width-1), 2^(width+1))`.
+        i64 shift = width - big_bitlen(&d) + big_bitlen(&den)
+        if shift >= 0:
+            big_shl(&d, shift)
+        else:
+            big_shl(&den, 0 - shift)
+
+        // Restoring division, one quotient bit at a time from the top.
+        big_shl(&den, width)
+        i64 bit = width
+        for bit >= 0:
+            if big_cmp(&d, &den) >= 0:
+                big_sub(&d, &den)
+                q = q | (u64(1) << bit)
+
+            big_shr1(&den)
+            bit -= 1
+
+        sticky = sticky || d.n != 0
+        e2 = 0 - k - shift
+        if q >> width != 0:
+            sticky = sticky || q & 1 == 1
+            q = q >> 1
+            e2 += 1
+
+    return assemble(q, e2, sticky, f)
+
+// `(q + a fraction) × 2^e2`, rounded to nearest-even in format `f`, as bits.
+// `q` has exactly `bits + 2` bits and `sticky` says the fraction is not zero.
+private u64 assemble(u64 q, i64 e2, bool sticky, Format f):
+    i64 width = i64(f.bits) + 2
+    i64 shift = 2
+    if e2 + shift < i64(f.emin):
+        shift = i64(f.emin) - e2
+
+    // Every bit shifted out: the value is below half the smallest subnormal.
+    if shift > width:
+        return 0
+
+    u64 m = q >> shift
+    u64 rem = q & ((u64(1) << shift) - 1)
+    u64 half = u64(1) << (shift - 1)
+    if rem > half || (rem == half && (sticky || m & 1 == 1)):
+        m += 1
+
+    i64 e = e2 + shift
+    if m >> f.bits != 0:
+        m = m >> 1
+        e += 1
+
+    if e > i64(f.emax):
+        return f.exp_all << (f.bits - 1)
+
+    // A subnormal is `m` at `emin` with the hidden bit clear, so its biased
+    // exponent comes out 0; a normal `m` carries the hidden bit into the
+    // exponent field, which is why the offset is one short of the bias.
+    return m + (u64(e - i64(f.emin)) << (f.bits - 1))

@@ -1,0 +1,513 @@
+// The children: one **run** whose output is the Output pane (a build, a
+// test, `dado update`), and one **query** at a time behind it whose output
+// is read whole and parsed (`dado where`, `dado doctor --format=json`,
+// `dadoc --emit=packages|explained|constants`).
+//
+// Both are `core:os/proc` duplexes: an argument list and no shell, so a path
+// with a space or a quote in it is one argument; standard error merged into
+// standard output, as a terminal would show them; read with a zero timeout
+// from the loop, between frames, so nothing here ever blocks the UI.
+// Cancelling is `terminate` (SIGTERM, which lets `dado` and the compiler
+// stop on their own) and then `stop`, which closes the pipes, gives the
+// child `STOP_GRACE_MS` and kills it if it is still there.
+//
+// **One query at a time, and at most two children.** The machine the gate
+// runs on has two cores and a build wants both; the queries are each a
+// fraction of a second and wait their turn in `next_query`'s order, the one
+// the screen is showing first.
+package dashboard
+
+import tui "vendor:tui"
+import "core:os"
+import "core:os/proc"
+import "core:strings"
+
+private const i32 STOP_GRACE_MS = 1500
+
+// ── an argument list ───────────────────────────────────────────────────────
+
+private const i32 MAX_ARGS = 64
+
+// Each argument twice: as the C string the child is handed, and as text for
+// showing.
+private [MAX_ARGS]ref []char8 g_argbuf
+private [MAX_ARGS]ref []char8 g_argtext
+private [MAX_ARGS]cstring g_argv
+private i32 g_argc
+
+private void args_reset():
+    for i in 0..<g_argc:
+        #delete(g_argbuf[i])
+        g_argbuf[i] = nil
+        #delete(g_argtext[i])
+        g_argtext[i] = nil
+    g_argc = 0
+
+private void arg(string8 s):
+    if g_argc >= MAX_ARGS: return
+    ref []char8 c = strings.clone_to_cstring(s, #heap)
+    if c == nil: return
+    g_argbuf[g_argc] = c
+    g_argtext[g_argc] = own(nil, s)
+    g_argv[g_argc] = cstring(c)
+    g_argc = g_argc + 1
+
+// The argument list as the command line a person would type, for the
+// Output pane's first line and the Build tab's preview.
+private string8 args_shown(bool program_name):
+    ref []char8 run = #make([]char8, 0, tui.mem)
+    if run == nil: return ""
+    for i in 0..<g_argc:
+        string8 a = txt(g_argtext[i])
+        if i == 0 && !program_name: a = "dado"
+        if i > 0: _ = #append(run, ' ')
+        bool plain = #len(a) > 0
+        for c in a:
+            if c == ' ' || c == '\'' || c == '"' || c == '$' || c == '\\' || c == '*' || c == ';' || c == '&' || c == '|' || c == '<' || c == '>':
+                plain = false
+        if !plain: _ = #append(run, '\'')
+        for c in a:
+            if c == '\'':
+                for q in "'\\''": _ = #append(run, q)
+            else: _ = #append(run, c)
+        if !plain: _ = #append(run, '\'')
+    string8 s = run
+    return s
+
+// Start the argument list built with `arg`, with `env_a=val_a` and
+// `env_b=val_b` in its environment when the names are not empty. The
+// environment is this process's, changed for the moment of the spawn and put
+// back: `posix_spawnp` (and `CreateProcessW`) copy it when the child starts.
+private proc.Duplex spawn(string8 env_a, string8 val_a, string8 env_b, string8 val_b):
+    if #len(env_a) > 0:
+        try os.set_env(env_a, val_a) else: pass
+    if #len(env_b) > 0:
+        try os.set_env(env_b, val_b) else: pass
+    proc.Duplex d = proc.duplex(g_argv[0..<g_argc], proc.ERRORS_MERGE)
+    if #len(env_a) > 0:
+        try os.unset_env(env_a) else: pass
+    if #len(env_b) > 0:
+        try os.unset_env(env_b) else: pass
+    // The child reads nothing from us: closing its input at once turns a
+    // program that asks a question into one that hears end-of-file and takes
+    // its default, instead of one that waits for an answer nobody can type.
+    _ = proc.close_input(&d)
+    return d
+
+// Why a child did not start, and what to do about it.
+private string8 start_failure(i32 why):
+    if why == 2:
+        string8 a = #format("could not start ", args_shown(true), ": no such program. Run the dashboard as `dado dashboard`, so it can find dado beside itself, or put dado on your PATH.", tui.mem)
+        return a
+    string8 b = #format("could not start ", args_shown(true), " (error ", why, "). Check the program is executable, and that the system has processes to spare.", tui.mem)
+    return b
+
+// ── the run ────────────────────────────────────────────────────────────────
+
+private const i32 RUN_NONE = 0
+private const i32 RUN_BUILD = 1
+private const i32 RUN_RUN = 2
+private const i32 RUN_TEST = 3
+private const i32 RUN_CHECK = 4
+private const i32 RUN_VERB = 5           // update, upgrade, a rollback
+
+private const i32 RESULT_NONE = 0
+private const i32 RESULT_OK = 1
+private const i32 RESULT_FAILED = 2
+private const i32 RESULT_CANCELLED = 3
+private const i32 RESULT_NOT_STARTED = 4
+
+private tui.Log g_out
+private proc.Duplex g_run
+private bool g_running
+private i32 g_run_kind
+private ref []char8 g_run_label          // "build corpus/tour"
+private ref []char8 g_run_pkg            // the package it was for
+private f64 g_run_started
+private f64 g_run_took
+private i32 g_result
+private ref []char8 g_built              // the path a `built <path>` line named
+
+// Start the argument list as the run, its output into the Output pane.
+private bool start_run(i32 kind, string8 label, string8 pkg, string8 env_a, string8 val_a, string8 env_b, string8 val_b):
+    if g_running: return false
+    string8 shown = args_shown(false)
+    tui.log_clear(&g_out)
+    if #len(env_a) > 0:
+        tui.log_say(&g_out, #format("$ ", env_a, "=", val_a, " ", env_b, "=", val_b, " ", shown, tui.mem))
+    else:
+        tui.log_say(&g_out, #format("$ ", shown, tui.mem))
+    g_run = spawn(env_a, val_a, env_b, val_b)
+    g_run_label = own(g_run_label, label)
+    g_run_pkg = own(g_run_pkg, pkg)
+    g_run_kind = kind
+    g_run_started = tui.clock()
+    g_built = own(g_built, "")
+    if !proc.started(g_run):
+        g_result = RESULT_NOT_STARTED
+        g_run_took = 0.0
+        tui.log_say(&g_out, start_failure(g_run.failure))
+        tui.toast(#format(label, " did not start", tui.mem), tui.now().err)
+        args_reset()
+        return false
+    args_reset()
+    g_running = true
+    g_result = RESULT_NONE
+    save_settings()
+    tui.wake()
+    return true
+
+// Stop the run: asked to stop, then made to — and everything it started
+// with it (`stop_tree`).
+private void cancel_run():
+    if !g_running: return
+    stop_tree(g_run.pid)
+    _ = proc.terminate(&g_run)
+    _ = proc.stop(&g_run, STOP_GRACE_MS)
+    g_running = false
+    g_result = RESULT_CANCELLED
+    g_run_took = tui.clock() - g_run_started
+    tui.log_say(&g_out, "")
+    tui.log_say(&g_out, "cancelled: the run was stopped, and anything it was writing is incomplete. Run it again when you are ready.")
+    tui.toast(#format(txt(g_run_label), " cancelled", tui.mem), tui.now().warn)
+    tui.wake()
+
+// Read what the run wrote since the last pass; finish it when it is done.
+private void pump_run():
+    if !g_running: return
+    [16384]char8 chunk
+    for:
+        i32 n = proc.receive(&g_run, chunk[:], 0)
+        if n == proc.WAITED: return
+        if n == proc.DRAINED || n == proc.BROKE: break
+        tui.log_feed(&g_out, chunk[0..<n])
+        tui.wake()
+    (bool exited, i32 status) = proc.stop(&g_run, STOP_GRACE_MS)
+    g_running = false
+    g_run_took = tui.clock() - g_run_started
+    g_result = RESULT_OK if proc.ok(exited, status) else RESULT_FAILED
+    note_built()
+    finish_run()
+    tui.wake()
+
+// The path of the last `built <path>` line, which is what a build says when
+// it worked.
+private void note_built():
+    i32 n = tui.log_lines(g_out)
+    for k in 0..<n:
+        i32 i = n - 1 - k
+        string8 l = tui.log_at(&g_out, i)
+        if strings.starts_with(l, "built "):
+            g_built = own(g_built, strings.trim(strings.rest(l, 6)))
+            return
+
+// What follows a run: the result said once, where it will be seen, and the
+// diagnostics read again for the package it was about.
+private void finish_run():
+    string8 label = txt(g_run_label)
+    tui.log_say(&g_out, "")
+    if g_result == RESULT_OK:
+        tui.log_say(&g_out, #format(label, ": done in ", seconds(g_run_took), tui.mem))
+        tui.toast(#format(label, " ok in ", seconds(g_run_took), tui.mem), tui.now().ok)
+    else:
+        tui.log_say(&g_out, #format(label, " failed after ", seconds(g_run_took), ". The output above says why; Diagnostics (4) lists what the compiler found.", tui.mem))
+        tui.toast(#format(label, " failed", tui.mem), tui.now().err)
+    if g_run_kind != RUN_VERB:
+        want_explained(txt(g_run_pkg))
+    else:
+        want_where()
+        want_doctor()
+
+private string8 seconds(f64 v):
+    i64 tenths = i64((v * 10.0) + 0.5)
+    string8 s = #format(tenths / 10, ".", tenths % 10, " s", tui.mem)
+    return s
+
+// ── queries ────────────────────────────────────────────────────────────────
+
+private const i32 Q_NONE = 0
+private const i32 Q_WHERE = 1
+private const i32 Q_DOCTOR = 2
+private const i32 Q_PROJECT = 3
+private const i32 Q_PACKAGES = 4
+private const i32 Q_EXPLAINED = 5
+private const i32 Q_CONSTANTS = 6
+
+private proc.Duplex g_q
+private bool g_q_live
+private i32 g_q_kind
+private ref []char8 g_q_for              // the package or directory it is about
+private ref []char8 g_q_out              // what it wrote
+private f64 g_q_started
+
+// What is wanted, newest request for each kind winning. A kind asked for
+// while one of its own is running is asked again when that one ends.
+private bool g_want_where
+private bool g_want_doctor
+private bool g_want_project
+private ref []char8 g_want_packages      // a directory, or nil
+private ref []char8 g_want_explained     // a package, or nil
+private ref []char8 g_want_constants     // a package, or nil
+
+private void want_where(): g_want_where = true
+private void want_doctor(): g_want_doctor = true
+private void want_project(): g_want_project = true
+
+private void want_packages(string8 dir):
+    g_want_packages = own(g_want_packages, dir)
+
+private void want_explained(string8 pkg):
+    if #len(pkg) == 0: return
+    g_want_explained = own(g_want_explained, pkg)
+
+private void want_constants(string8 pkg):
+    if #len(pkg) == 0: return
+    g_want_constants = own(g_want_constants, pkg)
+
+// Whether a query of `kind` is running or waiting — for a pane to say
+// "reading…" rather than "none".
+private bool querying(i32 kind):
+    if g_q_live && g_q_kind == kind: return true
+    if kind == Q_EXPLAINED: return g_want_explained != nil
+    if kind == Q_CONSTANTS: return g_want_constants != nil
+    if kind == Q_PACKAGES: return g_want_packages != nil
+    if kind == Q_DOCTOR: return g_want_doctor
+    if kind == Q_PROJECT: return g_want_project
+    if kind == Q_WHERE: return g_want_where
+    return false
+
+// Start the next wanted query, in the order the screen needs them: what the
+// toolchain is first (everything else asks it), then what the open tab
+// shows, then the rest.
+private void next_query():
+    if g_q_live: return
+    if g_want_where:
+        g_want_where = false
+        query_dado(Q_WHERE, "", "where", "", "")
+        return
+    // The compiler's path comes from `dado where`: until it has answered,
+    // the questions for the compiler wait.
+    if !g_where_known:
+        if g_want_doctor:
+            g_want_doctor = false
+            query_dado(Q_DOCTOR, "", "doctor", "--format=json", "")
+        return
+    if g_want_explained != nil:
+        string8 p = txt(g_want_explained)
+        query_dadoc(Q_EXPLAINED, p, "--emit=explained", true)
+        #delete(g_want_explained)
+        g_want_explained = nil
+        return
+    if g_want_constants != nil:
+        string8 p = txt(g_want_constants)
+        query_dadoc(Q_CONSTANTS, p, "--emit=constants", false)
+        #delete(g_want_constants)
+        g_want_constants = nil
+        return
+    if g_want_packages != nil:
+        string8 p = txt(g_want_packages)
+        query_dadoc(Q_PACKAGES, p, "--emit=packages", false)
+        #delete(g_want_packages)
+        g_want_packages = nil
+        return
+    if g_want_project:
+        g_want_project = false
+        query_dadoc(Q_PROJECT, ".", "--emit=packages", false)
+        return
+    if g_want_doctor:
+        g_want_doctor = false
+        query_dado(Q_DOCTOR, "", "doctor", "--format=json", "")
+
+// `dado <verb> [a] [b]` as a query.
+private void query_dado(i32 kind, string8 about, string8 verb, string8 a, string8 b):
+    args_reset()
+    arg(txt(g_dado))
+    arg(verb)
+    if #len(a) > 0: arg(a)
+    if #len(b) > 0: arg(b)
+    begin_query(kind, about)
+
+// `dadoc <emit> --collections=<c> [--strict] <path>` as a query. `dadoc` is
+// asked directly, not through `dado emit`: it is the program that answers,
+// and the driver in front of it would cost a second process for each
+// answer.
+private void query_dadoc(i32 kind, string8 path, string8 emit, bool strict):
+    if blank(txt(g_dadoc)):
+        query_failed(kind, path, "the compiler's path is not known yet: `dado where` has not answered. Check the Toolchain tab.")
+        return
+    args_reset()
+    arg(txt(g_dadoc))
+    arg(emit)
+    if filled(txt(g_collections)): arg(#format("--collections=", txt(g_collections), tui.mem))
+    if strict: arg("--strict")
+    arg(path)
+    begin_query(kind, path)
+
+private void begin_query(i32 kind, string8 about):
+    g_q = spawn("", "", "", "")
+    g_q_kind = kind
+    g_q_for = own(g_q_for, about)
+    g_q_out = own(g_q_out, "")
+    g_q_started = tui.clock()
+    if !proc.started(g_q):
+        string8 why = start_failure(g_q.failure)
+        args_reset()
+        query_failed(kind, about, why)
+        return
+    args_reset()
+    g_q_live = true
+
+private void cancel_query():
+    if !g_q_live: return
+    _ = proc.terminate(&g_q)
+    _ = proc.stop(&g_q, STOP_GRACE_MS)
+    g_q_live = false
+    query_failed(g_q_kind, txt(g_q_for), "cancelled. Ctrl-R asks again.")
+    tui.wake()
+
+private void pump_query():
+    if !g_q_live:
+        next_query()
+        return
+    [16384]char8 chunk
+    for:
+        i32 n = proc.receive(&g_q, chunk[:], 0)
+        if n == proc.WAITED: return
+        if n == proc.DRAINED || n == proc.BROKE: break
+        for i in 0..<n:
+            if !#append(g_q_out, chunk[i]): break
+    (bool exited, i32 status) = proc.stop(&g_q, STOP_GRACE_MS)
+    g_q_live = false
+    bool ok = proc.ok(exited, status)
+    query_answered(g_q_kind, txt(g_q_for), txt(g_q_out), ok)
+    tui.wake()
+    next_query()
+
+// Hand an answer to the pane that asked for it.
+private void query_answered(i32 kind, string8 about, string8 text, bool ok):
+    switch kind:
+        case Q_WHERE: where_answered(text, ok)
+        case Q_DOCTOR: doctor_answered(text, ok)
+        case Q_PROJECT: project_answered(text, ok)
+        case Q_PACKAGES: packages_answered(about, text, ok)
+        case Q_EXPLAINED: explained_answered(about, text, ok)
+        case Q_CONSTANTS: constants_answered(about, text, ok)
+        else: pass
+
+private void query_failed(i32 kind, string8 about, string8 why):
+    switch kind:
+        case Q_WHERE: where_failed(why)
+        case Q_DOCTOR: doctor_failed(why)
+        case Q_PROJECT: project_failed(why)
+        case Q_EXPLAINED: explained_failed(about, why)
+        case Q_CONSTANTS: constants_failed(about, why)
+        else: pass
+
+// What is running, for the title bar: "" when nothing is.
+private string8 busy_text():
+    if g_running: return txt(g_run_label)
+    if g_q_live:
+        switch g_q_kind:
+            case Q_WHERE: return "reading the toolchain"
+            case Q_DOCTOR: return "dado doctor"
+            case Q_PROJECT: return "reading this project"
+            case Q_PACKAGES: return "reading packages"
+            case Q_EXPLAINED: return "reading diagnostics"
+            case Q_CONSTANTS: return "reading constants"
+            else: return "working"
+    return ""
+
+// ── the run's own children ─────────────────────────────────────────────────
+//
+// `dado run` starts the program it built as its own child, and `dado build`
+// starts `dadoc` and the C compiler; ending `dado` alone leaves those
+// running with nobody to read them — a program that loops forever would
+// outlive the dashboard. On Windows `terminate` already ends the child's
+// whole job. On POSIX there is no group to signal (`core:os/proc` starts the
+// child in ours), so the descendants are found from `ps -A -o pid= -o ppid=`,
+// which Linux and macOS both answer, and each is sent SIGTERM with `kill`
+// before `dado` itself is stopped.
+
+private const i32 MAX_PROCS = 8192
+
+private void stop_tree(i32 root):
+    when #OS == #WINDOWS:
+        return
+    else:
+        if root <= 0: return
+        args_reset()
+        arg("ps")
+        arg("-A")
+        arg("-o")
+        arg("pid=")
+        arg("-o")
+        arg("ppid=")
+        string8 table = read_all(1500)
+        [MAX_PROCS]i32 pids
+        [MAX_PROCS]i32 parents
+        i32 n = 0
+        string8 rest = table
+        for #len(rest) > 0 && n < MAX_PROCS:
+            (string8 l, string8 tail, bool more) = strings.line(rest)
+            (string8 a, string8 b, bool two) = strings.split_first(strings.trim(l), " ")
+            (i64 pid, bool pok) = number(strings.trim(a))
+            (i64 parent, bool qok) = number(strings.trim(b))
+            if two && pok && qok:
+                pids[n] = i32(pid)
+                parents[n] = i32(parent)
+                n = n + 1
+            if !more: break
+            rest = tail
+        // Breadth first from the run: every process whose parent is in the
+        // list joins it.
+        [MAX_PROCS]i32 found
+        i32 nfound = 1
+        found[0] = root
+        i32 at = 0
+        for at < nfound:
+            i32 p = found[at]
+            at = at + 1
+            for i in 0..<n:
+                if parents[i] == p && nfound < MAX_PROCS:
+                    found[nfound] = pids[i]
+                    nfound = nfound + 1
+        if nfound <= 1: return
+        args_reset()
+        arg("kill")
+        arg("-TERM")
+        for i in 1..<nfound:
+            if g_argc >= MAX_ARGS: break
+            arg(#format(found[i], tui.mem))
+        _ = read_all(1500)
+
+// Run the argument list built with `arg` and answer what it wrote, waiting
+// at most `limit_ms` for it — for the two short commands above, never for a
+// build.
+private string8 read_all(i32 limit_ms):
+    proc.Duplex d = spawn("", "", "", "")
+    args_reset()
+    if !proc.started(d): return ""
+    ref []char8 got = #make([]char8, 0, tui.mem)
+    [4096]char8 chunk
+    f64 began = tui.clock()
+    for (tui.clock() - began) * 1000.0 < f64(limit_ms):
+        i32 n = proc.receive(&d, chunk[:], 50)
+        if n == proc.WAITED: continue
+        if n <= 0: break
+        for i in 0..<n:
+            _ = #append(got, chunk[i])
+    _ = proc.stop(&d, 200)
+    string8 s = got
+    return s
+
+// Everything that is still running, stopped: the way out.
+private void stop_everything():
+    if g_running:
+        stop_tree(g_run.pid)
+        _ = proc.terminate(&g_run)
+        _ = proc.stop(&g_run, STOP_GRACE_MS)
+        g_running = false
+    if g_q_live:
+        _ = proc.terminate(&g_q)
+        _ = proc.stop(&g_q, STOP_GRACE_MS)
+        g_q_live = false

@@ -1,0 +1,475 @@
+// core:jobs — a general task system and the worker pool the runtime parallelises
+// itself with. A job is the C-classic pair — Dado has no closures — of a
+// function reference plus a data pointer. The surface is
+// stable across two engines — a **serial** one (zero worker threads: every job
+// runs inline on submit) and a **pooled** one (a central MPMC queue behind a
+// mutex+condvar, N worker threads, batch completion via atomic counters). A
+// caller writes the same code either way; threads are only how fast it goes.
+//
+// **A job hands its result back through a signal.** It has no return value and
+// no handle to hang one on, so it `#emit`s into a queue signal the caller
+// declared, and the caller drains it — once the batch is joined, or on the
+// next frame, whichever it wants:
+//
+//     #signal(64) tile_done(i32 tile, i64 checksum)
+//     private i32 g_tiles_lost
+//
+//     void render_tile(^jobs.JobArgs a):
+//         for t in a.begin..<a.end:
+//             try #emit(tile_done, t, checksum_of(t)) else:
+//                 _ = #atomic_fetch_add(&g_tiles_lost, 1, #RELAXED)
+//
+//     void frame(^jobs.Scheduler s):
+//         jobs.parallel_for(s, 64, 4, render_tile, nil)
+//         for tile, checksum in #drain(tile_done):
+//             show(tile, checksum)
+//
+// A value is copied into the signal's slot, so nothing the job wrote has to
+// outlive it; a `ref` moves to the thread that drains. **Size the signal for
+// the batch.** The thread that drains is usually the one waiting, and a wait
+// helps by running jobs on the waiting thread — so a job that retried on
+// `FULL` there would be waiting on itself. Count the refusal instead, as
+// above, or keep the value for a later batch. And **drain from one thread** —
+// the one that submits is the natural choice — for the signal's whole life.
+//
+// So the scheduler's only answer about a job is *finished or not*: `wait` for a
+// handle, or `parallel_for`, which joins before it returns. There is no
+// polling of a result array through a handle.
+//
+// Scheduler home is `core:jobs`, not `app:jobs`: no `app`
+// dependency, broadly reusable; `app:app` owns one instance and layers the frame
+// barrier on top. Engine v1 is the simplest correct one: a
+// central queue, tuned for "obviously correct under a sanitiser," not throughput.
+//
+// **The concurrency contract.** The ambient allocator is per thread, so a job
+// allocates the way any Dado code does: a bare `#make`/`#format` in a job
+// reads *its worker thread's* `#default`, which is the root — C's
+// heap — unless the job opened a `using`, and a `using` a job opens is that
+// worker's alone and is undone when its suite ends. **A job runs with its
+// worker's ambient, not with its submitter's**: a `using` around `submit` or
+// `parallel_for` does not reach a worker, because it changed the ambient on
+// the submitting thread only. So the worker's private scratch arena is handed
+// over as `JobArgs.scratch`, and the idiom for temporaries is `using
+// ja.scratch:` inside the job (or an explicit `#make(T, n, ja.scratch)`) —
+// both allocate from an arena no other worker touches, and it is reset with
+// `reset_scratch`, so nothing a job means to keep goes there. `core:runtime`'s
+// scratch is per thread too, so a job may use `enter_temp`/`close_temp`; it
+// is its worker's, and the worker's first scope configures it. A
+// `parallel_for` chunk owns a disjoint index range, so nothing here is shared
+// across workers; **a map or any other structure a job shares with another
+// thread is not synchronised** and needs a `core:threads` mutex.
+//
+// This is a `core:` library and owes tests: it is a concurrency engine and
+// wraps core:threads.
+//
+// ## The atomics are the language's, and the ordering is written at each call
+//
+// Every atomic access below is a `#atomic_*` intrinsic over an ordinary `i32`
+// the scheduler already owns, and not a call to `core:threads`' wrappers. Those
+// are one verb each at `#SEQ_CST`, because a function cannot take an ordering
+// as a parameter: the ordering has to be a constant at the machine
+// instruction, which is exactly why `#atomic_*` takes a `#` member the checker
+// folds and refuses. A wrapper fixes one ordering for every caller, and this
+// package wants four.
+//
+// So the orderings below are written per access rather than paid for uniformly,
+// and each is chosen rather than defaulted:
+//
+//   * **the batch counter's decrement is `#ACQ_REL`** — release, so that a
+//     thread which sees the count reach zero sees everything the job wrote
+//     before it; acquire, so that the decrementing thread sees the other
+//     chunks' decrements. This is the one pairing the whole barrier rests on.
+//   * **every read of a batch counter is `#ACQUIRE`**, which is the other half
+//     of it: `join_batch` is what observes zero.
+//   * **`running` is `#RELEASE` to store and `#ACQUIRE` to read**, the ordinary
+//     shutdown-flag pairing.
+//   * **`hnext` is `#RELAXED`**, and that is the one worth defending: it is a
+//     ticket dispenser and nothing is published through it. Every ticket is
+//     distinct because the increment is atomic, and the *slot* it names is then
+//     claimed by a compare-exchange that carries its own ordering. A stronger
+//     ordering here would buy nothing and cost a fence per submission.
+//
+// `core:threads` keeps its atomic wrappers and its tests: they are what a
+// program that holds a cell and not an ordering needs, and `jobs` not calling
+// them is not a reason to delete them.
+package jobs
+
+import "core:threads"
+import "core:mem/arena"
+import "core:mem/libc"
+
+const i32 MAX_WORKERS = 64
+const i32 QCAP = 8192 // job ring capacity; a fuller push runs inline
+const i32 HCAP = 8192 // batch-counter ring capacity
+
+// What a job sees. `scratch` is this worker's private arena — `using
+// ja.scratch:` or an explicit argument (see the contract above). `begin`/`end` are the sub-range for a
+// `parallel_for` chunk; a plain `submit` gets [0, 0).
+type JobArgs:
+    i32       worker,
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) scratch,
+    i32       begin,
+    i32       end,
+    rawptr    data,
+
+type JobFn: void(^JobArgs)
+
+// A completion token. Serial handles are always done; a pooled handle names a
+// batch-counter slot. Block-and-help with `wait`; a job's result comes back
+// through a signal (see the header).
+distinct type Handle: i32
+
+private const i32 SERIAL_DONE = -1
+
+// `alloc_batch` found no free slot in the whole ring. Not a `Handle` and never
+// converted to one: a caller that gets this runs its work inline and answers
+// `Handle(SERIAL_DONE)`, which is the *already finished* handle and is correct
+// for work that has finished. The two constants share a value because a slot
+// index is a non-negative number and both of these are "not one"; nothing reads
+// either as the other.
+private const i32 NO_BATCH = -1
+
+// One queued unit of work: a chunk of a batch.
+private type Job:
+    JobFn  fn,
+    rawptr data,
+    i32    begin,
+    i32    end,
+    i32    batch,
+
+// A worker's identity, handed to its thread. `sched` is a real `^Scheduler`
+// — a self-reference bounded by the pointer — so its fields keep their
+// names — unlike a rawptr-converted pointer.
+private type WCtx:
+    ^Scheduler sched,
+    i32        index,
+
+// The scheduler. One instance, owned by the caller (a package global — the inline
+// rings make it too big for the stack). Functions take `^Scheduler`.
+type Scheduler:
+    rawptr mtx,
+    rawptr cv,
+    i32    nworkers, // worker THREADS (0 = serial engine)
+    i32    running,  // atomic flag: 1 running, 0 = draining to shutdown
+    // job ring, guarded by mtx
+    [QCAP]Job q,
+    i32       qhead,
+    i32       qtail,
+    i32       qcount,
+    // batch counters, atomic; a ring indexed by hnext
+    [HCAP]i32 counters,
+    i32       hnext,
+    // workers 0..nworkers (0 is the main thread, which helps during wait)
+    [MAX_WORKERS]rawptr      wthreads,
+    [MAX_WORKERS]arena.Arena warenas,
+    bool                     started,
+
+// The worker contexts live here, not inside `Scheduler`: a `WCtx` holds a
+// `^Scheduler`, and an inline `[MAX_WORKERS]WCtx` field inside `Scheduler` makes a
+// struct that embeds an array of a type that points back at it — which the C
+// emitter cannot lay out (incomplete element type). Hoisting the array out breaks
+// the cycle. The cost: **v1 supports one active pooled scheduler** — which is
+// exactly what `app:app` owns. (A later engine can pass per-worker storage in.)
+private [MAX_WORKERS]WCtx g_wctx
+
+// ── lifecycle ────────────────────────────────────────────────────────────────
+
+// Start the scheduler with `nthreads` worker threads (0 → the serial engine, all
+// inline). Worker indices run 1..nthreads; index 0 is the main thread, which
+// participates while it waits. Per-participant scratch arenas 0..nthreads are
+// created here. Returns false if a thread or primitive could not be created.
+bool start(^Scheduler s, i32 nthreads):
+    i32 nt = nthreads
+
+    if nt < 0:
+        nt = 0
+
+    if nt > MAX_WORKERS - 1:
+        nt = MAX_WORKERS - 1
+
+    s.nworkers = nt
+    s.qhead = 0
+    s.qtail = 0
+    s.qcount = 0
+    s.hnext = 0
+    s.running = 1
+
+    // arenas for participants 0..nt
+    for i in 0..=nt:
+        s.warenas[i] = arena.over(libc.allocator())
+
+    if nt == 0:
+        s.started = true
+        return true
+
+    s.mtx = threads.mutex_new()
+    s.cv = threads.cond_new()
+
+    if s.mtx == nil || s.cv == nil:
+        return false
+
+    for i in 1..=nt:
+        g_wctx[i] = (s, i)
+        s.wthreads[i] = threads.spawn(worker_main, rawptr(&g_wctx[i]))
+
+        if s.wthreads[i] == nil:
+            return false
+
+    s.started = true
+    return true
+
+// Stop the pool: signal drain, wake all workers, join them, free primitives and
+// arenas. Safe to call once after `start`.
+void stop(^Scheduler s):
+    if !s.started:
+        return
+
+    if s.nworkers > 0:
+        threads.lock(s.mtx)
+        #atomic_store(&s.running, 0, #RELEASE)
+        threads.cond_broadcast(s.cv)
+        threads.unlock(s.mtx)
+
+        for i in 1..=s.nworkers:
+            if s.wthreads[i] != nil:
+                _ = threads.join(s.wthreads[i])
+
+        threads.mutex_free(s.mtx)
+        threads.cond_free(s.cv)
+
+    for i in 0..=s.nworkers:
+        arena.destroy(&s.warenas[i])
+
+    s.started = false
+
+// Reset the per-participant scratch arenas — the app calls this once a frame.
+void reset_scratch(^Scheduler s):
+    for i in 0..=s.nworkers:
+        arena.reset(&s.warenas[i])
+
+// ── the surface ──────────────────────────────────────────────────────────────
+
+// Submit one job. Serial: runs inline now. Pooled: enqueued; `wait` the handle.
+Handle submit(^Scheduler s, JobFn fn, rawptr data):
+    if s.nworkers == 0:
+        run_inline(s, fn, data, 0, 0)
+        return Handle(SERIAL_DONE)
+
+    i32 batch = alloc_batch(s, 1)
+
+    // Every batch-counter slot is live, so this job has nowhere to record its
+    // completion. It runs here instead — `push`'s answer to a full queue, one
+    // ring over — and the handle it answers with is the one that is already
+    // done, because it is.
+    if batch == NO_BATCH:
+        run_inline(s, fn, data, 0, 0)
+        return Handle(SERIAL_DONE)
+
+    push(s, (fn, data, 0, 0, batch))
+    return Handle(batch)
+
+// Submit `fn` to run after `dep` completes. v1: since callers wait on `dep`
+// before depending on its result, this simply waits then submits.
+Handle submit_after(^Scheduler s, JobFn fn, rawptr data, Handle dep):
+    wait(s, dep)
+    return submit(s, fn, data)
+
+// Fork-join over [0, n) in `grain`-sized chunks, then join before returning.
+// This is the common case and carries its own barrier, so it needs no handle.
+void parallel_for(^Scheduler s, i32 n, i32 grain, JobFn fn, rawptr data):
+    if n <= 0:
+        return
+
+    i32 g = grain
+
+    if g <= 0:
+        g = 1
+
+    if s.nworkers == 0:
+        chunks_inline(s, n, g, fn, data)
+        return
+
+    i32 nch = (n + g - 1) / g
+    i32 batch = alloc_batch(s, nch)
+
+    // No slot to count this batch down in, so it is run on this thread — which
+    // is also the barrier this function promises, reached the short way.
+    if batch == NO_BATCH:
+        chunks_inline(s, n, g, fn, data)
+        return
+
+    i32 i = 0
+
+    for i < n:
+        i32 e = i + g
+
+        if e > n:
+            e = n
+
+        push(s, (fn, data, i, e, batch))
+        i = e
+
+    join_batch(s, batch)
+
+// Cooperatively wait for a handle: the waiting thread runs other ready jobs while
+// the batch is unfinished, so the main thread at the barrier stays useful.
+void wait(^Scheduler s, Handle h):
+    if s.nworkers == 0 || i32(h) == SERIAL_DONE:
+        return
+
+    join_batch(s, i32(h))
+
+// ── internals ────────────────────────────────────────────────────────────────
+
+private void run_inline(^Scheduler s, JobFn fn, rawptr data, i32 begin, i32 end):
+    JobArgs ja = (0, arena.allocator(&s.warenas[0]), begin, end, data)
+    fn(&ja)
+
+// Every chunk of [0, n), on this thread. The serial engine's whole loop, and
+// also what a pooled engine falls back to when it has no batch counter to spend
+// — hoisted so the two are one piece of code rather than two that agree today.
+private void chunks_inline(^Scheduler s, i32 n, i32 g, JobFn fn, rawptr data):
+    i32 i = 0
+    for i < n:
+        i32 e = i + g
+
+        if e > n:
+            e = n
+
+        run_inline(s, fn, data, i, e)
+        i = e
+
+    return
+
+// Run a queued job on participant `idx`, then release its slot in the batch.
+private void run_job(^Scheduler s, Job job, i32 idx):
+    JobArgs ja = (idx, arena.allocator(&s.warenas[idx]), job.begin, job.end, job.data)
+    job.fn(&ja)
+    _ = #atomic_fetch_add(&s.counters[job.batch], -1, #ACQ_REL)
+
+// Claim a batch-counter slot and publish `count` into it.
+//
+// **The store used to be unconditional, on an assumption written in this
+// comment**: *the ring is far larger than the in-flight batch count, so a slot
+// is reused only long after its batch drained.* That is a hope about arithmetic
+// the scheduler does not control. `hnext` wraps every 8192 submissions and
+// nothing anywhere holds it back, so a program that submits faster than its
+// jobs drain — a producer thread feeding a saturated pool is the ordinary
+// way — eventually comes back to a slot whose counter is not zero and
+// **overwrites a live batch's count**. Every thread waiting on that batch then
+// waits on a number that means something else: `join_batch` returns early and
+// its caller reads results from jobs that have not run, or the count never
+// reaches zero and the barrier hangs. Neither has a symptom that points here.
+//
+// So the slot is *claimed* rather than taken. A compare-and-swap against zero
+// publishes the count only into a slot whose last batch finished, and a slot
+// that is still live is skipped for the next ticket.
+//
+// **This is the bounded retry loop `tests/cases/atomics.dado` deliberately did
+// not write.** That case writes one retry and says why: a bounded loop's
+// give-up arm is a line no single-threaded run can reach, and the emitted-C
+// coverage audit is right to say so. `jobs` has threads to lose a race to, and
+// its give-up arm is reachable — `jobs_test` fills the ring by hand and asks.
+//
+// The bound is `HCAP` because each attempt takes the *next* ticket, so `HCAP`
+// attempts have looked at every slot in the ring; going round again would ask
+// the same slots the same question. Answering `NO_BATCH` is not a failure the
+// caller has to handle specially: it means the pool is saturated, and every
+// caller's response is to run the work inline on the calling thread, which is
+// `push`'s existing answer to a full queue and is what makes the ring bounded
+// in the first place. It is also the response that makes progress — running a
+// job is what frees a slot.
+//
+// The compare-exchange is `#ACQ_REL` on success, which publishes `count` to
+// whoever loads the counter next and acquires whatever the previous occupant
+// released; `#ACQUIRE` on failure, where nothing is published and the observed
+// value is only being discarded.
+private i32 alloc_batch(^Scheduler s, i32 count):
+    i32 tries = 0
+    for tries < HCAP:
+        i32 raw = #atomic_fetch_add(&s.hnext, 1, #RELAXED)
+        i32 slot = raw % HCAP
+
+        if slot < 0:
+            slot = slot + HCAP
+
+        (i32 _, bool claimed) = #atomic_compare_exchange(&s.counters[slot], 0, count, false, #ACQ_REL, #ACQUIRE)
+        if claimed:
+            return slot
+
+        tries = tries + 1
+
+    return NO_BATCH
+
+// Enqueue a job, or — if the ring is full — run it inline on the caller to keep
+// memory bounded (it still belongs to its batch, so the count stays right).
+private void push(^Scheduler s, Job job):
+    threads.lock(s.mtx)
+
+    if s.qcount >= QCAP:
+        threads.unlock(s.mtx)
+        run_job(s, job, 0)
+        return
+
+    s.q[s.qtail] = job
+    s.qtail = (s.qtail + 1) % QCAP
+    s.qcount = s.qcount + 1
+    threads.cond_signal(s.cv)
+    threads.unlock(s.mtx)
+
+// Pop one job under the lock. Returns false (via the flag) when the ring is empty.
+private (Job, bool) try_pop(^Scheduler s):
+    threads.lock(s.mtx)
+
+    if s.qcount == 0:
+        threads.unlock(s.mtx)
+        Job empty
+        return (empty, false)
+
+    Job j = s.q[s.qhead]
+    s.qhead = (s.qhead + 1) % QCAP
+    s.qcount = s.qcount - 1
+    threads.unlock(s.mtx)
+    return (j, true)
+
+// Help until this batch is drained: run any ready job, else spin (the last chunk
+// is finishing on another worker). This is the cooperative barrier.
+private void join_batch(^Scheduler s, i32 batch):
+    for #atomic_load(&s.counters[batch], #ACQUIRE) > 0:
+        (Job j, bool got) = try_pop(s)
+
+        if got:
+            run_job(s, j, 0)
+
+// A worker thread: block for work, run it, repeat until drained and shut down.
+private rawptr worker_main(rawptr arg):
+    WCtx me = wctx_of(arg)
+    ^Scheduler s = me.sched
+    i32 idx = me.index
+
+    for:
+        threads.lock(s.mtx)
+
+        for s.qcount == 0 && #atomic_load(&s.running, #ACQUIRE) == 1:
+            threads.cond_wait(s.cv, s.mtx)
+
+        if s.qcount == 0 && #atomic_load(&s.running, #ACQUIRE) == 0:
+            threads.unlock(s.mtx)
+            return nil
+
+        Job j = s.q[s.qhead]
+        s.qhead = (s.qhead + 1) % QCAP
+        s.qcount = s.qcount - 1
+        threads.unlock(s.mtx)
+        run_job(s, j, idx)
+
+    return nil // unreachable: the loop only exits via the return above
+
+// Recover a WCtx from the rawptr thread argument. Converting rawptr -> a typed
+// pointer drops the pointee's name view, so copy the pointee into a typed local.
+private WCtx wctx_of(rawptr arg):
+    WCtxPtr p = WCtxPtr(arg)
+    WCtx w = p^
+    return w
+
+private type WCtxPtr: ^WCtx

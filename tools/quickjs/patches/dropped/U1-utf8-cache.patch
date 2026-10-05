@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: S2a lab <s2a@lab>
+Date: Fri, 25 Sep 2026 15:20:48 -0800
+Subject: [PATCH] Strings: cache the UTF-8 form a native crossing makes (U1,
+ dropped)
+
+TOYS fork prototype U1: an additive JSString field holding the UTF-8 copy
+JS_ToCStringLen made (or noting an ASCII string is its own UTF-8), so a
+string crossing again neither scans nor transcodes. Measured and not
+kept: +8 bytes per string (+10.7% RSS on 1M short strings). U1b keeps
+the ASCII half at no memory cost.
+---
+ quickjs.c | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/quickjs.c b/quickjs.c
+index 17a7247..77795f8 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -705,10 +705,15 @@ struct JSString {
+     uint32_t atom_type : 2; /* != 0 if atom, JS_ATOM_TYPE_x */
+     uint32_t hash_next; /* atom_index for JS_ATOM_TYPE_SYMBOL */
+     JSWeakRefRecord *first_weak_ref;
++    /* TOYS fork (U1): the UTF-8 form JS_ToCStringLen made of this string,
++       kept for the next crossing: NULL (none yet), JS_UTF8_IS_SELF (an ASCII
++       normal string, its own UTF-8), or a string holding the UTF-8 bytes */
++    struct JSString *toys_utf8;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head link; /* string list */
+ #endif
+ };
++#define JS_UTF8_IS_SELF ((JSString *)1)
+ 
+ typedef struct JSStringSlice {
+     JSString *parent;
+@@ -2595,6 +2600,7 @@ static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char
+     str->atom_type = 0;
+     str->hash = 0;          /* optional but costless */
+     str->hash_next = 0;     /* optional */
++    str->toys_utf8 = NULL;  /* TOYS fork (U1) */
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     list_add_tail(&str->link, &rt->string_list);
+ #endif
+@@ -2625,6 +2631,10 @@ static inline void js_free_string0(JSRuntime *rt, JSString *str)
+ {
+     JSStringSlice *slice;
+ 
++    if (str->toys_utf8 > JS_UTF8_IS_SELF) { /* TOYS fork (U1) */
++        js_free_string(rt, str->toys_utf8);
++        str->toys_utf8 = NULL;
++    }
+     if (str->atom_type) {
+         JS_FreeAtomStruct(rt, str);
+     } else {
+@@ -3566,6 +3576,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
+             p->is_wide_char = str->is_wide_char;
+             p->len = str->len;
+             p->kind = JS_STRING_KIND_NORMAL;
++            p->toys_utf8 = NULL; /* TOYS fork (U1) */
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+             list_add_tail(&p->link, &rt->string_list);
+ #endif
+@@ -3581,6 +3592,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
+         p->is_wide_char = 1;    /* Hack to represent NULL as a JSString */
+         p->len = 0;
+         p->kind = JS_STRING_KIND_NORMAL;
++        p->toys_utf8 = NULL; /* TOYS fork (U1) */
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+         list_add_tail(&p->link, &rt->string_list);
+ #endif
+@@ -3685,6 +3697,10 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
+     /* insert in free atom list */
+     rt->atom_array[i] = atom_set_free(rt->atom_free_index);
+     rt->atom_free_index = i;
++    if (p->toys_utf8 > JS_UTF8_IS_SELF) { /* TOYS fork (U1) */
++        js_free_string(rt, p->toys_utf8);
++        p->toys_utf8 = NULL;
++    }
+     if (unlikely(p->first_weak_ref)) {
+         reset_weak_ref(rt, &p->first_weak_ref);
+     }
+@@ -4890,6 +4906,20 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
+         goto fail;
+     str = JS_VALUE_GET_STRING(val);
+     len = str->len;
++    /* TOYS fork (U1): a string that crossed before crosses again for free */
++    if (!cesu8 && str->toys_utf8) {
++        if (str->toys_utf8 == JS_UTF8_IS_SELF) {
++            if (plen)
++                *plen = len;
++            return (const char *)str8(str); /* the reference in val is the caller's */
++        }
++        str_new = str->toys_utf8;
++        JS_REF_COUNT(str_new)++;
++        JS_FreeValue(ctx, val);
++        if (plen)
++            *plen = str_new->len;
++        return (const char *)str8(str_new);
++    }
+     if (!str->is_wide_char) {
+         const uint8_t *src = str8(str);
+         int count;
+@@ -4905,6 +4935,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
+             count += src[pos] >> 7;
+         }
+         if (count == 0 && str->kind == JS_STRING_KIND_NORMAL) {
++            str->toys_utf8 = JS_UTF8_IS_SELF; /* TOYS fork (U1) */
+             if (plen)
+                 *plen = len;
+             return (const char *)src;
+@@ -4959,6 +4990,12 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
+ 
+     *q = '\0';
+     str_new->len = q - str8(str_new);
++    /* TOYS fork (U1): keep it for next time, unless the string is a
++       temporary (referenced only by the caller's argument and val) */
++    if (!cesu8 && !str->toys_utf8 && JS_REF_COUNT(str) > 2) {
++        str->toys_utf8 = str_new;
++        JS_REF_COUNT(str_new)++;
++    }
+     JS_FreeValue(ctx, val);
+     if (plen)
+         *plen = str_new->len;
+-- 
+2.43.0
+

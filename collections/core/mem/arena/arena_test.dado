@@ -1,0 +1,692 @@
+@test
+// `core:mem/bump` is a cursor over **one** block and answers `nil`
+// when that block is full; this is the same cursor over a **list** of them. So
+// everything worth claiming here is about the list — when a block is requested,
+// when one is released, and what survives a reset — and none of it is visible in
+// the return value of an allocation. It is visible in the **backing allocator's
+// call counts**, which is why this file writes its own backing allocator instead
+// of reaching for `core:mem/libc`:
+//
+//   * a counting pool, so `blocks`, `used` and every `Alloc`/`Free` the arena
+//     makes are numbers a claim can be written against — the same reason
+//     `tests/cases/pkg_arena` counts rather than prints;
+//   * with a **starvation switch**, because an allocation that
+//     fails is a value and not a trap, and the arm where a block cannot be
+//     obtained is unreachable from a backing allocator that always succeeds;
+//   * and the switch is per-allocation rather than global, because `grow` makes
+//     **two** requests — the `Block` header and its data — and the interesting
+//     failure is the second one, where the header has already been handed out
+//     and has to be given back. A leak there would be invisible in every output
+//     this package produces.
+//
+// The first block's size is written rather than left at `BLOCK`'s 64 KiB, so the
+// pool below can hold several of them and the growth is something this file can
+// actually watch happen.
+package arena
+
+import "core:mem"
+
+// ── The counting, starvable backing allocator ────────────────────────────────
+
+private const i64 POOL = 16384
+// **Exactly `POOL`, because the alignment is stated rather than bought with
+// spare bytes.** This run used to be sixteen bytes longer than it needed to be:
+// a Dado run is emitted as `struct { uint8_t s[N]; }`, whose C alignment is
+// **1**, so `pool_base()` rounded the block up to `mem.MAX_ALIGN` and the
+// window needed somewhere to end up. `@align(mem.MAX_ALIGN)` says the thing the
+// oversize was a way of not saying, and the base is now aligned where it is
+// declared.
+private type PoolBlock: [16384]u8
+private @align(mem.MAX_ALIGN) Pool pool_storage
+private type Pool: PoolBlock
+
+private u64 pool_used
+private i32 pool_allocs
+private i32 pool_frees
+// −1 means "never fail". Otherwise the allocation with this ordinal, counting
+// from 0 within the current run, is the one that answers `nil`.
+private i32 pool_fail_at
+
+private void pool_reset():
+    pool_used = 0
+    pool_allocs = 0
+    pool_frees = 0
+    pool_fail_at = 0 - 1
+    pool_skew = false
+    return
+
+// **Aligned, because an allocator that is asked for `align` must honour it** —
+// and aligned at the declaration, which is where the fact belongs. This pool
+// used to align its `pool_used` cursor over a base of C alignment 1 and hand out
+// `base + at` — `core:mem/bump`'s defect, in the test file that backs the
+// package which most depends on it not happening. `arena.grow` now checks what
+// it gets back, so this pool was one of the first things that check caught.
+private rawptr pool_base():
+    rawptr p = rawptr(&pool_storage)
+    return p
+
+// The switch that makes this pool break its word: one byte past where it should
+// hand out. `arena.grow`'s alignment refusal is unreachable from a conforming
+// backing allocator, and an arm nothing can reach is an arm nobody has tested.
+private bool pool_skew
+
+private rawptr pool_skewed(rawptr p):
+    if !pool_skew:
+        return p
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<2]
+    return rawptr(&span[1])
+
+private rawptr pool_proc(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            i32 ordinal = pool_allocs
+            pool_allocs = pool_allocs + 1
+            if pool_fail_at >= 0 && ordinal >= pool_fail_at:
+                return nil
+            u64 at = mem.align_up(pool_used, align)
+            if at > u64(POOL) || nbytes > u64(POOL) - at:
+                return nil
+            mem.Bytes b = mem.Bytes(pool_base())
+            []u8 region = b[0..<POOL]
+            pool_used = at + nbytes
+            return pool_skewed(rawptr(&region[at]))
+        case mem.AllocatorMode.Resize:
+            return nil
+        case mem.AllocatorMode.Free:
+            pool_frees = pool_frees + 1
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            pool_used = 0
+            return nil
+        else:
+            return nil
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) pool():
+    return (pool_proc, nil)
+
+// ── Reading a block's bytes ──────────────────────────────────────────────────
+
+private void set_byte(rawptr p, i64 i, u8 v):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i + 1]
+    i64 last = #len(span) - 1
+    span[last] = v
+    return
+
+private u8 byte_at(rawptr p, i64 i):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i + 1]
+    return span[i]
+
+private void fill_bytes(rawptr p, i64 n, u8 v):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<n]
+    for i in 0..<n:
+        span[i] = v
+    return
+
+// A pattern no zeroing or stray copy produces: byte i is (3i + 1) mod 256.
+private void fill_pattern(rawptr p, i64 n):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<n]
+    for i in 0..<n:
+        span[i] = u8((3 * i + 1) % 256)
+    return
+
+private bool has_pattern(rawptr p, i64 n):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<n]
+    for i in 0..<n:
+        if span[i] != u8((3 * i + 1) % 256):
+            return false
+    return true
+
+private bool all_bytes(rawptr p, i64 n, u8 v):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<n]
+    for i in 0..<n:
+        if span[i] != v:
+            return false
+    return true
+
+// `p + k`, as an address.
+private rawptr offset_of(rawptr p, i64 k):
+    return p + k
+
+private bool zero_between(rawptr p, i64 from, i64 to):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[from..<to]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        if span[i] != 0:
+            return false
+    return true
+
+i32 test():
+    bool ok = true
+
+    // ── over: it does not allocate ───────────────────────────────────────────
+    //
+    // An arena that is never used costs four words and no call — which is what
+    // makes it cheap enough to be a struct field. The zero in `pool_allocs` is
+    // the claim; the arena's own `blocks` of 0 would be true of a broken
+    // constructor too.
+    pool_reset()
+    Arena a = sized(pool(), 256)
+    ok = #expect(pool_allocs == 0, "constructing an arena took ", pool_allocs, " allocations, not 0") && ok
+    ok = #expect(blocks(a) == 0, "a fresh arena held ", blocks(a), " blocks") && ok
+    ok = #expect(used(a) == 0, "a fresh arena had used ", used(a)) && ok
+
+    // `sized(backing, 0)` falls back to `BLOCK`, which is the guard in the
+    // constructor and the only branch in it.
+    Arena defaulted = sized(pool(), 0)
+    ok = #expect(pool_allocs == 0, "a defaulted arena allocated") && ok
+    ok = #expect(blocks(defaulted) == 0, "a defaulted arena held blocks") && ok
+    ok = #expect(BLOCK == 65536, "BLOCK was ", BLOCK) && ok
+
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) al = allocator(&a)
+    ok = #expect(al.proc != nil, "arena.allocator did not produce a usable allocator") && ok
+
+    // ── the first allocation requests a block ────────────────────────────────
+    //
+    // **Two** backing allocations, not one: the `Block` header and the block's
+    // data are separate requests, which is what lets the header live in the
+    // backing allocator rather than inside the block it describes. The count is
+    // the only place that shows.
+    rawptr p1 = al.proc(al.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(p1 != nil, "the first allocation failed") && ok
+    ok = #expect(pool_allocs == 2, "the first allocation took ", pool_allocs, " backing allocations, not 2") && ok
+    ok = #expect(blocks(a) == 1, "the first allocation left ", blocks(a), " blocks") && ok
+    ok = #expect(used(a) == 32, "used after the first allocation was ", used(a)) && ok
+    ok = #expect(zero_between(p1, 0, 32), "the first allocation was not zeroed") && ok
+
+    // More allocations that fit in the head block ask the backing allocator for
+    // nothing at all — which is the property that makes an arena worth reaching
+    // for in a frame loop.
+    rawptr p2 = al.proc(al.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    ok = #expect(p2 != nil, "the second allocation failed") && ok
+    ok = #expect(pool_allocs == 2, "an allocation that fit still asked the backing allocator: ", pool_allocs) && ok
+    ok = #expect(blocks(a) == 1, "an allocation that fit added a block") && ok
+    ok = #expect(used(a) == 96, "used after two allocations was ", used(a)) && ok
+
+    // ── growth: a request that does not fit gets a new block ─────────────────
+    //
+    // The head block is 256 bytes and 96 are gone, so 200 will not fit. This is
+    // the whole difference between this package and `core:mem/bump`, which
+    // answers `nil` here.
+    rawptr p3 = al.proc(al.data, mem.AllocatorMode.Alloc, 200, 16, nil, 0)
+    ok = #expect(p3 != nil, "the arena did not grow: this is the difference from core:mem/bump") && ok
+    ok = #expect(blocks(a) == 2, "growing left ", blocks(a), " blocks, not 2") && ok
+    ok = #expect(pool_allocs == 4, "growing took ", pool_allocs, " backing allocations in total, not 4") && ok
+    // `used` sums across every block, so the old block's 96 bytes are still
+    // counted — a walk that stopped at the head would report 200.
+    ok = #expect(used(a) == 296, "used across two blocks was ", used(a), ", not 296") && ok
+    ok = #expect(zero_between(p3, 0, 200), "the allocation from the new block was not zeroed") && ok
+
+    // Nothing was released on the way: growing keeps the older blocks, which is
+    // what makes every pointer into them still valid.
+    ok = #expect(pool_frees == 0, "growing released ", pool_frees, " blocks") && ok
+
+    // A request larger than the next block size still succeeds, because `grow`
+    // takes the larger of the two — an arena whose block size was a ceiling
+    // would refuse here, and that is the bug already retired in a different
+    // shape.
+    rawptr big = al.proc(al.data, mem.AllocatorMode.Alloc, 2000, 16, nil, 0)
+    ok = #expect(big != nil, "a request larger than the next block size was refused") && ok
+    ok = #expect(blocks(a) == 3, "the oversized request left ", blocks(a), " blocks") && ok
+    ok = #expect(zero_between(big, 0, 2000), "the oversized allocation was not zeroed") && ok
+
+    // ── reset keeps the oldest block ─────────────────────────────────────────
+    //
+    // **The whole difference between `reset` and `destroy`**, and what a frame
+    // loop wants: after the first frame the arena is the size the program
+    // actually needs, and steady state asks the backing allocator for nothing.
+    // Two blocks released — four `Free`s, a header and a data each — and one
+    // kept.
+    i32 frees_before = pool_frees
+    reset(&a)
+    ok = #expect(blocks(a) == 1, "reset left ", blocks(a), " blocks, not 1") && ok
+    ok = #expect(used(a) == 0, "reset left used at ", used(a)) && ok
+    ok = #expect(pool_frees == frees_before + 4, "reset released ", pool_frees - frees_before, " backing blocks, not 4") && ok
+
+    // And steady state: the next allocation fits the kept block and asks for
+    // nothing. This is the claim the whole design is for.
+    i32 allocs_before = pool_allocs
+    rawptr steady = al.proc(al.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(steady != nil, "the allocation after reset failed") && ok
+    ok = #expect(pool_allocs == allocs_before, "steady state asked the backing allocator for ", pool_allocs - allocs_before, " blocks") && ok
+
+    // The same store reached through the mode rather than the function.
+    _ = al.proc(al.data, mem.AllocatorMode.FreeAll, 0, 0, nil, 0)
+    ok = #expect(used(a) == 0, "FreeAll left used at ", used(a)) && ok
+    ok = #expect(blocks(a) == 1, "FreeAll left ", blocks(a), " blocks, not 1") && ok
+
+    // ── destroy hands back everything ────────────────────────────────────────
+    //
+    // Including the oldest, which `reset` keeps. The arena is reusable
+    // afterwards — it is what `over` returned, minus the block-size growth.
+    frees_before = pool_frees
+    destroy(&a)
+    ok = #expect(blocks(a) == 0, "destroy left ", blocks(a), " blocks") && ok
+    ok = #expect(used(a) == 0, "destroy left used at ", used(a)) && ok
+    ok = #expect(pool_frees == frees_before + 2, "destroy released ", pool_frees - frees_before, " backing blocks, not 2") && ok
+
+    // Reusable: the next allocation requests a block again, from scratch.
+    allocs_before = pool_allocs
+    rawptr revived = al.proc(al.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(revived != nil, "a destroyed arena would not allocate again") && ok
+    ok = #expect(pool_allocs == allocs_before + 2, "reviving took ", pool_allocs - allocs_before, " allocations, not 2") && ok
+    ok = #expect(blocks(a) == 1, "the revived arena held ", blocks(a), " blocks") && ok
+
+    // `destroy` on an arena that never allocated does nothing and does not
+    // crash — the loop's zero-iteration case.
+    Arena untouched = over(pool())
+    frees_before = pool_frees
+    destroy(&untouched)
+    ok = #expect(pool_frees == frees_before, "destroying an unused arena released ", pool_frees - frees_before, " blocks") && ok
+    ok = #expect(blocks(untouched) == 0, "an unused arena held blocks after destroy") && ok
+
+    // ── marks ────────────────────────────────────────────────────────────────
+    //
+    // Where the arena is now, so a scope can be rewound. `bump.used` is already
+    // this for one block; a list needs the block as well as the offset into it —
+    // which is why the mark is rewound **across a growth** below and not only
+    // within a block, since a mark that only remembered an offset would leave
+    // the newer blocks behind.
+    pool_reset()
+    Arena scratch = sized(pool(), 256)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) sc = allocator(&scratch)
+
+    _ = sc.proc(sc.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    ok = #expect(used(scratch) == 64, "the pre-mark allocation left used at ", used(scratch)) && ok
+
+    Mark m = begin(&scratch)
+    _ = sc.proc(sc.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    _ = sc.proc(sc.data, mem.AllocatorMode.Alloc, 400, 16, nil, 0)
+    ok = #expect(blocks(scratch) == 2, "the marked region did not cross a block: ", blocks(scratch)) && ok
+    ok = #expect(used(scratch) > 64, "the marked region allocated nothing: ", used(scratch)) && ok
+
+    i32 frees_at_mark = pool_frees
+    end(m)
+    ok = #expect(used(scratch) == 64, "end(m) rewound to ", used(scratch), ", not 64") && ok
+    ok = #expect(blocks(scratch) == 1, "end(m) left ", blocks(scratch), " blocks, not 1") && ok
+    // The block requested inside the marked region was handed back: two `Free`s,
+    // a header and a data.
+    ok = #expect(pool_frees == frees_at_mark + 2, "end(m) released ", pool_frees - frees_at_mark, " backing blocks, not 2") && ok
+
+    // A mark taken before anything was allocated rewinds to nothing at all —
+    // `m.block` is nil, so the loop releases every block and leaves the arena
+    // empty. This is the arm that a mark carrying only an offset could not
+    // reach.
+    pool_reset()
+    Arena fresh = sized(pool(), 128)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) fr = allocator(&fresh)
+    Mark m0 = begin(&fresh)
+    _ = fr.proc(fr.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    _ = fr.proc(fr.data, mem.AllocatorMode.Alloc, 200, 16, nil, 0)
+    ok = #expect(blocks(fresh) == 2, "the fresh arena held ", blocks(fresh), " blocks before rewinding") && ok
+    end(m0)
+    ok = #expect(blocks(fresh) == 0, "rewinding to an empty mark left ", blocks(fresh), " blocks") && ok
+    ok = #expect(used(fresh) == 0, "rewinding to an empty mark left used at ", used(fresh)) && ok
+    ok = #expect(pool_frees == 4, "rewinding to an empty mark released ", pool_frees, " backing blocks, not 4") && ok
+
+    // A release that empties the arena must put `next_size` back where the
+    // arena started, or `begin`/`end` used as a per-frame reset doubles the
+    // block request every frame into gigabytes. `sized(pool(), 128)` is why
+    // this is asserted here: the restore goes to the arena's own first size,
+    // not to `BLOCK`.
+    ok = #expect(fresh.next_size == 128, "rewinding to an empty mark left next_size at ", fresh.next_size) && ok
+    for i in 0..<8:
+        Mark mi = begin(&fresh)
+        _ = fr.proc(fr.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+        end(mi)
+    ok = #expect(fresh.next_size == 128, "eight empty-mark frames left next_size at ", fresh.next_size) && ok
+    ok = #expect(blocks(fresh) == 0, "eight empty-mark frames left ", blocks(fresh), " blocks") && ok
+
+    // C2-09: a **primed** arena never empties, so a frame that grows past the
+    // primed block and rewinds must still put `next_size` back — to what it
+    // was after the block the rewind kept — or identical frames double the
+    // request until the backing allocator refuses. Twelve frames at 128 bytes
+    // first would ask for 512 KiB of a 16 KiB pool by the last.
+    pool_reset()
+    Arena framed = sized(pool(), 128)
+    ok = #expect(prime(&framed), "the arena would not prime") && ok
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) pr = allocator(&framed)
+    u64 settled = framed.next_size
+    for i in 0..<12:
+        Mark mp = begin(&framed)
+        rawptr grown = pr.proc(pr.data, mem.AllocatorMode.Alloc, 200, 16, nil, 0)
+        ok = #expect(grown != nil, "frame ", i, " of a primed arena could not grow") && ok
+        end(mp)
+        ok = #expect(framed.next_size == settled, "frame ", i, " of a primed arena left next_size at ", framed.next_size, ", not ", settled) && ok
+    ok = #expect(blocks(framed) == 1, "twelve frames left ", blocks(framed), " blocks") && ok
+    // And `reset`, which keeps the oldest block, the same.
+    _ = pr.proc(pr.data, mem.AllocatorMode.Alloc, 200, 16, nil, 0)
+    _ = pr.proc(pr.data, mem.AllocatorMode.Alloc, 900, 16, nil, 0)
+    reset(&framed)
+    ok = #expect(framed.next_size == settled, "a reset to the primed block left next_size at ", framed.next_size, ", not ", settled) && ok
+    destroy(&framed)
+
+    // A mark with a nil arena — the guard at the top of `end`, which is what a
+    // zero `Mark` is and is not reachable through `begin`.
+    Mark nowhere = (nil, nil, 0)
+    end(nowhere)
+    ok = #expect(true, "end on a nil mark returned") && ok
+
+    // ── exhaustion: an allocation that fails is a value, not a trap ──────────
+    //
+    // The backing allocator refuses, so the arena cannot obtain a
+    // block, so the allocation answers `nil` — and **the arena is unchanged**,
+    // which is the half that would be silently wrong if `grow` had linked a
+    // half-built block into the list before checking.
+    pool_reset()
+    Arena starved = sized(pool(), 256)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) st = allocator(&starved)
+    pool_fail_at = 0
+    rawptr denied = st.proc(st.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(denied == nil, "a starved backing allocator still produced a block") && ok
+    ok = #expect(blocks(starved) == 0, "the failed growth left ", blocks(starved), " blocks") && ok
+    ok = #expect(used(starved) == 0, "the failed growth left used at ", used(starved)) && ok
+    ok = #expect(pool_frees == 0, "the failed header allocation freed something") && ok
+
+    // **The second request is the interesting one.** `grow` asks for the `Block`
+    // header first and the data second; when the data fails, the header has
+    // already been handed out and must be given back. `pool_fail_at = 1` is the
+    // only way to reach that line, and a leak there would be invisible in every
+    // output this package produces — the arena would report no blocks and the
+    // backing allocator would be one header down, for ever.
+    pool_reset()
+    Arena half_starved = sized(pool(), 256)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) hs = allocator(&half_starved)
+    pool_fail_at = 1
+    rawptr half_denied = hs.proc(hs.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(half_denied == nil, "a failed data allocation still produced a block") && ok
+    ok = #expect(pool_allocs == 2, "the failed growth made ", pool_allocs, " requests, not 2") && ok
+    ok = #expect(pool_frees == 1, "the failed growth returned ", pool_frees, " headers, not 1") && ok
+    ok = #expect(blocks(half_starved) == 0, "the half-failed growth left ", blocks(half_starved), " blocks") && ok
+
+    // And a refusal is not a poisoning: with the switch off, the same arena
+    // allocates.
+    pool_fail_at = 0 - 1
+    rawptr recovered = hs.proc(hs.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(recovered != nil, "the arena stopped working after one refusal") && ok
+    ok = #expect(blocks(half_starved) == 1, "the recovered arena held ", blocks(half_starved), " blocks") && ok
+
+    // The pool running genuinely out of room, rather than being switched off —
+    // the same answer by a different route, which is what says the arena reads
+    // the backing allocator's `nil` and not a flag of its own.
+    pool_reset()
+    Arena hungry = sized(pool(), 256)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) hu = allocator(&hungry)
+    rawptr last_good = nil
+    for round in 0..<200:
+        rawptr got = hu.proc(hu.data, mem.AllocatorMode.Alloc, 256, 16, nil, 0)
+        if got != nil:
+            last_good = got
+    ok = #expect(last_good != nil, "the arena never allocated at all") && ok
+    ok = #expect(hu.proc(hu.data, mem.AllocatorMode.Alloc, 256, 16, nil, 0) == nil, "an arena over an exhausted pool kept handing out blocks") && ok
+    // The blocks it did get are still its own — an exhausted arena has not lost
+    // what it had.
+    ok = #expect(blocks(hungry) > 0, "the exhausted arena reported ", blocks(hungry), " blocks") && ok
+
+    // ── Resize ───────────────────────────────────────────────────────────────
+    //
+    // In place when the block is the head's last allocation, which is O(1) and
+    // invisible from outside; `mem.resize_by_copy` otherwise. The two are told
+    // apart by whether the pointer moved, which is the only thing the caller can
+    // see and is exactly what matters.
+    pool_reset()
+    Arena rz = sized(pool(), 512)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) rl = allocator(&rz)
+
+    rawptr r1 = rl.proc(rl.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    set_byte(r1, 0, 7)
+    set_byte(r1, 31, 9)
+    rawptr r2 = rl.proc(rl.data, mem.AllocatorMode.Resize, 64, 16, r1, 32)
+    ok = #expect(r2 == r1, "growing the head's last allocation moved it") && ok
+    ok = #expect(used(rz) == 64, "the in-place grow left used at ", used(rz)) && ok
+    ok = #expect(byte_at(r2, 0) == 7, "the in-place grow lost the first byte") && ok
+    ok = #expect(byte_at(r2, 31) == 9, "the in-place grow lost the last byte") && ok
+    ok = #expect(zero_between(r2, 32, 64), "the grown tail was not zeroed") && ok
+
+    // Buried under a newer allocation, so there is nothing clever to do and the
+    // library helper is what an allocator in that position calls instead.
+    rawptr b1 = rl.proc(rl.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    set_byte(b1, 0, 42)
+    _ = rl.proc(rl.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    rawptr moved = rl.proc(rl.data, mem.AllocatorMode.Resize, 64, 16, b1, 32)
+    ok = #expect(moved != nil, "resizing a buried block failed") && ok
+    ok = #expect(moved != b1, "a buried block was grown in place, over its neighbour") && ok
+    ok = #expect(byte_at(moved, 0) == 42, "the copy lost the bytes") && ok
+
+    // A `Resize` of a nil block is an `Alloc`.
+    rawptr from_nothing = rl.proc(rl.data, mem.AllocatorMode.Resize, 16, 16, nil, 0)
+    ok = #expect(from_nothing != nil, "resizing from nil did not allocate") && ok
+
+    // ── Free is a no-op, and dispatch's guards ───────────────────────────────
+    u64 before_free = used(rz)
+    ok = #expect(rl.proc(rl.data, mem.AllocatorMode.Free, 0, 0, from_nothing, 16) == nil, "Free returned something other than nil") && ok
+    ok = #expect(used(rz) == before_free, "Free reclaimed: used went from ", before_free, " to ", used(rz)) && ok
+
+    // A nil `data` is the guard at the top of `dispatch`, and is not reachable
+    // through `allocator(&arena)`.
+    ok = #expect(rl.proc(nil, mem.AllocatorMode.Alloc, 8, 8, nil, 0) == nil, "dispatch with nil data handed out memory") && ok
+    ok = #expect(rl.proc(nil, mem.AllocatorMode.FreeAll, 0, 0, nil, 0) == nil, "dispatch with nil data did not answer nil") && ok
+
+    // ── the alignment its blocks are asked for, and the backing that lies ──
+    //
+    // Every block here is requested at `mem.MAX_ALIGN`, and everything after
+    // that rests on it: `BlockPtr(head)` dereferences a struct of pointers, and
+    // `carve_from` aligns an offset into `data` and hands out `data + at`,
+    // which is aligned only if `data` was. `arena.grow` now asks.
+    //
+    // **The claim cannot be written directly**, so it is written the way
+    // `tests/cases/align_forward.dado` writes its own: `u64(p)` on a `rawptr` is
+    // ERR0504 and there is no `uintptr`, so nothing here can say *this address
+    // is a multiple of 16* — but it can ask whether rounding the address up
+    // moves it, which is the same question from the other side.
+    pool_reset()
+    Arena aligned_a = sized(pool(), 512)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) aal = allocator(&aligned_a)
+    rawptr aligned_out = aal.proc(aal.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(aligned_out != nil, "a conforming pool produced no block") && ok
+    ok = #expect(#align_forward(aligned_out, 16) == aligned_out, "the arena handed out a misaligned block from a conforming pool") && ok
+    destroy(&aligned_a)
+
+    // And the same pool told to break its word. The refusal is the arm that is
+    // unreachable from a backing allocator that keeps it, which is why the
+    // switch exists: **an arm nothing can reach is an arm nobody has tested.**
+    //
+    // The header is the first of the two requests, so it is the one that fails,
+    // and the whole of `grow` fails with it — there is no half-built block and
+    // no leak, which is what the free count says.
+    pool_reset()
+    pool_skew = true
+    Arena liar = sized(pool(), 512)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) ll = allocator(&liar)
+    ok = #expect(ll.proc(ll.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0) == nil, "an arena over a pool that under-aligns handed out a block") && ok
+    ok = #expect(blocks(liar) == 0, "the refused grow left ", blocks(liar), " block(s) on the list") && ok
+    ok = #expect(pool_frees == pool_allocs, "the refused grow leaked: ", pool_allocs, " allocations and ", pool_frees, " frees") && ok
+    pool_skew = false
+
+    // ── `prime`: the same refusal, asked at the door ────────────────────────
+    //
+    // The refusal above is real and arrives late — at the first allocation, as
+    // a nil three frames from whoever built the arena. `prime` asks for the
+    // first block at construction, so a conforming pool answers `true` with one
+    // block on the list, a second `prime` asks nothing, and the lying pool
+    // answers `false` there and then, leaking nothing.
+    pool_reset()
+    Arena primed = sized(pool(), 512)
+    ok = #expect(prime(&primed), "prime refused a conforming pool") && ok
+    ok = #expect(blocks(primed) == 1 && pool_allocs == 2, "prime left ", blocks(primed), " block(s) after ", pool_allocs, " requests") && ok
+    ok = #expect(prime(&primed) && pool_allocs == 2, "a second prime asked the backing allocator again") && ok
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) pl = allocator(&primed)
+    rawptr from_primed = pl.proc(pl.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    ok = #expect(from_primed != nil && pool_allocs == 2, "the first allocation after prime asked for another block") && ok
+    destroy(&primed)
+
+    pool_reset()
+    pool_skew = true
+    Arena crooked = sized(pool(), 512)
+    ok = #expect(!prime(&crooked), "prime accepted a pool that under-aligns") && ok
+    ok = #expect(blocks(crooked) == 0 && pool_frees == pool_allocs, "a refused prime kept ", blocks(crooked), " block(s) or leaked") && ok
+    pool_skew = false
+
+    // ── the ceiling ─────────────────────────────────────────────
+    //
+    // `MAX_ALIGN` is what the blocks are asked for, so it is what can be handed
+    // out. A request above it is refused rather than answered with an offset
+    // that is a multiple of 32 from a base that is only a multiple of 16 — and
+    // refused in `carve`, before `grow` is reached, so a request nothing can
+    // satisfy does not first cost the backing allocator a block.
+    pool_reset()
+    Arena ceiling = sized(pool(), 512)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) cl = allocator(&ceiling)
+    ok = #expect(cl.proc(cl.data, mem.AllocatorMode.Alloc, 8, 32, nil, 0) == nil, "an allocation above MAX_ALIGN was granted") && ok
+    ok = #expect(pool_allocs == 0, "the refusal above MAX_ALIGN still asked the pool for ", pool_allocs, " block(s)") && ok
+    ok = #expect(cl.proc(cl.data, mem.AllocatorMode.Alloc, 8, 16, nil, 0) != nil, "the ceiling refused an allocation at MAX_ALIGN itself") && ok
+    destroy(&ceiling)
+
+    // ── end_keeping: rewind, but keep the last allocation, moved to the mark ─────
+    //
+    // Four places the kept bytes can be: in the mark's own block (moved down over the
+    // work done since the mark), moved from a newer block into the mark's block, left
+    // in a newer block kept directly over the mark's (when the mark's block has no
+    // room), and a mark taken on an empty arena. Each time the bytes must arrive
+    // intact, everything else since the mark must be gone, and they must be the
+    // arena's last allocation (so an in-place Resize works on them).
+    pool_reset()
+    Arena ek = sized(pool(), 1024)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) el = allocator(&ek)
+    rawptr before_mark = el.proc(el.data, mem.AllocatorMode.Alloc, 40, 16, nil, 0)
+    fill_bytes(before_mark, 40, 7)
+    Mark em = begin(&ek)
+    rawptr junk = el.proc(el.data, mem.AllocatorMode.Alloc, 300, 16, nil, 0)
+    fill_bytes(junk, 300, 9)
+    rawptr blob = el.proc(el.data, mem.AllocatorMode.Alloc, 48, 16, nil, 0)
+    fill_pattern(blob, 48)
+    rawptr kept_at = end_keeping(em, blob, 48)
+    ok = #expect(kept_at != nil && kept_at == offset_of(before_mark, 48), "same block: the bytes went to ", kept_at, ", not the mark rounded up") && ok
+    ok = #expect(has_pattern(kept_at, 48), "same block: the bytes did not arrive intact") && ok
+    ok = #expect(all_bytes(before_mark, 40, 7), "same block: what lay below the mark changed") && ok
+    ok = #expect(used(ek) == 96 && blocks(ek) == 1, "same block: used ", used(ek), " in ", blocks(ek), " blocks, not 96 in 1") && ok
+    ok = #expect(el.proc(el.data, mem.AllocatorMode.Resize, 64, 16, kept_at, 48) == kept_at, "same block: the kept bytes are not the last allocation") && ok
+    ok = #expect(has_pattern(kept_at, 48) && zero_between(kept_at, 48, 64), "same block: an in-place grow of the kept bytes lost them or did not zero the tail") && ok
+
+    // From a newer block into the mark's: the block the bytes were in is released.
+    Mark em2 = begin(&ek)
+    _ = el.proc(el.data, mem.AllocatorMode.Alloc, 950, 16, nil, 0)   // forces a new block
+    rawptr blob2 = el.proc(el.data, mem.AllocatorMode.Alloc, 64, 16, nil, 0)
+    fill_pattern(blob2, 64)
+    i32 ek_frees = pool_frees
+    ok = #expect(blocks(ek) == 2, "cross block: the setup left ", blocks(ek), " blocks") && ok
+    rawptr kept2 = end_keeping(em2, blob2, 64)
+    ok = #expect(kept2 != nil && kept2 == offset_of(before_mark, 112) && has_pattern(kept2, 64), "cross block: the bytes went to ", kept2, " or arrived damaged") && ok
+    ok = #expect(blocks(ek) == 1 && pool_frees == ek_frees + 2, "cross block: ", blocks(ek), " blocks left and ", pool_frees - ek_frees, " frees, not 1 and 2") && ok
+    ok = #expect(used(ek) == 176, "cross block: used ", used(ek), ", not 176") && ok
+
+    // No room in the mark's block: the newer block that holds the bytes is kept,
+    // directly over the mark's, with the bytes at its start; blocks in between go.
+    _ = el.proc(el.data, mem.AllocatorMode.Alloc, 800, 16, nil, 0)   // the mark's block: 976 of 1024
+    Mark em3 = begin(&ek)
+    u64 used_mark = used(ek)
+    _ = el.proc(el.data, mem.AllocatorMode.Alloc, 900, 16, nil, 0)   // block 2
+    _ = el.proc(el.data, mem.AllocatorMode.Alloc, 1500, 16, nil, 0)  // block 3
+    rawptr blob3 = el.proc(el.data, mem.AllocatorMode.Alloc, 200, 16, nil, 0)
+    fill_pattern(blob3, 200)
+    ok = #expect(blocks(ek) == 3, "no room: the setup left ", blocks(ek), " blocks") && ok
+    rawptr kept3 = end_keeping(em3, blob3, 200)
+    ok = #expect(kept3 != nil && has_pattern(kept3, 200), "no room: the bytes did not arrive intact") && ok
+    ok = #expect(blocks(ek) == 2 && used(ek) == used_mark + 200, "no room: ", blocks(ek), " blocks and used ", used(ek), ", not 2 and ", used_mark + 200) && ok
+    ok = #expect(el.proc(el.data, mem.AllocatorMode.Resize, 300, 16, kept3, 200) == kept3 && has_pattern(kept3, 200), "no room: the kept bytes are not the last allocation") && ok
+    ok = #expect(all_bytes(before_mark, 40, 7), "no room: the oldest block's bytes changed") && ok
+    // The block kept over the mark's is the head now, so `next_size` is `after` it, as
+    // every release that keeps a block leaves it (C2-09): twice its 4096 bytes.
+    ok = #expect(ek.next_size == 8192, "no room: next_size ", ek.next_size, ", not twice the kept block") && ok
+    destroy(&ek)
+
+    // A mark taken on an empty arena names no block: the block holding the bytes is
+    // the only one kept.
+    pool_reset()
+    Arena ee = sized(pool(), 256)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) eel = allocator(&ee)
+    Mark eem = begin(&ee)
+    _ = eel.proc(eel.data, mem.AllocatorMode.Alloc, 200, 16, nil, 0)
+    _ = eel.proc(eel.data, mem.AllocatorMode.Alloc, 400, 16, nil, 0)
+    rawptr blob4 = eel.proc(eel.data, mem.AllocatorMode.Alloc, 32, 16, nil, 0)
+    fill_pattern(blob4, 32)
+    rawptr kept4 = end_keeping(eem, blob4, 32)
+    ok = #expect(kept4 != nil && has_pattern(kept4, 32) && blocks(ee) == 1 && used(ee) == 32, "empty mark: ", blocks(ee), " blocks, used ", used(ee)) && ok
+    ok = #expect(ee.next_size == 1024, "empty mark: next_size ", ee.next_size, ", not twice the kept 512-byte block") && ok
+    // Refusals: bytes that are not the last allocation, and none at all, rewind as
+    // `end` does and answer nil.
+    Mark eem2 = begin(&ee)
+    rawptr not_last = eel.proc(eel.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    _ = eel.proc(eel.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(end_keeping(eem2, not_last, 16) == nil && used(ee) == 32, "not the last allocation: answered, or used ", used(ee)) && ok
+    Mark eem3 = begin(&ee)
+    rawptr last16 = eel.proc(eel.data, mem.AllocatorMode.Alloc, 16, 16, nil, 0)
+    ok = #expect(end_keeping(eem3, last16, 0) == nil && used(ee) == 32, "no bytes: answered, or used ", used(ee)) && ok
+    destroy(&ee)
+
+    // An invariant rather than an expectation: the arena's own `blocks` count
+    // must never exceed the number of block allocations the backing allocator
+    // has made — the arena requests two per block, so this is generous by half
+    // and would still catch a count that ran away. If it were false the
+    // *package* would be reporting a list it does not have, and there would be
+    // nothing to carry on for.
+    #assert(i32(blocks(rz)) <= pool_allocs, "the arena claimed ", blocks(rz), " blocks from ", pool_allocs, " requests")
+
+    ok = #expect(implementer_cases(), "the arena as an implementer of mem.Allocator") && ok
+
+    if ok:
+        return 0
+    return 1
+
+// ── the trait (a0.13b H13) ──────────────────────────────────────────────────
+//
+// An `ArenaAllocator` takes `mem.Allocator` on and is accepted wherever an
+// allocator is asked: `#new`'s last argument, a `using` suite, a binder, and
+// the two words a `ref` carries, which `#delete` hands the block back through.
+// Every block lands in the arena's one block, which `used` counts.
+
+private type Cell: (i64 a, i64 b)
+
+private i64 through(mem.Allocator al):
+    ref Cell c = #new(Cell, al)
+    c^.a = 7
+    i64 got = c^.a
+    #delete(c)
+    return got
+
+private bool implementer_cases():
+    bool ok = true
+    // The pool fresh: nothing earlier holds a block of it by now.
+    pool_fail_at = -1
+    pool_skew = false
+    pool_used = 0
+    Arena a = sized(pool(), 256)
+    ArenaAllocator h = &a
+    ok = #expect(h.ok(), "an arena's implementer reported itself unusable") && ok
+    ref Cell c = #new(Cell, h)
+    c^.b = 3
+    ok = #expect(used(a) > 0, "#new through the implementer left the arena empty") && ok
+    using h:
+        ref Cell d = #new(Cell)
+        d^.a = 5
+        ok = #expect(d^.a == 5, "an allocation under `using h` did not hold") && ok
+        #delete(d)
+    ok = #expect(through(h) == 7, "the binder's allocation did not hold") && ok
+    ok = #expect(c^.b == 3, "a block the arena handed out was disturbed") && ok
+    // And as a `mem.Allocator` trait value, whose `data()` is dispatched.
+    mem.Allocator tv = h
+    using tv:
+        ref Cell e = #new(Cell)
+        e^.b = 6
+        ok = #expect(e^.b == 6, "an allocation under `using` a trait value did not hold") && ok
+        #delete(e)
+    #delete(c)
+    destroy(&a)
+    return ok

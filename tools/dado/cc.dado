@@ -1,0 +1,220 @@
+// The C compiler, and the argument lists handed to it.
+//
+// **Which compiler.** `--cc <program>` uses that program, as one word. Without
+// it, the pinned zig, run as `zig cc`: in an install the one under
+// `zig/<version>/`, in a checkout a `zig` on `PATH` whose `zig version` is the
+// one `ZIG_PIN` names. `$CC` does not choose. A `ZIG_TARGET` in the
+// environment becomes `-target <it>` on every `zig cc` line, so a
+// cross-compile sets it beside `DADO_TARGET`, one for each half of the build.
+//
+// **What zig changes.** Two things the pinned zig does differently from
+// clang and gcc, each answered here rather than at every caller:
+//
+// * it has no AddressSanitizer runtime on Linux, and given `address` in a
+//   combined `-fsanitize=` list it links the program anyway with no ASan in
+//   it. So under zig `address` is taken out of every list, and the build says
+//   once that it was;
+// * its linker refuses `--export-dynamic-symbol`, so an executable's exports
+//   are put in its dynamic table with `-rdynamic` instead, which exports every
+//   external symbol rather than only the listed ones.
+//
+// **The order of the compile line is a contract**, weakest first: the
+// driver's own flags, the program's `flags` clauses, the sanitizer (so a
+// clause cannot turn it off), then the include directories with
+// `DADO_CFLAGS` last, so the person at the keyboard has the last word on
+// `-O` and `-D`. `-I` is searched first-wins, so a `flags "-I…"` clause is
+// searched before the package's own directory. On the link half, Homebrew's
+// `-L` comes first, then the command line's `-l`, the `link` clauses and the
+// engine, then the exports, the sanitizer and `DADO_LDFLAGS` last.
+package driver
+
+import "core:path"
+import "core:strings"
+
+// A C compiler: the words that start it, and what a line calls it.
+type Compiler:
+    ref []string8 words
+    string8 name
+    bool zig
+    bool found
+    string8 why       // when not found: what was looked for, and the repair
+
+// The compiler `--cc` names: one program, run as written.
+Compiler given_compiler(string8 program):
+    Compiler c
+    ref []string8 w = #make([]string8, 0)
+    _ = #append(w, program)
+    c.words = w
+    c.name = program
+    c.zig = strings.starts_with(path.base(program), "zig")
+    c.found = true
+    c.why = ""
+    return c
+
+// The pinned zig at `zig`, as `zig cc`, with `-target` when `target` is not
+// empty.
+Compiler zig_compiler(string8 zig, string8 target):
+    Compiler c
+    ref []string8 w = #make([]string8, 0)
+    _ = #append(w, zig)
+    _ = #append(w, "cc")
+    if #len(target) > 0:
+        _ = #append(w, "-target")
+        _ = #append(w, target)
+    c.words = w
+    c.name = "zig cc"
+    c.zig = true
+    c.found = true
+    c.why = ""
+    return c
+
+Compiler no_compiler(string8 why):
+    Compiler c
+    c.words = #make([]string8, 0)
+    c.name = ""
+    c.zig = false
+    c.found = false
+    c.why = why
+    return c
+
+// ── sanitizers ──────────────────────────────────────────────────────────────
+
+// `words` with `address` taken out of every `-fsanitize=` list, and a list
+// left empty dropped; every other word as it was.
+ref []string8 without_address([]string8 words):
+    ref []string8 out = #make([]string8, 0)
+    for w in words:
+        if !strings.starts_with(w, "-fsanitize="):
+            _ = #append(out, w)
+            continue
+        string8 list = w[11..<#len(w)]     // after `-fsanitize=`
+        strings.Builder b = strings.builder(#len(w))
+        _ = strings.append(&b, "-fsanitize=")
+        bool any = false
+        string8 rest = list
+        for:
+            (string8 item, string8 tail, bool more) = split_byte(rest, ',')
+            if #len(item) > 0 && item != "address":
+                if any:
+                    _ = strings.append_char(&b, ',')
+                _ = strings.append(&b, item)
+                any = true
+            if !more: break
+            rest = tail
+        ref []char8 made = strings.finish(&b)
+        if any:
+            _ = #append(out, txt(made))
+    return out
+
+// The compile and link flags a sanitized build takes: `cflags` and `ldflags`
+// as `defaults` writes them for the kind asked, split into words, and under
+// zig with `address` taken out (see the head of this file).
+(ref []string8 cflags, ref []string8 ldflags) sanitizer_words(string8 cflags, string8 ldflags, bool zig):
+    ref []string8 c = words_of(cflags)
+    ref []string8 l = words_of(ldflags)
+    if zig:
+        return (without_address(c[:]), without_address(l[:]))
+    return (c, l)
+
+// ── the link line ───────────────────────────────────────────────────────────
+
+// The flags that put each `export`'s C symbol in a native executable's
+// dynamic symbol table, for target `os`. Nothing when there are none, and
+// nothing on Windows or a freestanding target; `-export_dynamic` on Darwin;
+// elsewhere one `--export-dynamic-symbol` per symbol, or `-rdynamic` under
+// zig, whose linker refuses that flag.
+ref []string8 export_flags(string8 os, []string8 symbols, bool zig):
+    ref []string8 out = #make([]string8, 0)
+    if #len(symbols) == 0: return out
+    if os == "#DARWIN":
+        _ = #append(out, "-Wl,-export_dynamic")
+        return out
+    if os == "#WINDOWS" || os == "#NONE":
+        return out
+    if zig:
+        _ = #append(out, "-rdynamic")
+        return out
+    for s in symbols:
+        _ = #append(out, txt(#format("-Wl,--export-dynamic-symbol=", s)))
+    return out
+
+// Everything a native compile and link is made of, in the order it goes on
+// the line.
+type Link:
+    ref []string8 cc
+    ref []string8 base          // `CFLAGS_BASE`
+    ref []string8 interop       // `CFLAGS_INTEROP`
+    ref []string8 werror        // `CFLAGS_WERROR`, or nothing under --no-werror
+    ref []string8 opt           // `-O2`, or `-g -O0` under --debug
+    ref []string8 freestanding  // `-ffreestanding` for a linked `#NONE` build
+    ref []string8 extra         // the program's `flags` clauses
+    ref []string8 san_c
+    ref []string8 includes      // `-I` per package, the engine's, Homebrew's, then DADO_CFLAGS
+    string8 c_file
+    ref []string8 sources
+    string8 out
+    ref []string8 libs          // Homebrew's `-L`, the command line's `-l`, `link` clauses, the engine
+    ref []string8 exports       // `export_flags`' answer
+    ref []string8 san_l
+    ref []string8 ldflags       // DADO_LDFLAGS
+
+// An empty `Link`, every list made.
+Link new_link():
+    Link k
+    k.cc = #make([]string8, 0)
+    k.base = #make([]string8, 0)
+    k.interop = #make([]string8, 0)
+    k.werror = #make([]string8, 0)
+    k.opt = #make([]string8, 0)
+    k.freestanding = #make([]string8, 0)
+    k.extra = #make([]string8, 0)
+    k.san_c = #make([]string8, 0)
+    k.includes = #make([]string8, 0)
+    k.c_file = ""
+    k.sources = #make([]string8, 0)
+    k.out = ""
+    k.libs = #make([]string8, 0)
+    k.exports = #make([]string8, 0)
+    k.san_l = #make([]string8, 0)
+    k.ldflags = #make([]string8, 0)
+    return k
+
+// The one command that compiles and links a hosted program.
+Command link_command(^Link k):
+    Command c = command_of(k.cc[:])
+    add_all(&c, k.base[:])
+    add_all(&c, k.interop[:])
+    add_all(&c, k.werror[:])
+    add_all(&c, k.opt[:])
+    add_all(&c, k.freestanding[:])
+    add_all(&c, k.extra[:])
+    add_all(&c, k.san_c[:])
+    add_all(&c, k.includes[:])
+    add(&c, k.c_file)
+    add_all(&c, k.sources[:])
+    add(&c, "-o")
+    add(&c, k.out)
+    add_all(&c, k.libs[:])
+    add_all(&c, k.exports[:])
+    add_all(&c, k.san_l[:])
+    add_all(&c, k.ldflags[:])
+    return c
+
+// The command that compiles one translation unit `unit` of a freestanding
+// build to the object `object`, linking nothing: the link line's compile half
+// with `-ffreestanding -c` after the optimisation flags.
+Command object_command(^Link k, string8 unit, string8 object):
+    Command c = command_of(k.cc[:])
+    add_all(&c, k.base[:])
+    add_all(&c, k.interop[:])
+    add_all(&c, k.werror[:])
+    add_all(&c, k.opt[:])
+    add(&c, "-ffreestanding")
+    add(&c, "-c")
+    add_all(&c, k.extra[:])
+    add_all(&c, k.san_c[:])
+    add_all(&c, k.includes[:])
+    add(&c, unit)
+    add(&c, "-o")
+    add(&c, object)
+    return c

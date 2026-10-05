@@ -1,0 +1,189 @@
+// Walking a tree, and making one — the half of `core:os/fs` that allocates.
+//
+//     fs.Listing l = fs.walk("collections", #heap)
+//     for e in l.entries:
+//         if !e.is_dir && strings.ends_with(e.path, ".dado"):
+//             ...
+//     fs.release(l)
+//
+// **`fs.dado` imports nothing and this file imports three, which is the split
+// and not an accident.** That file's header says there is no path *algebra*
+// here — no join, no basename, no normalise — *"because those return new bytes
+// and there is nowhere to build them that outlives the block"*. That is still
+// true of it. What changed is that an allocator makes *somewhere* exist, so
+// the operations that need one live apart from the ones that do not, and a
+// program that only asks `is_dir` still pulls in neither `core:mem` nor
+// `core:strings`.
+//
+// **Three hand-written walks already exist in this tree**, which is the
+// measurement that says this belongs in the library: `tools/doc`'s `walk`,
+// `archive/lang/load/graph.dado`'s four crossing wrappers, and
+// `load_test.dado`'s `wipe`. Each of them re-derived the `#format` /
+// `clone_to_cstring` / `#delete` triple at every level.
+package fs
+
+import "core:mem"
+import "core:strings"
+
+// One path a walk found, and whether it is a directory.
+//
+// `path` is a **view into the listing's own bytes** and dies with it. That is
+// the whole ownership design: the alternative is a `ref []string`, and a
+// `ref` frees one block while the strings in it would each be another — so
+// the elements would leak or the slice would be unfreeable, and neither is a
+// thing to hand a caller.
+public type Entry: (string8 path, bool is_dir)
+
+// What a walk returns: one block of bytes holding every path, and one slice of
+// views over it. Two allocations, freed by `release`, and **not** by
+// `#delete` on either half — a caller that frees the bytes leaves the entries
+// pointing at nothing, which is exactly the mistake the pair exists to make
+// hard to write.
+public type Listing: (ref []char8 bytes, ref []Entry entries)
+
+// A span of the blob, recorded while the blob is still growing.
+//
+// **Views cannot be taken until the bytes have stopped moving.** `#append` may
+// reallocate, so a `string` built into `entries` during the walk would point
+// at a freed block the moment the blob grew past its capacity — which is the
+// kind of defect that works in every small test. So the walk records offsets
+// and the views are made once, at the end.
+private type Span: (i64 start, i64 len, bool is_dir)
+
+// Every path under `root`, depth first, **a directory before its contents**.
+//
+// `root` itself is not in the listing: the caller named it and already has it.
+//
+// Reversed, this is a safe deletion order — every child appears after its
+// parent, so backwards every child comes before it — which is what `rm -rf`
+// needs and is why the order is stated rather than left as whatever `readdir`
+// gave.
+//
+// **Hidden entries are skipped**, which is `fs.hidden`'s policy: `.`, `..` and
+// every dotfile. Descending into a `.git` is the difference between a second
+// and a minute, and it is the same choice `tools/doc` made when it wrote this
+// walk by hand. A caller that wants them uses `open`/`next` and its own
+// recursion, which is what this replaces rather than forbids.
+//
+// **A symlinked directory is listed and not entered.** A link can point at its
+// own ancestor, and a walk that follows one does not finish; `is_symlink` is
+// what makes that checkable, and this is the first caller of it.
+//
+// An unreadable directory contributes nothing and is not an error: a walk of a
+// tree somebody is editing underneath it is a normal thing to be doing, and
+// the alternative is a listing that is thrown away because one directory
+// changed. An empty `Listing` is the answer for a `root` that is not there.
+public Listing walk(string8 root, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 bytes = #make([]char8, 0, alloc)
+    ref []Span spans = #make([]Span, 0, alloc)
+    walk_into(root, &bytes, &spans, alloc)
+
+    ref []Entry entries = #make([]Entry, 0, alloc)
+    string8 all = bytes
+    for s in spans:
+        // `substring(s, at, count)` — a **count**, not an end index. Written
+        // out because the two read alike. The calls that meant *to the end*
+        // and got it only because a count past the end is clamped now say
+        // `strings.rest(s, at)`.
+        _ = #append(entries, (strings.substring(all, s.start, s.len), s.is_dir))
+    #delete(spans)
+    return (bytes, entries)
+
+// Free what a walk allocated. A `Listing` that was never walked is safe to
+// release, because `#make` of nothing is still a block.
+public void release(Listing l):
+    #delete(l.entries)
+    #delete(l.bytes)
+
+private void walk_into(string8 dir, ^ref []char8 bytes, ^ref []Span spans,
+                       (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    ref []char8 dirc = strings.clone_to_cstring(dir, alloc)
+    ^Dir d = open(cstring(dirc))
+    #delete(dirc)
+    if !opened(d):
+        return
+    defer close(d)
+    for:
+        (cstring name, bool more) = next(d)
+        if !more:
+            break
+        string8 nm = string8(name)
+        if hidden(nm):
+            continue
+        ref []char8 joined = #format(dir, "/", nm, alloc)
+        string8 p = joined
+        ref []char8 pc = strings.clone_to_cstring(p, alloc)
+        bool dir_here = is_dir(cstring(pc))
+        bool link_here = is_symlink(cstring(pc))
+        #delete(pc)
+
+        i64 start = #len(bytes^)
+        for c in p:
+            _ = #append(bytes^, c)
+        _ = #append(spans^, (start, #len(p), dir_here))
+
+        // Listed above, entered only here. A directory reached through a
+        // symlink is a directory somewhere else in the tree, and walking it
+        // from here either duplicates it or never ends.
+        if dir_here && !link_here:
+            walk_into(p, bytes, spans, alloc)
+        #delete(joined)
+
+// ── making a tree ─────────────────────────────────────────────────────────
+
+// `mkdir -p`: every directory on `path` that is not there yet.
+//
+// **Not a row and it is here because the walk needed the same bytes.** Seven
+// places in this tree shell out to `mkdir -p` today — five of them in `./dado`
+// alone — and `make_dir` is deliberately one level, its own comment saying
+// *"`mkdir -p` is a loop over a split path, and there is no split until there
+// is somewhere to put the pieces"*. An allocator is that somewhere.
+//
+// True when `path` exists as a directory afterwards, whoever made it. **An
+// existing directory is not a failure** — that is the whole difference between
+// `mkdir` and `mkdir -p`, and a caller racing another process to the same
+// parent is the ordinary case rather than the exotic one.
+//
+// A component that exists as a *file* is false: nothing here replaces
+// anything.
+public bool make_dirs(string8 path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    if #len(path) == 0:
+        return false
+    // One mutable copy, terminated at each separator in turn and put back.
+    // The alternative is a `#format` per component, which is one allocation
+    // per level of a path for no reason.
+    ref []char8 buf = strings.clone_to_cstring(path, alloc)
+    defer #delete(buf)
+    i64 n = #len(path)
+    i32 i = 0
+    for i < n:
+        // A leading `/` is the root and a `//` is one separator: an empty
+        // component has nothing to make.
+        char8 c = buf[i]
+        if separator(c) && i > 0:
+            buf[i] = '\0'
+            bool step = ensure_dir(cstring(buf))
+            buf[i] = c
+            if !step:
+                return false
+        i += 1
+    return ensure_dir(cstring(buf))
+
+// A byte that ends a path component: `/` everywhere, and `\` too on Windows,
+// which reads both.
+when #OS == #WINDOWS:
+    private bool separator(char8 c):
+        return c == '/' || c == '\\'
+else:
+    private bool separator(char8 c):
+        return c == '/'
+
+// One level, treating *already a directory* as success.
+private bool ensure_dir(cstring p):
+    if is_dir(p):
+        return true
+    if make_dir(p):
+        return true
+    // The race: somebody else made it between the two calls above. Asking
+    // again is cheaper than locking and is the only answer that is true.
+    return is_dir(p)

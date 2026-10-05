@@ -1,0 +1,372 @@
+@test
+// `app:text` — the pen loop, what it records, and the batching claim it exists
+// to make.
+//
+// Everything here runs against `draw.init_headless` and `font.fallback`, so it
+// needs no GPU and no font file: the server records into real items, walks and
+// orders them exactly as the GPU path does, and counts what that path would
+// have cost. The built-in bitmap face is compiled into `app:font`.
+//
+// **What this file asserts moved with the surface.** It used to count `quads()`
+// and `draw_calls()` over an implicit frame, and neither exists: a `run*` now
+// appends commands to a `draw.Item` that outlives the frame, so the questions
+// are how many commands landed in *which item*, what the render made of them,
+// and how many state changes the replay counted. That last one is an **upper
+// bound** on draw calls and `app:draw` says the word in its own doc comment —
+// `sokol_gp`'s optimiser only ever merges — so every number below that names it
+// is asserted as the bound it is.
+//
+// **What this file cannot see is a recorded command's contents.** `app:draw`'s
+// command list is private to `app:draw`, which is right, and no accessor reads
+// one back. So the one thing here that must be true of a command's *payload* —
+// that a glyph's source rectangle is the font's pixel rectangle and not a
+// normalised one — is asserted against `glyph_src`, which is the single place
+// this package builds that rectangle and is private to this package, so a test
+// file of this package can call it. A regression that stopped using it would be
+// caught by nothing here, and that is stated rather than papered over.
+//
+// The pixels are proved elsewhere and against a real GPU: `example/drawsmoke`
+// reads the reserved texel back and checks it is opaque with no fringe.
+package text
+
+import "app:draw"
+import "app:font"
+import "core:mem/libc"
+import "core:mem"
+
+private const [4]u8 WHITE = [255, 255, 255, 255]
+private const [4]u8 BLUE = [64, 128, 255, 255]
+
+private const i32 FB_W = 800
+private const i32 FB_H = 600
+
+private bool near(f32 a, f32 b, f32 eps):
+    f32 d = a - b
+    if d < 0.0:
+        d = -d
+    return d <= eps
+
+// One item on a canvas of its own, so that a render counts this item and
+// nothing else. A shared canvas would mean every earlier section's item was
+// still being painted, and every count below would be a sum.
+private (draw.Canvas c, draw.Item it) solo():
+    draw.Canvas c = draw.canvas_create()
+    return (c, draw.canvas_item_create(c))
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = libc.allocator()
+
+    ok = #expect(draw.init_headless() using alloc, "init_headless") && ok
+    font.Font f = font.fallback(16.0) using alloc
+    (i32 aw, i32 ah) = font.atlas_size(&f)
+    draw.Texture atlas = draw.texture_create(aw, ah, font.atlas_pixels(&f))
+    ok = #expect(draw.texture_valid(atlas), "the atlas took a handle") && ok
+    f32 cw = font.cell_width(&f)
+    f32 lh = font.line_height(&f)
+
+    // ── a run is commands in an item, and it ends where `measure` says ─────
+    //
+    // The pen loop and the measuring walk are two functions and they must
+    // agree, or a caret sits somewhere the text is not. And every inked glyph
+    // is exactly one command in the item the caller named — not in a frame,
+    // not in the server, in the item.
+
+    (draw.Canvas c1, draw.Item line) = solo()
+    ok = #expect(draw.canvas_item_is_empty(line), "a fresh item holds nothing") && ok
+    f32 end = run_at_baseline(line, &f, atlas, 10.0, 40.0, "hello", WHITE)
+    ok = #expect(near(end - 10.0, font.measure(&f, "hello"), 0.001),
+                 "run ended at ", end - 10.0, " but measure says ",
+                 font.measure(&f, "hello")) && ok
+    ok = #expect(draw.canvas_item_command_count(line) == 5,
+                 "five inked glyphs are five commands, got ",
+                 draw.canvas_item_command_count(line)) && ok
+
+    draw.canvas_render(c1, FB_W, FB_H)
+    ok = #expect(draw.painted() == 1, "one item painted, got ", draw.painted()) && ok
+    ok = #expect(draw.commands() == 5,
+                 "the render replayed ", draw.commands(), " commands") && ok
+    ok = #expect(draw.primitives() == 5,
+                 "each glyph is one textured rect, got ", draw.primitives()) && ok
+    ok = #expect(draw.state_changes() == 1,
+                 "one run over one atlas is one view bind, got ",
+                 draw.state_changes()) && ok
+
+    // ── the item outlives the frame, and the pen does not ──────────────────
+    //
+    // This is row G2 made visible. A second render draws the same five glyphs
+    // and re-records nothing, so the string is not walked, so no pen is
+    // produced — what the second frame has is the item, and a caller that
+    // wanted the width had to keep `end`.
+
+    draw.canvas_render(c1, FB_W, FB_H)
+    ok = #expect(draw.canvas_item_command_count(line) == 5,
+                 "a render neither consumes nor re-records the list, got ",
+                 draw.canvas_item_command_count(line)) && ok
+    ok = #expect(draw.commands() == 5,
+                 "and the second frame replays the same five, got ",
+                 draw.commands()) && ok
+
+    // `canvas_item_clear` is what a re-record begins with, and it is the only
+    // thing that empties a list.
+    draw.canvas_item_clear(line)
+    ok = #expect(draw.canvas_item_command_count(line) == 0,
+                 "clear empties the list, got ",
+                 draw.canvas_item_command_count(line)) && ok
+    draw.canvas_free(c1)
+
+    // ── a blank, and the empty run ─────────────────────────────────────────
+
+    (draw.Canvas c2, draw.Item blanks) = solo()
+    f32 sp = run_at_baseline(blanks, &f, atlas, 0.0, 40.0, "a b", WHITE)
+    ok = #expect(draw.canvas_item_command_count(blanks) == 2,
+                 "a space is not a command, got ",
+                 draw.canvas_item_command_count(blanks)) && ok
+    ok = #expect(near(sp, 3.0 * cw, 0.001), "'a b' ended at ", sp) && ok
+
+    draw.canvas_item_clear(blanks)
+    f32 nothing = run_at_baseline(blanks, &f, atlas, 7.0, 40.0, "", WHITE)
+    ok = #expect(draw.canvas_item_command_count(blanks) == 0,
+                 "the empty run recorded ",
+                 draw.canvas_item_command_count(blanks), " commands") && ok
+    ok = #expect(near(nothing, 7.0, 0.001),
+                 "the empty run moved the pen to ", nothing) && ok
+
+    // ── the two anchors are one ascent apart ───────────────────────────────
+    //
+    // Both spellings must end at the same pen, and `run` must be
+    // `run_at_baseline` an ascent lower. The second half is checked where it
+    // can be seen: `example/drawsmoke` reads the pixels.
+
+    draw.canvas_item_clear(blanks)
+    f32 top_end = run(blanks, &f, atlas, 10.0, 40.0, "hello", WHITE)
+    ok = #expect(near(top_end, end, 0.001),
+                 "the two anchors ended at different pens: ", top_end,
+                 " vs ", end) && ok
+    draw.canvas_free(c2)
+
+    // ── `.notdef` is a glyph and it records like one ───────────────────────
+
+    (draw.Canvas c3, draw.Item boxes_item) = solo()
+    f32 boxes = run_at_baseline(boxes_item, &f, atlas, 0.0, 40.0, "日本語", WHITE)
+    ok = #expect(draw.canvas_item_command_count(boxes_item) == 3,
+                 "three characters, three boxes, got ",
+                 draw.canvas_item_command_count(boxes_item)) && ok
+    ok = #expect(near(boxes, 3.0 * font.notdef(&f).advance, 0.001),
+                 "three unknown characters ended at ", boxes) && ok
+    draw.canvas_render(c3, FB_W, FB_H)
+    ok = #expect(draw.state_changes() == 1,
+                 "three .notdef boxes are one bind, got ", draw.state_changes()) && ok
+    draw.canvas_free(c3)
+
+    // ── a glyph's source rect is the atlas pixel rect ──────────────────────
+    //
+    // `glyph_src` is the one place this package turns a `font.Glyph` into
+    // something `app:draw` takes, and what it must produce is the glyph's box
+    // **in atlas pixels**. The normalised form it replaced is distinguishable
+    // by inspection and not only by equality: every number of a uv rectangle
+    // is in `0..1`, and a real glyph box is several texels across and sits at
+    // an offset of tens.
+
+    font.Glyph ga = font.glyph(&f, 'A')
+    ok = #expect(ga.present && ga.pw > 0, "the fallback face has an 'A'") && ok
+    [4]f32 src = glyph_src(ga)
+    [4]f32 want = (f32(ga.px), f32(ga.py), f32(ga.pw), f32(ga.ph))
+    ok = #expect(src == want,
+                 "the source rect is ", src[0], ",", src[1], " ", src[2], "x", src[3],
+                 " and the glyph's box is ", want[0], ",", want[1], " ",
+                 want[2], "x", want[3]) && ok
+    ok = #expect(src[2] > 1.0 && src[3] > 1.0,
+                 "pixels, not uv: the extent is ", src[2], "x", src[3]) && ok
+    ok = #expect(src[0] + src[2] <= f32(aw) && src[1] + src[3] <= f32(ah),
+                 "and it lies inside the ", aw, "x", ah, " atlas") && ok
+
+    // ── `fill` and a glyph run land in one item, and therefore in one bind ──
+    //
+    // Ten two-glyph runs with a solid box between each pair, twice, in the same
+    // item shape. Through `draw.rect` the box is untextured, so the replay
+    // resets the view for it and binds the atlas again for the next run: 20
+    // counted state changes. Through `fill` the box rides `font.solid_src` and
+    // the whole item is one bind. Both are built here so the two numbers are
+    // comparable and neither is a claim.
+    //
+    // **What the counted number is, exactly.** 20 is the *upper bound*, not a
+    // draw-call count: `sokol_gp`'s batch optimiser reorders and merges behind
+    // this, and how much of the 20 it wins back is a question for
+    // `draw.gpu_draw_calls()` on a machine that has a GPU. The package comment
+    // has the four bounds it works inside and why a line of text meets all
+    // four. What 1 means needs no such qualification, and that asymmetry is
+    // the whole argument for riding the atlas.
+
+    (draw.Canvas c4, draw.Item obvious) = solo()
+    for i in 0..<10:
+        f32 x = f32(i32(i)) * 40.0
+        _ = run_at_baseline(obvious, &f, atlas, x, 40.0, "ab", WHITE)
+        draw.rect(obvious, (x + 20.0, 30.0, 8.0, 12.0), BLUE)
+    ok = #expect(draw.canvas_item_command_count(obvious) == 30,
+                 "20 glyphs + 10 boxes = 30 commands, got ",
+                 draw.canvas_item_command_count(obvious)) && ok
+    draw.canvas_render(c4, FB_W, FB_H)
+    i32 split = draw.state_changes()
+    ok = #expect(draw.primitives() == 30,
+                 "and 30 primitives, got ", draw.primitives()) && ok
+
+    (draw.Canvas c5, draw.Item batched) = solo()
+    for i in 0..<10:
+        f32 x = f32(i32(i)) * 40.0
+        _ = run_at_baseline(batched, &f, atlas, x, 40.0, "ab", WHITE)
+        fill(batched, &f, atlas, x + 20.0, 30.0, 8.0, 12.0, BLUE)
+    ok = #expect(draw.canvas_item_command_count(batched) == 30,
+                 "the same content is the same 30 commands, got ",
+                 draw.canvas_item_command_count(batched)) && ok
+    draw.canvas_render(c5, FB_W, FB_H)
+    i32 joined = draw.state_changes()
+    ok = #expect(draw.primitives() == 30,
+                 "and the same 30 primitives, got ", draw.primitives()) && ok
+
+    ok = #expect(split == 20,
+                 "ten runs alternating with ten untextured boxes should cost 20 ",
+                 "state changes, got ", split) && ok
+    ok = #expect(joined == 1,
+                 "the same content through the atlas should cost 1, got ",
+                 joined) && ok
+    draw.canvas_free(c4)
+    draw.canvas_free(c5)
+
+    // ── the other rectangles ride the same bind ────────────────────────────
+
+    (draw.Canvas c6, draw.Item mixed) = solo()
+    _ = run_at_baseline(mixed, &f, atlas, 0.0, 40.0, "hit", WHITE)
+    underline(mixed, &f, atlas, 0.0, 40.0, font.measure(&f, "hit"), BLUE)
+    caret(mixed, &f, atlas, 30.0, 40.0 - font.ascent(&f), 2.0, BLUE)
+    outline(mixed, &f, atlas, 60.0, 20.0, 30.0, 20.0, 1.0, BLUE)
+    fill(mixed, &f, atlas, 100.0, 20.0, 30.0, 20.0, BLUE)
+    ok = #expect(draw.canvas_item_command_count(mixed) == 3 + 1 + 1 + 4 + 1,
+                 "text, underline, caret, outline and fill are ",
+                 draw.canvas_item_command_count(mixed), " commands") && ok
+    draw.canvas_render(c6, FB_W, FB_H)
+    ok = #expect(draw.state_changes() == 1,
+                 "and one bind, got ", draw.state_changes()) && ok
+    draw.canvas_free(c6)
+
+    // A degenerate rectangle records nothing rather than a zero-area command.
+    (draw.Canvas c7, draw.Item degen) = solo()
+    fill(degen, &f, atlas, 0.0, 0.0, 0.0, 10.0, BLUE)
+    fill(degen, &f, atlas, 0.0, 0.0, 10.0, 0.0, BLUE)
+    outline(degen, &f, atlas, 0.0, 0.0, 10.0, 10.0, 0.0, BLUE)
+    ok = #expect(draw.canvas_item_command_count(degen) == 0,
+                 "a degenerate rectangle recorded ",
+                 draw.canvas_item_command_count(degen), " commands") && ok
+    draw.canvas_free(c7)
+
+    // ── culling drops the commands it claims to ────────────────────────────
+    //
+    // The claim is about *commands*, not about pixels: an off-screen glyph must
+    // not reach the item at all, because the point of a retained list is that
+    // what is in it is what a frame costs for as long as it is in it.
+
+    string8 long = "0123456789012345678901234567890123456789"
+    (draw.Canvas c8, draw.Item all_item) = solo()
+    f32 all_end = run_at_baseline(all_item, &f, atlas, 0.0, 40.0, long, WHITE)
+    i32 all_cmds = draw.canvas_item_command_count(all_item)
+    ok = #expect(all_cmds == 40, "forty digits are forty commands, got ", all_cmds) && ok
+
+    (draw.Canvas c9, draw.Item cut_item) = solo()
+    f32 cut_end = run_clipped(cut_item, &f, atlas, 0.0, 40.0, long, WHITE, 0.0, 5.0 * cw)
+    i32 cut_cmds = draw.canvas_item_command_count(cut_item)
+    ok = #expect(cut_cmds < all_cmds,
+                 "culling recorded ", cut_cmds, " of ", all_cmds, " commands") && ok
+    ok = #expect(cut_cmds >= 5,
+                 "culling dropped a visible glyph: ", cut_cmds,
+                 " commands for five cells") && ok
+    // The answer is where recording stopped, not where the run ends — the walk
+    // does not measure a tail it is not drawing, and that is the saving.
+    ok = #expect(cut_end < all_end,
+                 "a culled run answered the full width ", cut_end) && ok
+    ok = #expect(cut_end >= 5.0 * cw,
+                 "a culled run stopped before the window edge, at ", cut_end) && ok
+
+    // A window entirely to the left of the run records nothing at all, and the
+    // item is empty rather than holding commands a scissor would have thrown
+    // away at replay.
+    (draw.Canvas c10, draw.Item off_item) = solo()
+    _ = run_clipped(off_item, &f, atlas, 100.0, 40.0, long, WHITE, 0.0, 50.0)
+    ok = #expect(draw.canvas_item_is_empty(off_item),
+                 "a run past the right edge recorded ",
+                 draw.canvas_item_command_count(off_item), " commands") && ok
+    draw.canvas_render(c10, FB_W, FB_H)
+    ok = #expect(draw.commands() == 0 && draw.primitives() == 0,
+                 "so its frame costs nothing: ", draw.commands(), " ",
+                 draw.primitives()) && ok
+    draw.canvas_free(c8)
+    draw.canvas_free(c9)
+    draw.canvas_free(c10)
+
+    // ── a tab advances and records nothing ─────────────────────────────────
+    //
+    // Both spellings are checked, because a run loop that forgot `Cell.tab`
+    // would record a box on top of the indent and still measure right.
+
+    font.Tabs t4 = tabs4(&f)
+    (draw.Canvas c11, draw.Item tabbed) = solo()
+    f32 tab_end = run_tabbed(tabbed, &f, atlas, 0.0, 40.0, "ab\tx", WHITE, t4, 0.0, 800.0)
+    ok = #expect(draw.canvas_item_command_count(tabbed) == 3,
+                 "a tab recorded a command: ",
+                 draw.canvas_item_command_count(tabbed), " for 'ab\\tx'") && ok
+    ok = #expect(near(tab_end, 5.0 * cw, 0.001), "'ab\\tx' ended at ", tab_end) && ok
+    ok = #expect(near(tab_end, font.measure_tabbed(&f, "ab\tx", t4), 0.001),
+                 "the run and the measurement disagree about a tab") && ok
+
+    draw.canvas_item_clear(tabbed)
+    _ = run_at_baseline(tabbed, &f, atlas, 0.0, 40.0, "ab\tx", WHITE)
+    ok = #expect(draw.canvas_item_command_count(tabbed) == 4,
+                 "with no stops a tab is a .notdef box: ",
+                 draw.canvas_item_command_count(tabbed), " commands") && ok
+    draw.canvas_free(c11)
+
+    // ── a nil face, and a target that is not there ─────────────────────────
+    //
+    // Neither is a crash, and neither is a silent zero: a run into `NIL_ITEM`
+    // records nothing and answers the pen it would have reached, because the
+    // walk is not the recording.
+
+    ^font.Font none
+    (draw.Canvas c12, draw.Item nil_face) = solo()
+    f32 nil_end = run_at_baseline(nil_face, none, atlas, 12.0, 40.0, "hello", WHITE)
+    fill(nil_face, none, atlas, 0.0, 0.0, 10.0, 10.0, BLUE)
+    underline(nil_face, none, atlas, 0.0, 0.0, 10.0, BLUE)
+    caret(nil_face, none, atlas, 0.0, 0.0, 2.0, BLUE)
+    outline(nil_face, none, atlas, 0.0, 0.0, 10.0, 10.0, 1.0, BLUE)
+    ok = #expect(near(nil_end, 12.0, 0.001), "run(nil) moved the pen to ", nil_end) && ok
+    ok = #expect(draw.canvas_item_command_count(nil_face) == 0,
+                 "run(nil) recorded ", draw.canvas_item_command_count(nil_face),
+                 " commands") && ok
+    draw.canvas_free(c12)
+
+    f32 no_target = run_at_baseline(draw.NIL_ITEM, &f, atlas, 10.0, 40.0, "hello", WHITE)
+    ok = #expect(near(no_target, end, 0.001),
+                 "a run with nowhere to record answered ", no_target,
+                 " where a recorded one answered ", end) && ok
+
+    // ── the line height a caret spans ──────────────────────────────────────
+    ok = #expect(lh > 0.0, "the fallback has no line height") && ok
+
+    // ── a grow does not move a glyph's source rect ─────────────────────────
+    //
+    // Last, because it changes the atlas's shape and every texture handle above
+    // it names the old one. This is the invariant `glyph_src` is built on: a
+    // pixel rectangle survives a `grow_atlas` where the normalised form it
+    // replaced divided by a height that just doubled.
+
+    ok = #expect(font.grow_atlas(&f), "the atlas grew") && ok
+    ok = #expect(glyph_src(font.glyph(&f, 'A')) == want,
+                 "a grow moved 'A''s source rect") && ok
+
+    font.destroy(&f)
+    draw.shutdown()
+    if ok:
+        return 0
+    return 1
+
+private font.Tabs tabs4(^font.Font f):
+    return font.tabs(4.0 * font.cell_width(f), 4)

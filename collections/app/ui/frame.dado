@@ -1,0 +1,385 @@
+// app:ui — the frame: opening a window, and everything a program does not
+// have to wire.
+//
+//     import "app:ui"
+//
+//     !void ready():
+//         ui.Control view = ui.text_view(ui.NIL)
+//         ...
+//
+//     !i32 main():
+//         try ui.open(1200, 800, "ide")
+//         ui.hook(ready: ready)
+//         try ui.run()
+//         return 0
+//
+// **A program opens a window and builds a tree; it does not drive a
+// renderer.** This package installs its own four hooks on the app runtime
+// (`app:graphical`) and calls the program's inside them, so a program never
+// brings up the grid, never polls input for the tree, never runs layout,
+// never uploads the atlas and never issues a draw. What happens each frame,
+// in order:
+//
+//   - `ready`: the grid comes up at the display's DPI scale, then the
+//     program's `ready` builds its tree.
+//   - `process`: the input queue is drained and each event is offered,
+//     bubbling up, to the focused node — or, for a mouse event, to the node
+//     holding the capture or else the one under the pointer (`dispatch`);
+//     what nobody handled is kept for the program (`unhandled`). The pointer
+//     is placed against the hit map the last frame's paint left, which is
+//     the picture the user clicked on. Then the program's `process` runs. Then the
+//     screen is sized in whole cells (`grid.begin`), the tree is laid out and
+//     its dirty nodes painted into the grid (`update`), and the atlas page is
+//     uploaded if a paint made a new glyph resident (`grid.prepare`) — all
+//     outside the render pass. Before `update` the grid is given as many
+//     layer groups as the tree's nodes use (`layers_used`); after it, the
+//     chrome — every visible node's `StyleBox` in pixels — is rebuilt if
+//     anything it depends on changed (`chrome_sync`), which an idle frame
+//     never does, and the window's clear colour follows the theme's
+//     `window_bg`.
+
+//   - `draw`: inside the pass, the program's `draw` if it has one, then the
+//     grid's layers, bottom first, each as its chrome, one instanced draw of
+//     its cells, its scrolling regions, and then its ink (icons and pixel
+//     boxes, `ink_begin`).
+//   - `shutdown`: the program's `shutdown`, then the tree and the grid go
+//     down.
+//
+// The per-frame spans and counters this runs are readable (`frame_stats`), so
+// an instrument can print what a frame cost without reaching inside.
+//
+// ── Drawing only when the picture changes ──────────────────────────────────
+//
+// **`process` runs every loop iteration; `draw` runs only on a frame whose
+// pixels would differ from the last one drawn.** This package turns the
+// runtime's redraw-on-demand on at `open` and asks for each frame it wants
+// (`app.request_redraw`), deciding at the end of `process`, once everything
+// that can change the picture this frame has run. A frame is drawn when
+// (`FrameChange`, `redraw_decide`):
+//
+//   - a node painted, or the chrome was rebuilt — the cells or the boxes
+//     changed;
+//   - the atlas page was uploaded, or is still dirty — and sokol_gfx allows
+//     one image update per `sg_commit`, which only a drawn frame makes, so an
+//     upload on an undrawn frame would make the next one a validation error;
+//   - the framebuffer changed size (in pixels, not only in cells — a new
+//     swapchain holds nothing), a `Resize` event arrived, or the window
+//     regained focus;
+//   - the clear colour changed (a theme's `window_bg`);
+//   - something called `request_frame` — a widget that changed what is on
+//     screen without painting a cell, such as a scroll region's pixel
+//     offset, or a program whose own `draw` hook has something new;
+//   - it is the first frame.
+//
+// **And then `SETTLE_FRAMES` more.** On a skipped frame the runtime opens no
+// pass and calls no draw hook, and sokol_gfx is not committed, but sokol_app's
+// X11 loop still calls `glXSwapBuffers` every iteration (`_sapp_linux_frame`
+// swaps unconditionally): the loop keeps presenting whatever the back buffer
+// holds. Under a copy-on-swap driver (Mesa's software GL, Xvfb) that is the
+// last picture drawn; under a flipping one it is the picture from one or two
+// swaps ago. Drawing the same picture into every buffer of the chain before
+// going quiet is what makes both show the right thing, so a change draws its
+// frame and `SETTLE_FRAMES` (2, enough for triple buffering) identical ones
+// after it. Metal and D3D present only from a committed pass, so there the
+// extra frames only cost their draw. A driver that discards the back buffer
+// on swap (EGL's `EGL_BUFFER_DESTROYED`) cannot be helped by any number; the
+// program would need `set_continuous(true)`.
+//
+// What a skipped frame still does: the runtime runs `process` (so the queue
+// is drained, dispatch, layout and paint all run, and an idle frame is cheap
+// because the tree answers from the root's bits), rolls back the temp arena
+// and ends the input frame; sokol still pumps the X event queue before each
+// iteration and still swaps after it (the swap blocks up to a refresh under
+// vsync); and `app:graphical` tops an undrawn iteration up to
+// `set_idle_frame_time` (8 ms by default) with a nap, counting the time the
+// swap already took rather than adding to it. So an idle loop polls at the
+// slower of the display's refresh and the budget — ~110 times a second
+// measured under Xvfb, where the swap does not block; the refresh rate under
+// vsync — and a keystroke waits at most one such period before its frame
+// starts.
+//
+// `set_continuous(true)` turns all of this off and draws every frame, for a
+// program that animates.
+package ui
+
+import app "app:graphical"
+import "app:display"
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+import "core:time"
+
+type ReadyFn:    !void()
+type ProcessFn:  !void(f32)
+type DrawFn:     !void()
+type ShutdownFn: !void()
+
+// Refused before the loop starts: the grid would not come up.
+const i32 E_GRID_UP = 20
+
+private !void no_hook():                 return
+private !void no_process(f32 dt):        _ = dt
+
+private ReadyFn    g_user_ready    = no_hook
+private ProcessFn  g_user_process  = no_process
+private DrawFn     g_user_draw     = no_hook
+private ShutdownFn g_user_shutdown = no_hook
+
+// This frame's events that no node handled, in arrival order.
+private ref []input.Event g_unhandled
+private i32 g_nunhandled
+
+// What one frame of this package cost, as spans on the monotonic clock
+// (microseconds of wall time across CPU work, not CPU time) and counts.
+// `process_us` covers dispatch, layout, paint, the chrome rebuild and the
+// atlas upload; `render_us` covers the instance uploads and the draws (chrome
+// and cells, every layer); neither covers the program's own hooks or anything
+// the runtime does between them, such as acquiring the next framebuffer.
+// `chrome_rebuilt` is whether this frame rebuilt the chrome, and
+// `chrome_boxes` how many boxes the chrome holds.
+//
+// `drawn` is whether the frame was drawn; on one that was not, `render_us` and
+// `input_to_render_us` are 0.
+//
+// `input_to_render_us` is, for a drawn frame whose `process` received input
+// events, the span from the start of that `process` to the end of that
+// frame's grid render — the part of input latency this program's own work
+// decides: dispatch, the program's `process`, layout, paint, the chrome, the
+// atlas upload, the program's `draw` and the instance uploads and draws. It
+// does **not** include the OS delivering the event to the window, the time the
+// event waited before the frame began (up to one idle period — the slower of
+// a refresh and the idle budget — or one swap wait while drawing), the
+// runtime's `sg_commit` and swap, the
+// compositor, or the display's scan-out. 0 on a frame with no events or not
+// drawn.
+type FrameStats: (
+    f64 process_us,
+    f64 render_us,
+    i32 events,
+    i32 unhandled,
+    bool resized,
+    bool chrome_rebuilt,
+    i32 chrome_boxes,
+    bool drawn,
+    f64 input_to_render_us,
+)
+
+private FrameStats g_frame
+
+// ── Redraw on demand ───────────────────────────────────────────────────────
+
+// Identical frames drawn after the one that changed, so that every buffer of
+// a double- or triple-buffered swapchain holds the new picture before the
+// loop stops drawing (see the package comment).
+@const i32 SETTLE_FRAMES = 2
+
+// Why a frame's pixels would differ from the last frame drawn. Each is one
+// cause the package comment lists; `redraw_decide` draws when any is set.
+type FrameChange: (
+    bool painted,
+    bool chrome,
+    bool upload,
+    bool resized,
+    bool exposed,
+    bool background,
+    bool asked,
+)
+
+// Whether to draw this frame, and how many settling frames remain after it:
+// a change draws and restarts the count at `SETTLE_FRAMES`; no change draws
+// while the count lasts, one a frame; then nothing is drawn. Pure.
+(bool draw, i32 settle) redraw_decide(FrameChange ch, i32 settle):
+    if ch.painted || ch.chrome || ch.upload || ch.resized || ch.exposed || ch.background || ch.asked:
+        return (true, SETTLE_FRAMES)
+    if settle > 0:
+        return (true, settle - 1)
+    return (false, 0)
+
+private bool g_continuous
+// True at start, so the first frame draws whatever else it finds.
+private bool g_frame_asked = true
+private i32  g_settle
+private i32  g_last_w = -1
+private i32  g_last_h = -1
+// Whether this frame's `process` received events, and when it started.
+private bool g_input_seen
+private f64  g_input_t0
+
+// Ask for the next frame to be drawn (the one being processed, when called
+// before the end of its `process`). For a change to what is on screen that
+// no node's paint makes — a region's pixel offset, a program's own drawing.
+// Cheap and idempotent; a node's `mark_paint` never needs it.
+void request_frame():
+    g_frame_asked = true
+
+// Draw every frame (`true`) or only frames whose picture changed (`false`,
+// the default). For a program that animates in its own `draw` hook every
+// frame; one that animates now and then calls `request_frame` instead.
+void set_continuous(bool on):
+    g_continuous = on
+    app.set_redraw_on_demand(!on)
+    g_frame_asked = true
+
+bool continuous():
+    return g_continuous
+
+// The theme generation whose `window_bg` the window is cleared to.
+private i64 g_bg_gen = -1
+
+// Clear the window to the theme's `window_bg` when the theme changed since;
+// answers whether it did.
+private bool apply_window_bg():
+    i64 gen = theme_generation()
+    if gen == g_bg_gen:
+        return false
+    g_bg_gen = gen
+    [4]u8 c = theme_window_bg()
+    display.set_background(f32(c[0]) / 255.0, f32(c[1]) / 255.0, f32(c[2]) / 255.0, f32(c[3]) / 255.0)
+    return true
+
+FrameStats frame_stats():
+    return g_frame
+
+// Open a window `width` by `height` (in logical pixels) titled `title`. Refuses
+// a size that is not one; the runtime owns that code.
+!void open(i32 width, i32 height, string8 title):
+    try app.init(width, height, title)
+    app.hook(ready: ui_ready, process: ui_process, draw: ui_draw, shutdown: ui_shutdown)
+    app.set_redraw_on_demand(!g_continuous)
+
+// The program's hooks, each optional.
+void hook(ReadyFn ready = no_hook, ProcessFn process = no_process,
+          DrawFn draw = no_hook, ShutdownFn shutdown = no_hook):
+    g_user_ready = ready
+    g_user_process = process
+    g_user_draw = draw
+    g_user_shutdown = shutdown
+
+// Run until the window closes or `quit` is called. Carries out any failure a
+// hook raised; `E_GRID_UP` is this package's own.
+!void run():
+    try app.run()
+
+void quit():
+    app.quit()
+
+// How many events this frame no node handled, and the `i`th of them in
+// arrival order. An `i` out of range answers a zero event, whose kind is
+// `Key` with code 0, which no key is.
+i32 unhandled_count():
+    return g_nunhandled
+
+input.Event unhandled_at(i32 i):
+    input.Event none
+    if g_unhandled == nil || i < 0 || i >= g_nunhandled:
+        return none
+    return g_unhandled[i]
+
+// `ready` runs under the runtime's persistent allocator, which is why the
+// tree's pool is created here, before anything else can create it: the tree
+// takes the allocator that is ambient when its pool is first made, and a
+// program that builds nothing in its own `ready` would otherwise have it made
+// by the first `update`, inside a per-frame arena that is rolled back.
+private !void ui_ready():
+    if !grid.up(display.window_get_dpi_scale()):
+        fail E_GRID_UP
+    _ = ensure()
+    g_unhandled = #make([]input.Event, 64, g_alloc)
+    try g_user_ready()
+    return
+
+// Grows rather than dropping: an event nobody handled may be the one the
+// program is waiting for, and a burst of mouse motion in one frame must not
+// push a keystroke out.
+private void keep(input.Event e):
+    if g_unhandled == nil:
+        return
+    if g_nunhandled >= i32(#len(g_unhandled)):
+        if !#resize(g_unhandled, #len(g_unhandled) * 2):
+            return
+    g_unhandled[g_nunhandled] = e
+    g_nunhandled = g_nunhandled + 1
+
+private !void ui_process(f32 dt):
+    f64 t0 = time.now()
+    g_nunhandled = 0
+    i32 events = 0
+    bool exposed = false
+    [32]input.Event evs
+    for:
+        i32 n = input.poll(evs[:])
+        if n <= 0:
+            break
+        for i in 0..<n:
+            events = events + 1
+            if evs[i].kind == input.EventKind.Resize || input.is_focus_gained(evs[i]):
+                exposed = true
+            if !dispatch(evs[i]):
+                keep(evs[i])
+    f64 t_disp = time.now()
+    try g_user_process(dt)
+    f64 t_user = time.now()
+
+    (i32 w, i32 h) = display.window_get_size()
+    if w != g_last_w || h != g_last_h:
+        g_last_w = w
+        g_last_h = h
+        exposed = true
+    bool resized = grid.begin(w, h)
+    if grid.layers() != layers_used():
+        grid.set_layers(layers_used())
+    update(cell.rect(0, 0, grid.cols(), grid.rows()))
+    bool rebuilt = chrome_sync()
+    bool bg = apply_window_bg()
+    grid.prepare()
+    i32 painted = stats().painted
+    sync_cursor()
+    f64 t1 = time.now()
+
+    FrameChange ch = (painted > 0, rebuilt, grid.stats().frame_page_upload_bytes > 0 || grid.atlas_dirty(),
+                      resized, exposed, bg, g_frame_asked)
+    g_frame_asked = false
+    (bool draw, i32 settle) = redraw_decide(ch, g_settle)
+    g_settle = settle
+    if g_continuous:
+        draw = true
+    if draw:
+        app.request_redraw()
+    g_input_seen = events > 0
+    g_input_t0 = t0
+
+    g_frame.process_us = ((t_disp - t0) + (t1 - t_user)) * 1000000.0
+    g_frame.events = events
+    g_frame.unhandled = g_nunhandled
+    g_frame.resized = resized
+    g_frame.chrome_rebuilt = rebuilt
+    (i64 _, i32 boxes, bool _) = chrome_counters()
+    g_frame.chrome_boxes = boxes
+    // The render fields are this frame's own once `ui_draw` has run, and stay
+    // 0 on a frame that is not drawn.
+    g_frame.drawn = draw
+    g_frame.render_us = 0.0
+    g_frame.input_to_render_us = 0.0
+
+    return
+
+private !void ui_draw():
+    try g_user_draw()
+    f64 t0 = time.now()
+    (i32 w, i32 h) = display.window_get_size()
+    grid.render(w, h)
+    f64 t1 = time.now()
+    g_frame.render_us = (t1 - t0) * 1000000.0
+    g_frame.drawn = true
+    if g_input_seen:
+        g_frame.input_to_render_us = (t1 - g_input_t0) * 1000000.0
+    return
+
+private !void ui_shutdown():
+    try g_user_shutdown()
+    reset()
+    grid.down()
+    if g_unhandled != nil:
+        #delete(g_unhandled)
+        g_unhandled = nil
+    return

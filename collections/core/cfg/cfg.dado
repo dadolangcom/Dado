@@ -1,0 +1,324 @@
+// core:cfg — a native INI reader/writer over core:io and core:os/fs.
+//
+//     import "core:cfg"
+//     import "core:mem"
+//
+//     (cfg.Config c, bool ok, i32 bad) = cfg.load("settings.ini", alloc)
+//     defer cfg.destroy(&c)
+//     i32 width = cfg.get_i32(c, "window", "width", 1280, alloc)
+//     cfg.set_i32(&c, "window", "width", width, alloc)
+//     cfg.save(c, "settings.ini", alloc)
+//
+// The format is INI, and a vendored C parser was ruled out in favour of
+// this one — zero dependency, and the result is a queryable
+// Dado value rather than an opaque handle behind a getter that only speaks
+// `"section:key"` strings.
+//
+// **The format.** `[section]` headers, `key = value` lines, `;` and `#`
+// comments, blank lines — the common subset every INI reader agrees on.
+// Whitespace around `=` and around a section name is trimmed; nothing else
+// is. Lines before the first header land in the `""` section, so a caller
+// that never writes `[section]` still has a flat key=value file.
+//
+// **Forgiving on read, exact on write.** A hand-edited config is not a wire
+// protocol: a stray line that isn't a comment, a header or a `key = value`
+// pair is skipped rather than failing the whole load, the same stance
+// `numbers.to_i32` (`core:strings/parse`) takes on unparsable text.
+// `bad_lines` says how many were dropped and `ok` is `bad_lines == 0`, so a
+// caller that cares can still tell the difference between "booted clean" and
+// "booted anyway".
+//
+// **Every value a `Config` holds is its own allocation, and `destroy` ends
+// them.** Section and key names become map keys, and a map already copies
+// those on a fresh insert and frees them at `#delete`; the *value* half of
+// every entry is a `ref []char8` the map neither copies nor frees, so
+// `parse`/`set_*` clone it in and `destroy(&c)` frees every value, every
+// section's map and the outer map. A `set_*` over a key that already has a
+// value frees the old one first, so a reload or an overwrite does not leak.
+// The result is a `Config` that does not borrow from the text it was parsed
+// from — `load` frees its read buffer the moment `parse` returns — and one
+// that can be ended: **the caller that made it calls `destroy`**, or made it
+// under a `using` arena whose end is the free. `get`/`get_string` answer a
+// `string8` **window** into the stored value, good until that key is set
+// again or the `Config` is destroyed.
+//
+// **Why the value type is `ref []char8` and not `string8`**:
+// a `string8` is a window, `#delete` of a window is ERR0504, and so a value
+// stored as one could be freed by nobody — `clone` minted a `ref`, returned a
+// window over it, and the `ref`, the only thing with authority to free, died
+// at the end of `clone`. LeakSanitizer measured it: every value of every
+// `Config` ever parsed, and a program reloading its config leaked the whole
+// config each time. Storing the `ref` keeps the authority where `destroy` can
+// reach it; the getters still answer `string8`, so no reader changed.
+package cfg
+
+import "core:strings"
+// `STR-FREESTANDING` (2026-09-02): `to_i32`/`to_f64` left `core:strings` for a
+// package of their own, then a `foreign "stdlib.h"` block and now plain Dado.
+// This package parses, so it imports the parsers by name.
+//
+// **Bound `numbers` rather than taking the default `parse`**, which would
+// collide with this file's own `parse` function; an import's optional binding
+// is what that is for.
+import numbers "core:strings/parse"
+import "core:io"
+import "core:os/fs"
+import "core:mem"
+
+// section -> key -> value. `""` is the implicit default section. Each value
+// is an owned run; read one with `get`/`get_string`, end them all with
+// `destroy`.
+type Config: {string8: {string8: ref []char8}}
+
+// `string ⇄ []char8` is free, but `[]T` is not a callable
+// spelling — the conversion is only reachable through a named alias. This is
+// that alias, used wherever a `string` needs to reach `write_bytes`.
+type Bytes: []char8
+
+// A fresh, empty config. The allocator is explicit, not `#default`
+// — the same reason `polygon.offset_by` takes one: a parameter default has
+// to fold at compile time and the ambient allocator is a runtime value.
+Config fresh((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    return #make(Config, 8, alloc)
+
+// A value's own copy, independent of whatever `s` was a window into. Every
+// value stored in a `Config` goes through this — see the package doc comment
+// on why keys don't need the same treatment. **It returns the `ref`**, which
+// is what makes the copy freeable; it used to return `string8(out[:])` and
+// drop the `ref` on the floor.
+ref []char8 clone(string8 s, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i64 n = #len(s)
+    ref []char8 out = #make([]char8, n, alloc)
+    for i in 0..<n:
+        out[i] = s[i]
+    return out
+
+// Store `val` under `section`/`key`, freeing the value it replaces. The one
+// place a value enters a `Config`: `parse` (where a key repeated in a file
+// overwrites) and every `set_*` come through here, so an overwrite never
+// strands the old run.
+private void put(^Config cfg, string8 section, string8 key, ref []char8 val):
+    ({string8: ref []char8} sec, bool has_sec) = cfg^[section]
+    if has_sec:
+        (ref []char8 old, bool had) = sec[key]
+        if had:
+            #delete(old)
+    cfg^[section][key] = val
+
+// End a `Config`: every value, every section's map, and the outer map. `cfg`
+// is the zero `Config` afterwards, so a second `destroy` does nothing and a
+// `Config` that was never filled (`fresh`, or a missing file's `load`) is
+// safe to destroy. Not needed — and harmless — for a `Config` made under a
+// `using` arena, whose end frees all of it at once.
+void destroy(^Config cfg):
+    for _, sec in cfg^:
+        for _, val in sec:
+            #delete(val)
+        #delete(sec)
+    #delete(cfg^)
+
+// `[name]`, trimmed and unwrapped. False on anything that isn't a `[...]`
+// line or whose name is empty once trimmed — `[]` and `[  ]` are both bad.
+(string8 name, bool ok) parse_section(string8 ln):
+    i64 n = #len(ln)
+    if n < 2 || ln[n - 1] != ']':
+        return ("", false)
+    string8 inner = strings.trim(ln[1..<(n - 1)])
+    if strings.is_empty(inner):
+        return ("", false)
+    return (inner, true)
+
+// `key = value`, split on the first `=`. False when there is no `=` at all
+// or the key side is empty once trimmed — `= value` names nothing.
+(string8 key, string8 val, bool ok) parse_kv(string8 ln):
+    (string8 head, string8 tail, bool found) = strings.split_first(ln, "=")
+    if !found:
+        return ("", "", false)
+    string8 key = strings.trim(head)
+    if strings.is_empty(key):
+        return ("", "", false)
+    return (key, strings.trim(tail), true)
+
+// Parse INI text into a `Config`. See the package doc comment for the format
+// and the forgiving-on-read stance; `bad_lines` counts the lines this
+// skipped and `ok` is `bad_lines == 0`.
+// (`section` and `key` used to trip LNT0412, "declared and never read", under
+// `--strict`: the lint does not count a variable used only as a chained map
+// index in write position, `cfg[section][key] = …`, as read. The write moved
+// into `put` when values became freeable, so both are arguments now and the
+// lint is quiet here. The gap itself has since been closed: a map's key in a
+// place position is a read.)
+(Config cfg, bool ok, i32 bad_lines) parse(string8 text, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    Config cfg = #make(Config, 8, alloc)
+    string8 section = ""
+    i32 bad = 0
+    string8 rest = text
+    bool more = true
+    for more:
+        (string8 raw, string8 tail, bool found) = strings.line(rest)
+        rest = tail
+        more = found
+        string8 ln = strings.trim(raw)
+        if strings.is_empty(ln):
+            continue
+        if ln[0] == ';' || ln[0] == '#':
+            continue
+        if ln[0] == '[':
+            (string8 name, bool sok) = parse_section(ln)
+            if !sok:
+                bad = bad + 1
+                continue
+            section = name
+            continue
+        (string8 key, string8 val, bool kok) = parse_kv(ln)
+        if !kok:
+            bad = bad + 1
+            continue
+        put(&cfg, section, key, clone(val, alloc))
+    return (cfg, bad == 0, bad)
+
+// Whether `path` names a file `load` would actually read (as opposed to
+// nothing there yet, or a directory of that name).
+bool exists(cstring path):
+    return fs.exists(path) && fs.is_file(path)
+
+// Read `path` and parse it. A missing file is not an error — it returns a
+// fresh empty `Config` with `ok` true and `bad_lines` 0, which is what lets
+// `app:config`'s "no file yet, write defaults" path share this call with
+// the ordinary "read it back" path. Use `exists` first if the distinction
+// matters to the caller.
+(Config cfg, bool ok, i32 bad_lines) load(cstring path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    if !exists(path):
+        return (fresh(alloc), true, 0)
+    i64 nbytes = fs.bytes(path)
+    if nbytes <= 0:
+        return (fresh(alloc), true, 0)
+    auto f = io.open_read(path)
+    if !io.opened(f):
+        return (fresh(alloc), false, 0)
+    ref []char8 buf = #make([]char8, nbytes, alloc)
+    i64 n = io.read_bytes(f, buf[:])
+    io.close(f)
+    string8 text = string8(buf[0..<i32(n)])
+    (Config cfg, bool ok, i32 bad) = parse(text, alloc)
+    #delete(buf)
+    return (cfg, ok, bad)
+
+// Write every key of one section (no header) — the shared body `save` uses
+// for both the default section and each named one.
+void write_pairs(^io.FILE f, {string8: ref []char8} pairs):
+    for key, val in pairs:
+        io.write_bytes(f, Bytes(key))
+        io.write(f, " = ")
+        io.write_bytes(f, val[:])
+        io.write(f, "\n")
+
+// Write `cfg` to `path` as INI text: the default section's keys first with
+// no header, then every other section under its own `[name]`. Overwrites
+// whatever was at `path`. False only if the file could not be opened for
+// writing.
+bool save(Config cfg, cstring path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    auto f = io.open_write(path)
+    if !io.opened(f):
+        return false
+    ({string8: ref []char8} def_sec, bool has_def) = cfg[""]
+    if has_def:
+        write_pairs(f, def_sec)
+    for section, inner in cfg:
+        if strings.is_empty(section):
+            continue
+        io.write(f, "[")
+        io.write_bytes(f, Bytes(section))
+        io.write_line(f, "]")
+        write_pairs(f, inner)
+    io.close(f)
+    return true
+
+// ── typed reads ──────────────────────────────────────────────────────────
+//
+// Deliberately getters with a caller-supplied fallback, not automatic struct
+// deserialization — this is a queryable Dado API, and the same
+// shape as the `iniparser_getstring(d, "sec:key", def)` named as
+// precedent. A missing key and a value that doesn't parse are the same
+// "couldn't answer" case here: `get_f64` answers `fallback` when strict
+// `numbers.to_f64` fails, and `get_i32` inherits `numbers.to_i32`'s 0.
+
+// The stored value as a window into the `Config`'s own run: good until the
+// key is set again or the `Config` is destroyed. Copy it (`#format(v)`) to
+// keep it longer.
+(string8 val, bool found) get(Config cfg, string8 section, string8 key):
+    ({string8: ref []char8} sec, bool sfound) = cfg[section]
+    if !sfound:
+        return ("", false)
+    (ref []char8 v, bool found) = sec[key]
+    if !found:
+        return ("", false)
+    return (string8(v[:]), true)
+
+string8 get_string(Config cfg, string8 section, string8 key, string8 fallback):
+    (string8 v, bool found) = get(cfg, section, key)
+    if found:
+        return v
+    return fallback
+
+i32 get_i32(Config cfg, string8 section, string8 key, i32 fallback, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    (string8 v, bool found) = get(cfg, section, key)
+    if !found:
+        return fallback
+    ref []char8 c = strings.clone_to_cstring(v, alloc)
+    i32 n = numbers.to_i32(cstring(c))
+    #delete(c)
+    return n
+
+// `fallback` too when the value is not exactly a number: `to_f64` is strict,
+// so `"2.5 # note"` and `"fast"` are both a fallback rather than 2.5 and 0.
+// `alloc` is no longer used — `to_f64` reads the value in place — and stays in
+// the signature so that `get_f64` and `get_i32` keep one shape.
+f64 get_f64(Config cfg, string8 section, string8 key, f64 fallback, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    _ = alloc
+    (string8 v, bool found) = get(cfg, section, key)
+    if !found:
+        return fallback
+    try f64 n = numbers.to_f64(v) else:
+        return fallback
+    return n
+
+// Accepts true/1/yes/on and false/0/no/off (case-sensitive — a hand-written
+// file is expected to use one style consistently); anything else, like a
+// missing key, answers `fallback`.
+bool get_bool(Config cfg, string8 section, string8 key, bool fallback):
+    (string8 v, bool found) = get(cfg, section, key)
+    if !found:
+        return fallback
+    if strings.compare(v, "true") == 0 || strings.compare(v, "1") == 0 || strings.compare(v, "yes") == 0 || strings.compare(v, "on") == 0:
+        return true
+    if strings.compare(v, "false") == 0 || strings.compare(v, "0") == 0 || strings.compare(v, "no") == 0 || strings.compare(v, "off") == 0:
+        return false
+    return fallback
+
+// ── typed writes ─────────────────────────────────────────────────────────
+
+// **The map is taken by pointer, and it has to be.** A `Config` is a map, a
+// map value is a table pointer and the allocator that made it, and both are
+// passed by value — so a setter that took `Config` would be inserting into
+// its own copy of the handle. Reaching a new section reallocates the outer
+// table once it passes three quarters of its slots; the copy is handed the
+// new one, the old one is freed, and the caller is left holding it. ERR0819
+// is the rule, and `^Config` with `cfg^` at each use is what it asks for.
+//
+// **An overwrite frees the value it replaces**, so setting one key a thousand
+// times holds one value, not a thousand.
+void set_string(^Config cfg, string8 section, string8 key, string8 val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    put(cfg, section, key, clone(val, alloc))
+
+void set_i32(^Config cfg, string8 section, string8 key, i32 val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    put(cfg, section, key, #format(val, alloc))
+
+void set_f64(^Config cfg, string8 section, string8 key, f64 val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    put(cfg, section, key, #format(val, alloc))
+
+void set_bool(^Config cfg, string8 section, string8 key, bool val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    if val:
+        set_string(cfg, section, key, "true", alloc)
+    else:
+        set_string(cfg, section, key, "false", alloc)

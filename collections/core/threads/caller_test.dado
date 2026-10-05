@@ -1,0 +1,96 @@
+@test
+// `#caller` on a spawned thread.
+//
+// `#caller` is the ambient the immediate caller saw before any `using` it
+// opened around the call, handed over by the call as a hidden argument — so
+// it is as per-thread as the ambient it is read from. Four threads each run a
+// heavy-scratch, durable-result function under their own two allocators, at
+// once, and each must find its scratch in its inner allocator and its result
+// in its outer one, never another thread's and never the spawner's.
+//
+// A thread's entry is a function value (`ThreadFn`), and a function whose body
+// names `#caller` cannot be one (ERR0822) — the entry here names nothing and
+// calls one that does, directly. Everything allocated is freed, so the test is
+// clean under LeakSanitizer and under `--sanitize=thread`.
+package threads
+
+import "core:mem"
+import "core:mem/libc"
+
+private type I32Ptr: ^i32
+
+const i64 WORKERS = 4
+
+// Two allocators per worker: [2i] the outer (its `using` around `run`), [2i+1]
+// the inner (`run`'s `using` around `glue`). [8] is the spawner's.
+private [9]i32 g_counts
+
+// Each worker's own index, as the one address its entry is handed.
+private [4]i32 g_ids
+
+// Each worker's verdict: 1 when every count was the one wanted.
+private [4]i32 g_ok
+
+private rawptr counting(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    if mode == mem.AllocatorMode.Alloc:
+        _ = #atomic_fetch_add(I32Ptr(data), 1, #SEQ_CST)
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) h = libc.allocator()
+    return h.proc(h.data, mode, nbytes, align, old, old_size)
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) counter(i64 i):
+    return (counting, rawptr(&g_counts[i]))
+
+private i32 count(i64 i):
+    return #atomic_load(&g_counts[i], #SEQ_CST)
+
+// Heavy scratch on the ambient, the durable result on `#caller`.
+private ref []char8 glue(string8 a, string8 b):
+    ref []char8 scratch = #make([]char8, #len(a) + #len(b))
+    if scratch == nil:
+        return nil
+    defer #delete(scratch)
+    i64 n = 0
+    for c in a:
+        scratch[n] = c
+        n = n + 1
+    for c in b:
+        scratch[n] = c
+        n = n + 1
+    return #copy(scratch[0..<n], #caller)
+
+// Called under the worker's outer allocator; opens the inner one around the
+// call, so `glue`'s `#caller` is the outer.
+private bool run(i64 i):
+    ref []char8 s = glue("per", "thread") using counter(2 * i + 1)
+    bool ok = #expect(s != nil && #len(s) == 9, "glue answered nothing")
+    #delete(s)
+    ok = #expect(count(2 * i + 1) == 1, "worker ", i, ": the inner allocator was handed ", count(2 * i + 1), " allocations, want 1 (the scratch)") && ok
+    ok = #expect(count(2 * i) == 1, "worker ", i, ": the outer allocator was handed ", count(2 * i), " allocations, want 1 (the result)") && ok
+    return ok
+
+private rawptr worker(rawptr arg):
+    I32Ptr id = I32Ptr(arg)
+    i64 i = i64(id^)
+    bool ok = run(i) using counter(2 * i)
+    if ok:
+        #atomic_store(&g_ok[i], 1, #SEQ_CST)
+    return nil
+
+i32 test():
+    bool ok = true
+    [4]rawptr handles
+    // Spawned inside a suite: each thread starts at the root regardless.
+    using counter(8):
+        for k in 0..<WORKERS:
+            g_ids[k] = i32(k)
+            handles[k] = spawn(worker, rawptr(&g_ids[k]))
+            ok = #expect(handles[k] != nil, "spawn") && ok
+    for k in 0..<WORKERS:
+        if handles[k] != nil:
+            _ = join(handles[k])
+    for k in 0..<WORKERS:
+        ok = #expect(#atomic_load(&g_ok[k], #SEQ_CST) == 1, "worker ", k, " saw the wrong allocator") && ok
+    ok = #expect(count(8) == 0, "the spawner's suite was handed ", count(8), " allocations, want 0") && ok
+    if ok:
+        return 0
+    return 1

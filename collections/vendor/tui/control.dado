@@ -1,0 +1,648 @@
+// vendor:tui — the widgets that carry state across a frame.
+//
+// `widget.dado` holds the ones that do not: a button's whole memory is which id
+// has focus. These four need more — where a pane is scrolled, where a caret
+// sits, which row is on screen — and all of it lives in `state.dado` keyed by
+// the widget's id, not in anything the program passes.
+package tui
+
+import "core:chars"
+import "core:fmt"
+
+// ── scroll ─────────────────────────────────────────────────────────────────
+
+// A clipped, scrollable column.
+//
+// The content's height is not known until the body has run, which one pass
+// cannot use in the same frame — so the scrollbar is sized from **last frame's**
+// content height. That is one frame of lag on the bar's thumb and on nothing
+// else: the clipping, the offset and the wheel are all exact, because they only
+// need the offset, which is known before the body runs.
+//
+//     for tui.scroll(height: tui.REST):
+//         for line in log:
+//             tui.text(line)
+bool scroll(i32 height = REST, i32 width = REST, string8 tag = "scroll", bool follow = false):
+    if closing(tag):
+        end_scroll()
+        return false
+    u32 cand = slot_id(tag)
+    Rect at = place_container(width, height)
+    if empty(at): return false
+
+    ^Slot st = state_of(cand)
+    i32 content = st.a          // last frame's content height
+    i32 offset = st.b
+
+    // The wheel belongs to whichever pane the pointer is over, which is what
+    // makes two scroll panes on one screen behave.
+    i32 turned = take_wheel_in(at)
+    if turned != 0: offset = offset + turned
+
+    i32 max_off = content - at.h
+    if max_off < 0: max_off = 0
+    if follow: offset = max_off
+    if offset > max_off: offset = max_off
+    if offset < 0: offset = 0
+    st.b = offset
+
+    // A bar is drawn only when there is something to scroll; a full-height
+    // thumb on a pane that fits is a control that lies about being usable.
+    i32 body_w = at.w
+    if content > at.h: body_w = at.w - 1
+
+    Rect saved = push_clip(at)
+    // The region's box starts above the visible rectangle by `offset`, so a
+    // child placed at content row N lands on screen row N - offset, and the
+    // clip discards the rest. The height is the *content's*, not the pane's,
+    // so children below the fold still place rather than being refused.
+    i32 room = content
+    if room < at.h: room = at.h
+    Rect box = (at.x, at.y - offset, body_w, room + at.h)
+    if !open_region(cand, box, Axis.Down, 0, saved): return false
+    g_stack[g_depth].scroller = true
+    g_stack[g_depth].port = at
+    return true
+
+private void end_scroll():
+    Region r = g_stack[g_depth]
+    i32 used = r.near_used
+    Rect port = r.port
+    set_clip(r.saved_clip)
+    g_depth = g_depth - 1
+    g_stack[g_depth].seq = g_stack[g_depth].seq + 1
+
+    ^Slot st = state_of(r.id)
+    st.a = used
+    draw_scrollbar(port, used, st.b)
+
+// A one-cell gutter on the right: a track in `faint`, a thumb in `border`
+// lifted toward the text. It is drawn only when the content overflows.
+private void draw_scrollbar(Rect port, i32 content, i32 offset):
+    if content <= port.h: return
+    if port.w < 2: return
+    i32 x = port.x + port.w - 1
+    Color track = mix(g_theme.surface, g_theme.faint, 90)
+    Color thumb = mix(g_theme.faint, g_theme.text, 70)
+
+    i32 span = (port.h * port.h) / content
+    if span < 1: span = 1
+    i32 travel = port.h - span
+    i32 max_off = content - port.h
+    i32 top = 0
+    if max_off > 0: top = (offset * travel) / max_off
+
+    for i in 0..<port.h:
+        Color c = track
+        if i >= top && i < top + span: c = thumb
+        draw_glyph(x, port.y + i, scroll_glyph(), (c, g_theme.surface, Attr.NONE))
+
+private string8 scroll_glyph():
+    if g_theme.wide_glyphs: return "▐"
+    return "|"
+
+// Scroll a pane by hand, by the tag it was opened with.
+void scroll_to(string8 tag, i32 line):
+    ^Slot st = state_of(slot_id(tag))
+    st.b = line
+
+// ── item list ──────────────────────────────────────────────────────────────
+
+// A list of rows, one selected. `selected` is yours.
+//
+// Answers `true` when a row is **activated** — Enter, or a click on the row —
+// which is a different event from the selection moving, and the one a caller
+// almost always wants. `changed()` asks about the other.
+//
+// Arrow keys move the selection while the list has focus, the view follows it,
+// and the wheel scrolls without moving it. None of that is registered: the list
+// keeps its own offset in `state.dado` under its own id.
+bool list(^i32 selected, []string8 items, i32 height = REST, string8 tag = "list"):
+    u32 id = slot_id(tag)
+    i32 n = i32(#len(items))
+    Rect at = place(REST, height, 0, n)
+    if empty(at): return false
+    register_focus(id, false)
+
+    ^Slot st = state_of(id)
+    bool foc = has_focus(id)
+    bool fired = false
+    bool moved = false
+
+    if foc && n > 0:
+        i32 was = selected^
+        if key("up"): selected^ = selected^ - 1
+        if key("down"): selected^ = selected^ + 1
+        if key("home"): selected^ = 0
+        if key("end"): selected^ = n - 1
+        if key("pgup"): selected^ = selected^ - at.h
+        if key("pgdn"): selected^ = selected^ + at.h
+        if selected^ < 0: selected^ = 0
+        if selected^ >= n: selected^ = n - 1
+        moved = selected^ != was
+        if key("enter"): fired = true
+
+    i32 turned = take_wheel_in(at)
+    if turned != 0: st.b = st.b + turned
+
+    // Keep the selection on screen — but **only when it moved**, not whenever
+    // the list happens to have focus.
+    //
+    // Following on focus is the bug that makes a focused list impossible to
+    // scroll: every wheel turn is undone on the same frame by a rule dragging
+    // the view back to a selection that never moved, so the reader has to
+    // activate something else, or click the bottom row and turn again, and
+    // again. The wheel moves the view; the arrows move the selection and the
+    // view follows *that*. They are two different gestures and only one of them
+    // is about the selection.
+    //
+    // `d` is the first-layout flag: a list whose selection starts below the
+    // fold still opens with it visible, which is the one case focus-following
+    // was accidentally covering.
+    i32 offset = st.b
+    if moved || st.d == 0:
+        if selected^ < offset: offset = selected^
+        if selected^ >= offset + at.h: offset = selected^ - at.h + 1
+        st.d = 1
+    i32 max_off = n - at.h
+    if max_off < 0: max_off = 0
+    if offset > max_off: offset = max_off
+    if offset < 0: offset = 0
+    st.b = offset
+
+    i32 body_w = at.w
+    if n > at.h: body_w = at.w - 1
+
+    Color bg = surface_here()
+    for row in 0..<at.h:
+        i32 i = offset + row
+        Rect line = (at.x, at.y + row, body_w, 1)
+        if i >= n:
+            fill_rect(line, (g_theme.text, bg, Attr.NONE))
+            continue
+
+        bool is_sel = i == selected^
+        bool hot = hovering(line)
+        Color rowbg = bg
+        Color fg = g_theme.subtext
+        if is_sel:
+            fg = g_theme.text
+            rowbg = mix(bg, g_theme.accent, 40)
+            if foc: rowbg = mix(bg, g_theme.accent, 85)
+        else if hot:
+            rowbg = mix(bg, g_theme.accent, 16)
+
+        fill_rect(line, (fg, rowbg, Attr.NONE))
+        // A selection marker in the gutter, not just a tint: on a terminal
+        // without colour the tint is nothing at all, and a list you cannot read
+        // the selection off is not a list.
+        if is_sel:
+            draw_glyph(line.x, line.y, sel_marker(), (g_theme.accent, rowbg, Attr.NONE))
+        _ = draw_text(line.x + 2, line.y, items[i], (fg, rowbg, Attr.NONE), body_w - 2)
+
+        if clicked_in(line):
+            take_focus(id)
+            if selected^ == i: fired = true
+            selected^ = i
+
+    draw_scrollbar(at, n, offset)
+    record(at, hovering(at), foc)
+    if fired: acted()
+    return fired
+
+private string8 sel_marker():
+    if g_theme.wide_glyphs: return "▸"
+    return ">"
+
+// ── tabs ───────────────────────────────────────────────────────────────────
+
+// A row of tabs. `active` is yours; the answer is whether it changed.
+//
+// The labels are a variadic pack, so the common case reads as a sentence and
+// allocates nothing: a pack is a compound literal in the caller's own frame.
+//
+//     tui.tabs(&page, "Build", "Test", "Constants")
+bool tabs(^i32 active, ..string8 labels):
+    return tabs_of(active, labels)
+
+// The same, when the labels are data rather than written out.
+bool tabs_of(^i32 active, []string8 labels, string8 tag = "tabs"):
+    u32 id = slot_id(tag)
+    i32 n = i32(#len(labels))
+    if n == 0: return false
+    Rect at = place(REST, 1, 0, 1)
+    if empty(at): return false
+    register_focus(id, false)
+
+    bool foc = has_focus(id)
+    bool changed = false
+    if foc:
+        i32 was = active^
+        if key("left"): active^ = active^ - 1
+        if key("right"): active^ = active^ + 1
+        if active^ < 0: active^ = n - 1
+        if active^ >= n: active^ = 0
+        changed = active^ != was
+
+    fill_rect(at, (g_theme.text, g_theme.mantle, Attr.NONE))
+    i32 x = at.x
+    for i in 0..<n:
+        i32 w = measure(labels[i]) + 4
+        if x + w > at.x + at.w: break
+        Rect tabr = (x, at.y, w, 1)
+        bool on = i == active^
+        bool hot = hovering(tabr)
+
+        Color tbg = g_theme.mantle
+        Color tfg = g_theme.muted
+        Attr ta = Attr.NONE
+        if on:
+            // The active tab is the surface the content below it sits on, which
+            // is what makes a tab strip read as one object with the panel under
+            // it rather than as a row of buttons above it.
+            tbg = g_theme.surface
+            tfg = g_theme.text
+            ta = Attr.BOLD
+        else if hot:
+            tbg = mix(g_theme.mantle, g_theme.accent, 22)
+            tfg = g_theme.subtext
+
+        fill_rect(tabr, (tfg, tbg, ta))
+        _ = draw_text(x + 2, at.y, labels[i], (tfg, tbg, ta), w - 4)
+        if on:
+            // A one-cell accent underline on the *top* edge, which is where a
+            // terminal has room for it.
+            draw_glyph(x, at.y, "▏", (g_theme.accent, tbg, Attr.NONE))
+        if clicked_in(tabr):
+            take_focus(id)
+            if active^ != i: changed = true
+            active^ = i
+        x = x + w
+
+    record(at, hovering(at), foc)
+    if changed: acted()
+    return changed
+
+// ── select ─────────────────────────────────────────────────────────────────
+
+// One of a set, cycled in place: `‹ clang ›`.
+//
+// Not a dropdown. A popup has to be drawn above everything else, which needs an
+// overlay pass this library does not have yet; a cycler needs none, works with
+// the keyboard and the mouse, and is honest about how many options there are by
+// showing the count. When overlays land this grows a popup and the signature
+// does not change.
+bool select(string8 label, ^i32 index, ..string8 options):
+    return select_of(label, index, options)
+
+bool select_of(string8 label, ^i32 index, []string8 options):
+    u32 id = slot_id(label)
+    i32 n = i32(#len(options))
+    if n == 0: return false
+    Rect at = place(FLOW, 1, measure(label) + 18, 1)
+    if empty(at): return false
+    register_focus(id, false)
+
+    bool foc = has_focus(id)
+    bool changed = false
+    if index^ < 0: index^ = 0
+    if index^ >= n: index^ = n - 1
+
+    if foc:
+        i32 was = index^
+        if key("left"): index^ = index^ - 1
+        if key("right"): index^ = index^ + 1
+        if key("space") || key("enter"): index^ = index^ + 1
+        if index^ < 0: index^ = n - 1
+        if index^ >= n: index^ = 0
+        changed = index^ != was
+
+    Color bg = surface_here()
+    if foc: bg = mix(bg, g_theme.accent, 28)
+    else if hovering(at): bg = mix(bg, g_theme.accent, 16)
+    fill_rect(at, (g_theme.text, bg, Attr.NONE))
+
+    i32 lw = draw_text(at.x, at.y, label, (g_theme.subtext, bg, Attr.NONE), at.w)
+    string8 value = options[index^]
+    i32 vw = measure(value)
+    i32 right = at.x + at.w
+    // `‹ value ›` against the right edge, so a column of selects lines its
+    // values up whatever the labels are doing.
+    if lw + vw + 4 <= at.w:
+        // The same leader `kv` uses. Without it, a select in a wide panel is a
+        // label at one edge and a value at the other, and nothing says they
+        // are one control.
+        for i in 0..<(at.w - lw - vw - 5):
+            u32 g = 32
+            if (i % 2) == 1: g = 0x00B7
+            put_cell(at.x + lw + 1 + i, at.y, g, (g_theme.faint, bg, Attr.NONE), false)
+        Rect lft = (right - vw - 4, at.y, 2, 1)
+        Rect rgt = (right - 2, at.y, 2, 1)
+        draw_glyph(lft.x, at.y, arrow_left(), (g_theme.muted, bg, Attr.NONE))
+        _ = draw_text(right - vw - 2, at.y, value, (g_theme.text, bg, Attr.BOLD), vw)
+        draw_glyph(rgt.x + 1, at.y, arrow_right(), (g_theme.muted, bg, Attr.NONE))
+        if clicked_in(lft):
+            take_focus(id)
+            index^ = index^ - 1
+            if index^ < 0: index^ = n - 1
+            changed = true
+        else if clicked_in(rgt):
+            take_focus(id)
+            index^ = index^ + 1
+            if index^ >= n: index^ = 0
+            changed = true
+        else if clicked_in(at):
+            take_focus(id)
+
+    record(at, hovering(at), foc)
+    if changed: acted()
+    return changed
+
+private string8 arrow_left():
+    if g_theme.wide_glyphs: return "‹"
+    return "<"
+
+private string8 arrow_right():
+    if g_theme.wide_glyphs: return "›"
+    return ">"
+
+// ── confirm button ─────────────────────────────────────────────────────────
+
+// A button that asks first: the press arms it, and a second press within
+// `window` seconds does the thing.
+//
+//     if tui.confirm_button("Clean", armed: "Clean build/?"): clean()
+//
+// This is the destructive-action widget, and it is here rather than in a
+// program because the state it needs — armed, and since when — is per-widget
+// and keyed by id, which is exactly what the library already holds and an
+// immediate-mode caller does not.
+//
+// A modal would be the other answer and is a worse one for a toolbar: it takes
+// the keyboard, needs somewhere to live in the layout, and costs two more
+// interactions than the mistake it prevents. Arming costs one, and it disarms
+// itself, so a press you did not mean expires rather than waiting for you.
+bool confirm_button(string8 label, string8 armed = "sure?", i32 width = AUTO, f64 window = 3.0, bool enabled = true):
+    u32 id = slot_id(label)
+    ^Slot st = state_of(id)
+    bool was_armed = st.a != 0
+
+    // Expire first, so a stale arm from a minute ago cannot be completed by a
+    // press aimed at the ordinary label.
+    if was_armed && (clock() - st.t) > window:
+        was_armed = false
+        st.a = 0
+
+    // **Sized from the wider of the two labels, always.** A button that grows
+    // when you arm it shoves everything beside it sideways at the exact moment
+    // you are about to click again, which is how a confirm turns into a
+    // misclick. The width is a property of the control, not of its state.
+    i32 wl = measure(label)
+    i32 wa = measure(armed)
+    i32 nat = wl + 4
+    if wa + 4 > nat: nat = wa + 4
+    Rect r = place(width, 1, nat, 1)
+    if empty(r): return false
+    if enabled: register_focus(id, false)
+
+    bool hot = hovering(r)
+    bool foc = enabled && has_focus(id)
+    bool pressed = false
+    if enabled:
+        if clicked_in(r):
+            take_focus(id)
+            pressed = true
+        if foc && (key("enter") || key("space")): pressed = true
+
+    // The whole state change happens **before** the label is chosen. Choosing
+    // it first draws the state the widget was in rather than the one it is in,
+    // so a disarm renders as still-armed and — because nothing is animating any
+    // more — never gets corrected.
+    bool is_armed = was_armed
+    bool fired = false
+    if is_armed && key("esc"):
+        is_armed = false
+        st.a = 0
+        pressed = false
+    if pressed:
+        if is_armed:
+            fired = true
+            is_armed = false
+            st.a = 0
+        else:
+            is_armed = true
+            st.a = 1
+            st.t = clock()
+    if is_armed != was_armed: acted()
+
+    string8 shown = label
+    if is_armed: shown = armed
+
+    Color bg = mix(g_theme.overlay, g_theme.text, 22)
+    Color fg = g_theme.text
+    Attr at = Attr.NONE
+    if !enabled:
+        bg = mix(g_theme.surface, g_theme.text, 8)
+        fg = g_theme.faint
+    else if is_armed:
+        // The armed state is the warning colour and not the accent: it is not
+        // the primary action, it is the one you have to mean. `animate` is what
+        // makes the expiry above actually happen — without a frame to run in,
+        // a timeout is a value nobody reads.
+        bg = g_theme.warn
+        fg = g_theme.base
+        at = Attr.BOLD
+        animate()
+    else if foc:
+        bg = g_theme.accent
+        fg = g_theme.on_accent
+        at = Attr.BOLD
+    else if hot:
+        bg = mix(g_theme.overlay, g_theme.accent, 55)
+
+    Color under = surface_here()
+    fill_rect(r, (fg, bg, at))
+    if g_theme.wide_glyphs && r.w >= 3:
+        draw_glyph(r.x, r.y, "▐", (bg, under, Attr.NONE))
+        draw_glyph(r.x + r.w - 1, r.y, "▌", (bg, under, Attr.NONE))
+    i32 tw = measure(shown)
+    i32 pad = (r.w - tw) / 2
+    if pad < 0: pad = 0
+    _ = draw_text(r.x + pad, r.y, shown, (fg, bg, at), r.w - pad)
+    record(r, hot, foc)
+    if fired: acted()
+    return fired
+
+// Whether the confirm button with this label is currently waiting for its
+// second press. For a program that wants to say so somewhere else.
+bool armed(string8 label):
+    return state_of(slot_id(label)).a != 0
+
+// ── line edit ──────────────────────────────────────────────────────────────
+
+// A single-line text field. The buffer is yours, and it is a `^ref []char8`
+// because that is the language's own growth idiom — `#append` through a pointer
+// to the handle, which is the repair ERR0813 names.
+//
+//     private ref []char8 filter
+//     ...
+//     tui.line_edit("filter", &filter, placeholder: "type to search")
+//     tui.list(&pick, matches(tui.edited(filter)))
+//
+// While it has focus it **claims plain characters and the editing keys** —
+// so typing `q` into it does not reach a global `key("q")` — and leaves
+// everything else global, so `ctrl+s` still saves while you are typing.
+bool line_edit(string8 label, ^ref []char8 buf, string8 placeholder = "", bool secret = false, i32 width = FLOW):
+    u32 id = slot_id(label)
+    i32 lw = 0
+    if #len(label) > 0: lw = measure(label) + 1
+    Rect at = place(width, 1, lw + 16, 1)
+    if empty(at): return false
+    register_focus(id, true)
+
+    ^Slot st = state_of(id)
+    bool foc = has_focus(id)
+    bool changed = false
+
+    if clicked_in(at): take_focus(id)
+
+    // A nil buffer is minted here rather than by the caller. The alternative is
+    // that every program using a text field writes a `#make` beside every
+    // declaration, which is ceremony for a thing the field knows how to do.
+    //
+    // **The buffer is yours**: it comes from the allocator `open` was given and
+    // `close` does not free it, because the program is what reads it after the
+    // UI is gone.
+    if buf^ == nil:
+        buf^ = #make([]char8, 0, g_backing)
+        if buf^ == nil: return false
+
+    i32 len = i32(#len(buf^))
+    i32 caret = st.a
+    if caret > len: caret = len
+    if caret < 0: caret = 0
+
+    if foc:
+        if own_key("left"): caret = caret - 1
+        if own_key("right"): caret = caret + 1
+        if own_key("home"): caret = 0
+        if own_key("end"): caret = len
+        if own_key("bksp") && caret > 0:
+            remove_at(buf, caret - 1)
+            caret = caret - 1
+            len = len - 1
+            changed = true
+        if own_key("del") && caret < len:
+            remove_at(buf, caret)
+            len = len - 1
+            changed = true
+        string8 typed_now = typed()
+        i32 tn = i32(#len(typed_now))
+        if tn > 0:
+            for k in 0..<tn:
+                if insert_at(buf, caret, typed_now[k]):
+                    caret = caret + 1
+                    len = len + 1
+            changed = true
+        if caret < 0: caret = 0
+        if caret > len: caret = len
+    st.a = caret
+
+    // Draw. The field is the raised surface even when it is empty, because a
+    // text field you cannot see the extent of is a text field you do not know
+    // is there.
+    Color bg = mix(surface_here(), g_theme.text, 10)
+    if foc: bg = mix(surface_here(), g_theme.accent, 22)
+    Rect field = (at.x + lw, at.y, at.w - lw, 1)
+    if field.w < 2: return false
+    fill_rect(field, (g_theme.text, bg, Attr.NONE))
+    if lw > 0:
+        _ = draw_text(at.x, at.y, label, (g_theme.subtext, surface_here(), Attr.NONE), lw - 1)
+
+    // Scroll the text so the caret is visible.
+    i32 room = field.w - 2
+    i32 from = st.c
+    if caret < from: from = caret
+    if caret > from + room: from = caret - room
+    if from < 0: from = 0
+    st.c = from
+
+    string8 shown = ""
+    if len > 0: shown = buf^
+    if secret && len > 0: shown = stars(len)
+
+    // The placeholder goes away when you *type*, not when you focus. A palette
+    // opens with its field already focused, and hiding the one line that says
+    // what the field is for at the exact moment you look at it is the wrong
+    // half of the convention. The caret is a `tint_rect`, so it sits on the
+    // first placeholder letter rather than erasing it.
+    if len == 0 && #len(placeholder) > 0:
+        _ = draw_text(field.x + 1, at.y, placeholder, (g_theme.muted, bg, Attr.ITALIC), room)
+    else if len > from:
+        _ = draw_text(field.x + 1, at.y, shown[from..<len], (g_theme.text, bg, Attr.NONE), room)
+
+    if foc:
+        // A block caret that blinks. `animate()` is what keeps the loop awake
+        // for it, and the loop goes back to sleep the moment focus leaves.
+        animate()
+        i32 phase = anim_frame(clock(), 2.0, 2)
+        if phase == 0:
+            i32 cx = field.x + 1 + (caret - from)
+            if cx < field.x + field.w:
+                tint_rect((cx, at.y, 1, 1), g_theme.accent)
+
+    record(at, hovering(at), foc)
+    if changed: acted()
+    return changed
+
+private string8 stars(i32 n):
+    ref []char8 run = #make([]char8, 0, mem)
+    if run == nil: return ""
+    Sink into = fmt.to_run(&run)
+    _ = fmt.put_repeat('*', n, into)
+    string8 out = run
+    return out
+
+// The contents of a line edit's buffer, as a `string` to read.
+string8 edited(ref []char8 buf):
+    if buf == nil: return ""
+    string8 out = buf
+    return out
+
+// Put `s` into a line edit's buffer, minting one if there is none. Answers the
+// buffer, because a nil one becomes a real one and the caller holds the handle:
+//
+//     edit = tui.set_text(edit, "default")
+//
+// The companion to `edited`, and what a program uses to seed a field from
+// somewhere else — a config file, a previous run, a compiler's own answer. The
+// caret clamps itself to the new length on the next frame, so replacing the
+// text under a cursor cannot leave it past the end.
+ref []char8 set_text(ref []char8 buf, string8 s):
+    ref []char8 b = buf
+    if b == nil:
+        b = #make([]char8, 0, g_backing)
+        if b == nil: return b
+    if !#resize(b, 0): return b
+    for i in 0..<i32(#len(s)):
+        if !#append(b, s[i]): break
+    return b
+
+private bool insert_at(^ref []char8 buf, i32 at, char8 c):
+    if !#append(buf^, c): return false
+    i32 n = i32(#len(buf^))
+    // Shift right from the end, so the byte written last is the one moved
+    // first and nothing is overwritten before it has been copied.
+    i32 k = n - 1
+    for k > at:
+        buf^[k] = buf^[k - 1]
+        k = k - 1
+    buf^[at] = c
+    return true
+
+private void remove_at(^ref []char8 buf, i32 at):
+    i32 n = i32(#len(buf^))
+    if at < 0 || at >= n: return
+    for k in at..<(n - 1):
+        buf^[k] = buf^[k + 1]
+    _ = #resize(buf^, i64(n - 1))

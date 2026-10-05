@@ -1,0 +1,210 @@
+// The install journal: every change an install makes outside its own folder,
+// written down before it is made, so `dado uninstall` can take each one back.
+//
+// `<install>/install.journal` is one record per line, its fields separated by
+// tabs, the first naming the record's kind. It is only ever added to. The
+// kinds, and how `dado uninstall` reverses each:
+//
+//     begin    <version>                  the bootstrap started; nothing to undo
+//     done     <version>                  `dado install` ran to its end
+//     mkdir    <dir>                      a directory made outside the install:
+//                                         removed if it is empty
+//     symlink  <link> <target>            removed if it still points into the
+//                                         install
+//     winpath  <entry>                    the Windows user PATH entry: that one
+//                                         entry is taken out, nothing restored
+//     vscode   <editor cli> <extension>   `<cli> --uninstall-extension <id>`
+//     claude-plugin <plugin> <marketplace>
+//                                         `claude plugin uninstall`, then the
+//                                         marketplace is removed
+//     file     <path> <sha256>            removed if its bytes are unchanged
+//     block    <file> <sha256>            the marked block taken out of the
+//                                         file if it is unchanged (below)
+//     update   <old tree> <new tree>      bookkeeping for a rollback
+//     upgrade  <old version> <new version>
+//
+// **Written before the change**, so an install stopped anywhere leaves a
+// journal that names everything it might have done; each reversal first asks
+// whether the thing is there and still ours, which makes it safe to run over
+// a record whose change never happened, and to run twice.
+//
+// **A marked block** is a run of whole lines in a config file that has only
+// one, opening with a line holding `added by dado install` and closing with a
+// line holding `end of the block dado install added`. Its record's SHA-256 is
+// over those lines, both markers and every newline included; a block someone
+// has since edited no longer matches, and is left where it is with a word.
+//
+// `DADO_INSTALL_STOP_AFTER=<n>` ends the process with status 3 just after the
+// n-th record this process writes, before the change it records: the install
+// test uses it to show an install interrupted anywhere uninstalls cleanly.
+package driver
+
+import "core:hash"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+// One line of the journal: its kind and its fields after the kind.
+type Record:
+    string8 kind
+    ref []string8 fields
+    string8 line
+
+// The journal's place in an install.
+string8 journal_path(string8 install):
+    return join2(install, "install.journal")
+
+// `text` read as journal lines. Blank lines are skipped; a line is never
+// refused, since a kind this version does not know is kept for one that does.
+ref []Record parse_journal(string8 text):
+    ref []Record out = #make([]Record, 0)
+    for l in lines_of(text):
+        ref []string8 parts = tab_fields(l)
+        Record r
+        r.kind = parts[0]
+        ref []string8 rest = #make([]string8, 0)
+        for i in 1..<#len(parts):
+            _ = #append(rest, parts[i])
+        r.fields = rest
+        r.line = l
+        _ = #append(out, r)
+    return out
+
+// `l` cut at each tab.
+ref []string8 tab_fields(string8 l):
+    ref []string8 out = #make([]string8, 0)
+    string8 rest = l
+    for:
+        (string8 head, string8 tail, bool more) = split_byte(rest, '\t')
+        _ = #append(out, head)
+        if !more: break
+        rest = tail
+    return out
+
+// One record's line: `kind` and `fields` joined by tabs. A tab or a newline
+// inside a field would split the record, so each becomes a space.
+string8 record_line(string8 kind, []string8 fields):
+    strings.Builder b = strings.builder(128)
+    _ = strings.append(&b, kind)
+    for f in fields:
+        _ = strings.append_char(&b, '\t')
+        for c in f:
+            _ = strings.append_char(&b, ' ' if c == '\t' || c == '\n' || c == '\r' else c)
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// Whether `records` hold a line exactly `line`.
+bool journal_has([]Record records, string8 line):
+    for r in records:
+        if r.line == line: return true
+    return false
+
+// The kinds `dado uninstall` reverses, in the order it reverses them: every
+// record that is not bookkeeping, last first.
+ref []Record reversal_plan([]Record records):
+    ref []Record out = #make([]Record, 0)
+    i64 i = #len(records) - 1
+    for i >= 0:
+        Record r = records[i]
+        i -= 1
+        if r.kind == "begin" || r.kind == "done" || r.kind == "update" || r.kind == "upgrade": continue
+        // A change made twice, by an install run twice, is undone once.
+        bool seen = false
+        for o in out:
+            if o.line == r.line: seen = true
+        if !seen: _ = #append(out, r)
+    return out
+
+// Whether the journal says `dado install` ran to its end since the last
+// bootstrap began.
+bool journal_done([]Record records):
+    bool done = false
+    for r in records:
+        if r.kind == "begin": done = false
+        if r.kind == "done": done = true
+    return done
+
+// ── writing ─────────────────────────────────────────────────────────────────
+
+private i64 g_written
+private i64 g_stop_after = 0 - 1
+private bool g_stop_asked
+
+// The journal of the install, as records; empty when there is none.
+ref []Record read_journal(string8 install):
+    try ref []char8 text = fs.read_file(journal_path(install)) else:
+        return #make([]Record, 0)
+    return parse_journal(txt(text))
+
+// Add `kind` and `fields` to the journal of `install`. Ends the process when
+// it cannot be written: a change made without its record could never be
+// taken back.
+void journal_append(string8 install, string8 kind, []string8 fields):
+    string8 p = journal_path(install)
+    string8 before = read_or_empty(p)
+    string8 line = record_line(kind, fields)
+    string8 sep = "\n" if #len(before) > 0 && !strings.ends_with(before, "\n") else ""
+    // The whole file is written again, atomically: a reader sees the journal
+    // with the record or without it, never half a line.
+    try fs.write_file(p, txt(#format(before, sep, line, "\n"))) else code:
+        die(txt(#format("cannot write the install journal ", p, ": ", os.message(code), ".\n  Nothing was changed for this step. Make the install folder writable, then run dado install again.")))
+    g_written += 1
+    if !g_stop_asked:
+        g_stop_asked = true
+        (string8 n, bool set) = env("DADO_INSTALL_STOP_AFTER")
+        if set:
+            (i64 v, bool ok) = decimal(n)
+            if ok: g_stop_after = v
+    if g_written == g_stop_after:
+        tell(txt(#format("stopping after journal record ", g_written, " (DADO_INSTALL_STOP_AFTER): ", line)))
+        os.quit_with(3)
+
+// `journal_append` with one field, two, or none.
+void journal1(string8 install, string8 kind, string8 a):
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, a)
+    journal_append(install, kind, f[:])
+
+void journal2(string8 install, string8 kind, string8 a, string8 b):
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, a)
+    _ = #append(f, b)
+    journal_append(install, kind, f[:])
+
+// ── marked blocks ───────────────────────────────────────────────────────────
+
+const string8 BLOCK_OPEN = "added by dado install"
+const string8 BLOCK_CLOSE = "end of the block dado install added"
+
+// `text` with its marked block whose SHA-256 is `sha` taken out, and what
+// happened: `removed`, `changed` (a block is there and is not the one
+// recorded) or `absent`.
+(string8 text, string8 outcome) without_block(string8 text, string8 sha):
+    // Each line with its newline, so the block's bytes are exactly the file's.
+    i64 n = #len(text)
+    i64 at = 0
+    i64 open_at = 0 - 1
+    bool found_any = false
+    for at < n:
+        i64 end = at
+        for end < n && text[end] != '\n':
+            end += 1
+        i64 next = end + 1 if end < n else n
+        string8 l = text[at..<end]
+        if open_at < 0 && strings.contains(l, BLOCK_OPEN):
+            open_at = at
+        else if open_at >= 0 && strings.contains(l, BLOCK_CLOSE):
+            found_any = true
+            string8 block = text[open_at..<next]
+            ref []char8 hex = hash.sha256_hex(hash.sha256_text(block))
+            if txt(hex) == sha:
+                return (txt(#format(text[0..<open_at], text[next..<n])), "removed")
+            open_at = 0 - 1
+        at = next
+    if found_any: return (text, "changed")
+    return (text, "absent")
+
+// The SHA-256 of `text`, in hex.
+string8 sha256_of(string8 text):
+    ref []char8 hex = hash.sha256_hex(hash.sha256_text(text))
+    return txt(hex)

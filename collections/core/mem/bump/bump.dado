@@ -1,0 +1,280 @@
+// core:mem/bump — a cursor over a block, behind the allocator interface.
+//
+//     import "core:mem"
+//     import "core:mem/bump"
+//
+//     [4096]u8 storage
+//     bump.Arena arena = bump.over(&storage, 4096)
+//     mem.Allocator a = bump.allocator(&arena)
+//
+// **The foundation every other allocator is described in terms of**, and the
+// one whose `FreeAll` is the reason to reach for it: releasing every
+// allocation an arena ever made is one store, O(1), no matter how many there
+// were.
+//
+// It is also the allocator a **freestanding** program uses. At depth 0 on a
+// freestanding target `#default` is `nil`, so allocating there
+// means supplying an arena — and an arena over a `[N]u8` in static storage
+// asks nothing of libc, which is the property `corpus/freestanding` tests by
+// inspecting the emitted `#include` lines rather than by asserting. (That program
+// writes its own bump arena rather than importing this package — a corpus program
+// imports nothing outside its own directory — so what it pins is the *language*
+// claim this package is one implementation of. `bump_test.dado` is what tests the
+// code here.)
+//
+// ## What it does with each mode
+//
+//     Alloc     align the cursor, hand back the block, advance
+//     Resize    **in place** when the block is the last allocation, which is
+//               O(1) and invisible from outside; `mem.resize_by_copy`
+//               otherwise
+//     Free      a no-op — an arena does not reclaim one block
+//     FreeAll   `used = 0`. One store. Every reference into the arena is stale
+//               from that moment, and nothing detects it
+//
+// `Free` being a no-op is not a gap: the shipped set of allocators already
+// contains an allocator that does not honour `delete`, which is what makes a
+// collector an ordinary member of the interface rather than a new idea.
+package bump
+
+import "core:mem"
+
+// The arena's state: where the block is, how large it is, and how much of it
+// has been handed out. `last` is the offset of the most recent allocation,
+// which is the whole of what `Resize`'s in-place fast path needs to know.
+//
+// `last == used` means "nothing has been handed out since the last reset", and
+// is why `last` is an offset rather than a pointer: an offset has a zero that
+// means something.
+type Arena: (
+    rawptr block,
+    u64 cap,
+    u64 used,
+    u64 last,
+    u64 last_size,
+)
+
+// An arena over storage that already exists — a `[N]u8` on the stack, a
+// package-level one in static storage, or a block from another
+// allocator. It **does not allocate**, which is what makes it the freestanding
+// answer.
+//
+// ## The base is aligned here, and that used to be an assumption
+//
+// `carve` aligns the **cursor** — an offset, an ordinary integer — and hands
+// back `block + at`. That address is aligned only if `block` was, and until
+// `#align_forward` existed there was no way to say so in this language, let
+// alone check it: `u64(p)` on a `rawptr` is ERR0504 and there is no `uintptr`.
+// So every allocator written in Dado aligned an offset and *assumed* a base.
+//
+// It is not a safe assumption at this door in particular. This is the one
+// place a block enters the allocator system from **outside** the interface: a
+// `[N]u8` has C alignment 1 by the standard, and a caller writing
+// `bump.over(&storage, 4096)` is promising nothing about where `storage` sits.
+// Everything downstream — `core:mem/arena` and every `#make` through it —
+// inherits whatever answer is given here. So the alignment is done here, once,
+// with the verb.
+//
+// **This was not a hypothetical, and the number is why the loop below is
+// here.** Measured 2026-09-05 under clang 18.1 and gcc 13.3: a Dado run is
+// emitted as `struct { uint8_t s[N]; }`, whose C alignment is **1**, so a
+// package-level `[256]u8`, a `[64]u8` and a named `Block` all landed at
+// addresses that are not multiples of 16. Every bump arena over Dado-declared
+// storage has therefore been handing out misaligned blocks, and
+// `core:mem/arena` over a bump backing inherits it. On x86-64 that is a
+// slowdown and an atomics hazard; on a target that traps it is a crash. It was
+// invisible because nothing in the language could look.
+//
+// ## How far the base moved, in a language with no pointer difference
+//
+// `#align_forward` answers an *address*. Subtracting the original from it is
+// pointer arithmetic, which the verb was deliberately made too small to
+// open — so the distance is not a number this code is handed. It is found by
+// asking the block which of its first `MAX_ALIGN - 1` bytes *is* that address:
+// at most fifteen comparisons, once, at construction, and never again.
+//
+// The ceiling would have been the cheaper answer — charge `MAX_ALIGN - 1` and
+// stop — and it is what the first draft did. It is rejected because the
+// paragraph above makes the padding the **common** case rather than the rare
+// one: charging its ceiling costs a 256-byte arena 15 bytes it did not need to
+// lose, on every arena, forever. A ceiling is the right shape for a number
+// nobody can measure; this one can be measured, so it is.
+//
+// A base that was already aligned is charged nothing and does not scan.
+Arena over(rawptr block, u64 cap):
+    if block == nil:
+        return (nil, 0, 0, 0, 0)
+    rawptr base = #align_forward(block, mem.MAX_ALIGN)
+    if base == block:
+        return (block, cap, 0, 0, 0)
+    // `pad` starts at the ceiling, which is what it stays at when the scan
+    // finds nothing — and the scan finds nothing exactly when the aligned
+    // address is past the end of a block too small to hold it. `cap <= pad`
+    // catches that on the next line, so the unfound case is the refused case
+    // and not a wrong subtraction.
+    u64 pad = mem.MAX_ALIGN
+    u64 k = 1
+    for k < mem.MAX_ALIGN && k <= cap:
+        if offset(block, cap, k) == base:
+            pad = k
+            break
+        k = k + 1
+    if cap <= pad:
+        // The alignment costs more than the block holds, so nothing in it can
+        // be handed out at `MAX_ALIGN`. An arena of zero capacity, which is a
+        // value that refuses every request — the shape `over(nil, n)` already
+        // had, reached by a second road.
+        return (base, 0, 0, 0, 0)
+    return (base, cap - pad, 0, 0, 0)
+
+// The allocator for `arena`. The arena is the allocator's `data`, so it is
+// borrowed by pointer and must outlive every allocation made through it — the
+// ordinary raw-pointer bargain, stated because an arena is exactly the
+// value somebody puts on the stack.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Arena arena):
+    return (dispatch, rawptr(arena))
+
+// The allocator for a bump arena, as a declaration that takes `mem.Allocator` on:
+// a `BumpAllocator` is accepted wherever an allocator is asked — `#new`, `using`, a
+// parameter written as the two words, an `Allocator` binder — and the
+// compiler calls its `data()` there. It holds only the pointer, so a
+// one-slot declaration: `self` *is* the `^Arena`.
+//
+//     bump.BumpAllocator h = &a
+//     using h:
+//         ...
+type BumpAllocator using mem.Allocator:
+    ^Arena arena,
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+        return (dispatch, rawptr(self))
+
+// How many bytes are in use, and how many are left. A test asserting an
+// allocation count reads these rather than eyeballing a printout.
+u64 used(Arena a):
+    return a.used
+
+u64 available(Arena a):
+    return a.cap - a.used
+
+// Release every allocation in one store. **Lifetime-ending**: every
+// reference into the arena is stale from this moment and using one is UB,
+// exactly as using a pointer after `free` is. Nothing detects it, and a
+// checker for it is the one gap worth closing for the programs that need
+// it closed.
+void reset(^Arena a):
+    a^.used = 0
+    a^.last = 0
+    a^.last_size = 0
+    return
+
+// ── The procedure ────────────────────────────────────────────────────────────
+
+private type ArenaPtr: ^Arena
+
+private rawptr dispatch(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    ArenaPtr a = ArenaPtr(data)
+    if rawptr(a) == nil:
+        return nil
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            return carve(a, nbytes, align)
+        case mem.AllocatorMode.Resize:
+            return regrow(a, nbytes, align, old, old_size)
+        case mem.AllocatorMode.Free:
+            // An arena does not reclaim one block. The one thing it can do
+            // cheaply is take back the **last** one, which is what makes a
+            // scratch push/pop pair O(1) — and it is not done here, because a
+            // `Free` that sometimes reclaims is worse than one that never
+            // does: it makes "how much is in use" depend on allocation order.
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            reset(a)
+            return nil
+        else:
+            return nil
+
+// Align the cursor, hand back the block, advance. The whole allocator.
+//
+// The two tests are written as one subtraction rather than as `at + nbytes >
+// cap`, because `at + nbytes` is a `u64` sum that can wrap and a wrapped sum
+// compares small. `at <= cap` is what makes the second line safe.
+private rawptr carve(ArenaPtr a, u64 nbytes, u64 align):
+    // **The ceiling, stated rather than assumed.** `over` aligned this block's
+    // base to `mem.MAX_ALIGN` and to nothing coarser, so aligning the cursor to
+    // more than that produces an offset that is a multiple of `align` from a
+    // base that is not — an address this allocator would be claiming is aligned
+    // when it has no reason to think so. Refused, because `MAX_ALIGN` is
+    // documented as what every shipped allocator hands out and an allocator
+    // that quietly under-aligns is the worst of the three possible answers.
+    //
+    // It is a refusal and not a wider alignment on purpose: honouring an
+    // arbitrary `align` means paying `align - 1` bytes of a block the caller
+    // sized, and a 4096-byte arena losing 511 bytes to one request for
+    // `align = 512` is a surprise nobody asked for. If a caller needs more, the
+    // block is theirs to over-size and `over` is theirs to call.
+    if align > mem.MAX_ALIGN:
+        return nil
+    u64 at = mem.align_up(a^.used, align)
+    if at > a^.cap || nbytes > a^.cap - at:
+        return nil
+    rawptr out = offset(a^.block, a^.cap, at)
+    if out == nil:
+        return nil
+    zero_range(out, nbytes)
+    a^.last = at
+    a^.last_size = nbytes
+    a^.used = at + nbytes
+    return out
+
+// `Resize`, with the in-place case that is the reason `Resize` is a mode
+// rather than something the caller synthesizes.
+//
+// The block is the arena's last allocation exactly when its offset is `last`,
+// and then growing it is moving the cursor: O(1), no copy, and the data did
+// not move — which matters, because a reference that did not move
+// leaves every pointer and slice into it valid.
+private rawptr regrow(ArenaPtr a, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    if old == nil:
+        return carve(a, nbytes, align)
+    if old == offset(a^.block, a^.cap, a^.last) && old_size == a^.last_size:
+        u64 at = a^.last
+        if at > a^.cap || nbytes > a^.cap - at:
+            return nil
+        if nbytes > old_size:
+            zero_from(old, old_size, nbytes)
+        a^.last_size = nbytes
+        a^.used = at + nbytes
+        return old
+    // Not on top of the arena, so there is nothing clever to do and the
+    // library helper is what an allocator in that position calls instead.
+    return mem.resize_by_copy((dispatch, rawptr(a)), old, old_size, nbytes, align)
+
+// ── Byte work ────────────────────────────────────────────────────────────────
+//
+// The same byte window `core:mem` uses, for the same reason: Dado has no pointer
+// arithmetic, so `block + at` is spelled by taking a `[]u8` over the
+// block and asking for the address of a slot. The window's length is the
+// arena's **own `cap`** — the number the caller of `over` supplied — so an
+// arena is as large as its block and there is no second, invented ceiling for
+// `carve` to refuse against.
+
+private rawptr offset(rawptr block, u64 cap, u64 at):
+    if block == nil || at > cap:
+        return nil
+    mem.Bytes b = mem.Bytes(block)
+    []u8 region = b[0..<i64(cap)]
+    return rawptr(&region[at])
+
+private void zero_range(rawptr p, u64 nbytes):
+    zero_from(p, 0, nbytes)
+    return
+
+private void zero_from(rawptr p, u64 from, u64 to):
+    if p == nil || to <= from:
+        return
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[i64(from)..<i64(to)]
+    i64 zero = 0
+    for i in zero..<#len(span):
+        span[i] = 0
+    return

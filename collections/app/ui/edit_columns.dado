@@ -1,0 +1,219 @@
+// app:ui — the text edit's column index: its caret's line measured once.
+//
+// A column comes from walking a line from its start (`cell.column_from` says
+// why: a tab's width depends on the column it starts at). On a line of a
+// megabyte that walk is milliseconds, and a keystroke asks for columns on the
+// caret's line several times — the follow, the paint's left column, the caret
+// cell, the snap back onto a cluster. So the widget keeps **marks** for one
+// line: `cell.ColumnMark`s, a cluster boundary and its column, laid every
+// `EDIT_COLUMN_STRIDE` bytes by a walk that goes only as far as a question
+// needs. A question then walks from the nearest mark before it, never more
+// than a stride and one cluster, and answers exactly what a walk from the
+// start answers (`cell.visual_from`, `cell.logical_from`).
+//
+// **Which line.** The caret's: a question about the caret's line keys the
+// index to it, dropping the marks of whatever line it held. A question about
+// another line is answered by the plain walk unless the index already holds
+// that line, so a paint of every visible row, or clamping an anchor on
+// another line, never evicts the caret's marks. A motion that is about to
+// land on a line (Up and Down, a press) keys it first, since the caret's
+// questions come next. A line no longer than a stride is always walked
+// plainly: the walk is as short as a mark would make it, and it costs no
+// memory.
+//
+// **Edits truncate; they never shift.** An edit at byte `b` of the indexed
+// line keeps the marks before `b` and drops the rest, which the next question
+// walks again — typing at the end of a long line re-walks the last stride.
+// Shifting marks by the inserted length would be wrong: the columns after an
+// edit depend on where the tabs after it now start. A mark survives only if
+// every byte a walk read to reach it is unchanged, and reaching a boundary
+// decodes the code point that starts there, which reads up to
+// `EDIT_COLUMN_REACH` bytes (a malformed sequence cut short by the edit reads
+// into it), so a mark is kept when it lies at least that far before `b`. An
+// edit that opens or closes lines at or above the indexed line renumbers it,
+// and drops the index; so does `text_edit_set_source`. A mark past the line's
+// end, which only a change behind the widget's back can make, empties the
+// index before it is read.
+//
+// **One answer is remembered**: the column of the last byte asked about, so
+// a frame that asks for the caret's column in the follow and again in the
+// paint walks once. Any edit, and any change of line, forgets it.
+//
+// The marks live in the tree's allocator (`g_alloc`) and are freed by the
+// widget's free hook (`edit_free`, through `cols_free`).
+package ui
+
+import "app:ui/cell"
+import "core:chars"
+
+// Bytes between marks. A question walks at most this many bytes (and one
+// cluster) past its mark, and the marks cost 8 bytes per stride of the line.
+@const i32 EDIT_COLUMN_STRIDE = 512
+
+// How far before an edit a mark must lie to survive it: the most bytes a
+// decode reads from the code point's first byte.
+private const i32 EDIT_COLUMN_REACH = 4
+
+private const i32 COL_NONE = 2147483647
+
+private void cols_forget(^EditState s):
+    s.cols_keyed = false
+    s.ncols = 0
+    s.memo_ok = false
+
+private void cols_free(^EditState s):
+    cols_forget(s)
+    if s.cols != nil:
+        #delete(s.cols)
+        s.cols = nil
+
+// Whether the index answers for line `li` (text `line`); with `claim`, keyed
+// to it when it held another line. A short line is never served.
+private bool cols_serve(^EditState s, i64 li, string8 line, bool claim):
+    i32 n = i32(#len(line))
+    if n <= EDIT_COLUMN_STRIDE:
+        return false
+    if s.cols_keyed && s.cols_line == li:
+        if s.cols[s.ncols - 1].byte > n:
+            s.ncols = 1
+            s.memo_ok = false
+        return true
+    if !claim:
+        return false
+    if s.cols == nil:
+        s.cols = #make([]cell.ColumnMark, 64, g_alloc)
+        if s.cols == nil:
+            return false
+    s.cols[0] = cell.mark(0, 0)
+    s.ncols = 1
+    s.cols_line = li
+    s.cols_keyed = true
+    s.memo_ok = false
+    return true
+
+// Walk on from the last mark, laying one every stride, while the walk is at
+// or before byte `to_byte` and column `to_col`, so the last mark is within a
+// stride of either. A mark that cannot be stored stops the laying and
+// nothing else: the questions walk further, and answer the same.
+private void cols_extend(^EditState s, string8 line, i32 to_byte, i32 to_col):
+    i32 n = i32(#len(line))
+    cell.ColumnMark last = s.cols[s.ncols - 1]
+    i32 at = last.byte
+    i32 col = last.col
+    i32 next = at + EDIT_COLUMN_STRIDE
+    for at < n && at <= to_byte && col <= to_col:
+        if at >= next:
+            if s.ncols >= i32(#len(s.cols)):
+                if !#resize(s.cols, #len(s.cols) * 2):
+                    return
+            s.cols[s.ncols] = cell.mark(at, col)
+            s.ncols = s.ncols + 1
+            next = at + EDIT_COLUMN_STRIDE
+        col = col + cell.cluster_columns_at(line, at, col)
+        at = chars.cluster_end(line, at)
+
+// The last mark at or before byte `b`.
+private cell.ColumnMark cols_at_byte(^EditState s, i32 b):
+    i32 lo = 0
+    i32 hi = s.ncols - 1
+    for lo < hi:
+        i32 mid = (lo + hi + 1) / 2
+        if s.cols[mid].byte <= b:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s.cols[lo]
+
+// The last mark at or before column `c`. Columns strictly increase from mark
+// to mark, since every cluster before the end takes at least one.
+private cell.ColumnMark cols_at_col(^EditState s, i32 c):
+    i32 lo = 0
+    i32 hi = s.ncols - 1
+    for lo < hi:
+        i32 mid = (lo + hi + 1) / 2
+        if s.cols[mid].col <= c:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s.cols[lo]
+
+// An edit at byte `b` of line `li`; `count_changed` when it opened or closed
+// lines. See the file comment.
+private void cols_edit(^EditState s, i64 li, i32 b, bool count_changed):
+    if !s.cols_keyed:
+        return
+    s.memo_ok = false
+    if s.cols_line == li:
+        for s.ncols > 1 && s.cols[s.ncols - 1].byte + EDIT_COLUMN_REACH > b:
+            s.ncols = s.ncols - 1
+        return
+    if s.cols_line > li && count_changed:
+        cols_forget(s)
+
+// `cell.visual_of(line, byte)` for line `li`, from the index when it serves
+// the line (see `cols_serve` for `claim`).
+private i32 edit_col(^EditState s, i64 li, string8 line, i32 byte, bool claim):
+    if !cols_serve(s, li, line, claim):
+        return i32(cell.visual_of(line, cell.LogicalOffset(byte)))
+    if s.memo_ok && s.memo_byte == byte:
+        return s.memo_col
+    cols_extend(s, line, byte, COL_NONE)
+    i32 col = i32(cell.visual_from(line, cols_at_byte(s, byte), cell.LogicalOffset(byte)))
+    s.memo_ok = true
+    s.memo_byte = byte
+    s.memo_col = col
+    return col
+
+// `cell.logical_of(line, col)` for line `li`, from the index when it serves.
+private i32 edit_logical(^EditState s, i64 li, string8 line, i32 col, bool claim):
+    if !cols_serve(s, li, line, claim):
+        return i32(cell.logical_of(line, cell.VisualCol(col)))
+    cols_extend(s, line, COL_NONE, col)
+    return i32(cell.logical_from(line, cols_at_col(s, col), cell.VisualCol(col)))
+
+// `cell.byte_at_column(line, col)` for line `li`, from the index when it
+// serves.
+private (i32 byte, i32 start) edit_byte_at(^EditState s, i64 li, string8 line, i32 col, bool claim):
+    if !cols_serve(s, li, line, claim):
+        return cell.byte_at_column(line, col)
+    cols_extend(s, line, COL_NONE, col)
+    cell.ColumnMark m = cols_at_col(s, col)
+    return cell.byte_at_column_from(line, m.byte, m.col, col)
+
+// `edit_snap(line, byte)` for line `li`, through the index.
+private i32 edit_snap_in(^EditState s, i64 li, string8 line, i32 byte, bool claim):
+    i32 n = i32(#len(line))
+    if byte <= 0:
+        return 0
+    if byte >= n:
+        return n
+    return edit_logical(s, li, line, edit_col(s, li, line, byte, claim), claim)
+
+// `edit_snap_forward(line, byte)` for line `li`, through the index.
+private i32 edit_snap_forward_in(^EditState s, i64 li, string8 line, i32 byte, bool claim):
+    i32 b = edit_snap_in(s, li, line, byte, claim)
+    if b >= byte:
+        return b
+    return i32(cell.next_visual(line, cell.caret(b)).offset)
+
+// How many marks the index holds, and the line it holds them for (-1 when
+// it holds none) — for the tests, which prove the marks are used and kept.
+(i32 marks, i64 line) text_edit_column_marks(Control c):
+    if !is_edit(c):
+        return (0, -1)
+    ^EditState s = EditPtr(state(c))
+    if !s.cols_keyed:
+        return (0, -1)
+    return (s.ncols, s.cols_line)
+
+// The caret's column on screen, as `cell.visual_of` answers it for the
+// caret's line — through the index, so a program showing it every frame
+// does not walk a long line. 0 for anything that is not a live text edit.
+i32 text_edit_caret_column(Control c):
+    if !is_edit(c):
+        return 0
+    ^EditState s = EditPtr(state(c))
+    if !s.has_src:
+        return 0
+    string8 ln = doc_line(s, s.caret.line)
+    return edit_col(s, s.caret.line, ln, s.caret.byte, true)

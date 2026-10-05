@@ -1,0 +1,352 @@
+// dado dashboard — the toolchain's face: the packages under a directory,
+// built, run, tested and checked from one screen, with the compiler's
+// diagnostics, the constants `-D` can override, and the toolchain itself.
+//
+//     dado                      on a terminal, opens this (when it is built)
+//     dado dashboard [DIR]      the same, on DIR
+//     dado dashboard --theme=light
+//
+// Six tabs, each a key: Home (1) — this project, the toolchain, updates and
+// `dado doctor`'s summary; Packages (2) — the tree, the selection, imports
+// and dependents; Build (3) — the verbs, their choices and live output;
+// Diagnostics (4); Constants (5); Toolchain (6) — versions, paths, and the
+// install's update, upgrade and rollbacks. `?` lists every key, ctrl+p
+// every command, and the mouse is optional throughout.
+//
+// **It reads and runs; it never edits.** Source is opened in your editor,
+// settings are the only file it writes (`settings.dado`), and every action is
+// a `dado` or `dadoc` command line the Build tab shows before it runs.
+//
+// **The loop is `tui.step`**, and between frames `pump` reads whatever the
+// children wrote (`jobs.dado`) and indexes a slice of the package tree, so a
+// build streams while the screen stays live and nothing ever blocks. A frame
+// is composed only when something changed and is sent as one write; with
+// `DADO_DASHBOARD_STATS=<file>` the frame times are written there on exit,
+// which is what the pty suite reads.
+package dashboard
+
+import tui "vendor:tui"
+import "core:flags"
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+private const i32 TAB_HOME = 0
+private const i32 TAB_PACKAGES = 1
+private const i32 TAB_BUILD = 2
+private const i32 TAB_DIAGNOSTICS = 3
+private const i32 TAB_CONSTANTS = 4
+private const i32 TAB_TOOLCHAIN = 5
+private const i32 N_TABS = 6
+
+private const i32 MIN_COLS = 80
+private const i32 MIN_ROWS = 24
+
+private i32 g_tab = 0
+private bool g_help_open
+private bool g_palette_open
+private ref []char8 g_palette_query
+private i32 g_max_writes
+
+// ── commands ───────────────────────────────────────────────────────────────
+
+private const i32 N_COMMANDS = 15
+private [N_COMMANDS]string8 COMMANDS = [
+    "Build the selected package          b",
+    "Run it                              r",
+    "Test it                             t",
+    "Check it                            c",
+    "Stop what is running                esc",
+    "Read everything again               ctrl+r",
+    "Home                                1",
+    "Packages                            2",
+    "Build                               3",
+    "Diagnostics                         4",
+    "Constants                           5",
+    "Toolchain                           6",
+    "Open the diagnostic in the editor   enter",
+    "Every key                           ?",
+    "Quit                                q",
+]
+
+private void command(i32 chose):
+    switch chose:
+        case 0: do_build()
+        case 1: do_run()
+        case 2: do_test()
+        case 3: do_check()
+        case 4: stop_one()
+        case 5: refresh()
+        case 6: g_tab = TAB_HOME
+        case 7: g_tab = TAB_PACKAGES
+        case 8: g_tab = TAB_BUILD
+        case 9: g_tab = TAB_DIAGNOSTICS
+        case 10: g_tab = TAB_CONSTANTS
+        case 11: g_tab = TAB_TOOLCHAIN
+        case 12: open_in_editor(g_diag_row)
+        case 13: g_help_open = true
+        else: tui.quit()
+
+// Esc: the run if there is one, else the query in progress — done from
+// `pump`, between frames, since finding a run's children asks `ps`.
+private bool g_stop_pending
+
+private void stop_one(): g_stop_pending = true
+
+private void stop_now():
+    g_stop_pending = false
+    if g_running:
+        cancel_run()
+        return
+    cancel_query()
+
+// Ctrl-R: the tree walked again and every answer asked again.
+private void refresh():
+    g_wanted_package = own(g_wanted_package, selected_package())
+    // Walked from `pump`, between frames, like the first walk.
+    g_walk_pending = true
+    want_where()
+    want_doctor()
+    string8 pkg = selected_package()
+    if #len(pkg) > 0:
+        want_explained(pkg)
+        want_constants(pkg)
+    tui.toast("reading everything again", tui.now().info, 2.0)
+
+private void open_help(): g_help_open = true
+private void open_palette(): g_palette_open = true
+
+// ── the frame ──────────────────────────────────────────────────────────────
+
+private void frame():
+    if tui.cols() < MIN_COLS || tui.rows() < MIN_ROWS:
+        too_small()
+        return
+    keys()
+    title_bar()
+    _ = tui.tabs(&g_tab, "Home", "Packages", "Build", "Diagnostics", "Constants", "Toolchain")
+    tui.reserve(1)
+    for tui.column(height: tui.REST, gap: 0, tag: "body"):
+        switch g_tab:
+            case TAB_HOME: home_tab()
+            case TAB_PACKAGES: packages_tab()
+            case TAB_BUILD: build_tab()
+            case TAB_DIAGNOSTICS: diagnostics_tab()
+            case TAB_CONSTANTS: constants_tab()
+            else: toolchain_tab()
+    // Overlays last: composed after everything else, which is what puts them
+    // on top.
+    help_overlay()
+    verb_modal()
+    i32 chose = tui.palette(open: &g_palette_open, query: &g_palette_query, items: COMMANDS[:])
+    if chose >= 0: command(chose)
+    tui.align(tui.BOTTOM)
+    tui.hints()
+
+private void too_small():
+    tui.bind("q", "quit", tui.quit)
+    tui.text(s: "Dado", color: tui.now().accent, attr: tui.Attr.BOLD)
+    tui.space()
+    _ = tui.paragraph(s: #format("The dashboard needs a terminal of at least ", MIN_COLS, "×", MIN_ROWS, "; this one is ", tui.cols(), "×", tui.rows(), ". Make the window larger and it redraws; q quits.", tui.mem), color: tui.now().text)
+
+private void title_bar():
+    for tui.row(height: 1, gap: 0, tag: "title"):
+        tui.text(s: "Dado", color: tui.now().accent, attr: tui.Attr.BOLD)
+        tui.text(s: "  dashboard  ", color: tui.now().subtext)
+        tui.text(s: title_place(), color: tui.now().muted)
+        tui.align(tui.RIGHT)
+        string8 busy = busy_text()
+        if #len(busy) > 0: tui.spinner(busy)
+        else: tui.text(s: "? help", color: tui.now().muted)
+
+private string8 title_place():
+    string8 here = txt(g_cwd)
+    string8 base = last_part(here)
+    if #len(base) == 0: return here
+    return base
+
+// **Global keys first, then draw.** A binding read at the end of a frame
+// sets state the frame has already drawn from, so the screen would answer a
+// key one keystroke late.
+private void keys():
+    tui.bind("?", "help", open_help)
+    tui.hint("1-6", "tabs")
+    tui.bind("b", "build", do_build)
+    if g_running: tui.bind("esc", "stop", stop_one)
+    else if g_q_live: tui.bind("esc", "stop reading", stop_one)
+    tui.bind("ctrl+p", "commands", open_palette)
+    tui.bind("q", "quit", tui.quit)
+    if tui.key("r"): do_run()
+    if tui.key("t"): do_test()
+    if tui.key("c"): do_check()
+    if tui.key("ctrl+r"): refresh()
+    if tui.key("1"): g_tab = TAB_HOME
+    if tui.key("2"): g_tab = TAB_PACKAGES
+    if tui.key("3"): g_tab = TAB_BUILD
+    if tui.key("4"): g_tab = TAB_DIAGNOSTICS
+    if tui.key("5"): g_tab = TAB_CONSTANTS
+    if tui.key("6"): g_tab = TAB_TOOLCHAIN
+    string8 log_tag = "out" if g_tab == TAB_BUILD else "tc-log"
+    if g_tab == TAB_BUILD || g_tab == TAB_TOOLCHAIN:
+        if tui.key("pgup"): tui.log_scroll(log_tag, 0 - 10)
+        if tui.key("pgdn"): tui.log_scroll(log_tag, 10)
+        if tui.key("end"): tui.log_scroll(log_tag, 1000000)
+
+private const i32 N_HELP = 20
+private [N_HELP]string8 HELP_KEYS = [
+    "1 … 6", "tab, shift+tab", "arrows", "enter, space", "ctrl+p",
+    "b r t c", "esc", "ctrl+r", "pgup pgdn end",
+    "right, left", "filter", "enter",
+    "q", "ctrl+z", "?", "", "", "", "", "",
+]
+private [N_HELP]string8 HELP_SAYS = [
+    "the tabs: Home … Toolchain",
+    "move between the controls",
+    "move in a list; change a choice",
+    "press a button; open a directory",
+    "every command, by name",
+    "build, run, test, check the selection",
+    "stop the run, else the query; close this",
+    "read the tree and the toolchain again",
+    "scroll the output; follow it again",
+    "open, close a directory (Packages)",
+    "list packages whose path holds it",
+    "open a diagnostic in your editor",
+    "quit, stopping what still runs",
+    "suspend to the shell; fg resumes",
+    "this list",
+    "", "", "", "", "",
+]
+
+private void help_overlay():
+    if tui.modal(title: "Keys", open: &g_help_open, width: 62, height: 20):
+        defer tui.end()
+        for i in 0..<N_HELP:
+            if #len(HELP_KEYS[i]) == 0: break
+            for tui.row(height: 1, gap: 2, tag: "help-row"):
+                tui.push_id(i)
+                for tui.column(width: 16, height: 1, gap: 0, tag: "help-key"):
+                    tui.text(s: HELP_KEYS[i], color: tui.now().accent, attr: tui.Attr.BOLD)
+                tui.text(s: HELP_SAYS[i], color: tui.now().text)
+                tui.pop_id()
+        tui.space()
+        tui.text(s: "The mouse works too: click, and the wheel scrolls.", color: tui.now().muted)
+
+// ── the loop ───────────────────────────────────────────────────────────────
+
+// What happens between frames: the children read, the tree indexed.
+private bool g_walk_pending
+
+private void pump():
+    if g_stop_pending: stop_now()
+    if g_walk_pending:
+        g_walk_pending = false
+        walk_tree()
+        index_restart()
+        tui.wake()
+    pump_run()
+    pump_query()
+    index_some()
+    (i32 _, i32 writes) = tui.frame_output()
+    if writes > g_max_writes: g_max_writes = writes
+
+// The dado to run: the one beside this program (a checkout's build/tools,
+// an install's bin), else whichever is on the PATH.
+private void find_dado():
+    string8 name = "dado"
+    when #OS == #WINDOWS:
+        name = "dado.exe"
+    try string8 exe = os.executable_path() else:
+        g_dado = own(g_dado, "dado")
+        return
+    ref []char8 dir = path.dir(exe)
+    ref []char8 beside = path.join(txt(dir), name)
+    #delete(dir)
+    ref []char8 c = strings.clone_to_cstring(txt(beside), #heap)
+    bool there = fs.executable(cstring(c))
+    #delete(c)
+    if there: g_dado = own(g_dado, txt(beside))
+    else: g_dado = own(g_dado, "dado")
+    #delete(beside)
+
+// The frame times, for the pty suite, when it asked for them.
+private void write_stats():
+    (ref []char8 where, bool set) = os.get_env("DADO_DASHBOARD_STATS")
+    defer #delete(where)
+    if !set || blank(txt(where)): return
+    (i32 frames, f64 last_ms, f64 worst_ms, f64 mean_ms, i32 over) = tui.frame_times()
+    ref []char8 text = #format("frames=", frames, "\nlast_ms=", last_ms, "\nworst_ms=", worst_ms, "\nmean_ms=", mean_ms, "\nover_4ms=", over, "\nmax_writes=", g_max_writes, "\nwalk_ms=", g_walk_ms, "\nnodes=", g_nodes, "\n", #heap)
+    try fs.write_file(txt(where), txt(text)) else:
+        pass
+    #delete(text)
+
+i32 main(i32 argc, ^rawptr argv):
+    []string8 all = os.args(argc, argv)
+    []string8 args = all[1..<#len(all)] if #len(all) > 0 else all
+    flags.Parser p = flags.parser("dado dashboard", "The Dado dashboard: browse, build, run and test the packages under a directory, on a terminal.")
+    flags.TextFlag theme_flag = p.choice("--theme", "=dark|light", "the ground the palette is drawn for (default dark; also DADO_THEME)", "")
+    flags.TextFlag dir_flag = p.positional("DIR", "the directory to open (default: the working directory)", false)
+    try string8 _ = p.parse(args) else:
+        fmt.writeln(io.stderr_sink(), "error: ", p.error(), ". Try: dado dashboard --help")
+        return 2
+    if p.wants_help():
+        ref []char8 h = p.help()
+        fmt.print(txt(h))
+        return 0
+
+    string8 dir = p.value(dir_flag)
+    if #len(dir) > 0:
+        ref []char8 dc = strings.clone_to_cstring(dir, #heap)
+        bool moved = fs.set_cwd(cstring(dc))
+        #delete(dc)
+        if !moved:
+            fmt.writeln(io.stderr_sink(), "error: cannot open ", dir, ": it is not a directory you can enter. Give a directory that exists, or none for this one.")
+            return 2
+    g_cwd = own(g_cwd, string8(fs.cwd()))
+
+    (ref []char8 te, bool _) = os.get_env("DADO_THEME")
+    bool light = p.value(theme_flag) == "light" || (blank(p.value(theme_flag)) && strings.trim(txt(te)) == "light")
+    #delete(te)
+
+    if !tui.is_terminal():
+        fmt.writeln(io.stderr_sink(), "error: the dashboard needs a terminal, and this is not one. Run it in a terminal, or use the commands it runs: dado build, dado test, dado check.")
+        return 1
+
+    // The children's environment: no update check of their own (the `dado`
+    // that started this one has done it), and no colour in output that is
+    // read here rather than shown on a terminal.
+    try os.set_env("DADO_NO_UPDATE_CHECK", "1") else: pass
+    try os.set_env("DADO_COLOR", "never") else: pass
+    find_dado()
+
+    if !tui.open():
+        fmt.writeln(io.stderr_sink(), "error: could not take the terminal (raw mode was refused). Run it in an ordinary terminal window.")
+        return 1
+    defer tui.close()
+    choose_theme(light)
+
+    g_out = tui.log_open(#heap, 1048576)
+    g_doctor = tui.log_open(#heap)
+    g_project = tui.log_open(#heap)
+    g_diags = tui.log_open(#heap, 1048576)
+    g_excerpt = tui.log_open(#heap)
+    g_consts = tui.log_open(#heap)
+    tui.log_say(&g_out, "b build · r run · t test · c check")
+
+    // The tree is walked after the first frame is up, from `pump`: a large
+    // directory (or a slow filesystem — Wine's took 7.4 s over this
+    // repository) is a wait the screen can show rather than hide.
+    g_walk_pending = true
+    want_where()
+    want_doctor()
+
+    // 30 ms is the cadence children are read at, not a repaint rate: a frame
+    // is composed only when something changed.
+    for tui.step(frame, 30): pump()
+    stop_everything()
+    save_settings()
+    write_stats()
+    return 0

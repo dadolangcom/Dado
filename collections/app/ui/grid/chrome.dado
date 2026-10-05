@@ -1,0 +1,644 @@
+// app:ui/grid — the chrome pass: panel fills, borders, rounded corners and
+// shadows, drawn in free pixels under a layer's cells.
+//
+//     grid.set_layers(2)
+//     ChromeBox b = grid.chrome_box(x, y, w, h)
+//     b.fill = [40, 44, 52, 255]
+//     b.border = [90, 96, 110, 255]
+//     b.border_l = 1   ...
+//     b.radius = 6
+//     _ = grid.chrome_add(grid.BASE, b)
+//
+// **Why not cells.** A cell is the smallest thing the grid can colour, so a
+// border drawn in cells is a whole cell thick and a corner is a square. A
+// panel wants a one-pixel rule, a rounded corner and a soft shadow that
+// spills past its edge; none of those sit on the cell lattice. The chrome is
+// drawn first and the layer's cells over it, and a cell whose background
+// alpha is 0 is the hole the chrome shows through: the grid shader writes
+// premultiplied colour and blends ONE, ONE_MINUS_SRC_ALPHA, so a blank cell
+// with a transparent background writes `(0, 0, 0, 0)` and leaves the pixel
+// under it exactly as it was, and a glyph on such a cell is its ink alone,
+// over the chrome.
+//
+// **A retained list, in framebuffer pixels.** Each layer keeps its boxes until
+// `chrome_clear`; nothing here is rebuilt per frame except the triangles,
+// which are cheap. `begin` does not clear them on a resize, because a box is
+// in pixels, not cells, and only its owner knows where it goes at the new
+// size — a caller that repaints on `begin`'s true repaints its chrome too.
+//
+// ## Everything is triangles, built with no GPU
+//
+// `box_triangles` turns one box into coloured triangles and is pure, which is
+// what the tests hold it to. The drawing is then one `sgp_set_color` per
+// colour change and one `sgp_draw_filled_triangle` per triangle; sokol_gp
+// merges a run of draws with the same pipeline and textures into one call
+// itself (colour is per vertex, not state), so the box count does not become
+// the draw count. Measured with `sg_query_stats().prev_frame` under Xvfb and
+// Mesa's software GL, 2026-09-22: a layer with two boxes (a bordered rounded
+// panel and a shadowed card, 140 triangles, 8400 bytes of vertices appended)
+// cost one sokol draw beside the grid's one.
+//
+// The order inside a box is fixed: shadow, then fill, then border, so the
+// shadow is beneath both and the border is never covered by its own fill.
+// Boxes are drawn in list order.
+//
+// **Square corners.** A box with `radius` 0 is axis-aligned rectangles on
+// whole pixels: its fill is one rectangle, its border four (`border_rects`),
+// each edge's width drawn inside the box. With integer coordinates every edge
+// of every triangle lies on a pixel boundary, so a 1 px border is exactly one
+// row or column of pixels.
+//
+// **Rounded corners** are a convex polygon, each corner a quarter-ellipse of
+// `corner_segments` chords, filled as a fan from the centre. The border is the
+// ring between that outline and an inner one — the box inset by the four
+// widths, each inner corner's radii the outer radius less the two widths that
+// meet there — built point for point with the same parameter so the ring is
+// one quad per chord. There is no anti-aliasing: the chords land on pixels by
+// the rasteriser's centre rule, so an arc is stair-stepped at the pixel; the
+// straight runs between arcs are still exact.
+//
+// **A soft shadow** is `shadow_steps` copies of the box's shape, offset by
+// (`shadow_dx`, `shadow_dy`) and grown by an even share of `shadow_size` each,
+// every copy in the shadow colour at the same step alpha. Stacked "over" in
+// one colour, `m` copies of alpha `s` compose to `1 - (1 - s)^m`, whatever the
+// order; the step alpha is chosen so all of them together give the shadow's
+// own alpha, `s = 1 - (1 - a)^(1 / steps)`. A pixel next to the box is under
+// every copy and gets the full alpha; one at the outer rim is under only the
+// largest copy and gets `s`. That is the falloff.
+//
+// ## Interleaving with the cells, and why it is safe
+//
+// `render` calls `chrome_draw` for a layer and then issues that layer's
+// instanced draw, inside the same pass. `sgp_flush` (in the vendored
+// `sokol_gp.h`) starts every flush with its current pipeline id set to an
+// impossible value, so its first draw command always calls
+// `sg_apply_pipeline` and then `sg_apply_bindings` and its uniforms: it does
+// not trust whatever was bound before it. The grid's own draw, in the other
+// direction, calls `sg_apply_pipeline`, `sg_apply_bindings` and
+// `sg_apply_uniforms` every time it draws a layer, so nothing sokol_gp left
+// bound survives into it. Neither side sets a viewport or a scissor here —
+// `sgp_flush` applies one only for a queued `sgp_viewport` or `sgp_scissor`
+// command, and this file queues neither — so both draw into the full pass.
+//
+// The vertices share sokol_gp's one per-frame vertex buffer with every other
+// sokol_gp user in the frame (the runtime's own canvas draws after the draw
+// hook, through the same buffer): `sgp_flush` appends to it with
+// `sg_append_buffer`, which sokol_gfx allows many times a frame. A box costs
+// at most `MAX_BOX_TRIS * 3` vertices of that budget.
+package grid
+
+import "core:math"
+import "core:mem"
+import sgp "vendor:sokol/sokol_gp"
+
+// One box of chrome. The rectangle is the box's own area in framebuffer
+// pixels; a shadow may ink outside it. A colour with alpha 0 is "none".
+// Border widths are drawn inside the rectangle.
+type ChromeBox: (
+    i32 x, i32 y, i32 w, i32 h,
+    [4]u8 fill,
+    [4]u8 border,
+    i32 border_l, i32 border_t, i32 border_r, i32 border_b,
+    i32 radius,
+    [4]u8 shadow,
+    i32 shadow_size, i32 shadow_dx, i32 shadow_dy,
+)
+
+// A box at (`x`, `y`), `w` x `h`, with no fill, no border, square corners and
+// no shadow: the caller sets what it wants.
+ChromeBox chrome_box(i32 x, i32 y, i32 w, i32 h):
+    ChromeBox b
+    b.x = x
+    b.y = y
+    b.w = w
+    b.h = h
+    return b
+
+// The largest pixel quantity the tessellation takes: every coordinate,
+// size, width, radius, shadow extent and offset of a box is held to
+// `-MAX_CHROME_PX .. MAX_CHROME_PX` (sizes, widths, radius and shadow extent
+// to `0 .. MAX_CHROME_PX`) by `chrome_clamped` before any arithmetic. 16384
+// is a choice, past any framebuffer this draws into, and it keeps every sum
+// below in `i32` with room to spare, so none needs widening — the
+// widest is an outer shadow copy's `w + 2 * size`, at most 3 * 16384 = 49152,
+// and every quantity stays far below 2^24, where an `f32` stops holding whole
+// pixels exactly. Unclamped, a shadow size near 1.5e9 wrapped `w + 2 * e`
+// negative and lost the shadow, and one of 2147483647 made the float-to-int
+// rounding of the shadow's growth overflow.
+const i32 MAX_CHROME_PX = 16384
+
+private i32 px_held(i32 v, i32 lo):
+    if v < lo:
+        return lo
+    if v > MAX_CHROME_PX:
+        return MAX_CHROME_PX
+    return v
+
+// `b` with every pixel quantity held to the range above; colours untouched.
+ChromeBox chrome_clamped(ChromeBox b):
+    ChromeBox c = b
+    i32 lo = 0 - MAX_CHROME_PX
+    c.x = px_held(b.x, lo)
+    c.y = px_held(b.y, lo)
+    c.w = px_held(b.w, 0)
+    c.h = px_held(b.h, 0)
+    c.border_l = px_held(b.border_l, 0)
+    c.border_t = px_held(b.border_t, 0)
+    c.border_r = px_held(b.border_r, 0)
+    c.border_b = px_held(b.border_b, 0)
+    c.radius = px_held(b.radius, 0)
+    c.shadow_size = px_held(b.shadow_size, 0)
+    c.shadow_dx = px_held(b.shadow_dx, lo)
+    c.shadow_dy = px_held(b.shadow_dy, lo)
+    return c
+
+type ChromePt: (f32 x, f32 y)
+
+type ChromeRect: (i32 x, i32 y, i32 w, i32 h)
+
+// One triangle of chrome in one straight-alpha colour.
+type ChromeTri: (ChromePt a, ChromePt b, ChromePt c, [4]u8 col)
+
+// ── Pure geometry ───────────────────────────────────────────────────────────
+
+// The most chords a quarter-circle is cut into, and the most copies a soft
+// shadow is drawn as. Both are choices. Sixteen chords keep the sag below
+// `CHORD_SAG` up to a radius of `0.25 / (1 - cos(pi / 64))`, about 207 px, far
+// past any panel corner; four shadow copies is a step of a quarter of the
+// shadow's alpha range, which is what the few-pixel shadows of a UI want.
+const i32 MAX_CORNER_SEGMENTS = 16
+const i32 SHADOW_STEPS = 4
+
+// How far a chord may sag inside its arc, in pixels, before a corner gets
+// another segment: a quarter of a pixel, a choice. With no anti-aliasing an
+// edge is decided by which pixel centres it passes, and a sag this small
+// moves few of them. A 6 px radius gets 3 chords: 1 and 2 would sag
+// `6 * (1 - cos(pi / 4))` = 1.76 and `6 * (1 - cos(pi / 8))` = 0.46 px, 3 sags
+// `6 * (1 - cos(pi / 12))` = 0.20.
+private const f32 CHORD_SAG = 0.25
+
+// The outline of a rounded box has four corners of `segs + 1` points each.
+// With `segs` at most `MAX_CORNER_SEGMENTS` that is 68 points, and a box is at
+// most: `SHADOW_STEPS` fans of 68 triangles, one fill fan of 68, and a border
+// ring of two triangles per outline edge, 136 — 476 in all. `MAX_BOX_TRIS`
+// rounds that up.
+const i32 MAX_OUTLINE_POINTS = 68
+const i32 MAX_BOX_TRIS = 512
+
+// The chords a quarter-circle of radius `r` is cut into: the fewest, from 1
+// to `MAX_CORNER_SEGMENTS`, whose sag `r * (1 - cos(pi / 4 / segs))` is at
+// most `CHORD_SAG`. A radius at or below zero has no arc and answers 0.
+i32 corner_segments(f32 r):
+    if !(r > 0.0):
+        return 0
+    for s in 1..<MAX_CORNER_SEGMENTS:
+        f64 half = math.PI / 4.0 / f64(s)
+        if f64(r) * (1.0 - math.cosine(half)) <= f64(CHORD_SAG):
+            return i32(s)
+    return MAX_CORNER_SEGMENTS
+
+// The largest corner radius a `w` x `h` box can take: half its shorter side.
+// A radius past that would make two corners overlap.
+f32 clamp_radius(f32 r, f32 w, f32 h):
+    f32 m = w
+    if h < m:
+        m = h
+    m = m * 0.5
+    if r > m:
+        r = m
+    if !(r > 0.0):
+        return 0.0
+    return r
+
+// The outline of the box (`x`, `y`, `w`, `h`), clockwise on a y-down screen
+// from the top-left corner's leftmost point, each corner a quarter-ellipse of
+// radii (`rx[k]`, `ry[k]`) cut into `segs` chords: `segs + 1` points per
+// corner, top-left, top-right, bottom-right, bottom-left. A corner with radii
+// 0 is its `segs + 1` points all at the box's corner, so two outlines with the
+// same `segs` always pair point for point. Answers the points written, 0 when
+// `out` is too short for all of them.
+i32 rounded_outline(f32 x, f32 y, f32 w, f32 h, [4]f32 rx, [4]f32 ry, i32 segs, []ChromePt out):
+    if segs < 1:
+        segs = 1
+    i32 per = segs + 1
+    if #len(out) < i64(per) * 4:
+        return 0
+    // The corner centres and the angle each arc starts at, in quarter turns:
+    // left (2) to up (3) at the top-left, up to right (4) at the top-right,
+    // right (0) to down (1) at the bottom-right, down to left at the
+    // bottom-left.
+    [4]f32 cx = [x + rx[0], x + w - rx[1], x + w - rx[2], x + rx[3]]
+    [4]f32 cy = [y + ry[0], y + ry[1], y + h - ry[2], y + h - ry[3]]
+    [4]f64 start = [2.0, 3.0, 0.0, 1.0]
+    i32 n = 0
+    for k in 0..<4:
+        for j in 0..<per:
+            f64 a = (start[k] + f64(j) / f64(segs)) * math.PI * 0.5
+            // Exact at the arc's two ends, so the straight runs between
+            // corners are exactly horizontal and vertical.
+            f32 c = f32(math.cosine(a))
+            f32 s = f32(math.sine(a))
+            if j == 0 || j == segs:
+                c = f32(round_half_up(c))
+                s = f32(round_half_up(s))
+            ChromePt p = (cx[k] + rx[k] * c, cy[k] + ry[k] * s)
+            out[n] = p
+            n = n + 1
+    return n
+
+// The four border rectangles of a square-cornered box, each width drawn
+// inside the box: the top and bottom rows run the full width, the left and
+// right columns fill the height between them. Widths are held to what the box
+// has room for, top before bottom and left before right, so a border wider
+// than its box fills the box and never inverts. Empty rectangles are left
+// out; answers how many were written.
+i32 border_rects(ChromeBox box, []ChromeRect out):
+    ChromeBox b = chrome_clamped(box)
+    if b.w < 1 || b.h < 1:
+        return 0
+    i32 t = math.clamp(b.border_t, 0, b.h)
+    i32 bo = math.clamp(b.border_b, 0, b.h - t)
+    i32 l = math.clamp(b.border_l, 0, b.w)
+    i32 r = math.clamp(b.border_r, 0, b.w - l)
+    [4]ChromeRect rs
+    rs[0] = (b.x, b.y, b.w, t)
+    rs[1] = (b.x, b.y + b.h - bo, b.w, bo)
+    rs[2] = (b.x, b.y + t, l, b.h - t - bo)
+    rs[3] = (b.x + b.w - r, b.y + t, r, b.h - t - bo)
+    i32 n = 0
+    for i in 0..<4:
+        if rs[i].w > 0 && rs[i].h > 0 && n < i32(#len(out)):
+            out[n] = rs[i]
+            n = n + 1
+    return n
+
+// How many copies a box's shadow is drawn as: its size in pixels, held to
+// 1..`SHADOW_STEPS`, so a shadow never has a step finer than a pixel; 0 for a
+// box with no shadow colour.
+i32 shadow_steps(ChromeBox box):
+    ChromeBox b = chrome_clamped(box)
+    if b.shadow[3] == 0:
+        return 0
+    i32 n = b.shadow_size
+    if n > SHADOW_STEPS:
+        n = SHADOW_STEPS
+    if n < 1:
+        n = 1
+    return n
+
+// The alpha each of `steps` stacked copies carries so that all of them
+// together compose to `a`: `1 - (1 - a)^(1 / steps)`, rounded, at least 1 for
+// a nonzero `a`.
+u8 shadow_step_alpha(u8 a, i32 steps):
+    if a == 0 || steps < 1:
+        return 0
+    if steps == 1:
+        return a
+    f64 left = 1.0 - f64(a) / 255.0
+    f64 s = 1.0 - math.raised(left, 1.0 / f64(steps))
+    i32 v = i32(round_half_up(f32(s * 255.0)))
+    if v < 1:
+        v = 1
+    if v > 255:
+        v = 255
+    return u8(v)
+
+// Copy `k` of the box's shadow (0 innermost): the box moved by the shadow
+// offset and grown on every side by `round(size * (k + 1) / steps)` pixels,
+// its corner radius grown by the same, and the step alpha. The outermost copy
+// reaches exactly `shadow_size` past the offset box.
+(ChromeRect r, i32 radius, u8 alpha) shadow_ring(ChromeBox box, i32 k):
+    ChromeBox b = chrome_clamped(box)
+    i32 steps = shadow_steps(b)
+    ChromeRect none
+    if steps == 0 || k < 0 || k >= steps:
+        return (none, 0, 0)
+    i32 size = b.shadow_size
+    if size < 0:
+        size = 0
+    i32 e = i32(round_half_up(f32(size) * f32(k + 1) / f32(steps)))
+    ChromeRect r = (b.x + b.shadow_dx - e, b.y + b.shadow_dy - e, b.w + 2 * e, b.h + 2 * e)
+    i32 rad = b.radius
+    if rad < 0:
+        rad = 0
+    return (r, rad + e, shadow_step_alpha(b.shadow[3], steps))
+
+// ── Tessellation ────────────────────────────────────────────────────────────
+
+// A write cursor into a caller's triangle run.
+private type Sink: (i32 n)
+
+private void put_tri(ChromeTri t, []ChromeTri out, ^Sink n):
+    if n.n < i32(#len(out)):
+        out[n.n] = t
+        n.n = n.n + 1
+
+private void put_rect(f32 x, f32 y, f32 w, f32 h, [4]u8 col, []ChromeTri out, ^Sink n):
+    if !(w > 0.0) || !(h > 0.0):
+        return
+    ChromePt a = (x, y)
+    ChromePt b = (x + w, y)
+    ChromePt c = (x + w, y + h)
+    ChromePt d = (x, y + h)
+    put_tri((a, b, c, col), out, n)
+    put_tri((a, c, d, col), out, n)
+
+// A filled box with corner radius `r` (held by `clamp_radius`): two triangles
+// when square, else a fan from the centre over the rounded outline.
+private void put_shape(f32 x, f32 y, f32 w, f32 h, f32 r, [4]u8 col, []ChromeTri out, ^Sink n):
+    if !(w > 0.0) || !(h > 0.0):
+        return
+    f32 cr = clamp_radius(r, w, h)
+    if cr == 0.0:
+        put_rect(x, y, w, h, col, out, n)
+        return
+    [MAX_OUTLINE_POINTS]ChromePt pts
+    [4]f32 rr = [cr, cr, cr, cr]
+    i32 m = rounded_outline(x, y, w, h, rr, rr, corner_segments(cr), pts[:])
+    ChromePt c = (x + w * 0.5, y + h * 0.5)
+    for i in 0..<m:
+        i32 j = (i32(i) + 1) % m
+        put_tri((c, pts[i], pts[j], col), out, n)
+
+// The border of a rounded box: the ring between its outline and the inner
+// one, two triangles per outline edge.
+private void put_ring(ChromeBox b, f32 r, []ChromeTri out, ^Sink n):
+    f32 l = f32(math.clamp(b.border_l, 0, b.w))
+    f32 t = f32(math.clamp(b.border_t, 0, b.h))
+    f32 rt = f32(math.clamp(b.border_r, 0, b.w))
+    f32 bo = f32(math.clamp(b.border_b, 0, b.h))
+    f32 iw = f32(b.w) - l - rt
+    f32 ih = f32(b.h) - t - bo
+    if !(iw > 0.0) || !(ih > 0.0):
+        // No hole: the border covers the whole box.
+        put_shape(f32(b.x), f32(b.y), f32(b.w), f32(b.h), r, b.border, out, n)
+        return
+    i32 segs = corner_segments(r)
+    [MAX_OUTLINE_POINTS]ChromePt o
+    [MAX_OUTLINE_POINTS]ChromePt p
+    [4]f32 rr = [r, r, r, r]
+    [4]f32 irx = [inner_radius(r, l, iw), inner_radius(r, rt, iw), inner_radius(r, rt, iw), inner_radius(r, l, iw)]
+    [4]f32 iry = [inner_radius(r, t, ih), inner_radius(r, t, ih), inner_radius(r, bo, ih), inner_radius(r, bo, ih)]
+    i32 m = rounded_outline(f32(b.x), f32(b.y), f32(b.w), f32(b.h), rr, rr, segs, o[:])
+    i32 m2 = rounded_outline(f32(b.x) + l, f32(b.y) + t, iw, ih, irx, iry, segs, p[:])
+    if m == 0 || m != m2:
+        return
+    for i in 0..<m:
+        i32 j = (i32(i) + 1) % m
+        put_tri((o[i], o[j], p[j], b.border), out, n)
+        put_tri((o[i], p[j], p[i], b.border), out, n)
+
+// An inner corner's radius along one axis: the outer radius less the border
+// width on that side, never negative and never past half the inner extent.
+private f32 inner_radius(f32 r, f32 width, f32 extent):
+    f32 v = r - width
+    if v > extent * 0.5:
+        v = extent * 0.5
+    if !(v > 0.0):
+        return 0.0
+    return v
+
+// Tessellate one box into `out`: its shadow copies, then its fill, then its
+// border. Answers the triangles written; `out` of `MAX_BOX_TRIS` always holds
+// a whole box. A box with no area draws nothing, shadow included.
+i32 box_triangles(ChromeBox box, []ChromeTri out):
+    ChromeBox b = chrome_clamped(box)
+    Sink n
+    if b.w < 1 || b.h < 1:
+        return 0
+    f32 r = clamp_radius(f32(b.radius), f32(b.w), f32(b.h))
+    i32 steps = shadow_steps(b)
+    for k in 0..<steps:
+        (ChromeRect sr, i32 srad, u8 sa) = shadow_ring(b, i32(k))
+        [4]u8 sc = [b.shadow[0], b.shadow[1], b.shadow[2], sa]
+        put_shape(f32(sr.x), f32(sr.y), f32(sr.w), f32(sr.h), f32(srad), sc, out, &n)
+    if b.fill[3] != 0:
+        put_shape(f32(b.x), f32(b.y), f32(b.w), f32(b.h), r, b.fill, out, &n)
+    bool has_border = b.border_l > 0 || b.border_t > 0 || b.border_r > 0 || b.border_b > 0
+    if b.border[3] != 0 && has_border:
+        if r == 0.0:
+            [4]ChromeRect rs
+            i32 k = border_rects(b, rs[:])
+            for i in 0..<k:
+                put_rect(f32(rs[i].x), f32(rs[i].y), f32(rs[i].w), f32(rs[i].h), b.border, out, &n)
+        else:
+            put_ring(b, r, out, &n)
+    return n.n
+
+// ── The retained list ───────────────────────────────────────────────────────
+
+// One layer's boxes, in draw order. The storage comes from the allocator
+// given to the first `chrome_list_add` and is kept for every later growth.
+type ChromeList: ((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc, ref []ChromeBox boxes, i32 n)
+
+private const i32 CHROME_FIRST = 16
+
+// Append `b`, growing by doubling. Answers false, having changed nothing,
+// when the storage could not be made or grown.
+bool chrome_list_add(^ChromeList l, ChromeBox b, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a):
+    if l.boxes == nil:
+        l.boxes = #make([]ChromeBox, i64(CHROME_FIRST), a)
+        if l.boxes == nil:
+            return false
+        l.alloc = a
+        l.n = 0
+    else if l.n >= i32(#len(l.boxes)):
+        if !#resize(l.boxes, #len(l.boxes) * 2):
+            return false
+    l.boxes[l.n] = b
+    l.n = l.n + 1
+    return true
+
+// Forget every box, keeping the storage.
+void chrome_list_clear(^ChromeList l):
+    l.n = 0
+
+void chrome_list_free(^ChromeList l):
+    if l.boxes != nil:
+        #delete(l.boxes)
+        l.boxes = nil
+    l.n = 0
+
+// ── Drawing ─────────────────────────────────────────────────────────────────
+//
+// sokol_gp has two vertex limits, and they are different limits.
+//
+// **Per flush.** `_sgp_next_vertices` in the vendored `sokol_gp.h` refuses a
+// draw once `cur_vertex + count` passes `max_vertices` (SGP_ERROR_VERTICES_FULL),
+// and `sgp_flush` rewinds `cur_vertex` to the `_base_vertex` that `sgp_begin`
+// recorded; `_sgp_next_command` does the same for `max_commands`. So one
+// `sgp_begin` .. `sgp_flush` holds `max_vertices - _base_vertex` vertices,
+// and a layer whose chrome needs more is drawn in chunks, a flush each.
+// sokol_gp's error is sticky until the next `sgp_begin`, and a flush after an
+// error draws nothing — which is how one oversized layer used to lose every
+// box it had.
+//
+// **Per frame.** `sgp_flush` copies its vertices into one GPU buffer of
+// `max_vertices * sizeof(sgp_vertex)` bytes with `sg_append_buffer`, and
+// every flush of the frame, by every sokol_gp user, appends to the same
+// buffer. In `sokol_gfx.h`'s `sg_append_buffer` an append that does not fit
+// sets `append_overflow`, and that flag stays set until the next frame: every
+// later append that frame is refused and `sgp_flush` reports
+// SGP_ERROR_VERTICES_OVERFLOW and draws nothing. The runtime's own canvas
+// flushes after the draw hook, so a chrome pass that overflowed would take
+// the canvas down with it. Chrome therefore never asks for more than
+// `CHROME_FRAME_PERCENT` of the buffer in one frame, counted across layers
+// from `begin` to `begin`, and leaves the rest to whoever flushes after it.
+//
+// When the budget runs out, the boxes that do not fit are dropped **from the
+// end of the list**: boxes are taken in list order and the first that does
+// not fit stops the layer, so the dropped ones are a suffix — the last added,
+// which is where a caller puts what is drawn on top — and a later layer gets
+// only what the earlier ones left. `stats().chrome_dropped` counts them.
+
+// The share of sokol_gp's per-frame vertex buffer the chrome may use, in
+// percent: a choice, leaving a quarter to the runtime's canvas and anything
+// else that flushes later in the frame. At `app:draw`'s default of 65536
+// vertices that is 49152 vertices, 16384 triangles.
+@const i32 CHROME_FRAME_PERCENT = 75
+
+// What to do with the next box, of `m` triangles, when the open flush already
+// holds `in_flush`, a flush holds at most `flush_cap` and the frame has
+// `frame_left` left.
+enum ChunkStep: (
+    Draw = 0,
+    FlushThenDraw = 1,
+    Drop = 2,
+)
+
+// The one rule both `chunk_plan` and `chrome_draw` follow. A box that does not
+// fit what is left of the frame, or could never fit one flush, is dropped; a
+// box that would overfill the open flush closes it first. A box is never
+// split across flushes.
+ChunkStep chunk_step(i32 m, i32 in_flush, i32 flush_cap, i32 frame_left):
+    if m > frame_left || m > flush_cap:
+        return ChunkStep.Drop
+    if i64(in_flush) + i64(m) > i64(flush_cap):
+        return ChunkStep.FlushThenDraw
+    return ChunkStep.Draw
+
+// How a list of boxes of `box_tris` triangles each is drawn: how many boxes
+// (a prefix of the list) and in how many flushes. Pure; `chrome_draw` does the
+// same walk with the triangles in hand.
+(i32 drawn, i32 flushes) chunk_plan([]i32 box_tris, i32 flush_cap, i32 frame_left):
+    i32 in_flush = 0
+    i32 flushes = 0
+    i32 drawn = 0
+    for i in 0..<#len(box_tris):
+        i32 m = box_tris[i]
+        ChunkStep st = chunk_step(m, in_flush, flush_cap, frame_left)
+        if st == ChunkStep.Drop:
+            break
+        if st == ChunkStep.FlushThenDraw:
+            flushes = flushes + 1
+            in_flush = 0
+        in_flush = in_flush + m
+        frame_left = frame_left - m
+        drawn = drawn + 1
+    if in_flush > 0:
+        flushes = flushes + 1
+    return (drawn, flushes)
+
+// The chrome's triangle budget for a whole frame: `CHROME_FRAME_PERCENT` of
+// sokol_gp's vertex buffer, three vertices a triangle. 0 before sokol_gp is
+// set up.
+i32 chrome_frame_tris():
+    if !sgp.sgp_is_valid():
+        return 0
+    sgp.sgp_desc d = sgp.sgp_query_desc()
+    i64 v = i64(d.max_vertices) * i64(CHROME_FRAME_PERCENT) / 100
+    return i32(v / 3)
+
+// What one layer's chrome pass did: triangles drawn, flushes made, boxes
+// dropped (a suffix of the list), and whether sokol_gp reported an error or
+// was not set up.
+type ChromeDrawn: (i32 tris, i32 flushes, i32 dropped, bool failed)
+
+// Open a sokol_gp scope for chrome and answer how many triangles one flush of
+// it holds: the vertex room above `_base_vertex` over three, and never more
+// than the command room, since a triangle that fails to merge costs a
+// command.
+private i32 chrome_scope(i32 fb_w, i32 fb_h):
+    sgp.sgp_begin(fb_w, fb_h)
+    // Straight alpha, as a `ChromeBox` colour is: src * a + dst * (1 - a).
+    sgp.sgp_set_blend_mode(sgp.sgp_blend_mode.SGP_BLENDMODE_BLEND)
+    sgp.sgp_desc d = sgp.sgp_query_desc()
+    ^sgp.sgp_state st = sgp.sgp_query_state()
+    i64 verts = i64(d.max_vertices) - i64(st._base_vertex)
+    i64 cmds = i64(d.max_commands) - i64(st._base_command)
+    i64 cap = verts / 3
+    if cmds < cap:
+        cap = cmds
+    if cap < 0:
+        cap = 0
+    return i32(cap)
+
+// Close the scope; answers whether sokol_gp drew it.
+private bool chrome_close():
+    sgp.sgp_flush()
+    bool ok = sgp.sgp_get_last_error() == sgp.sgp_error.SGP_NO_ERROR
+    sgp.sgp_end()
+    return ok
+
+// Draw the boxes of `l` with sokol_gp, inside the open pass, into a
+// framebuffer `fb_w` x `fb_h`, using at most `frame_left` triangles: in list
+// order, in as many flushes as it takes, dropping the tail that does not fit.
+// A flush sokol_gp refuses anyway (someone earlier in the frame filled the
+// buffer) drops its boxes and every one after it, since the overflow holds
+// for the rest of the frame.
+ChromeDrawn chrome_draw(^ChromeList l, i32 fb_w, i32 fb_h, i32 frame_left):
+    ChromeDrawn r
+    if l.n < 1 || fb_w < 1 || fb_h < 1:
+        return r
+    if !sgp.sgp_is_valid():
+        r.dropped = l.n
+        r.failed = true
+        return r
+    i32 cap = chrome_scope(fb_w, fb_h)
+    [MAX_BOX_TRIS]ChromeTri tris
+    i32 in_flush = 0
+    i32 chunk_first = 0
+    i32 chunk_tris = 0
+    [4]u8 cur = [0, 0, 0, 0]
+    bool have = false
+    i32 i = 0
+    for i < l.n:
+        i32 m = box_triangles(l.boxes[i], tris[:])
+        ChunkStep st = chunk_step(m, in_flush, cap, frame_left)
+        if st == ChunkStep.Drop:
+            break
+        if st == ChunkStep.FlushThenDraw:
+            if !chrome_close():
+                r.failed = true
+                r.dropped = l.n - chunk_first
+                return r
+            r.tris = r.tris + chunk_tris
+            r.flushes = r.flushes + 1
+            cap = chrome_scope(fb_w, fb_h)
+            in_flush = 0
+            chunk_first = i
+            chunk_tris = 0
+            have = false
+        for k in 0..<m:
+            ChromeTri t = tris[k]
+            if !have || t.col != cur:
+                cur = t.col
+                have = true
+                sgp.sgp_set_color(f32(cur[0]) / 255.0, f32(cur[1]) / 255.0,
+                                  f32(cur[2]) / 255.0, f32(cur[3]) / 255.0)
+            sgp.sgp_draw_filled_triangle(t.a.x, t.a.y, t.b.x, t.b.y, t.c.x, t.c.y)
+        in_flush = in_flush + m
+        chunk_tris = chunk_tris + m
+        frame_left = frame_left - m
+        i = i + 1
+    r.dropped = l.n - i
+    if chunk_tris > 0 || in_flush > 0:
+        if !chrome_close():
+            r.failed = true
+            r.dropped = l.n - chunk_first
+            return r
+        r.tris = r.tris + chunk_tris
+        r.flushes = r.flushes + 1
+    else:
+        sgp.sgp_end()
+    return r

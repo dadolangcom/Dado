@@ -1,0 +1,156 @@
+// core:script — a script loading another by its path: the host side of
+// `Script.load(path, ..args)`, a native module `dados:host` exporting `load`,
+// and the resolver every module's imports go through.
+//
+// **One engine.** A mod is read from `<path>.js` under the working directory,
+// compiled and evaluated in the engine of the script that loads it, on its
+// heap: stopping or deleting that engine ends the mod with it. Each load reads
+// the file afresh and evaluates it under a module name of its own,
+// `mod:<path>#<n>`, so a mod rewritten on disk is a new module the next time.
+//
+// **A mod cannot see Dado.** The resolver (`normalize_import`) hands a module
+// loaded by its path nothing but `dados:runtime`, the runtime every script
+// imports: an import of a `dado:` module — Dado's functions — of a package's
+// script or of JavaScript is refused at load, the `Error` naming the import
+// and why. Every other module's imports resolve as written.
+package script
+
+private foreign "quickjs.h":
+    ^#c.char js_strdup(^JSContext ctx, cstring str)
+
+// The native module `Script.load` reaches through `dados:mods`.
+private const string8 HOST_MODULE = "dados:host"
+
+// What a module loaded by its path is named with in front.
+private const string8 MOD_PREFIX = "mod:"
+
+// The one module a mod may import.
+private const string8 RUNTIME_MODULE = "dados:runtime"
+
+// The engine's resolver: `name` as written, unless the module importing it
+// was loaded by its path and `name` is anything but the runtime — then nil,
+// with a `ReferenceError` naming the import pending.
+private ^#c.char normalize_import(^JSContext ctx, cstring base, cstring name, rawptr opaque):
+    string8 from = string8(base)
+    string8 wanted = string8(name)
+    if starts(from, MOD_PREFIX) && wanted != RUNTIME_MODULE:
+        [1024]char8 file
+        _ = mod_file(&file, from)
+        if starts(wanted, "dado:"):
+            _ = JS_ThrowReferenceError(ctx, "`%s` imports `%s`: a script loaded at run time cannot see Dado; it reaches only what its loader hands its init method, so take what it needs from that", cstring(rawptr(&file[0])), name)
+        else if starts(wanted, "js:") || ends(wanted, ".js") || ends(wanted, ".mjs"):
+            _ = JS_ThrowReferenceError(ctx, "`%s` imports `%s`: a script loaded at run time imports no JavaScript, since a program's JavaScript is embedded in it when it is built and a loaded script's cannot be; hand it what it needs through its init method", cstring(rawptr(&file[0])), name)
+        else:
+            _ = JS_ThrowReferenceError(ctx, "`%s` imports `%s`, a script of a package: a script loaded at run time imports nothing but the runtime, and reaches only what its loader hands its init method; take what it needs from that", cstring(rawptr(&file[0])), name)
+        return nil
+    return js_strdup(ctx, name)
+
+// `dados:host`, made for an engine when `dados:mods` first imports it.
+private ^JSModuleDef host_module(^JSContext ctx, cstring name):
+    ^JSModuleDef m = JS_NewCModule(ctx, name, init_host)
+    if m == nil:
+        return nil
+    if JS_AddModuleExport(ctx, m, "load") < 0:
+        return nil
+    return m
+
+private i32 init_host(^JSContext ctx, ^JSModuleDef m):
+    JSValue f = JS_NewCFunction2(ctx, host_load, "load", 1, JSCFunctionEnum.Generic, 0)
+    if JS_SetModuleExport(ctx, m, "load", f) < 0:
+        return 0 - 1
+    return 0
+
+// `dados:host`'s `load(path)`: the namespace of the module at `<path>.js`,
+// compiled and evaluated in this engine; or an exception saying why not.
+private JSValue host_load(^JSContext ctx, JSValue this_value, i32 argc, ^JSValue argv):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    #c.size_t len = 0
+    ^const #c.char text = JS_ToCStringLen2(ctx, &len, argv^, false)
+    if text == nil:
+        return exception()
+    string8 path = string8(cstring(rawptr(text)))
+    [PATH_MAX]char8 file
+    i64 n = mod_path(&file, path)
+    if n < 0:
+        JS_FreeCString(ctx, cstring(rawptr(text)))
+        return JS_ThrowReferenceError(ctx, "the path is longer than 1023 bytes")
+    ref([]char8) source = read_whole(cstring(rawptr(&file[0])))
+    if source == nil:
+        JSValue thrown = JS_ThrowReferenceError(ctx, "`%s` cannot be read", cstring(rawptr(&file[0])))
+        JS_FreeCString(ctx, cstring(rawptr(text)))
+        return thrown
+    [PATH_MAX]char8 name
+    i64 k = 0
+    string8 prefix = MOD_PREFIX
+    for i in 0..<#len(prefix):
+        name[k] = prefix[i]
+        k += 1
+    for i in 0..<#len(path):
+        if k + 24 < PATH_MAX:
+            name[k] = path[i]
+            k += 1
+    JS_FreeCString(ctx, cstring(rawptr(text)))
+    name[k] = '#'
+    k += 1
+    e^.reloading.made += 1
+    k = put_decimal(&name, k, e^.reloading.made)
+    name[k] = '\0'
+    i32 flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_DADOS
+    JSValue compiled = JS_Eval(ctx, cstring(rawptr(&source[0])), #c.size_t(#len(source) - 1), cstring(rawptr(&name[0])), flags)
+    #delete(source)
+    if is_exception(compiled):
+        return compiled
+    ^JSModuleDef def = ^JSModuleDef(compiled.u.ptr)
+    JSValue done = JS_EvalFunction(ctx, compiled)
+    if is_exception(done):
+        return done
+    JSPromiseStateEnum state = JS_PromiseState(ctx, done)
+    if state == JSPromiseStateEnum.Rejected:
+        JSValue thrown = JS_Throw(ctx, JS_PromiseResult(ctx, done))
+        JS_FreeValue(ctx, done)
+        return thrown
+    JS_FreeValue(ctx, done)
+    if state == JSPromiseStateEnum.Pending:
+        return JS_ThrowReferenceError(ctx, "`%s` did not finish evaluating (top-level await is not supported)", cstring(rawptr(&file[0])))
+    return JS_GetModuleNamespace(ctx, def)
+
+// `<path>.js`, NUL-terminated, into `out`: its length, or −1.
+private i64 mod_path(^[PATH_MAX]char8 out, string8 path):
+    if #len(path) + 4 >= PATH_MAX:
+        return 0 - 1
+    for i in 0..<#len(path):
+        out^[i] = path[i]
+    i64 n = #len(path)
+    out^[n] = '.'
+    out^[n + 1] = 'j'
+    out^[n + 2] = 's'
+    out^[n + 3] = '\0'
+    return n + 3
+
+// The file a module loaded by its path was read from, from its name
+// `mod:<path>#<n>`: `<path>.js`, NUL-terminated.
+private i64 mod_file(^[1024]char8 out, string8 name):
+    string8 path = after(name, MOD_PREFIX)
+    i64 end = #len(path)
+    for i in 0..<#len(path):
+        if path[i] == '#':
+            end = i
+    if end + 4 >= 1024:
+        end = 1019
+    for i in 0..<end:
+        out^[i] = path[i]
+    out^[end] = '.'
+    out^[end + 1] = 'j'
+    out^[end + 2] = 's'
+    out^[end + 3] = '\0'
+    return end + 3
+
+private bool ends(string8 s, string8 suffix):
+    return #len(s) >= #len(suffix) && s[#len(s) - #len(suffix)..<#len(s)] == suffix
+
+// The engine's exception value: what a native function answers when it has
+// left an exception pending.
+private JSValue exception():
+    JSValue v
+    v.tag = i64(JS_TAG_EXCEPTION)
+    return v

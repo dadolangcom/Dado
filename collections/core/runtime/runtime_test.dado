@@ -1,0 +1,285 @@
+@test
+// `core:runtime` is a **policy** over `core:mem/arena`, not a second
+// arena — so almost nothing worth claiming here is about carving bytes, which
+// `arena_test.dado` already claims. What is worth claiming is the policy:
+//
+//   * which `AllocatorMode`s `temp()` passes through and which one it takes
+//     over, and that the one it takes over is `FreeAll`;
+//   * that a checkpoint is O(1) and allocation-free — visible in the **backing
+//     allocator's call counts**, which is why this file writes its own backing
+//     allocator instead of reaching for `core:mem/libc`;
+//   * `TEMP_GUARD`'s exact trigger, in both spellings, and that a deferred
+//     rollback frees **nothing**;
+//   * and both discharge points, because *never* was a candidate answer and is
+//     not the one this package took.
+//
+// **The `expect` lines on stderr are the point, not a failure.** `TEMP_GUARD`
+// is a strippable warning and warns through `expect`, so a test that trips it
+// deliberately prints it deliberately. The exit status is the claim.
+package runtime
+
+import "core:mem"
+
+// ── A counting backing allocator ─────────────────────────────────────────────
+//
+// Over a package-level block rather than a stack one, so its address
+// is stable across every helper in this file. It counts, so *when* the scratch
+// asks the backing allocator for storage is a claim rather than a guess — and it
+// starves on demand, because an allocation that fails is a value
+// and not a trap, and the arm where a block cannot be obtained is unreachable
+// from a backing allocator that always succeeds.
+
+private const i64 POOL = 131072
+
+// The pool's backing storage. **`@align(16)` is `mem.MAX_ALIGN`**, which is the
+// strictest alignment `core:mem` hands out and therefore the strictest one a
+// backing allocator can be asked for — and it has to be stated, because a Dado
+// run is emitted as `struct { uint8_t s[N]; }`, whose C alignment is 1. Without
+// it the linker is free to place this off a 16-byte boundary; `pool_proc` below
+// aligns the *offset* it hands out and cannot align the *base*, `arena.grow`
+// then refuses the block on its own `head != align_forward(head, 16)` guard,
+// `take(64)` answers `nil`, and the next line dereferences it.
+private type Pool: [131072]u8
+private @align(16) Pool g_pool
+
+private u64 g_at
+private u64 g_allocs
+private u64 g_frees
+private bool g_starve
+// One byte past where the pool should hand out: the backing allocator that
+// breaks its word, which `init_scratch_over` must refuse at the door.
+private bool g_skew
+
+// The base, bound to a local rather than written at the use: nested inside a
+// conversion the `rawptr(...)` collapses and the emitted C initialises a
+// `uint8_t *` from a `struct ... *`, which `-Werror` rejects.
+private rawptr base():
+    rawptr p = rawptr(&g_pool)
+    return p
+
+private void pool_reset():
+    g_at = 0
+    g_allocs = 0
+    g_frees = 0
+    g_starve = false
+    g_skew = false
+    return
+
+private rawptr pool_proc(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            if g_starve:
+                return nil
+            u64 at = mem.align_up(g_at, align)
+            if g_skew:
+                at = at + 1
+            if at > u64(POOL) || nbytes > u64(POOL) - at:
+                return nil
+            mem.Bytes bytes = mem.Bytes(base())
+            []u8 region = bytes[0..<POOL]
+            []u8 out = region[i64(at)..<i64(at) + i64(nbytes)]
+            i64 zero = 0
+            for i in zero..<#len(out):
+                out[i] = 0
+            g_at = at + nbytes
+            g_allocs = g_allocs + 1
+            return rawptr(&region[at])
+        case mem.AllocatorMode.Free:
+            // A pool does not reclaim one block; the count is what is claimed.
+            g_frees = g_frees + 1
+            return nil
+        case mem.AllocatorMode.Resize, mem.AllocatorMode.FreeAll:
+            // `Resize` and `FreeAll` decline: the scratch never asks this
+            // allocator for either, and an arm nothing reaches is an arm nothing
+            // checked.
+            return nil
+        else:
+            return nil
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) pool():
+    return (pool_proc, nil)
+
+// A byte of a block, read back. Zeroing is a rule and therefore a claim.
+private u8 byte_at(rawptr p, i64 i):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i + 1]
+    return span[i]
+
+private rawptr take(u64 nbytes):
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) t = temp()
+    return t.proc(t.data, mem.AllocatorMode.Alloc, nbytes, 16, nil, 0)
+
+i32 test():
+    bool ok = true
+
+    pool_reset()
+
+    // ── Configuration ────────────────────────────────────────────────────────
+    ok = #expect(!ready(), "a fresh process reported a configured scratch") && ok
+    ok = #expect(!init_scratch_over((nil, nil), 1024, true), "a nil backing allocator was accepted") && ok
+    ok = #expect(init_scratch_over(pool(), 1024, true), "the scratch would not configure") && ok
+    ok = #expect(ready(), "the scratch configured and did not say so") && ok
+    ok = #expect(!init_scratch_over(pool(), 1024, true), "a second configuration was accepted") && ok
+
+    // Over a caller's allocator it asks for the first block **at configuration**
+    // — one block, which is two calls: the header and the data. That is the
+    // price of `true` meaning the scratch works, and `init_scratch`, over C's
+    // heap, pays it too.
+    ok = #expect(g_allocs == 2, "configuring the scratch asked the backing allocator ", g_allocs, " times") && ok
+    ok = #expect(temp_used() == 0 && temp_blocks() == 1 && temp_depth() == 0, "a fresh scratch was not one empty block") && ok
+
+    // ── `temp()` is an allocator, and it is this one ─────────────────────────
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) t = temp()
+    ok = #expect(t.proc != nil && is_temp(t), "temp() did not answer this package's scratch") && ok
+    ok = #expect(!is_temp(pool()), "is_temp accepted an allocator that is not the scratch") && ok
+
+    // ── The four modes ───────────────────────────────────────────────────────
+    //
+    // `Alloc` carves and zeroes; `Resize` is the arena's, in place when the
+    // block is the head's last allocation; `Free` is a no-op; `FreeAll` is the
+    // one this package takes over.
+    rawptr a = take(64)
+    ok = #expect(a != nil, "the scratch would not hand out 64 bytes") && ok
+    ok = #expect(byte_at(a, 0) == 0 && byte_at(a, 63) == 0, "an allocation was not zeroed") && ok
+    ok = #expect(temp_used() == 64, "used was ", temp_used(), " after one 64-byte allocation") && ok
+    ok = #expect(g_allocs == 2, "one block cost the backing allocator ", g_allocs, " calls") && ok
+
+    rawptr grown = t.proc(t.data, mem.AllocatorMode.Resize, 128, 16, a, 64)
+    ok = #expect(grown == a, "a resize of the head's last allocation moved it") && ok
+    ok = #expect(byte_at(grown, 127) == 0, "a resize did not zero the tail it grew into") && ok
+
+    rawptr second = take(16)
+    rawptr moved = t.proc(t.data, mem.AllocatorMode.Resize, 32, 16, grown, 128)
+    ok = #expect(moved != nil && moved != grown, "a resize that is not on top copied in place") && ok
+
+    _ = t.proc(t.data, mem.AllocatorMode.Free, 0, 0, second, 16)
+    ok = #expect(g_frees == 0, "a Free through the scratch reached the backing allocator") && ok
+
+    // ── Checkpoints, and that they cost the backing allocator nothing ────────
+    u64 calls = g_allocs
+    Checkpoint one = temp_open()
+    ok = #expect(temp_depth() == 1, "opening a scope left the depth at ", temp_depth()) && ok
+    u64 held = temp_used()
+    rawptr inside = take(256)
+    ok = #expect(inside != nil && temp_used() > held, "an allocation inside a scope did not grow the scratch") && ok
+    Checkpoint two = temp_open()
+    _ = take(256)
+    ok = #expect(temp_depth() == 2, "scopes did not nest") && ok
+    ok = #expect(temp_close(two), "the innermost scope would not close") && ok
+    ok = #expect(temp_used() == held + 256, "an inner rewind released ", temp_used() - held, " bytes rather than the inner scope's") && ok
+    ok = #expect(g_allocs == calls, "opening and closing scopes cost the backing allocator ", g_allocs - calls, " calls") && ok
+
+    // ── `TEMP_GUARD`, spelling one: a reset while a scope is open ────────────
+    u64 before = temp_used()
+    ok = #expect(!reset_scratch(), "a reset was performed while a scope was open") && ok
+    ok = #expect(temp_used() == before, "a deferred rollback freed ", before - temp_used(), " bytes") && ok
+    ok = #expect(deferrals() == 1, "the guard deferred ", deferrals(), " rollbacks rather than one") && ok
+
+    // The same rollback through the allocator's own `proc`, which is how a verb
+    // would reach it: the same predicate, in the same place.
+    _ = t.proc(t.data, mem.AllocatorMode.FreeAll, 0, 0, nil, 0)
+    ok = #expect(temp_used() == before && deferrals() == 2, "a FreeAll through the interface was not guarded") && ok
+
+    // ── Discharge, the first point: the outermost scope's own rewind ─────────
+    // The mark was taken at depth zero, so the rewind goes back to exactly what
+    // the scratch held before any scope was entered — which is above the bytes
+    // the two deferrals declined to free, so it frees those too.
+    ok = #expect(temp_close(one), "the outermost scope would not close") && ok
+    ok = #expect(temp_depth() == 0, "the outermost close left the depth at ", temp_depth()) && ok
+    ok = #expect(temp_used() == held, "the outermost rewind left ", temp_used(), " bytes rather than the ", held, " it was entered with") && ok
+
+    // ── `TEMP_GUARD`, spelling two, and the second discharge point ───────────
+    //
+    // An outermost close that is itself deferred takes the depth to zero holding
+    // bytes; the next scope entered at depth zero resets the scratch before
+    // taking its mark. *Never* is not the answer.
+    Checkpoint outer = temp_open()
+    _ = take(128)
+    Checkpoint deeper = temp_open()
+    _ = take(128)
+    ok = #expect(!temp_close(outer), "closing a scope that is not the innermost was performed") && ok
+    ok = #expect(temp_depth() == 0, "a deferred close did not leave the scope") && ok
+    ok = #expect(temp_used() > 0, "a deferred close freed the bytes it deferred") && ok
+    ok = #expect(deferrals() == 3, "the guard deferred ", deferrals(), " rollbacks rather than three") && ok
+
+    // A checkpoint that was already abandoned is deeper than the current depth
+    // and moves nothing at all.
+    Checkpoint fresh = temp_open()
+    ok = #expect(temp_used() == 0, "entering a scope at depth zero did not discharge the deferral") && ok
+    _ = take(64)
+    ok = #expect(!temp_close(deeper), "a stale checkpoint closed a scope") && ok
+    ok = #expect(temp_depth() == 1 && temp_used() == 64, "a stale close moved the depth or the cursor") && ok
+    ok = #expect(temp_close(fresh), "the live scope would not close") && ok
+
+    // ── With nothing open, the same reset is performed ───────────────────────
+    _ = take(64)
+    ok = #expect(reset_scratch(), "a reset with no scope open was deferred") && ok
+    ok = #expect(temp_used() == 0, "a performed reset left ", temp_used(), " bytes") && ok
+
+    // ── A fixed scratch refuses rather than growing ──────────────────────────
+    destroy_scratch()
+    ok = #expect(!ready(), "destroy_scratch left the scratch configured") && ok
+    pool_reset()
+    ok = #expect(init_scratch_over(pool(), 256, false), "a fixed scratch would not configure") && ok
+    ok = #expect(take(128) != nil, "a fixed scratch would not hand out 128 of 256 bytes") && ok
+    ok = #expect(take(256) == nil, "a fixed scratch grew past its one block") && ok
+    ok = #expect(take(64) != nil, "a refusal left a fixed scratch unusable") && ok
+    ok = #expect(temp_blocks() == 1, "a fixed scratch holds ", temp_blocks(), " blocks") && ok
+
+    // A default size, and a backing allocator that cannot serve a second block.
+    // The first one is `BLOCK` and was primed at configuration, so the request
+    // that starves is one too large for it.
+    destroy_scratch()
+    pool_reset()
+    ok = #expect(init_scratch_over(pool(), 0, true), "a zero first block was refused") && ok
+    g_starve = true
+    ok = #expect(take(BLOCK * 2) == nil, "a starved backing allocator still yielded a block") && ok
+    ok = #expect(temp_used() == 0, "a failed allocation moved the cursor") && ok
+    destroy_scratch()
+
+    // ── The door refuses what it cannot use ─────────────────────────────────
+    //
+    // A backing allocator that hands out a block one byte off `mem.MAX_ALIGN`,
+    // and one that has nothing to hand out. Both used to configure and answer
+    // `true`, and the first allocation answered nil; both now answer `false`
+    // here, leave the scratch unconfigured, and leak nothing.
+    pool_reset()
+    g_skew = true
+    ok = #expect(!init_scratch_over(pool(), 256, false), "a misaligned backing block configured a scratch") && ok
+    ok = #expect(!ready() && temp_blocks() == 0, "a refused configuration left a scratch behind") && ok
+    g_skew = false
+    pool_reset()
+    g_starve = true
+    ok = #expect(!init_scratch_over(pool(), 256, true), "a backing allocator with nothing to give configured a scratch") && ok
+    ok = #expect(!ready(), "a refused configuration reported ready") && ok
+    g_starve = false
+    ok = #expect(init_scratch_over(pool(), 256, true), "a refusal left the door shut") && ok
+    destroy_scratch()
+
+    // C2-04: `init_scratch` keeps its first block. Configured over C's heap it
+    // holds one block before any frame, and a depth-1 frame's close rewinds to
+    // a mark in that block rather than handing it back — so a frame loop asks
+    // the heap for nothing after configuration.
+    ok = #expect(init_scratch(), "init_scratch would not configure") && ok
+    ok = #expect(temp_blocks() == 1, "init_scratch configured ", temp_blocks(), " blocks, not its first") && ok
+    for i in 0..<16:
+        using enter_temp():
+            ref []i32 xs = #make([]i32, 4)
+            xs[0] = i32(i)
+            ok = #expect(temp_blocks() == 1, "frame ", i, " holds ", temp_blocks(), " blocks") && ok
+        ok = #expect(close_temp(), "frame ", i, " would not close") && ok
+        ok = #expect(temp_blocks() == 1, "closing frame ", i, " left ", temp_blocks(), " blocks") && ok
+    destroy_scratch()
+
+    // The procedure reached with a nil `data`, which is the guard at the top of
+    // `temp_proc` and is not reachable through `temp()`.
+    ok = #expect(t.proc(nil, mem.AllocatorMode.Alloc, 8, 8, nil, 0) == nil, "the scratch procedure dereferenced a nil data") && ok
+
+    // An invariant rather than an expectation: a scratch that is not configured
+    // must report nothing in use. If it did, this package would be reporting
+    // memory it does not own and there would be nothing to carry on for.
+    #assert(temp_used() == 0 && temp_depth() == 0, "a destroyed scratch reported ", temp_used(), " bytes and ", temp_depth(), " open scopes")
+
+    if ok:
+        return 0
+    return 1

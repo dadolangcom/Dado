@@ -1,0 +1,650 @@
+// Tools: the programs beside the driver, found by directory and run by name.
+//
+//     dado tools                       list them: built or not, current or not
+//     dado tools rebuild [NAME]        rebuild one, or every one
+//     dado <name> args...              run one, rebuilding it first if stale
+//
+// **A tool is a directory of `tools/` holding a `tool.toml`**, and adding a
+// tool is adding the directory. The file is three keys, one per line:
+//
+//     name = "webdev"                  the directory's own name
+//     summary = "serve a web build, rebuilding as its sources change"
+//     ship = false                     optional: a tool that never ships
+//
+// `tools/dado` is the driver itself and has none. A verb of this driver
+// always wins over a tool of the same name, so `dado doc` is the verb even
+// though `tools/doc` is a tool.
+//
+// **Where a tool's program goes.** In a checkout, `<build>/tools/<name>`,
+// beside the driver's own; in an install, `<install>/bin/<name>`, beside
+// `dado`. Built by this driver (`dado build <tool> -o <program> --no-c`), run
+// as a child process so one tool failing to build cannot end the driver.
+//
+// **A stale tool rebuilds itself** before it runs, with one line on standard
+// error saying why. Stale means: not built; built with no record of it; built
+// by another `dadoc` (the first line of `dadoc --version` differs); or its
+// sources changed (their SHA-256, below, differs).
+//
+// **The sources' SHA-256** is over every file of the tool's directory except
+// hidden ones (`fs.walk`'s policy), ordered by their paths relative to it,
+// written with `/`. Each file feeds `<relative path>\n<byte count>\n`, then
+// its bytes. Only the tool's own package: what it imports from the
+// collections is not in the hash.
+//
+// **The state file** is `<build>/tools/state` in a checkout and
+// `<install>/state` in an install. One fact per line, its first word naming
+// its kind; this driver writes `tool` lines,
+//
+//     tool <name> <sha256 of its sources, hex> <dadoc --version's first line>
+//
+// and keeps every line of a kind it does not know, as it found it, so other
+// parts of the toolchain can keep their facts in the same file. Lines
+// starting `#` are comments, rewritten each time the file is.
+package driver
+
+import "core:flags"
+import "core:fmt"
+import "core:hash"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:slices"
+import "core:strings"
+
+// ── tool.toml ───────────────────────────────────────────────────────────────
+
+// What a `tool.toml` says.
+type ToolSpec:
+    string8 name
+    string8 summary
+    bool ship
+
+// `text` read as a `tool.toml`: `key = "text"` or `key = true|false` lines,
+// blank lines and `#` comments skipped, a comment allowed after a value.
+// `name` and `summary` are required, `ship` defaults to true. `ok` false,
+// with `why` naming the line, on anything else, a key it does not know
+// included.
+(ToolSpec spec, bool ok, string8 why) parse_tool_toml(string8 text):
+    ToolSpec t
+    t.name = ""
+    t.summary = ""
+    t.ship = true
+    bool has_name = false
+    bool has_summary = false
+    string8 rest = text
+    i64 line_no = 0
+    for #len(rest) > 0:
+        (string8 line, string8 tail, bool more) = strings.line(rest)
+        rest = tail
+        line_no += 1
+        string8 l = strings.trim(line)
+        if #len(l) == 0 || l[0] == '#':
+            if !more: break
+            continue
+        (string8 key_raw, string8 value_raw, bool eq) = strings.split_first(l, "=")
+        string8 key = strings.trim(key_raw)
+        string8 value = strings.trim(value_raw)
+        if !eq || #len(key) == 0:
+            return (t, false, txt(#format("line ", line_no, " is not `key = value`: ", l)))
+        if key == "name" || key == "summary":
+            (string8 s, bool quoted) = quoted_value(value)
+            if !quoted:
+                return (t, false, txt(#format("line ", line_no, ": `", key, "` takes a double-quoted value, as ", key, " = \"...\"")))
+            if key == "name":
+                if !tool_named(s):
+                    return (t, false, txt(#format("line ", line_no, ": the name `", s, "` is not lower-case letters, digits, `-` and `_`")))
+                t.name = s
+                has_name = true
+            else:
+                t.summary = s
+                has_summary = true
+        else if key == "ship":
+            string8 v = without_comment(value)
+            if v == "true":
+                t.ship = true
+            else if v == "false":
+                t.ship = false
+            else:
+                return (t, false, txt(#format("line ", line_no, ": `ship` is true or false, not ", v)))
+        else:
+            return (t, false, txt(#format("line ", line_no, ": no key `", key, "` (a tool.toml has name, summary and ship)")))
+        if !more: break
+    if !has_name:
+        return (t, false, "no `name = \"...\"` line")
+    if !has_summary:
+        return (t, false, "no `summary = \"...\"` line")
+    return (t, true, "")
+
+// The text between a value's double quotes, and whether it was quoted, with
+// nothing after the closing quote but a comment.
+private (string8 s, bool ok) quoted_value(string8 value):
+    if #len(value) < 2 || value[0] != '"': return ("", false)
+    string8 inner = value[1..<#len(value)]
+    i64 close = strings.index_of(inner, '"')
+    if close < 0: return ("", false)
+    string8 after = strings.trim(inner[close + 1..<#len(inner)])
+    if #len(after) > 0 && after[0] != '#': return ("", false)
+    return (inner[0..<close], true)
+
+private string8 without_comment(string8 value):
+    (string8 head, string8 _, bool _) = strings.split_first(value, "#")
+    return strings.trim(head)
+
+private bool tool_named(string8 name):
+    if #len(name) == 0: return false
+    for c in name:
+        bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
+        if !ok: return false
+    return true
+
+// ── discovery ───────────────────────────────────────────────────────────────
+
+// One directory of `tools/` that holds a `tool.toml`, and whether the file
+// reads; `why` says what is wrong with it when it does not.
+type Tool:
+    string8 name
+    string8 dir
+    ToolSpec spec
+    bool ok
+    string8 why
+
+// Where the tools' directories are: `tools/` under the toolchain's root.
+string8 tools_dir():
+    return join2(root(), "tools")
+
+// Every tool under `dir`, ordered by name.
+ref []Tool discover_tools(string8 dir):
+    ref []string8 names = #make([]string8, 0)
+    ref []char8 dc = strings.clone_to_cstring(dir, #default)
+    ^fs.Dir d = fs.open(cstring(dc))
+    if fs.opened(d):
+        for:
+            (cstring name, bool more) = fs.next(d)
+            if !more: break
+            string8 n = string8(name)
+            if fs.hidden(n): continue
+            ref []char8 own = #format(n)
+            _ = #append(names, txt(own))
+        fs.close(d)
+    slices.sort(names[:], strings.before)
+    ref []Tool out = #make([]Tool, 0)
+    for n in names:
+        string8 toml = join3(dir, n, "tool.toml")
+        if !is_file(toml): continue
+        Tool t
+        t.name = n
+        t.dir = join2(dir, n)
+        t.ok = true
+        t.why = ""
+        try ref []char8 text = fs.read_file(toml) else code:
+            t.ok = false
+            t.why = txt(#format("cannot read ", toml, ": ", os.message(code)))
+            _ = #append(out, t)
+            continue
+        (ToolSpec spec, bool ok, string8 why) = parse_tool_toml(txt(text))
+        t.spec = spec
+        if !ok:
+            t.ok = false
+            t.why = txt(#format(toml, ": ", why))
+        else if spec.name != n:
+            t.ok = false
+            t.why = txt(#format(toml, ": its name is `", spec.name, "`, and a tool is named for its directory, `", n, "`"))
+        _ = #append(out, t)
+    return out
+
+// The tool called `name` in `tools`, and whether there is one.
+(Tool tool, bool found) tool_named_in([]Tool tools, string8 name):
+    for t in tools:
+        if t.name == name: return (t, true)
+    Tool none
+    none.name = ""
+    none.dir = ""
+    none.ok = false
+    none.why = ""
+    return (none, false)
+
+// Where tool `name`'s program is: `<install>/bin/<name>` in an install,
+// `<build>/tools/<name>` in a checkout.
+string8 tool_binary(string8 name):
+    Layout l = layout()
+    if l.kind == "install":
+        return join3(l.install, "bin", exe_name(name))
+    return join3(build_dir(), "tools", exe_name(name))
+
+// The state file: `<install>/state` in an install, `<build>/tools/state` in
+// a checkout.
+string8 state_path():
+    Layout l = layout()
+    if l.kind == "install":
+        return join2(l.install, "state")
+    return join3(build_dir(), "tools", "state")
+
+// ── the sources' SHA-256 ────────────────────────────────────────────────────
+
+// The SHA-256, in hex, of the files under `dir` as the head of this file
+// describes. A file that cannot be read feeds its path and no bytes.
+string8 sources_hash(string8 dir):
+    string8 base = clean_path(dir)
+    fs.Listing l = fs.walk(base, #default)
+    ref []string8 rel = #make([]string8, 0)
+    for e in l.entries:
+        if e.is_dir: continue
+        if #len(e.path) <= #len(base) + 1: continue
+        ref []char8 own = #format(e.path[#len(base) + 1..<#len(e.path)])
+        _ = #append(rel, txt(own))
+    fs.release(l)
+    slices.sort(rel[:], strings.before)
+    hash.Sha256 h = hash.sha256_init()
+    for r in rel:
+        string8 body = read_or_empty(txt(#format(base, "/", r)))
+        h.update_text(txt(#format(r, "\n", #len(body), "\n")))
+        h.update_text(body)
+    ref []char8 hex = hash.sha256_hex(h.finish())
+    return txt(hex)
+
+// ── the state file ──────────────────────────────────────────────────────────
+
+// One `tool` line: what a tool was last built from.
+type ToolState:
+    string8 name
+    string8 hash
+    string8 dadoc
+
+// `text` read as the state file: its `tool` lines, and every other
+// non-comment line as it was. A `tool` line too short to hold its three
+// fields is dropped, which makes that tool stale.
+(ref []ToolState tools, ref []string8 other) parse_state(string8 text):
+    ref []ToolState tools = #make([]ToolState, 0)
+    ref []string8 other = #make([]string8, 0)
+    for l in lines_of(text):
+        if l[0] == '#': continue
+        (string8 kind, string8 after, bool _) = strings.field(l)
+        if kind != "tool":
+            _ = #append(other, l)
+            continue
+        (string8 name, string8 after2, bool _) = strings.field(after)
+        (string8 sum, string8 after3, bool _) = strings.field(after2)
+        string8 dadoc_line = strings.trim(after3)
+        if #len(name) == 0 || #len(sum) == 0 || #len(dadoc_line) == 0: continue
+        ToolState s
+        s.name = name
+        s.hash = sum
+        s.dadoc = dadoc_line
+        _ = #append(tools, s)
+    return (tools, other)
+
+private const string8 STATE_HEAD = "# dado's state: one fact per line, its first word naming its kind.\n# `tool <name> <sha256 of its sources> <dadoc --version's first line>`\n# records what each tool was last built from; lines of other kinds are\n# kept as they are. Rewritten by dado, comments included.\n"
+
+// The state file's text: the comment at its head, the lines of other kinds
+// as they were, then one `tool` line per tool, ordered by name.
+string8 format_state([]ToolState tools, []string8 other):
+    strings.Builder b = strings.builder(512)
+    _ = strings.append(&b, STATE_HEAD)
+    for o in other:
+        _ = strings.append(&b, o)
+        _ = strings.append(&b, "\n")
+    ref []ToolState sorted = #make([]ToolState, 0)
+    for t in tools:
+        _ = #append(sorted, t)
+    slices.sort(sorted[:], state_before)
+    for t in sorted:
+        _ = strings.append(&b, txt(#format("tool ", t.name, " ", t.hash, " ", t.dadoc, "\n")))
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+private bool state_before(ToolState a, ToolState b):
+    return strings.before(a.name, b.name)
+
+// `tools` with `entry` in place of the line for the same tool, or added.
+ref []ToolState with_tool_state([]ToolState tools, ToolState entry):
+    ref []ToolState out = #make([]ToolState, 0)
+    bool replaced = false
+    for t in tools:
+        if t.name == entry.name:
+            _ = #append(out, entry)
+            replaced = true
+        else:
+            _ = #append(out, t)
+    if !replaced:
+        _ = #append(out, entry)
+    return out
+
+// What the state file records for `name`, and whether it records anything.
+(ToolState state, bool found) recorded_state([]ToolState tools, string8 name):
+    for t in tools:
+        if t.name == name: return (t, true)
+    ToolState none
+    none.name = ""
+    none.hash = ""
+    none.dadoc = ""
+    return (none, false)
+
+// Why a tool must be built before it runs, or "" when it is current: its
+// program is not there; there is no record of what it was built from; it was
+// built by another `dadoc`; or its sources changed.
+string8 why_stale(bool built, bool recorded, ToolState rec, string8 sources, string8 dadoc_line):
+    if !built: return "it is not built yet"
+    if !recorded: return "there is no record of what it was built from"
+    if rec.dadoc != dadoc_line:
+        return txt(#format("dadoc changed (", rec.dadoc, " -> ", dadoc_line, ")"))
+    if rec.hash != sources: return "its sources changed"
+    return ""
+
+private (ref []ToolState tools, ref []string8 other) read_state():
+    try ref []char8 text = fs.read_file(state_path()) else:
+        return parse_state("")
+    return parse_state(txt(text))
+
+private void record_build(string8 name, string8 sources, string8 dadoc_line):
+    (ref []ToolState tools, ref []string8 other) = read_state()
+    ToolState s
+    s.name = name
+    s.hash = sources
+    s.dadoc = dadoc_line
+    ref []ToolState updated = with_tool_state(tools[:], s)
+    string8 p = state_path()
+    _ = fs.make_dirs(dir_of(p), #default)
+    try fs.write_file(p, format_state(updated[:], other[:])) else code:
+        warn(txt(#format("cannot write ", p, ": ", os.message(code), ".\n  The tool was built; it will be rebuilt the next time it runs.")))
+
+// ── building and running ────────────────────────────────────────────────────
+
+private string8 g_dadoc_line = ""
+private bool g_dadoc_line_asked
+
+// The first line of the active `dadoc`'s `--version`, or "" when there is no
+// `dadoc` that runs.
+string8 dadoc_version_line():
+    if g_dadoc_line_asked: return g_dadoc_line
+    g_dadoc_line_asked = true
+    string8 dc = find_dadoc()
+    if #len(dc) == 0: return ""
+    Command c = command(dc)
+    add(&c, "--version")
+    g_dadoc_line = first_line(c, true)
+    return g_dadoc_line
+
+// A line of this driver's own on standard error, where it does not mix with
+// what a tool writes on standard output.
+void tell(string8 line):
+    _ = io.flush(io.stdout())
+    fmt.writeln(io.stderr_sink(), line)
+    _ = io.flush(io.stderr())
+
+// Build `t` with this driver, as a child, into its program's place; record
+// what it was built from when it builds. `said` is everything the build
+// printed, for the failure.
+(bool ok, string8 said) build_tool(Tool t):
+    string8 sources = sources_hash(t.dir)
+    string8 dadoc_line = dadoc_version_line()
+    string8 bin = tool_binary(t.name)
+    _ = fs.make_dirs(dir_of(bin), #default)
+    Command c = command(executable())
+    add(&c, "build")
+    add(&c, t.dir)
+    add(&c, "-o")
+    add(&c, bin)
+    add(&c, "--no-c")
+    if verbose():
+        add(&c, "-v")
+        note(txt(#format("  $ ", shown(c))))
+    Captured r = capture_merged(c)
+    if !r.started || r.status != 0:
+        return (false, txt(r.out))
+    record_build(t.name, sources, dadoc_line)
+    return (true, txt(r.out))
+
+// Make `t`'s program current, building it first when it is stale and saying
+// why in one line. `ok` false when it cannot be, with what the build printed
+// in `said` and the failure, naming the repair, in `why`.
+(bool ok, string8 said, string8 why) ensure_tool(Tool t):
+    if !t.ok:
+        return (false, "", txt(#format("the tool `", t.name, "` cannot be built: ", t.why)))
+    string8 bin = tool_binary(t.name)
+    bool built = is_file(bin)
+    string8 dadoc_line = dadoc_version_line()
+    if #len(dadoc_line) == 0:
+        if built:
+            warn(txt(#format("no dadoc runs here, so whether ", t.name, " is current cannot be checked; running it as it is.")))
+            return (true, "", "")
+        return (false, "", txt(#format("the tool `", t.name, "` is not built, and there is no dadoc here to build it.\n  `dado doctor` says what is missing.")))
+    (ref []ToolState states, ref []string8 _) = read_state()
+    (ToolState rec, bool recorded) = recorded_state(states[:], t.name)
+    string8 why = why_stale(built, recorded, rec, sources_hash(t.dir), dadoc_line)
+    if #len(why) == 0: return (true, "", "")
+    tell(txt(#format(("building " if !built else "rebuilding "), t.name, ": ", why)))
+    (bool ok, string8 said) = build_tool(t)
+    if ok: return (true, "", "")
+    return (false, said, txt(#format("the tool `", t.name, "` did not build (the output above says why).\n  Once it is fixed: dado tools rebuild ", t.name)))
+
+// Run tool `t` with `args`, rebuilding it first when stale, and answer its
+// exit status.
+i32 run_tool(Tool t, []string8 args):
+    (bool ok, string8 said, string8 why) = ensure_tool(t)
+    if !ok:
+        if #len(said) > 0: tell(strings.trim_right(said))
+        die(why)
+    Command c = command(tool_binary(t.name))
+    add_all(&c, args)
+    default_sigpipe()
+    return run(c)
+
+// `dado <word> args...` where `word` is not a verb: the tool of that name,
+// or an error naming the nearest verb or tool. `verb_hint` is the verb the
+// command line's parser would have suggested, or "".
+i32 dispatch_tool(string8 word, []string8 args, string8 verb_hint):
+    ref []Tool tools = discover_tools(tools_dir())
+    (Tool t, bool found) = tool_named_in(tools[:], word)
+    if found:
+        return run_tool(t, args)
+    ref []string8 names = #make([]string8, 0)
+    for x in tools:
+        _ = #append(names, x.name)
+    if #len(verb_hint) > 0:
+        _ = #append(names, verb_hint)
+    string8 near = nearest_name(word, names[:])
+    if #len(near) > 0:
+        die(txt(#format("`", word, "` is neither a command nor a tool; did you mean `", near, "`?\n  `dado --help` lists the commands, and `dado tools` the tools.")))
+    die(txt(#format("`", word, "` is neither a command nor a tool.\n  `dado --help` lists the commands, and `dado tools` the tools.")))
+    return 1
+
+// Whether `word` is one of the parser's verbs, asked by parsing it alone,
+// and the verb the parser suggests when it is not. The parser starts afresh
+// at every `parse`, so the real command line is parsed after this as if
+// nothing had happened.
+(bool verb, string8 hint) verb_or_hint(^flags.Parser p, string8 word):
+    ref []string8 probe = #make([]string8, 0)
+    _ = #append(probe, word)
+    try string8 _ = p.parse(probe[:]) else code:
+        if code != flags.UNKNOWN_COMMAND: return (true, "")
+        (string8 _, string8 after, bool found) = strings.split_first(p.error(), "did you mean `")
+        if !found: return (false, "")
+        (string8 hint, string8 _, bool closed) = strings.split_first(after, "`")
+        if !closed: return (false, "")
+        ref []char8 own = #format(hint)
+        return (false, txt(own))
+    return (true, "")
+
+// The name in `names` nearest to `word` (insertions, deletions,
+// substitutions and swapped neighbours, each one edit), or "" when none is
+// within a third of `word`'s length (and at least one edit), as `core:flags`
+// suggests a command.
+string8 nearest_name(string8 word, []string8 names):
+    i64 limit = #len(word) / 3
+    if limit < 1: limit = 1
+    string8 best = ""
+    i64 best_d = limit + 1
+    for n in names:
+        i64 d = edit_distance(word, n)
+        if d < best_d:
+            best = n
+            best_d = d
+    return best
+
+// The optimal string alignment distance between `a` and `b`, or 1000 when
+// either is longer than 64 bytes.
+i64 edit_distance(string8 a, string8 b):
+    i64 n = #len(a)
+    i64 m = #len(b)
+    if n > 64 || m > 64: return 1000
+    [65]i64 back
+    [65]i64 prev
+    [65]i64 cur
+    for j in 0..=m:
+        prev[j] = j
+        back[j] = j
+    for i in 1..=n:
+        cur[0] = i
+        for j in 1..=m:
+            i64 cost = 0 if a[i - 1] == b[j - 1] else 1
+            i64 best = prev[j - 1] + cost
+            if prev[j] + 1 < best: best = prev[j] + 1
+            if cur[j - 1] + 1 < best: best = cur[j - 1] + 1
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] && back[j - 2] + 1 < best:
+                best = back[j - 2] + 1
+            cur[j] = best
+        for j in 0..=m:
+            back[j] = prev[j]
+            prev[j] = cur[j]
+    return prev[m]
+
+// ── the `tools` verb ────────────────────────────────────────────────────────
+
+private flags.TextFlag g_tools_action
+private flags.TextFlag g_tools_name
+private flags.TextFlag g_doctor_format
+
+// The command-line declarations of `tools` and `doctor`, beside the verbs
+// themselves.
+void declare_tools(^flags.Parser p):
+    g_tools_action = p.positional("ACTION", "`rebuild` rebuilds the tools; without it, they are listed", false, "tools")
+    g_tools_name = p.positional("NAME", "with rebuild: only this tool", false, "tools")
+    g_doctor_format = p.choice("--format", "=text|json", "how the report is written", "text", "doctor")
+
+// Whether `doctor` was asked for JSON.
+bool doctor_json(^flags.Parser p):
+    return p.value(g_doctor_format) == "json"
+
+// `dado tools` and `dado tools rebuild [NAME]`.
+i32 tools_command(^flags.Parser p):
+    ref []char8 action_own = #format(p.value(g_tools_action))
+    ref []char8 name_own = #format(p.value(g_tools_name))
+    string8 action = txt(action_own)
+    string8 name = txt(name_own)
+    ref []Tool tools = discover_tools(tools_dir())
+    if #len(action) == 0:
+        return list_tools(p, tools[:])
+    if action != "rebuild":
+        (Tool _, bool is_tool) = tool_named_in(tools[:], action)
+        if is_tool:
+            die(txt(#format("`dado tools` takes `rebuild [NAME]` or nothing, not `", action, "`.\n  Try: dado tools rebuild ", action, "  (or run it: dado ", action, ")")))
+        die(txt(#format("`dado tools` takes `rebuild [NAME]` or nothing, not `", action, "`.")))
+    if #len(name) > 0:
+        (Tool t, bool found) = tool_named_in(tools[:], name)
+        if !found:
+            ref []string8 names = #make([]string8, 0)
+            for x in tools:
+                _ = #append(names, x.name)
+            string8 near = nearest_name(name, names[:])
+            if #len(near) > 0:
+                die(txt(#format("there is no tool `", name, "`; did you mean `", near, "`? `dado tools` lists them")))
+            die(txt(#format("there is no tool `", name, "`. `dado tools` lists them")))
+        ref []Tool one = #make([]Tool, 0)
+        _ = #append(one, t)
+        return rebuild_tools(one[:])
+    return rebuild_tools(tools[:])
+
+private i32 rebuild_tools([]Tool tools):
+    if #len(tools) == 0:
+        say(txt(#format("no tools under ", tools_dir())))
+        return 0
+    string8 dadoc_line = dadoc_version_line()
+    if #len(dadoc_line) == 0:
+        _ = dadoc()
+    i32 failed = 0
+    for t in tools:
+        if !t.ok:
+            warn(txt(#format("skipping ", t.name, ": ", t.why)))
+            failed += 1
+            continue
+        say(txt(#format("build  ", t.name)))
+        (bool ok, string8 said) = build_tool(t)
+        if ok:
+            say_green("built", txt(#format(" ", tool_binary(t.name))))
+        else:
+            tell(strings.trim_right(said))
+            warn(txt(#format(t.name, " did not build: the output above says why")))
+            failed += 1
+    if failed > 0: return 1
+    return 0
+
+private i32 list_tools(^flags.Parser p, []Tool tools):
+    if #len(tools) == 0:
+        say(txt(#format("no tools under ", tools_dir())))
+        return 0
+    i64 width = 4
+    for t in tools:
+        if #len(t.name) > width: width = #len(t.name)
+    (ref []ToolState states, ref []string8 _) = read_state()
+    string8 dadoc_line = dadoc_version_line()
+    for t in tools:
+        string8 state = ""
+        string8 summary = t.spec.summary
+        if !t.ok:
+            state = "broken"
+            summary = t.why
+        else:
+            string8 bin = tool_binary(t.name)
+            bool built = is_file(bin)
+            (ToolState rec, bool recorded) = recorded_state(states[:], t.name)
+            if !built:
+                state = "not built"
+            else if #len(dadoc_line) == 0:
+                state = "built (no dadoc to check it against)"
+            else:
+                string8 why = why_stale(built, recorded, rec, sources_hash(t.dir), dadoc_line)
+                if #len(why) == 0:
+                    state = "built, current"
+                else:
+                    state = txt(#format("built, stale: ", why))
+        string8 marks = ""
+        if t.ok && !t.spec.ship: marks = "  (not shipped)"
+        (bool verb, string8 _) = verb_or_hint(p, t.name)
+        if verb: marks = txt(#format(marks, "  (`dado ", t.name, "` is the verb)"))
+        fmt.println(padded(t.name, width), "  ", summary, marks)
+        fmt.println(padded("", width), "  ", state)
+    return 0
+
+// `s` followed by spaces up to `width` bytes.
+string8 padded(string8 s, i64 width):
+    strings.Builder b = strings.builder(width + 1)
+    _ = strings.append(&b, s)
+    i64 n = #len(s)
+    for n < width:
+        _ = strings.append_char(&b, ' ')
+        n += 1
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// ── bare `dado` ─────────────────────────────────────────────────────────────
+
+// `dado` with nothing after it, on a terminal: run the dashboard when it is
+// built or can be, answering `ran` false when it cannot (no toolchain found,
+// no dashboard tool, or no way to build it), so the caller prints the help
+// instead.
+(bool ran, i32 status) run_dashboard():
+    try string8 exe = os.executable_path() else:
+        return (false, 0)
+    Layout l = locate(dir_of(exe))
+    if !l.found: return (false, 0)
+    start()
+    ref []Tool tools = discover_tools(tools_dir())
+    (Tool t, bool found) = tool_named_in(tools[:], "dashboard")
+    if !found || !t.ok: return (false, 0)
+    (bool ok, string8 said, string8 why) = ensure_tool(t)
+    if !ok:
+        if #len(said) > 0: tell(strings.trim_right(said))
+        warn(txt(#format(why, "\n  Meanwhile, here is the help.")))
+        return (false, 0)
+    ref []string8 none = #make([]string8, 0)
+    return (true, run_tool(t, none[:]))

@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: S2a lab <s2a@lab>
+Date: Fri, 25 Sep 2026 14:56:23 -0800
+Subject: [PATCH] Strings: join of flat strings in one pass, memchr search,
+ inline ===
+
+DadoScript fork patch F1-F3 (additive). Array.prototype.join over a fast array
+of flat strings sizes the result once and copies once; String indexOf
+(and every search through string_indexof: includes, split, replace)
+finds the first character with memchr; === and !== on two flat strings
+compare in the interpreter instead of through js_strict_eq_slow.
+---
+ quickjs.c                   | 118 +++++++++++++++++++++++++++++++++++-
+ tests/test_dados_strings.js |  47 ++++++++++++++
+ 2 files changed, 163 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_dados_strings.js
+
+diff --git a/quickjs.c b/quickjs.c
+index 77f91a9..cdb6b6e 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -20666,8 +20666,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode));
+             OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
+             OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
+-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
+-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
++            /* DadoScript fork (F3): === and !== on two flat strings compare in
++               place: identity, then length, then bytes */
++#define OP_CMP_STR(opcode, neg, slow_call)                                 \
++            CASE(opcode):                                                 \
++                {                                                         \
++                JSValue op1, op2;                                         \
++                op1 = sp[-2];                                             \
++                op2 = sp[-1];                                             \
++                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {             \
++                    sp[-2] = js_bool((JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2)) ^ neg); \
++                    sp--;                                                 \
++                } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&      \
++                           JS_VALUE_GET_TAG(op2) == JS_TAG_STRING) {      \
++                    JSString *s1 = JS_VALUE_GET_STRING(op1);              \
++                    JSString *s2 = JS_VALUE_GET_STRING(op2);              \
++                    bool eq = s1 == s2 || js_string_eq(s1, s2);           \
++                    JS_FreeValue(ctx, op1);                               \
++                    JS_FreeValue(ctx, op2);                               \
++                    sp[-2] = js_bool(eq ^ neg);                           \
++                    sp--;                                                 \
++                } else {                                                  \
++                    sf->cur_pc = pc;                                      \
++                    if (slow_call)                                        \
++                        goto exception;                                   \
++                    sp--;                                                 \
++                }                                                         \
++                }                                                         \
++            BREAK
++            OP_CMP_STR(OP_strict_eq, 0, js_strict_eq_slow(ctx, sp, 0));
++            OP_CMP_STR(OP_strict_neq, 1, js_strict_eq_slow(ctx, sp, 1));
+ 
+         CASE(OP_in):
+             sf->cur_pc = pc;
+@@ -44326,6 +44354,63 @@ static JSValue js_array_toString(JSContext *ctx, JSValueConst this_val,
+     return ret;
+ }
+ 
++/* DadoScript fork (F1): join n flat strings with separator c (a Latin-1 char) or
++   sep (when c < 0). Returns JS_UNDEFINED when an element is not a flat
++   string (the caller then takes the generic path), JS_EXCEPTION on OOM. */
++static JSValue js_array_join_strings(JSContext *ctx, JSValue *arr, uint32_t n,
++                                     int c, JSString *sep)
++{
++    uint64_t total = 0;
++    int wide = sep && c < 0 ? sep->is_wide_char : 0;
++    uint32_t i, seplen = c >= 0 ? 1 : sep->len, pos;
++    JSString *r;
++
++    for (i = 0; i < n; i++) {
++        JSString *e;
++        if (JS_VALUE_GET_TAG(arr[i]) != JS_TAG_STRING)
++            return JS_UNDEFINED;
++        e = JS_VALUE_GET_STRING(arr[i]);
++        total += e->len;
++        wide |= e->is_wide_char;
++    }
++    if (n > 1)
++        total += (uint64_t)seplen * (n - 1);
++    if (total > JS_STRING_LEN_MAX)
++        return JS_UNDEFINED; /* the generic path throws the right error */
++    r = js_alloc_string(ctx, total, wide);
++    if (!r)
++        return JS_EXCEPTION;
++    pos = 0;
++    for (i = 0; i < n; i++) {
++        JSString *e = JS_VALUE_GET_STRING(arr[i]);
++        uint32_t j;
++        if (i > 0) {
++            if (c >= 0) {
++                if (wide) str16(r)[pos] = c; else str8(r)[pos] = c;
++                pos++;
++            } else {
++                if (!wide)
++                    memcpy(str8(r) + pos, str8(sep), seplen);
++                else if (sep->is_wide_char)
++                    memcpy(str16(r) + pos, str16(sep), seplen * 2);
++                else
++                    for (j = 0; j < seplen; j++) str16(r)[pos + j] = str8(sep)[j];
++                pos += seplen;
++            }
++        }
++        if (!wide)
++            memcpy(str8(r) + pos, str8(e), e->len);
++        else if (e->is_wide_char)
++            memcpy(str16(r) + pos, str16(e), e->len * 2);
++        else
++            for (j = 0; j < e->len; j++) str16(r)[pos + j] = str8(e)[j];
++        pos += e->len;
++    }
++    if (!wide)
++        str8(r)[pos] = '\0';
++    return JS_MKPTR(JS_TAG_STRING, r);
++}
++
+ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv, int toLocaleString)
+ {
+@@ -44350,6 +44435,19 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
+         else
+             c = -1;
+     }
++    /* DadoScript fork (F1): an array of flat strings is joined with one size pass
++       and one allocation, instead of growing a buffer element by element */
++    if (!toLocaleString) {
++        JSValue *arrp, ret;
++        uint32_t count32;
++        if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == n &&
++            (ret = js_array_join_strings(ctx, arrp, count32, c, p),
++             !JS_IsUndefined(ret))) {
++            JS_FreeValue(ctx, sep);
++            JS_FreeValue(ctx, obj);
++            return ret;
++        }
++    }
+     string_buffer_init(ctx, b, 0);
+ 
+     for(i = 0; i < n; i++) {
+@@ -47532,6 +47630,14 @@ static int string_indexof_char(JSString *p, int c, int from)
+ {
+     /* assuming 0 <= from <= p->len */
+     int i, len = p->len;
++    /* DadoScript fork (F2): memchr for 8-bit strings */
++    if (!p->is_wide_char && from < len) {
++        const uint8_t *q;
++        if (c & ~0xff)
++            return -1;
++        q = memchr(str8(p) + from, c, len - from);
++        return q ? (int)(q - str8(p)) : -1;
++    }
+     if (p->is_wide_char) {
+         for (i = from; i < len; i++) {
+             if (str16(p)[i] == c)
+@@ -47696,6 +47802,14 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
+         inc = 1;
+     }
+     ret = -1;
++    /* DadoScript fork (F2): forward search scans for the first character with
++       memchr (via string_indexof) instead of comparing at every position */
++    if (inc > 0 && len >= v_len && start <= stop) {
++        ret = string_indexof(p, p1, start);
++        JS_FreeValue(ctx, str);
++        JS_FreeValue(ctx, v);
++        return js_int32(ret);
++    }
+     if (len >= v_len && inc * (stop - start) >= 0) {
+         for (i = start;; i += inc) {
+             if (!string_cmp(p, p1, i, 0, v_len)) {
+diff --git a/tests/test_dados_strings.js b/tests/test_dados_strings.js
+new file mode 100644
+index 0000000..af8d90a
+--- /dev/null
++++ b/tests/test_dados_strings.js
+@@ -0,0 +1,47 @@
++// DadoScript fork (F1-F3): join of flat strings, forward indexOf, and === on
++// strings must equal their generic definitions.
++import { assert } from "./assert.js";
++
++function naiveJoin(a, sep) {
++    sep = sep === undefined ? "," : String(sep);
++    let r = "";
++    for (let i = 0; i < a.length; i++) {
++        if (i > 0) r += sep;
++        const e = a[i];
++        if (e !== null && e !== undefined) r += String(e);
++    }
++    return r;
++}
++function naiveIndexOf(h, n, from) {
++    from = Math.min(Math.max(from | 0, 0), h.length);
++    for (let i = from; i + n.length <= h.length; i++)
++        if (h.substring(i, i + n.length) == n) return i;
++    return -1;
++}
++const cases = [[], ["a"], ["a", "b"], ["αβ", "x"], ["x", "世"], ["", ""],
++    ["a", 1, "b"], ["a", null, undefined, "b"], ["a", { toString() { return "Z"; } }],
++    ["é", "e"], new Array(3), ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]];
++const seps = [undefined, ",", "", "--", "✓", "ab世", "é"];
++for (const c of cases)
++    for (const s of seps)
++        assert(c.join(s), naiveJoin(c, s), JSON.stringify([c, s]));
++
++const hays = ["the quick brown fox jumps over the lazy dog éé end",
++    "wide 世界 text 世 again 世界", "", "aaaaab"];
++const needles = ["the", "fox", "dog", "end", "x", "", "é", "é e", "zz", "t",
++    "世界", "世 a", " ", "aab", "b", "aaaaab", "aaaaaab"];
++for (const h of hays)
++    for (const n of needles)
++        for (const f of [undefined, 0, 1, 5, 100, -3])
++            assert(h.indexOf(n, f), naiveIndexOf(h, n, f), JSON.stringify([h, n, f]));
++
++const a = "abcdefghijklmnopqrst", b = "abcdefghijklmnopqrs".concat("t");
++const c = "abc".concat("世");
++assert(a === b, true);
++assert(a !== b, false);
++assert(a === c, false);
++assert(c === "abc世", true);
++assert(c !== "abc世", false);
++assert(a === 1, false);
++assert(("x" + "y") === "xy", true);
++assert("é" === "é".concat(""), true);
+-- 
+2.43.0
+

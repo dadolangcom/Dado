@@ -1,0 +1,415 @@
+// `dado install`: the second half of installing Dado, run by `dadoc bootstrap`
+// once it has put zig, the checkout and `dado` itself in place, and safe to
+// run again at any time.
+//
+//     dado install                     ask once which editors, then set up
+//     dado install --yes               no questions: every editor found
+//     dado install --editors=none --no-path
+//
+// In order: it builds every shipped tool (one that fails is reported with its
+// log and does not stop the rest); builds the script engine for this host, so
+// the first program that runs DadoScript does not wait 20 to 55 s for it;
+// puts `dado`, `dadoc` and `dado-lsp` on PATH; sets Dado up in the editors
+// chosen (`editors.dado`); runs `dado doctor`; and says what to do next.
+//
+// **PATH, without editing a shell's files.** On macOS and Linux it links
+// `~/.local/bin/{dado,dadoc,dado-lsp}` to the install, making `~/.local/bin`
+// if there is none, and never replaces a file there that is not already its
+// own link; when `~/.local/bin` is not on PATH it prints the one line that
+// puts it there for the shell in `$SHELL`, for the user to run. On Windows it
+// adds `<install>\bin` to the user's PATH through .NET's
+// `Environment.SetEnvironmentVariable(…, 'User')`, which also tells running
+// programs the value changed; never `setx`, which cuts the value at 1,024
+// characters.
+//
+// **Every change outside the install is journalled first** (`journal.dado`),
+// and `done` is written last, when the install has run to its end; anything
+// it could not do is in its exit status: 0 when all went well, 1 when
+// something did not, with what to do about it said where it happened.
+package driver
+
+import "core:flags"
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "core:time"
+
+// What `dado install` was told on its command line.
+type InstallFlags:
+    bool yes
+    bool no_path
+    bool no_editor
+    bool editors_given
+    string8 editors
+
+i32 install_command(InstallFlags f):
+    Layout l = layout()
+    if l.kind != "install":
+        die(txt(#format("dado install sets up an install, and this is a checkout of the repository\n  (", l.root, ").\n  To install Dado, unpack a release and run ./dadoc bootstrap there; a checkout\n  needs no installing: run ./dado from its root.")))
+    string8 install = l.install
+    i64 problems = 0
+    problems += install_tools(install)
+    problems += install_engine(install)
+    if !f.no_path:
+        problems += install_path(install)
+    if !f.no_editor || f.editors_given:
+        ref []Editor known = known_editors()
+        ref []Found found = detect_editors(known[:], surroundings())
+        report_unsupported(found[:])
+        (ref []Found chosen, bool ok) = pick_editors(f.editors, f.editors_given, f.no_editor, f.yes, found[:])
+        if !ok: problems += 1
+        problems += set_up_editors(install, chosen[:])
+    fmt.println("")
+    if doctor(false) != 0: problems += 1
+    next_steps(install, problems)
+    (string8 released, string8 _, bool _) = strings.split_first(version_word(dadoc_version_line()), "+")
+    journal1(install, "done", released)
+    if problems > 0: return 1
+    return 0
+
+// ── tools ───────────────────────────────────────────────────────────────────
+
+// Build every shipped tool that is not current. A tool that fails leaves its
+// output in `<install>/logs/<name>.log`. Answers how many failed.
+private i64 install_tools(string8 install):
+    ref []Tool tools = discover_tools(tools_dir())
+    string8 dadoc_line = dadoc_version_line()
+    if #len(dadoc_line) == 0: _ = dadoc()
+    (ref []ToolState states, ref []string8 _) = read_tool_states()
+    string8 logs = join2(install, "logs")
+    i64 failed = 0
+    for t in tools:
+        if !t.ok:
+            warn(txt(#format("skipping the tool ", t.name, ": ", t.why)))
+            failed += 1
+            continue
+        if !t.spec.ship: continue
+        string8 bin = tool_binary(t.name)
+        (ToolState rec, bool recorded) = recorded_state(states[:], t.name)
+        string8 stale = why_stale(is_file(bin), recorded, rec, sources_hash(t.dir), dadoc_line)
+        if #len(stale) == 0:
+            note(txt(#format("tool   ", t.name, " is current")))
+            continue
+        say(txt(#format("tool   ", t.name)))
+        (bool ok, string8 said) = build_tool(t)
+        string8 log = join2(logs, txt(#format(t.name, ".log")))
+        if ok:
+            remove_quietly(log)
+            say_green("built", txt(#format(" ", bin)))
+            continue
+        _ = fs.make_dirs(logs, #default)
+        write_quietly(log, said)
+        warn(txt(#format("the tool ", t.name, " did not build; what the build said is in\n    ", log, "\n  The rest of the install goes on. Once it is fixed: dado tools rebuild ", t.name)))
+        failed += 1
+    return failed
+
+// The tools' state lines, as `tools.dado` keeps them.
+private (ref []ToolState tools, ref []string8 other) read_tool_states():
+    return parse_state(read_or_empty(state_path()))
+
+// ── the script engine ───────────────────────────────────────────────────────
+
+// Build the QuickJS-ng engine for this host with the pinned zig, as a build
+// of a program that runs DadoScript would, saying so first since it takes a
+// while. Answers 1 when it did not build.
+private i64 install_engine(string8 install):
+    when #OS == #WINDOWS:
+        note("engine the script engine's build is POSIX shell: programs that run DadoScript cannot be built on Windows yet")
+        return 0
+    else:
+        string8 script = join3(root(), "tools", join2("quickjs", "build.sh"))
+        if !is_file(script):
+            warn(txt(#format("no script engine build at ", script, ": the checkout is incomplete.\n  Restore it: git -C ", root(), " checkout -- tools/quickjs")))
+            return 1
+        Compiler cc = compiler("", true)
+        if !cc.found:
+            warn(txt(#format("the script engine was not built: ", cc.why)))
+            return 1
+        ref []char8 words = strings.join(cc.words[:], " ")
+        Command key = command(script)
+        add(&key, "--cc")
+        add(&key, txt(words))
+        add(&key, "--print-key")
+        Captured k = capture(key, true)
+        ref []string8 kl = lines_of(txt(k.out))
+        if k.started && k.status == 0 && #len(kl) > 0 && is_file(join2(kl[#len(kl) - 1], "libquickjs.a")):
+            note(txt(#format("engine is built at ", kl[#len(kl) - 1])))
+            return 0
+        say("engine building the script engine for this host (20 to 55 s, once)")
+        time.Instant t0 = time.instant()
+        Command c = command(script)
+        add(&c, "--cc")
+        add(&c, txt(words))
+        add(&c, "--quiet")
+        Captured r = capture_merged(c)
+        i64 secs = time.as_seconds(time.elapsed(t0))
+        ref []string8 ls = lines_of(txt(r.out))
+        if r.started && r.status == 0 && #len(ls) > 0 && is_file(join2(ls[#len(ls) - 1], "libquickjs.a")):
+            say_green("built", txt(#format(" ", ls[#len(ls) - 1], " in ", secs, " s")))
+            return 0
+        string8 logs = join2(install, "logs")
+        string8 log = join2(logs, "quickjs.log")
+        _ = fs.make_dirs(logs, #default)
+        write_quietly(log, txt(r.out))
+        warn(txt(#format("the script engine did not build; what its build said is in\n    ", log, "\n  Programs that run DadoScript will try again when they build. To try now:\n    ", script, " --cc '", txt(words), "'")))
+        return 1
+
+// ── PATH ────────────────────────────────────────────────────────────────────
+
+// Put the install's programs on PATH. Answers how many things failed.
+private i64 install_path(string8 install):
+    when #OS == #WINDOWS:
+        return install_windows_path(install)
+    else:
+        string8 home = home_or_empty()
+        if #len(home) == 0:
+            warn("the home directory is not known (HOME is not set), so dado was not put on PATH.\n  Set HOME and run dado install again, or put the install's bin/ on PATH yourself.")
+            return 1
+        string8 local = join2(home, ".local")
+        string8 bin = join2(local, "bin")
+        for d in [local, bin]:
+            if is_dir(d): continue
+            if exists(d) || is_link(d):
+                warn(txt(#format(d, " is there and is not a directory, so dado was not put on PATH.\n  Move it away and run dado install again.")))
+                return 1
+            journal1(install, "mkdir", d)
+            ref []char8 dc = strings.clone_to_cstring(d, #default)
+            if !fs.make_dir(cstring(dc)):
+                warn(txt(#format("cannot create ", d, ": ", os.message(os.last_error()), "\n  so dado was not put on PATH. Make it yourself and run dado install again.")))
+                return 1
+        i64 failed = 0
+        if !link_into(install, join2(bin, "dado"), join3(install, "bin", "dado")): failed += 1
+        if !link_into(install, join2(bin, "dadoc"), join2(install, "dadoc")): failed += 1
+        if !link_into(install, join2(bin, "dado-lsp"), join2(install, "dado-lsp")): failed += 1
+        if failed == 0:
+            say_green("linked", txt(#format(" ", bin, "/{dado,dadoc,dado-lsp} -> ", install)))
+        (string8 path, bool _) = env("PATH")
+        if !dir_on_path(path, bin):
+            (string8 shell, bool _) = env("SHELL")
+            fmt.println("")
+            fmt.println(bin, " is not on your PATH.")
+            fmt.println("To put it there, run this once, then open a new terminal (dado edits no shell's files):\n")
+            fmt.println("    ", path_line(shell, ON_DARWIN))
+            fmt.println("")
+        return failed
+
+when #OS == #DARWIN:
+    private const bool ON_DARWIN = true
+else:
+    private const bool ON_DARWIN = false
+
+// Make `link` a link to `target`, journalling first. A link already there and
+// already ours is kept; anything else there is the user's, and is left alone
+// with a word. Answers whether `link` is ours now.
+private bool link_into(string8 install, string8 link, string8 target):
+    string8 line = record_line("symlink", fields2(link, target))
+    if is_link(link):
+        string8 now = link_target(link)
+        if now == target:
+            ref []Record records = read_journal(install)
+            if !journal_has(records[:], line): journal2(install, "symlink", link, target)
+            return true
+        warn(txt(#format(link, " links to ", now, ", not to this install, and was left alone.\n  If that is an older Dado, remove the link (rm ", link, ") and run dado install again.")))
+        return false
+    if exists(link):
+        warn(txt(#format(link, " is a file of yours, and was left alone, so `", base_name(link), "` does not reach this install.\n  Move it away and run dado install again.")))
+        return false
+    journal2(install, "symlink", link, target)
+    try fs.make_symlink(target, link) else code:
+        warn(txt(#format("cannot link ", link, " to ", target, ": ", os.message(code))))
+        return false
+    return true
+
+// Whether `p` is a symbolic link, whether or not what it names exists.
+bool is_link(string8 p):
+    ref []char8 c = strings.clone_to_cstring(p, #default)
+    return fs.is_symlink(cstring(c))
+
+// What the link at `p` holds, or "".
+string8 link_target(string8 p):
+    ref []char8 c = strings.clone_to_cstring(p, #default)
+    ref []char8 buf = #make([]char8, 4096)
+    i64 n = fs.read_link(cstring(c), buf[:])
+    if n < 0: return ""
+    string8 held = string8(buf[0..<n])
+    ref []char8 own = #format(held)
+    return txt(own)
+
+// The last part of `p`.
+string8 base_name(string8 p):
+    i64 at = strings.last_index_of(p, '/')
+    if at < 0: return p
+    return p[at + 1..<#len(p)]
+
+// Whether `dir` is one of the `:`-separated entries of `path`, a trailing
+// `/` on either ignored.
+bool dir_on_path(string8 path, string8 dir):
+    string8 want = strings_trim_slash(dir)
+    string8 rest = path
+    for #len(rest) > 0:
+        (string8 d, string8 tail, bool more) = split_byte(rest, ':')
+        if strings_trim_slash(d) == want && #len(want) > 0: return true
+        if !more: break
+        rest = tail
+    return false
+
+private string8 strings_trim_slash(string8 s):
+    string8 t = s
+    for #len(t) > 1 && t[#len(t) - 1] == '/':
+        t = t[0..<#len(t) - 1]
+    return t
+
+// The one line that puts `~/.local/bin` on PATH for `shell` (the value of
+// `$SHELL`) from then on: fish's own command, or an `export` appended to the
+// file the shell reads at start. On macOS a terminal starts bash as a login
+// shell, which reads `~/.bash_profile` and not `~/.bashrc`.
+string8 path_line(string8 shell, bool darwin):
+    string8 name = base_name(shell)
+    string8 export_it = "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> "
+    if name == "fish": return "fish_add_path ~/.local/bin"
+    if name == "zsh": return txt(#format(export_it, "~/.zshrc"))
+    if name == "bash":
+        if darwin: return txt(#format(export_it, "~/.bash_profile"))
+        return txt(#format(export_it, "~/.bashrc"))
+    return txt(#format(export_it, "~/.profile"))
+
+// ── the Windows user PATH ───────────────────────────────────────────────────
+
+// Whether `entry` is one of the `;`-separated entries of `value`, compared as
+// Windows compares paths: ignoring case and a trailing `\`.
+bool has_path_entry(string8 value, string8 entry):
+    string8 want = path_key(entry)
+    string8 rest = value
+    for #len(rest) > 0:
+        (string8 d, string8 tail, bool more) = split_byte(rest, ';')
+        if path_key(d) == want && #len(want) > 0: return true
+        if !more: break
+        rest = tail
+    return false
+
+// `value` with `entry` added at its end.
+string8 with_path_entry(string8 value, string8 entry):
+    if #len(value) == 0: return entry
+    if strings.ends_with(value, ";"): return txt(#format(value, entry))
+    return txt(#format(value, ";", entry))
+
+// `value` with every entry equal to `entry` (as `has_path_entry` compares)
+// taken out, the others kept exactly as they were, and whether any was.
+(string8 value, bool removed) without_path_entry(string8 value, string8 entry):
+    string8 want = path_key(entry)
+    ref []string8 kept = #make([]string8, 0)
+    bool removed = false
+    string8 rest = value
+    for:
+        (string8 d, string8 tail, bool more) = split_byte(rest, ';')
+        if path_key(d) == want && #len(want) > 0:
+            removed = true
+        else:
+            _ = #append(kept, d)
+        if !more: break
+        rest = tail
+    ref []char8 j = strings.join(kept[:], ";")
+    return (txt(j), removed)
+
+private string8 path_key(string8 p):
+    string8 t = strings.trim(p)
+    for #len(t) > 1 && (t[#len(t) - 1] == '\\' || t[#len(t) - 1] == '/'):
+        t = t[0..<#len(t) - 1]
+    return lowered(t)
+
+// The user's own PATH, as Windows keeps it (not this process's, which has
+// the system's in front of it). `ok` false when PowerShell would not say.
+(string8 value, bool ok) read_user_path():
+    Command c = command("powershell")
+    add(&c, "-NoProfile")
+    add(&c, "-Command")
+    add(&c, "[Environment]::GetEnvironmentVariable('Path', 'User')")
+    Captured r = capture(c, true)
+    if !r.started || r.status != 0: return ("", false)
+    return (strings.trim(txt(r.out)), true)
+
+// Set the user's PATH to `value`. The value goes through this process's
+// environment rather than the command line, so no quoting of PowerShell's
+// can change it.
+bool write_user_path(string8 value):
+    try os.set_env("DADO_USER_PATH", value) else:
+        return false
+    Command c = command("powershell")
+    add(&c, "-NoProfile")
+    add(&c, "-Command")
+    add(&c, "[Environment]::SetEnvironmentVariable('Path', $env:DADO_USER_PATH, 'User')")
+    return succeeds(c)
+
+private i64 install_windows_path(string8 install):
+    string8 entry = join2(install, "bin")
+    (string8 value, bool ok) = read_user_path()
+    if !ok:
+        warn(txt(#format("PowerShell did not say what your PATH is, so dado was not put on it.\n  Add ", entry, " to your user PATH yourself (Settings, *Edit environment variables for your account*).")))
+        return 1
+    if has_path_entry(value, entry):
+        string8 line = record_line("winpath", fields1(entry))
+        ref []Record records = read_journal(install)
+        if !journal_has(records[:], line): journal1(install, "winpath", entry)
+        note(txt(#format("path   ", entry, " is on your PATH")))
+        return 0
+    journal1(install, "winpath", entry)
+    if !write_user_path(with_path_entry(value, entry)):
+        warn(txt(#format("PowerShell did not change your PATH. Add ", entry, " to your user PATH yourself\n  (Settings, *Edit environment variables for your account*).")))
+        return 1
+    say_green("added", txt(#format(" ", entry, " to your PATH: open a new terminal to use it")))
+    return 0
+
+ref []string8 fields1(string8 a):
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, a)
+    return f
+
+// ── the end ─────────────────────────────────────────────────────────────────
+
+private void next_steps(string8 install, i64 problems):
+    string8 version = version_word(dadoc_version_line())
+    fmt.println("")
+    if problems == 0:
+        say(txt(#format("Dado ", version, " is installed in ", install, ".")))
+    else:
+        say(txt(#format("Dado ", version, " is installed in ", install, ", with ", problems, " thing", "" if problems == 1 else "s", " to look at above.")))
+    fmt.println("")
+    fmt.println("Next:")
+    fmt.println("  dado build <package>      build a program (dado --help lists the rest)")
+    fmt.println("  dado doctor               check this install again, at any time")
+    fmt.println("  dado editors              set up an editor installed later")
+    fmt.println("  agents: run `dado agent`")
+    fmt.println("  dado uninstall            remove Dado, and every change it made outside ", install)
+    _ = io.flush(io.stdout())
+
+// ── the command line ────────────────────────────────────────────────────────
+
+private flags.BoolFlag g_yes
+private flags.BoolFlag g_no_path
+private flags.BoolFlag g_no_editor
+private flags.TextFlag g_editors
+private flags.BoolFlag g_remove
+
+// The command-line declarations of `install`, `editors` and `uninstall`.
+void declare_install(^flags.Parser p):
+    g_yes = p.boolean("-y --yes", "ask nothing: install and editors take every editor found, uninstall goes ahead", "install editors uninstall")
+    g_no_path = p.boolean("--no-path", "do not put dado on PATH", "install")
+    g_no_editor = p.boolean("--no-editor", "set up no editor", "install")
+    g_editors = p.text("--editors", "=all|none|LIST", "the editors to set up, LIST naming them with commas (vscode, vscode-insiders, vscodium, cursor, windsurf, claude-code)", "", "install editors")
+    g_remove = p.boolean("--remove", "take back out what dado set up in editors", "editors")
+
+// `dado install`, `dado editors` or `dado uninstall`, as `cmd` says.
+i32 install_verbs(^flags.Parser p, string8 cmd):
+    if cmd == "install":
+        InstallFlags f
+        f.yes = p.on(g_yes)
+        f.no_path = p.on(g_no_path)
+        f.no_editor = p.on(g_no_editor)
+        f.editors_given = p.given(g_editors)
+        f.editors = p.value(g_editors)
+        return install_command(f)
+    if cmd == "editors":
+        return editors_command(p.value(g_editors), p.given(g_editors), p.on(g_remove), p.on(g_yes))
+    return uninstall_command(p.on(g_yes))

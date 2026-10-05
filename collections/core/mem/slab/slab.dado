@@ -1,0 +1,748 @@
+// core:mem/slab — size classes over large chunks, behind the allocator interface.
+//
+//     import "core:mem"
+//     import "core:mem/libc"
+//     import "core:mem/slab"
+//
+//     slab.Slab lines = slab.over(libc.allocator())
+//     defer slab.destroy(&lines)
+//     mem.Allocator a = slab.allocator(&lines)
+//     ref []char8 run = #make([]char8, n, a)      // `#resize`, `#delete` as ever
+//
+// The allocator for **many small blocks that are freed one at a time**, which is
+// the shape neither of the two cursor allocators in this collection can hold:
+// `core:mem/bump` and `core:mem/arena` never reclaim one block, and C's heap
+// reclaims every one but pays a call, a lock and a header for each. An editor
+// holding a file as one owned run per line is the case it is written for: a
+// load is one allocation per line, and every edit frees one line's run and
+// allocates its replacement.
+//
+// ## How it is built
+//
+// A request of at most `MAX_CLASS` bytes is rounded up to a **size class**, and
+// each class keeps an intrusive free list threaded through its freed blocks. A
+// block comes off that list if it can, and otherwise is carved off the newest
+// **chunk** — a large block requested from the backing allocator, whose first
+// `CHUNK_HEADER` bytes link it to the one before. Chunks are shared by every
+// class: a chunk is a bump cursor, not a per-class page, so a slab that only ever
+// holds lines of 0..200 bytes asks for no chunk on behalf of a class it does not
+// use. A request above `MAX_CLASS` is a **large block**, passed straight to the
+// backing allocator behind a `LARGE_HEADER` that links it into a list, so
+// `reset` and `destroy` can find it.
+//
+// ## What it does with each mode
+//
+//     Alloc     pop the class's free list, else carve from the newest chunk,
+//               else request a chunk; above `MAX_CLASS`, a large block
+//     Resize    **in place** when the new size rounds to the same class; a
+//               large block is handed to the backing allocator's own `Resize`,
+//               which may grow it in place; otherwise allocate, copy, free
+//     Free      push the block onto its class's free list — O(1), no call
+//     FreeAll   `reset`: release every large block and every chunk **but the
+//               oldest**, and empty every free list. `core:mem/arena`'s
+//               reasoning, for the same frame-loop reason
+//
+// ## The size is the caller's, and there is no per-block header
+//
+// A small block carries **no header**: its class is recovered from `old_size`,
+// which the interface passes on every `Resize` and `Free`. The verbs pass the
+// size last requested — `#delete` and `#resize` send `cap * #size(T)`, and `cap`
+// is the element count the run was made or last resized to (read in the emitted
+// C for `#make`/`#resize`/`#delete` over this collection's `libc.allocator()`).
+// So the per-block overhead of a small block is its class rounding and nothing
+// else. **A caller that frees with a size it did not allocate with corrupts a
+// free list**, and nothing detects it — the same bargain `mem.resize_by_copy`
+// already makes when it copies `old_size` bytes on the caller's word.
+//
+// The alternative was a per-chunk class table found from the address, which
+// survives a lying caller; it is refused because it costs a lookup on every
+// `Free` to defend against a caller the interface already trusts everywhere
+// else.
+//
+// ## Zero bytes
+//
+// `Alloc` of 0 answers a **distinct, non-nil** block of the smallest class — the
+// compiler's own root heap answers `calloc(1, size ? size : 1)`, and
+// `core:mem/libc` clamps a zero `Resize` to one byte, so a zero-length run holds a
+// real handle that `#delete` hands back. Freeing it with `old_size` 0 finds the
+// same class, so the pair round-trips.
+//
+// ## Refused
+//
+//   * `align` above `mem.MAX_ALIGN`, answered `nil` before anything is
+//     requested — chunks and large blocks are asked for at `MAX_ALIGN` and every
+//     class is a multiple of 16, so that is exactly the alignment this can
+//     vouch for, and no more;
+//   * a backing allocator that hands back a block not aligned to `MAX_ALIGN` —
+//     the block is given back and the request fails, `core:mem/arena`'s rule;
+//   * a large request whose size plus its header would wrap a `u64`.
+//
+// ## Trusted
+//
+//   * `old_size`, as above;
+//   * the backing allocator's zeroing. A chunk and a large block are
+//     allocations, which the interface zeroes, so a block carved fresh from a
+//     chunk is handed out without a second pass — see `take` for what that
+//     pass cost. A backing that does not zero hands out blocks that are not
+//     zero, and a block reused off a free list is zeroed here either way.
+//
+// ## What it costs
+//
+// Measured with a throwaway program over `mem.Allocator` values: 100 000
+// allocations of 0..200 bytes each written through, freed in shuffled order,
+// then 100 000 edits (free one, allocate its replacement), 30 rounds, median
+// of five runs, `./dado build` -O2 on a two-core VM. Nanoseconds per operation,
+// gcc 13 / clang 18:
+//
+//                             load       shuffled free   edit pair
+//     malloc, first round     65 / 60    69 / 56         120 / 65
+//     malloc, later rounds    28 / 28    59 / 75         122 / 68
+//     slab, first round       42 / 59    23 / 23          53 / 58
+//     slab kept, later rounds 33 / 34    28 / 23          60 / 54
+//
+// A free is a push, and costs between a quarter and a half of `free`'s. An
+// edit is half of `malloc`'s under gcc and level with it under clang. A load
+// is no faster: the first is first touch of twelve megabytes either way, and a
+// slab kept across loads no longer pays those page faults but hands its blocks
+// out in the order they were freed, which here is shuffled — glibc coalesces a
+// shuffled free and hands the next load out in address order. What the slab
+// changes is the backing: 15 calls for the load where `malloc` is called
+// 100 000 times, and **none** in 29 further rounds on the kept slab.
+//
+// **Not thread-safe.** A `Slab` is a plain value with no lock; two threads
+// allocating through one race on its free lists. One slab per thread, or a lock
+// the caller owns.
+package slab
+
+import "core:mem"
+
+// ── The numbers ──────────────────────────────────────────────────────────────
+
+// The largest request served from a size class. Above it a request is a large
+// block, one backing call each way, which is what a block that large costs
+// anywhere.
+const u64 MAX_CLASS = 4096
+
+// How many size classes there are. The classes are 16, 32, and then every power
+// of two from 64 to `MAX_CLASS` with the three-quarter step below it:
+//
+//     16 32 48 64 96 128 192 256 384 512 768 1024 1536 2048 3072 4096
+//
+// **Half-steps rather than bare powers of two, because of what an editor's
+// lines round to.** Over line lengths uniform on 0..200 bytes the mean request
+// is 100 bytes; bare powers of two from 16 round it to a mean block of 146.5
+// bytes (46% over), these classes to 119.5 (19% over) — the sum over all 201
+// sizes. `slab_test`'s 100 000-line load measures the same thing off real
+// blocks: 9 956 453 bytes requested, 11 928 624 in blocks, 1.198. Every class
+// is a multiple of 16, which is what keeps a carved block aligned to
+// `mem.MAX_ALIGN`; 24 is therefore not a class.
+const u64 CLASSES = 16
+
+// The first chunk's size, and where every doubling starts. Later chunks double
+// up to `CHUNK_MAX`, so a load of N bytes costs a logarithm of N calls while it
+// is small and N / `CHUNK_MAX` once it is large, and a slab that holds three
+// lines holds 64 KiB rather than a megabyte.
+const u64 CHUNK = 65536
+
+// The ceiling the doubling stops at, and so the most a slab holds uncarved.
+// 1 MiB: the 100 000-line load in `slab_test` (sizes 0..200, 11 928 624 bytes
+// of blocks) costs **15** backing calls under it — 64 + 128 + 256 + 512 KiB and
+// eleven of 1 MiB, 12 517 376 bytes reserved, measured — where a fixed 64 KiB
+// chunk would cost at least 183 (11 928 624 over the 65 520 bytes a chunk
+// carves, rounded up).
+const u64 CHUNK_MAX = 1048576
+
+// Bytes at the front of every chunk: the link to the older chunk and the
+// chunk's size — `#size(Chunk)`, which `slab_test` asserts, and a multiple of
+// `MAX_ALIGN`, so the first block carved after it is aligned.
+const u64 CHUNK_HEADER = 16
+
+// Bytes in front of every large block: two links, the backing size and the
+// requested size — `#size(Large)`, which `slab_test` asserts, and a multiple
+// of `MAX_ALIGN`, so the payload after it is aligned. The one per-block header
+// this allocator has, on blocks of more than 4 KiB: under 0.8% of the block.
+const u64 LARGE_HEADER = 32
+
+// ── The state ────────────────────────────────────────────────────────────────
+
+// A chunk's own first bytes.
+type Chunk: (
+    rawptr next,
+    u64 size,
+)
+
+// A freed small block's own first bytes. Only `next` is read; the second word
+// makes the record the smallest class exactly, so every block has room for it.
+type Link: (
+    rawptr next,
+    rawptr unused,
+)
+
+// A large block's header, in front of the payload the caller holds.
+type Large: (
+    rawptr prev,
+    rawptr next,
+    u64 total,
+    u64 size,
+)
+
+// The slab. The backing allocator is captured **by value**, as
+// `core:mem/arena` captures it, so a slab over `libc.allocator()` needs nothing
+// to outlive it.
+//
+// `cursor` and `left` are the newest chunk's uncarved tail; `free` is one list
+// head per class. `live` and everything after it is instrumentation, kept
+// because an engine component must be measurable — the readers below are
+// what a caller asserts against.
+type Slab: (
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing,
+    rawptr chunks,
+    rawptr cursor,
+    u64 left,
+    rawptr large,
+    u64 next_chunk,
+    [CLASSES]rawptr free,
+    [CLASSES]u64 live,
+    u64 reserved,
+    u64 in_use,
+    u64 requested,
+    u64 nchunks,
+    u64 nlarge,
+    u64 calls,
+)
+
+private type SlabPtr: ^Slab
+private type ChunkPtr: ^Chunk
+private type LinkPtr: ^Link
+private type LargePtr: ^Large
+
+// ── Lifetime ─────────────────────────────────────────────────────────────────
+
+// A slab over `backing`. **It does not allocate**: the first chunk is requested
+// by the first small allocation. A zero `backing` — no procedure — gives a slab
+// that refuses every request.
+Slab over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing):
+    Slab s
+    s.backing = backing
+    s.next_chunk = CHUNK
+    return s
+
+// The allocator for `s`. The slab is the allocator's `data`, so it is borrowed
+// by pointer and must outlive every block made through it. A nil `s` gives an
+// allocator that answers `nil` to everything.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Slab s):
+    return (dispatch, rawptr(s))
+
+// The allocator for a slab, as a declaration that takes `mem.Allocator` on:
+// a `SlabAllocator` is accepted wherever an allocator is asked — `#new`, `using`, a
+// parameter written as the two words, an `Allocator` binder — and the
+// compiler calls its `data()` there. It holds only the pointer, so a
+// one-slot declaration: `self` *is* the `^Slab`.
+//
+//     slab.SlabAllocator h = &s
+//     using h:
+//         ...
+type SlabAllocator using mem.Allocator:
+    ^Slab slab,
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+        return (dispatch, rawptr(self))
+
+// Release every block, **keeping the oldest chunk** — the one `FreeAll` does.
+// Every large block and every newer chunk goes back to the backing allocator,
+// every free list is emptied, and the next allocation carves from the kept
+// chunk's start. Lifetime-ending for every block handed out, and nothing
+// detects a use after it.
+void reset(^Slab s):
+    if rawptr(s) == nil:
+        return
+    release_large(s)
+    rawptr node = s^.chunks
+    rawptr oldest = nil
+    for node != nil:
+        ChunkPtr c = ChunkPtr(node)
+        rawptr older = c^.next
+        if older == nil:
+            oldest = node
+        else:
+            release_chunk(s, node)
+        node = older
+    forget_blocks(s)
+    s^.chunks = oldest
+    if oldest == nil:
+        s^.next_chunk = CHUNK
+        return
+    ChunkPtr kept = ChunkPtr(oldest)
+    // Carving trusts a chunk's bytes to be zero, and this one's have been
+    // handed out: zero it once here, O(chunk) rather than O(blocks).
+    zero(oldest, CHUNK_HEADER, kept^.size)
+    s^.cursor = oldest + CHUNK_HEADER
+    s^.left = kept^.size - CHUNK_HEADER
+    s^.next_chunk = grown(kept^.size)
+    return
+
+// Hand every chunk and every large block back. The slab is exactly what `over`
+// returned afterwards, and usable again; destroying one twice, or one that
+// never allocated, does nothing.
+void destroy(^Slab s):
+    if rawptr(s) == nil:
+        return
+    release_large(s)
+    rawptr node = s^.chunks
+    for node != nil:
+        ChunkPtr c = ChunkPtr(node)
+        rawptr older = c^.next
+        release_chunk(s, node)
+        node = older
+    forget_blocks(s)
+    s^.chunks = nil
+    s^.next_chunk = CHUNK
+    return
+
+// ── Reporting ────────────────────────────────────────────────────────────────
+//
+// Every reader answers 0 for a nil slab.
+
+// Bytes held from the backing allocator right now: every chunk, and every large
+// block with its header.
+u64 reserved(^Slab s):
+    if rawptr(s) == nil:
+        return 0
+    return s^.reserved
+
+// Bytes of live blocks as this slab counts them: a small block is its whole
+// class, a large one the size it was asked for. `reserved - in_use` is what the
+// slab holds and is not handing out — chunk tails, headers and free lists.
+u64 in_use(^Slab s):
+    if rawptr(s) == nil:
+        return 0
+    return s^.in_use
+
+// Bytes callers asked for across every live block. `in_use / requested` is the
+// class rounding, measured.
+u64 requested(^Slab s):
+    if rawptr(s) == nil:
+        return 0
+    return s^.requested
+
+// How many chunks are held.
+u64 chunks(^Slab s):
+    if rawptr(s) == nil:
+        return 0
+    return s^.nchunks
+
+// How many large blocks are live.
+u64 large_blocks(^Slab s):
+    if rawptr(s) == nil:
+        return 0
+    return s^.nlarge
+
+// How many calls this slab has made of its backing allocator — `Alloc`,
+// `Resize` and `Free` alike — since `over`. Never reset: it is the number a load
+// is judged by.
+u64 backing_calls(^Slab s):
+    if rawptr(s) == nil:
+        return 0
+    return s^.calls
+
+// How many blocks of class `class` are live. 0 for a class out of range.
+u64 live(^Slab s, u64 class):
+    if rawptr(s) == nil || class >= CLASSES:
+        return 0
+    return s^.live[class]
+
+// The block size of class `class`, 0 out of range. `class_size(CLASSES - 1)`
+// is `MAX_CLASS`.
+u64 class_size(u64 class):
+    if class >= CLASSES:
+        return 0
+    if class == 0:
+        return 16
+    if class % 2 == 1:
+        return u64(1) << ((class - 1) / 2 + 5)
+    return (u64(1) << (class / 2 + 5)) / 4 * 3
+
+// The class a request of `nbytes` is served from, or `CLASSES` for a large
+// block.
+u64 class_of(u64 nbytes):
+    if nbytes > MAX_CLASS:
+        return CLASSES
+    if nbytes <= 16:
+        return 0
+    if nbytes <= 32:
+        return 1
+    // `p` is the least power of two at or above `nbytes`, from 64, and `k` its
+    // class; the three-quarter class below it is `k - 1`.
+    u64 p = 64
+    u64 k = 3
+    for p < nbytes:
+        p = p * 2
+        k = k + 2
+    if nbytes <= p / 4 * 3:
+        return k - 1
+    return k
+
+// ── The procedure ────────────────────────────────────────────────────────────
+
+private rawptr dispatch(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    SlabPtr s = SlabPtr(data)
+    if rawptr(s) == nil:
+        return nil
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            if align > mem.MAX_ALIGN:
+                return nil
+            return take(s, nbytes)
+        case mem.AllocatorMode.Resize:
+            if align > mem.MAX_ALIGN:
+                return nil
+            return regrow(s, nbytes, old, old_size)
+        case mem.AllocatorMode.Free:
+            give(s, old, old_size)
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            reset(s)
+            return nil
+        else:
+            return nil
+
+// `Alloc`, after the alignment check.
+private rawptr take(SlabPtr s, u64 nbytes):
+    u64 class = class_of(nbytes)
+    if class >= CLASSES:
+        return take_large(s, nbytes)
+    u64 size = class_size(class)
+    rawptr out = s^.free[class]
+    if out != nil:
+        s^.free[class] = LinkPtr(out)^.next
+        // Allocation always zeroes. The requested bytes only: the rest of the
+        // class may hold a free list's link or an old tenant's bytes, and an
+        // in-class `Resize` that grows zeroes from the old size, so nothing
+        // reads them.
+        zero(out, 0, nbytes)
+    else:
+        // A block carved fresh is **not** zeroed here: it is bytes of a chunk
+        // no block has occupied, and a chunk is an allocation, which the
+        // interface zeroes. Zeroing it again was a second pass over every
+        // byte of a load, after the backing's pass had evicted the chunk from
+        // cache — and it made a fresh slab's `Alloc` slower than `malloc`'s:
+        // 110 ns against 71 per allocation over 100 000 allocations of 0..200
+        // bytes, gcc -O2, and 14 ns once this pass went. `reset` re-zeroes the
+        // chunk it keeps, so the rule holds for a chunk carved before.
+        out = carve(s, size)
+        if out == nil:
+            return nil
+    s^.live[class] = s^.live[class] + 1
+    s^.in_use = s^.in_use + size
+    s^.requested = s^.requested + nbytes
+    return out
+
+// `Free`. A nil block is nothing to free, as C's `free(NULL)` is.
+private void give(SlabPtr s, rawptr old, u64 old_size):
+    if old == nil:
+        return
+    u64 class = class_of(old_size)
+    if class >= CLASSES:
+        give_large(s, old)
+        return
+    LinkPtr l = LinkPtr(old)
+    l^.next = s^.free[class]
+    s^.free[class] = old
+    if s^.live[class] > 0:
+        s^.live[class] = s^.live[class] - 1
+    s^.in_use = less(s^.in_use, class_size(class))
+    s^.requested = less(s^.requested, old_size)
+    return
+
+// `Resize`.
+private rawptr regrow(SlabPtr s, u64 nbytes, rawptr old, u64 old_size):
+    if old == nil:
+        return take(s, nbytes)
+    u64 from = class_of(old_size)
+    u64 to = class_of(nbytes)
+    if from < CLASSES && from == to:
+        // The same class, so the block already has room: the pointer does not
+        // move and nothing is copied. Growing zeroes the bytes the caller had
+        // not asked for before, which is every byte that might be stale.
+        if nbytes > old_size:
+            zero(old, old_size, nbytes)
+        s^.requested = less(s^.requested, old_size) + nbytes
+        return old
+    if from >= CLASSES && to >= CLASSES:
+        return regrow_large(s, nbytes, old, old_size)
+    rawptr fresh = take(s, nbytes)
+    if fresh == nil:
+        return nil
+    u64 keep = old_size
+    if nbytes < keep: keep = nbytes
+    copy_bytes(fresh, old, keep)
+    give(s, old, old_size)
+    return fresh
+
+// ── Chunks ───────────────────────────────────────────────────────────────────
+
+// `size` bytes off the newest chunk, requesting a chunk if the tail is short.
+// The short tail is abandoned, not split into smaller classes: it is less than
+// one `MAX_CLASS` block, and at most one per chunk.
+private rawptr carve(SlabPtr s, u64 size):
+    if s^.cursor == nil || s^.left < size:
+        if !grow(s):
+            return nil
+    rawptr out = s^.cursor
+    s^.cursor = out + size
+    s^.left = s^.left - size
+    return out
+
+// Request the next chunk and make its tail the cursor.
+private bool grow(SlabPtr s):
+    u64 want = s^.next_chunk
+    if want < CHUNK: want = CHUNK
+    rawptr c = back_alloc(s, want)
+    if c == nil:
+        return false
+    ChunkPtr h = ChunkPtr(c)
+    h^.next = s^.chunks
+    h^.size = want
+    s^.chunks = c
+    s^.cursor = c + CHUNK_HEADER
+    s^.left = want - CHUNK_HEADER
+    s^.nchunks = s^.nchunks + 1
+    s^.reserved = s^.reserved + want
+    s^.next_chunk = grown(want)
+    return true
+
+// The doubling, stopped at the ceiling.
+private u64 grown(u64 size):
+    if size >= CHUNK_MAX / 2:
+        return CHUNK_MAX
+    return size * 2
+
+private void release_chunk(SlabPtr s, rawptr c):
+    ChunkPtr h = ChunkPtr(c)
+    u64 size = h^.size
+    back_free(s, c, size)
+    s^.reserved = less(s^.reserved, size)
+    if s^.nchunks > 0:
+        s^.nchunks = s^.nchunks - 1
+    return
+
+// Forget every small block: the free lists, the live counts and the cursor. The
+// chunks themselves are the caller's to release or keep.
+private void forget_blocks(SlabPtr s):
+    for i in u64(0)..<CLASSES:
+        s^.free[i] = nil
+        s^.live[i] = 0
+    s^.cursor = nil
+    s^.left = 0
+    s^.in_use = 0
+    s^.requested = 0
+    return
+
+// ── Large blocks ─────────────────────────────────────────────────────────────
+
+private rawptr take_large(SlabPtr s, u64 nbytes):
+    if nbytes > 0 - LARGE_HEADER - 1:
+        return nil
+    u64 total = nbytes + LARGE_HEADER
+    rawptr h = back_alloc(s, total)
+    if h == nil:
+        return nil
+    // Not zeroed here: the backing allocator zeroed it, by the interface's
+    // rule, and a second pass is a second trip over bytes the caller is about
+    // to write.
+    link_large(s, h, total, nbytes)
+    s^.reserved = s^.reserved + total
+    s^.in_use = s^.in_use + nbytes
+    s^.requested = s^.requested + nbytes
+    return h + LARGE_HEADER
+
+private void give_large(SlabPtr s, rawptr old):
+    rawptr h = old - LARGE_HEADER
+    LargePtr l = LargePtr(h)
+    u64 total = l^.total
+    u64 size = l^.size
+    unlink_large(s, h)
+    back_free(s, h, total)
+    s^.reserved = less(s^.reserved, total)
+    s^.in_use = less(s^.in_use, size)
+    s^.requested = less(s^.requested, size)
+    return
+
+// Large to large: the backing allocator's own `Resize`, which is the one place
+// a block can grow **in place** (C's `realloc`), and the reason `Resize` is a
+// mode. A backing that answers `nil` — refused, or not implemented — still
+// holds the old block untouched, so the fallback is allocate, copy, free.
+private rawptr regrow_large(SlabPtr s, u64 nbytes, rawptr old, u64 old_size):
+    if nbytes > 0 - LARGE_HEADER - 1:
+        return nil
+    rawptr h = old - LARGE_HEADER
+    LargePtr l = LargePtr(h)
+    u64 total = l^.total
+    u64 size = l^.size
+    rawptr prev = l^.prev
+    rawptr next = l^.next
+    u64 want = nbytes + LARGE_HEADER
+    rawptr moved = back_resize(s, h, total, want)
+    if moved != nil && moved == #align_forward(moved, mem.MAX_ALIGN):
+        // The header moved with the block, so its neighbours still point at
+        // the old address: repoint them. `prev` and `next` were read before
+        // the call, because after it `h` may be freed memory.
+        LargePtr m = LargePtr(moved)
+        m^.prev = prev
+        m^.next = next
+        m^.total = want
+        m^.size = nbytes
+        if prev == nil:
+            s^.large = moved
+        else:
+            LargePtr(prev)^.next = moved
+        if next != nil:
+            LargePtr(next)^.prev = moved
+        s^.reserved = less(s^.reserved, total) + want
+        s^.in_use = less(s^.in_use, size) + nbytes
+        s^.requested = less(s^.requested, size) + nbytes
+        return moved + LARGE_HEADER
+    if moved != nil:
+        // The backing moved the block somewhere it does not align, and the old
+        // address is gone. Its header cannot be read as a `Large` there — that
+        // is a misaligned access, which UBSan reports — so the block is dropped
+        // from the list through its neighbours, which are aligned, its payload
+        // is copied out byte by byte, and it goes back by the address and size
+        // the backing just gave it.
+        if prev == nil:
+            s^.large = next
+        else:
+            LargePtr(prev)^.next = next
+        if next != nil:
+            LargePtr(next)^.prev = prev
+        if s^.nlarge > 0:
+            s^.nlarge = s^.nlarge - 1
+        s^.reserved = less(s^.reserved, total) + want
+        s^.in_use = less(s^.in_use, size)
+        s^.requested = less(s^.requested, size)
+        u64 keep = size
+        if nbytes < keep: keep = nbytes
+        rawptr fresh = take_large(s, nbytes)
+        if fresh != nil:
+            copy_bytes(fresh, moved + LARGE_HEADER, keep)
+        back_free(s, moved, want)
+        s^.reserved = less(s^.reserved, want)
+        // A nil here has lost the caller's block: the backing already freed the
+        // old address, and the one it moved to could not be kept. It is the one
+        // failure this allocator cannot make atomic, and it is reached only by
+        // a backing that broke `MAX_ALIGN`.
+        return fresh
+    rawptr fresh = take_large(s, nbytes)
+    if fresh == nil:
+        return nil
+    u64 keep = old_size
+    if nbytes < keep: keep = nbytes
+    copy_bytes(fresh, old, keep)
+    give_large(s, old)
+    return fresh
+
+private void link_large(SlabPtr s, rawptr h, u64 total, u64 size):
+    LargePtr l = LargePtr(h)
+    l^.prev = nil
+    l^.next = s^.large
+    l^.total = total
+    l^.size = size
+    if s^.large != nil:
+        LargePtr(s^.large)^.prev = h
+    s^.large = h
+    s^.nlarge = s^.nlarge + 1
+    return
+
+private void unlink_large(SlabPtr s, rawptr h):
+    LargePtr l = LargePtr(h)
+    if l^.prev == nil:
+        s^.large = l^.next
+    else:
+        LargePtr(l^.prev)^.next = l^.next
+    if l^.next != nil:
+        LargePtr(l^.next)^.prev = l^.prev
+    if s^.nlarge > 0:
+        s^.nlarge = s^.nlarge - 1
+    return
+
+private void release_large(SlabPtr s):
+    rawptr node = s^.large
+    for node != nil:
+        LargePtr l = LargePtr(node)
+        rawptr next = l^.next
+        u64 total = l^.total
+        back_free(s, node, total)
+        s^.reserved = less(s^.reserved, total)
+        node = next
+    s^.large = nil
+    s^.nlarge = 0
+    return
+
+// ── The backing allocator, counted ───────────────────────────────────────────
+
+// A block of `nbytes` at `MAX_ALIGN`, or nil — including when the backing
+// allocator answered one it had not aligned, which is given back
+// (`core:mem/arena`'s refusal, for its reason: a carve from a misaligned base
+// is misaligned, and repairing it would need a word per chunk to remember the
+// original).
+private rawptr back_alloc(SlabPtr s, u64 nbytes):
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) b = s^.backing
+    if b.proc == nil:
+        return nil
+    s^.calls = s^.calls + 1
+    rawptr p = b.proc(b.data, mem.AllocatorMode.Alloc, nbytes, mem.MAX_ALIGN, nil, 0)
+    if p == nil:
+        return nil
+    if p != #align_forward(p, mem.MAX_ALIGN):
+        back_free(s, p, nbytes)
+        return nil
+    return p
+
+private rawptr back_resize(SlabPtr s, rawptr old, u64 old_size, u64 nbytes):
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) b = s^.backing
+    if b.proc == nil:
+        return nil
+    s^.calls = s^.calls + 1
+    return b.proc(b.data, mem.AllocatorMode.Resize, nbytes, mem.MAX_ALIGN, old, old_size)
+
+private void back_free(SlabPtr s, rawptr p, u64 nbytes):
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) b = s^.backing
+    if b.proc == nil:
+        return
+    s^.calls = s^.calls + 1
+    _ = b.proc(b.data, mem.AllocatorMode.Free, 0, 0, p, nbytes)
+    return
+
+// ── Byte work ────────────────────────────────────────────────────────────────
+
+// `a - b`, stopping at zero. A counter that would go below zero is a caller
+// who freed with a size it did not allocate with; the counter stays sane and
+// the free list is already beyond saving.
+private u64 less(u64 a, u64 b):
+    if b > a:
+        return 0
+    return a - b
+
+// Zero `[from, to)` of the block at `p`.
+private void zero(rawptr p, u64 from, u64 to):
+    if p == nil || to <= from:
+        return
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[i64(from)..<i64(to)]
+    i64 z = 0
+    for i in z..<#len(span):
+        span[i] = 0
+    return
+
+// Copy `n` bytes from `src` to `dst`. The two never overlap: `dst` is a block
+// just handed out and `src` one still live.
+private void copy_bytes(rawptr dst, rawptr src, u64 n):
+    if dst == nil || src == nil || n == 0:
+        return
+    mem.Bytes a = mem.Bytes(src)
+    mem.Bytes b = mem.Bytes(dst)
+    []u8 from = a[0..<i64(n)]
+    []u8 into = b[0..<i64(n)]
+    i64 z = 0
+    for i in z..<#len(into):
+        into[i] = from[i]
+    return

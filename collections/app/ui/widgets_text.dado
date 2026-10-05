@@ -1,0 +1,429 @@
+// app:ui — the text widgets: `Label` and `TextView`.
+//
+// A text widget writes clusters into grid cells and nothing else: no pen, no
+// advance, no kerning. Where a character goes is a column count
+// (`cell.cluster_columns_at`), and the grid resolves the glyph.
+//
+// ## Label
+//
+// One line of text, clipped at its rectangle. Its minimum is the text's
+// width in columns by one row. It holds its own copy of the text.
+//
+// ## TextView
+//
+// A read-only, scrolling view of lines it does not own. The lines come from a
+// **source**: a function answering the line count and a function answering
+// line `i`, both given the context pointer the program passed, so a view reads
+// a document without copying it and without knowing how it is stored. It
+// repaints only when it was told to (`text_view_changed`) or when it scrolled.
+//
+// **The scroll position is a pixel offset, not a line index.** The first
+// visible line is `offset / cell height`, so a trackpad that reports a
+// fraction of a line and a wheel that reports whole notches move the same
+// value, and nothing is lost between them. The grid draws whole cells, so what
+// is on screen moves a row at a time; a TextView does not draw the sub-row
+// remainder as a pixel shift of the view (`TextEdit` does, through a grid
+// region).
+//
+// Keys, while the view has focus: Up and Down move one line; PageUp and
+// PageDown one screen less one line; Home and End (with Ctrl) the top and the
+// bottom. The wheel moves `WHEEL_LINES` lines a notch — `WHEEL_LINES` times
+// `input.wheel_amount` lines' worth of pixels, so a trackpad's fraction of a
+// line moves the pixel offset by that fraction (`wheel_scroll_px`), and a
+// whole-notch wheel moves exactly the whole lines it always did. Every motion
+// clamps to the range where the last line can reach the bottom row and no
+// further.
+package ui
+
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+
+// Lines moved per wheel notch.
+@const i32 WHEEL_LINES = 3
+
+// The pixels a wheel turn of `amount` lines (`input.wheel_amount`, positive
+// down) scrolls a view whose rows are `cell_h` pixels high: `amount` times
+// `WHEEL_LINES` rows, rounded to the nearest pixel, cut first to `max_lines`
+// lines either way so that no product can overflow. A whole `amount` is exactly
+// `amount * WHEEL_LINES` rows — what a notch always scrolled. A fraction that
+// rounds under half a pixel moves nothing. Pure; `cell_h` below one is one.
+i64 wheel_scroll_px(f32 amount, i32 cell_h, i64 max_lines):
+    f64 lines = f64(amount) * f64(WHEEL_LINES)
+    if !(lines == lines):
+        return 0
+    f64 cap = f64(max_lines)
+    if cap < 0.0:
+        cap = 0.0
+    if lines > cap:
+        lines = cap
+    if lines < 0.0 - cap:
+        lines = 0.0 - cap
+    i32 h = cell_h
+    if h < 1:
+        h = 1
+    f64 px = lines * f64(h)
+    if px >= 0.0:
+        return i64(px + 0.5)
+    return 0 - i64(0.5 - px)
+
+// ── Label ──────────────────────────────────────────────────────────────────
+//
+// Its colours and its box come from the theme: `LabelTheme`, or `StatusTheme`
+// for a label made a status line (`label_set_status`). A box set on the node
+// itself (`label_set_style`) replaces the theme's box and nothing else. The
+// box's content margins are room around the text, counted into the minimum;
+// its ink is the chrome pass's (`label_style_now`). Every cell of the label,
+// margins included, is painted in the theme's background (see theme.dado for
+// why a theme over a filled box makes that alpha 0).
+
+private type LabelState: (ref []char8 text, bool status, bool has_style, StyleBox style)
+private type LabelPtr: ^LabelState
+
+private Kind g_label_kind = NO_KIND
+
+private Kind label_kind():
+    if !kind_ok(g_label_kind):
+        Hooks h
+        h.measure = label_measure
+        h.arrange = nil
+        h.paint = label_paint
+        h.input = nil
+        h.free = label_free
+        h.style = label_style_hook
+        g_label_kind = register_kind("label", h)
+    return g_label_kind
+
+private string8 label_string(^LabelState s):
+    if s.text == nil:
+        return ""
+    return string8(s.text[:])
+
+private StyleBox label_box(^LabelState s):
+    if s.has_style:
+        return s.style
+    if s.status:
+        return theme_status().box
+    return theme_label().box
+
+// The label's text and background colours, from its table.
+private ([4]u8 fg, [4]u8 bg) label_colours(^LabelState s):
+    if s.status:
+        StatusTheme t = theme_status()
+        return (t.fg, t.bg)
+    LabelTheme l = theme_label()
+    return (l.fg, l.bg)
+
+private StyleBox label_style_hook(Control c, rawptr st):
+    _ = c
+    return label_box(LabelPtr(st))
+
+private cell.CellPoint label_measure(Control c, rawptr st):
+    _ = c
+    ^LabelState s = LabelPtr(st)
+    cell.CellPoint m = style_minimum(label_box(s))
+    i64 cols = i64(cell.columns(label_string(s))) + i64(m.col)
+    if cols > 2147483647:
+        cols = 2147483647
+    cell.CellPoint p = (i32(cols), 1 + m.row)
+    return p
+
+// The text is laid out from the content rect's left edge and the grid's clip
+// is set to the paint rectangle, so when an ancestor cuts the label on the
+// left the cells left of the clip are not written.
+private void label_paint(Control c, rawptr st, cell.CellRect clip):
+    ^LabelState s = LabelPtr(st)
+    ([4]u8 fg, [4]u8 bg) = label_colours(s)
+    cell.CellRect r = inner_rect(label_box(s), rect(c))
+    grid.clip(clip)
+    grid.fill(clip, fg, bg)
+    cell.CellRect on = cell.intersect(r, clip)
+    if !cell.is_empty(on) && r.row >= on.row && r.row < on.row + on.rows:
+        grid.clip(on)
+        _ = grid.text(r.col, r.row, label_string(s), on.col + on.cols - r.col, fg, bg)
+    grid.unclip()
+
+private void label_free(Control c, rawptr st):
+    _ = c
+    ^LabelState s = LabelPtr(st)
+    if s.text != nil:
+        #delete(s.text)
+        s.text = nil
+
+// A one-line label under `parent` showing a copy of `text`.
+Control label(Control parent, string8 text):
+    Control c = create_owned(label_kind(), parent, i64(#size(LabelState)))
+    if !valid(c):
+        return NIL
+    set_label_text(c, text)
+    return c
+
+private bool is_label(Control c):
+    return kind(c) == g_label_kind && state(c) != nil
+
+// A label's text, as a view valid until it next changes; the empty string for
+// anything that is not a live label.
+string8 label_text(Control c):
+    if !is_label(c):
+        return ""
+    return label_string(LabelPtr(state(c)))
+
+// Replace a label's text. Does nothing to a node that is not a live label.
+//
+// Does nothing while `update` runs, like every setter that marks layout: a
+// change made then would be kept and never drawn.
+void set_label_text(Control c, string8 text):
+    if !is_label(c) || g_phase != PHASE_IDLE:
+        return
+    ^LabelState s = LabelPtr(state(c))
+    if s.text != nil:
+        #delete(s.text)
+        s.text = nil
+    s.text = #make([]char8, #len(text), g_alloc)
+    if s.text != nil:
+        for i in 0..<#len(text):
+            s.text[i] = text[i]
+    mark_layout(c)
+
+// Give this one label its own box, in place of its table's; its margins
+// re-measure it. Does nothing to anything else, or while `update` runs.
+void label_set_style(Control c, StyleBox b):
+    if !is_label(c) || g_phase != PHASE_IDLE:
+        return
+    ^LabelState s = LabelPtr(state(c))
+    s.style = b
+    s.has_style = true
+    chrome_changed()
+    mark_layout(c)
+
+// Drop the label's own box; it takes its table's again.
+void label_clear_style(Control c):
+    if !is_label(c) || g_phase != PHASE_IDLE:
+        return
+    ^LabelState s = LabelPtr(state(c))
+    s.has_style = false
+    chrome_changed()
+    mark_layout(c)
+
+// Read the label's colours and box from `StatusTheme` (on) or `LabelTheme`
+// (off, the default): the look of a status line.
+void label_set_status(Control c, bool on):
+    if !is_label(c) || g_phase != PHASE_IDLE:
+        return
+    ^LabelState s = LabelPtr(state(c))
+    s.status = on
+    chrome_changed()
+    mark_layout(c)
+
+// The box the label is drawn with now: its own, or its table's. A label has
+// one state, so this is also its normal box. `style_empty()` for anything
+// that is not a live label.
+StyleBox label_style_now(Control c):
+    if !is_label(c):
+        return style_empty()
+    return label_box(LabelPtr(state(c)))
+
+// ── TextView ───────────────────────────────────────────────────────────────
+
+// A source's two functions. `count` answers how many lines there are; `line`
+// answers line `i` (0-based) as a view the caller does not keep past the
+// paint. Both are given the context pointer the source was set with.
+type LineCountFn: i64(rawptr)
+type LineFn: string8(rawptr, i64)
+
+private type ViewState: (
+    LineCountFn count,
+    LineFn      line,
+    rawptr      ctx,
+    i64         offset_px,
+    i64         last_top,
+    i64         lines_painted,
+    i64         scrolls,
+)
+private type ViewPtr: ^ViewState
+
+private Kind g_view_kind = NO_KIND
+
+private Kind view_kind():
+    if !kind_ok(g_view_kind):
+        Hooks h
+        h.measure = nil
+        h.arrange = nil
+        h.paint = view_paint
+        h.input = view_input
+        h.free = nil
+        g_view_kind = register_kind("text_view", h)
+    return g_view_kind
+
+// A text view under `parent`, focusable, expanding both ways, with no source
+// (it shows nothing until `text_view_set_source`).
+Control text_view(Control parent):
+    Control c = create_owned(view_kind(), parent, i64(#size(ViewState)))
+    if !valid(c):
+        return NIL
+    ^ViewState s = ViewPtr(state(c))
+    s.last_top = -1
+    set_expand(c, true, true)
+    set_focusable(c, true)
+    return c
+
+private bool is_view(Control c):
+    return kind(c) == g_view_kind && state(c) != nil
+
+// A view that may be changed now: not while `update` runs, when the repaint
+// the change needs would be dropped.
+private bool view_changeable(Control c):
+    return is_view(c) && g_phase == PHASE_IDLE
+
+// Give the view its lines. Scrolls to the top and repaints.
+void text_view_set_source(Control c, LineCountFn count, LineFn line, rawptr ctx):
+    if !view_changeable(c):
+        return
+    ^ViewState s = ViewPtr(state(c))
+    s.count = count
+    s.line = line
+    s.ctx = ctx
+    s.offset_px = 0
+    mark_paint(c)
+
+// Tell the view its source's lines changed; it repaints.
+void text_view_changed(Control c):
+    if is_view(c):
+        mark_paint(c)
+
+private i64 line_count(^ViewState s):
+    if s.count == nil:
+        return 0
+    i64 n = s.count(s.ctx)
+    if n < 0:
+        return 0
+    return n
+
+// The largest offset: the last line on the bottom row, or zero when every
+// line fits. Pure over its arguments.
+i64 max_scroll_px(i64 lines, i32 rows, i32 cell_h):
+    if rows <= 0 || cell_h <= 0:
+        return 0
+    i64 over = lines - i64(rows)
+    if over <= 0:
+        return 0
+    return over * i64(cell_h)
+
+// `offset` clamped to `[0, max]`.
+i64 clamp_scroll(i64 offset, i64 max):
+    if offset < 0:
+        return 0
+    if offset > max:
+        return max
+    return offset
+
+// The first visible line for a pixel offset. Pure over its arguments.
+i64 top_line(i64 offset_px, i32 cell_h):
+    if cell_h <= 0 || offset_px <= 0:
+        return 0
+    return offset_px / i64(cell_h)
+
+// Move the view to `offset_px`, clamped; repaints when the first visible line
+// changed. Answers whether it did.
+bool text_view_scroll_to(Control c, i64 offset_px):
+    if !view_changeable(c):
+        return false
+    ^ViewState s = ViewPtr(state(c))
+    i32 ch = grid.cell_h()
+    i64 max = max_scroll_px(line_count(s), rect(c).rows, ch)
+    i64 next = clamp_scroll(offset_px, max)
+    i64 before = top_line(s.offset_px, ch)
+    s.offset_px = next
+    if top_line(next, ch) == before:
+        return false
+    s.scrolls = s.scrolls + 1
+    mark_paint(c)
+    return true
+
+// Move the view by `lines` lines (negative is up). A request past either end
+// is cut to the document's length first, so the multiplication by the cell
+// height cannot overflow and wrap to the other end.
+bool text_view_scroll_lines(Control c, i64 lines):
+    if !is_view(c):
+        return false
+    ^ViewState s = ViewPtr(state(c))
+    i64 n = line_count(s) + 1
+    i64 d = lines
+    if d > n:
+        d = n
+    if d < 0 - n:
+        d = 0 - n
+    return text_view_scroll_to(c, s.offset_px + d * i64(grid.cell_h()))
+
+// The first visible line, and the pixel offset it comes from.
+(i64 top, i64 offset_px) text_view_position(Control c):
+    if !is_view(c):
+        return (0, 0)
+    ^ViewState s = ViewPtr(state(c))
+    return (top_line(s.offset_px, grid.cell_h()), s.offset_px)
+
+// How many lines this view has painted, and how many times it scrolled, since
+// it was made — the counters an instrument reads.
+(i64 lines_painted, i64 scrolls) text_view_counters(Control c):
+    if !is_view(c):
+        return (0, 0)
+    ^ViewState s = ViewPtr(state(c))
+    return (s.lines_painted, s.scrolls)
+
+private void view_paint(Control c, rawptr st, cell.CellRect clip):
+    ^ViewState s = ViewPtr(st)
+    cell.CellRect r = rect(c)
+    i64 n = line_count(s)
+    i32 ch = grid.cell_h()
+    // A resize can leave the offset past the new maximum; clamp it here, where
+    // the rows are known, rather than showing blank space below the last line.
+    s.offset_px = clamp_scroll(s.offset_px, max_scroll_px(n, r.rows, ch))
+    i64 top = top_line(s.offset_px, ch)
+    s.last_top = top
+    // The view draws in the text colours of the edit's table: it is the same
+    // text, read-only.
+    EditTheme th = theme_edit()
+    i32 right = clip.col + clip.cols
+    grid.clip(clip)
+    defer grid.unclip()
+    for row in clip.row..<(clip.row + clip.rows):
+        i64 li = top + i64(row - r.row)
+        cell.CellRect band = cell.rect(clip.col, row, clip.cols, 1)
+        grid.fill(band, th.fg, th.bg)
+        if li < 0 || li >= n || s.line == nil:
+            continue
+        _ = grid.text(r.col, row, s.line(s.ctx, li), right - r.col, th.fg, th.bg)
+        s.lines_painted = s.lines_painted + 1
+
+private bool view_input(Control c, rawptr st, input.Event e):
+    ^ViewState s = ViewPtr(st)
+    f32 wheel = input.wheel_amount(e)
+    if wheel != 0.0:
+        _ = text_view_scroll_to(c, s.offset_px + wheel_scroll_px(wheel, grid.cell_h(), line_count(s) + 1))
+        return true
+    if !input.is_key_press(e):
+        return false
+    i64 page = i64(rect(c).rows) - 1
+    if page < 1:
+        page = 1
+    bool ctrl = (e.mods & u32(input.Modifier.Ctrl)) != 0 || (e.mods & u32(input.Modifier.Super)) != 0
+    i32 k = e.code
+    if k == i32(input.Keycode.Home) || (ctrl && k == i32(input.Keycode.Up)):
+        _ = text_view_scroll_to(c, 0)
+        return true
+    if k == i32(input.Keycode.End) || (ctrl && k == i32(input.Keycode.Down)):
+        _ = text_view_scroll_to(c, max_scroll_px(line_count(s), rect(c).rows, grid.cell_h()))
+        return true
+    if k == i32(input.Keycode.Down):
+        _ = text_view_scroll_lines(c, 1)
+        return true
+    if k == i32(input.Keycode.Up):
+        _ = text_view_scroll_lines(c, -1)
+        return true
+    if k == i32(input.Keycode.PageDown):
+        _ = text_view_scroll_lines(c, page)
+        return true
+    if k == i32(input.Keycode.PageUp):
+        _ = text_view_scroll_lines(c, 0 - page)
+        return true
+    return false

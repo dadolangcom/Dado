@@ -1,0 +1,507 @@
+// The Packages tab: every package under the working directory as a tree, the
+// one selected, and what it imports and what imports it.
+//
+// **The tree is the filesystem's**: a directory is a package when it holds a
+// `.dado` file, and a node is listed when it is a package or holds one below
+// it. It is walked once at start (and again on ctrl+r), never entering a
+// hidden directory, a symlink, `build`, `target` or `node_modules`, at most
+// `MAX_DEPTH` deep and `MAX_NODES` long — the repository's own tree is 779
+// directories and 316 packages, read in a few milliseconds.
+//
+// **What each package is comes from the compiler**: `dadoc --emit=packages`
+// on the selected directory says its declared name, how many files and
+// `@test` files it has, whether it is a program (`main`), tests or a library,
+// and whether it checks clean. It is asked when a package is selected and
+// remembered, so the tree fills in as it is browsed.
+//
+// **Imports and dependents** are read from the `import` lines of each
+// package's files, resolved the way the compiler resolves them — a
+// `<collection>:` prefix against the collections, anything else relative to
+// the importing directory — because `--emit=packages` reports neither. The
+// whole tree is indexed in slices of `INDEX_SLICE_MS` between frames, so the
+// dependents of the first package selected may say "indexing" for a moment.
+package dashboard
+
+import tui "vendor:tui"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+private const i32 MAX_NODES = 2000
+private const i32 MAX_DEPTH = 10
+private const i32 MAX_DIRS = 20000
+private const f64 INDEX_SLICE_MS = 3.0
+
+private ref []char8 g_paths              // every node's path, relative to the working directory
+private ref []char8 g_names              // each package's declared name, once known
+private ref []char8 g_imports            // per node: `written<TAB>resolved` lines
+
+private [MAX_NODES]i32 n_off
+private [MAX_NODES]i32 n_len
+private [MAX_NODES]i32 n_depth
+private [MAX_NODES]i32 n_files
+private [MAX_NODES]i32 n_tests           // -1 until the compiler says
+private [MAX_NODES]i32 n_entry           // -1 unknown, 0 library, 1 program, 2 tests
+private [MAX_NODES]i32 n_status          // -1 unknown, 0 clean, 1 errors
+private [MAX_NODES]i32 n_name_off
+private [MAX_NODES]i32 n_name_len
+private [MAX_NODES]i32 n_imp_off
+private [MAX_NODES]i32 n_imp_len
+private [MAX_NODES]bool n_pkg
+private [MAX_NODES]bool n_kids
+private [MAX_NODES]bool n_open
+private [MAX_NODES]bool n_indexed
+
+private i32 g_nodes
+private i32 g_dirs_seen
+private bool g_tree_known
+private bool g_tree_cut                  // a limit was reached
+private f64 g_walk_ms
+
+private i32 g_pkg_row                    // the cursor, an index into the visible rows
+private i32 g_selected = 0 - 1           // the selected node
+private ref []char8 g_wanted_package     // the settings' package, until the tree has it
+private ref []char8 g_filter
+private i32 g_index_at                   // the next node to index
+
+private i32 node_count(): return g_nodes
+private bool node_is_package(i32 i): return i >= 0 && i < g_nodes && n_pkg[i]
+private i32 node_depth(i32 i): return n_depth[i]
+
+private string8 node_path(i32 i):
+    if i < 0 || i >= g_nodes: return ""
+    string8 all = g_paths
+    return all[n_off[i]..<n_off[i] + n_len[i]]
+
+private string8 node_name(i32 i):
+    if i < 0 || i >= g_nodes || n_name_len[i] == 0: return last_part(node_path(i))
+    string8 all = g_names
+    return all[n_name_off[i]..<n_name_off[i] + n_name_len[i]]
+
+private string8 node_imports(i32 i):
+    if i < 0 || i >= g_nodes || !n_indexed[i]: return ""
+    string8 all = g_imports
+    return all[n_imp_off[i]..<n_imp_off[i] + n_imp_len[i]]
+
+// The selected package's path, as the Build tab hands it to `dado`: "" when
+// nothing is selected, "." for the working directory itself.
+private string8 selected_package():
+    if !node_is_package(g_selected): return ""
+    return node_path(g_selected)
+
+// ── the walk ───────────────────────────────────────────────────────────────
+
+private void walk_tree():
+    f64 began = tui.clock()
+    g_paths = own(g_paths, "")
+    g_names = own(g_names, "")
+    g_imports = own(g_imports, "")
+    g_nodes = 0
+    g_dirs_seen = 0
+    g_tree_cut = false
+    g_selected = 0 - 1
+    g_pkg_row = 0
+    g_index_at = 0
+    _ = scan(".", 0)
+    if g_nodes > 0: n_open[0] = true
+    g_tree_known = true
+    g_walk_ms = (tui.clock() - began) * 1000.0
+    choose_initial()
+
+// The working directory's package when it is one, else the package the
+// settings remember, else the first program in the tree, else the first
+// package.
+private void choose_initial():
+    if g_nodes == 0: return
+    string8 want = txt(g_wanted_package)
+    if n_pkg[0] && blank(want):
+        select_node(0)
+        return
+    if #len(want) > 0:
+        for i in 0..<g_nodes:
+            if n_pkg[i] && node_path(i) == want:
+                select_node(i)
+                return
+    for i in 0..<g_nodes:
+        if n_pkg[i]:
+            select_node(i)
+            return
+
+// The package the settings remember, selected once they have been read —
+// unless the working directory is a package, which wins.
+private void apply_wanted_package():
+    string8 want = txt(g_wanted_package)
+    if #len(want) == 0 || g_nodes == 0 || n_pkg[0]: return
+    i32 i = node_at_path(want)
+    if i >= 0 && n_pkg[i]: select_node(i)
+
+private bool skipped(string8 name):
+    return name == "build" || name == "target" || name == "node_modules" || fs.hidden(name)
+
+// Walk `rel`, adding it and what it holds; false when nothing in it was kept.
+private bool scan(string8 rel, i32 depth):
+    if g_nodes >= MAX_NODES || g_dirs_seen >= MAX_DIRS:
+        g_tree_cut = true
+        return false
+    g_dirs_seen = g_dirs_seen + 1
+    ref []char8 abs = path.join(txt(g_cwd), rel) if rel != "." else own(nil, txt(g_cwd))
+    defer #delete(abs)
+    ref []char8 ac = strings.clone_to_cstring(txt(abs), #heap)
+    defer #delete(ac)
+    ^fs.Dir d = fs.open(cstring(ac))
+    if !fs.opened(d): return false
+
+    // The subdirectories' names, copied out (`next` reuses its buffer) and
+    // sorted, so the tree reads the same on every system.
+    ref []char8 blob = #make([]char8, 0, #heap)
+    defer #delete(blob)
+    [512]i32 off
+    [512]i32 len
+    i32 nsub = 0
+    i32 files = 0
+    for:
+        (cstring cname, bool more) = fs.next(d)
+        if !more: break
+        string8 name = string8(cname)
+        if skipped(name): continue
+        if strings.ends_with(name, ".dado"):
+            files = files + 1
+            continue
+        if nsub >= 512: continue
+        ref []char8 child = path.join(txt(abs), name)
+        ref []char8 cc = strings.clone_to_cstring(txt(child), #heap)
+        bool dir = fs.is_dir(cstring(cc)) && !fs.is_symlink(cstring(cc))
+        #delete(cc)
+        #delete(child)
+        if !dir: continue
+        off[nsub] = i32(#len(blob))
+        for c in name: _ = #append(blob, c)
+        len[nsub] = i32(#len(name))
+        nsub = nsub + 1
+    fs.close(d)
+    string8 names = blob
+    for i in 1..<nsub:
+        i32 k = i
+        for k > 0 && strings.before(names[off[k]..<off[k] + len[k]], names[off[k - 1]..<off[k - 1] + len[k - 1]]):
+            i32 to = off[k]
+            off[k] = off[k - 1]
+            off[k - 1] = to
+            i32 tl = len[k]
+            len[k] = len[k - 1]
+            len[k - 1] = tl
+            k = k - 1
+
+    i32 me = add_node(rel, depth, files)
+    if me < 0: return false
+    bool any = false
+    if depth < MAX_DEPTH:
+        for i in 0..<nsub:
+            string8 name = names[off[i]..<off[i] + len[i]]
+            ref []char8 child_rel = path.join(rel, name) if rel != "." else own(nil, name)
+            if scan(txt(child_rel), depth + 1): any = true
+            #delete(child_rel)
+    n_kids[me] = any
+    if files == 0 && !any:
+        g_nodes = me
+        return false
+    return true
+
+private i32 add_node(string8 rel, i32 depth, i32 files):
+    if g_nodes >= MAX_NODES: return 0 - 1
+    i32 i = g_nodes
+    n_off[i] = i32(#len(g_paths))
+    for c in rel: _ = #append(g_paths, c)
+    n_len[i] = i32(#len(rel))
+    n_depth[i] = depth
+    n_files[i] = files
+    n_pkg[i] = files > 0
+    n_kids[i] = false
+    n_open[i] = false
+    n_tests[i] = 0 - 1
+    n_entry[i] = 0 - 1
+    n_status[i] = 0 - 1
+    n_name_len[i] = 0
+    n_imp_len[i] = 0
+    n_indexed[i] = false
+    g_nodes = g_nodes + 1
+    return i
+
+private i32 node_at_path(string8 p):
+    for i in 0..<g_nodes:
+        if node_path(i) == p: return i
+    return 0 - 1
+
+// Select node `i`: it becomes what the Build tab acts on, its ancestors are
+// opened so it is on screen, and the compiler is asked what it is.
+private void select_node(i32 i):
+    if i < 0 || i >= g_nodes: return
+    g_selected = i
+    i32 d = n_depth[i]
+    for k in 0..<i:
+        i32 j = i - 1 - k
+        if n_depth[j] < d:
+            n_open[j] = true
+            d = n_depth[j]
+    if n_pkg[i] && n_entry[i] < 0: want_packages(node_path(i))
+
+// ── what the compiler says ─────────────────────────────────────────────────
+
+private void packages_answered(string8 about, string8 text, bool ok):
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        if strings.starts_with(l, "package\t"):
+            string8 dir = field(l, 1)
+            if strings.starts_with(dir, "./"): dir = strings.rest(dir, 2)
+            else if strings.starts_with(dir, ".\\"): dir = strings.rest(dir, 2)
+            i32 i = node_at_path(dir)
+            if i >= 0:
+                string8 name = field(l, 2)
+                n_name_off[i] = i32(#len(g_names))
+                for c in name: _ = #append(g_names, c)
+                n_name_len[i] = i32(#len(name))
+                (i64 f, bool fok) = number(field(l, 3))
+                if fok: n_files[i] = i32(f)
+                (i64 t, bool tok) = number(field(l, 4))
+                if tok: n_tests[i] = i32(t)
+                string8 e = field(l, 5)
+                n_entry[i] = 1 if e == "main" else (2 if e == "test" else 0)
+                n_status[i] = 0 if field(l, 6) == "ok" else 1
+        if !more: break
+        rest = tail
+
+// ── imports ────────────────────────────────────────────────────────────────
+
+private void index_restart():
+    g_index_at = 0
+    for i in 0..<g_nodes: n_indexed[i] = false
+
+private bool index_done(): return g_index_at >= g_nodes
+
+// Index packages until the slice's time is spent.
+private void index_some():
+    if !g_tree_known || !g_where_known: return
+    if g_index_at >= g_nodes: return
+    f64 began = tui.clock()
+    for g_index_at < g_nodes:
+        i32 i = g_index_at
+        g_index_at = g_index_at + 1
+        if n_pkg[i]: index_node(i)
+        if (tui.clock() - began) * 1000.0 > INDEX_SLICE_MS: break
+    if g_index_at >= g_nodes: tui.wake()
+
+private void index_node(i32 i):
+    string8 rel = node_path(i)
+    ref []char8 dir = path.join(txt(g_cwd), rel) if rel != "." else own(nil, txt(g_cwd))
+    defer #delete(dir)
+    ref []char8 dc = strings.clone_to_cstring(txt(dir), #heap)
+    defer #delete(dc)
+    ^fs.Dir d = fs.open(cstring(dc))
+    if !fs.opened(d): return
+    ref []char8 found = #make([]char8, 0, #heap)
+    defer #delete(found)
+    for:
+        (cstring cname, bool more) = fs.next(d)
+        if !more: break
+        string8 name = string8(cname)
+        if !strings.ends_with(name, ".dado") || fs.hidden(name): continue
+        ref []char8 file = path.join(txt(dir), name)
+        ref []char8 text = read_owned(txt(file))
+        #delete(file)
+        if text == nil: continue
+        imports_of(txt(text), txt(dir), &found)
+        #delete(text)
+    fs.close(d)
+    n_imp_off[i] = i32(#len(g_imports))
+    for c in txt(found): _ = #append(g_imports, c)
+    n_imp_len[i] = i32(#len(found))
+    n_indexed[i] = true
+
+// Append `written<TAB>resolved` for each import of `text` not already in
+// `into`.
+private void imports_of(string8 text, string8 dir, ^ref []char8 into):
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        string8 t = strings.trim(l)
+        if strings.starts_with(t, "import "):
+            (string8 _, string8 q, bool open) = strings.split_first(t, "\"")
+            (string8 written, string8 _, bool closed) = strings.split_first(q, "\"")
+            if open && closed && #len(written) > 0:
+                string8 resolved = resolve_import(written, dir)
+                string8 entry = #format(written, "\t", resolved, "\n", tui.mem)
+                if !strings.contains(txt(into^), entry):
+                    for c in entry: _ = #append(into^, c)
+        if !more: break
+        rest = tail
+
+// Where `import "<written>"` in a file of `dir` lands, relative to the working
+// directory when it is under it, else absolute.
+private string8 resolve_import(string8 written, string8 dir):
+    ref []char8 abs = nil
+    (string8 head, string8 tail, bool colon) = strings.split_first(written, ":")
+    if colon && !strings.contains(head, "/") && filled(txt(g_collections)):
+        abs = path.join(txt(g_collections), head, tail)
+    else:
+        abs = path.join(dir, written)
+    defer #delete(abs)
+    try ref []char8 rel = path.rel(txt(g_cwd), txt(abs)) else:
+        string8 a = #format(txt(abs), tui.mem)
+        return a
+    defer #delete(rel)
+    if strings.starts_with(txt(rel), ".."):
+        string8 b = #format(txt(abs), tui.mem)
+        return b
+    string8 c = #format(txt(rel), tui.mem)
+    return c
+
+// ── the tab ────────────────────────────────────────────────────────────────
+
+// The nodes on screen, in order: every node whose ancestors are all open, or
+// with a filter, every package whose path holds it.
+private [MAX_NODES]i32 g_visible
+private i32 g_nvisible
+
+private void compute_visible():
+    g_nvisible = 0
+    string8 want = tui.edited(g_filter)
+    if #len(want) > 0:
+        for i in 0..<g_nodes:
+            if n_pkg[i] && strings.contains(node_path(i), want):
+                g_visible[g_nvisible] = i
+                g_nvisible = g_nvisible + 1
+        return
+    i32 hide_below = 0 - 1
+    for i in 0..<g_nodes:
+        if hide_below >= 0:
+            if n_depth[i] > hide_below: continue
+            hide_below = 0 - 1
+        g_visible[g_nvisible] = i
+        g_nvisible = g_nvisible + 1
+        if !n_open[i] && n_kids[i]: hide_below = n_depth[i]
+
+private string8 row_text(i32 i, bool flat):
+    ref []char8 run = #make([]char8, 0, tui.mem)
+    if run == nil: return ""
+    if !flat:
+        for k in 0..<n_depth[i]:
+            _ = #append(run, ' ')
+            _ = #append(run, ' ')
+        string8 mark = "  "
+        if n_kids[i]: mark = "▾ " if n_open[i] else "▸ "
+        for c in mark: _ = #append(run, c)
+        string8 label = last_part(node_path(i))
+        if i == 0: label = #format(last_part(txt(g_cwd)), " (here)", tui.mem)
+        for c in label: _ = #append(run, c)
+    else:
+        for c in node_path(i): _ = #append(run, c)
+    if n_pkg[i]:
+        string8 kind = ""
+        if n_entry[i] == 1: kind = "  program"
+        else if n_entry[i] == 2: kind = "  tests"
+        else if n_entry[i] == 0: kind = "  library"
+        for c in kind: _ = #append(run, c)
+        if n_status[i] == 1:
+            for c in "  ✗": _ = #append(run, c)
+    else if !n_kids[i]:
+        pass
+    string8 s = run
+    return s
+
+private void packages_tab():
+    compute_visible()
+    // Keep the cursor on the selected node across a filter or a fold.
+    for r in 0..<g_nvisible:
+        if g_visible[r] == g_selected: g_pkg_row = r
+    for tui.row(height: tui.REST, gap: 1, tag: "pk"):
+        package_tree()
+        package_detail()
+
+// A helper of its own because its body returns early (see toolchain_info).
+private void package_tree():
+    bool flat = filled(tui.edited(g_filter))
+    if tui.panel(title: "Packages", width: tui.pct(50), height: tui.REST, pad: 1):
+        defer tui.end()
+        _ = tui.line_edit(label: "filter", buf: &g_filter, placeholder: "part of a path")
+        if !g_tree_known:
+            tui.muted("reading the tree…")
+            return
+        if g_nodes == 0:
+            _ = tui.paragraph(s: "No package here or below. Home (1) says how to start one.", color: tui.now().subtext)
+            return
+        ref []string8 rows = #make([]string8, 0, tui.mem)
+        for r in 0..<g_nvisible:
+            _ = #append(rows, row_text(g_visible[r], flat))
+        i32 was = g_pkg_row
+        bool activated = tui.list(selected: &g_pkg_row, items: rows[:], height: tui.REST, tag: "tree")
+        bool foc = tui.focused()
+        if g_nvisible == 0: return
+        if g_pkg_row >= g_nvisible: g_pkg_row = g_nvisible - 1
+        i32 at = g_visible[g_pkg_row]
+        if g_pkg_row != was || at != g_selected: select_node(at)
+        if foc && tui.key("right") && n_kids[at]: n_open[at] = true
+        if foc && tui.key("left"):
+            if n_open[at] && n_kids[at]: n_open[at] = false
+            else: select_parent(at)
+        if activated:
+            if n_kids[at] && !n_pkg[at]: n_open[at] = !n_open[at]
+            else if n_pkg[at]: g_tab = TAB_BUILD
+        if g_tree_cut: tui.text(s: "the tree was cut short at its limits", color: tui.now().warn)
+
+private void select_parent(i32 at):
+    i32 d = n_depth[at]
+    for k in 0..<at:
+        i32 j = at - 1 - k
+        if n_depth[j] < d:
+            select_node(j)
+            return
+
+private void package_detail():
+    i32 i = g_selected
+    if tui.panel(title: "Selected", height: tui.REST, pad: 1):
+        defer tui.end()
+        if i < 0 || i >= g_nodes:
+            tui.muted("nothing selected")
+            return
+        kv_path("path", node_path(i))
+        if !n_pkg[i]:
+            _ = tui.paragraph(s: "A directory holding packages, not one itself: right or enter opens it.", color: tui.now().subtext)
+            return
+        tui.kv_text("package", node_name(i))
+        if n_tests[i] >= 0: tui.kv_text("files", #format(n_files[i], " + ", n_tests[i], " @test", tui.mem))
+        else: tui.kv_text("files", #format(n_files[i], tui.mem))
+        if n_entry[i] < 0: tui.kv_text("kind", "asking dadoc…" if querying(Q_PACKAGES) else "unknown")
+        else: tui.kv_text("kind", entry_word(entry_name(n_entry[i])))
+        if n_status[i] == 0: tui.kv_text("checks", "clean")
+        else if n_status[i] == 1: tui.kv_text("checks", "errors: Diagnostics (4)")
+        tui.rule("imports")
+        if !n_indexed[i]:
+            tui.muted("indexing…")
+        else:
+            string8 imps = node_imports(i)
+            if #len(imps) == 0: tui.muted("none")
+            string8 rest = imps
+            for #len(rest) > 0:
+                (string8 l, string8 tail, bool more) = strings.line(rest)
+                if #len(l) > 0: tui.text(s: field(l, 0), color: tui.now().text)
+                if !more: break
+                rest = tail
+        tui.rule("imported by")
+        if !index_done():
+            tui.muted(#format("indexing… ", g_index_at, " of ", g_nodes, tui.mem))
+            return
+        i32 n = 0
+        string8 me = node_path(i)
+        string8 needle = #format("\t", me, "\n", tui.mem)
+        for j in 0..<g_nodes:
+            if j == i || !n_indexed[j]: continue
+            if strings.contains(node_imports(j), needle):
+                if n < 12: tui.text(s: node_path(j), color: tui.now().text)
+                n = n + 1
+        if n == 0: tui.muted("nothing under this directory")
+        else if n > 12: tui.muted(#format("and ", n - 12, " more", tui.mem))
+
+private string8 entry_name(i32 e):
+    if e == 1: return "main"
+    if e == 2: return "test"
+    return "-"

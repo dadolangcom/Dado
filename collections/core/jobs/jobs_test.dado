@@ -1,0 +1,220 @@
+@test
+
+// core:jobs — the serial and pooled engines must produce identical results.
+// A parallel_for sums 0..N-1 by having each chunk atomically add its partial to
+// a shared total: if any chunk ran twice or zero times, or a range overlapped,
+// the total would be wrong. Then submit/wait, each job handing its result back
+// through a signal this thread drains. Run this under a thread sanitiser to
+// prove the pool itself is race-free.
+package jobs
+
+import "core:threads"
+
+// **The atomics here are the language's, as they are in the package under
+// test.** These two job bodies are the concurrent work — `sum_job` runs once
+// per chunk on every worker — so each access writes the ordering it wants
+// rather than taking `core:threads`' `#SEQ_CST`, and a test that went through
+// the wrappers would be exercising a path `jobs` does not have. The four
+// wrappers keep their own tests in `threads_test`: they are what a program that
+// holds a cell and not an ordering needs, and `jobs` not calling them is not a
+// reason to stop testing them.
+
+private Scheduler g_sched
+
+private type SumData:
+    ^i32 total,
+    i32  n,
+
+private type SumPtr: ^SumData
+
+// atomically add the sum of this chunk's indices to the shared total
+void sum_job(^JobArgs a):
+    i32 partial = 0
+    for i in a.begin..<a.end:
+        partial = partial + i
+
+    SumPtr dp = SumPtr(a.data)
+    SumData d = dp^
+
+    // Release, so a thread that later reads the total sees these writes; acquire,
+    // so this chunk sees the ones already folded in. The same pairing the batch
+    // counter's decrement uses, one level up.
+    _ = #atomic_fetch_add(d.total, partial, #ACQ_REL)
+
+// A job's result, handed back the way the header shows: emitted into a signal
+// sized for every job in flight, and drained by the thread that submitted.
+const i32 ASKS = 32
+
+#signal(32) job_answers(i32 ask, i32 answer)
+
+private i32 g_answers_lost = 0
+
+void answer_job(^JobArgs a):
+    SumPtr dp = SumPtr(a.data)
+    SumData d = dp^
+    try #emit(job_answers, d.n, d.n * d.n) else:
+        _ = #atomic_fetch_add(&g_answers_lost, 1, #RELAXED)
+
+// Submit ASKS jobs, wait for every handle, then drain: each ask answered once,
+// and correctly. The same code for either engine.
+private bool run_asks(^Scheduler s, string8 engine):
+    bool ok = true
+    [ASKS]SumData asks
+    [ASKS]Handle hs
+    i32 unused = 0
+    for i in 0..<ASKS:
+        asks[i] = (&unused, i)
+        hs[i] = submit(s, answer_job, rawptr(&asks[i]))
+    for i in 0..<ASKS:
+        wait(s, hs[i])
+    [ASKS]i32 seen
+    i32 wrong = 0
+    for ask, answer in #drain(job_answers):
+        if ask < 0 || ask >= ASKS || answer != ask * ask:
+            wrong += 1
+        else:
+            seen[ask] += 1
+    i32 missing = 0
+    for i in 0..<ASKS:
+        if seen[i] != 1:
+            missing += 1
+    ok = #expect(wrong == 0 && missing == 0, engine, ": ", wrong, " wrong answers, ", missing, " asks not answered exactly once") && ok
+    ok = #expect(#atomic_load(&g_answers_lost, #RELAXED) == 0, engine, ": a job saw its answer signal full") && ok
+    return ok
+
+// atomically store d.n into d.total (for the saturated-ring path)
+void store_job(^JobArgs a):
+    SumPtr dp = SumPtr(a.data)
+    SumData d = dp^
+    #atomic_store(d.total, d.n, #RELEASE)
+
+// The same sum, through a bare `#make` under `using a.scratch:` — the idiom
+// the contract names now that the ambient is per thread. Each chunk copies its
+// indices into a run from its worker's own arena and sums the run, so a chunk
+// that allocated from another worker's arena (or from a `using` on the
+// submitting thread) would race on that arena's cursor; a run that came back
+// short or nil adds a negative marker the total cannot hide.
+void scratch_sum_job(^JobArgs a):
+    i32 partial = 0
+    using a.scratch:
+        if #default.data != a.scratch.data:
+            partial = -1000000
+        ref []i32 run = #make([]i32, i64(a.end - a.begin))
+        if run == nil && a.end > a.begin:
+            partial = -1000000
+        else:
+            for i in a.begin..<a.end:
+                run[i64(i - a.begin)] = i
+            for x in run:
+                partial = partial + x
+    SumPtr dp = SumPtr(a.data)
+    SumData d = dp^
+    _ = #atomic_fetch_add(d.total, partial, #ACQ_REL)
+
+private i32 run_scratch_sum(^Scheduler s, i32 n):
+    i32 total = 0
+    SumData d = (&total, n)
+    parallel_for(s, n, 64, scratch_sum_job, rawptr(&d))
+    reset_scratch(s)
+    return #atomic_load(&total, #ACQUIRE)
+
+private i32 run_sum(^Scheduler s, i32 n):
+    i32 total = 0
+    SumData d = (&total, n)
+    parallel_for(s, n, 64, sum_job, rawptr(&d))
+    return #atomic_load(&total, #ACQUIRE)
+
+i32 test():
+    bool ok = true
+    const i32 N = 50000
+    i32 want = 0
+    for i in 0..<N:
+        want = want + i
+
+    // ── serial engine (0 workers) ──
+    ok = #expect(start(&g_sched, 0), "serial start") && ok
+    i32 serial = run_sum(&g_sched, N)
+    ok = #expect(serial == want, "serial sum ", serial, " want ", want) && ok
+    ok = run_asks(&g_sched, "serial") && ok
+    stop(&g_sched)
+
+    // ── pooled engine ──
+    i32 nt = threads.hardware_concurrency() - 1
+    if nt < 1:
+        nt = 1
+
+    ok = #expect(start(&g_sched, nt), "pool start (", nt, " workers)") && ok
+    i32 pooled = run_sum(&g_sched, N)
+    ok = #expect(pooled == want, "pool sum ", pooled, " want ", want) && ok
+    ok = #expect(pooled == serial, "pool == serial (identical results)") && ok
+
+    // a job's own `using` over its worker's scratch, bare `#make` inside it
+    i32 scratch_pooled = run_scratch_sum(&g_sched, N)
+    ok = #expect(scratch_pooled == want, "pool scratch sum ", scratch_pooled, " want ", want) && ok
+
+    // run it again to shake out queue-reuse / batch-slot recycling
+    i32 pooled2 = run_sum(&g_sched, N)
+    ok = #expect(pooled2 == want, "pool sum #2 ", pooled2) && ok
+
+    // ── submit + wait, results through a signal ──
+    ok = run_asks(&g_sched, "pooled") && ok
+
+    // ââ the batch ring is claimed, not taken ââââââââââââââââââââââ
+    //
+    // `alloc_batch` used to store its count into `hnext % HCAP` unconditionally,
+    // on the assumption that the ring is so much larger than the in-flight batch
+    // count that a slot is only ever reused long after it drained. `hnext` wraps
+    // every HCAP submissions and nothing holds it back, so the assumption is
+    // arithmetic the scheduler does not control — and when it fails, a live
+    // batch's count is overwritten and every thread waiting on it is waiting on
+    // a number that means something else.
+    //
+    // It is a compare-and-swap against zero now, and **this is the give-up arm
+    // that `tests/cases/atomics.dado` said belonged here.** That case writes one
+    // retry rather than a bounded loop and says why: with one thread a bounded
+    // loop's give-up arm is a line no run can reach. This one is reachable, by
+    // making every slot in the ring live — which no timing can be relied on to
+    // produce, so the test writes the state directly rather than racing for it.
+    // The pool above is stopped first. `start` re-initialises the queue and
+    // the batch ring without asking whether workers are still running, so a
+    // second `start` over a live pool raced its workers on `qcount` — reported
+    // by `--sanitize=thread`, and left the first pool's threads unjoined.
+    stop(&g_sched)
+    ok = #expect(start(&g_sched, 1), "start for the ring test") && ok
+    for i in 0..<HCAP:
+        g_sched.counters[i] = 1
+
+    ok = #expect(alloc_batch(&g_sched, 1) == NO_BATCH, "a full batch ring still handed out a slot") && ok
+
+    // And a submission into a saturated ring still **runs**, on the calling
+    // thread, and answers the handle that is already done — because it is.
+    // This is `push`'s answer to a full queue, one ring over: the fallback that
+    // makes progress, since running a job is what frees a slot.
+    i32 crowded = 0
+    SumData two = (&crowded, 7)
+    Handle full_h = submit(&g_sched, store_job, rawptr(&two))
+    ok = #expect(#atomic_load(&crowded, #ACQUIRE) == 7, "a submission into a full batch ring did not run: ", crowded) && ok
+    ok = #expect(i32(full_h) == SERIAL_DONE, "the handle from a full batch ring was not already done") && ok
+
+    // `parallel_for` takes the same road, and its fallback is also its barrier:
+    // the chunks ran on this thread, so they have finished by the time it
+    // returns and the total is exact.
+    i32 crowded_total = 0
+    SumData chunks = (&crowded_total, 0)
+    parallel_for(&g_sched, 100, 8, sum_job, rawptr(&chunks))
+    i32 want_100 = 0
+    for i in 0..<100:
+        want_100 = want_100 + i
+
+    ok = #expect(crowded_total == want_100, "parallel_for over a full batch ring summed ", crowded_total, " want ", want_100) && ok
+
+    // Put the ring back, so `stop` drains a scheduler in an ordinary state.
+    for i in 0..<HCAP:
+        g_sched.counters[i] = 0
+
+    stop(&g_sched)
+
+    if ok:
+        return 0
+
+    return 1

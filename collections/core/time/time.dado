@@ -1,0 +1,393 @@
+// core:time — measuring how long something took, and waiting.
+//
+//     import "core:time"
+//
+//     time.Instant started = time.instant()
+//     build()
+//     time.Duration took = time.elapsed(started)
+//     println("took ", time.as_milliseconds(took), "ms")
+//
+//     time.sleep(time.milliseconds(250))
+//
+// Two clocks, and the difference between them is the whole package. The
+// monotonic clock (`instant`, `now`) never goes backwards and has no meaningful
+// origin, so **only differences mean anything** — it is what you measure with.
+// The wall clock (`unix`, `unix_nanos`) can be set, stepped by NTP, and
+// printed — it is what you stamp with. Using the second to measure is the bug
+// this split exists to make hard to write.
+//
+// **Two surfaces, one clock each.** `Duration` and `Instant` are integers of
+// nanoseconds and are the surface to reach for: an interval adds, subtracts and
+// compares exactly, at any uptime, with no rounding. `now`, `since`, `ms_since`
+// and `nap` are the older `f64`-seconds surface, kept because other packages
+// call them, and they read the same clock.
+//
+// **What is not here yet**, and where it will go: calendar dates, formatting
+// and parsing a timestamp, time zones (UTC and the local offset, with no
+// time-zone database) and deadlines. Each is a function over `unix_nanos` or
+// over an `Instant` and a `Duration`, so it adds to this surface and changes
+// nothing above.
+//
+// **One arm per platform**, each written against that platform's own clock
+// API: POSIX's `clock_gettime` and `nanosleep`, Win32's
+// `QueryPerformanceCounter`, `GetSystemTimePreciseAsFileTime` and `Sleep`,
+// and the web runtime's host calls. Each arm supplies the same three private
+// primitives — `mono_ns`, `wall_ns` and `wait_ns` — and everything public is
+// written once, below the arms, over those three.
+//
+// **No `.c` beside this file.** There used to be one — `sysclock.c`, with
+// `sysclock.h` over it — and its stated reason was that `clock_gettime`,
+// `nanosleep` and `CLOCK_MONOTONIC` are POSIX rather than C99, so under a
+// strict `-std=` glibc declares none of them without a feature-test macro, and
+// a feature-test macro had to live in a `.c`. The first half is still true and
+// measured: with no macro, `-std=c11` gets `implicit declaration of function
+// 'clock_gettime'` and `'CLOCK_MONOTONIC' undeclared`. The second half is not:
+// a `define` clause on a `foreign` block is emitted above *every* `#include` in
+// the generated translation unit, which is exactly where a feature-test macro
+// has to be, because `<features.h>` fixes the whole feature set the first time
+// any header pulls it in. So the macro is written here and the sidecar is gone.
+package time
+
+// ── the web ─────────────────────────────────────────────────────────────────
+//
+// The two clocks are the host's: the monotonic one is `dado.now_ns()` —
+// `performance.now()`, which never goes backwards — and the wall clock is
+// `dado.wall_ns()`, `Date.now()`. Both reach the module as host calls the
+// compiler imports, through the runtime's `dado/web.h`, which is not a C header
+// but the runtime the compiler emits into a `#WEB` program. A wait sleeps on
+// the runtime's threads (`memory.atomic.wait32` with a timeout, on a word
+// nothing wakes) where the thread may wait — a worker of a `--web-threads`
+// module, or node's main thread — and elsewhere, a page's main thread or a
+// module with one thread, it spins on the clock: it stops the page while it
+// waits, as any long call does, so a page's frame loop yields instead.
+when #OS == #WEB:
+    private foreign "dado/web.h":
+        i64 dado_rt__web_now_ns()
+        i64 dado_rt__web_wall_ns()
+        void dado_rt__web_thread_sleep(i64 nanoseconds)
+
+    private i64 mono_ns():
+        return dado_rt__web_now_ns()
+
+    private i64 wall_ns():
+        return dado_rt__web_wall_ns()
+
+    // A wait here returns at its timeout or spins, so it never returns early.
+    private void wait_ns(i64 nanoseconds):
+        if nanoseconds <= 0: return
+        i64 until = dado_rt__web_now_ns() + nanoseconds
+        for:
+            i64 left = until - dado_rt__web_now_ns()
+            if left <= 0: return
+            dado_rt__web_thread_sleep(left)
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+//
+// Win32 through `<windows.h>`, as MinGW-w64 ships it — which is the header
+// `zig cc -target x86_64-windows-gnu` compiles against.
+//
+//   * **The monotonic clock is `QueryPerformanceCounter`**, in ticks of
+//     `QueryPerformanceFrequency` per second. Microsoft documents both as
+//     never failing on Windows XP and later, and the frequency as fixed at
+//     boot, so neither result is checked and the frequency is read with the
+//     counter rather than cached.
+//   * **The wall clock is `GetSystemTimePreciseAsFileTime`** (Windows 8 and
+//     later), a `FILETIME` of 100 ns intervals since 1601-01-01 UTC. The
+//     epochs are 11,644,473,600 seconds apart, which `FILETIME_TO_UNIX` holds
+//     in the file's own unit.
+//   * **A wait is `Sleep`**, which takes whole milliseconds and is quantised to
+//     the system timer's tick (15.6 ms unless a process asks for finer), so a
+//     wait is rounded **up** to the next millisecond and may overrun by a tick.
+//     It is not interrupted by anything a Dado program can send it, so unlike
+//     POSIX's it does not return early — and `sleep` checks the clock anyway.
+//
+// `LARGE_INTEGER` is a union in the header; it is restated by its one member
+// a program reads, `QuadPart`, which is at offset 0 and is the union's whole
+// width, so the emitter's layout assertions hold it honest exactly as they
+// would a struct. `DWORD` is `unsigned long`, which is 32 bits on Windows —
+// `#c.ulong` and never `u64` — and `BOOL` is `int`.
+//
+// `WIN32_LEAN_AND_MEAN` keeps `<windows.h>` to its core headers, which is all
+// this needs and keeps the rest of its macros out of the translation unit.
+else when #OS == #WINDOWS:
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        type LARGE_INTEGER: (#c.llong QuadPart)
+        type FILETIME: (#c.ulong dwLowDateTime, #c.ulong dwHighDateTime)
+
+        #c.int QueryPerformanceCounter(^LARGE_INTEGER count)
+        #c.int QueryPerformanceFrequency(^LARGE_INTEGER frequency)
+        void GetSystemTimePreciseAsFileTime(^FILETIME into)
+        void Sleep(#c.ulong milliseconds)
+
+    // The counter in nanoseconds. Whole seconds and the remainder are scaled
+    // apart, because `ticks * 1e9` overflows an `i64` after fifteen minutes of
+    // uptime at the common 10 MHz frequency; the remainder is below the
+    // frequency, so its product stays in range for any frequency under 9 GHz.
+    private i64 mono_ns():
+        LARGE_INTEGER ticks
+        LARGE_INTEGER frequency
+        _ = QueryPerformanceCounter(&ticks)
+        _ = QueryPerformanceFrequency(&frequency)
+        i64 count = i64(ticks.QuadPart)
+        i64 per_second = i64(frequency.QuadPart)
+        if per_second <= 0: return 0
+        i64 whole = count / per_second
+        i64 rest = count % per_second
+        return whole * NANOS_PER_SECOND_WHOLE + rest * NANOS_PER_SECOND_WHOLE / per_second
+
+    private i64 wall_ns():
+        FILETIME ft = (0, 0)
+        GetSystemTimePreciseAsFileTime(&ft)
+        i64 intervals = i64(ft.dwHighDateTime) * 4294967296 + i64(ft.dwLowDateTime)
+        return (intervals - FILETIME_TO_UNIX) * 100
+
+    // Rounded up to whole milliseconds, and split so that no single `Sleep`
+    // is handed `INFINITE` (0xFFFFFFFF), which would never return.
+    private void wait_ns(i64 nanoseconds):
+        if nanoseconds <= 0: return
+        i64 ms = (nanoseconds + NANOS_PER_MS - 1) / NANOS_PER_MS
+        for ms > 0:
+            i64 step = ms
+            if step > LONGEST_SLEEP_MS: step = LONGEST_SLEEP_MS
+            Sleep(#c.ulong(step))
+            ms = ms - step
+
+    // 100 ns intervals between 1601-01-01 and 1970-01-01, both UTC.
+    private const i64 FILETIME_TO_UNIX = 116444736000000000
+
+    // The longest wait handed to one `Sleep`: a day, far below `INFINITE`.
+    private const i64 LONGEST_SLEEP_MS = 86400000
+
+// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+else:
+    // **`TimeSpec=struct timespec` is what `define` is for.** POSIX declares a
+    // *tagged* struct and no typedef, and a `foreign` type emits under the name it
+    // was written with — so there is no spelling of `struct timespec` for Dado to
+    // use until a `define` gives it one. The same trick names `struct pollfd` in
+    // `drain`, and this is the second user of it.
+    //
+    // **`#c.long` on both members, and no `when #OS` is owed between Linux and
+    // macOS.** `time_t` and `tv_nsec` are both `long` on both, 64-bit on every
+    // ABI either ships (x86-64 and arm64 on each — 32-bit macOS ended at 10.15).
+    // Measured here under both gcc and clang: `sizeof(struct timespec)` 16,
+    // `tv_sec` at offset 0 width 8, `tv_nsec` at offset 8 width 8. The emitter
+    // writes a shadow struct and, per member, an `offsetof` **and** a `sizeof`
+    // assertion against the real one, so a wrong width is a build error naming
+    // the field rather than padding quietly absorbing it. That was checked by
+    // flipping `tv_sec` to `i32` and watching it fail: `sizeof` still matched
+    // (16 — the `i32` padded back up) and `offsetof` still matched, so the
+    // **only** assertion that fired was the per-member `sizeof`. **They were
+    // `i64`**, which is `long` on glibc and `long long` on Darwin: the same width
+    // and a different type, and the emitter also asserts each member's (and each
+    // function's) C type with `_Generic`, so an `i64` here is a build error at
+    // macOS that no Linux build can see. **Windows is where this stops being
+    // true** — `long` is 32 bits there and its `struct timespec` is a 64-bit
+    // `time_t` beside a 32-bit `long` — which is one reason Windows has an arm of
+    // its own above rather than this one.
+    //
+    // **`CLOCK_MONOTONIC` and `CLOCK_REALTIME` are `foreign const`s and not
+    // numbers written out.** `CLOCK_MONOTONIC` is 1 on Linux and 6 on Darwin, so
+    // a restated literal would be a silent wrong-clock on one of them; declared
+    // here, the C compiler resolves it and the per-OS difference never reaches
+    // Dado.
+    //
+    // **`time` is bound as `sys`** rather than declared bare, because this package
+    // is *called* `time` and a callee spelled `time(...)` inside it reads as the
+    // package. The emitted C is still the bare identifier. A binding covers the
+    // block's *type* too, which is why the restatement below refers to its own
+    // `TimeSpec` as `sys.TimeSpec`: inside a bound block the short name is not in
+    // scope, and the qualified one is what resolves.
+    private foreign sys "time.h" define "_POSIX_C_SOURCE=200809L" define "TimeSpec=struct timespec":
+        type TimeSpec:
+            #c.long tv_sec,
+            #c.long tv_nsec,
+
+        i32 nanosleep(^sys.TimeSpec request, ^sys.TimeSpec remaining)
+        #c.long time(^#c.long into)
+
+    // **`clockid_t` is `int` on glibc and an `enum` on Darwin**, and it needs an
+    // arm: the emitter asserts `clock_gettime`'s C type with `_Generic`, and an
+    // `int` parameter is not the type of an enum one. gcc and clang make an enum
+    // with no negative member compatible with `unsigned int`, so Darwin's
+    // restates it `#c.uint`. The constants are declared in each arm at the type
+    // its arm passes, so neither call converts.
+    when #OS == #DARWIN:
+        private foreign sys "time.h" define "_POSIX_C_SOURCE=200809L":
+            const #c.uint CLOCK_MONOTONIC
+            const #c.uint CLOCK_REALTIME
+            i32 clock_gettime(#c.uint clock_id, ^sys.TimeSpec into)
+    else:
+        private foreign sys "time.h" define "_POSIX_C_SOURCE=200809L":
+            const i32 CLOCK_MONOTONIC
+            const i32 CLOCK_REALTIME
+            i32 clock_gettime(i32 clock_id, ^sys.TimeSpec into)
+
+    // **The wall-clock fallback is kept and is a runtime check, not a
+    // compile-time one.** `CLOCK_MONOTONIC` is mandatory in POSIX.1-2008, so a
+    // platform without the name fails to compile, and a platform that has the
+    // name and refuses the clock at runtime falls back to wall time rather than
+    // to zero, so a duration is still a duration even where it can be
+    // perturbed.
+    private i64 mono_ns():
+        sys.TimeSpec ts = (0, 0)
+        if sys.clock_gettime(sys.CLOCK_MONOTONIC, &ts) == 0:
+            return i64(ts.tv_sec) * NANOS_PER_SECOND_WHOLE + i64(ts.tv_nsec)
+        return wall_ns()
+
+    // `CLOCK_REALTIME` is mandatory, and `time` is the answer of last resort
+    // for a platform that refuses it anyway.
+    private i64 wall_ns():
+        sys.TimeSpec ts = (0, 0)
+        if sys.clock_gettime(sys.CLOCK_REALTIME, &ts) == 0:
+            return i64(ts.tv_sec) * NANOS_PER_SECOND_WHOLE + i64(ts.tv_nsec)
+        return i64(sys.time(nil)) * NANOS_PER_SECOND_WHOLE
+
+    // One `nanosleep`. **It may return early**: a signal interrupts it, and
+    // this does not restart it — `sleep` is what restarts, by reading the
+    // monotonic clock and waiting again for whatever is left, which also covers
+    // a signal that arrives during the restart.
+    private void wait_ns(i64 nanoseconds):
+        if nanoseconds <= 0: return
+        sys.TimeSpec request = (#c.long(nanoseconds / NANOS_PER_SECOND_WHOLE), #c.long(nanoseconds % NANOS_PER_SECOND_WHOLE))
+        sys.nanosleep(&request, nil)
+
+// ── Duration ────────────────────────────────────────────────────────────────
+
+// An interval, in nanoseconds. `distinct`, so a `Duration` is not an `i64` a
+// caller can hand in by accident — a count of milliseconds reaching a function
+// that wanted nanoseconds is the bug — and it keeps the operators: two
+// `Duration`s add, subtract and compare, and `d * 3` scales. An `i64` of
+// nanoseconds spans 292 years either way, and may be negative: an interval
+// read backwards is a negative `Duration`, not a wrapped one.
+distinct type Duration: i64
+
+Duration nanoseconds(i64 n):
+    return Duration(n)
+
+Duration microseconds(i64 n):
+    return Duration(n * NANOS_PER_MICRO)
+
+Duration milliseconds(i64 n):
+    return Duration(n * NANOS_PER_MS)
+
+Duration seconds(i64 n):
+    return Duration(n * NANOS_PER_SECOND_WHOLE)
+
+// The interval as a count of each unit, truncated toward zero.
+i64 as_nanoseconds(Duration d):
+    return i64(d)
+
+i64 as_microseconds(Duration d):
+    return i64(d) / NANOS_PER_MICRO
+
+i64 as_milliseconds(Duration d):
+    return i64(d) / NANOS_PER_MS
+
+i64 as_seconds(Duration d):
+    return i64(d) / NANOS_PER_SECOND_WHOLE
+
+// The interval in seconds, with its fraction, for printing.
+f64 as_seconds_f64(Duration d):
+    return f64(i64(d)) / NANOS_PER_SECOND
+
+// ── Instant ─────────────────────────────────────────────────────────────────
+
+// A reading of the monotonic clock, in nanoseconds from an origin nobody
+// specifies. `distinct`, so it does not pass for a `Duration`: subtract two
+// with `between`, or measure from one with `elapsed`, and never read one.
+distinct type Instant: i64
+
+// The monotonic clock, now. Never earlier than a reading taken before it.
+Instant instant():
+    return Instant(mono_ns())
+
+// From `earlier` to `later`. Negative when the two were passed the wrong way
+// round, which is the caller's to notice.
+Duration between(Instant earlier, Instant later):
+    return Duration(i64(later) - i64(earlier))
+
+// How long since `started`.
+Duration elapsed(Instant started):
+    return between(started, instant())
+
+// `start` moved by `d` — a deadline, when `d` is a timeout.
+Instant add(Instant start, Duration d):
+    return Instant(i64(start) + i64(d))
+
+// ── waiting ─────────────────────────────────────────────────────────────────
+
+// Wait at least `d`. **Never returns early**: each platform's one wait may
+// (a signal ends POSIX's `nanosleep`; a clock's resolution can round any of
+// them), so this measures what is left on the monotonic clock after every wait
+// and waits again until nothing is. A zero or negative `d` returns at once. It
+// may overrun by a scheduler's quantum, and on Windows by a timer tick.
+void sleep(Duration d):
+    if i64(d) <= 0: return
+    Instant deadline = add(instant(), d)
+    for:
+        i64 left = i64(between(instant(), deadline))
+        if left <= 0: return
+        wait_ns(left)
+
+// ── the wall clock ──────────────────────────────────────────────────────────
+
+// Nanoseconds since the Unix epoch, 1970-01-01 UTC. Wall time — settable, and
+// the wrong clock to measure an interval with. An `i64` of these lasts until
+// the year 2262.
+i64 unix_nanos():
+    return wall_ns()
+
+// Whole seconds since the Unix epoch.
+i64 unix():
+    return wall_ns() / NANOS_PER_SECOND_WHOLE
+
+// ── the f64-seconds surface ─────────────────────────────────────────────────
+
+// Seconds on the monotonic clock. The origin is unspecified on purpose:
+// subtract two readings, never read one.
+f64 now():
+    return f64(mono_ns()) / NANOS_PER_SECOND
+
+// Wait `milliseconds`, once. **May return early on POSIX**, because a signal
+// interrupts the wait and this does not restart it: `sleep` is the one that
+// promises its whole duration. Named for what it does rather than for what it
+// promises. A non-positive count returns at once.
+void nap(i32 milliseconds):
+    if milliseconds <= 0: return
+    wait_ns(i64(milliseconds) * NANOS_PER_MS)
+
+// One second, in nanoseconds, as an `f64` — because a bare float literal has no
+// width and `now` needs this one as a divisor rather than as an argument.
+private const f64 NANOS_PER_SECOND = 1000000000.0
+
+// One second, a millisecond and a microsecond, in nanoseconds, as whole
+// numbers. Named rather than spelled inline so the factors cannot drift apart
+// between the arms.
+private const i64 NANOS_PER_SECOND_WHOLE = 1000000000
+private const i64 NANOS_PER_MS = 1000000
+private const i64 NANOS_PER_MICRO = 1000
+
+// Seconds since `started`, which is the only thing `now` is for.
+f64 since(f64 started):
+    return now() - started
+
+// Whole milliseconds since `started`, for a program counting frames rather
+// than integrating physics.
+//
+// **`i64`, and it was `i32`.** An `i32` of milliseconds runs out at 2^31 ms,
+// which is 24.85 days — and `now`'s origin is boot on Linux, so a `started`
+// read on a machine that has been up a month is already past it. The `i32`
+// answered `-2147483648` there while conversion was undefined, and would have
+// answered a frozen `2147483647` once it saturated: wrong either way, and wrong
+// on exactly the long-running process that measures a timeout. An `i64` of
+// milliseconds runs out after 292 million years.
+i64 ms_since(f64 started):
+    return ms_between(started, now())
+
+// `ms_since` with the second reading passed in, so the arithmetic can be tested
+// at an uptime no test can wait for. Truncates toward zero, like the `i32` it
+// replaces. A NaN reading gives 0 and an infinite one the `i64`'s end — the
+// conversion saturates — which is the right answer for a clock that returned
+// nonsense: bounded, and not a trap.
+private i64 ms_between(f64 started, f64 ended):
+    return i64((ended - started) * 1000.0)

@@ -1,0 +1,630 @@
+@test
+// The Windows arm against real children. The other test files here hold the
+// POSIX arm with `/bin/sh`, `cat` and signals, none of which Windows has, so
+// on Windows each of them is empty and the same claims are held here:
+//
+//   * **Windows' argument quoting round-trips.** An argv holding an empty
+//     string, spaces, tabs, quotes, backslash runs before a quote and at the
+//     end, and UTF-8 arrives in the child as itself — read back by the
+//     child's own `CommandLineToArgvW`, the parser the quoting is the inverse
+//     of, so the witness is Windows and not this package.
+//   * **Exit statuses, a missing program, and an ended child** are three
+//     different answers, and a missing program is told apart from an exit of
+//     127 wherever the type can say so (`spawn`, `duplex`).
+//   * **The shell form** runs a `cmd.exe` line with a quoted program path and
+//     a quoted argument — the line `_popen` gets wrong — in both directions.
+//   * **`drain` and `receive` come back before the child is done** and time
+//     out when it is quiet.
+//   * **`duplex`**: a megabyte through a child and back with neither side
+//     stuck, end-of-file by `close_input` with a second child alive (the
+//     handle list), the three stderr modes, a write to an exited child, and
+//     **`stop` ending the child's own child** (the job).
+//
+// The children are this test program run again: with `DADO_PROC_HELPER` set
+// in its environment, `test` reads its own command line and acts as the
+// helper its first argument names, so nothing here depends on a program
+// being installed.
+package proc
+
+import "core:io"
+import "core:strings"
+import "core:time"
+
+when #OS == #WINDOWS:
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        const #c.ulong SYNCHRONIZE
+        ^u16 GetCommandLineW()
+        type @incomplete @c("struct HINSTANCE__") ModuleInstance
+        #c.ulong GetModuleFileNameW(^ModuleInstance module, ^u16 into, #c.ulong size)
+        #c.int WideCharToMultiByte(#c.uint code_page, #c.ulong flags, ^const u16 from, #c.int from_count, ^#c.char into, #c.int into_count, cstring default_char, ^#c.int used_default)
+        #c.int SetEnvironmentVariableA(cstring name, cstring value)
+        rawptr OpenProcess(#c.ulong access, #c.int inherit, #c.ulong pid)
+        rawptr LocalFree(rawptr memory)
+
+    private foreign "shellapi.h" link "-lshell32":
+        ^^u16 CommandLineToArgvW(^const u16 line, ^#c.int count)
+
+    private foreign "stdlib.h":
+        cstring getenv(cstring name)
+
+    private const i64 MIB = 1048576
+
+    // The two pointer shapes this file converts to, named so the conversion
+    // is not read as a function type.
+    private type WideArgs: ^^u16
+    private type CChars: ^#c.char
+
+    private const cstring MISSING = "dado-no-such-program-zqx98765"
+
+    // This program's own path, as UTF-8, for running itself as a helper.
+    private [1024]char8 g_self
+
+    i32 test():
+        if getenv("DADO_PROC_HELPER") != nil: return helper()
+        _ = SetEnvironmentVariableA("DADO_PROC_HELPER", "1")
+        if !find_self():
+            _ = #expect(false, "could not find this program's own path")
+            return 1
+        bool ok = true
+        ok = quoting_rule() && ok
+        ok = quoting_round_trip() && ok
+        ok = exec_statuses() && ok
+        ok = shell_form() && ok
+        ok = draining() && ok
+        ok = megabyte_round_trip() && ok
+        ok = duplex_statuses() && ok
+        ok = write_after_exit() && ok
+        ok = eof_by_close_input() && ok
+        ok = two_children() && ok
+        ok = error_modes() && ok
+        ok = tree_is_stopped() && ok
+        ok = bad_handles() && ok
+        if ok: return 0
+        return 1
+
+    private cstring self():
+        return cstring(rawptr(&g_self[0]))
+
+    private bool find_self():
+        [1024]u16 wide
+        #c.ulong n = GetModuleFileNameW(nil, &wide[0], 1024)
+        if n == 0 || n >= 1024: return false
+        #c.int got = WideCharToMultiByte(CP_UTF8, 0, &wide[0], 0 - 1, CChars(rawptr(&g_self[0])), 1023, nil, nil)
+        return got > 0
+
+    // ── the helper ───────────────────────────────────────────────────────
+
+    private void say(rawptr handle, []char8 bytes):
+        if #len(bytes) == 0: return
+        #c.ulong wrote = 0
+        _ = WriteFile(handle, rawptr(&bytes[0]), #c.ulong(#len(bytes)), &wrote, nil)
+
+    private void say_text(rawptr handle, string8 text):
+        ref []char8 copy = #format(text, #heap)
+        say(handle, copy[:])
+        #delete(copy)
+
+    private i32 helper():
+        #c.int argc = 0
+        ^^u16 argv = CommandLineToArgvW(GetCommandLineW(), &argc)
+        if argv == nil || argc < 2: return 90
+        ref []char8 mode = narrow(arg_at(argv, i64(1)))
+        string8 m = mode
+        rawptr out = std_handle(STD_OUTPUT_HANDLE)
+        rawptr err = std_handle(STD_ERROR_HANDLE)
+        i32 answer = 0
+        if m == "args":
+            for i in 2..<i64(argc):
+                ref []char8 one = narrow(arg_at(argv, i64(i)))
+                say_text(out, "[")
+                say(out, one[:])
+                say_text(out, "]\n")
+                #delete(one)
+        else if m == "exit":
+            ref []char8 code = narrow(arg_at(argv, i64(2)))
+            string8 c = code
+            answer = 0
+            for ch in c:
+                answer = answer * 10 + i32(ch) - 48
+            #delete(code)
+        else if m == "cat" || m == "save":
+            rawptr into = out
+            if m == "save":
+                ref []char8 path = narrow(arg_at(argv, i64(2)))
+                ref []u16 wide = widen(cstring(rawptr(&path[0])))
+                into = CreateFileW(&wide[0], GENERIC_WRITE, 0, nil, 2, 0, nil)
+                #delete(wide)
+                #delete(path)
+            rawptr from = std_handle(STD_INPUT_HANDLE)
+            [8192]char8 chunk
+            for:
+                #c.ulong got = 0
+                if ReadFile(from, rawptr(&chunk[0]), 8192, &got, nil) == 0 || got == 0: break
+                say(into, chunk[0..<i64(got)])
+            if m == "save": close_handle(into)
+        else if m == "both":
+            say_text(out, "out")
+            say_text(err, "err")
+        else if m == "pause":
+            say_text(out, "alpha\nbeta\n")
+            Sleep(250)
+            say_text(out, "gamma\n")
+        else if m == "sleep":
+            Sleep(30000)
+        else if m == "tree":
+            // A child of its own, its pid on stdout, and then a long sleep:
+            // `tree_is_stopped` ends this one and asks after that one.
+            [2]cstring grand
+            grand[0] = self_again()
+            grand[1] = "sleep"
+            Duplex g = duplex(grand[:], ERRORS_INHERIT)
+            ref []char8 line = #format(g.pid, "\n", #heap)
+            say(out, line[:])
+            #delete(line)
+            Sleep(30000)
+        else:
+            answer = 91
+        #delete(mode)
+        _ = LocalFree(rawptr(argv))
+        return answer
+
+    // The helper's own path, for a helper starting a helper.
+    private cstring self_again():
+        _ = find_self()
+        return self()
+
+    // Element `i` of the array `CommandLineToArgvW` answers, which C indexes
+    // and Dado reaches by address.
+    private ^u16 arg_at(^^u16 argv, i64 i):
+        #c.uintptr_t at = #c.uintptr_t(rawptr(argv)) + #c.uintptr_t(u64(i) * #size(rawptr))
+        return WideArgs(rawptr(at))^
+
+    private ref []char8 narrow(^u16 wide):
+        #c.int need = WideCharToMultiByte(CP_UTF8, 0, wide, 0 - 1, nil, 0, nil, nil)
+        if need <= 0: return #make([]char8, 0, #heap)
+        ref []char8 bytes = #make([]char8, i64(need), #heap)
+        _ = WideCharToMultiByte(CP_UTF8, 0, wide, 0 - 1, CChars(rawptr(&bytes[0])), need, nil, nil)
+        #truncate(bytes, i64(need) - 1)
+        return bytes
+
+    // ── quoting ──────────────────────────────────────────────────────────
+
+    private bool quoted_as([]cstring argv, string8 want):
+        ref []char8 line = command_line_utf8(argv)
+        string8 got = line
+        bool ok = #expect(got == want, "quoted to [", got, "], not [", want, "]")
+        #delete(line)
+        return ok
+
+    // The rule itself, case by case, so a failure names the case.
+    private bool quoting_rule():
+        bool ok = true
+        [2]cstring a
+        a[0] = "prog"
+        a[1] = "plain"
+        ok = quoted_as(a[:], "prog plain") && ok
+        a[1] = ""
+        ok = quoted_as(a[:], "prog \"\"") && ok
+        a[1] = "a b"
+        ok = quoted_as(a[:], "prog \"a b\"") && ok
+        a[1] = "say \"hi\""
+        ok = quoted_as(a[:], "prog \"say \\\"hi\\\"\"") && ok
+        a[1] = "trail\\"
+        ok = quoted_as(a[:], "prog trail\\") && ok
+        a[1] = "sp trail\\"
+        ok = quoted_as(a[:], "prog \"sp trail\\\\\"") && ok
+        a[1] = "a\\\\\"b"
+        ok = quoted_as(a[:], "prog \"a\\\\\\\\\\\"b\"") && ok
+        a[1] = "C:\\dir\\file"
+        ok = quoted_as(a[:], "prog C:\\dir\\file") && ok
+        a[0] = "C:\\Program Files\\x.exe"
+        a[1] = "1"
+        ok = quoted_as(a[:], "\"C:\\Program Files\\x.exe\" 1") && ok
+        a[0] = "bad\"name"
+        ok = quoted_as(a[:], "") && ok
+        return ok
+
+    // The same arguments through a real child and its own parser.
+    private bool quoting_round_trip():
+        bool ok = true
+        [14]cstring argv
+        argv[0] = self()
+        argv[1] = "args"
+        argv[2] = ""
+        argv[3] = "two words"
+        argv[4] = "tab\there"
+        argv[5] = "\"quoted\""
+        argv[6] = "inner\"quote"
+        argv[7] = "trail\\"
+        argv[8] = "spaced trail\\"
+        argv[9] = "two\\\\"
+        argv[10] = "slashes\\\\\"quote"
+        argv[11] = "\\\\server\\share\\"
+        argv[12] = "caf\xc3\xa9 \xe2\x82\xac"
+        argv[13] = "\""
+        Child c = spawn(argv[:])
+        if !#expect(spawned(c), "the args helper did not start"): return false
+        i32 lines = 0
+        for:
+            (cstring line, bool got) = io.read_line(c.stream)
+            if !got: break
+            i64 at = i64(lines) + 2
+            if at < 14:
+                ref []char8 want = #format("[", string8(argv[at]), "]", #heap)
+                string8 w = want
+                string8 seen = strings.borrow_from_cstring(line)
+                ok = #expect(seen == w, "argument ", at, " came back as ", seen, ", not ", w) && ok
+                #delete(want)
+            lines += 1
+        (bool exited, i32 status) = wait(c)
+        ok = #expect(lines == 12, "the helper saw ", lines, " arguments, not 12") && ok
+        ok = #expect(exited && status == 0, "the args helper gave exited=", exited, " status=", status) && ok
+        return ok
+
+    // ── statuses ─────────────────────────────────────────────────────────
+
+    private bool exec_statuses():
+        bool ok = true
+        [3]cstring argv
+        argv[0] = self()
+        argv[1] = "exit"
+        argv[2] = "3"
+        (bool e3, i32 s3) = exec(argv[:])
+        ok = #expect(e3 && s3 == 3, "exit 3 gave exited=", e3, " status=", s3) && ok
+        argv[2] = "127"
+        (bool e127, i32 s127) = exec(argv[:])
+        ok = #expect(e127 && s127 == 127, "exit 127 gave exited=", e127, " status=", s127) && ok
+
+        // A missing program: 127 from `exec`, as on POSIX; a `Child` that
+        // did not start from `spawn`, which an exit of 127 never is.
+        argv[0] = MISSING
+        (bool em, i32 sm) = exec(argv[:])
+        ok = #expect(em && sm == 127, "a missing program gave exited=", em, " status=", sm) && ok
+        Child none = spawn(argv[:])
+        ok = #expect(!spawned(none), "a missing program was spawned") && ok
+        (bool ne, i32 ns) = wait(none)
+        ok = #expect(!ne && ns == 0 - 1, "waiting on nothing gave exited=", ne, " status=", ns) && ok
+
+        [3]cstring holed
+        holed[0] = self()
+        holed[1] = nil
+        holed[2] = "x"
+        (bool he, i32 hs) = exec(holed[:])
+        ok = #expect(!he && hs == 0 - 1, "a nil inside argv gave exited=", he, " status=", hs) && ok
+        return ok
+
+    // ── the shell form ───────────────────────────────────────────────────
+
+    private bool shell_form():
+        bool ok = true
+        ^io.FILE hello = read("echo hello")
+        ok = #expect(opened(hello), "read(echo hello) did not open") && ok
+        (cstring line, bool got) = io.read_line(hello)
+        string8 said = strings.borrow_from_cstring(line)
+        ok = #expect(got && said == "hello", "echo said [", said, "]") && ok
+        (bool he, i32 hs) = close(hello)
+        ok = #expect(he && hs == 0, "echo closed with exited=", he, " status=", hs) && ok
+
+        ^io.FILE three = read("exit 3")
+        (bool te, i32 ts) = close(three)
+        ok = #expect(te && ts == 3, "exit 3 closed with exited=", te, " status=", ts) && ok
+
+        ^io.FILE absent = read("dado_core_proc_test_no_such_command_9c1f 2>NUL")
+        ok = #expect(opened(absent), "a pipe for a missing command did not open") && ok
+        (bool ae, i32 as2) = close(absent)
+        ok = #expect(ae && as2 == 9009, "a missing command closed with exited=", ae, " status=", as2) && ok
+
+        (bool re, i32 rs) = run("exit 7")
+        ok = #expect(re && rs == 7, "run(exit 7) gave exited=", re, " status=", rs) && ok
+
+        // A quoted program path and a quoted argument with a space in it: the
+        // line `cmd.exe /c` without `/s` strips the wrong quotes from.
+        ref []char8 line_w = #format("\"", string8(self()), "\" save \"dado proc test.txt\"", char8(0), #heap)
+        ^io.FILE sink = write(cstring(rawptr(&line_w[0])))
+        ok = #expect(opened(sink), "a pipe for writing did not open") && ok
+        _ = io.write(sink, "written through a pipe\n")
+        (bool we, i32 ws) = close(sink)
+        ok = #expect(we && ws == 0, "the writing command gave exited=", we, " status=", ws) && ok
+        #delete(line_w)
+        ^io.FILE back = io.open_read("dado proc test.txt")
+        ok = #expect(io.opened(back), "the file the pipe wrote was not there") && ok
+        if io.opened(back):
+            (cstring wl, bool wg) = io.read_line(back)
+            string8 ws2 = strings.borrow_from_cstring(wl)
+            ok = #expect(wg && ws2 == "written through a pipe", "the pipe wrote [", ws2, "]") && ok
+            _ = io.close(back)
+        _ = io.delete("dado proc test.txt")
+
+        cstring no_command = nil
+        ok = #expect(read(no_command) == nil && write(no_command) == nil, "a nil command opened") && ok
+        (bool ne, i32 ns) = run(no_command)
+        ok = #expect(!ne && ns == 0 - 1, "run(nil) gave ", ns) && ok
+        ^io.FILE nothing = nil
+        (bool ce, i32 cs) = close(nothing)
+        ok = #expect(!ce && cs == 0 - 1, "close(nil) gave ", cs) && ok
+        ok = #expect(available(), "system(NULL) said there is no command interpreter") && ok
+        return ok
+
+    // ── draining ─────────────────────────────────────────────────────────
+
+    private bool draining():
+        bool ok = true
+        ref []char8 line = #format("\"", string8(self()), "\" pause", char8(0), #heap)
+        ^io.FILE p = read(cstring(rawptr(&line[0])))
+        #delete(line)
+        if !#expect(p != nil, "the pause helper did not open"): return false
+        [512]char8 chunk
+        i32 rounds = 0
+        i32 total = 0
+        i32 waits = 0
+        i32 early = 0
+        for rounds < 500:
+            i32 n = drain(p, chunk[:], 20)
+            rounds += 1
+            if n == DRAINED || n == BROKE: break
+            if n == WAITED:
+                waits += 1
+                continue
+            if total == 0: early = n
+            total += n
+        (bool exited, i32 status) = close(p)
+        ok = #expect(total == 17, "expected 17 bytes, got ", total) && ok
+        ok = #expect(early > 0 && early < 17, "first read was ", early, " bytes; a blocking read would be 17") && ok
+        ok = #expect(waits > 0, "never once timed out, so it never yielded") && ok
+        ok = #expect(exited && status == 0, "exited=", exited, " status=", status) && ok
+        return ok
+
+    // ── duplex ───────────────────────────────────────────────────────────
+
+    private Duplex helper_duplex(cstring mode, i32 errors):
+        [2]cstring argv
+        argv[0] = self()
+        argv[1] = mode
+        return duplex(argv[:], errors)
+
+    private bool megabyte_round_trip():
+        bool ok = true
+        Duplex d = helper_duplex("cat", ERRORS_INHERIT)
+        if !#expect(started(d), "cat did not start, failure=", d.failure): return false
+        ref []char8 payload = #make([]char8, MIB, #heap)
+        defer #delete(payload)
+        for i in 0..<MIB:
+            payload[i] = char8(i % 251)
+        [8192]char8 chunk
+        i64 sent = 0
+        i64 got = 0
+        i32 mismatches = 0
+        i32 stalls = 0
+        bool drained = false
+        bool broke = false
+        f64 began = time.now()
+        for !drained && !broke && time.ms_since(began) < 20000:
+            if sent < MIB:
+                i32 n = send(&d, payload[sent..<MIB], 0)
+                if n == BROKE: broke = true
+                if n == WAITED: stalls += 1
+                if n > 0:
+                    if i64(n) < MIB - sent: stalls += 1
+                    sent += i64(n)
+                    if sent == MIB: _ = close_input(&d)
+            i32 r = receive(&d, chunk[:], 5)
+            if r == DRAINED: drained = true
+            if r == BROKE: broke = true
+            if r > 0:
+                for k in 0..<r:
+                    if got + i64(k) < MIB && chunk[k] != payload[got + i64(k)]: mismatches += 1
+                got += i64(r)
+        (bool done, bool exited, i32 status) = finish(&d, 2000)
+        release(&d)
+        ok = #expect(!broke, "the round trip broke") && ok
+        ok = #expect(sent == MIB && got == MIB, "sent ", sent, " and read back ", got, " of ", MIB) && ok
+        ok = #expect(mismatches == 0, mismatches, " bytes came back different") && ok
+        ok = #expect(drained, "never saw end-of-file after closing cat's input") && ok
+        ok = #expect(stalls > 0, "the pipe never filled, so nothing proved send does not block") && ok
+        ok = #expect(done && exited && status == 0, "cat ended done=", done, " exited=", exited, " status=", status) && ok
+        return ok
+
+    private bool duplex_statuses():
+        bool ok = true
+        [3]cstring three
+        three[0] = self()
+        three[1] = "exit"
+        three[2] = "3"
+        Duplex d = duplex(three[:])
+        (bool done, bool exited, i32 status) = finish(&d, 5000)
+        ok = #expect(done && exited && status == 3, "exit 3 gave done=", done, " exited=", exited, " status=", status) && ok
+        (bool again, bool exited2, i32 status2) = finished(&d)
+        ok = #expect(again && exited2 && status2 == 3, "a second finished() changed its answer") && ok
+        release(&d)
+
+        Duplex s = helper_duplex("sleep", ERRORS_INHERIT)
+        ok = #expect(started(s), "sleep did not start") && ok
+        (bool early, _, _) = finished(&s)
+        ok = #expect(!early, "sleep finished at once") && ok
+        f64 began = time.now()
+        (bool timed, _, _) = finish(&s, 50)
+        i64 waited = time.ms_since(began)
+        ok = #expect(!timed && waited >= 40, "a 50 ms finish() on sleep said done=", timed, " after ", waited, " ms") && ok
+        [16]char8 quiet
+        began = time.now()
+        i32 r = receive(&s, quiet[:], 50)
+        waited = time.ms_since(began)
+        ok = #expect(r == WAITED && waited >= 40, "a quiet child's receive gave ", r, " after ", waited, " ms") && ok
+        ok = #expect(terminate(&s), "terminate refused a live child") && ok
+        (bool tdone, bool texited, i32 tstatus) = finish(&s, 5000)
+        ok = #expect(tdone && !texited && tstatus == 0 - 9, "terminate gave done=", tdone, " exited=", texited, " status=", tstatus) && ok
+        ok = #expect(!kill(&s) && !terminate(&s), "a reaped child was ended again") && ok
+        release(&s)
+
+        Duplex k = helper_duplex("sleep", ERRORS_INHERIT)
+        began = time.now()
+        (bool kexited, i32 kstatus) = stop(&k, 50)
+        i64 took = time.ms_since(began)
+        ok = #expect(!kexited && kstatus == 0 - 9, "stop gave exited=", kexited, " status=", kstatus) && ok
+        ok = #expect(took < 5000, "stop took ", took, " ms for a 50 ms grace") && ok
+
+        [2]cstring missing
+        missing[0] = MISSING
+        missing[1] = "x"
+        Duplex m = duplex(missing[:])
+        ok = #expect(!started(m) && m.failure == 2, "a missing program: started=", started(m), " failure=", m.failure) && ok
+        [4]char8 bytes
+        ok = #expect(send(&m, bytes[:], 0) == BROKE, "send to a failed start was not BROKE") && ok
+        ok = #expect(!ignoring_sigpipe(), "Windows has no SIGPIPE to ignore") && ok
+        return ok
+
+    private bool write_after_exit():
+        bool ok = true
+        [3]cstring argv
+        argv[0] = self()
+        argv[1] = "exit"
+        argv[2] = "0"
+        Duplex d = duplex(argv[:])
+        (bool done, _, _) = finish(&d, 5000)
+        ok = #expect(done, "exit 0 did not finish") && ok
+        [64]char8 bytes
+        i32 n = send(&d, bytes[:], 100)
+        ok = #expect(n == BROKE, "a write to an exited child answered ", n) && ok
+        (i64 sent, i32 stopped) = send_all(&d, bytes[:], 100)
+        ok = #expect(sent == 0 && stopped == BROKE, "send_all to an exited child gave ", sent, ", ", stopped) && ok
+        release(&d)
+        return ok
+
+    private bool eof_by_close_input():
+        bool ok = true
+        Duplex d = helper_duplex("cat", ERRORS_INHERIT)
+        [5]char8 hello
+        hello[0] = 'h'
+        hello[1] = 'e'
+        hello[2] = 'l'
+        hello[3] = 'l'
+        hello[4] = 'o'
+        (i64 sent, i32 stopped) = send_all(&d, hello[:], 1000)
+        ok = #expect(sent == 5 && stopped == 0, "send_all gave ", sent, ", ", stopped) && ok
+        ok = #expect(close_input(&d) && !close_input(&d), "close_input did not close exactly once") && ok
+        ok = #expect(send(&d, hello[:], 0) == BROKE, "send after close_input was not BROKE") && ok
+        [16]char8 chunk
+        i32 total = 0
+        bool drained = false
+        f64 began = time.now()
+        for !drained && time.ms_since(began) < 5000:
+            i32 r = receive(&d, chunk[total..<16], 10)
+            if r == DRAINED: drained = true
+            if r > 0: total += r
+            if r == BROKE: break
+        ok = #expect(drained && total == 5, "cat gave back ", total, " bytes, drained=", drained) && ok
+        ok = #expect(chunk[0] == hello[0] && chunk[4] == hello[4], "cat changed the bytes") && ok
+        ok = #expect(receive(&d, chunk[:], 0) == DRAINED, "a second receive after the end was not DRAINED") && ok
+        (bool done, bool exited, i32 status) = finish(&d, 5000)
+        ok = #expect(done && exited && status == 0, "cat did not exit 0 on end-of-file") && ok
+        release(&d)
+        return ok
+
+    // The handle-list claim: `b` started after `a` must not hold `a`'s
+    // stdin open.
+    private bool two_children():
+        bool ok = true
+        Duplex a = helper_duplex("cat", ERRORS_INHERIT)
+        Duplex b = helper_duplex("cat", ERRORS_INHERIT)
+        ok = #expect(started(a) && started(b), "two cats did not start") && ok
+        _ = close_input(&a)
+        (bool done, bool exited, i32 status) = finish(&a, 5000)
+        ok = #expect(done && exited && status == 0, "the first cat did not see end-of-file while the second lived: done=", done) && ok
+        (bool bdone, _, _) = finished(&b)
+        ok = #expect(!bdone, "the second cat ended with the first") && ok
+        _ = stop(&a, 0)
+        (bool bexited, i32 bstatus) = stop(&b, 5000)
+        ok = #expect(bexited && bstatus == 0, "the second cat did not end on stop: ", bstatus) && ok
+        return ok
+
+    private i32 read_all(^Duplex d, []char8 into, bool errors):
+        i32 total = 0
+        f64 began = time.now()
+        for time.ms_since(began) < 5000 && total < i32(#len(into)):
+            i32 r = 0
+            if errors: r = receive_errors(d, into[total..<#len(into)], 10)
+            else: r = receive(d, into[total..<#len(into)], 10)
+            if r == DRAINED || r == BROKE: break
+            if r > 0: total += r
+        return total
+
+    private bool error_modes():
+        bool ok = true
+        [16]char8 outb
+        [16]char8 errb
+        Duplex p = helper_duplex("both", ERRORS_PIPE)
+        i32 po = read_all(&p, outb[:], false)
+        i32 pe = read_all(&p, errb[:], true)
+        ok = #expect(po == 3 && pe == 3, "ERRORS_PIPE split out=", po, " err=", pe) && ok
+        ok = #expect(errb[0] == 'e', "the stderr pipe did not carry 'err'") && ok
+        _ = stop(&p, 5000)
+
+        Duplex m = helper_duplex("both", ERRORS_MERGE)
+        i32 mo = read_all(&m, outb[:], false)
+        ok = #expect(mo == 6, "ERRORS_MERGE carried ", mo, " bytes, not 6") && ok
+        ok = #expect(receive_errors(&m, errb[:], 0) == BROKE, "a merged child had a stderr pipe") && ok
+        _ = stop(&m, 5000)
+
+        Duplex x = helper_duplex("both", ERRORS_DISCARD)
+        i32 xo = read_all(&x, outb[:], false)
+        ok = #expect(xo == 3, "ERRORS_DISCARD carried ", xo, " bytes, not 3") && ok
+        (bool xexited, i32 xstatus) = stop(&x, 5000)
+        ok = #expect(xexited && xstatus == 0, "the discarding child failed: ", xstatus) && ok
+
+        Duplex bad = helper_duplex("both", 7)
+        ok = #expect(!started(bad) && bad.failure == 0 - 1, "an unknown errors mode was accepted") && ok
+        return ok
+
+    // `stop` ends the child and the child's own child: the job.
+    private bool tree_is_stopped():
+        bool ok = true
+        Duplex d = helper_duplex("tree", ERRORS_INHERIT)
+        if !#expect(started(d), "the tree helper did not start"): return false
+        [32]char8 line
+        i32 n = 0
+        f64 began = time.now()
+        for time.ms_since(began) < 5000 && n < 32:
+            i32 r = receive(&d, line[n..<32], 10)
+            if r == DRAINED || r == BROKE: break
+            if r > 0: n += r
+            if n > 0 && line[n - 1] == '\n': break
+        i64 grandchild = 0
+        for i in 0..<n:
+            if line[i] >= '0' && line[i] <= '9': grandchild = grandchild * 10 + i64(line[i]) - 48
+        ok = #expect(grandchild > 0, "the tree helper did not report its child") && ok
+        rawptr g = OpenProcess(SYNCHRONIZE, 0, #c.ulong(grandchild))
+        ok = #expect(g != nil, "the grandchild was not running before the stop") && ok
+        (bool exited, i32 status) = stop(&d, 0)
+        ok = #expect(!exited && status == 0 - 9, "stop on the tree gave exited=", exited, " status=", status) && ok
+        if g != nil:
+            ok = #expect(WaitForSingleObject(g, 5000) == WAIT_OBJECT_0, "the grandchild outlived stop") && ok
+            close_handle(g)
+        return ok
+
+    private bool bad_handles():
+        bool ok = true
+        [8]char8 buf
+        Duplex zero
+        ok = #expect(!started(zero), "the zero Duplex is started") && ok
+        ok = #expect(send(&zero, buf[:], 0) == BROKE && receive(&zero, buf[:], 0) == BROKE, "a verb on zero") && ok
+        ok = #expect(receive_errors(&zero, buf[:], 0) == BROKE && !close_input(&zero), "a verb on zero") && ok
+        ok = #expect(!terminate(&zero) && !kill(&zero), "an end of the zero Duplex") && ok
+        (bool zd, _, i32 zs) = finished(&zero)
+        ok = #expect(!zd && zs == 0 - 1, "finished on zero") && ok
+        release(&zero)
+        (bool ze, i32 zst) = stop(&zero, 0)
+        ok = #expect(!ze && zst == 0 - 1, "stop on zero") && ok
+        ok = #expect(send(nil, buf[:], 0) == BROKE && receive(nil, buf[:], 0) == BROKE, "a verb on nil") && ok
+
+        Duplex d = helper_duplex("cat", ERRORS_INHERIT)
+        _ = stop(&d, 5000)
+        ok = #expect(d.input == 0 - 1 && d.output == 0 - 1 && d.errors == 0 - 1, "stop left a descriptor open") && ok
+        ok = #expect(send(&d, buf[:], 0) == BROKE && receive(&d, buf[:], 0) == BROKE, "a verb after stop") && ok
+        ok = #expect(!close_input(&d) && !kill(&d) && !terminate(&d), "a verb acted after stop") && ok
+        (bool done, bool exited, i32 status) = finished(&d)
+        ok = #expect(done && exited && status == 0, "the stopped cat's answer changed: ", status) && ok
+        return ok
+else:
+    // POSIX: this file's claims are the other test files'.
+    i32 test():
+        return 0

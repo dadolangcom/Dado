@@ -1,0 +1,130 @@
+@test
+// **`core:cfg` round-trips a 64-section config a thousand times with no
+// growth** — the proof that a stored value is freed.
+//
+// Each round builds a 64-section `Config` through every setter (each section
+// also overwrites one key, which is the reload shape), saves it, loads it
+// back, reads it, and destroys both. Before values became freeable this leaked
+// 128 B a round from `cfg.clone` alone, because a stored value was a window
+// whose `ref` nobody held.
+//
+// **How "no growth" is measured, twice over:**
+//
+//   * **by count, in the test itself.** Every allocation this package makes
+//     goes through the allocator it is handed, and this file hands it one
+//     that counts live blocks (`Alloc` +1, `Free` −1) over `libc`. Blocks
+//     and not bytes: a map frees its table with `old_size` 0, so a byte
+//     count kept from the `Free` side would be wrong, and a block count is
+//     exact. The claims: zero live blocks after every round; and the peak
+//     (both configs built, before `destroy`) the same in the last round as in
+//     the first — the same work holds the same memory every time.
+//   * **by LeakSanitizer**, which sees what the counter cannot — anything
+//     allocated from `#default` rather than the allocator passed in. Run
+//     `ASAN_OPTIONS=detect_leaks=1 ./dado test --sanitize collections/core/cfg`;
+//     it reports nothing.
+package cfg
+
+import "core:mem"
+import "core:mem/libc"
+
+private const cstring PATH64 = "/tmp/dado_core_cfg_roundtrip64.ini"
+private const i64 SECTIONS = 64
+private const i32 ROUNDS = 1000
+
+private i64 live_blocks
+private i64 total_allocs
+
+// `libc`, counting. A `Resize` from `nil` is an allocation; a `Resize` of a
+// live block moves it and leaves the count alone.
+private rawptr counting_proc(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) base = libc.allocator()
+    rawptr p = base.proc(base.data, mode, nbytes, align, old, old_size)
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            if p != nil:
+                live_blocks = live_blocks + 1
+                total_allocs = total_allocs + 1
+        case mem.AllocatorMode.Resize:
+            if old == nil && p != nil:
+                live_blocks = live_blocks + 1
+                total_allocs = total_allocs + 1
+        case mem.AllocatorMode.Free:
+            if old != nil:
+                live_blocks = live_blocks - 1
+        case mem.AllocatorMode.FreeAll:
+            return p
+        else:
+            return p
+    return p
+
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) counting():
+    return (counting_proc, nil)
+
+// Section `i`'s name, `s00` … `s63`, as a window into `names`.
+private string8 name_of(ref []char8 names, i64 i):
+    return string8(names[(i * 3)..<((i * 3) + 3)])
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = counting()
+
+    ref []char8 names = #make([]char8, SECTIONS * 3)
+    for i in 0..<SECTIONS:
+        names[i * 3] = 's'
+        names[(i * 3) + 1] = '0' + char8(i / 10)
+        names[(i * 3) + 2] = '0' + char8(i % 10)
+
+    i64 first_peak = 0 - 1
+    i64 last_peak = 0 - 1
+    i32 leaked_round = 0 - 1
+    i64 leaked_blocks = 0
+    i32 bad_round = 0 - 1
+
+    for round in 0..<ROUNDS:
+        Config c = fresh(alloc)
+        for i in 0..<SECTIONS:
+            string8 sec = name_of(names, i)
+            set_i32(&c, sec, "index", 0, alloc)
+            set_string(&c, sec, "label", sec, alloc)
+            set_f64(&c, sec, "ratio", f64(i) + 0.5, alloc)
+            set_bool(&c, sec, "even", i % 2 == 0, alloc)
+            // The overwrite: the `0` above is freed here.
+            set_i32(&c, sec, "index", i32(i) + round, alloc)
+        bool saved = save(c, PATH64, alloc)
+        (Config back, bool lok, i32 bad) = load(PATH64, alloc)
+
+        i64 probe = i64(round) % SECTIONS
+        string8 psec = name_of(names, probe)
+        bool right = saved && lok && bad == 0
+        right = right && get_i32(back, psec, "index", 0 - 1, alloc) == i32(probe) + round
+        right = right && get_string(back, psec, "label", "?") == psec
+        f64 ratio = get_f64(back, psec, "ratio", 0.0, alloc)
+        right = right && ratio > f64(probe) + 0.4999 && ratio < f64(probe) + 0.5001
+        right = right && get_bool(back, psec, "even", probe % 2 != 0) == (probe % 2 == 0)
+        if !right && bad_round < 0:
+            bad_round = round
+
+        if round == 0:
+            first_peak = live_blocks
+        if round == ROUNDS - 1:
+            last_peak = live_blocks
+
+        destroy(&c)
+        destroy(&back)
+        if live_blocks != 0 && leaked_round < 0:
+            leaked_round = round
+            leaked_blocks = live_blocks
+
+    #delete(names)
+
+    ok = #expect(bad_round < 0, "the 64-section round trip read back wrong in round ", bad_round) && ok
+    ok = #expect(leaked_round < 0, "round ", leaked_round, " ended with ", leaked_blocks, " live blocks") && ok
+    ok = #expect(live_blocks == 0, "after 1,000 rounds ", live_blocks, " blocks are still live") && ok
+    ok = #expect(first_peak > 0 && first_peak == last_peak,
+                 "the peak grew: round 1 held ", first_peak, " blocks, round 1,000 held ", last_peak) && ok
+    // Sanity that the counter saw the work at all: every round allocates.
+    ok = #expect(total_allocs > i64(ROUNDS) * SECTIONS, "the counting allocator saw only ", total_allocs, " allocations") && ok
+
+    if ok:
+        return 0
+    return 1

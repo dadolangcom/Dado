@@ -1,0 +1,368 @@
+// `app:text` — the pen loop, written once, recorded into a canvas item.
+//
+//     import "app:draw"
+//     import "app:text"
+//
+//     draw.Item line = draw.canvas_item_create(canvas)
+//     f32 end = text.run(line, &font, atlas, x, top_of_line_box, "hello", WHITE)
+//
+// The call that is **not** in the frame loop is the one worth staring at.
+// `run` appends one command per inked glyph to `line`'s list and returns; the
+// text is on the screen every frame thereafter, and a frame that does not
+// re-record `line` walks no string, looks up no glyph and appends nothing.
+// That is the whole of what changed here: the loop is the same loop, and where
+// it used to hand quads to an implicit frame it now hands commands to an item a
+// client holds.
+//
+// ## Why this package exists at all
+//
+// `app:draw` does not know what a font is and `app:font` does not know what a
+// GPU is, and **that layering is right**: it is what lets a glyph atlas be
+// tested with no context and a drawing surface be tested with no font file.
+// But the seam between them is a loop — decode a character, look the glyph up,
+// place a quad at the pen, add the advance, add the kerning — and until this
+// package existed *every client wrote it*. `app:ui/draw`'s `Painter.text` and
+// `example/edit`'s line painter had each written the same twenty-five lines,
+// off-screen culling included, and neither could fix a bug in the other.
+//
+// So this is the seam, as a package. It imports both and adds nothing but the
+// loop. Nothing else in `app:` imports it, so a program that wants the loop
+// takes it and a program that wants to write its own still can.
+//
+// ## The target comes first
+//
+// Every function here takes a `draw.Item` as its **first** parameter, which is
+// the shape the whole retained surface uses: `draw.rect(item, …)`,
+// `draw.texture_rect_region(item, …)`, and now `text.run(item, …)`. A client
+// reading a paint function sees one target named once per line and in the same
+// column every time, which is what makes a block of recording calls skimmable.
+//
+// A `run*` into a dead handle — a freed item, a stale generation, `NIL_ITEM`,
+// or any handle at all while the server is down — records nothing and **still
+// answers the pen**. `app:draw` drops a command written through a dead handle
+// rather than trapping, and the walk here is not the recording: what a
+// character measures does not depend on there being anywhere to put its quad.
+//
+// ## Where `y` is
+//
+// **`run` takes the top of the line box** — the same anchor `app:ui`'s
+// `Painter.text` settled on, for the same reason: a widget's arithmetic is all
+// in box space, and a baseline anchor makes every caller add an ascent it has
+// no other reason to know.
+//
+// A text view's arithmetic is in *baselines* instead, because that is what a
+// row of a scrolling buffer is. So `run_at_baseline` is the same function with
+// the other anchor, and every function here comes in both spellings rather than
+// one of them being right. Two names with one meaning each is cheaper than one
+// name a caller has to remember the convention of — and this is the seam where
+// getting it wrong is one ascent of silent misplacement, which looks like a
+// layout bug and is not.
+//
+// ## The pen a run answers is a record-time value
+//
+// Every `run*` answers the pen it reached. Under the immediate surface that was
+// free in both directions: the loop walked the string to place the quads, so
+// the pen was a number already in hand, and handing it back cost a `return`.
+// Retention keeps half of that and takes half away, and being exact about which
+// half is the difference between a caller that is right and one that looks
+// right. **The pen is still free to compute, and it is computed only when
+// something records.** An item cached across a frame is not re-recorded, so
+// nothing walks, so there is no pen — not a stale pen, *no* pen. A client whose
+// layout depends on the width of a run it recorded three frames ago must have
+// kept the number. This is row **G2** of the work order and this package cannot
+// fix it for the client; what it can do is not pretend nothing happened.
+//
+// **Two answers were available and the return value stays.**
+//
+//   * *Drop it.* Make every `run*` a `void`, as every `draw.*` call is, so the
+//     surface cannot suggest a value that a cached item does not produce, and
+//     send anyone who wants a width to a measuring query. It costs every
+//     *recording* client a second walk of the same string for a number the
+//     first walk already had — and it buys the caching client nothing, because
+//     a client that does not record has to memoise either way.
+//   * *Keep it, and say what it is.* Which is this. The number is free where it
+//     is produced, and on the frame a client records — every dirty frame, and
+//     every frame at all for a client that has no dirty bit yet, which is all
+//     of them until row **G7** is done — it is the answer to the question the
+//     client was about to ask anyway.
+//
+// **There is no new query here, because the query already exists and it is
+// `app:font`'s.** `font.measure`, `font.measure_tabbed` and `font.advance_to`
+// answer the same walk from the same tables, taking no `Item`, no `Canvas` and
+// no `Texture` — they are exactly the "`font.measure`-shaped query the client
+// uses when it is not recording", and they were there before this package was.
+// A `text.measure` forwarding to them would be a third spelling of one walk, in
+// the package whose entire reason for existing is that the walk is written
+// once.
+//
+// So the rule, stated once: **the pen is the answer of the frame that
+// recorded.** Memoise it beside the item, next to the string that produced it
+// and next to the dirty bit that decides whether to re-record at all (row
+// **G7**), and invalidate all three together.
+//
+// **Two edges, and both are why *memoise the pen* is not *memoise the width*.**
+// `run_clipped` and `run_tabbed` answer where drawing **stopped**, which is the
+// run's width only when nothing was culled off the tail: the walk breaks at the
+// first pen past `x1` rather than measuring a line it is not drawing, and that
+// is the whole saving. And their cull window is a record-time value too — an
+// item cached across a horizontal scroll was culled against the window that was
+// in force when it was recorded, which is row **G5**.
+//
+// ## The batch
+//
+// **Everything this package draws goes through the atlas texture**, glyphs and
+// rectangles alike — `fill`, `outline`, `underline` and `caret` ride
+// `font.solid_src`, the fully-opaque point `app:font` reserves at the atlas
+// origin. What that is worth is smaller than it was and it is not nothing, and
+// the difference is worth writing down because the old claim is still true of
+// the wrong library.
+//
+// **What this file used to say** is that `app:draw` breaks a batch on a texture
+// change, so a line of glyphs with a caret and a selection quad drawn the
+// obvious way costs three draw calls and a screen of them costs one per
+// primitive. That was a true statement about the hand-written batcher this
+// package used to emit into, which compared each quad's texture against the
+// previous quad's and split whenever they differed.
+//
+// **`sokol_gp` is not that batcher.** Every draw it queues is offered to a
+// batch optimiser that looks back over the last `SGP_BATCH_OPTIMIZER_DEPTH`
+// draw commands — **8** by default — for one it can merge with, and merges when
+// the pipeline, the texture bindings and the shader uniforms all match *and* no
+// command between the two overlaps either one's region. So it will reorder a
+// textured draw back past an untextured one and merge it: one solid rectangle
+// dropped into a run of glyphs does not split the run, and row **E3**'s
+// simplest case is handled by the library rather than by this package.
+//
+// **The bounds are what survives**, and they are read out of
+// `_sgp_merge_batch_command` rather than measured, because measuring them wants
+// `draw.gpu_draw_calls()` and there is no GPU in the container this was written
+// in. There are four, and a text renderer is the most likely thing in the
+// system to meet every one of them:
+//
+//   * **The look-back is eight commands** and it is a look-back, not a sort.
+//     (Slightly more than eight in practice — a command already optimised away
+//     does not count against the depth, so the search steps over it.)
+//   * **A merge widens the surviving command's region to the union of the
+//     two.** That is the one that bites, and it bites sooner the better the
+//     optimiser is doing: merge two glyph runs either side of a box and the
+//     merged run's rectangle now *contains* that box, so the box overlaps every
+//     further merge and the next one is refused. A line of glyphs with a rule
+//     between every pair of them converges on exactly that state.
+//   * **An overlapping intermediary refuses the merge outright**, at any
+//     distance inside the window. A selection quad under its own text overlaps
+//     it by construction, and so does an underline under a descender — and both
+//     are things a text renderer draws constantly.
+//   * **Reordering moves vertices and the move is capped**, at
+//     `_SGP_MAX_MOVE_VERTICES`, which is **96** — sixteen rectangles' worth of
+//     intermediary content, after which the merge is refused rather than
+//     performed. And the search **stops dead at a scissor or viewport
+//     command**, so an `app:ui` row that pushes a clip has spent its window
+//     whatever was in it.
+//
+// **And the number this package can count is an upper bound, not the draw
+// calls.** `draw.state_changes()` counts what the replay changed; the optimiser
+// only ever merges, never splits, so the truth is that number or lower and
+// `draw.gpu_draw_calls()` is where it is read — one frame late, and zero
+// headless. Measured in `text_test.dado`, in one item, and measured as the bound
+// it is: ten two-glyph runs with a `draw.rect` between each pair is **20**
+// counted state changes; the same content with `fill` is **1**.
+//
+// So the claim is smaller and sharper than the one it replaces. It is not that
+// a texture change costs a draw call — it does not, usually. It is that riding
+// the atlas makes none of the four questions above arise: the upper bound is
+// one bind for a whole line however long it is, whatever it overlaps, however
+// many vertices sit between its ends and whatever is scissored around it — and
+// **a bound that holds is worth more than an optimiser that usually wins and
+// cannot tell you when it did not.**
+//
+// A client that wants a rectangle in a *different colour* still gets one batch
+// either way: `sokol_gp` writes colour into the vertices, so a colour change
+// costs nothing and `app:draw` does not count one. A client that wants a
+// rectangle nowhere near any text should use `draw.rect`, which is a view
+// change either way, and this package is not the place to decide.
+//
+// ## What it does not do
+//
+// No shaping, no bidi, no line breaking, no caching. One face per call. A
+// codepoint the atlas has not packed draws `app:font`'s `.notdef` box and
+// advances by it — which is a decision made there and not here.
+package text
+
+import "app:draw"
+import "app:font"
+import "core:chars"
+
+// ── runs ───────────────────────────────────────────────────────────────────
+
+// Record `s` into `into` with the top of its line box at `y`. Answers the pen x
+// it ended at, so runs chain — on the frame that records. See the package
+// comment on why that qualification is the interesting part of this signature.
+f32 run(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 y, string8 s,
+        [4]u8 col):
+    return run_at_baseline(into, f, atlas, x, y + font.ascent(f), s, col)
+
+// Record `s` into `into` with its baseline at `base`. Answers the pen x it
+// ended at.
+f32 run_at_baseline(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 base,
+                    string8 s, [4]u8 col):
+    return glyphs(into, f, atlas, x, base, s, col, font.no_tabs(), false, 0.0, 0.0)
+
+// As `run_at_baseline`, but a glyph that lies entirely outside `[x0, x1)` is
+// skipped rather than recorded and clipped.
+//
+// **This is not a substitute for `draw.push_clip`** and does not replace it: a
+// glyph straddling an edge is still recorded whole, so the scissor is what
+// makes the cut exact. What this saves is the commands for the part of a
+// four-thousand column line that is nowhere near the window, which is the
+// difference between an item that costs what is visible and one that costs what
+// exists.
+//
+// **`x0` and `x1` are read now and remembered by nobody.** The item keeps the
+// commands this call decided to append and no record of the window it decided
+// against, so an item cached across a horizontal scroll is culled against a
+// window that has moved. Re-record it, or do not cull. That is row **G5**, and
+// it is the one place retention costs this package something the immediate
+// surface did not charge for.
+//
+// **The answer is the pen where recording stopped**, which is the run's end
+// only when nothing was culled off the tail: the walk stops at the first pen
+// past `x1` rather than measuring the rest of a line it is not drawing, which
+// is the whole saving. A caller that wants the run's true width asks
+// `font.measure_tabbed`, which is the function for that question.
+f32 run_clipped(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 base,
+                string8 s, [4]u8 col, f32 x0, f32 x1):
+    return glyphs(into, f, atlas, x, base, s, col, font.no_tabs(), true, x0, x1)
+
+// The whole loop: tab stops, culling and all. The four forms above are this one
+// with arguments fixed, and a client that needs every knob at once calls it.
+//
+// Tab stops are measured from `x`, which is the run's own origin — see
+// `font.Tabs`. A tab **appends no command** and advances to its stop; with
+// `font.no_tabs()` it is an ordinary character and draws `.notdef`.
+//
+// Culls like `run_clipped`, and answers the same pen it does.
+f32 run_tabbed(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 base,
+               string8 s, [4]u8 col, font.Tabs t, f32 x0, f32 x1):
+    return glyphs(into, f, atlas, x, base, s, col, t, true, x0, x1)
+
+private f32 glyphs(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 base,
+                   string8 s, [4]u8 col, font.Tabs t, bool cull, f32 x0, f32 x1):
+    if f == nil:
+        return x
+    f32 pen = x
+    i32 column = 0
+    i64 i = 0
+    i64 n = #len(s)
+    for i < n:
+        font.Cell c = font.cell_at(f, s, i, pen - x, column, t)
+        if c.nbytes <= 0:
+            break
+        if cull && pen > x1:
+            break
+        if !c.tab:
+            if !cull || pen + c.advance >= x0:
+                font.Glyph g = font.glyph(f, c.cp)
+                if g.pw > 0:
+                    draw.texture_rect_region(into, atlas,
+                                             (pen + g.bearing_x, base + g.bearing_y,
+                                              f32(g.pw), f32(g.ph)),
+                                             glyph_src(g), col)
+        pen = pen + c.advance
+        column = column + c.columns
+        i64 next = i + i64(c.nbytes)
+        if next < n && !c.tab:
+            // The *pair* is what kerns, so the next character has to be known
+            // here. It is decoded rather than asked of `cell_at`, because
+            // `cell_at` also looks the glyph up — a linear walk of the sparse
+            // table for anything outside ASCII — and that answer is thrown
+            // away on the next turn of the loop anyway.
+            (char32 nc, i32 taken) = chars.decode(s, i32(next))
+            if taken > 0 && nc != '\t':
+                pen = pen + font.kern(f, c.cp, nc)
+        i = next
+    return pen
+
+// A glyph's source rectangle, in **atlas pixels**, which is the unit
+// `draw.texture_rect_region` takes and which `sgp_draw_textured_rect` divides
+// by the bound image's size itself.
+//
+// It is a function rather than four arguments written at the one call site
+// because it is the one place this package converts a `font.Glyph` into
+// something `app:draw` understands, and a test in this package can then check
+// the conversion without reading `app:draw`'s command list, which is private to
+// that package and rightly so.
+//
+// **There is nothing normalised here and there used to be.** A `Glyph` carried
+// `u0`/`v0`/`u1`/`v1` — the same box divided by the atlas size — and this loop
+// handed those four straight to `draw.textured_quad`. The division stales on
+// every `font.grow_atlas`, because `v` has `atlas_h` underneath it, and
+// `app:font` carried a `rewindow` pass over every glyph it had ever handed out
+// to repair exactly that. A pixel rectangle is invariant under a grow, so the
+// pass and the hazard it existed for are both gone, and this package is the
+// consumer that wanted pixels all along.
+private [4]f32 glyph_src(font.Glyph g):
+    return (f32(g.px), f32(g.py), f32(g.pw), f32(g.ph))
+
+// ── rectangles that ride in the glyph batch ────────────────────────────────
+
+// A filled rectangle recorded over the atlas's reserved opaque point, so it
+// joins whatever run of glyphs it sits among instead of costing a view change
+// between them.
+//
+// The colour is exact: every atlas texel is `(255, 255, 255, coverage)` and
+// `sokol_gp`'s stock shader is `texture(tex, uv) * color`, so a fully opaque
+// texel hands the tint back unchanged, alpha included — the same pixels
+// `draw.rect` would have produced, in the same bind as the text.
+//
+// **The source rectangle has zero extent, and that is the mechanism rather
+// than a tidiness.** `font.solid_src` answers a *point* at the centre of the
+// reserved block and not the block's own rectangle, because a source rect with
+// any extent at all interpolates across the quad and reaches the block's
+// transparent padding at the corners — measured over a 64×32 quad, every one of
+// its 2048 pixels wrong with a 1×1 block and 644 still wrong with the block six
+// texels square, against zero wrong for a point at either size. A rect of zero
+// extent cannot fringe whatever the quad's size, because every fragment of it
+// resolves to the same texel. `font.solid_box` is the block's rectangle and is
+// the measured *failing* case; this function wants the point, and the two names
+// in `app:font` differ by exactly that property.
+void fill(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 y, f32 w, f32 h,
+          [4]u8 col):
+    if f == nil || w <= 0.0 || h <= 0.0:
+        return
+    (f32 sx, f32 sy, f32 sw, f32 sh) = font.solid_src(f)
+    draw.texture_rect_region(into, atlas, (x, y, w, h), (sx, sy, sw, sh), col)
+
+// The four edges of a rectangle, inside it, in the glyph batch. Four `fill`s
+// and so four commands, where `draw.rect` with a positive width would be one —
+// and would be an untextured primitive drawn with lines, so a view change and a
+// topology change on each side of itself, in the middle of a run of glyphs.
+void outline(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 y, f32 w,
+             f32 h, f32 thickness, [4]u8 col):
+    if f == nil || w <= 0.0 || h <= 0.0 || thickness <= 0.0:
+        return
+    f32 t = thickness
+    if t > w:
+        t = w
+    if t > h:
+        t = h
+    fill(into, f, atlas, x, y, w, t, col)
+    fill(into, f, atlas, x, y + h - t, w, t, col)
+    fill(into, f, atlas, x, y + t, t, h - t - t, col)
+    fill(into, f, atlas, x + w - t, y + t, t, h - t - t, col)
+
+// An underline `w` pixels wide under a run whose baseline is `base`, at the
+// position and thickness the face asks for — which is what a search hit wants
+// and what no client could ask for before, because the face was not reporting
+// either number.
+void underline(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 base, f32 w,
+               [4]u8 col):
+    (f32 pos, f32 thick, bool _) = font.underline(f)
+    fill(into, f, atlas, x, base + pos, w, thick, col)
+
+// A caret `thickness` wide at `x`, spanning the whole line box whose top is
+// `y`. In the glyph batch — and now in whatever item the caller put it in,
+// which is the interesting half: a caret that blinks is one item's `set_visible`
+// every half second and no re-recording of the line it sits on.
+void caret(draw.Item into, ^font.Font f, draw.Texture atlas, f32 x, f32 y, f32 thickness,
+           [4]u8 col):
+    fill(into, f, atlas, x, y, thickness, font.line_height(f), col)

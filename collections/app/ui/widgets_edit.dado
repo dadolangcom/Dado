@@ -1,0 +1,2489 @@
+// app:ui — `TextEdit`: an editable, scrolling view of lines it does not own.
+//
+// ## The document is the program's
+//
+// A text edit reads and changes a document through an **edit source**: the
+// two reading functions a `TextView` takes, plus one that inserts text and one
+// that removes a span, all given the context pointer the program passed. The
+// widget never holds the text. A line it reads is a view valid until the next
+// insert or remove, so nothing here keeps one across a call into the source;
+// what the undo log keeps it copies.
+//
+// ## The caret and the seam
+//
+// The caret is a `cell.TextPos` and a `cell.Affinity`, the affinity carried
+// and ignored until bidi reads it. It moves sideways only through
+// `cell.next_visual` and `cell.prev_visual`, crossing a line end itself because
+// only it knows there is another line. A column comes from `cell.visual_of`
+// and becomes a byte again only through `cell.logical_of` or
+// `cell.byte_at_column` — on the caret's line through the column index
+// (`edit_col`, `edit_logical`, `edit_byte_at`), which walks from a kept
+// `cell.ColumnMark` and answers exactly what they answer. Up, Down, PageUp and PageDown aim at a **goal
+// column** taken on the first of a run of them, so passing through a short
+// line does not lose the column; any other motion and any edit drop it.
+//
+// Backspace removes the whole cluster before the caret (`chars.cluster_start`)
+// and Delete the whole cluster after it (`chars.cluster_end`); at a line's
+// start and end they join lines. So `e` then U+0301 is one cluster, and one
+// Backspace removes both — a mark is never left orphaned by the key that
+// removes its base, and never removed alone. After any edit the caret is put
+// back on a cluster boundary: after an insert, at the end of the cluster the
+// insert finished inside; after a removal, at the start of the cluster the
+// join landed inside.
+//
+// ## The selection
+//
+// The selection is an **anchor** `TextPos` and the caret; it is empty when the
+// two are equal, and the anchor then follows the caret everywhere. Shift with
+// any caret motion key (arrows, Home and End with or without the command
+// modifier, PageUp, PageDown) moves the caret and leaves the anchor. The same
+// key without Shift collapses the selection: Left and Right collapse it to its
+// start and its end without moving further, the others move from the caret
+// and collapse there. Command+A selects everything, the caret at the end.
+//
+// Typing, Enter, Tab, a paste and `text_edit_insert` replace a non-empty
+// selection; Backspace and Delete remove it. A replace is two primitives, a
+// removal and an insert, recorded as **one group** that undo and redo apply
+// whole. Undoing an edit restores the caret and the selection as they were
+// before it, so undoing a typed-over selection shows it selected again; redo
+// leaves the caret where the edit left it, collapsed. A replace breaks a run
+// of typing (it never joins the record before it), and the codepoints typed
+// right after it join its insert, so one undo takes back the replace and the
+// word typed over it together.
+//
+// A selection is painted as rectangles from `cell.span_rects`, one list per
+// line, in the selection colour; a line whose line break is selected shows
+// one more selected cell past its end, so a selected empty line is visible.
+//
+// ## The clipboard
+//
+// Command+C copies the selection and Command+X cuts it; with nothing selected
+// both do nothing (the key is still taken), because copying the caret's line
+// instead would overwrite the clipboard on a key pressed by mistake.
+// Command+V pastes at the caret, replacing the selection, as one undo step.
+// Pasted text has every CR LF, and every CR alone, turned into LF: the edit
+// source is only ever given LF breaks, whichever platform the text came from.
+//
+// The clipboard is reached only through a pair of functions, the display's by
+// default and a program's (or a test's) after `text_edit_set_clipboard`. When
+// the setter refuses — the display's does for text longer than
+// `display.clipboard_capacity()`, rather than truncating it — the copy and cut
+// answer false and emit `clipboard_refused`, and a cut then removes nothing:
+// text that could not be put anywhere is not taken out of the document.
+//
+// ## The mouse
+//
+// A left press puts the caret at the cell under the pointer: the line is the
+// view's first line plus the row, the byte is `cell.logical_of` of the column,
+// where the row is the one whose painted cells are under the pointer — its
+// pixel row plus the view's sub-row offset, in whole rows (`floor((y + dy) /
+// cell_h)`, `edit_event_cell`), so a view scrolled part of a row puts the
+// caret on the line drawn there, not on the line the screen cell alone names.
+// Presses, double-clicks and drags all read the row this way; the tree's hit
+// map, which is in screen cells, still chooses the node. A press on the top
+// line, which the offset cuts, scrolls the view back to that line's top edge.
+// so a press inside a tab or on the right half of a wide cluster goes to the
+// start of it, one past a line's end goes to that end, and one below the last
+// line goes to the end of the document. With Shift it moves the caret and
+// keeps the anchor. The press starts a drag: motion with the left button held
+// extends the selection until the release, and motion above or below the view
+// selects one line past the edge, which scrolls it one line per motion event.
+// Two presses at one cell within `DOUBLE_CLICK_S` select the word there; a
+// word is a run of clusters of one class — letters, digits, `_` and anything
+// non-ASCII; blanks; everything else — so double-clicking punctuation or a
+// gap selects that run; dragging on from a double-click extends by whole
+// words and never drops the clicked one. Motion is ignored until the pointer
+// leaves the pressed cell. A third press is an ordinary one. The wheel scrolls
+// without moving the caret, by `wheel_scroll_px` (TextView's rule: a notch is
+// `WHEEL_LINES` lines, a trackpad's fraction that fraction of them in
+// pixels). The drag relies on the tree's capture to keep
+// sending motion that leaves the rectangle; a motion with the button no
+// longer held ends it, in case its release went elsewhere. The pointer shows
+// the I-beam over the text and the default arrow over the gutter and the
+// margins, and keeps the I-beam for the whole of a drag (`edit_cursor`).
+//
+// ## The undo log
+//
+// Every edit is one of the two primitives, recorded with the caret and the
+// anchor before it and the caret after: an insert of text at a position
+// (undone by removing the span it made) and a removal of a span (undone by
+// inserting the copy taken before it went). A typed codepoint that lands where
+// the previous typed one ended joins that record, so a word undoes at once; a
+// newline, a removal, any motion key, a press, a programmatic insert, an undo
+// and a redo each close the record. A new edit drops everything that could be
+// redone. The log grows without a cap in the tree's allocator. It trusts that
+// the document changes only through this widget: a program that edits it
+// behind the widget calls `text_edit_set_source` again, which empties the
+// log. A source that refuses part-way through undoing or redoing a group
+// leaves the group split where it refused.
+//
+// ## Scrolling by pixels
+//
+// The scroll position is a pixel offset (`offset_px`); the first visible line
+// is the offset over the row height, and the rest, `dy`, is below a row. On a
+// grid that can make one, the view — gutter and text, inside the box's
+// margins, as much of it as the clip leaves — is drawn through a **grid
+// region** on the edit's layer (`grid.region_make`), made at the first paint
+// and freed by the free hook. The paint writes the view's rows and the spare
+// row below them (the line after the last whole one, whose top a nonzero
+// `dy` shows) into the region, and sets its offset to `dy`, so the gutter,
+// the text, the selection and the caret, all cells, move together by the
+// same pixels. The box's margins are written into the layer as before, and
+// the layer's cells under the region are left transparent. With no region
+// (no grid up, or one refused) the view is written into the layer, whole rows
+// only, and `dy` is not shown.
+//
+// Only the wheel and a trackpad (`wheel_scroll_px`) make a fraction of a row.
+// The keys and the caret's follow land on a whole line: PageUp and PageDown
+// move the first line by as many lines as the caret, `text_edit_scroll_lines`
+// counts from the first line, and a caret brought into view — or left on the
+// top line, which a nonzero `dy` cuts — puts that line's top edge at the top.
+//
+// ## What a keystroke repaints
+//
+// The widget tracks damage as one range of lines and repaints only rows in
+// it: an edit that keeps the line count damages the lines it touched, one that
+// changes the count damages from its first line to the bottom of the view,
+// and a caret motion damages the caret's old and new lines (and every line
+// between, the price of keeping one range). A selection change damages the
+// lines between each end's old and new place, so extending a selection by a
+// line repaints two lines however long it is. The spare row counts as the row
+// of its line. An idle frame paints nothing.
+//
+// A vertical scroll that keeps the first line repaints nothing: it sets the
+// region's offset and asks for a frame (`request_frame`), since no cell
+// changed. One that moves the first line by `k` lines, fewer than the view's
+// rows, shifts the region's rows by `k` (`grid.region_scroll_rows`, one
+// memmove) and repaints only the `k` rows that exposes — at the bottom, the
+// spare row among them, or at the top — with their gutter cells, together
+// with any damaged lines. A bigger jump, a horizontal scroll, a scroll with
+// no region, and a region remade blank (`grid.region_set_rect` answering
+// true: a new rect, from a resize or a new clip) repaint the whole view.
+//
+// A paint that is not the widget's own request must repaint everything. So it
+// paints only the damaged and exposed rows when all of this holds, and every
+// row otherwise: the paint was not forced by a repainting ancestor
+// (`paint_forced`, true after a new screen too, since the root then repaints);
+// its rectangle, its clip rectangle, the left column, the cell height and
+// whether it drew through the region are what they were at its last paint,
+// and the region's rect did not change; and its measure hook has
+// not run since. The last is for a node shown again: it gets back the very
+// rectangle it last painted, a sibling may have painted there while it was
+// hidden, and showing a node marks only the node, so that paint is not
+// forced.
+//
+// The caret is drawn as its cluster's cell in the theme's caret colours (the
+// text's swapped, in the default theme), or as one such blank cell at the end
+// of a line and on an empty one — cells of the view, so in the region with
+// the text, offset with it. It is drawn whether or not the widget has focus,
+// because a change of focus does not repaint.
+//
+// A node out of the picture is not painted, while its region would go on
+// drawing; the tree empties the rect of every region recorded with
+// `set_region` whose node is hidden or clipped away (ui.dado), and the next
+// paint, finding its rect remade, repaints whole.
+//
+// ## The theme, the box and the gutter
+//
+// Every colour is read from `theme_edit()` at paint; a new theme generation
+// repaints the whole view. The theme's normal box insets the view by its
+// content margins (its cells outside them are painted in the text
+// background, for the chrome pass to show through when that is alpha 0);
+// the focus box differs in ink only, which `text_edit_style_now` answers.
+//
+// Inside that, the **gutter** takes the left columns: the line numbers,
+// 1-based, right-aligned in as many digits as the line count has (at least
+// three), then `gutter_padding` blank cells; the text starts after it. It
+// scrolls with the text — row `k` numbers the view's first line plus `k` —
+// but never sideways. A view narrower than the gutter shows only gutter. The
+// caret's line's number is in `current_line_number_fg`, and when the theme's
+// `current_line_bg` is not transparent the caret's line's text cells take it.
+// Every column the widget reckons — the caret's, the goal, a press's, the
+// horizontal follow — is a text column, counted from the gutter's right
+// edge; a press in the gutter puts the caret at the start of that row's line.
+// `text_edit_set_gutter` turns it off, and the text then starts at the
+// view's left edge.
+//
+// What it repaints: a damaged row repaints its gutter cells only when the
+// line count changed (numbers appear, vanish or move) or the row is the
+// caret's old or new line and the caret changed lines; so typing on one line
+// repaints that line's text and no gutter. A gutter that changes width — the
+// line count crossing a power of ten, the theme's padding, the gutter turned
+// on or off — moves every text column, and repaints the whole view.
+//
+// ## Styled text
+//
+// A program may colour the text through a **style source**: one function and
+// a context pointer (`text_edit_set_styles`), asked at paint for each line it
+// paints and answering that line's `StyleSpan`s — byte ranges, each with a
+// role that indexes the theme's syntax palette (`EditTheme.syntax`,
+// `theme_syntax`). The widget knows nothing of what the roles mean. A span
+// sets the foreground of the cells its clusters begin in; the background,
+// the selection and the caret are painted as without one, so a selected span
+// or the caret's cell shows the selection's or the caret's colours. Spans are
+// read in order and held to the line (`paint_line` has the rules for
+// overlapping, inverted and out-of-range ones), so a source cannot make the
+// paint write outside the line's cells. A program that sets no source, or
+// sets one that answers no spans, paints exactly as before: one
+// `grid.text_from` a line.
+//
+// The spans are the program's. When they change without an edit — a
+// highlighter's answer arriving later — the program says which lines with
+// `text_edit_restyle`, which damages those of them in view (rows only, no
+// gutter) and nothing else; lines out of view are asked again when they
+// scroll in. What an edit damages is repainted from the source like any
+// other row, so a source that keeps its spans in step with the edits it is
+// told of through the edit source needs no restyle for them.
+//
+// **The cost** is the style source's call and one `grid.text_span` a run —
+// the gaps and the spans — instead of one `grid.text_from` a line. A run
+// ending at any byte keeps the ASCII fast path on exactly the cells a whole
+// line's call would take it on (`grid.text_span`), so a coloured line of
+// printable ASCII is still one table read a cell.
+//
+// ## Marks
+//
+// A program may lay backgrounds under byte ranges through a **mark source**
+// (`text_edit_set_marks`), the style source's shape exactly — one function,
+// asked at paint for each line painted, answering `StyleSpan`s — whose roles
+// index the theme's mark palette (`EditTheme.mark`, `MARK_MATCH`,
+// `MARK_CURRENT`) and set the **background** of the cells their clusters
+// begin in. It is a second source rather than a background field on a style
+// span because the two change for different reasons and on different
+// schedules: a highlighter's spans move with the text and land late, a find's
+// marks move with a needle typed in another widget, and one merged source
+// would make each re-derive the other's answer. Both are walked forward in
+// step, one run a change of either colour (`paint_line`), so a line with
+// neither costs exactly what it did and CP-8's foreground spans draw as
+// before under a mark. The selection and the caret are painted over marks,
+// as over spans. When the marks change with no edit — a new needle, a new
+// current match — the program repaints the lines in view with
+// `text_edit_remark`, which is `text_edit_restyle` without counting a
+// restyle; lines out of view are asked when they scroll in, so the source is
+// only ever asked about what is painted.
+//
+// ## Single-line mode
+//
+// A `line_edit` (widgets_line.dado) is this widget with `single` set, over its
+// own one-line text; that file says what the mode changes and why it is this
+// widget rather than a second one.
+package ui
+
+import "app:display"
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+import "core:chars"
+import "core:math"
+import "core:strings"
+import "core:time"
+
+// Insert `text` (which may hold newlines) at a position; answer the position
+// just after the inserted text, or the position given when it failed.
+type EditInsertFn: cell.TextPos(rawptr, cell.TextPos, string8)
+
+// Remove `[from, to)`, `from` before `to`, possibly across lines; answer
+// whether it did.
+type EditDeleteFn: bool(rawptr, cell.TextPos, cell.TextPos)
+
+// A document to edit. It always has at least one line; a source answering
+// fewer is read as one empty line.
+type EditSource: (
+    LineCountFn  count,
+    LineFn       line,
+    EditInsertFn insert,
+    EditDeleteFn remove,
+    rawptr       ctx,
+)
+
+// One styled run of a line: bytes `from` up to `to`, drawn in the theme's
+// syntax colour `role` (`theme_syntax`).
+type StyleSpan: (i32 from, i32 to, i32 role)
+
+// Line `line`'s styled runs, as a view valid until the next insert or remove
+// through the edit source, or the next call; an empty slice for a line with
+// none. Given the context pointer passed with it (`text_edit_set_styles`).
+// (The slice is named first: `[]StyleSpan(rawptr, i64)` reads as a slice of
+// functions.)
+type StyleSpans: []StyleSpan
+type LineStylesFn: StyleSpans(rawptr, i64)
+
+// Put text on a clipboard, answering whether it landed; and read it back, as
+// a view valid until the next call to either.
+type ClipboardSetFn: bool(string8)
+type ClipboardGetFn: string8()
+
+// The longest gap, in seconds, between the two presses of a double-click.
+const f64 DOUBLE_CLICK_S = 0.4
+
+// One primitive in the log. `text` holds `len` bytes: what was inserted, or
+// what the removal took.
+private type EditRec: (
+    bool         insert,
+    cell.TextPos from,
+    cell.TextPos to,
+    ref []char8  text,
+    i32          len,
+    cell.TextPos before,
+    cell.TextPos anchor_before,
+    cell.TextPos after,
+    // The version of the text this record leaves behind; see `version`.
+    i64          id,
+    // Records sharing a group undo and redo together.
+    i64          group,
+)
+
+private type EditState: (
+    EditSource     src,
+    bool           has_src,
+    bool           read_only,
+    cell.TextPos   caret,
+    cell.TextPos   anchor,
+    cell.Affinity  affinity,
+    bool           has_goal,
+    cell.VisualCol goal,
+    // The top record may take the next typed codepoint.
+    bool           open,
+    i64            offset_px,
+    i32            left_col,
+    ref []EditRec  recs,
+    // Records `[0, undo_n)` undo; `[undo_n, nrecs)` redo.
+    i32            nrecs,
+    i32            undo_n,
+    // Nonzero while a replace records its two primitives as one group.
+    i64            cur_group,
+    i64            next_group,
+    // Line numbers down the left; on unless turned off.
+    bool           gutter,
+    bool           dmg_all,
+    // A damaged row repaints its gutter cells too: set when the line count
+    // changed, which moves the numbers and may add or take one away.
+    bool           dmg_gutter,
+    bool           dmg_any,
+    i64            dmg_lo,
+    i64            dmg_hi,
+    bool           painted_once,
+    i64            last_top,
+    i32            last_left,
+    i32            last_unit,
+    cell.CellRect  last_rect,
+    cell.CellRect  last_clip,
+    i32            last_gutter_w,
+    i64            last_caret_line,
+    i64            last_gen,
+    i64            edits,
+    i64            lines_painted,
+    i64            gutter_painted,
+    // A version names one state of the text as the log knows it. Every record
+    // gets a fresh one when it is made and again whenever it grows, `base` is
+    // the text with nothing undoable, and `version` is whichever of them the
+    // text is in now — so undo and redo return to a version exactly when they
+    // return to that text. A log that had to be emptied starts a fresh base,
+    // because the text it would have returned to can no longer be reached.
+    // A group's version is its last record's, and undo and redo stop only
+    // between groups, so the version is never one from inside a group.
+    i64            next_id,
+    i64            base_id,
+    i64            version,
+    // The selection changed since the last announcement.
+    bool           sel_changed,
+    // A left press started a drag that has not ended.
+    bool           dragging,
+    // The last single press, for telling a double-click.
+    bool           has_press,
+    f64            press_t,
+    cell.CellPoint press_cell,
+    // The drag began with a double-click and extends by words; the word it
+    // selected is `[word_from, word_to)`.
+    bool           drag_words,
+    cell.TextPos   word_from,
+    cell.TextPos   word_to,
+    // The pointer has left the pressed cell since the press.
+    bool           drag_left,
+    // The grid region the view is drawn through, while `has_region`: made at
+    // the first paint on a grid that can make one, freed by `edit_free`.
+    // `region_on` says the last paint drew the view through it; while it is
+    // off the view is written straight into the layer, which shows no
+    // sub-row offset.
+    bool           has_region,
+    i32            region,
+    bool           region_on,
+    // The column index for one line (`cols_serve`): `ncols` marks in
+    // `cols` for line `cols_line` while `cols_keyed`, and the column of byte
+    // `memo_byte` while `memo_ok`.
+    bool                  cols_keyed,
+    i64                   cols_line,
+    ref []cell.ColumnMark cols,
+    i32                   ncols,
+    bool                  memo_ok,
+    i32                   memo_byte,
+    i32                   memo_col,
+    // The style source (`text_edit_set_styles`), nil for none; the spans it
+    // answered that the paint drew, and the `text_edit_restyle` calls that
+    // damaged a line in view, since the edit was made.
+    LineStylesFn          styles,
+    rawptr                styles_ctx,
+    i64                   spans_painted,
+    i64                   restyles,
+    // The mark source (`text_edit_set_marks`), nil for none, and the mark
+    // runs the paint drew from it since the edit was made.
+    LineStylesFn          marks,
+    rawptr                marks_ctx,
+    i64                   marks_painted,
+    // Single-line mode, which is what a `line_edit` is (widgets_line.dado):
+    // the text is the widget's own, `blen` bytes of `buf`, served through a
+    // source over it; `placeholder` is shown while it is empty; the key
+    // target is offered the vertical keys; `submit_mods` are the modifiers
+    // the last Enter was pressed with; `submits` and `cancels` count the
+    // Enters and Escapes.
+    bool                  single,
+    ref []char8           buf,
+    i32                   blen,
+    ref []char8           placeholder,
+    Control               key_target,
+    u32                   submit_mods,
+    i64                   submits,
+    i64                   cancels,
+)
+private type EditPtr: ^EditState
+
+// A damage range reaching the end of the document.
+private const i64 TO_END = 9223372036854775807
+
+private Kind g_edit_kind = NO_KIND
+// The screen column the last gutter row was drawn from; read by the tests,
+// which cannot read the grid.
+private i32  g_gutter_x
+// Cells a whole paint wrote outside the view (the box's margins), ever.
+private i64  g_edit_margin_cells
+
+private i32  g_sig_text = -1
+private i32  g_sig_caret = -1
+private i32  g_sig_sel = -1
+private i32  g_sig_refused = -1
+
+// The clipboard pair; nil means the display's.
+private ClipboardSetFn g_clip_set
+private ClipboardGetFn g_clip_get
+
+// The clock a double-click is timed on; nil means `time.now`. Tests set it.
+private type EditClockFn: f64()
+private EditClockFn g_edit_clock
+
+private Kind edit_kind():
+    if !kind_ok(g_edit_kind):
+        Hooks h
+        h.measure = edit_measure
+        h.arrange = nil
+        h.paint = edit_paint
+        h.input = edit_input
+        h.free = edit_free
+        h.style = edit_style_hook
+        h.cursor = edit_cursor
+        g_edit_kind = register_kind("text_edit", h)
+    return g_edit_kind
+
+// ── Pure arithmetic ────────────────────────────────────────────────────────
+//
+// Each answers from its arguments alone, so the tests exercise it with no
+// tree and no window.
+
+// The first visible line after the least scroll that shows `line` in a view
+// of `rows` rows whose first line is `top`. Unchanged for `rows` of zero or
+// less.
+i64 edit_follow_top(i64 top, i64 line, i32 rows):
+    if rows <= 0:
+        return top
+    if line < top:
+        return line
+    if line >= top + i64(rows):
+        return line - i64(rows) + 1
+    return top
+
+// The left column after the least scroll that shows column `col` in a view
+// `cols` wide whose left column is `left`. Unchanged for `cols` of zero or
+// less.
+i32 edit_follow_left(i32 left, i32 col, i32 cols):
+    if cols <= 0:
+        return left
+    if col < left:
+        return col
+    if col >= left + cols:
+        return col - cols + 1
+    return left
+
+// Lines a page moves: the view's rows less one, and at least one.
+i64 edit_page(i32 rows):
+    if rows <= 1:
+        return 1
+    return i64(rows) - 1
+
+// `byte` moved back to the start of the cluster it is inside, through the
+// seam: the column the cluster begins at, then the byte that column begins
+// at. Every cluster takes at least one column, so no two share one. Answers
+// `0` below the line and its length past it.
+i32 edit_snap(string8 line, i32 byte):
+    i32 n = i32(#len(line))
+    if byte <= 0:
+        return 0
+    if byte >= n:
+        return n
+    return i32(cell.logical_of(line, cell.visual_of(line, cell.LogicalOffset(byte))))
+
+// `byte` moved forward to the end of the cluster it is inside; unchanged at a
+// boundary.
+i32 edit_snap_forward(string8 line, i32 byte):
+    i32 b = edit_snap(line, byte)
+    if b >= byte:
+        return b
+    return i32(cell.next_visual(line, cell.caret(b)).offset)
+
+// One step right from `p` on `line` (line `p.line` of `count`): one cluster,
+// or to the next line's start from a line's end, or nowhere from the last.
+cell.TextPos edit_right(cell.TextPos p, string8 line, i64 count):
+    if p.byte < i32(#len(line)):
+        cell.Caret c = cell.next_visual(line, cell.caret(p.byte))
+        return cell.pos(p.line, i32(c.offset))
+    if p.line + 1 < count:
+        return cell.pos(p.line + 1, 0)
+    return p
+
+// One step left from `p` on `line`: one cluster, or to the end of the line
+// before (`prev_len` bytes long) from a line's start, or nowhere from the
+// first.
+cell.TextPos edit_left(cell.TextPos p, string8 line, i32 prev_len):
+    if p.byte > 0:
+        cell.Caret c = cell.prev_visual(line, cell.caret(p.byte))
+        return cell.pos(p.line, i32(c.offset))
+    if p.line > 0:
+        return cell.pos(p.line - 1, prev_len)
+    return p
+
+// The span Backspace removes at `p`: the cluster before it, or the line
+// break before the line; empty (`from == to`) at the start of the document.
+(cell.TextPos from, cell.TextPos to) edit_back_span(cell.TextPos p, string8 line, i32 prev_len):
+    if p.byte > 0:
+        return (cell.pos(p.line, chars.cluster_start(line, p.byte)), p)
+    if p.line > 0:
+        return (cell.pos(p.line - 1, prev_len), p)
+    return (p, p)
+
+// The span Delete removes at `p`: the cluster after it, or the line break
+// after the line; empty at the end of the document.
+(cell.TextPos from, cell.TextPos to) edit_forward_span(cell.TextPos p, string8 line, i64 count):
+    if p.byte < i32(#len(line)):
+        return (p, cell.pos(p.line, chars.cluster_end(line, p.byte)))
+    if p.line + 1 < count:
+        return (p, cell.pos(p.line + 1, 0))
+    return (p, p)
+
+// Whether typing `text` at `at` joins a record that is still open and ended
+// at `end`: it must be one codepoint, and not a newline.
+bool edit_joins(bool open, cell.TextPos end, cell.TextPos at, string8 text):
+    if !open || end != at || #len(text) == 0:
+        return false
+    return chars.count(text) == 1 && text != "\n"
+
+// `a` and `b` in text order.
+(cell.TextPos from, cell.TextPos to) edit_order(cell.TextPos a, cell.TextPos b):
+    if cell.pos_before(b, a):
+        return (b, a)
+    return (a, b)
+
+// The bytes of line `li` (`len` bytes long) inside the selection
+// `[from, to)`, and whether the line's break is selected too — true for every
+// line of it but the last. `(0, 0, false)` for a line outside it.
+(i32 a, i32 b, bool eol) edit_line_selection(cell.TextPos from, cell.TextPos to, i64 li, i32 len):
+    if !cell.pos_before(from, to) || li < from.line || li > to.line:
+        return (0, 0, false)
+    i32 a = 0
+    i32 b = len
+    if li == from.line:
+        a = from.byte
+    if li == to.line:
+        b = to.byte
+    return (a, b, li < to.line)
+
+// The class of the cluster starting at byte `at`, for word selection: 1 for a
+// letter, a digit, `_` or anything non-ASCII (most of which is letters in
+// some script); 2 for a space or a tab; 3 for the rest.
+i32 edit_word_class(string8 line, i32 at):
+    char8 ch = line[at]
+    if u8(ch) >= 0x80 || chars.is_alnum(ch) || ch == '_':
+        return 1
+    if ch == ' ' || ch == '\t':
+        return 2
+    return 3
+
+// The run of clusters of one class around byte `byte` of `line`: the cluster
+// starting there, or the last one when `byte` is at or past the end.
+// `(0, 0)` on an empty line.
+(i32 from, i32 to) edit_word_at(string8 line, i32 byte):
+    i32 n = i32(#len(line))
+    if n == 0:
+        return (0, 0)
+    i32 at = edit_snap(line, byte)
+    if at >= n:
+        at = chars.cluster_start(line, n)
+    i32 k = edit_word_class(line, at)
+    i32 a = at
+    for a > 0:
+        i32 q = chars.cluster_start(line, a)
+        if edit_word_class(line, q) != k:
+            break
+        a = q
+    i32 b = chars.cluster_end(line, at)
+    for b < n:
+        if edit_word_class(line, b) != k:
+            break
+        b = chars.cluster_end(line, b)
+    return (a, b)
+
+// How many digits the gutter gives a document of `lines` lines: the count's
+// own, and at least three, so the gutter does not change width through the
+// first 999 lines.
+i32 edit_gutter_digits(i64 lines):
+    i32 d = 1
+    i64 v = lines
+    for v >= 10:
+        v = v / 10
+        d = d + 1
+    if d < 3:
+        return 3
+    return d
+
+// The gutter's width in cells: the digits and then `padding` blank cells
+// (negative padding reads as zero).
+i32 edit_gutter_width(i64 lines, i32 padding):
+    i32 p = padding
+    if p < 0:
+        p = 0
+    return edit_gutter_digits(lines) + p
+
+// What the gutter shows for line `li` (0-based) of a document of `lines`
+// lines: its number, 1-based, right-aligned in `digits` characters written
+// into `out`, answered as a view of them; `digits` spaces for a line the
+// document does not have. A number with more digits than that keeps its
+// last ones. "" when `out` is shorter than `digits`, or `digits` is below
+// one.
+string8 edit_gutter_text(i64 li, i64 lines, i32 digits, []char8 out):
+    if digits < 1 || #len(out) < i64(digits):
+        return ""
+    for k in 0..<digits:
+        out[k] = ' '
+    if li >= 0 && li < lines:
+        i64 v = li + 1
+        i32 k = digits - 1
+        for k >= 0:
+            out[k] = char8(u8(48 + v % 10))
+            v = v / 10
+            if v == 0:
+                break
+            k = k - 1
+    return string8(out[0..<digits])
+
+// ── Construction and handles ───────────────────────────────────────────────
+
+// A text edit under `parent`, focusable, expanding both ways, with no source
+// (it shows nothing and handles nothing until `text_edit_set_source`).
+Control text_edit(Control parent):
+    Control c = create_owned(edit_kind(), parent, i64(#size(EditState)))
+    if !valid(c):
+        return NIL
+    ^EditState s = EditPtr(state(c))
+    s.gutter = true
+    s.affinity = cell.Affinity.After
+    s.last_top = -1
+    set_expand(c, true, true)
+    set_focusable(c, true)
+    return c
+
+private bool is_edit(Control c):
+    return kind(c) == g_edit_kind && state(c) != nil
+
+// A text edit that may be changed now: not while `update` runs, when the
+// repaint a change needs would be dropped.
+private bool edit_changeable(Control c):
+    return is_edit(c) && g_phase == PHASE_IDLE
+
+// ── Signals ────────────────────────────────────────────────────────────────
+
+// Emitted after every edit, undo and redo that changed the document.
+i32 text_changed_signal():
+    if g_sig_text < 0:
+        g_sig_text = signal("text_changed")
+    return g_sig_text
+
+// Emitted whenever the caret's position changes, by a key or a call.
+i32 caret_moved_signal():
+    if g_sig_caret < 0:
+        g_sig_caret = signal("caret_moved")
+    return g_sig_caret
+
+// Emitted whenever the selected range changes while it is, or was, not
+// empty; a caret moving with nothing selected is only `caret_moved`.
+i32 selection_changed_signal():
+    if g_sig_sel < 0:
+        g_sig_sel = signal("selection_changed")
+    return g_sig_sel
+
+// Emitted when a copy or cut found the clipboard refusing the selection
+// (longer than it holds, or no display to hold it); nothing was copied, and a
+// cut removed nothing.
+i32 clipboard_refused_signal():
+    if g_sig_refused < 0:
+        g_sig_refused = signal("clipboard_refused")
+    return g_sig_refused
+
+void on_text_changed(Control c, SignalFn fn, rawptr ctx):
+    connect(c, text_changed_signal(), fn, ctx)
+
+void on_caret_moved(Control c, SignalFn fn, rawptr ctx):
+    connect(c, caret_moved_signal(), fn, ctx)
+
+void on_selection_changed(Control c, SignalFn fn, rawptr ctx):
+    connect(c, selection_changed_signal(), fn, ctx)
+
+void on_clipboard_refused(Control c, SignalFn fn, rawptr ctx):
+    connect(c, clipboard_refused_signal(), fn, ctx)
+
+// A handler may remove `c`, which frees its state: nothing after the first
+// emit reads it, and each later one is skipped when `c` is gone.
+private void announce(Control c, bool text, bool moved):
+    if text:
+        _ = emit(c, text_changed_signal())
+    if moved && is_edit(c):
+        _ = emit(c, caret_moved_signal())
+    if !is_edit(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    if s.sel_changed:
+        s.sel_changed = false
+        _ = emit(c, selection_changed_signal())
+
+// ── Reading the source ─────────────────────────────────────────────────────
+
+// The source's own count, which may be below one.
+private i64 raw_count(^EditState s):
+    if !s.has_src || s.src.count == nil:
+        return 0
+    return s.src.count(s.src.ctx)
+
+// The line count the widget works with: zero without a source, else at least
+// one.
+private i64 doc_lines(^EditState s):
+    if !s.has_src:
+        return 0
+    i64 n = raw_count(s)
+    if n < 1:
+        return 1
+    return n
+
+// Line `i` as a view valid until the next insert or remove; "" for any line
+// the source does not have.
+private string8 doc_line(^EditState s, i64 i):
+    if !s.has_src || s.src.line == nil || i < 0 || i >= raw_count(s):
+        return ""
+    return s.src.line(s.src.ctx, i)
+
+// `p` moved into the document and back onto a cluster boundary.
+private cell.TextPos clamp_pos(^EditState s, cell.TextPos p):
+    return clamp_at(s, p, false)
+
+// `clamp_pos` for where the caret is about to go: its line claims the column
+// index (`cols_serve`), since the caret's questions come next.
+private cell.TextPos clamp_caret(^EditState s, cell.TextPos p):
+    return clamp_at(s, p, true)
+
+private cell.TextPos clamp_at(^EditState s, cell.TextPos p, bool claim):
+    i64 n = doc_lines(s)
+    i64 l = p.line
+    if l >= n:
+        l = n - 1
+    if l < 0:
+        l = 0
+    return cell.pos(l, edit_snap_in(s, l, doc_line(s, l), p.byte, claim || l == s.caret.line))
+
+// The caret and the anchor both clamped.
+private void clamp_sel(^EditState s):
+    s.caret = clamp_pos(s, s.caret)
+    s.anchor = clamp_pos(s, s.anchor)
+
+private bool has_sel(^EditState s):
+    return s.anchor != s.caret
+
+private (cell.TextPos from, cell.TextPos to) sel_range(^EditState s):
+    return edit_order(s.anchor, s.caret)
+
+// The end of the document.
+private cell.TextPos doc_end(^EditState s):
+    i64 last = doc_lines(s) - 1
+    string8 tail = doc_line(s, last)
+    return cell.pos(last, i32(#len(tail)))
+
+// The pixel height of a row. The grid answers zero before it is up, and a
+// view then counts one pixel a row, so the scroll arithmetic stays exact with
+// no window.
+private i32 edit_unit():
+    i32 h = grid.cell_h()
+    if h <= 0:
+        return 1
+    return h
+
+// ── Geometry ───────────────────────────────────────────────────────────────
+//
+// Three rectangles, nested: the node's rect; the view, which is that less the
+// theme's normal box's content margins; and the text, which is the view less
+// the gutter's columns on the left. Rows are the view's; columns are the
+// text's.
+
+private cell.CellRect edit_view(Control c):
+    return inner_rect(edit_box(c, STATE_NORMAL), rect(c))
+
+// The box for state `st` from the edit's table: `LineEditTheme`'s for a line
+// edit, `EditTheme`'s for any other.
+private StyleBox edit_box(Control c, i32 st):
+    rawptr p = state(c)
+    if p != nil && EditPtr(p).single:
+        return theme_line_edit().box[st]
+    return theme_edit().box[st]
+
+// The table a paint reads: `EditTheme`, or for a line edit that table with
+// `LineEditTheme`'s colours and boxes in place of its own and no current-line
+// highlight (a line edit has no gutter, so the gutter's fields go unread).
+private EditTheme edit_theme_of(^EditState s):
+    EditTheme th = theme_edit()
+    if !s.single:
+        return th
+    LineEditTheme le = theme_line_edit()
+    th.fg = le.fg
+    th.bg = le.bg
+    th.sel_bg = le.sel_bg
+    th.caret_fg = le.caret_fg
+    th.caret_bg = le.caret_bg
+    [4]u8 clear = [0, 0, 0, 0]
+    th.current_line_bg = clear
+    th.box = le.box
+    return th
+
+// The gutter's columns in a view `view_cols` wide: none when it is off, and
+// never more than the view has.
+private i32 gutter_cols(^EditState s, i32 view_cols):
+    if !s.gutter || view_cols <= 0:
+        return 0
+    i32 w = edit_gutter_width(doc_lines(s), theme_edit().gutter_padding)
+    if w > view_cols:
+        return view_cols
+    return w
+
+private cell.CellRect edit_text_rect(^EditState s, cell.CellRect vr):
+    i32 g = gutter_cols(s, vr.cols)
+    return cell.rect(vr.col + g, vr.row, vr.cols - g, vr.rows)
+
+// ── Damage ─────────────────────────────────────────────────────────────────
+
+private void damage(Control c, ^EditState s, i64 lo, i64 hi):
+    if !s.dmg_any:
+        s.dmg_lo = lo
+        s.dmg_hi = hi
+        s.dmg_any = true
+    else:
+        if lo < s.dmg_lo:
+            s.dmg_lo = lo
+        if hi > s.dmg_hi:
+            s.dmg_hi = hi
+    mark_paint(c)
+
+private void damage_all(Control c, ^EditState s):
+    s.dmg_all = true
+    mark_paint(c)
+
+// Damage for an edit between lines `a` and `b`: those lines, or everything
+// from the first down when the line count changed.
+private void damage_edit(Control c, ^EditState s, i64 a, i64 b, bool count_changed):
+    i64 lo = a
+    i64 hi = b
+    if b < a:
+        lo = b
+        hi = a
+    if count_changed:
+        hi = TO_END
+        s.dmg_gutter = true
+    damage(c, s, lo, hi)
+
+// ── Scrolling ──────────────────────────────────────────────────────────────
+
+private i64 max_offset(Control c, ^EditState s):
+    return max_scroll_px(doc_lines(s), edit_view(c).rows, edit_unit())
+
+// Scroll the least that shows the caret, both ways, to a whole line; a
+// sideways scroll repaints all. Rows and columns are the last layout's, so
+// before the first `update` nothing moves.
+private void follow(Control c, ^EditState s):
+    cell.CellRect r = edit_text_rect(s, edit_view(c))
+
+    i32 unit = edit_unit()
+    bool moved = false
+    if r.rows > 0:
+        // A caret on the top line, which a sub-row offset cuts, brings the
+        // view back to that line's top edge.
+        i64 top = top_line(s.offset_px, unit)
+        i64 nt = edit_follow_top(top, s.caret.line, r.rows)
+        if nt != top || (s.caret.line == top && sub_row(s, unit) != 0):
+            _ = scroll_to(c, s, nt * i64(unit))
+    if r.cols > 0:
+        string8 ln = doc_line(s, s.caret.line)
+        i32 col = edit_col(s, s.caret.line, ln, s.caret.byte, true)
+        // The caret covers its whole cluster — both cells of a wide one — so
+        // the last of them is brought into view first and then the first,
+        // which wins when the view is narrower than the cluster. A tab's
+        // caret is its first cell only.
+        i32 w = 1
+        if s.caret.byte < i32(#len(ln)) && u8(ln[s.caret.byte]) != 9:
+            w = cell.cluster_columns_at(ln, s.caret.byte, col)
+            if w < 1:
+                w = 1
+        i32 nl = edit_follow_left(s.left_col, col + w - 1, r.cols)
+        nl = edit_follow_left(nl, col, r.cols)
+        if nl != s.left_col:
+            s.left_col = nl
+            moved = true
+    if moved:
+        damage_all(c, s)
+
+// The part of the offset below a whole row.
+private i32 sub_row(^EditState s, i32 unit):
+    return i32(s.offset_px - top_line(s.offset_px, unit) * i64(unit))
+
+// Move the view to `offset_px`, clamped. Answers whether the first visible
+// line changed. A move that changes it marks the node for paint, and the
+// paint works out what to repaint (see the package comment); one within a row
+// repaints nothing: it moves the region's pixel offset and asks for a frame,
+// since no painted cell will.
+private bool scroll_to(Control c, ^EditState s, i64 offset_px):
+    i32 unit = edit_unit()
+    i64 was = s.offset_px
+    i64 before = top_line(was, unit)
+    s.offset_px = clamp_scroll(offset_px, max_offset(c, s))
+    if top_line(s.offset_px, unit) != before:
+        mark_paint(c)
+        return true
+    if s.offset_px != was && s.region_on:
+        grid.region_set_offset(s.region, sub_row(s, unit))
+        request_frame()
+    return false
+
+// A count of lines cut to the document's length first, so the multiplication
+// by the row height cannot overflow and wrap to the other end.
+private i64 cut_lines(^EditState s, i64 lines):
+    i64 n = doc_lines(s) + 1
+    if lines > n:
+        return n
+    if lines < 0 - n:
+        return 0 - n
+    return lines
+
+// ── The caret and the selection ────────────────────────────────────────────
+
+// Put the anchor at `anchor` and the caret at `p` (both already clamped),
+// dropping the goal column unless `keep_goal`. Damages the caret's old and
+// new lines when it moved, and for each end of the selection that moved, the
+// lines between its old and new place. Answers whether the caret moved.
+private bool place_sel(Control c, ^EditState s, cell.TextPos anchor, cell.TextPos p, bool keep_goal):
+    if !keep_goal:
+        s.has_goal = false
+    if p == s.caret && anchor == s.anchor:
+        follow(c, s)
+        return false
+    (cell.TextPos f1, cell.TextPos t1) = sel_range(s)
+    (cell.TextPos f2, cell.TextPos t2) = edit_order(anchor, p)
+    bool was = has_sel(s)
+    bool moved = p != s.caret
+    if moved:
+        damage(c, s, s.caret.line, s.caret.line)
+        damage(c, s, p.line, p.line)
+    if f1 != f2:
+        damage_edit(c, s, f1.line, f2.line, false)
+    if t1 != t2:
+        damage_edit(c, s, t1.line, t2.line, false)
+    if (was || anchor != p) && (f1 != f2 || t1 != t2):
+        s.sel_changed = true
+    s.caret = p
+    s.anchor = anchor
+    s.affinity = cell.Affinity.After
+    follow(c, s)
+    return moved
+
+// The caret at `p` (already clamped), the selection collapsed onto it.
+private bool place(Control c, ^EditState s, cell.TextPos p, bool keep_goal):
+    return place_sel(c, s, p, p, keep_goal)
+
+// A motion: it closes the open record whether or not the caret moved. With
+// `extend` the anchor stays, otherwise the selection collapses at the caret.
+private void motion(Control c, ^EditState s, cell.TextPos p, bool keep_goal, bool extend):
+    s.open = false
+    cell.TextPos q = clamp_caret(s, p)
+    cell.TextPos a = q
+    if extend:
+        a = clamp_pos(s, s.anchor)
+    announce(c, false, place_sel(c, s, a, q, keep_goal))
+
+// Select `[anchor, caret)` in either order, closing the open record.
+private void select_span(Control c, ^EditState s, cell.TextPos anchor, cell.TextPos caret):
+    s.open = false
+    announce(c, false, place_sel(c, s, clamp_pos(s, anchor), clamp_caret(s, caret), false))
+
+// Up and Down by `delta` lines, aiming at the goal column. From the first
+// line upward the caret goes to its start, and from the last downward to its
+// end; the goal stays, so the next move back finds its column again. With
+// `scroll`, the view moves by as many lines as the caret did (PageUp and
+// PageDown).
+private void vertical(Control c, ^EditState s, i64 delta, bool scroll, bool extend):
+    clamp_sel(s)
+    string8 here = doc_line(s, s.caret.line)
+    if !s.has_goal:
+        s.goal = cell.VisualCol(edit_col(s, s.caret.line, here, s.caret.byte, true))
+        s.has_goal = true
+    i64 n = doc_lines(s)
+    i64 target = s.caret.line + cut_lines(s, delta)
+    if target < 0:
+        target = 0
+    if target > n - 1:
+        target = n - 1
+    cell.TextPos p = s.caret
+    if target == s.caret.line:
+        if delta < 0:
+            p = cell.pos(target, 0)
+        else if delta > 0:
+            p = cell.pos(target, i32(#len(here)))
+    else:
+        // The caret lands on `target`, so its line claims the index now.
+        p = cell.pos(target, edit_logical(s, target, doc_line(s, target), i32(s.goal), true))
+    if scroll && target != s.caret.line:
+        i32 unit = edit_unit()
+        _ = scroll_to(c, s, (top_line(s.offset_px, unit) + target - s.caret.line) * i64(unit))
+    motion(c, s, p, true, extend)
+
+// ── The log ────────────────────────────────────────────────────────────────
+
+private void free_text(^EditRec r):
+    if r.text != nil:
+        #delete(r.text)
+        r.text = nil
+    r.len = 0
+
+// Drop every record that could be redone.
+private void drop_redo(^EditState s):
+    for i in s.undo_n..<s.nrecs:
+        free_text(&s.recs[i])
+    s.nrecs = s.undo_n
+
+private i64 fresh_id(^EditState s):
+    s.next_id = s.next_id + 1
+    return s.next_id
+
+private i64 fresh_group(^EditState s):
+    s.next_group = s.next_group + 1
+    return s.next_group
+
+private void clear_log(^EditState s):
+    s.undo_n = 0
+    drop_redo(s)
+    s.open = false
+    s.base_id = fresh_id(s)
+    s.version = s.base_id
+
+// The version the text is in once the top `undo_n` records are applied.
+private i64 version_at(^EditState s):
+    if s.undo_n <= 0 || s.recs == nil:
+        return s.base_id
+    return s.recs[s.undo_n - 1].id
+
+// A copy of `text` in the tree's allocator, or nil when it cannot be made.
+private ref []char8 copy_text(string8 text):
+    i64 n = #len(text)
+    if n < 1:
+        n = 1
+    ref []char8 t = #make([]char8, n, g_alloc)
+    if t == nil:
+        return nil
+    for i in 0..<#len(text):
+        t[i] = text[i]
+    return t
+
+private string8 rec_text(^EditRec r):
+    if r.text == nil || r.len <= 0:
+        return ""
+    return string8(r.text[0..<r.len])
+
+// Push a record, after dropping the redo side, into the open group or a new
+// group of its own. `anchor_before` and `before` are the selection it
+// restores. A record that cannot be stored empties the log rather than
+// leaving one that undoes the wrong thing.
+private void push_rec(^EditState s, bool insert, cell.TextPos from, cell.TextPos to, ref []char8 text, i32 len, cell.TextPos anchor_before, cell.TextPos before, cell.TextPos after):
+    drop_redo(s)
+    if s.recs == nil:
+        s.recs = #make([]EditRec, 16, g_alloc)
+    else if s.nrecs >= i32(#len(s.recs)):
+        if !#resize(s.recs, #len(s.recs) * 2):
+            if text != nil:
+                #delete(text)
+            clear_log(s)
+            return
+    if s.recs == nil || text == nil:
+        if text != nil:
+            #delete(text)
+        clear_log(s)
+        return
+    ^EditRec r = &s.recs[s.nrecs]
+    r.insert = insert
+    r.from = from
+    r.to = to
+    r.text = text
+    r.len = len
+    r.before = before
+    r.anchor_before = anchor_before
+    r.after = after
+    r.id = fresh_id(s)
+    if s.cur_group != 0:
+        r.group = s.cur_group
+    else:
+        r.group = fresh_group(s)
+    s.nrecs = s.nrecs + 1
+    s.undo_n = s.nrecs
+    s.version = r.id
+
+// Append `text` to the open top record, which now ends at `to`. Answers false
+// when it cannot grow, and the caller pushes a record of its own instead.
+private bool extend_rec(^EditState s, string8 text, cell.TextPos to, cell.TextPos after):
+    ^EditRec r = &s.recs[s.nrecs - 1]
+    i64 need = i64(r.len) + #len(text)
+    if need > #len(r.text):
+        i64 cap = #len(r.text) * 2
+        if cap < need:
+            cap = need
+        if !#resize(r.text, cap):
+            return false
+    for i in 0..<#len(text):
+        r.text[i64(r.len) + i64(i)] = text[i]
+    r.len = i32(need)
+    r.to = to
+    r.after = after
+    r.id = fresh_id(s)
+    s.version = r.id
+    return true
+
+// A copy of `[from, to)`, lines joined by "\n", exactly as long as the span
+// (one byte for an empty one), or nil when it cannot be made.
+private ref []char8 grab(^EditState s, cell.TextPos from, cell.TextPos to):
+    i64 total = 0
+    for l in from.line..<(to.line + 1):
+        string8 ln = doc_line(s, l)
+        i64 a = 0
+        i64 b = #len(ln)
+        if l == from.line:
+            a = i64(from.byte)
+        if l == to.line:
+            b = i64(to.byte)
+        if b > a:
+            total = total + (b - a)
+        if l < to.line:
+            total = total + 1
+    i64 cap = total
+    if cap < 1:
+        cap = 1
+    ref []char8 t = #make([]char8, cap, g_alloc)
+    if t == nil:
+        return nil
+    i64 k = 0
+    for l in from.line..<(to.line + 1):
+        string8 ln = doc_line(s, l)
+        i64 a = 0
+        i64 b = #len(ln)
+        if l == from.line:
+            a = i64(from.byte)
+        if l == to.line:
+            b = i64(to.byte)
+        for j in a..<b:
+            t[k] = ln[j]
+            k = k + 1
+        if l < to.line:
+            t[k] = '\n'
+            k = k + 1
+    return t
+
+// ── The two primitives, through the source ─────────────────────────────────
+
+// Answers whether the source took the insert, and where the text ended.
+private (bool ok, cell.TextPos end) src_insert(Control c, ^EditState s, cell.TextPos at, string8 text):
+    if !s.has_src || s.src.insert == nil || #len(text) == 0:
+        return (false, at)
+    i64 before = raw_count(s)
+    cell.TextPos e = s.src.insert(s.src.ctx, at, text)
+    if e == at:
+        return (false, at)
+    s.edits = s.edits + 1
+    bool count_changed = raw_count(s) != before
+    cols_edit(s, at.line, at.byte, count_changed)
+    damage_edit(c, s, at.line, e.line, count_changed)
+    return (true, e)
+
+private bool src_remove(Control c, ^EditState s, cell.TextPos from, cell.TextPos to):
+    if !s.has_src || s.src.remove == nil || !cell.pos_before(from, to):
+        return false
+    i64 before = raw_count(s)
+    if !s.src.remove(s.src.ctx, from, to):
+        return false
+    s.edits = s.edits + 1
+    bool count_changed = raw_count(s) != before
+    cols_edit(s, from.line, from.byte, count_changed)
+    damage_edit(c, s, from.line, to.line, count_changed)
+    return true
+
+// ── Edits ──────────────────────────────────────────────────────────────────
+//
+// The `_core` forms change the document and the log and announce nothing, so
+// a replace can make two of them before its one announcement; they answer
+// whether the document changed and whether the caret moved.
+
+// Insert `text` at `at`, taken as it is: a boundary the caller vouches for,
+// never snapped here. `typed` marks one codepoint from the keyboard, which
+// may join the open record. The caret is snapped only after the insert.
+private (bool changed, bool moved) insert_core(Control c, ^EditState s, cell.TextPos at, string8 text, bool typed):
+    if s.read_only || !s.has_src:
+        return (false, false)
+    bool joins = typed && s.undo_n == s.nrecs && s.nrecs > 0 && s.recs[s.nrecs - 1].insert && edit_joins(s.open, s.recs[s.nrecs - 1].to, at, text)
+    (bool ok, cell.TextPos e) = src_insert(c, s, at, text)
+    if !ok:
+        return (false, false)
+    cell.TextPos after = cell.pos(e.line, edit_snap_forward_in(s, e.line, doc_line(s, e.line), e.byte, true))
+    if !joins || !extend_rec(s, text, e, after):
+        push_rec(s, true, at, e, copy_text(text), i32(#len(text)), s.anchor, s.caret, after)
+    bool moved = place(c, s, after, false)
+    s.open = typed && text != "\n"
+    return (true, moved)
+
+// Remove `[from, to)` and leave the caret at `from`, the selection collapsed.
+private (bool changed, bool moved) remove_core(Control c, ^EditState s, cell.TextPos from, cell.TextPos to):
+    s.open = false
+    s.has_goal = false
+    if s.read_only || !s.has_src || !cell.pos_before(from, to):
+        return (false, false)
+    cell.TextPos before = s.caret
+    cell.TextPos anchor = s.anchor
+    ref []char8 copy = grab(s, from, to)
+    i32 len = 0
+    if copy != nil:
+        len = i32(#len(copy))
+    if !src_remove(c, s, from, to):
+        if copy != nil:
+            #delete(copy)
+        return (false, false)
+    cell.TextPos after = clamp_caret(s, from)
+    push_rec(s, false, from, to, copy, len, anchor, before, after)
+    return (true, place(c, s, after, false))
+
+private bool remove_span(Control c, ^EditState s, cell.TextPos from, cell.TextPos to):
+    (bool changed, bool moved) = remove_core(c, s, from, to)
+    if changed:
+        announce(c, true, moved)
+    return changed
+
+// Put `text` where the selection is: an insert at the caret when it is
+// empty, else a removal of it and an insert in its place, recorded as one
+// group. Refused whole when the removal is. Answers whether the document
+// changed.
+//
+// The insert goes at the removal's `from` exactly, not at the caret the
+// removal left: the join can make the bytes on either side of `from` one
+// cluster (`e` then a mark that began the next line), the caret is snapped
+// back to that cluster's start, and an insert there would land before a
+// character that was never selected.
+private bool replace_selection(Control c, ^EditState s, string8 text, bool typed):
+    if s.read_only || !s.has_src:
+        return false
+    clamp_sel(s)
+    cell.TextPos before = s.caret
+    if !has_sel(s):
+        (bool changed, bool moved) = insert_core(c, s, s.caret, text, typed)
+        if changed:
+            announce(c, true, moved)
+        return changed
+    (cell.TextPos from, cell.TextPos to) = sel_range(s)
+    s.cur_group = fresh_group(s)
+    (bool removed, bool _) = remove_core(c, s, from, to)
+    if removed && #len(text) > 0:
+        (bool _, bool _) = insert_core(c, s, from, text, typed)
+    s.cur_group = 0
+    if !removed:
+        return false
+    announce(c, true, s.caret != before)
+    return true
+
+private bool backspace(Control c, ^EditState s):
+    clamp_sel(s)
+    if has_sel(s):
+        (cell.TextPos sf, cell.TextPos st) = sel_range(s)
+        return remove_span(c, s, sf, st)
+    cell.TextPos p = s.caret
+    i32 prev_len = 0
+    if p.line > 0:
+        string8 above = doc_line(s, p.line - 1)
+        prev_len = i32(#len(above))
+    (cell.TextPos from, cell.TextPos to) = edit_back_span(p, doc_line(s, p.line), prev_len)
+    return remove_span(c, s, from, to)
+
+private bool delete_forward(Control c, ^EditState s):
+    clamp_sel(s)
+    if has_sel(s):
+        (cell.TextPos sf, cell.TextPos st) = sel_range(s)
+        return remove_span(c, s, sf, st)
+    cell.TextPos p = s.caret
+    (cell.TextPos from, cell.TextPos to) = edit_forward_span(p, doc_line(s, p.line), doc_lines(s))
+    return remove_span(c, s, from, to)
+
+// Undo the top group, last record first, and restore the selection the
+// group's first record was made over.
+private bool undo(Control c, ^EditState s):
+    s.open = false
+    s.has_goal = false
+    if s.read_only || !s.has_src || s.undo_n <= 0:
+        return false
+    i64 g = s.recs[s.undo_n - 1].group
+    bool any = false
+    cell.TextPos caret = s.caret
+    cell.TextPos anchor = s.anchor
+    for s.undo_n > 0 && s.recs[s.undo_n - 1].group == g:
+        ^EditRec r = &s.recs[s.undo_n - 1]
+        bool ok = false
+        if r.insert:
+            ok = src_remove(c, s, r.from, r.to)
+        else:
+            (bool took, cell.TextPos _) = src_insert(c, s, r.from, rec_text(r))
+            ok = took
+        if !ok:
+            break
+        s.undo_n = s.undo_n - 1
+        any = true
+        caret = r.before
+        anchor = r.anchor_before
+    if !any:
+        return false
+    s.version = version_at(s)
+    bool moved = place_sel(c, s, clamp_pos(s, anchor), clamp_caret(s, caret), false)
+    announce(c, true, moved)
+    return true
+
+// Redo the next group, first record first; the caret goes where its last
+// record left it.
+private bool redo(Control c, ^EditState s):
+    s.open = false
+    s.has_goal = false
+    if s.read_only || !s.has_src || s.undo_n >= s.nrecs:
+        return false
+    i64 g = s.recs[s.undo_n].group
+    bool any = false
+    cell.TextPos caret = s.caret
+    for s.undo_n < s.nrecs && s.recs[s.undo_n].group == g:
+        ^EditRec r = &s.recs[s.undo_n]
+        bool ok = false
+        if r.insert:
+            (bool took, cell.TextPos e) = src_insert(c, s, r.from, rec_text(r))
+            ok = took
+            if took:
+                r.to = e
+        else:
+            ok = src_remove(c, s, r.from, r.to)
+        if !ok:
+            break
+        s.undo_n = s.undo_n + 1
+        any = true
+        caret = r.after
+    if !any:
+        return false
+    s.version = version_at(s)
+    bool moved = place(c, s, clamp_caret(s, caret), false)
+    announce(c, true, moved)
+    return true
+
+// ── The clipboard ──────────────────────────────────────────────────────────
+
+private bool display_clip_set(string8 text):
+    return display.clipboard_set(text)
+
+// Before the window opens sokol has no clipboard to read, and answers "".
+private string8 display_clip_get():
+    if !display.valid():
+        return ""
+    return strings.borrow_from_cstring(display.clipboard_get())
+
+private bool clip_set(string8 text):
+    if g_clip_set != nil:
+        return g_clip_set(text)
+    return display_clip_set(text)
+
+private string8 clip_get():
+    if g_clip_get != nil:
+        return g_clip_get()
+    return display_clip_get()
+
+// Put the non-empty selection on the clipboard. Answers whether it landed;
+// on a refusal emits `clipboard_refused`, so a caller reads `s` no more.
+private bool copy_sel(Control c, ^EditState s):
+    clamp_sel(s)
+    (cell.TextPos from, cell.TextPos to) = sel_range(s)
+    ref []char8 t = grab(s, from, to)
+    bool ok = false
+    if t != nil:
+        ok = clip_set(string8(t[0..<#len(t)]))
+        #delete(t)
+    if !ok:
+        _ = emit(c, clipboard_refused_signal())
+    return ok
+
+// Copy, then remove, the selection: nothing is removed when the copy was
+// refused. Refused whole on a read-only edit, which copies nothing either —
+// a cut that only copied would look like it had cut.
+private bool cut(Control c, ^EditState s):
+    clamp_sel(s)
+    if s.read_only || !s.has_src || !has_sel(s):
+        return false
+    if !copy_sel(c, s):
+        return false
+    (cell.TextPos from, cell.TextPos to) = sel_range(s)
+    return remove_span(c, s, from, to)
+
+// `text` with every CR LF and every lone CR made one LF, in a copy exactly as
+// long as the result, or nil when that is empty or cannot be made.
+private ref []char8 plain_newlines(string8 text):
+    i64 n = #len(text)
+    i64 k = 0
+    for i in 0..<n:
+        if !(text[i] == '\r' && i + 1 < n && text[i + 1] == '\n'):
+            k = k + 1
+    if k == 0:
+        return nil
+    ref []char8 t = #make([]char8, k, g_alloc)
+    if t == nil:
+        return nil
+    i64 j = 0
+    for i in 0..<n:
+        char8 ch = text[i]
+        if ch == '\r':
+            if i + 1 < n && text[i + 1] == '\n':
+                continue
+            ch = '\n'
+        t[j] = ch
+        j = j + 1
+    return t
+
+// Replace the selection with the clipboard's text, as one undo step.
+private bool paste(Control c, ^EditState s):
+    s.open = false
+    if s.read_only || !s.has_src:
+        return false
+    ref []char8 t = plain_newlines(clip_get())
+    if t == nil:
+        return false
+    bool ok = replace_selection(c, s, string8(t[0..<#len(t)]), false)
+    #delete(t)
+    return ok
+
+// ── Public entry points ────────────────────────────────────────────────────
+
+// Give the edit its document. The caret goes to the start with nothing
+// selected, the view to the top, the log is emptied, and everything
+// repaints. Announces nothing: the program that called it knows.
+void text_edit_set_source(Control c, EditSource src):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    // A line edit's source is its own text, and stays so.
+    if s.single:
+        return
+    clear_log(s)
+    cols_forget(s)
+    s.src = src
+    s.has_src = true
+    s.caret = cell.pos(0, 0)
+    s.anchor = s.caret
+    s.sel_changed = false
+    s.dragging = false
+    s.drag_words = false
+    s.has_press = false
+    s.affinity = cell.Affinity.After
+    s.has_goal = false
+    s.offset_px = 0
+    s.left_col = 0
+    damage_all(c, s)
+
+// A read-only edit refuses every change to the document, undo and redo
+// included, and still moves its caret, selects, copies and scrolls.
+void text_edit_set_read_only(Control c, bool on):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    s.read_only = on
+
+bool text_edit_read_only(Control c):
+    return is_edit(c) && EditPtr(state(c)).read_only
+
+// Insert `text` at the caret, replacing the selection, as one undo step of
+// its own that closes the open record. Answers whether the document changed.
+bool text_edit_insert(Control c, string8 text):
+    if !edit_changeable(c):
+        return false
+    ^EditState s = EditPtr(state(c))
+    s.open = false
+    return replace_selection(c, s, text, false)
+
+bool text_edit_undo(Control c):
+    if !edit_changeable(c):
+        return false
+    return undo(c, EditPtr(state(c)))
+
+bool text_edit_redo(Control c):
+    if !edit_changeable(c):
+        return false
+    return redo(c, EditPtr(state(c)))
+
+bool text_edit_can_undo(Control c):
+    if !is_edit(c):
+        return false
+    ^EditState s = EditPtr(state(c))
+    return !s.read_only && s.undo_n > 0
+
+bool text_edit_can_redo(Control c):
+    if !is_edit(c):
+        return false
+    ^EditState s = EditPtr(state(c))
+    return !s.read_only && s.undo_n < s.nrecs
+
+// The version the text is in, as the undo log knows it: equal to a version
+// read earlier exactly when undo and redo have brought the text back to what
+// it was then. A program remembers the version at a save and compares, which
+// is how undoing back to the saved text reads as unmodified. Zero for
+// anything that is not a live text edit.
+i64 text_edit_version(Control c):
+    if !is_edit(c):
+        return 0
+    return EditPtr(state(c)).version
+
+// How many records undo and redo, whatever `read_only` says. A replace is two
+// records in one group, so one undo can move this by two.
+(i32 undo, i32 redo) text_edit_history(Control c):
+    if !is_edit(c):
+        return (0, 0)
+    ^EditState s = EditPtr(state(c))
+    return (s.undo_n, s.nrecs - s.undo_n)
+
+// Move the caret to `p`, clamped into the document and back onto the start
+// of the cluster it lands inside, collapsing the selection. Does nothing
+// without a source.
+void text_edit_set_caret(Control c, cell.TextPos p):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    if !s.has_src:
+        return
+    motion(c, s, p, false, false)
+
+// The caret; `(0, 0)` for anything that is not a live text edit.
+cell.TextPos text_edit_caret(Control c):
+    if !is_edit(c):
+        return cell.pos(0, 0)
+    return EditPtr(state(c)).caret
+
+// The anchor: the end of the selection the caret is not at, and the caret
+// itself when nothing is selected.
+cell.TextPos text_edit_anchor(Control c):
+    if !is_edit(c):
+        return cell.pos(0, 0)
+    return EditPtr(state(c)).anchor
+
+// The selection in text order; `from == to` when it is empty.
+(cell.TextPos from, cell.TextPos to) text_edit_selection(Control c):
+    if !is_edit(c):
+        return (cell.pos(0, 0), cell.pos(0, 0))
+    return sel_range(EditPtr(state(c)))
+
+// Select from `anchor` to `caret`, each clamped and snapped as
+// `text_edit_set_caret` does; equal positions collapse it. Does nothing
+// without a source.
+void text_edit_set_selection(Control c, cell.TextPos anchor, cell.TextPos caret):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    if !s.has_src:
+        return
+    select_span(c, s, anchor, caret)
+
+// Select the whole document, the caret at its end.
+void text_edit_select_all(Control c):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    if !s.has_src:
+        return
+    select_span(c, s, cell.pos(0, 0), doc_end(s))
+
+// A copy of the selected text, lines joined by "\n", in the tree's
+// allocator, for the caller to `#delete`; nil when nothing is selected.
+ref []char8 text_edit_selected_text(Control c):
+    if !is_edit(c):
+        return nil
+    ^EditState s = EditPtr(state(c))
+    clamp_sel(s)
+    if !s.has_src || !has_sel(s):
+        return nil
+    (cell.TextPos from, cell.TextPos to) = sel_range(s)
+    return grab(s, from, to)
+
+// Copy the selection to the clipboard. False with nothing selected (the
+// clipboard untouched) and when the clipboard refused it.
+bool text_edit_copy(Control c):
+    if !edit_changeable(c):
+        return false
+    ^EditState s = EditPtr(state(c))
+    clamp_sel(s)
+    if !s.has_src || !has_sel(s):
+        return false
+    return copy_sel(c, s)
+
+// Copy the selection and remove it, as one undo step. False when anything
+// refused, and then nothing was removed.
+bool text_edit_cut(Control c):
+    if !edit_changeable(c):
+        return false
+    return cut(c, EditPtr(state(c)))
+
+// Replace the selection with the clipboard's text, CR LF made LF, as one undo
+// step. False when the clipboard is empty or the edit refused.
+bool text_edit_paste(Control c):
+    if !edit_changeable(c):
+        return false
+    return paste(c, EditPtr(state(c)))
+
+// Route every text edit's clipboard through `set` and `get`; nil for either
+// puts the display's back.
+void text_edit_set_clipboard(ClipboardSetFn set, ClipboardGetFn get):
+    g_clip_set = set
+    g_clip_get = get
+
+// Scroll the view by `lines` (negative is up) from its first visible line,
+// without moving the caret, landing on a whole line. Answers whether the
+// first visible line changed.
+bool text_edit_scroll_lines(Control c, i64 lines):
+    if !edit_changeable(c):
+        return false
+    ^EditState s = EditPtr(state(c))
+    i32 unit = edit_unit()
+    return scroll_to(c, s, (top_line(s.offset_px, unit) + cut_lines(s, lines)) * i64(unit))
+
+// Scroll the view to pixel offset `offset_px`, clamped, without moving the
+// caret: what the wheel does, for a program or a test. Answers whether the
+// first visible line changed.
+bool text_edit_scroll_to_px(Control c, i64 offset_px):
+    if !edit_changeable(c):
+        return false
+    return scroll_to(c, EditPtr(state(c)), offset_px)
+
+// The grid region the view is drawn through, -1 while it has none.
+i32 text_edit_region(Control c):
+    if !is_edit(c):
+        return -1
+    ^EditState s = EditPtr(state(c))
+    if !s.has_region:
+        return -1
+    return s.region
+
+// The first visible line, and the pixel offset it comes from.
+(i64 top, i64 offset_px) text_edit_position(Control c):
+    if !is_edit(c):
+        return (0, 0)
+    ^EditState s = EditPtr(state(c))
+    return (top_line(s.offset_px, edit_unit()), s.offset_px)
+
+// The first visible column.
+i32 text_edit_left_col(Control c):
+    if !is_edit(c):
+        return 0
+    return EditPtr(state(c)).left_col
+
+// Edits applied through the source (undo and redo included) and document
+// lines painted, since the edit was made — the counters an instrument reads.
+(i64 edits, i64 lines_painted) text_edit_counters(Control c):
+    if !is_edit(c):
+        return (0, 0)
+    ^EditState s = EditPtr(state(c))
+    return (s.edits, s.lines_painted)
+
+// Rows whose gutter cells were painted since the edit was made.
+i64 text_edit_gutter_painted(Control c):
+    if !is_edit(c):
+        return 0
+    return EditPtr(state(c)).gutter_painted
+
+// Show or hide the line-number gutter (shown by default). The text's columns
+// move, so the view scrolls to keep the caret shown and repaints whole.
+void text_edit_set_gutter(Control c, bool on):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    if s.gutter == on || s.single:
+        return
+    s.gutter = on
+    damage_all(c, s)
+    follow(c, s)
+
+bool text_edit_gutter(Control c):
+    return is_edit(c) && EditPtr(state(c)).gutter
+
+// The gutter's width in cells as the last layout leaves it: zero when it is
+// off, and never wider than the view.
+i32 text_edit_gutter_width(Control c):
+    if !is_edit(c):
+        return 0
+    ^EditState s = EditPtr(state(c))
+    return gutter_cols(s, edit_view(c).cols)
+
+// What the gutter shows on screen row `row` now — the number of the line the
+// view puts there, right-aligned, without the padding — written into `out`
+// and answered as a view of it; "" for a row outside the view, with the
+// gutter off, or with `out` too short. The reader a test uses where it cannot
+// read the grid.
+string8 text_edit_gutter_text(Control c, i32 row, []char8 out):
+    if !is_edit(c):
+        return ""
+    ^EditState s = EditPtr(state(c))
+    cell.CellRect v = edit_view(c)
+    if gutter_cols(s, v.cols) <= 0 || row < v.row || row >= v.row + v.rows:
+        return ""
+    i64 li = top_line(s.offset_px, edit_unit()) + i64(row - v.row)
+    i64 n = doc_lines(s)
+    return edit_gutter_text(li, n, edit_gutter_digits(n), out)
+
+// The box the edit's chrome is drawn with now: the theme's focus box while it
+// has focus, its normal box otherwise. `style_empty()` for anything that is
+// not a live text edit.
+StyleBox text_edit_style_now(Control c):
+    if !is_edit(c):
+        return style_empty()
+    if focused() == c:
+        return edit_box(c, STATE_FOCUS)
+    return edit_box(c, STATE_NORMAL)
+
+// Colour the text through `fn` (see the package comment's "Styled text"),
+// or, with `fn` nil, draw it all in the text colour again. Repaints the whole
+// view either way. Does nothing to anything but a live text edit, and nothing
+// while `update` runs.
+void text_edit_set_styles(Control c, LineStylesFn fn, rawptr ctx):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    s.styles = fn
+    s.styles_ctx = ctx
+    damage_all(c, s)
+
+// Whether a style source is set.
+bool text_edit_has_styles(Control c):
+    return is_edit(c) && EditPtr(state(c)).styles != nil
+
+// The style source's answers changed for lines `from` up to but not including
+// `to`, with no edit to say so: repaint those of them in view at the next
+// paint — their rows only, text cells and not the gutter — and nothing for
+// the rest, which are painted from the source when they scroll in. A range
+// with no line in view (the view's rows and the spare row below them, as the
+// last layout left them) marks nothing. Does nothing to anything but a live
+// text edit, and nothing while `update` runs.
+void text_edit_restyle(Control c, i64 from, i64 to):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    (i64 lo, i64 hi) = edit_restyle_range(from, to, top_line(s.offset_px, edit_unit()), edit_view(c).rows)
+    if lo > hi:
+        return
+    s.restyles = s.restyles + 1
+    damage(c, s, lo, hi)
+
+// The lines `[from, to)` that a view of `rows` rows whose first line is `top`
+// shows — its rows and the spare row below them — as an inclusive pair;
+// `lo > hi` when none. Pure.
+(i64 lo, i64 hi) edit_restyle_range(i64 from, i64 to, i64 top, i32 rows):
+    if rows <= 0 || to <= from:
+        return (1, 0)
+    i64 lo = from
+    i64 hi = to - 1
+    if lo < top:
+        lo = top
+    if hi > top + i64(rows):
+        hi = top + i64(rows)
+    return (lo, hi)
+
+// Lay the backgrounds `fn` answers under the text (see "Marks" in the
+// package comment), or, with `fn` nil, take them away. Repaints the whole
+// view either way. Does nothing to anything but a live text edit, and nothing
+// while `update` runs.
+void text_edit_set_marks(Control c, LineStylesFn fn, rawptr ctx):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    if s.marks == fn && s.marks_ctx == ctx:
+        return
+    s.marks = fn
+    s.marks_ctx = ctx
+    damage_all(c, s)
+
+// Whether a mark source is set.
+bool text_edit_has_marks(Control c):
+    return is_edit(c) && EditPtr(state(c)).marks != nil
+
+// The mark source's answers changed for lines `from` up to but not including
+// `to`: repaint those of them in view, as `text_edit_restyle` does, without
+// counting a restyle. A find that moved its current match, or changed its
+// needle, says so with this. Does nothing to anything but a live text edit,
+// and nothing while `update` runs.
+void text_edit_remark(Control c, i64 from, i64 to):
+    if !edit_changeable(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    (i64 lo, i64 hi) = edit_restyle_range(from, to, top_line(s.offset_px, edit_unit()), edit_view(c).rows)
+    if lo > hi:
+        return
+    damage(c, s, lo, hi)
+
+// The mark runs the paint drew since the edit was made; 0 for anything that
+// is not a live text edit.
+i64 text_edit_marks_painted(Control c):
+    if !is_edit(c):
+        return 0
+    return EditPtr(state(c)).marks_painted
+
+// The first line in view and how many rows the view has, as the last layout
+// left them: which lines a paint asks the sources about. `(0, 0)` for
+// anything that is not a live text edit.
+(i64 top, i32 rows) text_edit_view_lines(Control c):
+    if !is_edit(c):
+        return (0, 0)
+    ^EditState s = EditPtr(state(c))
+    return (top_line(s.offset_px, edit_unit()), edit_view(c).rows)
+
+// The spans the paint drew from the style source, and the restyles that
+// damaged a line in view, since the edit was made; zeros for anything that is
+// not a live text edit.
+(i64 spans, i64 restyles) text_edit_style_counters(Control c):
+    if !is_edit(c):
+        return (0, 0)
+    ^EditState s = EditPtr(state(c))
+    return (s.spans_painted, s.restyles)
+
+// ── Hooks ──────────────────────────────────────────────────────────────────
+
+// No minimum but its box's margins; its running is the sign that layout
+// reached the node (a node shown again among them), after which its cells
+// cannot be trusted and the next paint is whole.
+private cell.CellPoint edit_measure(Control c, rawptr st):
+    ^EditState s = EditPtr(st)
+    s.dmg_all = true
+    cell.CellPoint m = style_minimum(edit_box(c, STATE_NORMAL))
+    // A line edit is one row, and at least one column, inside its box.
+    if s.single:
+        m.col = m.col + 1
+        m.row = m.row + 1
+    return m
+
+private StyleBox edit_style_hook(Control c, rawptr st):
+    _ = st
+    return text_edit_style_now(c)
+
+private void edit_free(Control c, rawptr st):
+    ^EditState s = EditPtr(st)
+    if s.has_region:
+        grid.region_free(s.region)
+        set_region(c, -1)
+        s.has_region = false
+        s.region_on = false
+    s.undo_n = 0
+    drop_redo(s)
+    if s.recs != nil:
+        #delete(s.recs)
+        s.recs = nil
+    cols_free(s)
+    if s.buf != nil:
+        #delete(s.buf)
+        s.buf = nil
+    s.blen = 0
+    if s.placeholder != nil:
+        #delete(s.placeholder)
+        s.placeholder = nil
+
+// Write line `li`, `line`, on `row` from column `left_col` of the text, in a
+// view whose left edge is screen column `x0` and whose right edge is `right`.
+// The cluster covering `left_col` (`cell.byte_at_column`, through the column
+// index on the caret's line) may begin left of the edge; the grid's clip
+// drops what falls outside, and `grid.text_from` counts tab stops from the
+// line's own column 0.
+//
+// With a style source or a mark source, the line is written as consecutive
+// runs through `grid.text_span`, each ending where the foreground or the
+// background changes: a byte in a span takes its role's syntax colour, and
+// in a mark its role's background; every other byte `fg` on `bg`. Spans and
+// marks are each read in order by one rule: a span is held to the line's
+// bytes, and one that ends at or before where the last run stopped is
+// skipped — so spans that overlap draw the earlier one's colour until it
+// ends and the later one's after, one out of order draws only what lies past
+// the run before it, and an empty or inverted one draws nothing. A role
+// outside its palette draws in `fg` (a span) or on `bg` (a mark). Two
+// sources never cost more than the runs their boundaries make: each is
+// walked once, forward, in step.
+private void paint_line(^EditState s, ^EditTheme th, i64 li, string8 line, i32 row, i32 x0, i32 right, [4]u8 fg, [4]u8 bg):
+    (i32 b, i32 start) = edit_byte_at(s, li, line, s.left_col, li == s.caret.line)
+    i32 x = x0 + start - s.left_col
+    i64 nspans = 0
+    i64 nmarks = 0
+    []StyleSpan spans
+    []StyleSpan marks
+    if s.styles != nil:
+        spans = s.styles(s.styles_ctx, li)
+        nspans = #len(spans)
+    if s.marks != nil:
+        marks = s.marks(s.marks_ctx, li)
+        nmarks = #len(marks)
+    if nspans == 0 && nmarks == 0:
+        _ = grid.text_from(x, row, line, b, start, right - x, fg, bg)
+        return
+    // Screen column of line column 0, and the line column the view ends at.
+    i32 base = x0 - s.left_col
+    i32 limit = right - base
+    i32 n = i32(#len(line))
+    i32 at = b
+    i32 c = start
+    i64 si = 0
+    i64 mi = 0
+    i64 span_counted = -1
+    i64 mark_counted = -1
+    for at < n && c < limit:
+        for si < nspans && math.clamp(spans[si].to, 0, n) <= at:
+            si = si + 1
+        [4]u8 f = fg
+        i32 fend = n
+        bool styled = false
+        if si < nspans:
+            i32 sf = math.clamp(spans[si].from, 0, n)
+            if sf > at:
+                fend = sf
+            else:
+                f = syntax_fg(th, spans[si].role, fg)
+                fend = math.clamp(spans[si].to, 0, n)
+                styled = true
+        for mi < nmarks && math.clamp(marks[mi].to, 0, n) <= at:
+            mi = mi + 1
+        [4]u8 g = bg
+        i32 gend = n
+        bool marked = false
+        if mi < nmarks:
+            i32 mf = math.clamp(marks[mi].from, 0, n)
+            if mf > at:
+                gend = mf
+            else:
+                g = mark_bg(th, marks[mi].role, bg)
+                gend = math.clamp(marks[mi].to, 0, n)
+                marked = true
+        i32 end = fend
+        if gend < end:
+            end = gend
+        (i32 na, i32 nc) = grid.text_span(base + c, row, line, at, end, c, limit - c, f, g)
+        if na <= at:
+            break
+        if styled && si != span_counted:
+            s.spans_painted = s.spans_painted + 1
+            span_counted = si
+        if marked && mi != mark_counted:
+            s.marks_painted = s.marks_painted + 1
+            mark_counted = mi
+        at = na
+        c = nc
+
+// The background of mark role `role` in `th`, or `plain` for a role outside
+// it.
+private [4]u8 mark_bg(^EditTheme th, i32 role, [4]u8 plain):
+    if role < 0 || role >= MARK_ROLES:
+        return plain
+    return th.mark[role]
+
+// The colour of syntax role `role` in `th`, or `plain` for a role outside it.
+private [4]u8 syntax_fg(^EditTheme th, i32 role, [4]u8 plain):
+    if role < 0 || role >= SYNTAX_ROLES:
+        return plain
+    return th.syntax[role]
+
+// The selected part of line `li` drawn again over the line, on the selection
+// background: each rectangle `cell.span_rects` answers for its bytes, then
+// one cell past the end when its line break is selected.
+private void paint_selection(^EditState s, ^EditTheme th, string8 line, i64 li, i32 row, i32 x0):
+    (cell.TextPos from, cell.TextPos to) = sel_range(s)
+    (i32 a, i32 b, bool eol) = edit_line_selection(from, to, li, i32(#len(line)))
+    [4]cell.CellRect rs
+    i32 k = cell.span_rects(line, row, cell.LogicalOffset(a), cell.LogicalOffset(b), rs[:])
+    for i in 0..<k:
+        cell.CellRect rc = rs[i]
+        i32 at = edit_logical(s, li, line, rc.col, li == s.caret.line)
+        _ = grid.text_from(x0 + rc.col - s.left_col, row, line, at, rc.col, rc.cols, th.fg, th.sel_bg)
+    if eol:
+        i32 end = edit_col(s, li, line, i32(#len(line)), li == s.caret.line)
+        grid.fill(cell.rect(x0 + end - s.left_col, row, 1, 1), th.fg, th.sel_bg)
+
+// The caret's cell in the caret colours: its cluster (both cells of a wide
+// one), the first cell of a tab, or one blank cell at the end of the line.
+private void paint_caret(^EditState s, ^EditTheme th, string8 line, i32 row, i32 x0):
+    i32 b = s.caret.byte
+    i32 col = edit_col(s, s.caret.line, line, b, true)
+    i32 x = x0 + col - s.left_col
+    if b >= i32(#len(line)) || line[b] == '\t':
+        grid.fill(cell.rect(x, row, 1, 1), th.caret_fg, th.caret_bg)
+        return
+    i32 e = i32(cell.next_visual(line, cell.caret(b)).offset)
+    _ = grid.text(x, row, line[b..<e], cell.cluster_columns_at(line, b, col), th.caret_fg, th.caret_bg)
+
+// Line `li`'s gutter cells on `row`: its number in the current-line colour
+// when it is the caret's, then the padding, all on the gutter background.
+//
+// Drawn from the gutter's own left column `x0`, not the clip's: when an
+// ancestor cuts the edit on its left, the grid's clip drops the digits that
+// fall outside and the rest stay where they belong. Each cell is written
+// once — the digits (spaces included) by the text, the padding by a fill.
+private void paint_gutter(^EditState s, ^EditTheme th, i32 x0, i32 gw, i64 li, i64 n, i32 row):
+    [24]char8 buf
+    i32 digits = edit_gutter_digits(n)
+    [4]u8 fg = th.gutter_fg
+    if li == s.caret.line:
+        fg = th.current_line_number_fg
+    _ = grid.text(x0, row, edit_gutter_text(li, n, digits, buf[:]), digits, fg, th.gutter_bg)
+    if gw > digits:
+        grid.fill(cell.rect(x0 + digits, row, gw - digits, 1), th.gutter_fg, th.gutter_bg)
+    g_gutter_x = x0
+    s.gutter_painted = s.gutter_painted + 1
+
+
+// Point the view's region at `vis` on `layer`, making it first — or again,
+// when the node now paints into another layer, or the grid dropped it.
+// Answers whether the view is drawn through it (a region could be made and
+// `vis` is not empty), and whether its buffer was remade blank.
+private (bool on, bool remade) edit_region(Control c, ^EditState s, i32 layer, cell.CellRect vis):
+    if s.has_region && (!grid.region_valid(s.region) || grid.region_layer(s.region) != layer):
+        grid.region_free(s.region)
+        set_region(c, -1)
+        s.has_region = false
+    if !s.has_region:
+        if cell.is_empty(vis):
+            return (false, false)
+        i32 id = grid.region_make(layer)
+        if id < 0:
+            return (false, false)
+        s.region = id
+        s.has_region = true
+        set_region(c, id)
+    bool remade = grid.region_set_rect(s.region, vis)
+    return (!cell.is_empty(grid.region_rect(s.region)), remade)
+
+// The view's rows are painted gutter first, then text, each under a clip of
+// its own rectangle, so a cluster the left column cuts cannot spill into the
+// gutter. A whole paint first covers the box's margin cells with the text
+// background.
+//
+// The view's visible part is drawn through the node's grid region when one
+// can be made (a grid that is up), and its rows then include the spare row
+// below it — the line after the last whole one, which a sub-row offset shows
+// the top of. The layer's own cells under the region are made transparent on
+// a whole paint, since the region draws over them and they would show through
+// its transparent cells. Where no region can be made the view is written
+// into the layer as it always was, whole rows only.
+private void edit_paint(Control c, rawptr st, cell.CellRect clip):
+    ^EditState s = EditPtr(st)
+    EditTheme th = edit_theme_of(s)
+    cell.CellRect v = edit_view(c)
+    cell.CellRect tr = edit_text_rect(s, v)
+    i32 gw = tr.col - v.col
+    i64 n = doc_lines(s)
+    i32 unit = edit_unit()
+    i64 gen = theme_generation()
+    // A resize or a shorter document can leave the offset past the new
+    // maximum; clamp it here, where the rows are known.
+    s.offset_px = clamp_scroll(s.offset_px, max_scroll_px(n, v.rows, unit))
+    i64 top = top_line(s.offset_px, unit)
+    i32 layer = grid.targeted()
+    cell.CellRect vis = cell.intersect(clip, v)
+    // A line edit is one row with nothing to scroll by the pixel: no region.
+    bool on = false
+    bool remade = false
+    if !s.single:
+        (on, remade) = edit_region(c, s, layer, vis)
+    bool all = s.dmg_all || !s.painted_once || s.left_col != s.last_left || on != s.region_on || remade
+    all = all || unit != s.last_unit || rect(c) != s.last_rect || clip != s.last_clip || paint_forced()
+    all = all || gw != s.last_gutter_w || gen != s.last_gen
+    // A new first line moves what the region holds by as many rows, one
+    // memmove, and only the rows that exposes are painted — while that is
+    // fewer than the view's rows. Otherwise, and with no region, everything.
+    i32 ex_lo = 0
+    i32 ex_hi = -1
+    i64 k = top - s.last_top
+    if !all && k != 0:
+        if on && k < i64(vis.rows) && k > 0 - i64(vis.rows):
+            grid.region_scroll_rows(s.region, i32(k))
+            if k > 0:
+                ex_lo = vis.row + vis.rows + 1 - i32(k)
+                ex_hi = vis.row + vis.rows
+            else:
+                ex_lo = vis.row
+                ex_hi = vis.row - i32(k) - 1
+        else:
+            all = true
+    bool line_moved = s.caret.line != s.last_caret_line
+    clamp_sel(s)
+    (cell.TextPos sf, cell.TextPos st2) = sel_range(s)
+    bool any_sel = has_sel(s)
+    bool highlight = th.current_line_bg[3] > 0
+    cell.CellRect gclip = cell.intersect(clip, cell.rect(v.col, v.row, gw, v.rows))
+    cell.CellRect tclip = cell.intersect(clip, tr)
+    i32 right = tclip.col + tclip.cols
+    // A whole paint writes the box's margin cells, and only those: every
+    // cell of the view is written below, once.
+    if all:
+        grid.clip(clip)
+        g_edit_margin_cells = g_edit_margin_cells + fill_outside(clip, v, th.fg, th.bg)
+        if on:
+            [4]u8 clear = [0, 0, 0, 0]
+            grid.fill(vis, clear, clear)
+    i32 end_row = vis.row + vis.rows
+    if on:
+        end_row = end_row + 1
+        grid.target_region(s.region)
+    for row in vis.row..<end_row:
+        i64 li = top + i64(row - v.row)
+        bool exposed = row >= ex_lo && row <= ex_hi
+        if !all && !exposed && (!s.dmg_any || li < s.dmg_lo || li > s.dmg_hi):
+            continue
+        if gw > 0 && (all || exposed || s.dmg_gutter || (line_moved && (li == s.caret.line || li == s.last_caret_line))):
+            grid.clip(gclip)
+            paint_gutter(s, &th, v.col, gw, li, n, row)
+        [4]u8 bg = th.bg
+        if highlight && li == s.caret.line:
+            bg = th.current_line_bg
+        grid.clip(tclip)
+        grid.fill(cell.rect(tclip.col, row, tclip.cols, 1), th.fg, bg)
+        if li < 0 || li >= n:
+            continue
+        string8 ln = doc_line(s, li)
+        paint_line(s, &th, li, ln, row, tr.col, right, th.fg, bg)
+        if s.single && #len(ln) == 0 && s.placeholder != nil:
+            _ = grid.text(tr.col, row, string8(s.placeholder[:]), right - tr.col, theme_line_edit().placeholder_fg, bg)
+        if any_sel && li >= sf.line && li <= st2.line:
+            paint_selection(s, &th, ln, li, row, tr.col)
+        if li == s.caret.line:
+            paint_caret(s, &th, ln, row, tr.col)
+        s.lines_painted = s.lines_painted + 1
+    grid.unclip()
+    if on:
+        grid.target(layer)
+        grid.region_set_offset(s.region, sub_row(s, unit))
+    s.region_on = on
+    s.painted_once = true
+    s.last_top = top
+    s.last_left = s.left_col
+    s.last_unit = unit
+    s.last_rect = rect(c)
+    s.last_clip = clip
+    s.last_gutter_w = gw
+    s.last_caret_line = s.caret.line
+    s.last_gen = gen
+    s.dmg_all = false
+    s.dmg_any = false
+    s.dmg_gutter = false
+
+private bool has_cmd(input.Event e):
+    return (e.mods & (u32(input.Modifier.Ctrl) | u32(input.Modifier.Super))) != 0
+
+private f64 edit_now():
+    if g_edit_clock != nil:
+        return g_edit_clock()
+    return time.now()
+
+// The cell under mouse event `e` in the view's terms: its screen column, and
+// the row whose cells are drawn under the pointer — its pixel row plus the
+// sub-row offset `dy`, in whole rows. The region draws buffer row `r` from
+// pixel `r * cell_h - dy`, so that is `floor((y + dy) / cell_h)`; with no
+// region there is no offset on screen, and it is the screen row. Like the
+// first line `pos_at_cell` adds to it, `dy` is the offset now, which a
+// scroll earlier in the same batch of events may have moved past what was
+// last painted.
+//
+// The offset applies only on the view's own screen rows, the only ones the
+// region draws: there the answer is at most the spare row (`v.row +
+// v.rows`). A pointer on a row outside the view — the box's margins, or past
+// them during a drag — answers its screen row, so a press in the margin below
+// is the row just past the view and never the one after it.
+private cell.CellPoint edit_event_cell(Control c, ^EditState s, input.Event e):
+    cell.CellPoint p = event_cell(e)
+    if s.region_on:
+        cell.CellRect v = edit_view(c)
+        if p.row >= v.row && p.row < v.row + v.rows:
+            i32 unit = edit_unit()
+            i32 r = cell_of(e.y + f32(sub_row(s, unit)), unit)
+            if r > v.row + v.rows:
+                r = v.row + v.rows
+            p.row = r
+    return p
+
+// The document position under view cell `at` (`edit_event_cell`); see the
+// package comment.
+// With `drag`, a row above or below the view is taken as the one line just
+// past that edge, so a drag held there scrolls one line per event.
+private cell.TextPos pos_at_cell(Control c, ^EditState s, cell.CellPoint at, bool drag):
+    cell.CellRect r = edit_text_rect(s, edit_view(c))
+    i32 row = at.row
+    if drag && r.rows > 0:
+        if row < r.row:
+            row = r.row - 1
+        if row >= r.row + r.rows:
+            row = r.row + r.rows
+    i64 li = top_line(s.offset_px, edit_unit()) + i64(row - r.row)
+    if li >= doc_lines(s):
+        return doc_end(s)
+    if li < 0:
+        return cell.pos(0, 0)
+    // A press left of the text — in the gutter or the box's margin — is the
+    // line's start, however far the view is scrolled sideways. A drag there
+    // is not: it keeps selecting toward the left column.
+    if !drag && at.col < r.col:
+        return cell.pos(li, 0)
+    i32 col = s.left_col + at.col - r.col
+    if col < 0:
+        col = 0
+    // The caret goes to this line, so it claims the index.
+    string8 ln = doc_line(s, li)
+    return cell.pos(li, edit_logical(s, li, ln, col, true))
+
+// The selection a drag by words makes with the pointer at `p`: the
+// double-clicked word joined to the word under `p`, the anchor at the far end
+// of the double-clicked one.
+private (cell.TextPos anchor, cell.TextPos caret) word_drag(^EditState s, cell.TextPos p):
+    (i32 a, i32 b) = edit_word_at(doc_line(s, p.line), p.byte)
+    if cell.pos_before(p, s.word_from):
+        return (s.word_to, cell.pos(p.line, a))
+    cell.TextPos end = cell.pos(p.line, b)
+    if !cell.pos_before(s.word_to, p) || cell.pos_before(end, s.word_to):
+        return (s.word_from, s.word_to)
+    return (s.word_from, end)
+
+// The left button: a press places or extends, a second press at the same cell
+// soon after selects a word, motion while it is held drags, and its release
+// ends the drag. Motion that has not yet left the pressed cell is taken and
+// does nothing, so a hand that trembles while clicking selects nothing; a
+// drag that began with a double-click extends by whole words, the clicked
+// word always kept. Unhandled, and so left to bubble: the other buttons, and
+// motion and releases outside a drag.
+private bool edit_mouse(Control c, ^EditState s, input.Event e):
+    input.MouseKind mk = input.mouse_kind(e)
+    if mk == input.MouseKind.Press:
+        if input.mouse_button(e) != 0:
+            return false
+        cell.CellPoint at = edit_event_cell(c, s, e)
+        cell.TextPos p = pos_at_cell(c, s, at, false)
+        bool shift = (e.mods & u32(input.Modifier.Shift)) != 0
+        f64 now = edit_now()
+        f64 gap = now - s.press_t
+        bool twice = !shift && s.has_press && s.press_cell == at && gap >= 0.0 && gap < DOUBLE_CLICK_S
+        s.dragging = true
+        s.drag_left = false
+        s.drag_words = twice
+        if twice:
+            s.has_press = false
+            (i32 a, i32 b) = edit_word_at(doc_line(s, p.line), p.byte)
+            s.word_from = cell.pos(p.line, a)
+            s.word_to = cell.pos(p.line, b)
+            select_span(c, s, s.word_from, s.word_to)
+            return true
+        s.has_press = true
+        s.press_t = now
+        s.press_cell = at
+        motion(c, s, p, false, shift)
+        return true
+    if mk == input.MouseKind.Motion:
+        if !s.dragging:
+            return false
+        if !input.button_held(e, 0):
+            s.dragging = false
+            return false
+        cell.CellPoint at = edit_event_cell(c, s, e)
+        if !s.drag_left && at == s.press_cell:
+            return true
+        s.drag_left = true
+        cell.TextPos p = clamp_pos(s, pos_at_cell(c, s, at, true))
+        if s.drag_words:
+            (cell.TextPos wa, cell.TextPos wc) = word_drag(s, p)
+            select_span(c, s, wa, wc)
+            return true
+        motion(c, s, p, false, true)
+        return true
+    if mk == input.MouseKind.Release:
+        if input.mouse_button(e) != 0 || !s.dragging:
+            return false
+        s.dragging = false
+        return true
+    return false
+
+// The I-beam over the text, and the default arrow over the gutter and the
+// box's margins — except during a drag, which keeps the I-beam wherever the
+// pointer goes (the capture keeps asking this node). The screen cell is the
+// right question here, offset or not: the region is drawn only inside the
+// view's own cells, so which of the text, the gutter and the margins is under
+// the pointer does not move with the sub-row offset; only the line does.
+private i32 edit_cursor(Control c, rawptr st, cell.CellPoint p):
+    ^EditState s = EditPtr(st)
+    if s.dragging:
+        return CURSOR_IBEAM
+    if cell.contains(edit_text_rect(s, edit_view(c)), p.col, p.row):
+        return CURSOR_IBEAM
+    return CURSOR_DEFAULT
+
+// Keys while focused, and the mouse; see the package comment for the motions,
+// the selection, the clipboard and the log. Ctrl and Super are one command
+// modifier (Super is macOS's command key). Unhandled, and so left to bubble:
+// every key release, every command chord but undo, redo, select-all, copy,
+// cut, paste and document start and end (Ctrl+S and Ctrl+Q among them), a
+// `Text` event that `input.is_typed_text` refuses (a chord's side effect),
+// and everything while there is no source. A printable key press with no
+// command modifier is taken and does nothing: the `Text` event after it is
+// what types, and a parent acting on the bare key would act twice.
+private bool edit_input(Control c, rawptr st, input.Event e):
+    ^EditState s = EditPtr(st)
+    if !s.has_src || g_phase != PHASE_IDLE:
+        return false
+    f32 wheel = input.wheel_amount(e)
+    if wheel != 0.0 && s.single:
+        return false
+    if wheel != 0.0:
+        _ = scroll_to(c, s, s.offset_px + wheel_scroll_px(wheel, edit_unit(), doc_lines(s) + 1))
+        return true
+    if input.mouse_kind(e) != input.MouseKind.None:
+        return edit_mouse(c, s, e)
+    if e.kind == input.EventKind.Text:
+        if !input.is_typed_text(e):
+            return false
+        [4]char8 buf
+        i32 k = chars.encode(char32(e.code), buf[:], 0)
+        if k > 0:
+            _ = replace_selection(c, s, string8(buf[0..<k]), true)
+        return true
+    if !input.is_key_press(e):
+        return false
+    i32 key = e.code
+    bool shift = (e.mods & u32(input.Modifier.Shift)) != 0
+    if s.single:
+        // A line edit's own keys (widgets_line.dado). An emit may remove the
+        // node, and `s` with it: nothing reads `s` after one.
+        if key == i32(input.Keycode.Enter) || key == i32(input.Keycode.KpEnter):
+            s.open = false
+            s.submit_mods = e.mods
+            s.submits = s.submits + 1
+            _ = emit(c, submitted_signal())
+            return true
+        if key == i32(input.Keycode.Escape):
+            s.cancels = s.cancels + 1
+            _ = emit(c, cancelled_signal())
+            return true
+        if key == i32(input.Keycode.Tab):
+            return false
+        if key == i32(input.Keycode.Up) || key == i32(input.Keycode.Down) || key == i32(input.Keycode.PageUp) || key == i32(input.Keycode.PageDown):
+            if valid(s.key_target) && s.key_target != c:
+                return offer_input(s.key_target, e)
+            return false
+    clamp_sel(s)
+    if has_cmd(e):
+        // A command chord with Alt held is the program's, whatever its key.
+        if (e.mods & u32(input.Modifier.Alt)) != 0:
+            return false
+        bool ctrl = (e.mods & u32(input.Modifier.Ctrl)) != 0
+        if key == i32('Z'):
+            if shift:
+                _ = redo(c, s)
+            else:
+                _ = undo(c, s)
+            return true
+        if key == i32('Y') && ctrl:
+            _ = redo(c, s)
+            return true
+        if key == i32('A'):
+            select_span(c, s, cell.pos(0, 0), doc_end(s))
+            return true
+        if key == i32('C'):
+            if has_sel(s):
+                _ = copy_sel(c, s)
+            return true
+        if key == i32('X'):
+            _ = cut(c, s)
+            return true
+        if key == i32('V'):
+            _ = paste(c, s)
+            return true
+        if key == i32(input.Keycode.Home):
+            motion(c, s, cell.pos(0, 0), false, shift)
+            return true
+        if key == i32(input.Keycode.End):
+            motion(c, s, doc_end(s), false, shift)
+            return true
+        return false
+    cell.TextPos p = s.caret
+    string8 ln = doc_line(s, p.line)
+    if key == i32(input.Keycode.Enter) || key == i32(input.Keycode.KpEnter):
+        s.open = false
+        _ = replace_selection(c, s, "\n", false)
+        return true
+    if key == i32(input.Keycode.Tab):
+        _ = replace_selection(c, s, "\t", true)
+        return true
+    if key == i32(input.Keycode.Backspace):
+        _ = backspace(c, s)
+        return true
+    if key == i32(input.Keycode.Delete):
+        _ = delete_forward(c, s)
+        return true
+    if key == i32(input.Keycode.Left):
+        if !shift && has_sel(s):
+            (cell.TextPos lf, cell.TextPos _) = sel_range(s)
+            motion(c, s, lf, false, false)
+            return true
+        i32 prev_len = 0
+        if p.line > 0:
+            string8 above = doc_line(s, p.line - 1)
+            prev_len = i32(#len(above))
+        motion(c, s, edit_left(p, ln, prev_len), false, shift)
+        return true
+    if key == i32(input.Keycode.Right):
+        if !shift && has_sel(s):
+            (cell.TextPos _, cell.TextPos rt) = sel_range(s)
+            motion(c, s, rt, false, false)
+            return true
+        motion(c, s, edit_right(p, ln, doc_lines(s)), false, shift)
+        return true
+    if key == i32(input.Keycode.Home):
+        motion(c, s, cell.pos(p.line, 0), false, shift)
+        return true
+    if key == i32(input.Keycode.End):
+        motion(c, s, cell.pos(p.line, i32(#len(ln))), false, shift)
+        return true
+    if key == i32(input.Keycode.Up):
+        vertical(c, s, -1, false, shift)
+        return true
+    if key == i32(input.Keycode.Down):
+        vertical(c, s, 1, false, shift)
+        return true
+    i64 page = edit_page(edit_view(c).rows)
+
+    if key == i32(input.Keycode.PageUp):
+        vertical(c, s, 0 - page, true, shift)
+        return true
+    if key == i32(input.Keycode.PageDown):
+        vertical(c, s, page, true, shift)
+        return true
+    return key >= 32 && key < 127

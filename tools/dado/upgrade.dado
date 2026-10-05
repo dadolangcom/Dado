@@ -1,0 +1,289 @@
+// `dado upgrade`: a newer `dadoc` and `dado-lsp`, from the project's releases.
+//
+//     dado upgrade                     the newest release, if it is newer
+//     dado upgrade --version 1.2.0     that release, newer or not
+//     dado upgrade --yes               without asking, a new major version included
+//     dado upgrade --rollback          back to the binaries and the tree before
+//
+// **Which release.** The repository's `v<semver>` tags (`git ls-remote
+// --tags`) are the releases. Prereleases (`1.0.0-rc.2`) count only when the
+// installed dadoc is a prerelease itself, or when `--version` names one.
+// Nothing newer is an answer, not an error: it says so and exits 0. A change
+// of major version, the one place the language may change under a program,
+// asks first on a terminal and needs `--yes` elsewhere.
+//
+// **The download** is `<RELEASE_BASE>/download/v<version>/<asset>` and the
+// release's `SHA256SUMS` beside it, fetched with the system's `curl -fL` into
+// the install's `cache/`. `RELEASE_BASE` is the `defaults` setting, and
+// `DADO_RELEASE_BASE` overrides it (a `file://` folder, for the test). The
+// asset is this host's: `dado-macos-universal.tar.gz` on any Mac,
+// `dado-linux-x86_64.tar.gz`, `dado-linux-aarch64.tar.gz`, and
+// `dado-windows-x86_64.zip` (Windows on ARM runs it under emulation). Its
+// SHA-256 must be the one its `SHA256SUMS` line gives (`<hex>  <name>`), or
+// it is deleted and nothing changes.
+//
+// **The swap.** The archive unpacks (the system's `tar -xf`, which reads a
+// zip on Windows too) to one folder `dado/` holding `dadoc`, `dado-lsp` and
+// the archive's other files. The new `dadoc` must run here before anything
+// moves. Then the current `dadoc` and `dado-lsp` become `dadoc.old` and
+// `dado-lsp.old` (replacing older ones), and the new ones take their names;
+// on Windows the running `dado.exe` is neither, so this works there too.
+// After that the checkout moves to the newest tree the **new** dadoc allows,
+// as `dado update` moves it, `dado` and the tools are rebuilt by the new
+// compiler, and `dado doctor` reports.
+//
+// **The record.** Before the binaries move, the journal gets
+// `upgrade<TAB><old version><TAB><new version>` and `state` gets
+// `previous_version=<old>` and `upgrade_tree=<the checkout's commit>`.
+// `--rollback` swaps each `.old` with the binary in place (so a second
+// rollback undoes the first), returns the checkout to `upgrade_tree`, and
+// rebuilds.
+package driver
+
+import "core:hash"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+// The release asset for a host, named as the release names it: `os` is
+// `macos`, `linux` or `windows`, `arch` `x86_64` or `aarch64`. "" when there
+// is no release for that host.
+string8 asset_name(string8 os_name, string8 arch):
+    if os_name == "macos": return "dado-macos-universal.tar.gz"
+    if os_name == "linux" && arch == "x86_64": return "dado-linux-x86_64.tar.gz"
+    if os_name == "linux" && arch == "aarch64": return "dado-linux-aarch64.tar.gz"
+    if os_name == "windows" && (arch == "x86_64" || arch == "aarch64"): return "dado-windows-x86_64.zip"
+    return ""
+
+// This host's system and architecture, spelled as `asset_name` takes them.
+(string8 os_name, string8 arch) this_host():
+    string8 o = "other"
+    string8 a = "other"
+    when #OS == #DARWIN:
+        o = "macos"
+    when #OS == #LINUX:
+        o = "linux"
+    when #OS == #WINDOWS:
+        o = "windows"
+    when #ARCH == #X86_64:
+        a = "x86_64"
+    when #ARCH == #AARCH64:
+        a = "aarch64"
+    return (o, a)
+
+// The SHA-256, in lower-case hex, that `SHA256SUMS` text `sums` gives for the
+// file `name`, from its `<hex>  <name>` line (`<hex> *<name>`, the binary
+// marker, too); `found` false when no line names it with 64 hex digits.
+(string8 hex, bool found) sum_for(string8 sums, string8 name):
+    for l in lines_of(sums):
+        (string8 h, string8 rest, bool _) = strings.field(l)
+        string8 n = strings.trim(rest)
+        if #len(n) > 0 && n[0] == '*': n = n[1..<#len(n)]
+        if n != name || !hex64(h): continue
+        ref []char8 lower = #make([]char8, 0)
+        for c in h:
+            _ = #append(lower, c + 32 if c >= 'A' && c <= 'F' else c)
+        return (txt(lower), true)
+    return ("", false)
+
+private bool hex64(string8 h):
+    if #len(h) != 64: return false
+    for c in h:
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+        if !ok: return false
+    return true
+
+// Whether going from version `from` to `to` changes the major version.
+bool major_change(string8 from, string8 to):
+    (i64 a, i64 _, i64 _, string8 _, bool aok) = version_parts(from)
+    (i64 b, i64 _, i64 _, string8 _, bool bok) = version_parts(to)
+    return aok && bok && a != b
+
+// The version without its build metadata: `1.0.0-dev` of `1.0.0-dev+abc`.
+string8 without_build(string8 v):
+    (string8 head, string8 _, bool _) = strings.split_first(v, "+")
+    return head
+
+// The binaries an upgrade replaces, as their files are named here.
+private ref []string8 upgraded_binaries():
+    ref []string8 out = #make([]string8, 0)
+    _ = #append(out, exe_name("dadoc"))
+    _ = #append(out, exe_name("dado-lsp"))
+    return out
+
+// `dado upgrade [--version X] [--yes]` and `dado upgrade --rollback`.
+i32 upgrade_command(bool rollback, string8 wanted, bool yes):
+    need_install("upgrade")
+    if rollback: return upgrade_rollback()
+    Layout l = layout()
+    need_clean_checkout()
+    string8 have = install_dadoc_version()
+    if #len(have) == 0:
+        die(txt(#format("the install's dadoc (", join2(l.install, exe_name("dadoc")), ") does not run, so there is no version to upgrade from.\n  Reinstall: download the archive again and run ./dadoc bootstrap.")))
+    string8 origin = checkout_origin()
+    Command ls = command("git")
+    add_all(&ls, ["ls-remote", "--tags", origin, "refs/tags/v*"])
+    Captured got = capture(ls, false)
+    if !got.started || got.status != 0:
+        die(txt(#format("git could not list the releases of ", origin, ".\n  Check the network, then run `dado upgrade` again.")))
+    Remote r = parse_ls_remote(txt(got.out))
+    string8 target = ""
+    if #len(wanted) > 0:
+        string8 w = wanted[1..<#len(wanted)] if wanted[0] == 'v' else wanted
+        for v in r.versions:
+            if v == w: target = v
+        if #len(target) == 0:
+            (string8 newest, bool any) = newest_version(r.versions[:], true)
+            string8 hint = txt(#format(" (the newest is ", newest, ")")) if any else ""
+            die(txt(#format("there is no release ", w, hint, ".\n  The releases are the repository's v* tags: git ls-remote --tags ", origin)))
+        if target == have:
+            say(txt(#format("dadoc ", have, " is already installed")))
+            return 0
+    else:
+        (string8 newest, bool any) = newest_version(r.versions[:], is_prerelease(have))
+        (i32 order, bool ok) = compare_versions(newest, have)
+        if !any || !ok || order <= 0:
+            say(txt(#format("dadoc ", have, " is the newest release")))
+            return 0
+        target = newest
+    if major_change(have, target) && !yes:
+        string8 q = txt(#format("dadoc ", have, " -> ", target, " changes the major version, and with it what the language promises.\n"))
+        if !(os.is_terminal(0) && os.is_terminal(2)):
+            die(txt(#format(q, "  Run `dado upgrade --yes` to go ahead without a terminal to ask on.")))
+        if !ask(txt(#format(q, "Upgrade? [y/N] ")), false):
+            say("not upgraded")
+            return 0
+    string8 dir = download_release(target)
+    install_binaries(dir, have, target)
+    remove_tree_quietly(dir)
+    // The checkout follows the new compiler, as far as it allows.
+    string8 now_have = install_dadoc_version()
+    _ = move_to_newest(now_have, true)
+    i32 status = 0
+    if !rebuild_driver(): status = 1
+    // The tools rebuild under the new `dado`, which asks the new dadoc.
+    Command tools = command(join3(l.install, "bin", exe_name("dado")))
+    add_all(&tools, ["tools", "rebuild"])
+    if run(tools) != 0: status = 1
+    say_green("upgraded", txt(#format(" dadoc ", have, " -> ", target)))
+    Command doc = command(join3(l.install, "bin", exe_name("dado")))
+    add(&doc, "doctor")
+    _ = run(doc)
+    return status
+
+// Download release `version`'s archive for this host into the install's
+// cache, check it against `SHA256SUMS`, and unpack it. Answers the folder it
+// was unpacked into; ends the process, naming the repair, on any failure.
+private string8 download_release(string8 version):
+    Layout l = layout()
+    (string8 os_name, string8 arch) = this_host()
+    string8 asset = asset_name(os_name, arch)
+    if #len(asset) == 0:
+        die(txt(#format("there is no release archive for ", os_name, " on ", arch, ".\n  Build dadoc from the repository instead (cargo build --release).")))
+    (string8 base_env, bool base_set) = env("DADO_RELEASE_BASE")
+    string8 base = base_env if base_set else setting("RELEASE_BASE")
+    string8 url_dir = txt(#format(strings.trim_right(base), "/download/v", version, "/"))
+    string8 cache = join3(l.install, "cache", txt(#format("upgrade-", version)))
+    _ = fs.make_dirs(cache, #default)
+    string8 archive = join2(cache, asset)
+    string8 sums_file = join2(cache, "SHA256SUMS")
+    fetch_file(txt(#format(url_dir, asset)), archive)
+    fetch_file(txt(#format(url_dir, "SHA256SUMS")), sums_file)
+    (string8 want, bool listed_sum) = sum_for(read_or_empty(sums_file), asset)
+    if !listed_sum:
+        remove_tree_quietly(cache)
+        die(txt(#format("the release's SHA256SUMS has no line for ", asset, ", so the download cannot be checked; it was deleted.\n  Nothing was changed. Try another release with --version, or report it.")))
+    try ref []char8 bytes = fs.read_file(archive) else code:
+        die(txt(#format("cannot read the download ", archive, ": ", os.message(code))))
+        quit 1
+    ref []char8 got = hash.sha256_hex(hash.sha256_text(txt(bytes)))
+    if txt(got) != want:
+        remove_tree_quietly(cache)
+        die(txt(#format("the download of ", asset, " is not the release's: its SHA-256 is\n    ", txt(got), "\n  and SHA256SUMS says\n    ", want, "\n  It was deleted, and nothing was changed. Run `dado upgrade` again; if it\n  happens again, report it.")))
+    string8 unpack = join2(cache, "unpacked")
+    remove_tree_quietly(unpack)
+    _ = fs.make_dirs(unpack, #default)
+    Command tar = command("tar")
+    add_all(&tar, ["-xf", archive, "-C", unpack])
+    Captured t = capture_merged(tar)
+    if !t.started || t.status != 0:
+        tell(strings.trim_right(txt(t.out)))
+        die(txt(#format("tar could not unpack ", archive, " (the output above says why).\n  Nothing was changed.")))
+    string8 dir = join2(unpack, "dado")
+    string8 new_dadoc = join2(dir, exe_name("dadoc"))
+    if !is_file(new_dadoc) || !is_file(join2(dir, exe_name("dado-lsp"))):
+        die(txt(#format(asset, " does not hold dado/", exe_name("dadoc"), " and dado/", exe_name("dado-lsp"), ", as a release archive does.\n  Nothing was changed. Report it.")))
+    if !dadoc_runs(new_dadoc):
+        die(txt(#format("the downloaded dadoc does not run here (", new_dadoc, ").\n  Nothing was changed. Report it, naming this system and architecture.")))
+    remove_quietly(archive)
+    return dir
+
+// `curl -fL` `url` into `file`, or end the process saying what failed.
+private void fetch_file(string8 url, string8 file):
+    say(txt(#format("fetch  ", url)))
+    Command c = command("curl")
+    add_all(&c, ["-fL", "--silent", "--show-error", "-o", file, url])
+    i32 status = run(c)
+    if status == 127:
+        die("there is no `curl` here, and the release is downloaded with it.\n  Install curl (it ships with macOS, Windows 10 and most Linux systems), then run `dado upgrade` again.")
+    if status != 0:
+        remove_quietly(file)
+        die(txt(#format("could not download ", url, " (curl exited ", status, ").\n  Nothing was changed. Check the network, then run `dado upgrade` again.")))
+
+// Put the unpacked binaries in `dir` in place of the install's, each current
+// one kept as `.old`; recorded first.
+private void install_binaries(string8 dir, string8 from, string8 to):
+    Layout l = layout()
+    journal_record("upgrade", from, to)
+    remember("previous_version", from)
+    remember("upgrade_tree", checkout_head())
+    for name in upgraded_binaries():
+        string8 cur = join2(l.install, name)
+        string8 old = txt(#format(cur, ".old"))
+        if is_file(cur):
+            if !cleared(old):
+                die(txt(#format("cannot remove ", old, " to keep the current ", name, " there.\n  Remove it yourself, then run `dado upgrade` again.")))
+            try fs.rename(cur, old) else code:
+                die(txt(#format("cannot move ", cur, " aside: ", os.message(code), ".\n  Nothing else was changed; run `dado upgrade` again.")))
+        try fs.rename(join2(dir, name), cur) else code:
+            try fs.rename(old, cur) else:
+                die(txt(#format("cannot put the new ", name, " in place (", os.message(code), "), nor the old one back.\n  The old one is ", old, ": rename it to ", cur, ".")))
+            die(txt(#format("cannot put the new ", name, " in place: ", os.message(code), ". The old one is back; run `dado upgrade --rollback` if dadoc and dado-lsp now disagree.")))
+
+// `dado upgrade --rollback`.
+private i32 upgrade_rollback():
+    Layout l = layout()
+    string8 dadoc_old = join2(l.install, txt(#format(exe_name("dadoc"), ".old")))
+    if !is_file(dadoc_old):
+        die(txt(#format("there is nothing to roll back to: no ", dadoc_old, ".\n  An upgrade keeps the previous dadoc there; this install has not been upgraded.")))
+    need_clean_checkout()
+    string8 cur_version = install_dadoc_version()
+    string8 old_version = without_build(version_of_dadoc(dadoc_old))
+    journal_record("upgrade", cur_version, old_version)
+    remember("previous_version", cur_version)
+    for name in upgraded_binaries():
+        string8 cur = join2(l.install, name)
+        string8 old = txt(#format(cur, ".old"))
+        string8 swap = txt(#format(cur, ".swap"))
+        if !is_file(old): continue
+        remove_quietly(swap)
+        bool had = is_file(cur)
+        if had:
+            try fs.rename(cur, swap) else code:
+                die(txt(#format("cannot move ", cur, " aside: ", os.message(code))))
+        try fs.rename(old, cur) else code:
+            die(txt(#format("cannot put ", old, " back as ", cur, ": ", os.message(code), ".\n  The newer one is ", swap, ".")))
+        if had:
+            try fs.rename(swap, old) else:
+                warn(txt(#format("the newer ", name, " was left as ", swap)))
+    say_green("rolled back", txt(#format(" dadoc ", cur_version, " -> ", old_version)))
+    string8 tree = remembered("upgrade_tree")
+    if #len(tree) > 0 && tree != checkout_head():
+        move_checkout(tree)
+        say(txt(#format("the collections are back at ", short_sha(tree))))
+    i32 status = 0
+    if !rebuild_driver(): status = 1
+    Command tools = command(join3(l.install, "bin", exe_name("dado")))
+    add_all(&tools, ["tools", "rebuild"])
+    if run(tools) != 0: status = 1
+    return status

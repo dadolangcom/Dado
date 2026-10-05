@@ -1,0 +1,594 @@
+// core:http — a minimal, non-blocking HTTP/1.1 server over TCP.
+//
+//     import "core:http"
+//
+//     http.Server s = http.listen(8080)
+//     if !http.valid(s):
+//         // port already bound
+//     defer http.stop(s)
+//
+//     // once per frame / loop turn — never blocks:
+//     http.Accepted a = http.poll(s)
+//     if a.ok:
+//         if http.method() == http.Method.Get && strings.starts_with(http.path(), "/"):
+//             http.respond(a.conn, 200, "OK", "text/html", body, alloc)
+//
+// **Why this package exists.** `core:net` is a `Reliable`/`Unreliable` wrapper
+// over ENet (UDP) — the shape a game session wants, and the wrong shape for a
+// browser or `curl`, which speak TCP and HTTP. This package is the other half:
+// a byte-stream socket a request/response protocol rides on. It is deliberately
+// small — enough to serve a status page from a tool's own event loop, not a
+// general web framework — and it owes tests, because it stands directly on the
+// platform's BSD sockets.
+//
+// **This package has no C of its own.** `<sys/socket.h>`, `<netinet/in.h>`,
+// `<arpa/inet.h>`, `<sys/time.h>`, `<fcntl.h>` and `<unistd.h>` are bound
+// directly and the bodies below are the whole implementation, layouts
+// included. What that owns, and what the two platforms disagree about, is
+// written beside `SockAddrIn` and above `send_flags`.
+//
+// **Non-blocking by construction, single-threaded by design.** The listen
+// socket is non-blocking, so `poll` accepts a waiting connection or answers
+// "nothing" immediately — it is meant to be called from one place, one turn of
+// a caller's loop, the same contract `app:input.poll` and `core:net.poll`
+// already have. There is no worker thread and no queue here: a caller that
+// wants concurrency puts it above this line, not inside it.
+//
+// **One request buffer, reused.** Like `core:io.read_line`, the parsed method
+// and path live in package-level storage that the next `poll` overwrites — so
+// read `method()` / `path()` (or copy what you need out of them) before polling
+// again. That is the single-threaded contract made concrete, and it is why this
+// package holds no per-connection state beyond the descriptor `Accepted` hands
+// back.
+package http
+
+import "core:strings"
+
+// ── handles — a listen socket and one accepted connection, kept apart from a
+// bare `i32` so a descriptor cannot be confused with an ordinary number ──────
+
+distinct type Server: i32
+distinct type Conn:   i32
+
+// ── the platform's BSD sockets, restated ────────────────────────────────────
+//
+// **No feature-test macro on Linux, and that is measured rather than assumed.**
+// Every call and every constant below — `socket`, `setsockopt`, `bind`,
+// `listen`, `accept`, `send`, `recv`, `fcntl`, `close`, `htons`, `htonl`,
+// `MSG_NOSIGNAL` included — is declared by these headers under
+// `-std=c11 -Wall -Wextra -pedantic` with nothing defined at all on this
+// glibc. A `define` clause is emitted above *every* `#include` in the whole
+// program's translation unit, not just this package's, so a feature macro here
+// is one every other package in the program gets: `_POSIX_C_SOURCE` would
+// *narrow* the set glibc turns on by itself when nothing asks, and is not
+// written because nothing here needs it. `_DARWIN_C_SOURCE` only widens, and is
+// inert on Linux.
+//
+// Bound as `sock`, because this package already declares `listen` — the Dado one
+// that starts a server — and a package function and a `foreign` name cannot be
+// the same word. A binding is what keeps one name from having to be two things;
+// the emitted C is still the bare identifier.
+private foreign sock "sys/socket.h" define "_DARWIN_C_SOURCE=1":
+    const #c.int AF_INET
+    const #c.int SOCK_STREAM
+    const #c.int SOL_SOCKET
+    const #c.int SO_REUSEADDR
+    const #c.int SO_RCVTIMEO
+    #c.int socket(#c.int domain, #c.int kind, #c.int protocol)
+    #c.int setsockopt(#c.int fd, #c.int level, #c.int optname, rawptr optval, #c.uint optlen)
+    // `struct sockaddr`, the generic address `bind` and `accept` are declared
+    // over, bodiless: never a value here, only what a pointer points at. The
+    // `sockaddr_in` this package builds reaches it through `SockAddrPtr` below —
+    // the cast every C caller of `bind` writes, written once.
+    type @c("struct sockaddr") SockAddr
+    #c.int bind(#c.int fd, ^const sock.SockAddr addr, #c.uint addrlen)
+    #c.int listen(#c.int fd, #c.int backlog)
+    #c.int accept(#c.int fd, ^sock.SockAddr addr, ^#c.uint addrlen)
+    // `ssize_t`, which Dado has no name for and which is `long`-shaped on every
+    // POSIX platform — 64 bits where `long` is, 32 where it is not. `#c.long`
+    // is therefore the restatement that stays true, and `i64` is the one that
+    // happens to be true here.
+    #c.long send(#c.int fd, rawptr from, #c.size_t nbytes, #c.int flags)
+    #c.long recv(#c.int fd, rawptr into, #c.size_t nbytes, #c.int flags)
+
+// `struct sockaddr_in` and the `struct in_addr` nested in it: two layouts this
+// package owns, and the whole of what owning them costs.
+//
+// The emitter writes a shadow struct beside each and asks the C compiler to
+// prove `sizeof` equal and every member's `offsetof` and width equal — so a
+// restatement is a claim the C compiler either proves or rejects by name, not a
+// guess that could be read wrong at run time. These two are the easy end of
+// that bargain: **POSIX fixes both**, down to `sin_zero`'s existence, and
+// unlike `struct stat` there is no libc-private padding to spell — but it does
+// not fix `sockaddr_in`'s first bytes, which is why it has an arm below.
+//
+// `struct sockaddr` is never a value here — only what `bind` and `accept` take a
+// pointer to — so it is declared bodiless above and there is no third layout.
+// It used to be a `rawptr`, which is `void *` and not the `struct sockaddr *`
+// the header declares; the `_Generic` assertion over each foreign signature is
+// what refuses that now.
+// How a `^SockAddrIn` becomes the generic address pointer `bind` takes — the
+// `(struct sockaddr *)&addr` of every C caller, spelled with a type's name
+// because `^T(x)` would read as a function type.
+private type SockAddrPtr: ^const sock.SockAddr
+
+private foreign "netinet/in.h" define "_DARWIN_C_SOURCE=1" define "InAddr=struct in_addr":
+    const u32 INADDR_ANY
+    type InAddr:     (u32 s_addr)
+
+// **`struct sockaddr_in` is not one layout.** BSD's, which Darwin keeps, leads
+// with a one-byte `sin_len` and makes `sa_family_t` one byte to pay for it, so
+// `sin_family` is at offset 1 and `unsigned char`; glibc's has no `sin_len` and
+// a two-byte family at 0. And `sin_zero` is `char` on Darwin and `unsigned
+// char` on glibc. POSIX fixes the members' existence, not those. A restatement
+// written once was glibc's, and failed at macOS on the family's offset, its
+// width and its type and on `sin_zero`'s type — four assertions this machine's
+// compile could not see. So each arm restates its own, and builds the
+// any-address value its members spell: `sin_len` is the struct's size, which
+// Darwin's own callers write and its kernel ignores for `bind`.
+when #OS == #DARWIN:
+    private foreign "netinet/in.h" define "_DARWIN_C_SOURCE=1" define "SockAddrIn=struct sockaddr_in":
+        type SockAddrIn: (u8 sin_len, u8 sin_family, u16 sin_port, InAddr sin_addr,
+                          [8]#c.char sin_zero)
+
+    private SockAddrIn any_address(u16 port):
+        return (u8(#size(SockAddrIn)), u8(sock.AF_INET), htons(port),
+                InAddr(htonl(INADDR_ANY)), [0, 0, 0, 0, 0, 0, 0, 0])
+else:
+    private foreign "netinet/in.h" define "_DARWIN_C_SOURCE=1" define "SockAddrIn=struct sockaddr_in":
+        type SockAddrIn: (u16 sin_family, u16 sin_port, InAddr sin_addr, [8]u8 sin_zero)
+
+    private SockAddrIn any_address(u16 port):
+        return (u16(sock.AF_INET), htons(port), InAddr(htonl(INADDR_ANY)),
+                [0, 0, 0, 0, 0, 0, 0, 0])
+
+private foreign "fcntl.h" define "_DARWIN_C_SOURCE=1":
+    const #c.int F_GETFL
+    const #c.int F_SETFL
+    const #c.int O_NONBLOCK
+    // C's variadic tail, restated as C writes it. `fcntl`'s third argument is
+    // an `int` for the two commands used here and a pointer for others, which
+    // is why the header does not type it and why this does not either.
+    #c.int fcntl(#c.int fd, #c.int cmd, ...)
+
+private foreign "unistd.h" define "_DARWIN_C_SOURCE=1":
+    #c.int close(#c.int fd)
+
+// **`htons` and `htonl` are function-like macros on both supported platforms,
+// and on Linux only when the C compiler is optimising.** glibc's
+// `<netinet/in.h>` spells them over `__bswap_16`/`__bswap_32` under
+// `#ifdef __OPTIMIZE__` and leaves them ordinary externs at `-O0`; Darwin's
+// `<sys/_endian.h>` spells them over `__DARWIN_OSSwapInt16` unconditionally.
+// So the answer changes with a *flag*, not with a platform, and there is no
+// `when` that states it — `@macro` is the marker that says *the header may
+// spell this as a macro*, and it is written here because on the build this tree
+// actually performs it does:
+//
+//     $ gcc -E -dM -std=c11      hn.c | grep '^#define htons'      # nothing
+//     $ gcc -E -dM -std=c11 -O1  hn.c | grep '^#define htons'
+//     #define htons(x) __bswap_16 (x)
+//
+// Without the marker the emitted C carries an `#ifdef htons` / `#error` pair
+// and the optimised build fails asking for it — which is the mechanism working,
+// and is how this was found. A `foreign` function emits a bare call and no
+// prototype, so the preprocessor expands the macro at the call site either way.
+private foreign "arpa/inet.h" define "_DARWIN_C_SOURCE=1":
+    @macro u16 htons(u16 x)
+    @macro u32 htonl(u32 x)
+
+// ── what the two platforms disagree about ───────────────────────────────────
+//
+// Two things, and they are what the deleted `http.c` spelled with
+// `#ifndef MSG_NOSIGNAL`, `#ifdef SO_NOSIGPIPE` and `#if defined(__APPLE__)`.
+// The first two of those were conditional compilation on a macro's *existence*,
+// which is not a question `foreign const` asks — but what they were really
+// testing is Linux-versus-Darwin, and `when #OS` says that directly.
+//
+//   1. **SIGPIPE suppression.** Writing to a socket whose peer has gone raises
+//      `SIGPIPE` and kills the process unless it is suppressed. Linux
+//      suppresses it per call, with `MSG_NOSIGNAL` on `send`; Darwin suppresses
+//      it per socket, with `SO_NOSIGPIPE` set once on an accepted connection.
+//      Neither platform has the other's spelling, so each arm answers with the
+//      one it has and the call sites below read the same on both.
+//   2. **`struct timeval`'s second member.** `tv_usec` is a `suseconds_t`,
+//      which glibc makes `long` and Darwin makes `int`; both structs are 16
+//      bytes, Darwin's with four bytes of tail padding. It lives in
+//      `<sys/time.h>` on both — `<sys/socket.h>` only forward-declares the tag,
+//      and a transparent restatement over the forward declaration fails in the
+//      emitter's own conversion helper with an incomplete type.
+//
+// **The Darwin arm is checked by Dado and not by a C compiler.** This tree's
+// machine is glibc on Linux, where `SO_NOSIGPIPE` does not exist. `dadoc
+// --target=*-apple-darwin` type-checks the arm and emits its C, which is what
+// the cross-target matrix runs; nothing here has compiled that C against
+// Darwin's headers, so the layout and declaration assertions it carries rest
+// on those headers and not on a build. Say so rather than imply it was
+// measured.
+when #OS == #DARWIN:
+    private foreign "sys/socket.h" define "_DARWIN_C_SOURCE=1":
+        const #c.int SO_NOSIGPIPE
+
+    private foreign "sys/time.h" define "_DARWIN_C_SOURCE=1" define "TimeVal=struct timeval":
+        type TimeVal: (#c.long tv_sec, #c.int tv_usec)
+
+    // At `tv_usec`'s own type in each arm, `int` here and `long` below: the
+    // literal `(0, QUARTER_SECOND_USEC)` is checked against `TimeVal`'s shape,
+    // and a `long` constant in an `int` member is ERR0504 at this triple.
+    private const #c.int QUARTER_SECOND_USEC = 250000
+
+    // A timeout of `ms` milliseconds, at this arm's `tv_usec` type.
+    private TimeVal timeval_ms(i32 ms):
+        return (#c.long(ms / 1000), #c.int((ms % 1000) * 1000))
+
+    // Darwin's `send` has no flag for it; the socket carries the suppression.
+    private #c.int send_flags():
+        return 0
+
+    private void suppress_sigpipe(#c.int fd):
+        #c.int on = 1
+        _ = sock.setsockopt(fd, sock.SOL_SOCKET, SO_NOSIGPIPE, rawptr(&on),
+                            #c.uint(#size(#c.int)))
+else:
+    private foreign "sys/socket.h":
+        const #c.int MSG_NOSIGNAL
+
+    private foreign "sys/time.h" define "TimeVal=struct timeval":
+        type TimeVal: (#c.long tv_sec, #c.long tv_usec)
+
+    private const #c.long QUARTER_SECOND_USEC = 250000
+
+    // A timeout of `ms` milliseconds, at this arm's `tv_usec` type.
+    private TimeVal timeval_ms(i32 ms):
+        return (#c.long(ms / 1000), #c.long((ms % 1000) * 1000))
+
+    // Linux carries the suppression on every `send`, so there is nothing to set
+    // on the socket and this is deliberately empty rather than absent: the call
+    // site below reads the same on both platforms.
+    private #c.int send_flags():
+        return MSG_NOSIGNAL
+
+    private void suppress_sigpipe(#c.int fd):
+        _ = fd
+
+// ── the five calls the rest of this package is written on ───────────────────
+//
+// These were a hand-written `http.c` and are now Dado. They keep a `sys_` prefix
+// because they are the platform half and the functions above them are the
+// package's — the old C reason for the prefix (the compiler mangles this
+// package's own `close` to the same C name a helper called `dado_http_close`
+// would take) died with the file, and this one is about reading.
+
+// Open a TCP listening socket bound to `port` on every local interface, made
+// non-blocking so `sys_accept` never waits. Returns the descriptor, or -1 on
+// failure (usually: the port is already bound).
+private #c.int sys_listen(#c.int port):
+    #c.int fd = sock.socket(sock.AF_INET, sock.SOCK_STREAM, 0)
+    if fd < 0:
+        return 0 - 1
+
+    #c.int one = 1
+    _ = sock.setsockopt(fd, sock.SOL_SOCKET, sock.SO_REUSEADDR, rawptr(&one),
+                        #c.uint(#size(#c.int)))
+
+    // Every member is written — `any_address`, one per platform — which is
+    // what the deleted C's `memset` before the assignments was for.
+    SockAddrIn addr = any_address(u16(port))
+
+    if sock.bind(fd, SockAddrPtr(rawptr(&addr)), #c.uint(#size(SockAddrIn))) != 0:
+        _ = close(fd)
+        return 0 - 1
+    if sock.listen(fd, 16) != 0:
+        _ = close(fd)
+        return 0 - 1
+
+    #c.int fl = fcntl(fd, F_GETFL, 0)
+    if fl >= 0:
+        _ = fcntl(fd, F_SETFL, fl | O_NONBLOCK)
+    return fd
+
+// Accept one pending connection on `lfd`, or return -1 when none is waiting
+// (the socket is non-blocking, so this is the ordinary "nothing to do" answer,
+// not an error).
+private #c.int sys_accept(#c.int lfd):
+    #c.int c = sock.accept(lfd, nil, nil)
+    if c < 0:
+        return 0 - 1
+
+    // A silent client must not be able to hang the caller's frame loop, so give
+    // every accepted connection a short read timeout.
+    TimeVal tv = (0, QUARTER_SECOND_USEC)
+    _ = sock.setsockopt(c, sock.SOL_SOCKET, sock.SO_RCVTIMEO, rawptr(&tv),
+                        #c.uint(#size(TimeVal)))
+    suppress_sigpipe(c)
+    return c
+
+// Read up to `cap` bytes from `fd` into `into`. Returns the count, 0 at end of
+// stream, or -1 on error or timeout.
+private i64 sys_recv(#c.int fd, rawptr into, i64 cap):
+    if cap <= 0:
+        return 0
+    return i64(sock.recv(fd, into, #c.size_t(cap), 0))
+
+// Write all `count` bytes from `from` to `fd`, looping until they are sent or a
+// write fails. Returns how many were sent — short means the peer went away.
+//
+// The loop advances through the buffer, and Dado has no pointer arithmetic to
+// advance a `rawptr` with — so the offset is the *slice* the caller already
+// holds, which is why this takes one rather than a bare pointer. That is the
+// one place the shape here differs from the C it replaces.
+private i64 sys_send(#c.int fd, []char8 from, i64 count):
+    if count <= 0:
+        return 0
+    i64 total = 0
+    for total < count:
+        #c.long n = sock.send(fd, rawptr(&from[total]),
+                              #c.size_t(count - total), send_flags())
+        if n <= 0:
+            return total
+        total = total + i64(n)
+    return total
+
+// Close a descriptor from either of the calls above. A no-op on a negative
+// descriptor, so closing a failed `listen` or a nil connection is safe.
+private void sys_close(#c.int fd):
+    if fd >= 0:
+        _ = close(fd)
+
+// ── request parsing state — reused across polls (see package doc comment) ────
+
+const i32 PATHCAP = 512     // a longer request-target is truncated to this
+const i32 REQCAP  = 16384   // the bytes of one request we read and look at
+
+enum i32 Method: (Get, Post, Head, Options, Other)
+
+private [PATHCAP]char8 g_path
+private i32            g_path_len
+private Method         g_method
+private [REQCAP]char8  g_body      // the request body of the last poll (see body())
+private i32            g_body_len
+
+// What `poll` hands back: whether a connection was accepted this turn, and the
+// connection itself when one was. A `false` carries a `Conn` of -1, which every
+// function here treats as nothing.
+type Accepted: (bool ok, Conn conn)
+
+// ── lifecycle ───────────────────────────────────────────────────────────────
+
+// Start listening on `port` (all local interfaces). Check `valid` before use —
+// a bound port, or no socket, comes back invalid rather than aborting.
+Server listen(u16 port):
+    return Server(i32(sys_listen(#c.int(port))))
+
+bool valid(Server s):
+    return i32(s) >= 0
+
+// Stop the server. The listen socket is closed; connections already handed to a
+// caller are the caller's to `respond` to (which closes them) or `close_conn`.
+void stop(Server s):
+    sys_close(#c.int(i32(s)))
+
+// ── the poll surface — one non-blocking step of the accept loop ──────────────
+
+// Accept at most one waiting connection and read its request line, or answer
+// `ok == false` when nothing is waiting. Never blocks on the accept; a slow
+// client can stall the following read up to the connection's 250 ms timeout and
+// no longer (`sys_accept` sets it). After a truthy result, `method()` and `path()`
+// describe the request until the next `poll`.
+Accepted poll(Server s):
+    Conn none = Conn(-1)
+    i32 cfd = i32(sys_accept(#c.int(i32(s))))
+    if cfd < 0:
+        return (false, none)
+
+    [REQCAP]char8 buf
+    i64 got = sys_recv(#c.int(cfd), rawptr(&buf[0]), i64(REQCAP))
+    i32 n = 0
+    if got > 0:
+        n = i32(got)
+    parse_request(buf[:], n)
+    extract_body(buf[:], n)
+    return (true, Conn(cfd))
+
+// The body of the request `poll` last accepted — the bytes after the blank line
+// that ends the headers — as a string viewing this package's own buffer. Empty
+// for a request with no body, and (like `path`) overwritten by the next `poll`.
+// One `recv` is read, so a body larger than what arrived in it is truncated; that
+// is enough for the small POSTs this server is meant to take (a dev bridge, a
+// webhook), not a file upload.
+string8 body():
+    return string8(g_body[0..<g_body_len])
+
+// Copy the bytes after the first CRLF-CRLF into the body buffer.
+private void extract_body([]char8 buf, i32 n):
+    g_body_len = 0
+    i32 i = 0
+    i32 start = 0 - 1
+    for i < n - 3:
+        if buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n':
+            start = i + 4
+            i = n
+        else:
+            i = i + 1
+    if start < 0:
+        return
+    i32 j = start
+    for j < n && g_body_len < REQCAP:
+        g_body[g_body_len] = buf[j]
+        g_body_len = g_body_len + 1
+        j = j + 1
+
+// The method of the request `poll` last accepted.
+Method method():
+    return g_method
+
+// The request-target (path) of the request `poll` last accepted, as a string
+// viewing this package's own buffer — copy it if it must outlive the next poll.
+string8 path():
+    return string8(g_path[0..<g_path_len])
+
+// Split "METHOD SP TARGET SP …" out of the first line. Anything malformed
+// leaves the method `Other` and the path empty, which routes to a 404 upstream
+// rather than misbehaving.
+private void parse_request([]char8 buf, i32 n):
+    g_method   = Method.Other
+    g_path_len = 0
+
+    if n >= 3 && buf[0] == 'G' && buf[1] == 'E' && buf[2] == 'T':
+        g_method = Method.Get
+    else if n >= 4 && buf[0] == 'P' && buf[1] == 'O' && buf[2] == 'S' && buf[3] == 'T':
+        g_method = Method.Post
+    else if n >= 4 && buf[0] == 'H' && buf[1] == 'E' && buf[2] == 'A' && buf[3] == 'D':
+        g_method = Method.Head
+    else if n >= 7 && buf[0] == 'O' && buf[1] == 'P' && buf[2] == 'T' && buf[3] == 'I' && buf[4] == 'O' && buf[5] == 'N' && buf[6] == 'S':
+        g_method = Method.Options
+
+    // step past the method to the space before the target
+    i32 i = 0
+    for i < n && buf[i] != ' ':
+        i = i + 1
+    i = i + 1
+
+    // copy the target up to the next space (or the cap)
+    for i < n && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n' && g_path_len < PATHCAP:
+        g_path[g_path_len] = buf[i]
+        g_path_len = g_path_len + 1
+        i = i + 1
+
+// ── responding ───────────────────────────────────────────────────────────────
+
+// The largest response this package assembles at once. A status page is a few
+// kilobytes; a body past this is truncated (and its Content-Length still counts
+// the whole of what was asked for, so a caller that needs to serve something
+// larger should stream it itself rather than through `respond`).
+const i32 RESPCAP = 32768
+
+// Write a complete HTTP/1.1 response to `c` and close it. `status`/`reason` are
+// the status line ("200"/"OK", "404"/"Not Found"); `ctype` is the Content-Type;
+// `body` is sent verbatim with a matching Content-Length header. Zero
+// allocation: the whole response is assembled in one stack buffer and sent, so
+// there is no lifetime for a caller to manage and no allocator to pass.
+void respond(Conn c, i32 status, string8 reason, string8 ctype, string8 body):
+    [RESPCAP]char8 out
+    i32 w = 0
+    w = put_str(out[:], w, "HTTP/1.1 ")
+    w = put_int(out[:], w, status)
+    w = put_str(out[:], w, " ")
+    w = put_str(out[:], w, reason)
+    w = put_str(out[:], w, "\r\nContent-Type: ")
+    w = put_str(out[:], w, ctype)
+    w = put_str(out[:], w, "\r\nContent-Length: ")
+    w = put_int(out[:], w, #len(body))
+    w = put_str(out[:], w, "\r\nConnection: close\r\n\r\n")
+    w = put_str(out[:], w, body)
+    if w > 0:
+        _ = sys_send(#c.int(i32(c)), out[:], i64(w))
+    sys_close(#c.int(i32(c)))
+
+// Like `respond`, but with a permissive CORS header set — for an endpoint a
+// browser on another origin posts to (a dev diagnostics bridge, a local webhook).
+// It answers the preflight (`Access-Control-Allow-*`) and adds
+// `Cross-Origin-Resource-Policy: cross-origin` so the response is not blocked by a
+// COEP page. `*` is the right scope for a localhost-only dev surface and the wrong
+// one for anything shipped — this function is a dev convenience, named so.
+void respond_cors(Conn c, i32 status, string8 reason, string8 ctype, string8 body):
+    [RESPCAP]char8 out
+    i32 w = 0
+    w = put_str(out[:], w, "HTTP/1.1 ")
+    w = put_int(out[:], w, status)
+    w = put_str(out[:], w, " ")
+    w = put_str(out[:], w, reason)
+    w = put_str(out[:], w, "\r\nAccess-Control-Allow-Origin: *")
+    w = put_str(out[:], w, "\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS")
+    w = put_str(out[:], w, "\r\nAccess-Control-Allow-Headers: content-type")
+    w = put_str(out[:], w, "\r\nCross-Origin-Resource-Policy: cross-origin")
+    w = put_str(out[:], w, "\r\nContent-Type: ")
+    w = put_str(out[:], w, ctype)
+    w = put_str(out[:], w, "\r\nContent-Length: ")
+    w = put_int(out[:], w, #len(body))
+    w = put_str(out[:], w, "\r\nConnection: close\r\n\r\n")
+    w = put_str(out[:], w, body)
+    if w > 0:
+        _ = sys_send(#c.int(i32(c)), out[:], i64(w))
+    sys_close(#c.int(i32(c)))
+
+// Close a connection without answering it — for a caller that decides, after
+// accepting, that it will not respond.
+void close_conn(Conn c):
+    sys_close(#c.int(i32(c)))
+
+// ── the connection, one level down — for a layer that reads and writes its own ──
+//
+// `poll` and `respond` read one request line into this package's buffers and
+// answer with one fixed set of headers, which is the whole of what a status page
+// needs. A layer above that parses headers and bodies itself and writes its own
+// responses — `core:http/server` — needs the connection and nothing else, and
+// these hand it over: accept without reading, read and write bytes, close. They
+// share `poll`'s single-threaded, non-blocking contract and hold no state.
+
+// Accept one waiting connection without reading from it, or answer a `Conn` that
+// is not `open` when none is waiting. The connection carries `poll`'s 250 ms read
+// timeout and its SIGPIPE suppression.
+Conn accept(Server s):
+    return Conn(i32(sys_accept(#c.int(i32(s)))))
+
+// Whether `c` is a connection, rather than the nothing `accept` answers.
+bool open(Conn c):
+    return i32(c) >= 0
+
+// Read what has arrived on `c` into `into`, waiting at most the connection's read
+// timeout. Answers the count, 0 when the peer has closed, or -1 on an error or a
+// timeout with nothing read.
+i64 receive(Conn c, []char8 into):
+    if #len(into) == 0:
+        return 0
+    return sys_recv(#c.int(i32(c)), rawptr(&into[0]), i64(#len(into)))
+
+// Write all of `from` to `c`. Answers how many bytes were sent; fewer than
+// `#len(from)` means the peer went away.
+i64 send(Conn c, []char8 from):
+    return sys_send(#c.int(i32(c)), from, i64(#len(from)))
+
+// Set how long a `receive` on `c` waits for bytes before answering -1.
+void set_read_timeout(Conn c, i32 milliseconds):
+    i32 ms = milliseconds if milliseconds > 0 else 1
+    TimeVal tv = timeval_ms(ms)
+    _ = sock.setsockopt(#c.int(i32(c)), sock.SOL_SOCKET, sock.SO_RCVTIMEO, rawptr(&tv),
+                        #c.uint(#size(TimeVal)))
+
+// Append `s`'s bytes to `out` at offset `w`, clamped to `out`'s capacity, and
+// answer the new offset. A body that would overrun the buffer stops here.
+private i32 put_str([]char8 out, i32 w, string8 s):
+    i32 cap = i32(#len(out))
+    i64 n = #len(s)
+    for i in 0..<n:
+        if w >= cap:
+            return w
+        out[w] = s[i]
+        w = w + 1
+    return w
+
+// Append `v` as decimal (used for the status code and Content-Length, both
+// non-negative in practice; a negative is written with a leading '-' anyway).
+private i32 put_int([]char8 out, i32 w, i64 v):
+    i32 cap = i32(#len(out))
+    if v < 0:
+        if w < cap:
+            out[w] = '-'
+            w = w + 1
+        v = 0 - v
+    [20]char8 tmp
+    i32 k = 0
+    if v == 0:
+        tmp[0] = '0'
+        k = 1
+    else:
+        for v > 0:
+            tmp[k] = char8(i32('0') + (v % 10))
+            v = v / 10
+            k = k + 1
+    for j in 0..<k:
+        if w >= cap:
+            return w
+        out[w] = tmp[k - 1 - j]
+        w = w + 1
+    return w

@@ -1,0 +1,227 @@
+@test
+// The driver's pure logic: reading `defaults`, finding the toolchain's root
+// over a fake tree, reading a build manifest, the compiler's argument lists,
+// and where a package's artifacts go.
+//
+// What is not here, and is exercised by running the driver instead: the
+// commands themselves, which start `dadoc` and a C compiler.
+package driver
+
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+private bool is(string8 got, string8 want, string8 what):
+    return #expect(got == want, what, " is `", got, "`, not `", want, "`")
+
+private bool words_are([]string8 got, string8 want, string8 what):
+    ref []char8 j = strings.join(got, " ")
+    return #expect(txt(j) == want, what, " is `", txt(j), "`, not `", want, "`")
+
+// ── defaults ────────────────────────────────────────────────────────────────
+
+private const string8 DEFAULTS = "# a comment\n\nDADOC_CANDIDATES=\"$ROOT/bin/dadoc\n$ROOT/dadoc\"\n\nCFLAGS_BASE=\"-std=c11 -Wall\"\nEMPTY=\"\"\n  # indented comment\nLAST=\"x\""
+
+private bool defaults_read():
+    bool ok = true
+    (ref []Setting s, bool good, string8 why) = parse_defaults(DEFAULTS)
+    ok = #expect(good, "the defaults did not parse: ", why) && ok
+    ok = #expect(#len(s) == 4, "the defaults hold ", #len(s), " settings, not 4") && ok
+    (string8 cand, bool found) = setting_in(s[:], "DADOC_CANDIDATES")
+    ok = #expect(found, "DADOC_CANDIDATES is missing") && ok
+    ok = is(cand, "$ROOT/bin/dadoc\n$ROOT/dadoc", "a value across two lines") && ok
+    ref []string8 lines = lines_of(with_root(cand, "/opt/dado"))
+    ok = words_are(lines[:], "/opt/dado/bin/dadoc /opt/dado/dadoc", "the candidates with $ROOT replaced") && ok
+    (string8 base, bool _) = setting_in(s[:], "CFLAGS_BASE")
+    ok = is(base, "-std=c11 -Wall", "CFLAGS_BASE") && ok
+    (string8 empty, bool efound) = setting_in(s[:], "EMPTY")
+    ok = #expect(efound && #len(empty) == 0, "an empty value") && ok
+    (string8 last, bool _) = setting_in(s[:], "LAST")
+    ok = is(last, "x", "the last value, with no newline after it") && ok
+    (string8 _, bool none) = setting_in(s[:], "NOPE")
+    ok = #expect(!none, "a name that is not there was found") && ok
+
+    (ref []Setting _, bool bad1, string8 why1) = parse_defaults("CFLAGS=-O2\n")
+    ok = #expect(!bad1 && strings.contains(why1, "line 1"), "an unquoted value was accepted: ", why1) && ok
+    (ref []Setting _, bool bad2, string8 why2) = parse_defaults("A=\"1\"\nB=\"never closed\n")
+    ok = #expect(!bad2 && strings.contains(why2, "no closing quote"), "an unclosed value was accepted: ", why2) && ok
+    (ref []Setting _, bool bad3, string8 why3) = parse_defaults("lower=\"x\"\n")
+    ok = #expect(!bad3, "a lower-case name was accepted: ", why3) && ok
+    ok = is(pinned_zig("# zig\nversion 0.16.0\n"), "0.16.0", "ZIG_PIN's version") && ok
+    return ok
+
+// ── the root, over a fake tree ──────────────────────────────────────────────
+
+private bool make(string8 dir):
+    return fs.make_dirs(dir, #default)
+
+private bool touch(string8 file):
+    try fs.write_file(file, "") else:
+        return false
+    return true
+
+private bool roots_found():
+    bool ok = true
+    try ref []char8 made = fs.make_temp_dir("dado-driver-test") else code:
+        return #expect(false, "no temp directory: ", os.message(code))
+    string8 t = txt(made)
+
+    // A checkout, with a build directory that mirrors `collections/core`.
+    string8 repo = join2(t, "repo")
+    ok = #expect(make(join3(repo, "collections", "core")), "making the checkout") && ok
+    ok = #expect(make(join3(repo, "tools", "dado")), "making tools/dado") && ok
+    ok = #expect(touch(join3(repo, "tools", join2("dado", "defaults"))), "writing defaults") && ok
+    ok = #expect(make(join3(repo, "build", join2("collections", "core"))), "making the decoy") && ok
+    ok = #expect(make(join3(repo, "build", "tools")), "making build/tools") && ok
+    Layout l = locate(join3(repo, "build", "tools"))
+    ok = #expect(l.found, "no root above the checkout's build/tools") && ok
+    ok = is(l.kind, "monorepo", "the checkout's layout") && ok
+    ok = is(l.root, repo, "the checkout's root") && ok
+    ok = is(l.install, "", "a checkout's install") && ok
+    Layout at_root = locate(repo)
+    ok = is(at_root.root, repo, "the root found from the root itself") && ok
+
+    // An install: `bin/` beside `src/`, and the root is `src`.
+    string8 inst = join2(t, "inst")
+    string8 src = join2(inst, "src")
+    ok = #expect(make(join3(src, "collections", "core")), "making the install") && ok
+    ok = #expect(make(join3(src, "tools", "dado")), "making the install's tools/dado") && ok
+    ok = #expect(touch(join3(src, "tools", join2("dado", "defaults"))), "writing the install's defaults") && ok
+    ok = #expect(make(join2(inst, "bin")), "making bin") && ok
+    Layout i = locate(join2(inst, "bin"))
+    ok = #expect(i.found, "no root above the install's bin") && ok
+    ok = is(i.kind, "install", "the install's layout") && ok
+    ok = is(i.root, src, "the install's root") && ok
+    ok = is(i.install, inst, "the install's directory") && ok
+
+    // A tree with `collections/core` and no driver settings is neither.
+    string8 bare = join2(t, "bare")
+    ok = #expect(make(join3(bare, "collections", "core")), "making the bare tree") && ok
+    ok = #expect(make(join2(bare, "x")), "making bare/x") && ok
+    Layout n = locate(join2(bare, "x"))
+    ok = #expect(!n.found || n.root != bare, "a tree without tools/dado/defaults was taken for a root") && ok
+
+    try fs.remove_all(t) else code:
+        ok = #expect(false, "removing the fake tree: ", os.message(code)) && ok
+    return ok
+
+// ── the build manifest ──────────────────────────────────────────────────────
+
+private const string8 MANIFEST = "include /r/collections/core/fmt\ninclude /r/corpus/x\nsource /r/corpus/x/args.c\nheader args.h\nlink -lm   -lpthread\nflags -DX=1 -I/opt/inc\nos #LINUX\ntarget x86_64-pc-linux-gnu\narch #X86_64\nlive core:fmt\ninline-c a.dado 3 top-level\nforeign-macro memcpy macro\ninstantiation 4 nominal\nimplementation SOKOL_IMPL\nwasm-import env f\nwasm-export main\nc-export dado_x__answer\nsignal s 0\nengine quickjs\njs-module m.js\npass inline on\ncosts abc\nplan def\n\n"
+
+private bool manifest_read():
+    bool ok = true
+    (Manifest m, bool good, string8 why) = parse_manifest(MANIFEST)
+    ok = #expect(good, "the manifest did not parse: ", why) && ok
+    ok = words_are(m.includes[:], "/r/collections/core/fmt /r/corpus/x", "include") && ok
+    ok = words_are(m.sources[:], "/r/corpus/x/args.c", "source") && ok
+    ok = words_are(m.headers[:], "args.h", "header") && ok
+    ok = words_are(m.links[:], "-lm -lpthread", "link, split on whitespace") && ok
+    ok = words_are(m.flags[:], "-DX=1 -I/opt/inc", "flags, split on whitespace") && ok
+    ok = words_are(m.exports[:], "dado_x__answer", "c-export") && ok
+    ok = is(m.os, "#LINUX", "os") && ok
+    ok = is(m.engine, "quickjs", "engine") && ok
+    (Manifest _, bool bad, string8 why2) = parse_manifest("include /a\nmystery line here\n")
+    ok = #expect(!bad, "an unknown manifest line was accepted") && ok
+    ok = is(why2, "unrecognised build manifest line: mystery line here", "the refusal") && ok
+    (Manifest e, bool empty_ok, string8 _) = parse_manifest("")
+    ok = #expect(empty_ok && #len(e.includes) == 0 && e.os == "", "an empty manifest") && ok
+    return ok
+
+// ── the compiler's argument lists ───────────────────────────────────────────
+
+private bool flags_assembled():
+    bool ok = true
+    // F1: zig is never handed `address` in a combined list.
+    ref []string8 cf = words_of("-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=undefined,float-cast-overflow -g1")
+    ref []string8 cz = without_address(cf[:])
+    ok = words_are(cz[:], "-fsanitize=undefined,float-cast-overflow -fno-sanitize-recover=undefined,float-cast-overflow -g1", "the flags without address") && ok
+    ref []string8 alone = words_of("-fsanitize=address -O2")
+    ref []string8 dropped = without_address(alone[:])
+    ok = words_are(dropped[:], "-O2", "a list of address alone, dropped") && ok
+    (ref []string8 zc, ref []string8 zl) = sanitizer_words("-fsanitize=address,undefined -g1", "-fsanitize=address,undefined", true)
+    ok = words_are(zc[:], "-fsanitize=undefined -g1", "zig's sanitizer cflags") && ok
+    ok = words_are(zl[:], "-fsanitize=undefined", "zig's sanitizer ldflags") && ok
+    (ref []string8 gc, ref []string8 _) = sanitizer_words("-fsanitize=address,undefined -g1", "-fsanitize=address,undefined", false)
+    ok = words_are(gc[:], "-fsanitize=address,undefined -g1", "clang's sanitizer cflags, untouched") && ok
+    ref []string8 tsan = words_of("-fsanitize=thread,undefined")
+    ref []string8 tz = without_address(tsan[:])
+    ok = words_are(tz[:], "-fsanitize=thread,undefined", "a thread list under zig") && ok
+
+    // F2: exports under zig are `-rdynamic`.
+    ref []string8 syms = words_of("a b")
+    ref []string8 elf = export_flags("#LINUX", syms[:], false)
+    ok = words_are(elf[:], "-Wl,--export-dynamic-symbol=a -Wl,--export-dynamic-symbol=b", "ELF exports") && ok
+    ref []string8 zelf = export_flags("#LINUX", syms[:], true)
+    ok = words_are(zelf[:], "-rdynamic", "exports under zig") && ok
+    ref []string8 mac = export_flags("#DARWIN", syms[:], false)
+    ok = words_are(mac[:], "-Wl,-export_dynamic", "Darwin's exports") && ok
+    ref []string8 win = export_flags("#WINDOWS", syms[:], true)
+    ok = #expect(#len(win) == 0, "Windows takes no export flag") && ok
+    ref []string8 none = words_of("")
+    ref []string8 nothing = export_flags("#LINUX", none[:], false)
+    ok = #expect(#len(nothing) == 0, "no export, no flag") && ok
+
+    // The link line's order is the contract the head of cc.dado states.
+    Link k = new_link()
+    k.cc = words_of("zig cc")
+    k.base = words_of("-std=c11")
+    k.interop = words_of("-Werror=int-conversion")
+    k.werror = words_of("-Werror")
+    k.opt = words_of("-O2")
+    k.extra = words_of("-DCLAUSE")
+    k.san_c = words_of("-fsanitize=undefined")
+    k.includes = words_of("-I/p -DUSER")
+    k.c_file = "x.c"
+    k.sources = words_of("s.c")
+    k.out = "x"
+    k.libs = words_of("-L/brew -lm")
+    k.exports = words_of("-rdynamic")
+    k.san_l = words_of("-fsanitize=undefined")
+    k.ldflags = words_of("-L/mine")
+    Command c = link_command(&k)
+    ok = words_are(c.words[:], "zig cc -std=c11 -Werror=int-conversion -Werror -O2 -DCLAUSE -fsanitize=undefined -I/p -DUSER x.c s.c -o x -L/brew -lm -rdynamic -fsanitize=undefined -L/mine", "the link line") && ok
+    Command obj = object_command(&k, "s.c", "s.o")
+    ok = words_are(obj.words[:], "zig cc -std=c11 -Werror=int-conversion -Werror -O2 -ffreestanding -c -DCLAUSE -fsanitize=undefined -I/p -DUSER s.c -o s.o", "a freestanding object's line") && ok
+
+    Compiler z = zig_compiler("/z/zig", "x86_64-windows-gnu")
+    ok = words_are(z.words[:], "/z/zig cc -target x86_64-windows-gnu", "zig with a target") && ok
+    ok = #expect(z.zig && z.name == "zig cc", "zig is zig") && ok
+    Compiler g = given_compiler("clang")
+    ok = #expect(!g.zig && g.name == "clang", "clang is not zig") && ok
+    ok = #expect(given_compiler("scripts/zigcc").zig, "a program named zig* is taken for zig") && ok
+    return ok
+
+// ── where artifacts go ──────────────────────────────────────────────────────
+
+private bool stems():
+    bool ok = true
+    when #OS == #WINDOWS:
+        ok = is(build_stem("C:\\r\\corpus\\tour", "C:\\r"), "corpus\\tour", "a package inside the base") && ok
+        ok = is(build_stem("C:\\elsewhere\\pkg", "C:\\r"), "C/elsewhere\\pkg", "a package outside it") && ok
+    else:
+        ok = is(build_stem("/r/corpus/tour", "/r"), "corpus/tour", "a package inside the base") && ok
+        ok = is(build_stem("/r/corpus/../corpus/./tour", "/r"), "corpus/tour", "one package however it is spelled") && ok
+        ok = is(build_stem("/r/main.dado", "/r"), "main", "a file's stem without .dado") && ok
+        ok = is(build_stem("/elsewhere/pkg", "/r"), "elsewhere/pkg", "a package outside the base") && ok
+        ok = is(build_stem("/rx/pkg", "/r"), "rx/pkg", "a sibling sharing the base's prefix") && ok
+        ok = is(absolute("corpus/tour", "/home/me"), "/home/me/corpus/tour", "a relative package") && ok
+        ok = is(absolute("/abs/p", "/home/me"), "/abs/p", "an absolute package") && ok
+    ok = is(missing_include("x.c:1:10: fatal error: 'foo.h' file not found"), "foo.h", "clang's missing header") && ok
+    ok = is(missing_include("x.c:1:10: fatal error: foo/bar.h: No such file or directory"), "foo/bar.h", "gcc's missing header") && ok
+    ok = is(missing_include("x.c:3:1: error: unknown type name"), "", "no missing header") && ok
+    return ok
+
+i32 test():
+    arena.Arena a = arena.over(libc.allocator())
+    defer arena.destroy(&a)
+    using arena.allocator(&a):
+        bool ok = defaults_read()
+        ok = roots_found() && ok
+        ok = manifest_read() && ok
+        ok = flags_assembled() && ok
+        ok = stems() && ok
+        if ok: return 0
+        return 1

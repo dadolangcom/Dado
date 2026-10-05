@@ -1,0 +1,243 @@
+// core:os/proc — running another program **without a shell**.
+//
+//     import "core:os/proc"
+//     import "core:io"
+//
+//     [3]cstring argv
+//     argv[0] = "git"
+//     argv[1] = "rev-parse"
+//     argv[2] = "--short"
+//     proc.Child c = proc.spawn(argv[:])
+//     (cstring line, bool ok) = io.read_line(c.stream)
+//     (bool exited, i32 status) = proc.wait(c)
+//
+// **This is the half of the package that does not go through `/bin/sh`.**
+// `read`, `write` and `run` hand a *line* to a shell; everything here hands an
+// *array* to `execvp`, so a space, a quote and a `;` are bytes in an argument
+// and nothing else. Measured on the shell side before this was written: one
+// seven-byte value `a b'c;d` split into two arguments, and one holding a `;`
+// ran a second command whose output arrived in the caller's pipe.
+//
+// `proc.dado`'s header used to say there was no `exec` form *"because that needs
+// an array of strings crossing into C and `foreign` has no spelling for one."*
+// Measured false: `rawptr` crosses, and the cost of that is stated on
+// `execvp` below rather than left as a reason not to have the feature.
+//
+// **`execvp` and not `execv`**, so a bare program name is looked up on `PATH`
+// the way a shell would — which is the one convenience of the shell form worth
+// keeping. The child inherits the caller's environment, because `execvp` reads
+// `environ` itself and nothing here has to name it.
+package proc
+
+import "core:io"
+
+// **The argv this package will assemble, at most.** C wants a null after the
+// last argument, and building that array is the only work `exec` and `spawn`
+// do before the fork.
+//
+// **A frame and not an allocation.** This package allocates nothing and an
+// `exec` that can fail for want of memory is a second failure mode on the path
+// whose whole point is being simpler than a shell line. Over the cap is a
+// *refusal* and never a truncation: an argv one element short is a different
+// program being run, and that is the kind of difference nobody notices.
+const i32 ARG_CAP = 255
+
+// The array `exec_argv` builds: the cap, plus C's terminator. Bound to its own
+// `const` because an array length is a compile-time integer written as one
+// spelling and `ARG_CAP + 1` is arithmetic (ERR0502).
+private const i32 ARGV_SLOTS = 256
+
+// A running program and the pipe its standard output arrives on.
+//
+// `pid` is kept beside the stream because `pclose` is not the answer here:
+// this pipe came from `pipe` and `fdopen` rather than from `popen`, so closing
+// it and reaping the child are two operations and `wait` does both.
+type Child:
+    ^io.FILE stream,
+    i32      pid,
+
+// Whether an argv is one this package will run: at least the program, no more
+// than the cap, and no `nil` before the end.
+//
+// **A `nil` in the middle is refused rather than treated as the end.** C would
+// stop there, so a caller that left one slot unfilled would silently run a
+// shorter command — which is the truncation the cap refuses, arriving by a
+// different door.
+private bool runnable([]cstring argv):
+    if #len(argv) < 1 || #len(argv) > ARG_CAP: return false
+    for a in argv:
+        if a == nil: return false
+    return true
+
+// Whether a `spawn` started anything.
+bool spawned(Child c): return c.stream != nil
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+//
+// `windows.dado` holds the mechanics: the argv quoted into one command line by
+// the rule the C runtime reverses, the child started by `CreateProcessW` with
+// only its three standard handles inherited, and waited on by its handle.
+// `exec` and `spawn` hand the child the caller's own standard input and error,
+// as the POSIX arm's `fork` does.
+//
+// **A program that is not there is 127 from `exec`**, as it is on POSIX, so a
+// caller reads one number on both. `CreateProcessW` says so before anything
+// runs, which `fork` and `execvp` cannot, so `spawn` answers a `Child` that did
+// not start — the more exact answer its type already has a spelling for — and
+// `duplex` a `failure` of `ERROR_FILE_NOT_FOUND`, which is 2, as `ENOENT` is.
+when #OS == #WINDOWS:
+    (bool exited, i32 status) exec([]cstring argv):
+        if !runnable(argv): return (false, 0 - 1)
+        (i32 pid, i32 why) = launch_argv(argv, std_handle(STD_INPUT_HANDLE), std_handle(STD_OUTPUT_HANDLE), std_handle(STD_ERROR_HANDLE))
+        if why == i32(ERROR_FILE_NOT_FOUND) || why == i32(ERROR_PATH_NOT_FOUND): return (true, 127)
+        if pid < 0: return (false, 0 - 1)
+        (_, bool exited, i32 status) = reap_pid(pid, 0 - 1)
+        return (exited, status)
+
+    Child spawn([]cstring argv):
+        if !runnable(argv): return (nil, 0 - 1)
+        (rawptr read_end, rawptr write_end, i32 why) = anonymous_pipe()
+        if why != 0: return (nil, 0 - 1)
+        (i32 pid, i32 failed) = launch_argv(argv, std_handle(STD_INPUT_HANDLE), write_end, std_handle(STD_ERROR_HANDLE))
+        close_handle(write_end)
+        if failed != 0:
+            close_handle(read_end)
+            return (nil, 0 - 1)
+        ^io.FILE f = stream_over(read_end, true)
+        if f == nil:
+            _ = end_tree(pid)
+            _ = reap_pid(pid, 0 - 1)
+            return (nil, 0 - 1)
+        return (f, pid)
+
+    (bool exited, i32 status) wait(Child c):
+        if c.stream == nil: return (false, 0 - 1)
+        _ = io.close(c.stream)
+        (_, bool exited, i32 status) = reap_pid(c.pid, 0 - 1)
+        return (exited, status)
+
+// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+else:
+    // **`argv` is restated as `^const ^#c.char`, which is C's `char *const *`
+    // exactly**, and the `_Generic` assertion over each foreign signature holds the
+    // declaration to it. It used to cross as `rawptr`, as a dated exception:
+    // `^cstring` emits `const char **`, which C does not convert to `char *const *`
+    // (adding `const` below the first level is the one qualifier conversion C
+    // refuses), and `^^char8` is `unsigned char **`. `#c.char` is C's plain `char`,
+    // and `^const ^#c.char` puts the `const` on the pointers where the header has
+    // it.
+    //
+    // **What is still erased is the call, not the declaration.** The argv is built
+    // as `[N]cstring` — `const char *` elements, because a `cstring` is one — and
+    // handing their address to `char *const *` is the conversion C refuses, so the
+    // call writes it through `Argv(rawptr(…))`, once, in `exec_argv` below (and in
+    // `duplex.dado`'s `posix_spawnp`, which takes argv and envp the same way).
+    // `exec_test` and `duplex_test` hold the two calls.
+    private type Argv: ^const ^#c.char
+
+    // Both feature macros are written unconditionally, which is `proc.dado`'s own
+    // rule and its reason: each is inert on the platform it is not for, which is
+    // cheaper than a `when` on `#OS` and says the same thing. `<features.h>` fixes
+    // the set the first time any header pulls it in, so a `define` clause is
+    // emitted above every `#include` in the translation unit.
+    private foreign sys "unistd.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        i32 execvp(cstring file, ^const ^#c.char argv)
+        i32 fork()
+        i32 pipe(^i32 fds)
+        i32 dup2(i32 old, i32 new)
+        i32 close(i32 fd)
+        void _exit(i32 code)
+
+    private foreign wait_for "sys/wait.h":
+        i32 waitpid(i32 pid, ^i32 status, i32 options)
+
+    private foreign "stdio.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        ^io.FILE fdopen(i32 fd, cstring mode)
+
+    // ── the whole thing in one call ───────────────────────────────────────────
+
+    // Run `argv` to completion with the caller's own streams, so its output goes
+    // straight to the terminal and nothing is captured. The `run` twin.
+    //
+    // `(false, -1)` for an argv this package will not run and for a fork that
+    // failed — the same pair `run` and `close` use for *the system said no*, which
+    // stays distinct from a program that ran and failed.
+    (bool exited, i32 status) exec([]cstring argv):
+        if !runnable(argv): return (false, 0 - 1)
+        i32 pid = sys.fork()
+        if pid < 0: return (false, 0 - 1)
+        if pid == 0: exec_argv(argv)
+        return reap(pid)
+
+    // ── opening ───────────────────────────────────────────────────────────────
+
+    // Start `argv` and read its standard output. The `read` twin.
+    //
+    // A `Child` whose `stream` is `nil` is one that did not start, which `spawned`
+    // asks. Its standard error is not redirected and goes wherever the caller's
+    // does; there is no `2>&1` to append here, and redirecting it is a decision
+    // this package does not yet offer.
+    Child spawn([]cstring argv):
+        if !runnable(argv): return (nil, 0 - 1)
+        [2]i32 fds
+        if sys.pipe(&fds[0]) != 0: return (nil, 0 - 1)
+        i32 pid = sys.fork()
+        if pid < 0:
+            _ = sys.close(fds[0])
+            _ = sys.close(fds[1])
+            return (nil, 0 - 1)
+        if pid == 0:
+            // **Only async-signal-safe calls between `fork` and `exec`**, which is
+            // `dup2`, `close`, `execvp` and `_exit` and nothing else. No allocation
+            // and no Dado that could reach one.
+            _ = sys.dup2(fds[1], 1)
+            _ = sys.close(fds[0])
+            _ = sys.close(fds[1])
+            exec_argv(argv)
+        _ = sys.close(fds[1])
+        ^io.FILE f = fdopen(fds[0], "r")
+        if f == nil:
+            _ = sys.close(fds[0])
+            _ = reap(pid)
+            return (nil, 0 - 1)
+        return (f, pid)
+
+    // ── closing, which is where the answer is ─────────────────────────────────
+
+    // Close the pipe and wait for the program. The `close` twin, and the same
+    // protocol: read to the end first, because the answer is here and not at the
+    // `spawn`.
+    //
+    // `(false, -1)` for a `Child` that never started.
+    (bool exited, i32 status) wait(Child c):
+        if c.stream == nil: return (false, 0 - 1)
+        _ = io.close(c.stream)
+        return reap(c.pid)
+
+    // ── the two halves nobody outside this file should have to write ──────────
+
+    // In the child, and it does not return. `execvp` returns only on failure, and
+    // 127 is the status a shell reports for a command it could not run — so a
+    // caller that switched from `run` to `exec` reads the same number back.
+    private void exec_argv([]cstring argv):
+        [ARGV_SLOTS]cstring c_argv
+        i32 i = 0
+        for i < #len(argv):
+            c_argv[i] = argv[i]
+            i += 1
+
+        // The terminator is the declaration's own zero, written here anyway: the
+        // array is a frame and its zero is what makes this a null-terminated argv
+        // rather than whatever was on the stack. Saying it costs one line and is
+        // the difference between a rule and a coincidence.
+        c_argv[i] = nil
+        _ = sys.execvp(c_argv[0], Argv(rawptr(&c_argv[0])))
+        sys._exit(127)
+
+    // In the parent. `waitpid` with no options blocks until the child ends, and
+    // `decode` — `proc.dado`'s, shared because a wait status has one reading — turns
+    // the raw status into the pair every caller here wants.
+    private (bool exited, i32 status) reap(i32 pid):
+        i32 raw = 0
+        if wait_for.waitpid(pid, &raw, 0) < 0: return (false, 0 - 1)
+        return decode(raw)

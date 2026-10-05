@@ -1,0 +1,428 @@
+// The questions a person or a program asks about Dado code and the
+// toolchain, each answered in two spellings: `--format=text` (the default)
+// for a person and `--format=json` for a program, the JSON's shape fixed so
+// that a later tool can wrap each command without reading its text.
+//
+//     dado inspect core:strings.contains       a declaration, its token, what it uses
+//     dado inspect core:strings                a package's signature summary
+//     dado api core:strings                    `inspect --signatures-only`
+//     dado peek core:strings.contains index_of what a name means inside a declaration
+//     dado refs core:strings.contains --in=src everything that names it
+//     dado apply edited.dado --dry-run         declarations written back as one unit
+//     dado explain ERR0301                     what a diagnostic code means
+//     dado search "no main"                    the docs and every code's title and rule
+//     dado lexicon                             every roster the compiler prints
+//     dado agent                               the guide for agents, for this version
+//     dado where --format=json                 where the toolchain's parts are
+//
+// **`inspect`, `peek`, `refs` and `apply` are `dadoc query`**, run with the
+// collections and the target a build would use, every option passed on as
+// written, and its status returned. Their JSON is the compiler's own, an
+// object whose `query` field names the command (`api`'s is `inspect`'s, the
+// command it is). `DADO_QUERY_CACHE` points into the build directory, so a
+// question asked again about packages that did not change is answered from
+// a file there without loading or checking anything.
+//
+// **Every other command's JSON is one object on one line** with a `query`
+// field naming the command; its shape is written above the function that
+// prints it. A command that cannot answer prints `{"query": "<command>",
+// "error": "<why, and the repair>"}` and exits 1, so a program reading
+// standard output always gets an object. (A `dadoc query` refusal is the
+// compiler's `{"error": ...}`.)
+package driver
+
+import "core:chars"
+import "core:flags"
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+// The verbs this file answers, and the `--format` they share.
+private const string8 ANSWERING = "inspect peek refs apply api doc explain search lexicon where agent new"
+
+private flags.TextFlag g_format
+private flags.TextFlag g_inspect_addr
+private flags.TextFlag g_inspect_out
+private flags.TextFlag g_max_chars
+private flags.BoolFlag g_signatures
+private flags.TextFlag g_peek_scope
+private flags.TextFlag g_peek_name
+private flags.TextFlag g_refs_decl
+private flags.TextFlag g_within
+private flags.TextFlag g_limit
+private flags.TextFlag g_page
+private flags.ListFlag g_apply_files
+private flags.BoolFlag g_strict
+private flags.BoolFlag g_dry_run
+private flags.TextFlag g_expect
+private flags.TextFlag g_package
+private flags.TextFlag g_api_pkg
+private flags.TextFlag g_code
+private flags.ListFlag g_terms
+private flags.TextFlag g_new_name
+private flags.BoolFlag g_doc_check
+private flags.BoolFlag g_doc_write
+
+// The command-line declarations of these verbs.
+void declare_queries(^flags.Parser p):
+    p.command("inspect", "a declaration's text, token and the names it uses; or a package's signatures")
+    p.command("api", "a package's signatures only: what can be called")
+    p.command("peek", "what a name resolves to inside a declaration, or where such a name exists")
+    p.command("refs", "every declaration that names this one")
+    p.command("apply", "write declarations back as one unit (refused on parse or name errors)")
+    p.command("explain", "what a diagnostic code means, and the rule behind it")
+    p.command("search", "search the documentation and every diagnostic's title and rule")
+    p.command("lexicon", "every roster the compiler prints, one row per line")
+    p.command("agent", "print the guide for agents that matches this toolchain")
+    p.command("new", txt(#format("make a new package: main.dado and a short AGENTS", MD)))
+    g_format = p.choice("--format", "=text|json", "how the answer is written", "text", ANSWERING)
+    g_inspect_addr = p.positional("ADDRESS", "a package (core:strings, ./pkg) or a declaration in one (core:strings.contains)", true, "inspect")
+    g_inspect_out = p.text("-o", "FILE", "write the declaration to FILE, its token in the header, for `apply`", "", "inspect")
+    g_max_chars = p.text("--max-chars", "N", "cut the answer to about N characters", "", "inspect api")
+    g_signatures = p.boolean("--signatures-only", "a package's signatures, without their doc lines", "inspect")
+    g_api_pkg = p.positional("PACKAGE", "the package (core:strings, ./pkg)", true, "api")
+    g_peek_scope = p.positional("SCOPE", "the declaration to look from (core:strings.contains)", true, "peek")
+    g_peek_name = p.positional("NAME", "the name to resolve there", true, "peek")
+    g_refs_decl = p.positional("DECL", "the declaration (core:strings.contains)", true, "refs")
+    g_within = p.text("--in", "DIR", "also look in the packages under DIR (default: here)", "", "refs")
+    g_limit = p.text("--limit", "N", "answer at most N (refs: 50, search: 20)", "", "refs search")
+    g_page = p.text("--page", "N", "with --limit: the Nth page", "", "refs")
+    g_apply_files = p.rest("FILE", "files of declarations, as `inspect -o` writes them", "apply")
+    g_strict = p.boolean("--strict", "refuse on any diagnostic, type errors included", "apply")
+    g_dry_run = p.boolean("--dry-run", "check the declarations in place and write nothing", "apply")
+    g_expect = p.text("--expect", "TOKEN", "refuse if the declaration changed since this token was read", "", "apply")
+    g_package = p.text("--package", "PKG", "the package the files' declarations belong to", "", "apply")
+    g_code = p.positional("CODE", "a diagnostic code, such as ERR0301", true, "explain")
+    g_terms = p.rest("TERM", "the words to look for, all of them on one line", "search")
+    g_new_name = p.positional("NAME", "the new package's directory, made here", true, "new")
+    g_doc_check = p.boolean("--check", "regenerate docs/ into a temporary directory and list every file that differs", "doc")
+    g_doc_write = p.boolean("--write", "regenerate docs/ in place", "doc")
+
+// Whether the answer is to be JSON.
+bool json_wanted(^flags.Parser p):
+    return p.value(g_format) == "json"
+
+// `dado doc --check` and `--write`.
+(bool check, bool write) doc_modes(^flags.Parser p):
+    return (p.on(g_doc_check), p.on(g_doc_write))
+
+// The verbs this file answers; `handled` is false for any other.
+(bool handled, i32 status) query_verbs(^flags.Parser p, string8 cmd):
+    bool json = json_wanted(p)
+    if cmd == "inspect":
+        ref []string8 w = #make([]string8, 0)
+        _ = #append(w, p.value(g_inspect_addr))
+        if p.given(g_inspect_out):
+            _ = #append(w, "-o")
+            _ = #append(w, p.value(g_inspect_out))
+        pass_value(&w, p, g_max_chars, "--max-chars=")
+        if p.on(g_signatures): _ = #append(w, "--signatures-only")
+        return (true, dadoc_query("inspect", w[:], json))
+    if cmd == "api":
+        ref []string8 w = #make([]string8, 0)
+        _ = #append(w, p.value(g_api_pkg))
+        _ = #append(w, "--signatures-only")
+        pass_value(&w, p, g_max_chars, "--max-chars=")
+        return (true, dadoc_query("inspect", w[:], json))
+    if cmd == "peek":
+        ref []string8 w = #make([]string8, 0)
+        _ = #append(w, p.value(g_peek_scope))
+        _ = #append(w, p.value(g_peek_name))
+        return (true, dadoc_query("peek", w[:], json))
+    if cmd == "refs":
+        ref []string8 w = #make([]string8, 0)
+        _ = #append(w, p.value(g_refs_decl))
+        pass_value(&w, p, g_within, "--in=")
+        pass_value(&w, p, g_limit, "--limit=")
+        pass_value(&w, p, g_page, "--page=")
+        return (true, dadoc_query("refs", w[:], json))
+    if cmd == "apply":
+        ref []string8 w = #make([]string8, 0)
+        for f in p.values(g_apply_files):
+            _ = #append(w, f)
+        if #len(w) == 0:
+            return (true, answer_error("apply", json, "no file given. Write a declaration to a file with `dado inspect <decl> -o <file>`, edit it, then: dado apply <file>"))
+        if p.on(g_strict): _ = #append(w, "--strict")
+        if p.on(g_dry_run): _ = #append(w, "--dry-run")
+        pass_value(&w, p, g_expect, "--expect=")
+        pass_value(&w, p, g_package, "--package=")
+        return (true, dadoc_query("apply", w[:], json))
+    if cmd == "explain":
+        return (true, explain_verb(p.value(g_code), json))
+    if cmd == "search":
+        return (true, search_verb(p.values(g_terms), p.value(g_limit), json))
+    if cmd == "lexicon":
+        return (true, lexicon_verb(json))
+    if cmd == "agent":
+        return (true, agent_verb(json))
+    if cmd == "new":
+        return (true, new_verb(p.value(g_new_name), json))
+    if cmd == "where":
+        return (true, where(json))
+    return (false, 0)
+
+// `prefix` and the value of `f` appended to `w`, when `f` was given.
+private void pass_value(^ref []string8 w, ^flags.Parser p, flags.TextFlag f, string8 prefix):
+    if p.given(f):
+        _ = #append(w^, txt(#format(prefix, p.value(f))))
+
+// ── dadoc query ─────────────────────────────────────────────────────────────
+
+// Where the query answers are kept between runs.
+string8 query_cache_dir():
+    return join3(build_dir(), ".dado-cache", "query")
+
+// The `--target=` a build here would tell dadoc: `DADO_TARGET`, or the
+// triple the C compiler says it builds for, or none when there is no
+// compiler to ask. Asked because a `when #OS` decides which declarations
+// exist, so a question has the same answer a build would.
+string8 query_target():
+    (string8 t, bool set) = env("DADO_TARGET")
+    if set: return txt(#format("--target=", t))
+    Compiler c = compiler("", true)
+    if !c.found: return ""
+    Command ask = command_of(c.words[:])
+    add(&ask, "-dumpmachine")
+    string8 triple = first_line(ask, true)
+    if #len(triple) == 0: return ""
+    return txt(#format("--target=", triple))
+
+// `dadoc query <mode> <words>`, with this toolchain's collections and target,
+// answering on this process's own streams; its status.
+private i32 dadoc_query(string8 mode, []string8 words, bool json):
+    Command c = command(dadoc())
+    add(&c, "query")
+    add(&c, mode)
+    add(&c, txt(#format("--collections=", collections())))
+    string8 target = query_target()
+    if #len(target) > 0: add(&c, target)
+    add(&c, "--format=json" if json else "--format=text")
+    add_all(&c, words)
+    try os.set_env("DADO_QUERY_CACHE", query_cache_dir()) else:
+        warn("cannot set DADO_QUERY_CACHE: this answer is computed afresh and not kept")
+    return run(c)
+
+// ── JSON ────────────────────────────────────────────────────────────────────
+
+// `"name": raw`, where `raw` is already JSON.
+string8 json_field(string8 name, string8 raw):
+    return txt(#format(json_quote(name), ": ", raw))
+
+// `"name": "value"`.
+string8 json_text(string8 name, string8 value):
+    return json_field(name, json_quote(value))
+
+// `"name": n`.
+string8 json_number(string8 name, i64 n):
+    return json_field(name, txt(#format(n)))
+
+// `fields`, each `"name": value`, as one object on one line.
+string8 json_object([]string8 fields):
+    ref []char8 j = strings.join(fields, ", ")
+    return txt(#format("{", txt(j), "}"))
+
+// `items`, each already JSON, as an array.
+string8 json_array([]string8 items):
+    ref []char8 j = strings.join(items, ", ")
+    return txt(#format("[", txt(j), "]"))
+
+// `items` as an array of JSON strings.
+string8 json_strings([]string8 items):
+    ref []string8 q = #make([]string8, 0)
+    for s in items:
+        _ = #append(q, json_quote(s))
+    return json_array(q[:])
+
+// The object a command prints when it cannot answer.
+string8 error_json(string8 query, string8 why):
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, json_text("query", query))
+    _ = #append(f, json_text("error", why))
+    return json_object(f[:])
+
+// A refusal: the error object on standard output under `--format=json`,
+// `error: <why>` on standard error otherwise. Status 1.
+i32 answer_error(string8 query, bool json, string8 why):
+    if json:
+        fmt.println(error_json(query, why))
+        _ = io.flush(io.stdout())
+        return 1
+    die(why)
+    return 1
+
+// `text` on standard output as it is.
+void print_raw(string8 text):
+    _ = io.flush(io.stdout())
+    _ = io.write_bytes(io.stdout(), strings.bytes(text))
+    _ = io.flush(io.stdout())
+
+// ── the lexicon, and explain ────────────────────────────────────────────────
+
+// One diagnostic code, as the lexicon's `code` roster lists it.
+type CodeRow:
+    string8 code
+    string8 scope
+    string8 rule
+    string8 title
+    string8 class
+
+// Every line of `text`, blank ones included, without its newline.
+ref []string8 raw_lines(string8 text):
+    ref []string8 out = #make([]string8, 0)
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        _ = #append(out, l)
+        if !more: break
+        rest = tail
+    return out
+
+// The `code` rows of a lexicon dump, in its order. A row short of fields is
+// skipped rather than guessed at.
+ref []CodeRow parse_codes(string8 lexicon):
+    ref []CodeRow out = #make([]CodeRow, 0)
+    for l in raw_lines(lexicon):
+        if !strings.starts_with(l, "code\t"): continue
+        ref []string8 f = tab_fields(l)
+        if #len(f) < 6: continue
+        CodeRow r
+        r.code = f[1]
+        r.scope = f[2]
+        r.rule = f[3]
+        r.title = f[4]
+        r.class = f[5]
+        _ = #append(out, r)
+    return out
+
+// `s` with ASCII letters in upper case.
+string8 upper(string8 s):
+    strings.Builder b = strings.builder(#len(s) + 1)
+    for c in s:
+        _ = strings.append_char(&b, chars.upper(c))
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// `s` with ASCII letters in lower case.
+string8 folded(string8 s):
+    strings.Builder b = strings.builder(#len(s) + 1)
+    for c in s:
+        _ = strings.append_char(&b, chars.lower(c))
+    ref []char8 done = strings.finish(&b)
+    return txt(done)
+
+// What `dadoc --emit=lexicon` prints. Ends the process when it fails.
+string8 lexicon_text():
+    Command c = command(dadoc())
+    add(&c, "--emit=lexicon")
+    Captured r = capture(c, false)
+    if !r.started || r.status != 0:
+        die(txt(#format(shown(c), " failed (status ", r.status, "). `dado doctor` checks the compiler.")))
+    return txt(r.out)
+
+// The row for `code` (matched in any case), and whether there is one.
+(CodeRow row, bool found) code_named([]CodeRow codes, string8 code):
+    string8 want = upper(code)
+    for r in codes:
+        if r.code == want: return (r, true)
+    CodeRow none
+    return (none, false)
+
+// Why `code` is not a diagnostic code, with the nearest one if any.
+string8 no_such_code([]CodeRow codes, string8 code):
+    ref []string8 ids = #make([]string8, 0)
+    for r in codes:
+        _ = #append(ids, r.code)
+    string8 near = nearest_name(upper(code), ids[:])
+    if #len(near) > 0:
+        return txt(#format("there is no diagnostic code `", code, "`; did you mean `", near, "`? `dado search <words>` finds a code by what it says"))
+    return txt(#format("there is no diagnostic code `", code, "`. Codes look like ERR0301; `dado search <words>` finds one by what it says"))
+
+// `dado explain <code>`: `dadoc --explain`'s page.
+//
+// JSON: {"query": "explain", "code": "ERR0301", "title": ..., "class":
+// "error"|"warning"|"lint", "scope": "file"|"program", "rule": ..., "text":
+// <the page as `--format=text` prints it>}
+private i32 explain_verb(string8 code, bool json):
+    ref []CodeRow codes = parse_codes(lexicon_text())
+    (CodeRow row, bool found) = code_named(codes[:], code)
+    if !found:
+        return answer_error("explain", json, no_such_code(codes[:], code))
+    Command c = command(dadoc())
+    add(&c, "--explain")
+    add(&c, row.code)
+    Captured r = capture(c, false)
+    if !r.started || r.status != 0:
+        return answer_error("explain", json, txt(#format(shown(c), " failed (status ", r.status, "). `dado doctor` checks the compiler.")))
+    if !json:
+        print_raw(txt(r.out))
+        return 0
+    fmt.println(explain_json(row, txt(r.out)))
+    return 0
+
+// `explain`'s JSON object for `row` and its page.
+string8 explain_json(CodeRow row, string8 page):
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, json_text("query", "explain"))
+    _ = #append(f, json_text("code", row.code))
+    _ = #append(f, json_text("title", row.title))
+    _ = #append(f, json_text("class", row.class))
+    _ = #append(f, json_text("scope", row.scope))
+    _ = #append(f, json_text("rule", row.rule))
+    _ = #append(f, json_text("text", page))
+    return json_object(f[:])
+
+// `dado lexicon`: every roster the compiler prints.
+//
+// JSON: {"query": "lexicon", "rows": [["code", "ERR0001", "file", ...], ...]},
+// each row its fields in the dump's order, the roster's name first.
+private i32 lexicon_verb(bool json):
+    string8 text = lexicon_text()
+    if !json:
+        print_raw(text)
+        return 0
+    fmt.println(lexicon_json(text))
+    return 0
+
+string8 lexicon_json(string8 text):
+    ref []string8 rows = #make([]string8, 0)
+    for l in raw_lines(text):
+        if #len(l) == 0: continue
+        ref []string8 fields = tab_fields(l)
+        _ = #append(rows, json_strings(fields[:]))
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, json_text("query", "lexicon"))
+    _ = #append(f, json_field("rows", json_array(rows[:])))
+    return json_object(f[:])
+
+// ── agent ───────────────────────────────────────────────────────────────────
+
+// Where the guide for agents is looked for: beside `dadoc` in an install
+// (the archive carries it), else at the root of the checkout.
+string8 agents_path():
+    Layout l = layout()
+    if l.kind == "install": return join2(l.install, txt(#format("AGENTS", MD)))
+    return join2(l.root, txt(#format("AGENTS", MD)))
+
+// `dado agent`: the guide, as this version shipped it.
+//
+// JSON: {"query": "agent", "path": <the file>, "text": <its contents>}
+private i32 agent_verb(bool json):
+    string8 at = agents_path()
+    string8 repair = txt(#format("Restore it from the repository (git checkout -- AGENTS", MD, ")."))
+    if layout().kind == "install":
+        repair = "Every release archive carries it beside dadoc: reinstall, or copy it there from the release you installed."
+    if !is_file(at):
+        return answer_error("agent", json, txt(#format("the guide for agents is not here: ", at, " is missing.\n  ", repair)))
+    try ref []char8 text = fs.read_file(at) else code:
+        return answer_error("agent", json, txt(#format("cannot read ", at, ": ", os.message(code), ".\n  ", repair)))
+    if !json:
+        print_raw(txt(text))
+        return 0
+    ref []string8 f = #make([]string8, 0)
+    _ = #append(f, json_text("query", "agent"))
+    _ = #append(f, json_text("path", at))
+    _ = #append(f, json_text("text", txt(text)))
+    fmt.println(json_object(f[:]))
+    return 0

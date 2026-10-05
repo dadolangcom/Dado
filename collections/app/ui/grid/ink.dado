@@ -1,0 +1,285 @@
+// app:ui/grid — ink: retained lists of free-pixel triangles drawn **over** a
+// layer's cells, each under a scissor.
+//
+//     i32 id = grid.ink_make(grid.BASE)          // once; -1 when refused
+//     grid.ink_clear(id)                         // on every rebuild
+//     grid.ink_set_scissor(id, rect_px)          // the owner's visible clip
+//     _ = grid.ink_add(id, tri)                  // as many as it takes
+//     grid.ink_free(id)
+//
+// **Why a second free-pixel list.** Chrome (`chrome_add`) is drawn *under* a
+// layer's cells, which is right for a panel's fill and border: the text goes
+// over it. An icon, a chevron or any picture a widget draws in pixels is the
+// other way round — it must sit on top of the row's background, and a cell's
+// opaque background would hide ink drawn under it. So an ink list is drawn
+// **after** its layer's cells and its layer's regions, and before the next
+// layer's chrome: a layer is chrome, cells, regions, ink, and a floating
+// layer above still covers all four.
+//
+// **What a list is.** A run of `ChromeTri` in framebuffer pixels (the same
+// triangles chrome tessellates to), one scissor rectangle for the whole run —
+// its owner's visible clip, so ink never escapes the cells its owner may draw
+// in — the layer it draws with, and a count of the times it was cleared. The
+// owner rebuilds a list only when its picture changes (`ink_clear` and a
+// fresh run of `ink_add`); an idle frame tessellates nothing and allocates
+// nothing, and drawing replays the retained triangles, as chrome does.
+//
+// **Drawing.** `render` draws a layer's lists after its regions, in id order,
+// through sokol_gp: one scope for the layer, one `sgp_scissor` per list, the
+// triangles, one flush (more when sokol_gp's per-flush room runs out). The
+// scissor is the list's rect cut to the framebuffer; a list whose rect is
+// empty or off screen is skipped. Ink shares chrome's per-frame triangle
+// budget (`CHROME_FRAME_PERCENT`), counted from the same `begin`: a list that
+// does not fit what is left is dropped whole, and `ink_drawn` counts it.
+//
+// **Memory.** Lists come from the allocator `up` (or `up_headless`) captured;
+// before that `ink_make` answers -1. The table grows by doubling, with no
+// fixed cap; a freed id is reused. A list on a layer `set_layers` has since
+// dropped is kept and not drawn. An id that names no live list does nothing
+// anywhere.
+package grid
+
+import sgp "vendor:sokol/sokol_gp"
+
+private type InkList: (
+    bool            live,
+    i32             layer,
+    ChromeRect      scissor,
+    ref []ChromeTri tris,
+    i32             n,
+    i64             clears,
+)
+
+private ref []InkList g_inks
+private i32 g_ink_live
+private i32 g_ink_lists_drawn
+private i32 g_ink_tris_drawn
+private i32 g_ink_dropped
+
+private i32 ink_capacity():
+    if g_inks == nil:
+        return 0
+    return i32(#len(g_inks))
+
+// Whether `id` names a live ink list.
+bool ink_valid(i32 id):
+    return id >= 0 && id < ink_capacity() && g_inks[id].live
+
+// Live ink lists.
+i32 ink_lists():
+    return g_ink_live
+
+// A new, empty ink list drawn with `layer`, with an empty scissor; answers its
+// id, or -1 for a layer that does not exist, before the allocator is captured,
+// and when the table could not grow.
+i32 ink_make(i32 layer):
+    if layer < 0 || layer >= g_nlayers || !g_have_alloc:
+        return -1
+    i32 cap = ink_capacity()
+    i32 id = -1
+    for i in 0..<cap:
+        if !g_inks[i].live:
+            id = i32(i)
+            break
+    if id < 0:
+        i32 want = cap * 2
+        if want < 4:
+            want = 4
+        if g_inks == nil:
+            g_inks = #make([]InkList, i64(want), g_alloc)
+            if g_inks == nil:
+                return -1
+        else if !#resize(g_inks, i64(want)):
+            return -1
+        InkList none
+        for i in cap..<want:
+            g_inks[i] = none
+        id = cap
+    InkList fresh
+    fresh.live = true
+    fresh.layer = layer
+    g_inks[id] = fresh
+    g_ink_live = g_ink_live + 1
+    return id
+
+// Give back list `id`'s triangles; the id is then free for reuse.
+void ink_free(i32 id):
+    if !ink_valid(id):
+        return
+    release_ink(&g_inks[id])
+    g_ink_live = g_ink_live - 1
+
+private void release_ink(^InkList k):
+    if k.tris != nil:
+        #delete(k.tris)
+        k.tris = nil
+    InkList none
+    k^ = none
+
+// Every list, and the table itself: `down`'s.
+private void release_inks():
+    for i in 0..<ink_capacity():
+        release_ink(&g_inks[i])
+    if g_inks != nil:
+        #delete(g_inks)
+        g_inks = nil
+    g_ink_live = 0
+
+// Forget list `id`'s triangles, keeping their storage, and count a clear.
+void ink_clear(i32 id):
+    if !ink_valid(id):
+        return
+    g_inks[id].n = 0
+    g_inks[id].clears = g_inks[id].clears + 1
+
+// Draw list `id` with `layer` from now on. A layer that does not exist is
+// accepted, and the list is not drawn while it does not.
+void ink_set_layer(i32 id, i32 layer):
+    if !ink_valid(id):
+        return
+    g_inks[id].layer = layer
+
+// The layer list `id` draws with; -1 for a bad id.
+i32 ink_layer(i32 id):
+    if !ink_valid(id):
+        return -1
+    return g_inks[id].layer
+
+// Clip list `id` to `r`, in framebuffer pixels. A rect of no area draws
+// nothing.
+void ink_set_scissor(i32 id, ChromeRect r):
+    if !ink_valid(id):
+        return
+    g_inks[id].scissor = r
+
+ChromeRect ink_scissor(i32 id):
+    ChromeRect none
+    if !ink_valid(id):
+        return none
+    return g_inks[id].scissor
+
+// Append one triangle to list `id`, growing its run by doubling. Answers
+// false, having added nothing, for a bad id or when the run could not grow.
+bool ink_add(i32 id, ChromeTri t):
+    if !ink_valid(id):
+        return false
+    ^InkList k = &g_inks[id]
+    if k.tris == nil:
+        k.tris = #make([]ChromeTri, 32, g_alloc)
+        if k.tris == nil:
+            return false
+    else if k.n >= i32(#len(k.tris)):
+        if !#resize(k.tris, #len(k.tris) * 2):
+            return false
+    k.tris[k.n] = t
+    k.n = k.n + 1
+    return true
+
+// How many triangles list `id` holds; 0 for a bad id.
+i32 ink_count(i32 id):
+    if !ink_valid(id):
+        return 0
+    return g_inks[id].n
+
+// Triangle `k` of list `id`; a zero triangle out of range.
+ChromeTri ink_at(i32 id, i32 k):
+    ChromeTri none
+    if !ink_valid(id) || k < 0 || k >= g_inks[id].n:
+        return none
+    return g_inks[id].tris[k]
+
+// How many times list `id` has been cleared since it was made: the count of
+// its owner's rebuilds. 0 for a bad id.
+i64 ink_clears(i32 id):
+    if !ink_valid(id):
+        return 0
+    return g_inks[id].clears
+
+// What the last `render` did with ink, all layers: lists drawn, their
+// triangles, and lists dropped for want of budget or to a refused flush.
+(i32 lists, i32 tris, i32 dropped) ink_drawn():
+    return (g_ink_lists_drawn, g_ink_tris_drawn, g_ink_dropped)
+
+private void ink_frame_reset():
+    g_ink_lists_drawn = 0
+    g_ink_tris_drawn = 0
+    g_ink_dropped = 0
+
+// `r` cut to a framebuffer `fb_w` x `fb_h`; `w` or `h` 0 when nothing of it
+// is on it. Pure. The sums are `i64`, since a rect may hold any `i32`.
+ChromeRect ink_scissor_on(ChromeRect r, i32 fb_w, i32 fb_h):
+    ChromeRect none
+    if r.w < 1 || r.h < 1 || fb_w < 1 || fb_h < 1:
+        return none
+    i64 x0 = i64(r.x)
+    i64 y0 = i64(r.y)
+    i64 x1 = x0 + i64(r.w)
+    i64 y1 = y0 + i64(r.h)
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > i64(fb_w):
+        x1 = i64(fb_w)
+    if y1 > i64(fb_h):
+        y1 = i64(fb_h)
+    if x1 <= x0 || y1 <= y0:
+        return none
+    ChromeRect o = (i32(x0), i32(y0), i32(x1 - x0), i32(y1 - y0))
+    return o
+
+// Draw `layer`'s lists in id order (see the file's head). Each list costs its
+// triangles and one command for its scissor against a flush's room.
+private void draw_inks(i32 layer, i32 fb_w, i32 fb_h):
+    if g_ink_live <= 0:
+        return
+    bool open = false
+    i32 cap = 0
+    i32 in_flush = 0
+    for id in 0..<ink_capacity():
+        ^InkList k = &g_inks[id]
+        if !k.live || k.layer != layer || k.n < 1:
+            continue
+        ChromeRect sc = ink_scissor_on(k.scissor, fb_w, fb_h)
+        if sc.w < 1 || sc.h < 1:
+            continue
+        if !sgp.sgp_is_valid():
+            g_ink_dropped = g_ink_dropped + 1
+            continue
+        if !open:
+            cap = chrome_scope(fb_w, fb_h)
+            open = true
+            in_flush = 0
+        i32 m = k.n + 1
+        i32 left = chrome_frame_tris() - g_chrome_frame_used
+        ChunkStep st = chunk_step(m, in_flush, cap, left)
+        if st == ChunkStep.Drop:
+            g_ink_dropped = g_ink_dropped + 1
+            continue
+        if st == ChunkStep.FlushThenDraw:
+            sgp.sgp_reset_scissor()
+            if !chrome_close():
+                g_ink_dropped = g_ink_dropped + 1
+                open = false
+                continue
+            cap = chrome_scope(fb_w, fb_h)
+            in_flush = 0
+        sgp.sgp_scissor(sc.x, sc.y, sc.w, sc.h)
+        [4]u8 cur = [0, 0, 0, 0]
+        bool have = false
+        for j in 0..<k.n:
+            ChromeTri t = k.tris[j]
+            if !have || t.col != cur:
+                cur = t.col
+                have = true
+                sgp.sgp_set_color(f32(cur[0]) / 255.0, f32(cur[1]) / 255.0,
+                                  f32(cur[2]) / 255.0, f32(cur[3]) / 255.0)
+            sgp.sgp_draw_filled_triangle(t.a.x, t.a.y, t.b.x, t.b.y, t.c.x, t.c.y)
+        in_flush = in_flush + m
+        g_chrome_frame_used = g_chrome_frame_used + k.n
+        g_ink_tris_drawn = g_ink_tris_drawn + k.n
+        g_ink_lists_drawn = g_ink_lists_drawn + 1
+    if open:
+        sgp.sgp_reset_scissor()
+        if !chrome_close():
+            g_ink_dropped = g_ink_dropped + 1

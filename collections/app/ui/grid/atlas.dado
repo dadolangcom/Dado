@@ -1,0 +1,820 @@
+// app:ui/grid — the glyph atlas: one page of cell-sized slots, the table that
+// says which cluster lives in which slot, and the rasteriser that fills them.
+//
+// Nothing in this file calls sokol. The page is bytes in memory and a dirty
+// flag; `grid.dado` owns the texture and uploads the bytes when the flag says
+// to. That split is what lets the tests build a page, a slot allocator and a
+// table with no window, no GPU and — for everything but the ink — no face.
+//
+// ## The page is a uniform grid of fixed width that grows downward
+//
+// A page is `w` pixels wide and `h` tall and cut into slots exactly one cell
+// each, row by row from the top-left: slot `k` sits at column `k % across`
+// and row `k / across`, where `across = w / cw`. The shader does the same
+// arithmetic with `across` and the page size as uniforms, so a slot index is
+// the whole of what a cell carries to find its texels. The strip to the right
+// of the last whole slot and below the last whole row is never used.
+//
+// **The width is fixed for the atlas's life and only the height grows**,
+// doubling, because that is what keeps every slot where it was: `across`
+// depends on the width alone, so slot `k`'s pixel origin is the same on the
+// grown page, and a row-major page of the same width is a prefix of its
+// taller self — growing is a resize of the byte array with the old rows left
+// in place, no slot is moved and no cell's slot changes. Growing the width
+// instead would change `across` and move every slot.
+//
+// The ladder (`page_width_for`, `page_height_cap`, `page_grown`): the width
+// is the smallest power of two whose square holds `MIN_SLOTS`, and the page
+// starts square; the height doubles when a cluster finds no room, up to the
+// texel budget of one `PAGE_PX` square (`PAGE_PX * PAGE_PX / w` rows) or the
+// device's largest texture side, whichever is less. For an 8 x 16 cell that is
+// 256 wide, heights 256, 512, 1024, 2048, 4096 — 64 KiB growing to 1 MiB,
+// 512 slots growing to 8192, the same final capacity one 1024 square had. For
+// a 16 x 32 cell it is 512 wide, heights 512, 1024, 2048: 256 KiB to 1 MiB.
+//
+// Why size it at all: the page is uploaded whole whenever it changed
+// (`sokol_gfx` replaces an image entirely, at most once a frame), so each
+// upload costs the page's bytes, not the new glyph's.
+//
+// Two slots are spoken for before anything is looked up. **Slot 0 is blank**
+// forever — `cell.blank()` points at it. **Slot 1 is `.notdef`**, inked once
+// when the atlas is made: it is the answer for a cluster no face in the chain
+// can draw, and for any cluster asked for after the page is full.
+//
+// ## A wide cluster is two slots side by side
+//
+// A cluster two columns wide is rasterised across `2 * cw` pixels and stored
+// in two horizontally adjacent slots of one page row; the table maps its key
+// to the left one and the right one is `left + 1`, which is why the pair may
+// never wrap from the end of one row to the start of the next. When the next
+// free slot is the last of its row, it is set aside as a spare for the next
+// one-column cluster and the pair starts on the next row.
+//
+// ## When the page is full
+//
+// A cluster that finds no room grows the page one step and tries again. At
+// the top of the ladder it answers the `.notdef` slot and counts an overflow.
+// A second page is later work; nothing is ever evicted, so a slot, once
+// handed out, names the same ink for the atlas's life.
+//
+// ## Printable ASCII is resident from the start
+//
+// `atlas_prewarm` rasterises U+0020..U+007E in one pass, before the first
+// upload, so typing ordinary text never makes the page dirty. Without it,
+// every keystroke that met a new character re-uploaded the whole page inside
+// that frame.
+package grid
+
+import "app:font"
+import "core:chars"
+import "core:mem"
+import "vendor:stb/stb_truetype"
+
+// The texel budget of a page, as the side of a square: a page is never wider
+// than this and never holds more than `PAGE_PX * PAGE_PX` texels. A `@const`,
+// so a build can shrink it to exercise overflow.
+@const i32 PAGE_PX = 1024
+
+// The slots the first page must hold, which picks its width: the 97 slots
+// `up` fills (the blank, `.notdef` and the 95 printable ASCII characters)
+// plus 287 more, room for a few hundred clusters of other scripts before the
+// first growth.
+@const i32 MIN_SLOTS = 384
+
+// The code points `atlas_prewarm` makes resident: printable ASCII.
+const i32 PREWARM_FIRST = 0x20
+const i32 PREWARM_LAST = 0x7E
+const i32 PREWARM_COUNT = PREWARM_LAST - PREWARM_FIRST + 1
+
+const u16 BLANK_SLOT = 0
+const u16 NOTDEF_SLOT = 1
+// The first slot a cluster can be given.
+const i32 FIRST_FREE = 2
+
+// What a page's texels are. **Only `R8` is used**: one byte of coverage per
+// texel, which the shader reads as `.r`. `Rgba8` is reserved and unused — the
+// field exists so that a colour page (emoji, `cell.COLOR_SLOT`) can be added
+// beside the coverage pages without changing this record's shape.
+enum PixelFormat: (
+    R8 = 0,
+    Rgba8 = 1,
+)
+
+// Bytes per texel of `f`: 1 for `R8`, 4 for `Rgba8`.
+i32 texel_bytes(PixelFormat f):
+    if f == PixelFormat.Rgba8:
+        return 4
+    return 1
+
+// One page: its size, the height it may grow to, its pixels (row-major from
+// the top-left, `w` bytes a row for `R8`), whether they have changed since
+// they were last uploaded, and how many times it has grown.
+type Page: (
+    PixelFormat format,
+    i32 w,
+    i32 h,
+    i32 max_h,
+    ref []u8 pixels,
+    bool dirty,
+    i32 grows,
+)
+
+// ── Slot arithmetic ─────────────────────────────────────────────────────────
+
+// Slots across one row of a page `page_w` wide for a cell `cw` wide: whole
+// slots only. Zero for a non-positive cell or page.
+i32 slots_across(i32 page_w, i32 cw):
+    if page_w < 1 || cw < 1:
+        return 0
+    return page_w / cw
+
+// Rows of slots down a page `page_h` tall for a cell `ch` tall.
+i32 slots_down(i32 page_h, i32 ch):
+    if page_h < 1 || ch < 1:
+        return 0
+    return page_h / ch
+
+// How many slots a `page_w` x `page_h` page holds, counting the blank and
+// `.notdef`. Never more than a cell's `u16` slot field can name: past 65 536 a
+// slot number would wrap onto the blank and `.notdef` and alias every slot
+// after them, so a page larger than that leaves its tail unused.
+i32 page_capacity(i32 page_w, i32 page_h, i32 cw, i32 ch):
+    i64 n = i64(slots_across(page_w, cw)) * i64(slots_down(page_h, ch))
+    if n > 65536:
+        n = 65536
+    return i32(n)
+
+// The page width for a `cw` x `ch` cell: the smallest power of two whose
+// square holds `min_slots`, and never more than `max_w`. When even a `max_w`
+// square is too small, `max_w` itself. Zero for a non-positive cell or cap.
+i32 page_width_for(i32 cw, i32 ch, i32 min_slots, i32 max_w):
+    if cw < 1 || ch < 1 || max_w < 1:
+        return 0
+    i32 w = 1
+    for w < max_w && page_capacity(w, w, cw, ch) < min_slots:
+        w = w * 2
+    if w > max_w:
+        w = max_w
+    return w
+
+// The tallest a page `w` wide may grow: the texel budget of one `budget_px`
+// square spread over the width, `budget_px * budget_px / w` rows, and at most
+// `limit` when `limit` is positive (the device's largest texture side). Zero
+// for a non-positive width.
+i32 page_height_cap(i32 w, i32 budget_px, i32 limit):
+    if w < 1 || budget_px < 1:
+        return 0
+    i64 h = i64(budget_px) * i64(budget_px) / i64(w)
+    if limit > 0 && h > i64(limit):
+        h = i64(limit)
+    if h > 0x40000000:
+        h = 0x40000000
+    return i32(h)
+
+// The next rung of the ladder above a page `h` tall: twice as tall, held at
+// `max_h`. At or above `max_h` there is none and the answer is `h` itself.
+i32 page_grown(i32 h, i32 max_h):
+    if h >= max_h || h < 1:
+        return h
+    i64 g = i64(h) * 2
+    if g > i64(max_h):
+        g = i64(max_h)
+    return i32(g)
+
+// The top-left pixel of `slot` on a page `across` slots wide, and whether
+// `slot` is on the page at all (`0 <= slot < capacity`). An off-page slot
+// answers `(0, 0, false)`.
+(i32 x, i32 y, bool ok) slot_origin(i32 slot, i32 across, i32 capacity, i32 cw, i32 ch):
+    if slot < 0 || slot >= capacity || across < 1 || cw < 1 || ch < 1:
+        return (0, 0, false)
+    return ((slot % across) * cw, (slot / across) * ch, true)
+
+// ── The slot allocator ──────────────────────────────────────────────────────
+
+// Where the next slot comes from. `next` only ever grows; `spare` is a slot
+// skipped at the end of a row to keep a wide pair on one row, waiting for the
+// next one-column cluster, or -1. A second skip while a spare is already held
+// is not remembered and is counted in `wasted`.
+type Slots: (i32 across, i32 capacity, i32 next, i32 spare, i32 wasted)
+
+Slots slots_make(i32 across, i32 capacity):
+    Slots s = (across, capacity, FIRST_FREE, -1, 0)
+    return s
+
+// Take room for a cluster `cols` columns wide (1 or 2; anything else reads as
+// 1) and answer its left slot, or -1 when the page has no room. A pair never
+// wraps: its left slot is never the last of a row.
+i32 slots_take(^Slots s, i32 cols):
+    if s.across < 1:
+        return -1
+    if cols != 2:
+        if s.spare >= 0:
+            i32 k = s.spare
+            s.spare = -1
+            return k
+        if s.next >= s.capacity:
+            return -1
+        i32 k = s.next
+        s.next = s.next + 1
+        return k
+    // A pair needs two slots on one row, so a page one slot across has none.
+    if s.across < 2:
+        return -1
+    i32 at = s.next
+    if at % s.across == s.across - 1:
+        if at >= s.capacity:
+            return -1
+        if s.spare < 0:
+            s.spare = at
+        else:
+            s.wasted = s.wasted + 1
+        at = at + 1
+    if at + 1 >= s.capacity:
+        // `at` stays taken if it was skipped past; the pair itself did not fit.
+        s.next = at
+        return -1
+    s.next = at + 2
+    return at
+
+// Slots handed out so far, counting the blank and `.notdef`, and not counting
+// a spare that is still waiting.
+i32 slots_used(^Slots s):
+    i32 n = s.next
+    if n > s.capacity:
+        n = s.capacity
+    if s.spare >= 0:
+        n = n - 1
+    return n
+
+// ── The prewarmed set ───────────────────────────────────────────────────────
+
+// How many code points `atlas_prewarm` makes resident, and the `i`th of them
+// (-1 off the end). Printable ASCII: U+0020..U+007E, 95 code points.
+i32 prewarm_count():
+    return PREWARM_COUNT
+
+i32 prewarm_code_point(i32 i):
+    if i < 0 || i >= prewarm_count():
+        return -1
+    return PREWARM_FIRST + i
+
+// ── The cluster table ───────────────────────────────────────────────────────
+//
+// Open addressing with linear probing over a power-of-two array, keyed by
+// (face chain id, pixel height, the cluster's bytes) and answering a slot.
+// The bytes are copied into the table's own blob, so a key outlives the
+// string it was looked up with. The table grows by doubling when an insert
+// would take it past three quarters full, so a probe always ends at an empty
+// entry; there is no cap and no deletion.
+
+type Entry: (u64 hash, u32 chain, f32 px, i32 off, i32 len, u16 slot, bool used)
+
+type Table: (
+    // The ambient allocator when the table was made. Growth happens later, at
+    // a lookup inside some frame's temporary arena, and must not land there.
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc,
+    ref []Entry entries,
+    i32 count,
+    ref []u8 blob,
+    i32 blob_n,
+)
+
+private const i32 MIN_ENTRIES = 16
+
+// FNV-1a, 64-bit, over the chain id's four bytes, the pixel height in 1/64
+// pixel (so two heights that are the same `f32` hash the same), and the
+// cluster's bytes. Unsigned arithmetic wraps, which is what the hash wants.
+u64 key_hash(u32 chain, f32 px, string8 bytes):
+    u64 h = u64(14695981039346656037)
+    u64 prime = u64(1099511628211)
+    for i in 0..<4:
+        h = (h ~ u64((chain >> (u32(i) * 8)) & 0xFF)) * prime
+    // Saturates past 2^57 pixels, and NaN is 0: two such heights hash alike,
+    // which a hash is allowed to do, and neither is a height anything draws at.
+    i64 q = i64(px * 64.0)
+    u64 uq = u64(q)
+    for i in 0..<8:
+        h = (h ~ ((uq >> (u64(i) * 8)) & u64(0xFF))) * prime
+    i32 n = i32(#len(bytes))
+    for i in 0..<n:
+        h = (h ~ u64(u8(bytes[i]))) * prime
+    return h
+
+// The smallest power of two at or above `n`, and at least `MIN_ENTRIES`.
+i32 table_size_for(i32 n):
+    i32 size = MIN_ENTRIES
+    for size < n && size < 0x40000000:
+        size = size * 2
+    return size
+
+// An empty table with room for `initial` entries before it first grows, from
+// the ambient allocator, which it keeps for its later growth. A table whose
+// allocations failed has nil storage; every function below answers it as
+// empty and refuses to insert.
+Table table_make(i32 initial):
+    Table t
+    t.alloc = #default
+    i32 want = initial + initial / 3 + 1
+    t.entries = #make([]Entry, i64(table_size_for(want)), t.alloc)
+    t.blob = #make([]u8, 256, t.alloc)
+    t.count = 0
+    t.blob_n = 0
+    return t
+
+void table_free(^Table t):
+    if t.entries != nil:
+        #delete(t.entries)
+        t.entries = nil
+    if t.blob != nil:
+        #delete(t.blob)
+        t.blob = nil
+    t.count = 0
+    t.blob_n = 0
+
+i32 table_count(^Table t):
+    return t.count
+
+i32 table_capacity(^Table t):
+    if t.entries == nil:
+        return 0
+    return i32(#len(t.entries))
+
+private bool entry_is(^Table t, ^Entry e, u64 h, u32 chain, f32 px, string8 bytes):
+    if e.hash != h || e.chain != chain || e.px != px || e.len != i32(#len(bytes)):
+        return false
+    for i in 0..<e.len:
+        if t.blob[e.off + i] != u8(bytes[i]):
+            return false
+    return true
+
+// The slot recorded for the key, and whether there was one.
+(u16 slot, bool found) table_get(^Table t, u32 chain, f32 px, string8 bytes):
+    if t.entries == nil:
+        return (0, false)
+    u64 h = key_hash(chain, px, bytes)
+    i32 cap = i32(#len(t.entries))
+    i32 at = i32(h & u64(cap - 1))
+    for i in 0..<cap:
+        ^Entry e = &t.entries[at]
+        if !e.used:
+            return (0, false)
+        if entry_is(t, e, h, chain, px, bytes):
+            return (e.slot, true)
+        at = (at + 1) & (cap - 1)
+    return (0, false)
+
+// Place `e` in `entries` by linear probing. The caller guarantees an empty
+// entry exists.
+private void place(ref []Entry entries, Entry e):
+    i32 cap = i32(#len(entries))
+    i32 at = i32(e.hash & u64(cap - 1))
+    for entries[at].used:
+        at = (at + 1) & (cap - 1)
+    entries[at] = e
+
+private bool table_grow(^Table t):
+    i32 cap = i32(#len(t.entries))
+    if cap >= 0x40000000:
+        return false
+    ref []Entry bigger = #make([]Entry, i64(cap * 2), t.alloc)
+    if bigger == nil:
+        return false
+    for i in 0..<cap:
+        if t.entries[i].used:
+            place(bigger, t.entries[i])
+    #delete(t.entries)
+    t.entries = bigger
+    return true
+
+// Record `slot` for the key, replacing what was there. Answers false, having
+// changed nothing, when the table or its blob could not grow.
+bool table_put(^Table t, u32 chain, f32 px, string8 bytes, u16 slot):
+    if t.entries == nil || t.blob == nil:
+        return false
+    u64 h = key_hash(chain, px, bytes)
+    i32 cap = i32(#len(t.entries))
+    i32 at = i32(h & u64(cap - 1))
+    for i in 0..<cap:
+        ^Entry e = &t.entries[at]
+        if !e.used:
+            break
+        if entry_is(t, e, h, chain, px, bytes):
+            e.slot = slot
+            return true
+        at = (at + 1) & (cap - 1)
+    // A new key. Grow first, so the entry lands in the final array.
+    if (t.count + 1) * 4 > cap * 3:
+        if !table_grow(t):
+            return false
+    i32 n = i32(#len(bytes))
+    i32 room = i32(#len(t.blob))
+    if t.blob_n + n > room:
+        i32 grown = room * 2
+        for grown < t.blob_n + n:
+            grown = grown * 2
+        if !#resize(t.blob, i64(grown)):
+            return false
+    for i in 0..<n:
+        t.blob[t.blob_n + i] = u8(bytes[i])
+    Entry e = (h, chain, px, t.blob_n, n, slot, true)
+    t.blob_n = t.blob_n + n
+    place(t.entries, e)
+    t.count = t.count + 1
+    return true
+
+// ── Faces ───────────────────────────────────────────────────────────────────
+
+// One face of the chain: the loaded face (only its `stbtt_fontinfo` is
+// used), its scale at the atlas's pixel height, and the pixel row within a
+// cell where its own baseline sits (`face_baseline`).
+type Face: (font.Font f, f32 scale, i32 baseline)
+
+// Where `f`'s baseline goes in a cell `ch` tall at scale `scale`: its own
+// ascent, rounded — `baseline_for` over the face's ascent. Every face of the
+// chain is scaled so that its ascent minus its descent is the same pixel
+// height, and that height is at most `ch`, so each face's design box fits the
+// cell when it stands on its own baseline; sharing the primary's would not.
+// Measured at 16 px (this box, 2026-09-22): DejaVu Sans Mono's ascent is
+// 12.76 and the Japanese gothic face's 14.08, so on the primary's baseline an
+// ideograph whose box starts 14 px above it lost its top two rows.
+i32 face_baseline(^font.Font f, f32 scale, i32 ch):
+    if f.info == nil:
+        return 0
+    i32 asc = 0
+    i32 desc = 0
+    i32 gap = 0
+    stb_truetype.stbtt_GetFontVMetrics(f.info, &asc, &desc, &gap)
+    return baseline_for(f32(asc) * scale, ch)
+
+// The horizontal squeeze for a glyph `advance` pixels wide in a run of slots
+// `span` pixels wide: 1 when it fits, else `span / advance`, so the glyph is
+// rasterised narrower and its advance is exactly the span. A proportional
+// fallback glyph can be wider than a monospace cell — DejaVu Sans's U+05E9
+// advances 9.74 px at 16 px, against an 8 px cell — and squeezing it keeps
+// its ink rather than cutting both edges off.
+f32 squeeze_for(i32 span, f32 advance):
+    if span < 1 || !(advance > f32(span)):
+        return 1.0
+    return f32(span) / advance
+
+// The scale that sets `f`'s ascent-to-descent span to `px` pixels, which is
+// what `stbtt_ScaleForPixelHeight` means by a pixel height; 0 for a face with
+// no TrueType data.
+f32 stb_scale(^font.Font f, f32 px):
+    if f.info == nil:
+        return 0.0
+    return stb_truetype.stbtt_ScaleForPixelHeight(f.info, px)
+
+// Which face of `faces` draws `cp`, and its glyph index there: the first that
+// has it, trying `prefer` first when it is a valid index. `(-1, 0)` when none
+// does.
+(i32 face, i32 glyph) find_glyph([]Face faces, i32 prefer, i32 cp):
+    i32 n = i32(#len(faces))
+    if prefer >= 0 && prefer < n && faces[prefer].f.info != nil:
+        i32 g = stb_truetype.stbtt_FindGlyphIndex(faces[prefer].f.info, cp)
+        if g != 0:
+            return (prefer, g)
+    for i in 0..<n:
+        if faces[i].f.info == nil:
+            continue
+        i32 g = stb_truetype.stbtt_FindGlyphIndex(faces[i].f.info, cp)
+        if g != 0:
+            return (i, g)
+    return (-1, 0)
+
+// ── The atlas ───────────────────────────────────────────────────────────────
+
+type Atlas: (
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc,
+    Page page,
+    Slots slots,
+    Table table,
+    // Where stb rasterises one glyph before it is copied into its slot with
+    // clipping; grown to the largest glyph box met so far.
+    ref []u8 scratch,
+    i32 cw, i32 ch,
+    f32 px,
+    u32 chain,
+    // Texels with ink that fell outside their slot and were dropped.
+    i32 clipped,
+    // Lookups that found the page full and answered `.notdef`.
+    i32 overflows,
+    // The slot of each printable ASCII byte, `b - PREWARM_FIRST` indexed,
+    // filled by `atlas_prewarm`; 0 (the blank slot, which no printable byte
+    // is given — even the space gets a slot of its own) means "not known,
+    // take the general path". It lives in the atlas so that a rebuilt atlas
+    // starts with it empty: a slot number is only true of the page it was
+    // handed out on.
+    [PREWARM_COUNT]u16 ascii,
+)
+
+// The pen's x within a slot `span` pixels wide for a glyph whose advance is
+// `advance` pixels: centred, rounded to a whole pixel. A monospace glyph whose
+// advance is exactly the cell answers 0; a proportional or CJK glyph from a
+// fallback face is centred in the one or two cells it was given.
+i32 pen_x(i32 span, f32 advance):
+    return i32(round_half_up((f32(span) - advance) * 0.5))
+
+// Round to nearest, halves up, without `core:math`'s f64 round trip.
+//
+// It converts only a value whose integer part an `i32` holds. At 2^23 and past
+// it every `f32` is a whole number and so its own rounding, and NaN is NaN;
+// before this guard a float becoming an `i32` saturated, so `3e9` rounded to
+// `2147483648` and a NaN to `0`.
+f32 round_half_up(f32 x):
+    if !(x > -8388608.0 && x < 8388608.0):
+        return x
+    f32 t = f32(i32(x))
+    if x < 0.0 && t != x:
+        t = t - 1.0
+    // `t` is now floor(x).
+    if x - t >= 0.5:
+        return t + 1.0
+    return t
+
+// Make an empty atlas for a `cw` x `ch` cell at pixel height `px` in face
+// chain `chain`, from the ambient allocator (kept for later growth). The page
+// starts `w` square on the ladder above, and `max_side`, when positive, is
+// the device's largest texture side, which neither the width nor the grown
+// height may pass. A failed allocation, or a cell too big for the page ever
+// to hold more than the blank and `.notdef`, leaves `page.pixels` nil, and
+// every lookup then answers `.notdef`.
+Atlas atlas_make(i32 cw, i32 ch, f32 px, u32 chain, i32 max_side = 0):
+    Atlas a
+    a.alloc = #default
+    a.cw = cw
+    a.ch = ch
+    a.px = px
+    a.chain = chain
+    a.page.format = PixelFormat.R8
+    i32 side = PAGE_PX
+    if max_side > 0 && max_side < side:
+        side = max_side
+    i32 w = page_width_for(cw, ch, MIN_SLOTS, side)
+    i32 max_h = page_height_cap(w, PAGE_PX, max_side)
+    i32 h = w
+    if h > max_h:
+        h = max_h
+    i32 across = slots_across(w, cw)
+    if page_capacity(w, max_h, cw, ch) <= FIRST_FREE:
+        a.slots = slots_make(across, 0)
+        return a
+    // A cell taller than the first square still fits by the top of the
+    // ladder: climb until the page holds more than the two fixed slots.
+    for page_capacity(w, h, cw, ch) <= FIRST_FREE:
+        h = page_grown(h, max_h)
+    a.slots = slots_make(across, page_capacity(w, h, cw, ch))
+    a.page.pixels = #make([]u8, i64(w) * i64(h) * i64(texel_bytes(a.page.format)), a.alloc)
+    if a.page.pixels == nil:
+        a.slots = slots_make(across, 0)
+        return a
+    a.page.w = w
+    a.page.h = h
+    a.page.max_h = max_h
+    a.table = table_make(256)
+    a.page.dirty = true
+    return a
+
+// Grow the page one rung: twice as tall, the old rows kept where they were
+// and the new ones zero, so every slot handed out keeps its origin and its
+// ink. Answers false, having changed nothing, at the top of the ladder, when
+// the taller page would name no more slots (the `u16` cap), or when the
+// allocation failed.
+bool atlas_grow(^Atlas a):
+    if a.page.pixels == nil:
+        return false
+    i32 nh = page_grown(a.page.h, a.page.max_h)
+    i32 cap = page_capacity(a.page.w, nh, a.cw, a.ch)
+    if nh <= a.page.h || cap <= a.slots.capacity:
+        return false
+    i64 old_n = #len(a.page.pixels)
+    i64 new_n = i64(a.page.w) * i64(nh) * i64(texel_bytes(a.page.format))
+    if !#resize(a.page.pixels, new_n):
+        return false
+    for i in old_n..<new_n:
+        a.page.pixels[i] = 0
+    a.page.h = nh
+    a.slots.capacity = cap
+    a.page.grows = a.page.grows + 1
+    a.page.dirty = true
+    return true
+
+void atlas_free(^Atlas a):
+    if a.page.pixels != nil:
+        #delete(a.page.pixels)
+        a.page.pixels = nil
+    a.page.w = 0
+    a.page.h = 0
+    a.page.max_h = 0
+    if a.scratch != nil:
+        #delete(a.scratch)
+        a.scratch = nil
+    table_free(&a.table)
+    a.page.dirty = false
+    for i in 0..<PREWARM_COUNT:
+        a.ascii[i] = BLANK_SLOT
+
+// Clusters resident: keys in the table, which counts each wide cluster once.
+i32 atlas_resident(^Atlas a):
+    return a.table.count
+
+// Ink `.notdef` into slot 1: the primary face's glyph 0, centred. Called once
+// by whoever made the atlas, with the faces it will look clusters up in.
+void atlas_ink_notdef(^Atlas a, []Face faces):
+    if #len(faces) < 1:
+        return
+    ink_centred(a, faces, 0, 0, i32(NOTDEF_SLOT), a.cw)
+
+// Make every code point of the prewarmed set (printable ASCII) resident, each
+// as a one-column cluster, and answer how many are resident afterwards. Called
+// once by whoever made the atlas, before the page's first upload, so that the
+// first upload carries them and ordinary typing never dirties the page again.
+//
+// It also fills `a.ascii`, the table the writers' ASCII fast path reads: each
+// byte's entry is the slot the table recorded for it, and stays 0 when the
+// table kept none (a page with no room, or a table that could not grow), so
+// that byte is looked up the general way every time, as it was before. Only
+// a recorded slot is trusted because only a recorded slot is what the general
+// path would answer again: an unrecorded `.notdef` is retried by it.
+i32 atlas_prewarm(^Atlas a, []Face faces):
+    [2]char8 b
+    i32 n = 0
+    for i in 0..<prewarm_count():
+        b[0] = char8(u8(prewarm_code_point(i32(i))))
+        string8 key = string8(b[0..<1])
+        u16 slot = atlas_slot(a, faces, key, 1)
+        (u16 have, bool found) = table_get(&a.table, a.chain, a.px, key)
+        if found:
+            a.ascii[i] = have
+        if found && slot != NOTDEF_SLOT:
+            n = n + 1
+    return n
+
+// The slot `atlas_prewarm` recorded for the printable ASCII byte `b`, or 0
+// (the blank slot) when it recorded none or `b` is not printable ASCII.
+u16 atlas_ascii_slot(^Atlas a, u8 b):
+    if b < u8(PREWARM_FIRST) || b > u8(PREWARM_LAST):
+        return BLANK_SLOT
+    return a.ascii[i32(b) - PREWARM_FIRST]
+
+// The slot of the cluster `bytes`, `cols` columns wide, rasterising it into a
+// fresh slot (or pair) when it is not resident. `cols` of 2 answers the left
+// slot of a pair; anything else is one slot.
+//
+// Refused inputs answer a fixed slot and change nothing: empty bytes or a tab
+// answer the blank slot; an atlas with no page answers `.notdef`. A cluster
+// that begins with any other control is looked up as U+FFFD, so every control
+// shares one slot. A full page grows (`atlas_grow`) and the lookup tries
+// again; at the top of the ladder it answers `.notdef` and counts an overflow.
+u16 atlas_slot(^Atlas a, []Face faces, string8 bytes, i32 cols):
+    if #len(bytes) == 0 || bytes[0] == '\t':
+        return BLANK_SLOT
+    if a.page.pixels == nil:
+        return NOTDEF_SLOT
+    string8 key = bytes
+    (char32 base, i32 _) = chars.decode(bytes, 0)
+    u32 b = u32(base)
+    if b < 0x20 || (b >= 0x7F && b < 0xA0):
+        key = "\xEF\xBF\xBD"
+        cols = 1
+    if cols != 2:
+        cols = 1
+    (u16 have, bool found) = table_get(&a.table, a.chain, a.px, key)
+    if found:
+        return have
+    i32 slot = slots_take(&a.slots, cols)
+    for slot < 0 && atlas_grow(a):
+        slot = slots_take(&a.slots, cols)
+    if slot < 0:
+        a.overflows = a.overflows + 1
+        return NOTDEF_SLOT
+    raster_cluster(a, faces, key, slot, cols)
+    if !table_put(&a.table, a.chain, a.px, key, u16(slot)):
+        // The ink is on the page but the key could not be kept; the next
+        // lookup rasterises again into another slot. Say so as an overflow,
+        // which is the one count a full or failing atlas already has.
+        a.overflows = a.overflows + 1
+    return u16(slot)
+
+// Rasterise `key` into `slot` (and `slot + 1` when `cols` is 2). The base
+// code point picks its face down the chain; each mark after it prefers the
+// base's face, so an accent is drawn in the same design as its letter. A base
+// no face has is drawn as the primary face's `.notdef`, and its marks are
+// dropped with it.
+//
+// Every code point is inked at the base's pen origin and max-blended into the
+// slot, with one exception, measured on DejaVu Sans at 16 px (run on this
+// box, 2026-09-22): a zero-advance mark whose ink lies wholly left of its
+// origin — U+0301 there has advance 0 and its box at x -5..-1 — was designed
+// to follow a pen that has already advanced past its letter, so it is inked
+// at the base's origin plus the base's advance. DejaVu Sans Mono's U+0301 has
+// the full cell advance and its box at x 3..7, and DejaVu Sans's U+05B8 (a
+// Hebrew vowel point) advance 0 and box x 2..7; both are inked at the base's
+// origin unchanged.
+private void raster_cluster(^Atlas a, []Face faces, string8 key, i32 slot, i32 cols):
+    i32 span = cols * a.cw
+    i32 n = i32(#len(key))
+    (char32 base, i32 size) = chars.decode(key, 0)
+    (i32 bf, i32 bg) = find_glyph(faces, -1, i32(base))
+    if bf < 0:
+        if #len(faces) > 0:
+            ink_centred(a, faces, 0, 0, slot, span)
+        return
+    f32 xf = squeeze_for(span, glyph_advance(faces, bf, bg))
+    f32 base_adv = glyph_advance(faces, bf, bg) * xf
+    i32 origin = pen_x(span, base_adv)
+    ink_glyph(a, faces, bf, bg, slot, span, origin, xf)
+    i32 at = size
+    for at < n:
+        (char32 cp, i32 k) = chars.decode(key, at)
+        at = at + k
+        (i32 mf, i32 mg) = find_glyph(faces, bf, i32(cp))
+        if mf < 0:
+            continue
+        i32 mo = origin
+        if glyph_advance(faces, mf, mg) == 0.0:
+            (i32 x0, i32 _, i32 x1, i32 _) = glyph_box(faces, mf, mg, xf)
+            if x1 <= 0 && x0 < x1:
+                mo = origin + i32(round_half_up(base_adv))
+        ink_glyph(a, faces, mf, mg, slot, span, mo, xf)
+
+private f32 glyph_advance([]Face faces, i32 face, i32 glyph):
+    i32 adv = 0
+    i32 lsb = 0
+    stb_truetype.stbtt_GetGlyphHMetrics(faces[face].f.info, glyph, &adv, &lsb)
+    return f32(adv) * faces[face].scale
+
+// The glyph's pixel box at its face's scale, squeezed horizontally by `xf`.
+private (i32 x0, i32 y0, i32 x1, i32 y1) glyph_box([]Face faces, i32 face, i32 glyph, f32 xf):
+    i32 x0 = 0
+    i32 y0 = 0
+    i32 x1 = 0
+    i32 y1 = 0
+    f32 s = faces[face].scale
+    stb_truetype.stbtt_GetGlyphBitmapBox(faces[face].f.info, glyph, s * xf, s, &x0, &y0, &x1, &y1)
+    return (x0, y0, x1, y1)
+
+// Ink a glyph alone, squeezed to fit `span` and centred in it: `.notdef`.
+private void ink_centred(^Atlas a, []Face faces, i32 face, i32 glyph, i32 slot, i32 span):
+    if face < 0 || face >= i32(#len(faces)) || faces[face].f.info == nil:
+        return
+    f32 adv = glyph_advance(faces, face, glyph)
+    f32 xf = squeeze_for(span, adv)
+    ink_glyph(a, faces, face, glyph, slot, span, pen_x(span, adv * xf), xf)
+
+// Rasterise glyph `glyph` of face `face`, squeezed horizontally by `xf`, into
+// the scratch, then max-blend it into the `span`-pixel-wide run of slots
+// starting at `slot`, pen at `origin` and on the face's own baseline. Ink
+// outside the run is dropped and counted in `a.clipped`.
+private void ink_glyph(^Atlas a, []Face faces, i32 face, i32 glyph, i32 slot, i32 span, i32 origin, f32 xf):
+    if face < 0 || face >= i32(#len(faces)) || faces[face].f.info == nil:
+        return
+    (i32 x0, i32 y0, i32 x1, i32 y1) = glyph_box(faces, face, glyph, xf)
+    i32 w = x1 - x0
+    i32 h = y1 - y0
+    if w <= 0 || h <= 0:
+        return
+    i64 need = i64(w) * i64(h)
+    if a.scratch == nil:
+        a.scratch = #make([]u8, need, a.alloc)
+        if a.scratch == nil:
+            return
+    else if #len(a.scratch) < need:
+        if !#resize(a.scratch, need):
+            return
+    for i in 0..<need:
+        a.scratch[i] = 0
+    f32 s = faces[face].scale
+    stb_truetype.stbtt_MakeGlyphBitmap(faces[face].f.info, &a.scratch[0], w, h, w, s * xf, s, glyph)
+    (i32 sx, i32 sy, bool ok) = slot_origin(slot, a.slots.across, a.slots.capacity, a.cw, a.ch)
+    if !ok:
+        return
+    a.clipped = a.clipped + blend_clipped(a.page.pixels, a.page.w, a.page.h, sx, sy, span, a.ch,
+                                          a.scratch, w, h, origin + x0, faces[face].baseline + y0)
+    a.page.dirty = true
+
+// Max-blend a `w` x `h` coverage box `src` into the `span` x `ch` rectangle
+// whose top-left is (`rx`, `ry`) on a `page_w` x `page_h` R8 page, with the
+// box's top-left at (`dx`, `dy`) relative to the rectangle. Answers the texels
+// with nonzero coverage that fell outside the rectangle and were not copied.
+// Pure: tested with hand-made boxes.
+i32 blend_clipped([]u8 dst, i32 page_w, i32 page_h, i32 rx, i32 ry, i32 span, i32 ch, []u8 src, i32 w, i32 h, i32 dx, i32 dy):
+    i32 clipped = 0
+    if w <= 0 || h <= 0 || #len(src) < i64(w) * i64(h):
+        return 0
+    bool page_ok = page_w > 0 && page_h > 0 && #len(dst) >= i64(page_w) * i64(page_h)
+    page_ok = page_ok && rx >= 0 && ry >= 0 && rx + span <= page_w && ry + ch <= page_h
+    for y in 0..<h:
+        for x in 0..<w:
+            u8 cov = src[i64(y) * i64(w) + i64(x)]
+            if cov == 0:
+                continue
+            i32 tx = dx + x
+            i32 ty = dy + y
+            if !page_ok || tx < 0 || ty < 0 || tx >= span || ty >= ch:
+                clipped = clipped + 1
+                continue
+            i64 at = i64(ry + ty) * i64(page_w) + i64(rx + tx)
+            if cov > dst[at]:
+                dst[at] = cov
+    return clipped

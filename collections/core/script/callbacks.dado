@@ -1,0 +1,209 @@
+// core:script — a script's function called by Dado: what the generated
+// trampolines of a bound Dado function's function-typed parameters call.
+//
+// **Two shapes, no executable memory.** Dado's idiom carries its context: a
+// `(proc, rawptr data)` pair — `Sink`, an allocator, any pair whose
+// procedure takes its `data` first — receives a script's function through a
+// trampoline the compiler generates for the parameter, as `proc`, and a
+// handle of the process's handle table (`handles.dado`) holding the function
+// as `data`. The handle is generation-checked like an instance's: a call
+// through it after its VM ended, or after the call that made it returned
+// (below), fails `STALE` and never reads freed memory. A **bare function
+// reference** parameter, `void(i32) f`, has no data to carry a handle in:
+// its trampoline is static, one per parameter, and reads the function from a
+// thread-local slot the thunk saves and restores around the call — valid
+// only for calls made during the call, on its thread; outside them the slot
+// is empty and the call fails `STALE`. A bare reference the bound function
+// keeps past the call is refused at compile time (`ERR1220`).
+//
+// **How long a pair's handle lives.** When the bound function keeps the pair
+// — stores it, returns it, hands it to a function that does, as the
+// compiler's escape check sees it — the handle is the VM's, one per function
+// object however often it crosses (its mark, as an instance's), and lives
+// until the VM ends. Otherwise it is the call's: made for the call and let
+// go of when it returns, so a loop calling Dado with a new function each turn
+// holds no handle past its turn.
+//
+// **A call enters the VM.** Every trampoline enters the engine the function
+// lives in, as a run does (`enter`): from a thread other than the VM's
+// owner it fails `THREAD`, on a stopped engine `STOPPED`, on a paused one
+// `BUSY`, each with its text on the error sink. The arguments cross as a Dado
+// function's answer does and the answer as a Dado function's argument; the
+// Dado allocator the callback's own calls into Dado see is the ambient in
+// effect when Dado calls it — never one captured (Sam's R7(b)). Leaving is a
+// safe point (`signals.dado`).
+//
+// **A failure takes the seam's route.** A failable procedure answers the
+// script's code to Dado. Either way, when the call came from inside a bound
+// Dado function the script called, the script's error is **parked** for that
+// function's thunk: it is thrown into the script when the Dado function
+// returns — always, when Dado could not see it (the procedure is not
+// failable), and when the Dado function fails, otherwise — so the script sees
+// its own error, not Dado's code. A call from outside any (Dado's own `main`
+// calling a stored pair) writes the failure's text to the error sink.
+package script
+
+// What a function's handle names as its class, in a failure's last line.
+private const cstring FUNCTION_CLASS = "function"
+
+// A script's error a callback met, waiting for the innermost thunk running
+// on the engine: the error, the thunk's depth (0 when none waits), and
+// whether the thunk throws it whatever the Dado function answers.
+type Parking:
+    i32 active,
+    JSValue parked,
+    i32 at,
+    bool owed,
+
+// ── The thunk's side ────────────────────────────────────────────────────────
+
+// A thunk is done: its depth let go of, and its answer given back — or the
+// error a callback parked for it thrown instead (above). Then the safe point.
+JSValue thunk_left(^JSContext ctx, JSValue answer):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    i32 depth = e^.parking.active
+    e^.parking.active -= 1
+    if depth > 0 && e^.parking.at == depth:
+        e^.parking.at = 0
+        JSValue p = e^.parking.parked
+        e^.parking.parked = undefined()
+        if forced(e):
+            JS_FreeValue(ctx, p)
+        else if is_exception(answer):
+            JSValue lost = JS_GetException(ctx)
+            JS_FreeValue(ctx, lost)
+            _ = JS_Throw(ctx, p)
+            return raised()
+        else if e^.parking.owed:
+            JS_FreeValue(ctx, answer)
+            _ = JS_Throw(ctx, p)
+            return raised()
+        else:
+            JS_FreeValue(ctx, p)
+    if is_exception(answer):
+        return answer
+    if signalled(e) && !forced(e):
+        if watch(e, nil) != 0:
+            JS_FreeValue(ctx, answer)
+            return raised()
+    return answer
+
+// A pair's function, argument `i`: held by a handle — the VM's when the
+// bound function keeps it (`kept`), the call's otherwise. Anything but a
+// function throws.
+!rawptr take_callback(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param, bool kept):
+    JSValue v = nth(argv, i)
+    if !JS_IsFunction(ctx, v):
+        mistyped(ctx, v, function, param, "a function")
+        fail TYPE
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    rawptr h = nil
+    if kept:
+        h = adopt(e, v, FUNCTION_CLASS)
+    else:
+        h = slot_new(e, JS_DupValue(ctx, v), false, FUNCTION_CLASS)
+    if h == nil:
+        _ = JS_ThrowOutOfMemory(ctx)
+        fail NO_MEMORY
+    return h
+
+// The call is over: a handle made for it let go of, so a copy Dado kept
+// anyway reads as stale.
+void drop_callback(^JSContext ctx, rawptr h, bool kept):
+    if kept:
+        return
+    Slot at
+    if slot_take(h, &at):
+        JS_FreeValue(ctx, at.value)
+
+// A bare reference's function, argument `i`: checked to be one; the thunk
+// keeps it, borrowed, in its parameter's thread-local slot for the call.
+!JSValue take_bare_callback(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param):
+    JSValue v = nth(argv, i)
+    if !JS_IsFunction(ctx, v):
+        mistyped(ctx, v, function, param, "a function")
+        fail TYPE
+    return v
+
+// ── The trampoline's side ───────────────────────────────────────────────────
+
+// A pair's trampoline coming in: the engine its handle names entered, and the
+// function, a counted reference the trampoline frees. Fails `STALE` for a handle let go of, and as `enter` does; the
+// text is on the error sink.
+!^JSContext callback_begin(rawptr h, ^JSValue fn, cstring label):
+    Slot at
+    if !slot_read(h, &at):
+        stale_callback(label)
+        fail STALE
+    Engine e = at.engine
+    try enter(e) else code:
+        fail code
+    if !slot_read(h, &at) || !JS_IsFunction(e^.ctx, at.value):
+        stale_callback(label)
+        fail leaving(e, STALE)
+    fn^ = JS_DupValue(e^.ctx, at.value)
+    return e^.ctx
+
+// A bare reference's trampoline coming in: `ctx` is what its slot holds — nil
+// outside the call that passed the function, or on another thread.
+!^JSContext callback_begin_bare(^JSContext ctx, cstring label):
+    if ctx == nil:
+        stale_callback(label)
+        fail STALE
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    try enter(e) else code:
+        fail code
+    return ctx
+
+private void stale_callback(cstring label):
+    text_begin(loose_err())
+    err_put(loose_err(), "script: a script's function passed to `")
+    err_put(loose_err(), string8(label))
+    err_put(loose_err(), "` was called after the call that passed it returned, after its VM ended, or on another thread: Dado calls a bare function reference only during the call, and keeps a script's function past it as a `(proc, data)` pair\n")
+
+// The function called with `argc` arguments, which this takes; its answer, a
+// counted reference the trampoline frees, or the script's failure's code —
+// parked for the thunk the call is inside, `owed` when Dado cannot see it.
+!JSValue callback_call(^JSContext ctx, JSValue fn, i32 argc, ^JSValue argv, cstring label, bool owed):
+    JSValue r = JS_Call(ctx, fn, undefined(), argc, argv)
+    for i in 0..<argc:
+        JS_FreeValue(ctx, nth(argv, i))
+    if !is_exception(r):
+        return r
+    fail callback_failed(ctx, label, owed)
+
+// The answer a trampoline read refused, or the call's own failure: the
+// exception pending, parked or written, and its code.
+i32 callback_failed(^JSContext ctx, cstring label, bool owed):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    if forced(e):
+        return STOPPED
+    if e^.parking.active > 0:
+        JSValue ex = as_failure(e, JS_GetException(ctx))
+        i32 code = code_of(e, ex)
+        if e^.parking.at == e^.parking.active:
+            JS_FreeValue(ctx, ex)
+        else:
+            e^.parking.parked = ex
+            e^.parking.at = e^.parking.active
+            e^.parking.owed = owed
+        return code
+    text_begin(e^.err)
+    err_put(e^.err, "script: the script's function Dado called through `")
+    err_put(e^.err, string8(label))
+    err_put(e^.err, "` failed:\n")
+    report(e)
+    return e^.thrown
+
+// The trampoline is done with the engine: a safe point.
+void callback_end(^JSContext ctx):
+    leave(Engine(JS_GetContextOpaque(ctx)))
+
+// A `Sink`'s bytes, as the `string` a script's function takes: bytes out of
+// Dado, counted.
+JSValue give_bytes(^JSContext ctx, rawptr bytes, i64 n):
+    if bytes == nil || n <= 0:
+        return JS_NewStringLen(ctx, "", #c.size_t(0))
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    e^.bytes_out += n
+    return JS_NewStringLen(ctx, cstring(bytes), #c.size_t(n))

@@ -1,0 +1,243 @@
+// app:ui — `LineEdit`: one line of editable text the widget owns.
+//
+// ## A text edit in single-line mode, and why
+//
+// **A line edit is a `TextEdit` with its `single` flag set, over a source
+// that serves the widget's own buffer as a one-line document.** It is the
+// same kind, so every `text_edit_*` call works on one — the caret, the
+// selection, `text_edit_select_all`, undo and redo, the clipboard pair, the
+// counters — and it moves its caret, snaps to clusters, selects by word,
+// drags, undoes whole words and pastes as one step by exactly the code a
+// multi-line edit does, through the seam (`cell.next_visual`,
+// `cell.prev_visual`, `cell.logical_of`). A second widget sharing those
+// mechanisms through helpers would have had to duplicate the undo log, the
+// selection and the mouse — six hundred lines that would drift — for a
+// saving of nothing measurable: one line is one row, and the per-row cost is
+// the same code either way. What single-line mode changes, and nothing else:
+//
+//   - **the text is the widget's**: `blen` bytes of a buffer grown by doubling
+//     in the tree's allocator, with no cap (`line_edit_text`,
+//     `line_edit_set_text`). Its source's insert turns every line break it is
+//     given — a paste, `text_edit_insert` — into a space, byte for byte, so
+//     the document is always one line and an undo record's length is the
+//     text's. `text_edit_set_source` does nothing to a line edit;
+//   - **its keys**: Enter (and keypad Enter) emits `submitted`, recording the
+//     modifiers it was pressed with (`line_edit_submit_mods`, so Shift+Enter
+//     can mean "previous"); Escape emits `cancelled`; Tab is left to bubble,
+//     for a dialog to move focus with; Up, Down, PageUp and PageDown are
+//     offered to the **key target** (`line_edit_set_key_target`) — a list the
+//     field filters, whose selection they move while focus stays here — and
+//     left to bubble without one. The wheel is left to bubble. Everything
+//     else is a text edit's, a command chord with Alt held excepted, which
+//     every text edit leaves to the program;
+//   - **its look**: `LineEditTheme` — its colours, its box — with no gutter,
+//     no current-line highlight, and the **placeholder** in its own colour
+//     while the text is empty, the caret drawn over its first cell;
+//   - **no grid region**: a line edit is one row with nothing to scroll by a
+//     pixel, so it writes its layer's cells directly;
+//   - **its size**: one row and at least one column inside its box's margins;
+//     it expands horizontally and not vertically.
+//
+// **Horizontal scroll** is the text edit's: the caret brought into view both
+// ways, a whole cluster at a time (`edit_follow_left`), so typing past the
+// right edge scrolls the text left and Home brings it back.
+//
+// Every entry point is total over a bad handle: a read answers the empty
+// thing, a change does nothing. `line_edit_*` calls on a multi-line text edit
+// are bad handles too.
+package ui
+
+import "app:ui/cell"
+
+private i32 g_sig_submitted = -1
+private i32 g_sig_cancelled = -1
+
+// ── The source over the buffer ─────────────────────────────────────────────
+
+private i64 le_count(rawptr ctx):
+    _ = ctx
+    return 1
+
+private string8 le_line(rawptr ctx, i64 i):
+    ^EditState s = EditPtr(ctx)
+    if i != 0 || s.buf == nil || s.blen <= 0:
+        return ""
+    return string8(s.buf[0..<s.blen])
+
+// Room for `need` bytes, the buffer doubled as often as that takes.
+private bool le_room(^EditState s, i64 need):
+    if s.buf == nil:
+        return false
+    if need <= #len(s.buf):
+        return true
+    i64 cap = #len(s.buf) * 2
+    if cap < need:
+        cap = need
+    return #resize(s.buf, cap)
+
+// Insert `text` at byte `at.byte` of line 0, every CR and LF in it a space.
+private cell.TextPos le_insert(rawptr ctx, cell.TextPos at, string8 text):
+    ^EditState s = EditPtr(ctx)
+    i64 k = #len(text)
+    if at.line != 0 || at.byte < 0 || at.byte > s.blen || k <= 0:
+        return at
+    if !le_room(s, i64(s.blen) + k):
+        return at
+    i64 i = i64(s.blen) - 1
+    for i >= i64(at.byte):
+        s.buf[i + k] = s.buf[i]
+        i = i - 1
+    for j in 0..<k:
+        char8 ch = text[j]
+        if ch == '\n' || ch == '\r':
+            ch = ' '
+        s.buf[i64(at.byte) + j] = ch
+    s.blen = s.blen + i32(k)
+    return cell.pos(0, at.byte + i32(k))
+
+private bool le_remove(rawptr ctx, cell.TextPos from, cell.TextPos to):
+    ^EditState s = EditPtr(ctx)
+    if from.line != 0 || to.line != 0 || from.byte < 0 || to.byte > s.blen || from.byte >= to.byte:
+        return false
+    i32 k = to.byte - from.byte
+    for i in to.byte..<s.blen:
+        s.buf[i - k] = s.buf[i]
+    s.blen = s.blen - k
+    return true
+
+// ── Construction and handles ───────────────────────────────────────────────
+
+// A line edit under `parent` (under the root for `NIL`): empty, focusable,
+// expanding horizontally; `NIL` wherever `create` would answer it, and when
+// its buffer would not allocate.
+Control line_edit(Control parent):
+    Control c = create_owned(edit_kind(), parent, i64(#size(EditState)))
+    if !valid(c):
+        return NIL
+    ^EditState s = EditPtr(state(c))
+    s.buf = #make([]char8, 16, g_alloc)
+    if s.buf == nil:
+        remove(c)
+        return NIL
+    s.single = true
+    s.gutter = false
+    s.affinity = cell.Affinity.After
+    s.last_top = -1
+    s.key_target = NIL
+    EditSource src = (le_count, le_line, le_insert, le_remove, rawptr(s))
+    s.src = src
+    s.has_src = true
+    clear_log(s)
+    set_expand(c, true, false)
+    set_focusable(c, true)
+    return c
+
+// Whether `c` is a live line edit.
+bool is_line_edit(Control c):
+    return is_edit(c) && EditPtr(state(c)).single
+
+// The text, as a view valid until it next changes; "" for anything that is
+// not a live line edit.
+string8 line_edit_text(Control c):
+    if !is_line_edit(c):
+        return ""
+    ^EditState s = EditPtr(state(c))
+    return le_line(rawptr(s), 0)
+
+// Replace the text — line breaks made spaces — with the caret at its end,
+// nothing selected and the undo log emptied (undo does not go back past a
+// text the program set). Emits nothing: the program that called it knows.
+// Does nothing to anything but a live line edit, while `update` runs, or when
+// the buffer cannot grow, which leaves the text as it was.
+void line_edit_set_text(Control c, string8 text):
+    if !is_line_edit(c) || g_phase != PHASE_IDLE:
+        return
+    ^EditState s = EditPtr(state(c))
+    if !le_room(s, #len(text) + 1):
+        return
+    s.blen = 0
+    _ = le_insert(rawptr(s), cell.pos(0, 0), text)
+    clear_log(s)
+    cols_forget(s)
+    s.caret = cell.pos(0, s.blen)
+    s.anchor = s.caret
+    s.has_goal = false
+    s.sel_changed = false
+    s.left_col = 0
+    damage_all(c, s)
+    follow(c, s)
+
+// Show `text` in the placeholder colour while the line edit is empty; "" for
+// none. Does nothing to anything but a live line edit, or while `update`
+// runs.
+void line_edit_set_placeholder(Control c, string8 text):
+    if !is_line_edit(c) || g_phase != PHASE_IDLE:
+        return
+    ^EditState s = EditPtr(state(c))
+    if s.placeholder != nil:
+        #delete(s.placeholder)
+        s.placeholder = nil
+    if #len(text) > 0:
+        s.placeholder = #make([]char8, #len(text), g_alloc)
+        if s.placeholder != nil:
+            for i in 0..<#len(text):
+                s.placeholder[i] = text[i]
+    damage_all(c, s)
+
+// The placeholder; "" for none and for anything but a live line edit.
+string8 line_edit_placeholder(Control c):
+    if !is_line_edit(c):
+        return ""
+    ^EditState s = EditPtr(state(c))
+    if s.placeholder == nil:
+        return ""
+    return string8(s.placeholder[:])
+
+// Offer Up, Down, PageUp and PageDown to `target`'s input hook (`offer_input`)
+// while this line edit has focus — a list whose selection the field drives —
+// or, with `NIL`, leave them to bubble. The line edit itself is never its own
+// target. Does nothing to anything but a live line edit.
+void line_edit_set_key_target(Control c, Control target):
+    if !is_line_edit(c):
+        return
+    ^EditState s = EditPtr(state(c))
+    s.key_target = target
+
+Control line_edit_key_target(Control c):
+    if !is_line_edit(c):
+        return NIL
+    return EditPtr(state(c)).key_target
+
+// The modifiers (`input.Modifier` bits) the last Enter was pressed with; 0
+// before any, and for anything but a live line edit.
+u32 line_edit_submit_mods(Control c):
+    if !is_line_edit(c):
+        return 0
+    return EditPtr(state(c)).submit_mods
+
+// The Enters and Escapes the line edit has taken since it was made.
+(i64 submits, i64 cancels) line_edit_counters(Control c):
+    if !is_line_edit(c):
+        return (0, 0)
+    ^EditState s = EditPtr(state(c))
+    return (s.submits, s.cancels)
+
+// ── Signals ────────────────────────────────────────────────────────────────
+
+// Emitted when Enter is pressed in a line edit.
+i32 submitted_signal():
+    if g_sig_submitted < 0:
+        g_sig_submitted = signal("submitted")
+    return g_sig_submitted
+
+// Emitted when Escape is pressed in a line edit.
+i32 cancelled_signal():
+    if g_sig_cancelled < 0:
+        g_sig_cancelled = signal("cancelled")
+    return g_sig_cancelled
+
+void on_submitted(Control c, SignalFn fn, rawptr ctx):
+    connect(c, submitted_signal(), fn, ctx)
+
+void on_cancelled(Control c, SignalFn fn, rawptr ctx):
+    connect(c, cancelled_signal(), fn, ctx)

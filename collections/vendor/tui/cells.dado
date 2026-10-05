@@ -1,0 +1,275 @@
+// vendor:tui — the cell grid, and everything that draws into it.
+//
+// This is the surface every widget in the library ultimately writes to, and it
+// is deliberately the *only* one. The tuibox port gave each box a 4 KiB byte
+// buffer, let its handler write escape codes into it, and then **parsed those
+// escape codes back out** to recover the style before compositing. That is a
+// clever way to spell "remember what colour this was" and it is one
+// indirection more than saying it.
+//
+// Here a widget writes `(glyph, fg, bg, attr)` into a cell. There is no
+// per-box cache, no byte ceiling, no `room()`, and no SGR parser anywhere in
+// the library — the only place an escape sequence is *produced* is the
+// compositor in `render.dado`, and there is no place one is consumed.
+//
+// Two grids: `back` is the frame being built, `front` is what the terminal
+// currently shows. `render.dado` writes the difference and nothing else.
+package tui
+
+import "core:chars"
+
+// A rectangle in terminal cells. Zero-based and half-open: a `Rect` at (0,0)
+// sized 3x1 covers columns 0, 1 and 2 of row 0. Terminals number their own
+// cells from one; that conversion happens once, in the compositor, and
+// nowhere else.
+type Rect: (i32 x, i32 y, i32 w, i32 h)
+
+const Rect NOWHERE = (0, 0, 0, 0)
+
+bool empty(Rect r):
+    return r.w <= 0 || r.h <= 0
+
+bool holds(Rect r, i32 x, i32 y):
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+
+Rect intersect(Rect a, Rect b):
+    i32 x0 = a.x
+    if b.x > x0: x0 = b.x
+    i32 y0 = a.y
+    if b.y > y0: y0 = b.y
+    i32 x1 = a.x + a.w
+    if b.x + b.w < x1: x1 = b.x + b.w
+    i32 y1 = a.y + a.h
+    if b.y + b.h < y1: y1 = b.y + b.h
+    if x1 <= x0 || y1 <= y0: return NOWHERE
+    return (x0, y0, x1 - x0, y1 - y0)
+
+Rect inset(Rect r, i32 by):
+    return (r.x + by, r.y + by, r.w - (by * 2), r.h - (by * 2))
+
+// ── cells ──────────────────────────────────────────────────────────────────
+
+// `glyph` is a code point, not packed UTF-8 bytes — the encode happens once,
+// at emit, so nothing else in the library has to know how UTF-8 works.
+//
+// `cont` marks the second column of a double-width character. The cell holds
+// no glyph of its own and the compositor skips it, because the terminal
+// advanced two columns when it drew the first one. Without this a CJK
+// character would leave a stale cell behind it that the diff never notices.
+private type Cell: (
+    u32 glyph,
+    Color fg,
+    Color bg,
+    Attr attr,
+    bool cont,
+)
+
+private const Cell BLANK = (32, DEFAULT, DEFAULT, Attr.NONE, false)
+
+private ref []Cell g_back
+private ref []Cell g_front
+private i32 g_cols
+private i32 g_rows
+
+// A full repaint is owed: the first frame, a resize, a theme change, a screen
+// switch. Set from several files, which is why it lives here with the grid it
+// is about.
+private bool g_force = true
+
+// Safety ceilings. A terminal that reports 100000 columns is a terminal that
+// is lying, and the answer to a lie is a bound rather than a runaway
+// allocation. Real windows sit far below both; the grid is sized to the
+// *measured* window and not to the ceiling.
+private const i32 MAX_COLS = 1024
+private const i32 MAX_ROWS = 512
+
+i32 cols():
+    return g_cols
+
+i32 rows():
+    return g_rows
+
+// The whole terminal, as a rectangle.
+Rect screen():
+    return (0, 0, g_cols, g_rows)
+
+private void free_grid():
+    #delete(g_back)
+    #delete(g_front)
+    g_back = nil
+    g_front = nil
+    g_cols = 0
+    g_rows = 0
+
+// Size the grids to (w, h), reallocating on a change. A fresh buffer holds no
+// valid `front`, so a resize forces a full repaint — which is correct rather
+// than merely safe: the terminal reflowed and nothing on it is where the old
+// front buffer says it is.
+private bool ensure_grid(i32 w, i32 h):
+    if g_back != nil && w == g_cols && h == g_rows:
+        return true
+    free_grid()
+    i32 n = w * h
+    if n <= 0: return false
+    g_back = #make([]Cell, n, #heap)
+    if g_back == nil: return false
+    g_front = #make([]Cell, n, #heap)
+    if g_front == nil:
+        #delete(g_back)
+        g_back = nil
+        return false
+    g_cols = w
+    g_rows = h
+    g_force = true
+    return true
+
+// ── the clip rectangle ─────────────────────────────────────────────────────
+//
+// Every write goes through it. A widget cannot draw outside the region that
+// contains it, and it does not have to check: a `panel` sets the clip to its
+// interior and a child that renders a hundred rows into a ten-row pane simply
+// stops appearing, with no `if` in the child.
+
+private Rect g_clip
+
+Rect clip():
+    return g_clip
+
+// Narrow the clip to `r` and answer what it was, so a caller restores it with
+// `defer set_clip(saved)`.
+private Rect push_clip(Rect r):
+    Rect was = g_clip
+    g_clip = intersect(g_clip, r)
+    return was
+
+private void set_clip(Rect r):
+    g_clip = r
+
+// ── writing ────────────────────────────────────────────────────────────────
+
+// The one write. Everything else in the library is built on it.
+private void put_cell(i32 x, i32 y, u32 glyph, Style st, bool cont):
+    if !holds(g_clip, x, y): return
+    if x < 0 || x >= g_cols || y < 0 || y >= g_rows: return
+    g_back[(y * g_cols) + x] = (glyph, st.fg, st.bg, st.attr, cont)
+
+// Paint a rectangle in one style, glyph and all. `fill_rect(r, surface)` is
+// how a panel gets a background distinct from the window's, which is the whole
+// mechanism behind the theme's surface ramp.
+void fill_rect(Rect r, Style st):
+    Rect a = intersect(r, g_clip)
+    if empty(a): return
+    for y in a.y..<(a.y + a.h):
+        for x in a.x..<(a.x + a.w):
+            put_cell(x, y, 32, st, false)
+
+// Repaint a rectangle's background without touching its glyphs — the selection
+// highlight and the hover tint, which must not erase the text they sit under.
+void tint_rect(Rect r, Color bg):
+    Rect a = intersect(r, g_clip)
+    if empty(a): return
+    for y in a.y..<(a.y + a.h):
+        for x in a.x..<(a.x + a.w):
+            i32 at = (y * g_cols) + x
+            if x < 0 || x >= g_cols || y < 0 || y >= g_rows: continue
+            g_back[at].bg = bg
+
+// Push everything in `r` toward the window's own background.
+//
+// What a modal does to the screen behind it. Both the foreground and the
+// background move, because dimming only the background leaves bright text
+// floating over a dark field and reads as a rendering fault rather than as
+// something being behind something else.
+void dim_rect(Rect r, u32 amount):
+    Rect a = intersect(r, g_clip)
+    if empty(a): return
+    for y in a.y..<(a.y + a.h):
+        for x in a.x..<(a.x + a.w):
+            if x < 0 || x >= g_cols || y < 0 || y >= g_rows: continue
+            i32 at = (y * g_cols) + x
+            g_back[at].fg = mix(g_back[at].fg, g_theme.base, amount)
+            g_back[at].bg = mix(g_back[at].bg, g_theme.base, amount)
+
+// Draw `s` at (x, y), stopping after `max_cols` columns. Answers how many
+// columns it actually occupied — the caller's advance, and its measurement if
+// it did not take one first.
+//
+// A double-width character writes its glyph and then a continuation cell. One
+// that does not fit in the remaining columns is dropped rather than half-drawn,
+// because half of a wide glyph is a different character.
+i32 draw_text(i32 x, i32 y, string8 s, Style st, i32 max_cols):
+    i32 n = i32(#len(s))
+    i32 at = 0
+    i32 used = 0
+    for at < n:
+        (char32 cp, i32 size) = chars.decode(s, at)
+        if size == 0: break
+        at = at + size
+        i32 w = chars.width(cp)
+        if w == 0: continue                    // a combining mark: not our model
+        if used + w > max_cols: break
+        put_cell(x + used, y, u32(cp), st, false)
+        if w == 2: put_cell(x + used + 1, y, 32, st, true)
+        used = used + w
+    return used
+
+// `draw_text`, and then blank the rest of the run in the same style. This is
+// what a label in a themed panel wants: without it the cells past the text
+// keep whatever was behind them, and a background colour stops halfway across
+// a row.
+i32 draw_text_fill(i32 x, i32 y, string8 s, Style st, i32 cols_wide):
+    i32 used = draw_text(x, y, s, st, cols_wide)
+    for c in used..<cols_wide:
+        put_cell(x + c, y, 32, st, false)
+    return used
+
+// How wide `s` will be. One call, so a widget that measures and a widget that
+// draws can never disagree about what a string costs.
+i32 measure(string8 s):
+    return chars.display_width(s)
+
+// A single glyph, given as the string a theme spells it with. Used by the
+// border and marker vocabularies, which are `string` constants because a box
+// corner is three bytes and writing it as a number would make the theme
+// unreadable.
+private void draw_glyph(i32 x, i32 y, string8 g, Style st):
+    (char32 cp, i32 size) = chars.decode(g, 0)
+    if size == 0: return
+    put_cell(x, y, u32(cp), st, false)
+
+// A horizontal run of one glyph.
+private void draw_hline(i32 x, i32 y, i32 n, string8 g, Style st):
+    for i in 0..<n:
+        draw_glyph(x + i, y, g, st)
+
+private void draw_vline(i32 x, i32 y, i32 n, string8 g, Style st):
+    for i in 0..<n:
+        draw_glyph(x, y + i, g, st)
+
+// A box, optionally with a caption inset into its top edge.
+//
+// The caption is drawn in its own style and padded with a space on each side,
+// so it reads as a label sitting *on* the line rather than as a gap in it —
+// which is the difference between a titled panel and a broken border.
+void draw_box(Rect r, BorderSet b, Style line, string8 title, Style cap):
+    if r.w < 2 || r.h < 2: return
+    i32 x1 = r.x + r.w - 1
+    i32 y1 = r.y + r.h - 1
+
+    draw_glyph(r.x, r.y, b.tl, line)
+    draw_glyph(x1, r.y, b.tr, line)
+    draw_glyph(r.x, y1, b.bl, line)
+    draw_glyph(x1, y1, b.br, line)
+    draw_hline(r.x + 1, r.y, r.w - 2, b.h, line)
+    draw_hline(r.x + 1, y1, r.w - 2, b.h, line)
+    draw_vline(r.x, r.y + 1, r.h - 2, b.v, line)
+    draw_vline(x1, r.y + 1, r.h - 2, b.v, line)
+
+    if #len(title) == 0: return
+    i32 room = r.w - 4                     // corners, plus one cell of inset
+    if room < 3: return
+    i32 want = measure(title) + 2          // a space either side
+    if want > room: want = room
+    put_cell(r.x + 2, r.y, 32, line, false)
+    i32 used = draw_text(r.x + 3, r.y, title, cap, want - 2)
+    put_cell(r.x + 3 + used, r.y, 32, line, false)

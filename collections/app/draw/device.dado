@@ -1,0 +1,970 @@
+// app:draw — the device half: textures, the `sokol_gp` painter, and the replay
+// that turns an ordered canvas into draw calls.
+//
+// `draw.dado` owns the tape, the tree and the paint order and never touches a
+// sokol handle. This file owns the handles and never decides what order
+// anything is drawn in. The seam between them is `replay`, which is called
+// with a canvas that has already been walked, pruned, tinted, clipped and
+// sorted, and whose only remaining question is what to hand `sokol_gp`.
+//
+// ── There are no shaders here ──────────────────────────────────────────────
+//
+// **Deleting them is what taking `sokol_gp` was for.** This file used to open
+// with nine `cstring` constants — GLSL 4.10, GLSL ES 3.00 and MSL, a vertex shader and
+// two fragment shaders each — picked at run time off `sg_query_backend()`,
+// with `init` answering `false` on D3D11, WGPU and Vulkan because no string
+// existed for them, and with the Metal strings never having been compiled by
+// any machine in this tree. `sokol_gp` ships shaders for every backend
+// `sokol_gfx` has. The strings are deleted, the two `sg_shader`s with them,
+// the two `sg_pipeline`s, the sampler, the streaming vertex buffer, the static
+// index buffer and the backend switch. What is left of the device is a
+// texture table.
+//
+// The Metal risk is **transferred rather than eliminated** and is worth saying
+// out loud: the shader a macOS build compiles is now `sokol_gp`'s rather than
+// ours. It is code upstream compiles on macOS, which is a better position than
+// the one this file was in, and it is still not a thing this container can
+// verify.
+//
+// ── Every texture is RGBA8 ─────────────────────────────────────────────────
+//
+// `texture_a8` is **gone**. `sokol_gp`'s stock shader is `texel * color` and
+// samples all four channels, so a one-channel image would hand back a red
+// glyph. `app:font`'s atlas is white-with-alpha now — `(255, 255, 255,
+// coverage)` — and the product is `vec4(tint.rgb, tint.a * coverage)`, which
+// is exactly what the deleted A8 fragment shader computed and it now computes
+// it with no shader at all. The cost is four times the atlas memory and it is
+// paid in `app:font`, which measures it.
+//
+// ── Two topologies, and no strips ──────────────────────────────────────────
+//
+// Everything this package draws is either a triangle or a line segment, and
+// nothing is a strip. `sokol_gp`'s batch optimiser refuses to merge a strip
+// with anything — `_sgp_queue_draw` skips the merge outright for
+// `TRIANGLE_STRIP` and `LINE_STRIP`, because a strip's vertices are not
+// independent — so a polyline drawn as `sgp_draw_lines_strip` is always a draw
+// call of its own however identical its state is to its neighbour's. Expanding
+// a strip into independent segments costs one extra vertex per segment and
+// buys the merge. This package chose the merge, and that choice is the only
+// reason `state_changes()` can call itself an upper bound.
+//
+// ── One primitive, one call ────────────────────────────────────────────────
+//
+// The replay below issues one `sgp_draw_*` per primitive and makes no attempt
+// to coalesce. That is not laziness: `sokol_gp` merges a draw into the
+// immediately-preceding command whenever the pipeline id and the bound
+// textures match, and looks back eight commands to reorder around a
+// non-overlapping one. Coalescing here would be a second optimiser writing
+// into the first one's input, and the measured behaviour is that it is not
+// needed — a run of same-state draws costs one call.
+//
+// The merge test also compares a `uniform`, and it is worth saying why that is
+// not on the list above: the pointer is `NULL` unless a caller has installed a
+// pipeline of its own through `sgp_set_pipeline`, which this package never
+// does. In particular the model-view projection is **not** a uniform —
+// `sokol_gp` bakes it into every vertex on the CPU — so the transform in force
+// has no bearing on whether two draws merge. `state_changes()` says what that
+// cost, because it used to be counted as though it did.
+//
+// What this does cost is **vertices**: sixty-four triangles for a filled
+// circle is 192 vertices whether they arrive in one call or sixty-four. That
+// is what `capacity()` is the budget for and what `overflowed()` reports.
+package draw
+
+import "app:graph"
+import "core:geom/xform"
+import "core:math"
+import sgp "vendor:sokol/sokol_gp"
+import "vendor:sokol/sokol_gfx"
+
+// ── The texture table ──────────────────────────────────────────────────────
+
+// One texture. `tv` is the view the painter samples through; `av` is the
+// colour-attachment view a render target is hung on a pass by, and is
+// meaningless on anything that is not a target.
+//
+// A `sokol_gfx` view is a handle and not a pointer, so a slot is 40-odd bytes
+// and the table is one growable run with a free list — the same shape the item
+// and canvas pools have, for the same reason: a stale `Texture` must read as
+// dead rather than address whatever has since reused its slot.
+private type TexSlot: (
+    bool                 live,
+    u32                  generation,
+    i32                  free_next,
+    sokol_gfx.sg_image   img,
+    sokol_gfx.sg_view    tv,
+    sokol_gfx.sg_view    av,
+    i32                  w,
+    i32                  h,
+    bool                 target,
+)
+
+private ref []TexSlot g_tex
+private i32 g_tex_used
+private i32 g_tex_free
+
+// Allocate the table and take slot 0 for the white texel. Called in either
+// mode; the GPU half of slot 0 is filled in by `painter_up`.
+//
+// It mentions no allocator: `pools` calls it under whatever the client brought
+// the server up with, and `#default` is what that means here.
+private bool tex_table():
+    g_tex = #make([]TexSlot, 16)
+    if g_tex == nil:
+        return false
+    g_tex_used = 1
+    g_tex_free = -1
+    g_tex[0].live = true
+    g_tex[0].free_next = -1
+    g_tex[0].w = 1
+    g_tex[0].h = 1
+    return true
+
+private void tex_table_down():
+    if g_tex == nil:
+        return
+    if !g_headless:
+        for i in 0..<g_tex_used:
+            if g_tex[i].live:
+                destroy_gpu_texture(i32(i))
+    #delete(g_tex)
+    g_tex = nil
+    g_tex_used = 0
+    g_tex_free = -1
+
+private void destroy_gpu_texture(i32 i):
+    sokol_gfx.sg_destroy_view(g_tex[i].tv)
+    if g_tex[i].target:
+        sokol_gfx.sg_destroy_view(g_tex[i].av)
+    sokol_gfx.sg_destroy_image(g_tex[i].img)
+
+private i32 tex_index(Texture t):
+    if g_tex == nil:
+        return -1
+    if t.index < 0 || t.index >= g_tex_used:
+        return -1
+    if !g_tex[t.index].live || g_tex[t.index].generation != t.generation:
+        return -1
+    return t.index
+
+private i32 tex_slot():
+    if g_tex_free >= 0:
+        i32 i = g_tex_free
+        g_tex_free = g_tex[i].free_next
+        return i
+    if g_tex_used >= i32(#len(g_tex)):
+        i32 old = i32(#len(g_tex))
+        if !#resize(g_tex, old * 2):
+            g_overflow = true
+            return -1
+        for k in old..<(old * 2):
+            g_tex[k].live = false
+            g_tex[k].generation = 0
+            g_tex[k].free_next = -1
+            g_tex[k].target = false
+    i32 i = g_tex_used
+    g_tex_used = g_tex_used + 1
+    return i
+
+// The built-in white 1x1 texel. An untextured primitive does not go through
+// it — it goes through `sgp_reset_view(0)`, which binds `sokol_gp`'s own white
+// image — so this exists for a caller that wants a texture handle standing for
+// "no texture", and for `app:ui`, which has one.
+Texture texture_white():
+    if g_tex == nil:
+        return NIL_TEXTURE
+    return Texture((0, g_tex[0].generation))
+
+// Upload an RGBA8 image, `w * h * 4` bytes, row-major from the top-left.
+// Answers `NIL_TEXTURE` if the server is not up, the run is short, or the
+// table could not grow.
+//
+// **There is no single-channel form.** See the file's doc comment: the stock
+// shader samples four channels and a one-channel atlas would draw red.
+Texture texture_create(i32 w, i32 h, []u8 rgba8):
+    if !g_ready || g_tex == nil:
+        return NIL_TEXTURE
+    if w < 1 || h < 1:
+        return NIL_TEXTURE
+    if #len(rgba8) < i64(w) * i64(h) * 4:
+        return NIL_TEXTURE
+    i32 i = tex_slot()
+    if i < 0:
+        return NIL_TEXTURE
+    g_tex[i].live = true
+    g_tex[i].free_next = -1
+    g_tex[i].w = w
+    g_tex[i].h = h
+    g_tex[i].target = false
+    if !g_headless:
+        sokol_gfx.sg_image_desc idesc
+        idesc.type_ = sokol_gfx.sg_image_type.SG_IMAGETYPE_2D
+        idesc.usage.dynamic_update = true
+        idesc.width = w
+        idesc.height = h
+        idesc.num_slices = 1
+        idesc.num_mipmaps = 1
+        idesc.pixel_format = sokol_gfx.sg_pixel_format.SG_PIXELFORMAT_RGBA8
+        idesc.sample_count = 1
+        idesc.label = "app:draw texture"
+        g_tex[i].img = sokol_gfx.sg_make_image(&idesc)
+        upload(g_tex[i].img, rgba8, w * h * 4)
+        sokol_gfx.sg_view_desc vdesc
+        vdesc.texture.image = g_tex[i].img
+        g_tex[i].tv = sokol_gfx.sg_make_view(&vdesc)
+    return Texture((i, g_tex[i].generation))
+
+// Replace a texture's pixels. The run must be at least as long as the texture
+// was made with. Answers false if it is not, if the handle is dead, or if it
+// names a render target.
+//
+// `sokol_gfx` allows one update per image per frame, so a caller growing a
+// glyph atlas should do it once, outside the pass.
+bool texture_update(Texture t, []u8 rgba8):
+    i32 i = tex_index(t)
+    if i < 0 || g_tex[i].target:
+        return false
+    i64 want = i64(g_tex[i].w) * i64(g_tex[i].h) * 4
+    if #len(rgba8) < want:
+        return false
+    if g_headless:
+        return true
+    upload(g_tex[i].img, rgba8, i32(want))
+    return true
+
+// A texture the GPU renders **into** rather than one uploaded from memory: an
+// RGBA8 colour attachment that can be sampled afterwards, which is what an
+// offscreen layer is, and which is how pixels get verified at all — see
+// `example/drawsmoke`, which renders into one and reads it back.
+//
+// A headless server has no GPU and answers `NIL_TEXTURE`.
+Texture texture_target_create(i32 w, i32 h):
+    if !g_ready || g_tex == nil || g_headless:
+        return NIL_TEXTURE
+    if w < 1 || h < 1:
+        return NIL_TEXTURE
+    i32 i = tex_slot()
+    if i < 0:
+        return NIL_TEXTURE
+    g_tex[i].live = true
+    g_tex[i].free_next = -1
+    g_tex[i].w = w
+    g_tex[i].h = h
+    g_tex[i].target = true
+
+    sokol_gfx.sg_image_desc idesc
+    idesc.type_ = sokol_gfx.sg_image_type.SG_IMAGETYPE_2D
+    idesc.usage.color_attachment = true
+    idesc.width = w
+    idesc.height = h
+    idesc.num_slices = 1
+    idesc.num_mipmaps = 1
+    idesc.pixel_format = sokol_gfx.sg_pixel_format.SG_PIXELFORMAT_RGBA8
+    idesc.sample_count = 1
+    idesc.label = "app:draw target"
+    g_tex[i].img = sokol_gfx.sg_make_image(&idesc)
+
+    sokol_gfx.sg_view_desc tvd
+    tvd.texture.image = g_tex[i].img
+    g_tex[i].tv = sokol_gfx.sg_make_view(&tvd)
+    sokol_gfx.sg_view_desc avd
+    avd.color_attachment.image = g_tex[i].img
+    g_tex[i].av = sokol_gfx.sg_make_view(&avd)
+    return Texture((i, g_tex[i].generation))
+
+// Hang a render target on a pass as its colour attachment. Answers false if
+// `t` is not a target, in which case `pass` is left alone.
+//
+// A pointer rather than a returned view, because this package does not open
+// passes — the caller writes the `sg_begin_pass` — and what it can offer is
+// the one field a pass needs filled in.
+bool texture_attach(Texture t, ^sokol_gfx.sg_pass pass):
+    i32 i = tex_index(t)
+    if i < 0 || !g_tex[i].target:
+        return false
+    pass.attachments.colors[0] = g_tex[i].av
+    return true
+
+// Release a texture. Slot 0 — the white texel — is not destroyable, so a
+// caller that frees everything it was handed does not take the built-in with
+// it.
+void texture_free(Texture t):
+    i32 i = tex_index(t)
+    if i <= 0:
+        return
+    if !g_headless:
+        destroy_gpu_texture(i)
+    g_tex[i].target = false
+    g_tex[i].live = false
+    g_tex[i].generation = g_tex[i].generation + 1
+    g_tex[i].free_next = g_tex_free
+    g_tex_free = i
+
+i32 texture_width(Texture t):
+    i32 i = tex_index(t)
+    if i < 0:
+        return 0
+    return g_tex[i].w
+
+i32 texture_height(Texture t):
+    i32 i = tex_index(t)
+    if i < 0:
+        return 0
+    return g_tex[i].h
+
+// Whether the handle is a `texture_target_create`.
+bool texture_is_target(Texture t):
+    i32 i = tex_index(t)
+    if i < 0:
+        return false
+    return g_tex[i].target
+
+// Whether the handle still names a live texture. A handle held past
+// `texture_free` answers false even after its slot is reused, which is what
+// the generation is for.
+bool texture_valid(Texture t):
+    return tex_index(t) >= 0
+
+// The GL texture object behind a handle, or 0 under a backend that is not GL,
+// for a dead handle, and on a headless server. An interop accessor: it is what
+// a readback or a foreign GL call needs, and it is a plain `u32` because that
+// is what a GL name is.
+u32 texture_gl_name(Texture t):
+    i32 i = tex_index(t)
+    if i < 0 || g_headless:
+        return 0
+    sokol_gfx.sg_gl_image_info info = sokol_gfx.sg_gl_query_image_info(g_tex[i].img)
+    return info.tex[info.active_slot]
+
+// The sokol resource state of a texture's image — `SG_RESOURCESTATE_VALID`
+// when it was made, and `SG_RESOURCESTATE_INITIAL` for a dead handle and for
+// every handle on a headless server, which has no images at all.
+sokol_gfx.sg_resource_state texture_state(Texture t):
+    i32 i = tex_index(t)
+    if i < 0 || g_headless:
+        return sokol_gfx.sg_resource_state.SG_RESOURCESTATE_INITIAL
+    return sokol_gfx.sg_query_image_state(g_tex[i].img)
+
+private void upload(sokol_gfx.sg_image img, []u8 pixels, i32 nbytes):
+    sokol_gfx.sg_image_data data
+    data.mip_levels[0].ptr = rawptr(&pixels[0])
+    data.mip_levels[0].size = #c.size_t(nbytes)
+    sokol_gfx.sg_update_image(img, &data)
+
+// ── Bringing the painter up ────────────────────────────────────────────────
+
+private bool g_painter
+private sokol_gfx.sg_sampler g_sampler
+
+// `sgp_setup` plus the white texel and the sampler. A zeroed `sgp_desc` asks
+// for `sokol_gp`'s defaults — the implementation runs every field through its
+// own `_sg_def`, so 0 means "the default" and not "none" — and the two
+// capacities are written because `capacity()` has to answer something.
+private bool painter_up():
+    sgp.sgp_desc d
+    d.max_vertices = u32(g_max_vertices)
+    d.max_commands = u32(g_max_commands)
+    sgp.sgp_setup(&d)
+    if !sgp.sgp_is_valid():
+        g_error = "app:draw could not start sokol_gp; sg_setup must have run first"
+        return false
+    g_painter = true
+
+    // Read back what the painter settled on rather than what was asked for.
+    sgp.sgp_desc got = sgp.sgp_query_desc()
+    g_max_vertices = i32(got.max_vertices)
+    g_max_commands = i32(got.max_commands)
+
+    // `gpu_draw_calls()` reads `sg_query_stats()`, and sokol collects nothing
+    // until it is told to. One flag, once, here — a client that wants the
+    // number should not have to know to ask sokol for it.
+    sokol_gfx.sg_enable_stats()
+
+    // The sampler. `sokol_gp`'s own default is NEAREST, and this package has
+    // documented LINEAR since it had a pipeline of its own; the difference is
+    // visible the moment anything is drawn at a non-integer scale, and
+    // `app:font`'s transparent-*white* unwritten texel exists precisely
+    // because a bilinear sample straddling the edge of a glyph box has to
+    // interpolate towards the tint rather than towards black. Keeping NEAREST
+    // would have made that prose false.
+    sokol_gfx.sg_sampler_desc sd
+    sd.min_filter = sokol_gfx.sg_filter.SG_FILTER_LINEAR
+    sd.mag_filter = sokol_gfx.sg_filter.SG_FILTER_LINEAR
+    sd.mipmap_filter = sokol_gfx.sg_filter.SG_FILTER_NEAREST
+    sd.wrap_u = sokol_gfx.sg_wrap.SG_WRAP_CLAMP_TO_EDGE
+    sd.wrap_v = sokol_gfx.sg_wrap.SG_WRAP_CLAMP_TO_EDGE
+    sd.wrap_w = sokol_gfx.sg_wrap.SG_WRAP_CLAMP_TO_EDGE
+    sd.max_anisotropy = 1
+    sd.label = "app:draw sampler"
+    g_sampler = sokol_gfx.sg_make_sampler(&sd)
+
+    [4]u8 texel = [255, 255, 255, 255]
+    sokol_gfx.sg_image_desc idesc
+    idesc.type_ = sokol_gfx.sg_image_type.SG_IMAGETYPE_2D
+    idesc.usage.dynamic_update = true
+    idesc.width = 1
+    idesc.height = 1
+    idesc.num_slices = 1
+    idesc.num_mipmaps = 1
+    idesc.pixel_format = sokol_gfx.sg_pixel_format.SG_PIXELFORMAT_RGBA8
+    idesc.sample_count = 1
+    idesc.label = "app:draw white"
+    g_tex[0].img = sokol_gfx.sg_make_image(&idesc)
+    upload(g_tex[0].img, texel[:], 4)
+    sokol_gfx.sg_view_desc vdesc
+    vdesc.texture.image = g_tex[0].img
+    g_tex[0].tv = sokol_gfx.sg_make_view(&vdesc)
+    return true
+
+// Give the painter back. The textures go separately, in `tex_table_down`, and
+// they go **after** this: `sgp_shutdown` releases its own buffers, shader,
+// pipelines, white image and white view, and every one of those is a
+// `sokol_gfx` resource that needs a live device — which is the same ordering
+// rule `example/gpshapes` writes out at its `cleanup`.
+private void painter_down():
+    if !g_painter:
+        return
+    g_painter = false
+    sokol_gfx.sg_destroy_sampler(g_sampler)
+    sgp.sgp_shutdown()
+
+// `sg_query_stats().prev_frame.num_draw` — how many draw calls the **previous**
+// frame actually cost, which is the truth and is one frame late. Zero on a
+// headless server, and zero before `sg_setup` has run, because
+// `sg_query_stats` asserts on a device that is not up.
+//
+// Read this against `state_changes()`. The gap between them is what
+// `sokol_gp`'s batch optimiser saved.
+i32 gpu_draw_calls():
+    if g_headless || !sokol_gfx.sg_isvalid():
+        return 0
+    sokol_gfx.sg_stats st = sokol_gfx.sg_query_stats()
+    return i32(st.prev_frame.num_draw)
+
+// ── The state the replay tracks ────────────────────────────────────────────
+//
+// One register per thing `sokol_gp` keys a batch on. Every one of them is set
+// through an emitter below, and every emitter counts before it calls — and
+// returns between the two lines when the server is headless. That is the whole
+// mechanism by which a headless run reports what a GPU run would have cost,
+// and it is why there is no second traversal to keep in step.
+
+private const i32 TOPO_TRIANGLES = 0
+private const i32 TOPO_LINES = 1
+
+private const i32 VIEW_UNKNOWN = -2
+private const i32 VIEW_NONE = -1
+
+private i32 g_fb_w
+private i32 g_fb_h
+
+private i32 g_cur_view
+private u32 g_cur_view_gen
+private i32 g_cur_blend
+private i32 g_cur_topo
+private xform.Transform2D g_cur_xf
+private i32 g_sc_x
+private i32 g_sc_y
+private i32 g_sc_w
+private i32 g_sc_h
+
+// Replay a canvas that `canvas_render` has already walked, ordered and
+// resolved. Everything below is either a state register or a primitive.
+private void replay(i32 ci, i32 w, i32 h):
+    frame_begin(w, h)
+    for i in 0..<g_npaint:
+        Paint p = g_paint[i]
+        i32 ii = p.item.index
+        if ii >= 0 && ii < g_items_used && g_items[ii].live:
+            replay_item(ci, ii, p)
+    frame_end()
+
+// The registers start where `sokol_gp` starts, with one exception: the bound
+// view starts *unknown* rather than at `sokol_gp`'s white, so the first
+// drawing command of a frame always costs one counted state change. That is
+// what makes `state_changes()` an upper bound and not an upper bound minus
+// one — a frame that draws anything at all has issued at least one state
+// change before its first draw call.
+private void frame_begin(i32 w, i32 h):
+    g_fb_w = w
+    g_fb_h = h
+    g_cur_view = VIEW_UNKNOWN
+    g_cur_view_gen = 0
+    g_cur_blend = BLEND_MIX
+    g_cur_topo = TOPO_TRIANGLES
+    g_cur_xf = xform.IDENTITY
+    g_sc_x = 0
+    g_sc_y = 0
+    g_sc_w = w
+    g_sc_h = h
+    if g_headless:
+        return
+    sgp.sgp_begin(w, h)
+    sgp.sgp_set_blend_mode(sgp.sgp_blend_mode.SGP_BLENDMODE_BLEND)
+    sgp.sgp_set_sampler(0, g_sampler)
+
+private void frame_end():
+    if g_headless:
+        return
+    // `sgp_flush` issues the queued draw calls into whatever pass is open;
+    // `sgp_end` pops the state `sgp_begin` pushed, so nothing this render did
+    // to the blend mode, the scissor or the transform outlives it.
+    sgp.sgp_flush()
+    if sgp.sgp_get_last_error() != sgp.sgp_error.SGP_NO_ERROR:
+        g_overflow = true
+    sgp.sgp_end()
+
+private void replay_item(i32 ci, i32 ii, Paint p):
+    xform.Transform2D base = graph.global_transform(&g_canvases[ci].g, g_items[ii].node)
+    xform.Transform2D cur = base
+    [4]f32 clip = p.clip
+    bool clipped = p.clipped
+    [CLIP_DEPTH][4]f32 saved_rect
+    [CLIP_DEPTH]bool saved_on
+    i32 depth = 0
+    i32 over = 0
+
+    gp_scissor(clip, clipped)
+    gp_transform(cur)
+
+    for k in 0..<g_items[ii].ncmds:
+        Cmd c = g_items[ii].cmds[k]
+        g_commands = g_commands + 1
+        if c.kind == CMD_PUSH_CLIP:
+            if depth >= CLIP_DEPTH:
+                over = over + 1
+            else:
+                saved_rect[depth] = clip
+                saved_on[depth] = clipped
+                depth = depth + 1
+                [4]f32 r = aabb_of(cur, c.a)
+                if clipped:
+                    clip = meet(clip, r)
+                else:
+                    clip = r
+                clipped = true
+                gp_scissor(clip, clipped)
+        else if c.kind == CMD_POP_CLIP:
+            if over > 0:
+                over = over - 1
+            else if depth > 0:
+                depth = depth - 1
+                clip = saved_rect[depth]
+                clipped = saved_on[depth]
+                gp_scissor(clip, clipped)
+        else if c.kind == CMD_SET_TRANSFORM:
+            cur = base * xform.from_trs((c.a[0], c.a[1]), c.b[0], (c.a[2], c.a[3]))
+            gp_transform(cur)
+        else if c.kind == CMD_SET_TRANSFORM_MATRIX:
+            xform.Mat3 m = [
+                [c.a[0], c.a[1], 0.0],
+                [c.a[2], c.a[3], 0.0],
+                [c.b[0], c.b[1], 1.0],
+            ]
+            cur = base * xform.Transform2D(m)
+            gp_transform(cur)
+        else if c.kind == CMD_SET_BLEND:
+            gp_blend(c.flags)
+        else if c.kind == CMD_RESET_BLEND:
+            gp_blend(BLEND_MIX)
+        else:
+            // Everything past here draws, and nothing draws through an empty
+            // scissor. That is not only an optimisation: it is what makes
+            // "this subtree is clipped away" observable in `primitives()`.
+            if g_sc_w > 0 && g_sc_h > 0:
+                draw_cmd(ii, c, p.tint)
+
+    // An unbalanced `push_clip` does not leak into the next item: the scissor
+    // is re-established at the top of every `replay_item` from the walk's own
+    // answer, so a list that forgot its `pop_clip` costs itself and nobody
+    // else.
+
+private void draw_cmd(i32 ii, Cmd c, [4]u8 tint):
+    [4]u8 col = modulate_by(c.col, tint)
+    bool filled = (c.flags & FLAG_FILLED) != 0
+    if c.kind == CMD_RECT:
+        gp_untextured()
+        if filled:
+            gp_color(col)
+            gp_topology(TOPO_TRIANGLES)
+            gp_filled_rect(c.a[0], c.a[1], c.a[2], c.a[3])
+        else:
+            outline_rect(c.a, col, c.width)
+    else if c.kind == CMD_TEXTURE_RECT || c.kind == CMD_TEXTURE_RECT_REGION:
+        // One lookup, and the size is read off the slot the lookup found. The
+        // shape this replaced asked `tex_index` twice — once through the
+        // binder and once for the whole-image source — and a binder that ever
+        // answered true without a live slot would have indexed the table at
+        // -1. A mutation run found exactly that, through the bounds check.
+        //
+        // `CMD_TEXTURE_RECT` resolves its source here rather than at record
+        // time, so a `texture_update` that changes nothing but the pixels does
+        // not stale a recorded command.
+        i32 ti = tex_index(c.tex)
+        if ti >= 0:
+            gp_bind_view(ti, c.tex.generation)
+            [4]f32 src = c.b
+            if c.kind == CMD_TEXTURE_RECT:
+                src = (0.0, 0.0, f32(g_tex[ti].w), f32(g_tex[ti].h))
+            gp_color(col)
+            gp_topology(TOPO_TRIANGLES)
+            gp_tex_rect(c.a, src)
+    else if c.kind == CMD_LINE:
+        gp_untextured()
+        gp_color(col)
+        segment(c.a[0], c.a[1], c.a[2], c.a[3], c.width)
+    else if c.kind == CMD_MULTILINE:
+        gp_untextured()
+        gp_color(col)
+        i32 n = c.count - (c.count % 2)
+        i32 i = 0
+        for i < n:
+            Vtx a = g_items[ii].pts[c.first + i]
+            Vtx b = g_items[ii].pts[c.first + i + 1]
+            segment(a.x, a.y, b.x, b.y, c.width)
+            i = i + 2
+    else if c.kind == CMD_POLYLINE:
+        gp_untextured()
+        gp_color(col)
+        for i in 1..<c.count:
+            Vtx a = g_items[ii].pts[c.first + i32(i) - 1]
+            Vtx b = g_items[ii].pts[c.first + i32(i)]
+            segment(a.x, a.y, b.x, b.y, c.width)
+    else if c.kind == CMD_CIRCLE:
+        gp_untextured()
+        gp_color(col)
+        ring(c.a[0], c.a[1], c.a[2], i32(c.a[3]), filled, c.width)
+    else if c.kind == CMD_POLYGON:
+        if c.count >= 3:
+            gp_untextured()
+            gp_color(col)
+            gp_topology(TOPO_TRIANGLES)
+            Vtx o = g_items[ii].pts[c.first]
+            for i in 2..<c.count:
+                Vtx a = g_items[ii].pts[c.first + i32(i) - 1]
+                Vtx b = g_items[ii].pts[c.first + i32(i)]
+                gp_triangle(o.x, o.y, a.x, a.y, b.x, b.y)
+    else if c.kind == CMD_PRIMITIVE:
+        if c.count >= 3:
+            bool bound = false
+            if c.tex == NIL_TEXTURE:
+                gp_untextured()
+                bound = true
+            else:
+                bound = gp_textured(c.tex)
+            if bound:
+                gp_topology(TOPO_TRIANGLES)
+                Vtx o = g_items[ii].pts[c.first]
+                for i in 2..<c.count:
+                    Vtx a = g_items[ii].pts[c.first + i32(i) - 1]
+                    Vtx b = g_items[ii].pts[c.first + i32(i)]
+                    gp_vertex_triangle(o, a, b, tint)
+
+// Four edges drawn inside the rectangle. A negative width is Godot's hairline
+// and is four `sokol_gp` lines; a positive one is four filled rectangles,
+// clamped so a thickness larger than the rectangle does not turn it inside out.
+private void outline_rect([4]f32 r, [4]u8 col, f32 width):
+    gp_color(col)
+    if width <= 0.0:
+        gp_topology(TOPO_LINES)
+        gp_line(r[0], r[1], r[0] + r[2], r[1])
+        gp_line(r[0] + r[2], r[1], r[0] + r[2], r[1] + r[3])
+        gp_line(r[0] + r[2], r[1] + r[3], r[0], r[1] + r[3])
+        gp_line(r[0], r[1] + r[3], r[0], r[1])
+        return
+    f32 t = width
+    if t > r[2]:
+        t = r[2]
+    if t > r[3]:
+        t = r[3]
+    if t <= 0.0:
+        return
+    gp_topology(TOPO_TRIANGLES)
+    gp_filled_rect(r[0], r[1], r[2], t)
+    gp_filled_rect(r[0], r[1] + r[3] - t, r[2], t)
+    gp_filled_rect(r[0], r[1] + t, t, r[3] - t - t)
+    gp_filled_rect(r[0] + r[2] - t, r[1] + t, t, r[3] - t - t)
+
+// One segment: a hairline, or a quad centred on it. A zero-length segment
+// draws nothing rather than dividing by zero.
+private void segment(f32 x0, f32 y0, f32 x1, f32 y1, f32 width):
+    if width <= 0.0:
+        gp_topology(TOPO_LINES)
+        gp_line(x0, y0, x1, y1)
+        return
+    f32 dx = x1 - x0
+    f32 dy = y1 - y0
+    f32 len2 = dx * dx + dy * dy
+    if len2 <= 0.0:
+        return
+    f32 inv = inv_sqrt(len2)
+    f32 half = width * 0.5
+    f32 nx = 0.0 - dy * inv * half
+    f32 ny = dx * inv * half
+    gp_topology(TOPO_TRIANGLES)
+    gp_quad(x0 + nx, y0 + ny, x1 + nx, y1 + ny, x1 - nx, y1 - ny, x0 - nx, y0 - ny)
+
+// A circle, filled as a fan or outlined as a ring of segments. The segment
+// count came from `segments_for` at record time, so the number a headless run
+// reports and the number a GPU run draws are the same number.
+private void ring(f32 cx, f32 cy, f32 radius, i32 segs, bool filled, f32 width):
+    if segs < 3 || radius <= 0.0:
+        return
+    f32 step = TAU / f32(segs)
+    if filled:
+        gp_topology(TOPO_TRIANGLES)
+    f32 px = cx + radius
+    f32 py = cy
+    for i in 1..=segs:
+        f32 ang = step * f32(i32(i))
+        f32 nx = cx + radius * cos_f(ang)
+        f32 ny = cy + radius * sin_f(ang)
+        if filled:
+            gp_triangle(cx, cy, px, py, nx, ny)
+        else:
+            segment(px, py, nx, ny, width)
+        px = nx
+        py = ny
+
+// ── The emitters: count, then call ─────────────────────────────────────────
+
+private void gp_untextured():
+    if g_cur_view == VIEW_NONE:
+        return
+    g_cur_view = VIEW_NONE
+    g_cur_view_gen = 0
+    g_changes = g_changes + 1
+    if g_headless:
+        return
+    // Measured, and the one thing about `sokol_gp` that will bite a reader:
+    // `sgp_draw_filled_rects` gives its vertices texcoords spanning the whole
+    // bound texture, so an untextured rectangle drawn while an atlas view is
+    // bound samples the atlas. Resetting to `sokol_gp`'s own white view is
+    // what makes an untextured primitive untextured.
+    sgp.sgp_reset_view(0)
+
+private bool gp_textured(Texture t):
+    i32 ti = tex_index(t)
+    if ti < 0:
+        return false
+    gp_bind_view(ti, t.generation)
+    return true
+
+// Bind the view of a slot the caller has already checked. The generation is
+// carried alongside the index because a slot that was freed and remade is a
+// different texture through the same view handle, and a register that
+// compared only the index would keep a stale bind.
+private void gp_bind_view(i32 ti, u32 gen):
+    if g_cur_view == ti && g_cur_view_gen == gen:
+        return
+    g_cur_view = ti
+    g_cur_view_gen = gen
+    g_changes = g_changes + 1
+    if g_headless:
+        return
+    sgp.sgp_set_view(0, g_tex[ti].tv)
+
+// The pipeline `sokol_gp` looks up is keyed on the blend mode and the
+// primitive topology together, so a switch between triangles and lines is a
+// pipeline change and breaks a batch exactly as a blend change does. No sokol
+// call is made here — the topology is implied by which `sgp_draw_*` runs — and
+// the register exists only so the count is honest.
+private void gp_topology(i32 topo):
+    if topo == g_cur_topo:
+        return
+    g_cur_topo = topo
+    g_changes = g_changes + 1
+
+private void gp_blend(i32 mode):
+    if mode == g_cur_blend:
+        return
+    g_cur_blend = mode
+    g_changes = g_changes + 1
+    if g_headless:
+        return
+    sgp.sgp_set_blend_mode(sgp_blend_of(mode))
+
+// The scissor, rounded to whole pixels and clamped to the framebuffer.
+// Rounding is to nearest at each edge rather than outward, which is what keeps
+// two adjacent clipped views from overlapping by a pixel.
+private void gp_scissor([4]f32 r, bool on):
+    i32 x0 = 0
+    i32 y0 = 0
+    i32 x1 = g_fb_w
+    i32 y1 = g_fb_h
+    if on:
+        x0 = math.clamp(round_i(r[0]), 0, g_fb_w)
+        y0 = math.clamp(round_i(r[1]), 0, g_fb_h)
+        x1 = math.clamp(round_i(r[0] + r[2]), 0, g_fb_w)
+        y1 = math.clamp(round_i(r[1] + r[3]), 0, g_fb_h)
+        if x1 < x0:
+            x1 = x0
+        if y1 < y0:
+            y1 = y0
+    if x0 == g_sc_x && y0 == g_sc_y && x1 - x0 == g_sc_w && y1 - y0 == g_sc_h:
+        return
+    g_sc_x = x0
+    g_sc_y = y0
+    g_sc_w = x1 - x0
+    g_sc_h = y1 - y0
+    g_changes = g_changes + 1
+    if g_headless:
+        return
+    if !on:
+        sgp.sgp_reset_scissor()
+    else:
+        sgp.sgp_scissor(g_sc_x, g_sc_y, g_sc_w, g_sc_h)
+
+// The item's transform, and any `set_transform` command composed on top of it.
+//
+// **A change here is not a batch break.** `sokol_gp` multiplies every vertex
+// by the model-view projection on the CPU as it records it, so the transform
+// never reaches the merge test and two items at different positions still cost
+// one draw call. It is real work all the same — four calls, and a fresh
+// multiply for every vertex after it — so it counts into `transform_changes()`
+// and not into `state_changes()`.
+//
+// **`sokol_gp` has no matrix setter**, so an affine transform is issued as
+// `sgp_translate` / `sgp_rotate` / `sgp_scale` out of the TRS decomposition
+// `core:geom/xform` already computes — and that decomposition cannot carry
+// shear. A transform built by `from_trs`, or composed out of translations,
+// rotations and *uniform* scales, survives exactly; a parent with a
+// non-uniform scale above a rotated child bakes shear into the product and
+// this draws the sheared child unsheared. It is the same loss
+// `graph.set_transform` and `xform.rotation_of` both document.
+//
+// The exact alternative was worked out and rejected here: any 2x2 is
+// `R(a) · diag(sx, sy) · R(b)` by its singular value decomposition, which
+// `sgp_translate`/`sgp_rotate`/`sgp_scale`/`sgp_rotate` can issue in four
+// calls and six degrees of freedom — enough for every affine map. It is thirty
+// lines of closed-form arithmetic whose only possible verification is looking
+// at pixels, and there is no GPU in the container this was written in. An
+// unverifiable exact answer is worse than a verified approximate one with the
+// approximation written down.
+private void gp_transform(xform.Transform2D t):
+    if t == g_cur_xf:
+        return
+    g_cur_xf = t
+    g_xforms = g_xforms + 1
+    if g_headless:
+        return
+    sgp.sgp_reset_transform()
+    [2]f32 p = xform.position_of(t)
+    f32 rot = xform.rotation_of(t)
+    [2]f32 s = xform.scale_of(t)
+    sgp.sgp_translate(p.x, p.y)
+    sgp.sgp_rotate(rot)
+    sgp.sgp_scale(s.x, s.y)
+
+// Colour is **not** a state change. `sokol_gp` writes it into every vertex it
+// builds, so a run of differently coloured rectangles is one draw call, and a
+// counter that moved here would be counting something that costs nothing.
+private void gp_color([4]u8 c):
+    if g_headless:
+        return
+    sgp.sgp_set_color(f32(c[0]) / 255.0, f32(c[1]) / 255.0,
+                      f32(c[2]) / 255.0, f32(c[3]) / 255.0)
+
+private void gp_filled_rect(f32 x, f32 y, f32 w, f32 h):
+    g_primitives = g_primitives + 1
+    if g_headless:
+        return
+    sgp.sgp_draw_filled_rect(x, y, w, h)
+
+private void gp_tex_rect([4]f32 dst, [4]f32 src):
+    g_primitives = g_primitives + 1
+    if g_headless:
+        return
+    sgp.sgp_draw_textured_rect(0, gp_rect(dst), gp_rect(src))
+
+private void gp_line(f32 x0, f32 y0, f32 x1, f32 y1):
+    g_primitives = g_primitives + 1
+    if g_headless:
+        return
+    sgp.sgp_draw_line(x0, y0, x1, y1)
+
+private void gp_triangle(f32 ax, f32 ay, f32 bx, f32 by, f32 cx, f32 cy):
+    g_primitives = g_primitives + 1
+    if g_headless:
+        return
+    sgp.sgp_draw_filled_triangle(ax, ay, bx, by, cx, cy)
+
+private void gp_quad(f32 ax, f32 ay, f32 bx, f32 by, f32 cx, f32 cy, f32 dx, f32 dy):
+    gp_triangle(ax, ay, bx, by, cx, cy)
+    gp_triangle(ax, ay, cx, cy, dx, dy)
+
+// One triangle carrying its own per-vertex colour and texture coordinate,
+// which is the only thing `sgp_draw` is here for.
+//
+// **Its texture coordinates are normalised and `texture_rect_region`'s source
+// rectangle is in image pixels**, and that asymmetry is `sokol_gp`'s rather
+// than this package's: `sgp_draw_textured_rect` divides by the bound image's
+// size itself and `sgp_draw` copies the coordinate into the vertex verbatim.
+// Restating one in the other's units here would mean dividing by an image size
+// at record time, which is the atlas-growth staleness hazard `app:font` just
+// finished deleting.
+private void gp_vertex_triangle(Vtx a, Vtx b, Vtx c, [4]u8 tint):
+    g_primitives = g_primitives + 1
+    if g_headless:
+        return
+    [3]sgp.sgp_vertex v
+    v[0] = gp_vertex(a, tint)
+    v[1] = gp_vertex(b, tint)
+    v[2] = gp_vertex(c, tint)
+    sgp.sgp_draw(u32(sokol_gfx.sg_primitive_type.SG_PRIMITIVETYPE_TRIANGLES), &v[0], u32(3))
+
+private sgp.sgp_vertex gp_vertex(Vtx a, [4]u8 tint):
+    [4]u8 c = modulate_by(a.col, tint)
+    sgp.sgp_vec2 pos = (a.x, a.y)
+    sgp.sgp_vec2 uv = (a.u, a.v)
+    sgp.sgp_color_ub4 col = (c[0], c[1], c[2], c[3])
+    return (pos, uv, col)
+
+private sgp.sgp_rect gp_rect([4]f32 r):
+    return (r[0], r[1], r[2], r[3])
+
+private sgp.sgp_blend_mode sgp_blend_of(i32 mode):
+    if mode == BLEND_NONE:
+        return sgp.sgp_blend_mode.SGP_BLENDMODE_NONE
+    if mode == BLEND_PREMULTIPLIED:
+        return sgp.sgp_blend_mode.SGP_BLENDMODE_BLEND_PREMULTIPLIED
+    if mode == BLEND_ADD:
+        return sgp.sgp_blend_mode.SGP_BLENDMODE_ADD
+    if mode == BLEND_ADD_PREMULTIPLIED:
+        return sgp.sgp_blend_mode.SGP_BLENDMODE_ADD_PREMULTIPLIED
+    if mode == BLEND_MOD:
+        return sgp.sgp_blend_mode.SGP_BLENDMODE_MOD
+    if mode == BLEND_MUL:
+        return sgp.sgp_blend_mode.SGP_BLENDMODE_MUL
+    return sgp.sgp_blend_mode.SGP_BLENDMODE_BLEND
+
+// ── Small arithmetic ───────────────────────────────────────────────────────
+//
+// These rather than `core:math`'s libm wrappers, because each is one
+// expression and all are on the replay's hot path; `core:math` reaches libm
+// through `f64` and back, which is two conversions per call to get a `sinf`.
+// `ring` is the only caller of the trigonometric pair and it wants `f32`.
+// `core:math`'s `clamp` is a template over the caller's own width and converts
+// nothing, so the scissor rectangle uses it.
+
+private const f32 TAU = 6.283185307179586
+
+private f32 inv_sqrt(f32 x):
+    return 1.0 / sqrt_f(x)
+
+// Round to nearest, halves up. Every caller clamps the answer to the
+// framebuffer, so a coordinate past an `i32`'s end saturating to that end is
+// the right answer — but the floor step would then take a saturated minimum
+// one further, which is an overflow and a trap. It cannot be owed there: an
+// `f32` that far out is a whole number, so only a value above `-2^31` steps.
+private i32 round_i(f32 v):
+    f32 shifted = v + 0.5
+    i32 t = i32(shifted)
+    if f32(t) > shifted && shifted > -2147483648.0:
+        t = t - 1
+    return t
+
+foreign "math.h" link "-lm":
+    f32 @c("sqrtf") sqrt_f(f32 x)
+    f32 @c("sinf") sin_f(f32 x)
+    f32 @c("cosf") cos_f(f32 x)

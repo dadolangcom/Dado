@@ -1,0 +1,141 @@
+@test
+// vendor:enet — end-to-end proof this binding actually moves bytes, not
+// just compiles. A binding that only round-trips a struct field is not
+// proof the FFI shape is right; a real client and a real server on
+// loopback, one reliable packet exchanged and its content verified byte
+// for byte, is. `enet_initialize`/`enet_deinitialize` are called once, at
+// the top and bottom of this one test — ENet's own contract is process-wide
+// initialization, not per-host.
+package enet
+
+private bool bytes_equal([]char8 a, []char8 b, i32 n):
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return false
+    return true
+
+i32 test():
+    bool ok = true
+
+    // ── library lifecycle ──────────────────────────────────────────────
+    i32 rc = enet_initialize()
+    ok = #expect(rc == 0, "enet_initialize() = ", rc) && ok
+    if !ok:
+        return 1
+    defer enet_deinitialize()
+
+    // ── server: bind loopback on an explicit port (an OS-picked ephemeral
+    // port would leave the client with nothing to connect to). ──────────
+    ^ENetAddress server_addr = address_create()
+    ok = #expect(server_addr != nil, "address_create() (server)") && ok
+    address_set_any(server_addr)
+    address_set_port(server_addr, 17771)
+
+    ^ENetHost server = enet_host_create(server_addr, 4, 1, 0, 0)
+    ok = #expect(server != nil, "enet_host_create() (server) — port 17771 busy?") && ok
+    address_destroy(server_addr)
+    if !ok:
+        return 1
+    defer enet_host_destroy(server)
+
+    // ── client: connect to 127.0.0.1:17771 ──────────────────────────────
+    ^ENetAddress client_addr = address_create()
+    ok = #expect(client_addr != nil, "address_create() (client)") && ok
+    bool resolved = address_set_host(client_addr, "127.0.0.1")
+    ok = #expect(resolved, "address_set_host(\"127.0.0.1\")") && ok
+    address_set_port(client_addr, 17771)
+
+    // `ENetAddress` is a transparent restatement now and these two read its
+    // members rather than calling into a hand-written C accessor, so the round
+    // trip is worth asserting: the port is a member write followed by a member
+    // read, and the host is whatever `enet_address_set_host_new` put in the
+    // `struct in_addr`, rendered back out by `enet_address_get_host_new`.
+    u16 got_port = address_get_port(client_addr)
+    ok = #expect(got_port == 17771, "address_get_port() round-trips, got ", i32(got_port)) && ok
+    //
+    // `address_get_host` is not asserted to give back the literal it was
+    // given: `enet_address_get_host_new` asks `getnameinfo` with `NI_NAMEREQD`
+    // first, so a machine with a reverse record for 127.0.0.1 answers
+    // "localhost" and one without answers "127.0.0.1", and both are correct.
+    // What is asserted is that it succeeded and wrote something — which it can
+    // only do by reading `host` at the right offset in the right mode.
+    [64]char8 host_out
+    bool rendered = address_get_host(client_addr, rawptr(&host_out[0]), 64)
+    ok = #expect(rendered, "address_get_host()") && ok
+    ok = #expect(host_out[0] != char8(0), "address_get_host() wrote a name") && ok
+
+    ^ENetHost client = enet_host_create(nil, 1, 1, 0, 0)
+    ok = #expect(client != nil, "enet_host_create() (client)") && ok
+    if !ok:
+        address_destroy(client_addr)
+        return 1
+    defer enet_host_destroy(client)
+
+    ^ENetPeer client_peer = enet_host_connect(client, client_addr, 1, 0)
+    ok = #expect(client_peer != nil, "enet_host_connect()") && ok
+    address_destroy(client_addr)
+
+    // ── drive both sides until each has seen its own Connect event ──────
+    ^ENetEvent client_ev = event_create()
+    ^ENetEvent server_ev = event_create()
+    defer event_destroy(client_ev)
+    defer event_destroy(server_ev)
+
+    bool client_connected = false
+    bool server_connected = false
+    i32 rounds = 0
+    for rounds < 100 && !(client_connected && server_connected):
+        i32 crc = enet_host_service(client, client_ev, 10)
+        if crc > 0 && event_type(client_ev) == u32(EventType.Connect):
+            client_connected = true
+        i32 src = enet_host_service(server, server_ev, 10)
+        if src > 0 && event_type(server_ev) == u32(EventType.Connect):
+            server_connected = true
+        rounds = rounds + 1
+    ok = #expect(client_connected, "client saw Connect within 1s") && ok
+    ok = #expect(server_connected, "server saw Connect within 1s") && ok
+
+    ^ENetPeer server_peer = event_peer(server_ev)
+    ok = #expect(server_peer != nil, "server's Connect event named a peer") && ok
+    ok = #expect(enet_peer_get_state(server_peer) == PeerState.Connected, "server's peer reports Connected") && ok
+
+    // ── send one reliable packet, client -> server, verify exact bytes ──
+    [9]char8 payload = ['p', 'i', 'n', 'g', '-', 'e', 'n', 'e', 't']
+    ^ENetPacket pkt = enet_packet_create(rawptr(&payload[0]), 9, u32(PacketFlag.Reliable))
+    ok = #expect(pkt != nil, "enet_packet_create()") && ok
+    i32 send_rc = enet_peer_send(client_peer, 0, pkt)
+    ok = #expect(send_rc == 0, "enet_peer_send() = ", send_rc) && ok
+    enet_host_flush(client)
+
+    bool received = false
+    [64]char8 recv_buf
+    i32 recv_len = 0
+    rounds = 0
+    for rounds < 100 && !received:
+        i32 src = enet_host_service(server, server_ev, 10)
+        if src > 0 && event_type(server_ev) == u32(EventType.Receive):
+            ^ENetPacket recv_pkt = event_packet(server_ev)
+            u64 copied = packet_copy(recv_pkt, rawptr(&recv_buf[0]), 64)
+            recv_len = i32(copied)
+            enet_packet_destroy(recv_pkt)
+            received = true
+        rounds = rounds + 1
+    ok = #expect(received, "server saw a Receive event within 1s") && ok
+    ok = #expect(recv_len == 9, "payload length round-tripped, got ", recv_len) && ok
+    ok = #expect(bytes_equal(recv_buf[:], payload[:], 9), "payload bytes round-tripped exactly") && ok
+
+    // ── clean disconnect ──────────────────────────────────────────────────
+    enet_peer_disconnect(client_peer, 0)
+    bool client_disconnected = false
+    rounds = 0
+    for rounds < 60 && !client_disconnected:
+        i32 crc = enet_host_service(client, client_ev, 10)
+        if crc > 0 && event_type(client_ev) == u32(EventType.Disconnect):
+            client_disconnected = true
+        enet_host_service(server, server_ev, 10)
+        rounds = rounds + 1
+    ok = #expect(client_disconnected, "client saw its own Disconnect within 600ms") && ok
+
+    if ok:
+        return 0
+    return 1

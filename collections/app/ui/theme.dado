@@ -1,0 +1,681 @@
+// app:ui — themes: the `StyleBox`, the per-widget tables a theme compiles
+// to, and the one compiled theme every widget reads.
+//
+// ── The StyleBox ────────────────────────────────────────────────────────────
+//
+// A node's look outside its text is a `StyleBox`, of one of three kinds:
+// `Empty` (nothing drawn), `Flat` (a fill, a border on each side, a corner
+// radius and a shadow) and `Line` (one rule across the rect). Every kind also
+// carries four **content margins**, which say how far a widget's content sits
+// inside its rect.
+//
+// **Ink and room are two quantities.** The border widths, the radius, the
+// line thickness and the shadow are **pixels**: they are ink, drawn under the
+// text grid by a chrome pass, and they cost the layout nothing. The content
+// margins are **cells**: they are room, and they are all the layout ever
+// reads. Neither is derived from the other, so a 1 px hairline and a 3 px
+// bevel inside a one-cell margin lay out identically. A border wider than the
+// margin it sits in runs under the content's cells; that is the theme's
+// choice, not an error. A border is inside the rect (nothing here grows the
+// box outward); only the shadow reaches past it.
+//
+// **A box declares its bleed in cells.** A shadow is ink outside the rect.
+// `bleed_cells` answers how many whole cells it reaches past each side at a
+// given cell size, rounded up, so that whatever tracks dirty cells can dirty
+// the cells a box bleeds into when the box moves or changes.
+//
+// ── The cell contract with the chrome pass ─────────────────────────────────
+//
+// The chrome pass draws a box's pixels under the grid, and a cell whose
+// background has alpha 0 lets them show through (`cell.Cell`). So a widget
+// paints its cells with the background its theme gives it, and a theme that
+// wants a box's fill to be seen gives the widgets drawn over it a background
+// of alpha 0. Nothing here rewrites a colour behind the theme's back: the
+// default theme keeps today's opaque backgrounds (and so looks as it did with
+// no chrome pass at all), and its panel fill is the text background, so the
+// two composite the same either way.
+//
+// **Chrome is paid for by the pixel, every frame**: the chrome pass redraws
+// every box from its retained list each frame, so a fill the size of the
+// window costs a window of fill rate on every idle frame only to be hidden
+// by opaque cells. The default theme therefore draws no fill at all: its
+// panel is a border, its margin cells are transparent so the border shows,
+// and what shows through them where there is no border is the window's
+// clear colour, `window_bg`, which the frame sets from the theme — the text
+// background, so the margin looks exactly as a filled panel would. A theme
+// that wants a real fill sets the widgets' backgrounds to alpha 0 over it.
+// A panel's margin cells take `PanelTheme.bg`, which must stay transparent
+// wherever the panel's border is to be seen: an opaque margin covers it.
+//
+// ── A theme is compiled, not looked up ─────────────────────────────────────
+//
+// A `ThemeDesc` is the data a program edits: a palette and a few boxes.
+// `theme_set` resolves it once into one flat table per widget type
+// (`PanelTheme`, `LabelTheme`, `EditTheme`, `StatusTheme`, `SplitTheme`,
+// `TabTheme`, `TreeTheme`, `PopupTheme`, `LineEditTheme`), and a widget reads
+// a field of its table (`theme_edit().gutter_fg`,
+// `theme_panel().box[STATE_FOCUS]`). There is no name lookup and no
+// inheritance at paint time: everything a desc leaves implied (the states it
+// gives no box of their own, the caret's swapped colours) is filled in by the
+// compile. Each compile bumps `theme_generation`, and `theme_set` marks every
+// node for layout, so every widget re-measures (a content margin may have
+// changed) and repaints. Before any `theme_set`, the first read compiles
+// `theme_default()`.
+//
+// **Refused:** per-paint lookup, inheritance chains, string keys, and a
+// `theme_set` while `update` runs (it does nothing then, like every setter
+// that marks layout). A per-node box is the exception, not the rule:
+// `panel_set_style` and `label_set_style` are the only ones.
+package ui
+
+import "app:ui/cell"
+
+// ── The StyleBox ────────────────────────────────────────────────────────────
+
+// The largest pixel width, radius, shadow size or shadow offset any box is
+// read with: `bleed_cells` and the chrome conversion hold every such field to
+// `[-STYLE_PX_MAX, STYLE_PX_MAX]` (widths and sizes to `[0, STYLE_PX_MAX]`).
+// A 4K screen is 3840 px across, so no sane box needs more, and a hostile or
+// mistaken value cannot overflow the arithmetic that sums them.
+const i32 STYLE_PX_MAX = 4096
+
+enum StyleKind: (
+    Empty = 0,
+    Flat  = 1,
+    Line  = 2,
+)
+
+// Pixel fields are ink (`border_*`, `radius`, `line_px`, `shadow_*`); `margin_*`
+// fields are cells of layout room. `shadow_size` is how far the shadow's
+// blur reaches past the rect on every side before the offset `(shadow_dx,
+// shadow_dy)` moves it. A `Line` draws `line_px` of `border` across the middle
+// of the rect: horizontally, or vertically when `vertical`. Negative widths
+// and margins read as zero everywhere.
+type StyleBox: (
+    StyleKind kind,
+    [4]u8     fill,
+    [4]u8     border,
+    i32       border_l,
+    i32       border_t,
+    i32       border_r,
+    i32       border_b,
+    i32       radius,
+    [4]u8     shadow,
+    i32       shadow_size,
+    i32       shadow_dx,
+    i32       shadow_dy,
+    i32       line_px,
+    bool      vertical,
+    i32       margin_l,
+    i32       margin_t,
+    i32       margin_r,
+    i32       margin_b,
+)
+
+private i32 nonneg(i32 v):
+    if v < 0:
+        return 0
+    return v
+
+// A pixel width or size held to `[0, STYLE_PX_MAX]`.
+i32 px_size(i32 v):
+    if v < 0:
+        return 0
+    if v > STYLE_PX_MAX:
+        return STYLE_PX_MAX
+    return v
+
+// A pixel offset held to `[-STYLE_PX_MAX, STYLE_PX_MAX]`.
+i32 px_offset(i32 v):
+    if v < 0 - STYLE_PX_MAX:
+        return 0 - STYLE_PX_MAX
+    if v > STYLE_PX_MAX:
+        return STYLE_PX_MAX
+    return v
+
+
+// Draws nothing and takes no room.
+StyleBox style_empty():
+    StyleBox b = (StyleKind.Empty, [0, 0, 0, 0], [0, 0, 0, 0], 0, 0, 0, 0, 0, [0, 0, 0, 0], 0, 0, 0, 0, false, 0, 0, 0, 0)
+    return b
+
+// A fill, a border `border_px` wide on every side, corners of `radius_px`,
+// no shadow, and a content margin of `margin` cells on every side.
+StyleBox style_flat([4]u8 fill, [4]u8 border, i32 border_px, i32 radius_px, i32 margin):
+    StyleBox b = style_empty()
+    b.kind = StyleKind.Flat
+    b.fill = fill
+    b.border = border
+    b.border_l = nonneg(border_px)
+    b.border_t = nonneg(border_px)
+    b.border_r = nonneg(border_px)
+    b.border_b = nonneg(border_px)
+    b.radius = nonneg(radius_px)
+    return style_with_margins(b, margin, margin, margin, margin)
+
+// One rule `thickness_px` thick in `color`, across the middle of the rect;
+// no content margins.
+StyleBox style_line([4]u8 color, i32 thickness_px, bool vertical):
+    StyleBox b = style_empty()
+    b.kind = StyleKind.Line
+    b.border = color
+    b.line_px = nonneg(thickness_px)
+    b.vertical = vertical
+    return b
+
+// `b` with its content margins replaced, clamped at zero.
+StyleBox style_with_margins(StyleBox b, i32 left, i32 top, i32 right, i32 bottom):
+    StyleBox o = b
+    o.margin_l = nonneg(left)
+    o.margin_t = nonneg(top)
+    o.margin_r = nonneg(right)
+    o.margin_b = nonneg(bottom)
+    return o
+
+// `b` with a shadow: `size_px` of blur on every side, moved by `(dx, dy)`.
+StyleBox style_with_shadow(StyleBox b, [4]u8 color, i32 size_px, i32 dx, i32 dy):
+    StyleBox o = b
+    o.shadow = color
+    o.shadow_size = nonneg(size_px)
+    o.shadow_dx = dx
+    o.shadow_dy = dy
+    return o
+
+// Whether the box casts a shadow at all: only a `Flat` one does, and only
+// with a size and a colour that is not fully transparent.
+bool style_has_shadow(StyleBox b):
+    return b.kind == StyleKind.Flat && b.shadow_size > 0 && b.shadow[3] > 0
+
+// `px` pixels in whole cells of `unit` pixels, rounded up; a unit below one
+// counts one pixel a cell, so with no grid up the answer errs wide.
+private i32 px_to_cells(i32 px, i32 unit):
+    if px <= 0:
+        return 0
+    i32 u = unit
+    if u < 1:
+        u = 1
+    return i32((i64(px) + i64(u) - 1) / i64(u))
+
+// How many whole cells the box's ink reaches past each side of its rect at a
+// cell size of `cell_w` x `cell_h` pixels. Only a shadow bleeds: on the left
+// it reaches `shadow_size - shadow_dx` pixels, on the right `shadow_size +
+// shadow_dx`, and likewise on the top and bottom with `shadow_dy`; each is
+// rounded up to cells, and a side the offset pulls the shadow wholly inside
+// bleeds zero. A box with no shadow bleeds nothing on any side.
+(i32 left, i32 top, i32 right, i32 bottom) bleed_cells(StyleBox b, i32 cell_w, i32 cell_h):
+    if !style_has_shadow(b):
+        return (0, 0, 0, 0)
+    i64 s = i64(px_size(b.shadow_size))
+    i64 l = s - i64(px_offset(b.shadow_dx))
+    i64 r = s + i64(px_offset(b.shadow_dx))
+    i64 t = s - i64(px_offset(b.shadow_dy))
+    i64 d = s + i64(px_offset(b.shadow_dy))
+    return (px_to_cells(sat(l), cell_w), px_to_cells(sat(t), cell_h), px_to_cells(sat(r), cell_w), px_to_cells(sat(d), cell_h))
+
+// An i64 held in `[0, i32 max]`.
+private i32 sat(i64 v):
+    if v < 0:
+        return 0
+    if v > 2147483647:
+        return 2147483647
+    return i32(v)
+
+// The rect a widget's content gets inside `r`: `r` less the content margins,
+// never below zero extent.
+cell.CellRect inner_rect(StyleBox b, cell.CellRect r):
+    return cell.inset(r, nonneg(b.margin_l), nonneg(b.margin_t), nonneg(b.margin_r), nonneg(b.margin_b))
+
+// The room the box itself takes: its margins summed per axis, as `(cols,
+// rows)`.
+cell.CellPoint style_minimum(StyleBox b):
+    i64 c = i64(nonneg(b.margin_l)) + i64(nonneg(b.margin_r))
+    i64 r = i64(nonneg(b.margin_t)) + i64(nonneg(b.margin_b))
+    cell.CellPoint p = (sat(c), sat(r))
+    return p
+
+// ── States ──────────────────────────────────────────────────────────────────
+//
+// Every per-state table is indexed by these. A widget that has no such state
+// (nothing here is ever `DISABLED` yet) reads its `NORMAL` entry, and the
+// compile fills a state a desc gives no box of its own with its normal box.
+
+const i32 STATE_NORMAL   = 0
+const i32 STATE_HOVER    = 1
+const i32 STATE_PRESSED  = 2
+const i32 STATE_FOCUS    = 3
+const i32 STATE_DISABLED = 4
+const i32 STATE_COUNT    = 5
+
+// ── The default palette ────────────────────────────────────────────────────
+//
+// The colours the widgets were drawn in before themes existed, kept by name
+// so `theme_default` is visibly the old look.
+
+const [4]u8 TEXT_FG = [216, 222, 233, 255]
+const [4]u8 TEXT_BG = [22, 24, 29, 255]
+const [4]u8 LABEL_FG = [150, 160, 176, 255]
+const [4]u8 LABEL_BG = [32, 35, 42, 255]
+// The selection's background; its text keeps the text colour.
+const [4]u8 TEXT_SEL_BG = [58, 74, 110, 255]
+// New with themes: the gutter's numbers, and the panel's hairline in its two
+// states.
+const [4]u8 GUTTER_FG = [96, 104, 120, 255]
+const [4]u8 PANEL_BORDER = [52, 57, 68, 255]
+const [4]u8 PANEL_FOCUS_BORDER = [88, 110, 160, 255]
+// New with splits and tabs: the strip behind a tab bar, darker than a tab.
+const [4]u8 TAB_BAR_BG = [16, 18, 22, 255]
+// New with the tree: a hovered row, a selected row while focus is elsewhere,
+// and the two icon colours — folders amber, files the label's grey-blue.
+const [4]u8 TREE_HOVER_BG = [30, 33, 40, 255]
+const [4]u8 TREE_SEL_UNFOCUSED_BG = [42, 46, 56, 255]
+const [4]u8 TREE_FOLDER = [214, 172, 92, 255]
+const [4]u8 TREE_FILE = [150, 160, 176, 255]
+
+// ── Syntax roles ────────────────────────────────────────────────────────────
+//
+// A styled run of text (`StyleSpan`) names a **role**, a small index into the
+// theme's syntax palette, and the palette is compiled like every other table:
+// `EditTheme.syntax[role]` is a field read at paint, with no lookup. The roles
+// are generic — nothing here knows a language; a program maps its own token
+// kinds onto them. `SYNTAX_PLAIN` is the text colour in the default palette,
+// and a role at or past `SYNTAX_ROLES`, or below zero, draws in the text
+// colour whatever the palette says.
+const i32 SYNTAX_PLAIN   = 0
+const i32 SYNTAX_KEYWORD = 1
+const i32 SYNTAX_TYPE    = 2
+const i32 SYNTAX_BUILTIN = 3
+const i32 SYNTAX_STRING  = 4
+const i32 SYNTAX_NUMBER  = 5
+const i32 SYNTAX_COMMENT = 6
+const i32 SYNTAX_PUNCT   = 7
+const i32 SYNTAX_ROLES   = 8
+
+// The default syntax palette, for the dark text background (`TEXT_BG`). Each
+// hue is one a reader tells apart from its neighbours at a glance and none is
+// the selection's or the gutter's: keywords violet, types amber, built-ins
+// (`#name`s) cyan, strings green, numbers orange, comments a grey dimmer
+// than the text but brighter than the gutter's numbers, punctuation the
+// label's grey-blue, close to the text so that code does not read as
+// confetti. The ide's pixel harness tells the classes apart on screen by hue
+// and luminance, which is the claim these values are held to.
+const [4]u8 SYNTAX_KEYWORD_FG = [198, 146, 234, 255]
+const [4]u8 SYNTAX_TYPE_FG = [229, 192, 123, 255]
+const [4]u8 SYNTAX_BUILTIN_FG = [86, 182, 194, 255]
+const [4]u8 SYNTAX_STRING_FG = [152, 195, 121, 255]
+const [4]u8 SYNTAX_NUMBER_FG = [209, 154, 102, 255]
+const [4]u8 SYNTAX_COMMENT_FG = [118, 128, 148, 255]
+const [4]u8 SYNTAX_PUNCT_FG = [150, 160, 176, 255]
+
+// The default palette, indexed by role.
+[SYNTAX_ROLES][4]u8 syntax_default():
+    [SYNTAX_ROLES][4]u8 p
+    p[SYNTAX_PLAIN] = TEXT_FG
+    p[SYNTAX_KEYWORD] = SYNTAX_KEYWORD_FG
+    p[SYNTAX_TYPE] = SYNTAX_TYPE_FG
+    p[SYNTAX_BUILTIN] = SYNTAX_BUILTIN_FG
+    p[SYNTAX_STRING] = SYNTAX_STRING_FG
+    p[SYNTAX_NUMBER] = SYNTAX_NUMBER_FG
+    p[SYNTAX_COMMENT] = SYNTAX_COMMENT_FG
+    p[SYNTAX_PUNCT] = SYNTAX_PUNCT_FG
+    return p
+
+// ── The compiled tables ────────────────────────────────────────────────────
+
+// `bg` is the background of the blank cells a panel paints in its margins:
+// alpha 0, so the chrome pass's border (and any fill) shows through, unless
+// a program with no chrome pass wants the margins painted in the cells
+// themselves.
+type PanelTheme: ([4]u8 bg, [5]StyleBox box)
+
+type LabelTheme: ([4]u8 fg, [4]u8 bg, StyleBox box)
+
+// ── Mark roles ──────────────────────────────────────────────────────────────
+//
+// A **mark** is a background a program lays under byte ranges of a text
+// edit's lines (`text_edit_set_marks`): a find's matches, say. Like a syntax
+// role it is an index into a compiled palette (`EditTheme.mark[role]`), read
+// by a field; a role outside `[0, MARK_ROLES)` is no mark. `MARK_MATCH` is
+// every match; `MARK_CURRENT` is the one the program is on, a brighter amber
+// the eye goes to first. The selection is painted over both, so a current
+// match that is also selected shows the selection's blue, and a match either
+// way stays told apart from its neighbours by hue — amber against blue —
+// which is the claim the ide's pixel harness holds them to.
+const i32 MARK_MATCH   = 0
+const i32 MARK_CURRENT = 1
+const i32 MARK_ROLES   = 2
+
+const [4]u8 MARK_MATCH_BG = [92, 74, 22, 255]
+const [4]u8 MARK_CURRENT_BG = [150, 112, 30, 255]
+
+// New with overlays: a popup's fill and its hairline, a step lighter than the
+// text so a find bar or a palette reads as lifted off what it covers.
+const [4]u8 POPUP_BG = [32, 35, 42, 255]
+const [4]u8 POPUP_BORDER = [72, 80, 98, 255]
+
+// A look drawn in cells alone: the text colour and the background of every
+// cell it covers.
+type CellLook: ([4]u8 fg, [4]u8 bg)
+
+// A split box's grab handle: `handle` at rest, `hot` while the pointer is
+// over it or dragging it.
+type SplitTheme: (CellLook handle, CellLook hot)
+
+// A tab bar: `bar_bg` behind and after the tabs; `tab` for every tab but the
+// selected one; `selected` for the selected tab while focus is inside the
+// bar's pane, `selected_unfocused` while it is not. A tab's modified mark and
+// close mark are drawn in its own look's colours.
+type TabTheme: ([4]u8 bar_bg, CellLook tab, CellLook selected, CellLook selected_unfocused)
+
+type StatusTheme: ([4]u8 fg, [4]u8 bg, StyleBox box)
+
+// A tree: `row` for every row but these; `selected` for the selected row
+// while the tree has focus, `selected_unfocused` while it has not; `hover` for
+// the row under the pointer. `chevron` inks the expand marks, `folder` a
+// folder's icon and `file` a file's. Icons and marks are ink, drawn over the
+// row's cells.
+type TreeTheme: (
+    CellLook row,
+    CellLook selected,
+    CellLook selected_unfocused,
+    CellLook hover,
+    [4]u8    chevron,
+    [4]u8    folder,
+    [4]u8    file,
+    // A row's detail, right-aligned (`tree_set_detail`): the key chord in a
+    // palette's list, say. Drawn on the row's own background.
+    [4]u8    detail,
+)
+
+// A popup (`popup`, `dialog`): `bg` is its margin cells' background, alpha 0
+// so the box's fill shows; `box` its box per state — a filled panel, lifted
+// by a shadow, whose focus state is the one it has while focus is inside it.
+type PopupTheme: ([4]u8 bg, [5]StyleBox box)
+
+// A line edit (`line_edit`): its text, its cells' background, its placeholder
+// text, the selection's background and the caret's colours (final, as
+// `EditTheme`'s are), and its box per state.
+type LineEditTheme: (
+    [4]u8       fg,
+    [4]u8       bg,
+    [4]u8       placeholder_fg,
+    [4]u8       sel_bg,
+    [4]u8       caret_fg,
+    [4]u8       caret_bg,
+    [5]StyleBox box,
+)
+
+// `caret_fg` and `caret_bg` are final: with `caret_swap` the compile has
+// already put the text's colours there the other way round. A
+// `current_line_bg` of alpha 0 means no current-line highlight. The gutter is
+// the line numbers' digits and then `gutter_padding` blank cells. `syntax` is
+// the colour of each syntax role, indexed by role (`SYNTAX_KEYWORD`, ...).
+type EditTheme: (
+    [4]u8      fg,
+    [4]u8      bg,
+    [4]u8      sel_bg,
+    bool       caret_swap,
+    [4]u8      caret_fg,
+    [4]u8      caret_bg,
+    [4]u8      gutter_fg,
+    [4]u8      gutter_bg,
+    [4]u8      current_line_number_fg,
+    [4]u8      current_line_bg,
+    i32        gutter_padding,
+    [5]StyleBox box,
+    [SYNTAX_ROLES][4]u8 syntax,
+    // The background of each mark role, indexed by role (`MARK_MATCH`, ...).
+    [MARK_ROLES][4]u8 mark,
+)
+
+// ── The data form ──────────────────────────────────────────────────────────
+
+// What a program edits. `caret_fg` and `caret_bg` are read only when
+// `caret_swap` is false. The boxes named `_focus` are the focus state's; every
+// other state takes the normal box.
+type ThemeDesc: (
+    [4]u8    text_fg,
+    [4]u8    text_bg,
+    [4]u8    selection_bg,
+    bool     caret_swap,
+    [4]u8    caret_fg,
+    [4]u8    caret_bg,
+    [4]u8    gutter_fg,
+    [4]u8    gutter_bg,
+    [4]u8    current_line_number_fg,
+    [4]u8    current_line_bg,
+    i32      gutter_padding,
+    [4]u8    label_fg,
+    [4]u8    label_bg,
+    [4]u8    status_fg,
+    [4]u8    status_bg,
+    [4]u8    panel_bg,
+    [4]u8    window_bg,
+    StyleBox panel_box,
+    StyleBox panel_focus_box,
+    StyleBox label_box,
+    StyleBox status_box,
+    StyleBox edit_box,
+    StyleBox edit_focus_box,
+    CellLook split_handle,
+    CellLook split_handle_hot,
+    [4]u8    tab_bar_bg,
+    CellLook tab,
+    CellLook tab_selected,
+    CellLook tab_selected_unfocused,
+    CellLook tree_row,
+    CellLook tree_selected,
+    CellLook tree_selected_unfocused,
+    CellLook tree_hover,
+    [4]u8    tree_chevron,
+    [4]u8    tree_folder,
+    [4]u8    tree_file,
+    [SYNTAX_ROLES][4]u8 syntax,
+    [MARK_ROLES][4]u8 mark,
+    [4]u8    tree_detail,
+    [4]u8    popup_bg,
+    StyleBox popup_box,
+    StyleBox popup_focus_box,
+    [4]u8    line_edit_fg,
+    [4]u8    line_edit_bg,
+    [4]u8    line_edit_placeholder_fg,
+    StyleBox line_edit_box,
+    StyleBox line_edit_focus_box,
+)
+
+// The dark theme: today's colours exactly, no current-line highlight, a
+// one-cell gutter pad, empty boxes on the label, the status label and the
+// edit (so none of them takes room it did not take before), and a panel that
+// is a hairline around a one-cell margin with no fill — the window is
+// cleared to the text background instead (see "Chrome is paid for"). A split
+// handle is the panel's hairline colour on the text background, lit in the
+// focus border's colour; a tab is a label, the selected one the text itself,
+// greyed when focus is elsewhere. A tree row is the text; the selected row
+// takes the selection's background, a quieter one when focus is elsewhere.
+ThemeDesc theme_default():
+    StyleBox none = style_empty()
+    [4]u8 clear = [0, 0, 0, 0]
+    StyleBox pn = style_flat(clear, PANEL_BORDER, 1, 0, 1)
+    StyleBox pf = style_flat(clear, PANEL_FOCUS_BORDER, 1, 0, 1)
+    CellLook sh = (PANEL_BORDER, TEXT_BG)
+    CellLook shot = (TEXT_FG, PANEL_FOCUS_BORDER)
+    CellLook tb = (LABEL_FG, LABEL_BG)
+    CellLook ts = (TEXT_FG, TEXT_BG)
+    CellLook tu = (LABEL_FG, TEXT_BG)
+    CellLook trow = (TEXT_FG, TEXT_BG)
+    CellLook tsel = (TEXT_FG, TEXT_SEL_BG)
+    CellLook tsu = (TEXT_FG, TREE_SEL_UNFOCUSED_BG)
+    CellLook thov = (TEXT_FG, TREE_HOVER_BG)
+    [MARK_ROLES][4]u8 marks
+    marks[MARK_MATCH] = MARK_MATCH_BG
+    marks[MARK_CURRENT] = MARK_CURRENT_BG
+    [4]u8 shade = [0, 0, 0, 150]
+    StyleBox po = style_with_shadow(style_flat(POPUP_BG, POPUP_BORDER, 1, 0, 1), shade, 10, 0, 3)
+    StyleBox pof = style_with_shadow(style_flat(POPUP_BG, PANEL_FOCUS_BORDER, 1, 0, 1), shade, 10, 0, 3)
+    ThemeDesc d = (TEXT_FG, TEXT_BG, TEXT_SEL_BG, true, TEXT_BG, TEXT_FG, GUTTER_FG, TEXT_BG, TEXT_FG, clear, 1, LABEL_FG, LABEL_BG, LABEL_FG, LABEL_BG, clear, TEXT_BG, pn, pf, none, none, none, none, sh, shot, TAB_BAR_BG, tb, ts, tu,
+                   trow, tsel, tsu, thov, LABEL_FG, TREE_FOLDER, TREE_FILE, syntax_default(),
+                   marks, GUTTER_FG, clear, po, pof, TEXT_FG, TEXT_BG, GUTTER_FG, none, none)
+    return d
+
+private bool        g_theme_ready
+private i64         g_theme_gen
+private PanelTheme  g_theme_panel
+private LabelTheme  g_theme_label
+private StatusTheme g_theme_status
+private EditTheme   g_theme_edit
+private SplitTheme  g_theme_split
+private TabTheme    g_theme_tab
+private TreeTheme   g_theme_tree
+private PopupTheme  g_theme_popup
+private LineEditTheme g_theme_line
+private [4]u8       g_theme_window_bg
+
+// Every state's box: `normal`, but `focus` in the focus state.
+private [5]StyleBox fill_states(StyleBox normal, StyleBox focus):
+    [5]StyleBox out
+    for i in 0..<STATE_COUNT:
+        out[i] = normal
+    out[STATE_FOCUS] = focus
+    return out
+
+private void compile(^const ThemeDesc d):
+    g_theme_panel.box = fill_states(d.panel_box, d.panel_focus_box)
+    g_theme_panel.bg = d.panel_bg
+    g_theme_window_bg = d.window_bg
+    g_theme_label.fg = d.label_fg
+    g_theme_label.bg = d.label_bg
+    g_theme_label.box = d.label_box
+    g_theme_status.fg = d.status_fg
+    g_theme_status.bg = d.status_bg
+    g_theme_status.box = d.status_box
+    ^EditTheme e = &g_theme_edit
+    e.fg = d.text_fg
+    e.bg = d.text_bg
+    e.sel_bg = d.selection_bg
+    e.caret_swap = d.caret_swap
+    e.caret_fg = d.caret_fg
+    e.caret_bg = d.caret_bg
+    if d.caret_swap:
+        e.caret_fg = d.text_bg
+        e.caret_bg = d.text_fg
+    e.gutter_fg = d.gutter_fg
+    e.gutter_bg = d.gutter_bg
+    e.current_line_number_fg = d.current_line_number_fg
+    e.current_line_bg = d.current_line_bg
+    e.gutter_padding = nonneg(d.gutter_padding)
+    e.box = fill_states(d.edit_box, d.edit_focus_box)
+    e.syntax = d.syntax
+    e.mark = d.mark
+    g_theme_popup.bg = d.popup_bg
+    g_theme_popup.box = fill_states(d.popup_box, d.popup_focus_box)
+    ^LineEditTheme le = &g_theme_line
+    le.fg = d.line_edit_fg
+    le.bg = d.line_edit_bg
+    le.placeholder_fg = d.line_edit_placeholder_fg
+    le.sel_bg = d.selection_bg
+    le.caret_fg = d.caret_fg
+    le.caret_bg = d.caret_bg
+    if d.caret_swap:
+        le.caret_fg = d.line_edit_bg
+        le.caret_bg = d.line_edit_fg
+    le.box = fill_states(d.line_edit_box, d.line_edit_focus_box)
+    g_theme_split.handle = d.split_handle
+    g_theme_split.hot = d.split_handle_hot
+    g_theme_tab.bar_bg = d.tab_bar_bg
+    g_theme_tab.tab = d.tab
+    g_theme_tab.selected = d.tab_selected
+    g_theme_tab.selected_unfocused = d.tab_selected_unfocused
+    g_theme_tree.row = d.tree_row
+    g_theme_tree.selected = d.tree_selected
+    g_theme_tree.selected_unfocused = d.tree_selected_unfocused
+    g_theme_tree.hover = d.tree_hover
+    g_theme_tree.chevron = d.tree_chevron
+    g_theme_tree.folder = d.tree_folder
+    g_theme_tree.file = d.tree_file
+    g_theme_tree.detail = d.tree_detail
+    g_theme_ready = true
+    g_theme_gen = g_theme_gen + 1
+
+private void theme_ready():
+    if !g_theme_ready:
+        ThemeDesc defaults = theme_default()
+        compile(&defaults)
+
+// Compile `d` into the tables every widget reads, bump the generation, and
+// mark every node for layout (and so for a whole repaint). Does nothing while
+// `update` runs, when the marks would be dropped.
+void theme_set(^const ThemeDesc d):
+    if g_phase != PHASE_IDLE:
+        return
+    compile(d)
+    if g_nodes == nil:
+        return
+    for i in 0..<g_used:
+        if g_nodes[i].live:
+            layout_up(i32(i))
+
+// How many times a theme has been compiled: 1 after the lazy default, and one
+// more for every `theme_set`. A widget that caches anything drawn from the
+// theme compares this to know the cache is stale.
+i64 theme_generation():
+    theme_ready()
+    return g_theme_gen
+
+PanelTheme theme_panel():
+    theme_ready()
+    return g_theme_panel
+
+LabelTheme theme_label():
+    theme_ready()
+    return g_theme_label
+
+StatusTheme theme_status():
+    theme_ready()
+    return g_theme_status
+
+EditTheme theme_edit():
+    theme_ready()
+    return g_theme_edit
+
+// The compiled colour of syntax role `role`: the palette's entry, or the text
+// colour for a role outside `[0, SYNTAX_ROLES)` — what the text edit draws a
+// span of that role in.
+[4]u8 theme_syntax(i32 role):
+    theme_ready()
+    if role < 0 || role >= SYNTAX_ROLES:
+        return g_theme_edit.fg
+    return g_theme_edit.syntax[role]
+
+// The compiled background of mark role `role`; alpha 0, no mark, for a role
+// outside `[0, MARK_ROLES)`.
+[4]u8 theme_mark(i32 role):
+    theme_ready()
+    [4]u8 none = [0, 0, 0, 0]
+    if role < 0 || role >= MARK_ROLES:
+        return none
+    return g_theme_edit.mark[role]
+
+PopupTheme theme_popup():
+    theme_ready()
+    return g_theme_popup
+
+LineEditTheme theme_line_edit():
+    theme_ready()
+    return g_theme_line
+
+SplitTheme theme_split():
+    theme_ready()
+    return g_theme_split
+
+TabTheme theme_tab():
+    theme_ready()
+    return g_theme_tab
+
+TreeTheme theme_tree():
+    theme_ready()
+    return g_theme_tree
+
+// The colour the window is cleared to under everything; the frame applies it
+// whenever the generation changes.
+[4]u8 theme_window_bg():
+    theme_ready()
+    return g_theme_window_bg

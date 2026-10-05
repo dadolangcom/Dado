@@ -1,0 +1,385 @@
+@test
+// app:input/sokol unit test — hand-built `sapp_event` values in, `app:input`
+// queue contents out.
+//
+// The decode is also verified end to end against a real event stream: a window
+// opened under Xvfb, driven with `xdotool`, produced a KEY_DOWN/CHAR/KEY_UP
+// triple per typed letter, a motion, a press, a release, a wheel notch and a
+// resize, all landing with the codes and flags asserted below. This file is
+// what keeps that true without an X server: it is the same decode called
+// directly, plus the cases an unattended X server does not hand you for free —
+// a window close request, an event kind with no seat in `EventKind`, the
+// focus pair (which a bare `Xvfb` will produce only for a client that calls
+// `XSetInputFocus` itself; `xdotool windowfocus` does not, with no window
+// manager running), and a file drop that landed nothing.
+//
+// **One arm is only half-testable here and the file says which.**
+// FILES_DROPPED's payload is not in the `sapp_event`: the decode fetches it
+// from sokol, and sokol has none without a window and a real XDND handshake.
+// The empty case is pinned below; the filled case is pinned by an `Xvfb` run
+// and by `input_test.dado`'s coverage of `input.push_drop`, which is the half
+// of that arm sokol does not own.
+package sokol_input
+
+import "app:app"
+import "app:input"
+import "vendor:sokol/sokol_app"
+
+private void nb_run():  return
+private void nb_step(): return
+
+// One `sapp_event` with only the fields a decode reads. Declared and then
+// assigned, which sets `type_` and `modifiers` and leaves every other member —
+// the `[8]sapp_touchpoint` among them — at the zero the declaration gave it.
+private sokol_app.sapp_event ev_of(sokol_app.sapp_event_type kind, u32 mods):
+    sokol_app.sapp_event e
+    e.type_ = kind
+    e.modifiers = mods
+    return e
+
+// What a frame does with the queue: the runtime's `input.deliver` at its top,
+// then the program's `poll`. No runtime runs here to make the first call.
+private i32 take([]input.Event out):
+    input.deliver()
+    return input.poll(out)
+
+// Decode one event and return the single queue entry it produced. Asserts the
+// count so a decode that pushed nothing, or twice, fails here rather than
+// silently handing back a stale event.
+private (bool, input.Event) one(sokol_app.sapp_event e):
+    input.Event got
+    [4]input.Event buf
+    i32 n = take(buf[:])
+    if n != 0:
+        return (false, got)            // queue was not drained by the last case
+    decode_event(&e)
+    n = take(buf[:])
+    if n != 1:
+        return (false, got)
+    return (true, buf[0])
+
+i32 test():
+    // `input.poll` is gated on the backend advertising Input, so install one.
+    app.set_backend((nil, nb_run, nb_step, nb_step, app.caps(app.Capability.Input),
+                     nil, nil, nil, nil, nil))
+
+    bool ok = true
+
+    // ── keys: down, up, and the KEY_UP flag ────────────────────────────────
+    sokol_app.sapp_event kd = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_DOWN,
+                                    u32(input.Modifier.Ctrl))
+    kd.key_code = sokol_app.sapp_keycode.SAPP_KEYCODE_A
+    (bool kdok, input.Event kde) = one(kd)
+    ok = #expect(kdok, "one key-down event decoded") && ok
+    ok = #expect(kde.kind == input.EventKind.Key, "key down is a Key") && ok
+    ok = #expect(kde.code == 65, "key down code = ", kde.code, ", want 65 (uppercase A)") && ok
+    ok = #expect(kde.mods == u32(input.Modifier.Ctrl), "key down mods = ", kde.mods) && ok
+    ok = #expect((kde.mods & input.KEY_UP) == 0, "a press does not carry KEY_UP") && ok
+
+    // A named key passes through as its sokol number, unchanged, which is what
+    // `Keycode` being copied from `sapp_keycode` buys.
+    sokol_app.sapp_event ke = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_DOWN, 0)
+    ke.key_code = sokol_app.sapp_keycode.SAPP_KEYCODE_ESCAPE
+    (bool keok, input.Event kee) = one(ke)
+    ok = #expect(keok, "one escape event decoded") && ok
+    ok = #expect(kee.code == i32(input.Keycode.Escape),
+                 "SAPP_KEYCODE_ESCAPE decodes to Keycode.Escape, got ", kee.code) && ok
+
+    sokol_app.sapp_event ku = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_UP,
+                                    u32(input.Modifier.Shift))
+    ku.key_code = sokol_app.sapp_keycode.SAPP_KEYCODE_A
+    (bool kuok, input.Event kue) = one(ku)
+    ok = #expect(kuok, "one key-up event decoded") && ok
+    ok = #expect(kue.kind == input.EventKind.Key, "key up is still a Key") && ok
+    ok = #expect(kue.code == 65, "key up code = ", kue.code) && ok
+    ok = #expect((kue.mods & input.KEY_UP) != 0, "a release carries KEY_UP") && ok
+    ok = #expect((kue.mods & u32(input.Modifier.Shift)) != 0,
+                 "a release keeps its keyboard modifiers, mods = ", kue.mods) && ok
+
+    // ── text ───────────────────────────────────────────────────────────────
+    sokol_app.sapp_event ch = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_CHAR, 0)
+    ch.char_code = 233                     // 'é' — a codepoint, not a byte
+    (bool chok, input.Event che) = one(ch)
+    ok = #expect(chok, "one char event decoded") && ok
+    ok = #expect(che.kind == input.EventKind.Text, "CHAR is Text") && ok
+    ok = #expect(che.code == 233, "char code = ", che.code) && ok
+    ok = #expect(input.is_typed_text(che), "an unmodified 'é' is typed text") && ok
+
+    // ── E1: the CHAR carries the modifiers that were held ─────────────────
+    //
+    // This is the whole of E1 in three assertions. X11 hands sokol a CHAR of
+    // `z` — not 0x1A — for Ctrl+Z, because sokol converts the keysym and the
+    // control modifier does not touch it; so `code` alone cannot tell the two
+    // apart and `mods` is the only thing that can. The decode must **not**
+    // drop the event: `is_typed_text` is where the policy lives.
+    sokol_app.sapp_event cz = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_CHAR,
+                                    u32(input.Modifier.Ctrl))
+    cz.char_code = 122                     // 'z', which is what X11 sends for Ctrl+Z
+    (bool czok, input.Event cze) = one(cz)
+    ok = #expect(czok, "Ctrl+Z still produces a Text event — it is not suppressed") && ok
+    ok = #expect(cze.code == 122, "Ctrl+Z's CHAR is still 'z', code = ", cze.code) && ok
+    ok = #expect(cze.mods == u32(input.Modifier.Ctrl),
+                 "the CHAR carries Ctrl, mods = ", cze.mods) && ok
+    ok = #expect(!input.is_typed_text(cze), "Ctrl+Z is not typed text") && ok
+
+    // AltGr on Windows is Ctrl+Alt, and the character it produces must survive
+    // — which is the case a suppress-on-Ctrl decode would have eaten.
+    sokol_app.sapp_event ca = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_CHAR,
+                                    u32(input.Modifier.Ctrl) | u32(input.Modifier.Alt))
+    ca.char_code = 64                      // '@' — AltGr+Q on a German layout
+    (bool caok, input.Event cae) = one(ca)
+    ok = #expect(caok, "an AltGr CHAR is decoded") && ok
+    ok = #expect(input.is_typed_text(cae), "AltGr's '@' is typed text") && ok
+
+    // ── mouse: press sets the held bit, release clears it ──────────────────
+    sokol_app.sapp_event md = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_DOWN, 0)
+    md.mouse_button = sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_LEFT
+    md.mouse_x = 12.5
+    md.mouse_y = 34.5
+    (bool mdok, input.Event mde) = one(md)
+    ok = #expect(mdok, "one mouse-down event decoded") && ok
+    ok = #expect(mde.kind == input.EventKind.Mouse, "MOUSE_DOWN is Mouse") && ok
+    ok = #expect(mde.code == 0, "left button is code 0, got ", mde.code) && ok
+    // 0-based pixels, **unrounded** (C5b): `Event.x`/`y` are f32 and the decode
+    // no longer truncates, so the half-pixel survives. The `i32(...)` casts that
+    // used to sit on `mouse_x`/`mouse_y` are what this pins gone.
+    ok = #expect(mde.x == 12.5 && mde.y == 34.5, "press at ", mde.x, ",", mde.y, ", want 12.5,34.5") && ok
+    ok = #expect(mde.mods == u32(input.Modifier.Lmb),
+                 "press sets the held-button bit, mods = ", mde.mods) && ok
+    ok = #expect((mde.mods & input.MOUSE_UP) == 0, "a press is not a MOUSE_UP") && ok
+
+    sokol_app.sapp_event mu = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_UP,
+                                    u32(input.Modifier.Lmb))
+    mu.mouse_button = sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_LEFT
+    (bool muok, input.Event mue) = one(mu)
+    ok = #expect(muok, "one mouse-up event decoded") && ok
+    ok = #expect((mue.mods & input.MOUSE_UP) != 0, "a release carries MOUSE_UP") && ok
+    ok = #expect((mue.mods & u32(input.Modifier.Lmb)) == 0,
+                 "a release clears the released button's held bit, mods = ", mue.mods) && ok
+
+    // right button, so the held-bit table is exercised past its first arm
+    sokol_app.sapp_event rd = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_DOWN, 0)
+    rd.mouse_button = sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_RIGHT
+    (bool rdok, input.Event rde) = one(rd)
+    ok = #expect(rdok, "one right-button event decoded") && ok
+    ok = #expect(rde.code == 1 && rde.mods == u32(input.Modifier.Rmb),
+                 "right press: code ", rde.code, " mods ", rde.mods) && ok
+
+    sokol_app.sapp_event nd = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_DOWN, 0)
+    nd.mouse_button = sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_MIDDLE
+    (bool ndok, input.Event nde) = one(nd)
+    ok = #expect(ndok, "one middle-button event decoded") && ok
+    ok = #expect(nde.code == 2 && nde.mods == u32(input.Modifier.Mmb),
+                 "middle press: code ", nde.code, " mods ", nde.mods) && ok
+
+    // ── mouse motion ───────────────────────────────────────────────────────
+    sokol_app.sapp_event mm = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_MOVE,
+                                    u32(input.Modifier.Lmb))
+    mm.mouse_x = 7.9
+    mm.mouse_y = 0.0
+    (bool mmok, input.Event mme) = one(mm)
+    ok = #expect(mmok, "one motion event decoded") && ok
+    ok = #expect(mme.code == -1, "motion has no button, code = ", mme.code) && ok
+    ok = #expect(mme.x == 7.9 && mme.y == 0.0, "motion at ", mme.x, ",", mme.y) && ok
+    ok = #expect((mme.mods & input.MOUSE_MOTION) != 0, "motion carries MOUSE_MOTION") && ok
+    ok = #expect((mme.mods & u32(input.Modifier.Lmb)) != 0,
+                 "a drag keeps the held-button bit, mods = ", mme.mods) && ok
+
+    // ── a whole event, written as one value ────────────────────────────────
+    //
+    // Every member of the header's struct, `[8]sapp_touchpoint touches` among
+    // them, built as a single value rather than declared and assigned. The
+    // touches are a run Dado holds and the header's member is C's array, so the
+    // value crosses element by element into the struct `sokol_app.h` declares,
+    // and the same translation unit's layout assertions hold the restatement to
+    // that declaration. The decode reads it through the pointer sokol's own
+    // callback hands over, and the touches are read back whole afterwards.
+    [8]sokol_app.sapp_touchpoint touches
+    touches[3] = (#c.uintptr_t(42), 1.5, 2.5,
+                  sokol_app.sapp_android_tooltype.SAPP_ANDROIDTOOLTYPE_UNKNOWN, true)
+    sokol_app.sapp_event built = (u64(9),
+                                  sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_MOVE,
+                                  sokol_app.sapp_keycode.SAPP_KEYCODE_A, u32(0), false,
+                                  u32(input.Modifier.Rmb),
+                                  sokol_app.sapp_mousebutton.SAPP_MOUSEBUTTON_LEFT,
+                                  3.5, 4.5, 0.0, 0.0, 0.0, 0.0, 4, touches,
+                                  640, 480, 1280, 960)
+    (bool bok, input.Event be) = one(built)
+    ok = #expect(bok, "one motion decoded from a constructed event") && ok
+    ok = #expect(be.x == 3.5 && be.y == 4.5, "constructed motion at ", be.x, ",", be.y) && ok
+    [8]sokol_app.sapp_touchpoint back = built.touches
+    ok = #expect(back[3].identifier == #c.uintptr_t(42) && back[3].pos_y == 2.5 && back[3].changed
+                 && back[2].identifier == #c.uintptr_t(0) && built.num_touches == 4
+                 && built.framebuffer_height == 960,
+                 "the constructed event's touches read back whole") && ok
+
+    // ── wheel: sokol's sign is the opposite of ours ────────────────────────
+    sokol_app.sapp_event wu = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL, 0)
+    wu.scroll_y = 1.0                      // sokol: +1 is a wheel-*up*
+    (bool wuok, input.Event wue) = one(wu)
+    ok = #expect(wuok, "one wheel-up event decoded") && ok
+    ok = #expect(input.wheel_delta(wue) == -1, "wheel up is one notch up, got ", input.wheel_delta(wue)) && ok
+    ok = #expect(input.wheel_amount(wue) == -1.0, "wheel up is -1.0 line, got ", input.wheel_amount(wue)) && ok
+    ok = #expect((wue.mods & input.MOUSE_WHEEL) != 0, "wheel carries MOUSE_WHEEL") && ok
+    ok = #expect(input.mouse_kind(wue) == input.MouseKind.Wheel, "a decoded wheel is MouseKind.Wheel") && ok
+
+    sokol_app.sapp_event wd = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL, 0)
+    wd.scroll_y = -1.0
+    (bool wdok, input.Event wde) = one(wd)
+    ok = #expect(wdok, "one wheel-down event decoded") && ok
+    ok = #expect(input.wheel_delta(wde) == 1, "wheel down is one notch down, got ", input.wheel_delta(wde)) && ok
+    ok = #expect(input.wheel_amount(wde) == 1.0, "wheel down is +1.0 line, got ", input.wheel_amount(wde)) && ok
+
+    // ── a trackpad's fraction survives the decode ──────────────────────────
+    // It used to be cut to its sign: 0.1 of a line up arrived as a whole
+    // notch, and `wheel_amount` could not have answered anything else.
+    sokol_app.sapp_event wf = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL, 0)
+    wf.scroll_y = 0.25
+    wf.mouse_x = 12.5
+    wf.mouse_y = 30.0
+    (bool wfok, input.Event wfe) = one(wf)
+    ok = #expect(wfok, "one fractional wheel event decoded") && ok
+    ok = #expect(input.wheel_amount(wfe) == -0.25, "a 0.25 wheel-up is -0.25 lines, got ",
+                 input.wheel_amount(wfe)) && ok
+    ok = #expect(input.wheel_delta(wfe) == -1, "and still one whole notch up, rounded away from zero, got ",
+                 input.wheel_delta(wfe)) && ok
+    ok = #expect(wfe.x == 12.5 && wfe.y == 30.0, "the pointer position rides along, got ",
+                 wfe.x, ",", wfe.y) && ok
+    // X11 reports the held buttons on a scroll; the decode's wheel carries
+    // keyboard modifiers only, so a wheel mid-drag says nothing about buttons.
+    sokol_app.sapp_event wm = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL,
+                                    u32(input.Modifier.Shift) | u32(input.Modifier.Lmb) | u32(input.Modifier.Rmb))
+    wm.scroll_y = -1.0
+    (bool wmok, input.Event wme) = one(wm)
+    ok = #expect(wmok && (wme.mods & u32(input.Modifier.Shift)) != 0, "a scroll keeps its keyboard modifiers") && ok
+    ok = #expect((wme.mods & (u32(input.Modifier.Lmb) | u32(input.Modifier.Rmb) | u32(input.Modifier.Mmb))) == 0,
+                 "and loses the held-button bits, got mods ", wme.mods) && ok
+    ok = #expect(!input.button_held(wme, 0), "a wheel mid-drag does not report the button held") && ok
+    sokol_app.sapp_event wb = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL, 0)
+    wb.scroll_y = -2.5
+    (bool wbok, input.Event wbe) = one(wb)
+    ok = #expect(wbok && input.wheel_amount(wbe) == 2.5 && input.wheel_delta(wbe) == 3,
+                 "an accelerated 2.5-line scroll down is 2.5 lines and 3 notches, got ",
+                 input.wheel_amount(wbe), " and ", input.wheel_delta(wbe)) && ok
+
+    // a horizontal-only scroll has nowhere to go and is dropped, not pushed as
+    // a zero-direction wheel event
+    sokol_app.sapp_event wh = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL, 0)
+    wh.scroll_x = 1.0
+    decode_event(&wh)
+    ok = #expect(input.pending() == 0, "a horizontal-only scroll pushes nothing, pending = ",
+                 input.pending()) && ok
+
+    // ── resize, in pixels ──────────────────────────────────────────────────
+    sokol_app.sapp_event rs = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_RESIZED, 0)
+    rs.window_width = 320
+    rs.window_height = 240
+    rs.framebuffer_width = 640
+    rs.framebuffer_height = 480
+    (bool rsok, input.Event rse) = one(rs)
+    ok = #expect(rsok, "one resize event decoded") && ok
+    ok = #expect(rse.kind == input.EventKind.Resize, "RESIZED is Resize") && ok
+    ok = #expect(i32(rse.x) == 640 && i32(rse.y) == 480,
+                 "resize reports framebuffer pixels, got ", rse.x, "x", rse.y) && ok
+
+    // ── focus: two sokol event types, one kind, direction in `mods` ───────
+    //
+    // FOCUSED and UNFOCUSED are one thing in two directions, so the decode
+    // collapses them the way it already collapses KEY_DOWN/KEY_UP. Both
+    // directions are asserted because the polarity — the bit marks the *loss*
+    // — is the one thing a reader can get backwards.
+    sokol_app.sapp_event fi = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_FOCUSED, 0)
+    (bool fiok, input.Event fie) = one(fi)
+    ok = #expect(fiok, "one FOCUSED event decoded") && ok
+    ok = #expect(fie.kind == input.EventKind.Focus, "FOCUSED is Focus") && ok
+    ok = #expect(fie.mods == 0, "a gain carries no flag, mods = ", fie.mods) && ok
+    ok = #expect(input.is_focus_gained(fie), "FOCUSED is a gain") && ok
+    ok = #expect(!input.is_focus_lost(fie), "FOCUSED is not a loss") && ok
+
+    sokol_app.sapp_event fo = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_UNFOCUSED, 0)
+    (bool fook, input.Event foe) = one(fo)
+    ok = #expect(fook, "one UNFOCUSED event decoded") && ok
+    ok = #expect(foe.kind == input.EventKind.Focus, "UNFOCUSED is Focus too") && ok
+    ok = #expect(foe.mods == input.FOCUS_LOST,
+                 "a loss carries exactly FOCUS_LOST, mods = ", foe.mods) && ok
+    ok = #expect(input.is_focus_lost(foe), "UNFOCUSED is a loss") && ok
+    ok = #expect(!input.is_focus_gained(foe), "UNFOCUSED is not a gain") && ok
+
+    // A focus change is not a close request, so a backend holding the close
+    // open at the event callback is not tricked by one.
+    sokol_app.sapp_event f3 = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_FOCUSED, 0)
+    ok = #expect(!decode_event(&f3), "FOCUSED is not a close request") && ok
+    sokol_app.sapp_event f4 = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_UNFOCUSED, 0)
+    ok = #expect(!decode_event(&f4), "UNFOCUSED is not a close request") && ok
+    [4]input.Event fdrain
+    i32 fn = take(fdrain[:])
+    ok = #expect(fn == 2, "both still pushed while answering false, n = ", fn) && ok
+
+    // ── quit ───────────────────────────────────────────────────────────────
+    sokol_app.sapp_event qr = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_QUIT_REQUESTED, 0)
+    (bool qrok, input.Event qre) = one(qr)
+    ok = #expect(qrok, "one quit event decoded") && ok
+    ok = #expect(qre.kind == input.EventKind.Quit, "QUIT_REQUESTED is Quit") && ok
+
+    // E8: the decode *answers* whether it saw a close request, because the
+    // backend has to know inside the event callback — the queue is a frame
+    // late and sokol orders the close before the next frame runs.
+    sokol_app.sapp_event q2 = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_QUIT_REQUESTED, 0)
+    ok = #expect(decode_event(&q2), "decode_event answers true for a close request") && ok
+    sokol_app.sapp_event k2 = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_DOWN, 0)
+    k2.key_code = sokol_app.sapp_keycode.SAPP_KEYCODE_A
+    ok = #expect(!decode_event(&k2), "a keystroke is not a close request") && ok
+    sokol_app.sapp_event f2 = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_ICONIFIED, 0)
+    ok = #expect(!decode_event(&f2), "an unseated event kind is not a close request") && ok
+    [4]input.Event drain
+    _ = take(drain[:])
+
+    // ── files dropped, with no window and therefore nothing dropped ───────
+    //
+    // **This is the one arm of the decode that is reachable headlessly**, and
+    // it is reachable because `sapp_get_num_dropped_files` answers `0` rather
+    // than asserting when drag-and-drop was never enabled — which is exactly
+    // the state a unit test is in, and also the state of any window whose
+    // program never called `graphical.set_file_drop(true)`. So this pins the
+    // empty case: a FILES_DROPPED that landed no paths pushes nothing, the
+    // same stance a horizontal-only scroll gets above.
+    //
+    // The **filled** case cannot be pinned here at any price:
+    // `sapp_get_dropped_file_path` asserts on an index past what sokol landed,
+    // sokol lands paths only from a real XDND handshake, and this package will
+    // not fake sokol's internal state. It is measured instead by driving a
+    // real drop at a window under `Xvfb` — two of them, to prove the paths are
+    // copied and not borrowed — and `input_test.dado` pins the table itself
+    // through `push_drop`, which is the half of the decode that is not sokol's.
+    sokol_app.sapp_event fd = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_FILES_DROPPED, 0)
+    ok = #expect(!decode_event(&fd), "FILES_DROPPED is not a close request") && ok
+    ok = #expect(input.pending() == 0,
+                 "a drop that landed no paths pushes nothing, pending = ",
+                 input.pending()) && ok
+
+    // ── an event kind with no seat is dropped, not mistranslated ───────────
+    //
+    // FOCUSED used to be the example here and now has a seat, which is the
+    // point: the `else` arm is what keeps an unseated kind from becoming a
+    // mistranslated one. ICONIFIED is the current example and is genuinely
+    // unseated.
+    sokol_app.sapp_event ig = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_ICONIFIED, 0)
+    decode_event(&ig)
+    ok = #expect(input.pending() == 0, "ICONIFIED pushes nothing, pending = ", input.pending()) && ok
+
+    // ── the rawptr door, which is what app:graphical actually calls ────────
+    sokol_app.sapp_event rp = ev_of(sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_DOWN, 0)
+    rp.key_code = sokol_app.sapp_keycode.SAPP_KEYCODE_TAB
+    ok = #expect(!decode(rawptr(&rp)), "decode(rawptr) of a keystroke is not a close request") && ok
+    [2]input.Event rbuf
+    i32 rn = take(rbuf[:])
+    ok = #expect(rn == 1 && rbuf[0].code == i32(input.Keycode.Tab),
+                 "decode(rawptr) reached the same decode, n = ", rn) && ok
+
+    // nil is a no-op rather than a segfault: the payload comes from C
+    ok = #expect(!decode(nil), "decode(nil) is not a close request") && ok
+    ok = #expect(input.pending() == 0, "decode(nil) is a no-op") && ok
+
+    if ok:
+        return 0
+    return 1

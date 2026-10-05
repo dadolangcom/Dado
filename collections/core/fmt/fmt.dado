@@ -1,0 +1,1644 @@
+// core:fmt — where rendered bytes go, and what shape they arrive in.
+//
+//     import "core:fmt"
+//
+//     [64]char8 store
+//     fmt.Cursor c = fmt.over(store[:])
+//     Sink out = fmt.to_bytes(&c)
+//
+//     _ = fmt.put_string("n = ", out)
+//     _ = fmt.put_signed(42, out)
+//     string line = fmt.written(c)       // the bytes, as a string
+//
+// **The compiler owns what a value looks like; this package owns where it goes
+// and how it is shaped.** `#render(v, sink)` renders one value in the one form
+// its type has — no width, no precision, no base, no alignment, because a
+// renderer driven by a type cannot take an opinion from a call. Every one of
+// those opinions lives here, and each is an ordinary function a program can
+// read.
+//
+// ## The four that write a message
+//
+//     public void print(..#any args)
+//     public void println(..#any args)
+//     public void write(Sink out, ..#any args)
+//     public void writeln(Sink out, ..#any args)
+//
+// These are the compiler's retired `print` and `println`, and they are this
+// package's because the destination is a library's business and the *rendering*
+// is not: `#render(v, sink)` is the compiler's, per-type, and these four are a
+// `..#any` pack unrolled over it. They exist only inside a `when #OS != #NONE:`
+// — on a freestanding target the names do not exist and a call is refused
+// rather than silently doing nothing. `print` and `println` reach the terminal
+// through `core:io`'s `stdout_sink()`; `write` and `writeln` take the sink the
+// caller names. None of them fails, so no call site writes `try`.
+//
+// They are the one place the sink is written **first**, and the rule below says
+// why that is the grammar's doing rather than a choice.
+//
+// ## The sink is last, and it is not optional
+//
+// Every function below takes its `Sink` as the final parameter, because that is
+// where the language already puts the argument that says *where this goes*:
+// `#format(v…, alloc)` writes the allocator last and `#render(v…, sink)` writes
+// the sink last, and both for the same reason — a value has a rendering and a
+// destination does not, so the position is unambiguous by type and a reader
+// never counts arguments to find it.
+//
+// A function that renders and hides its destination is the shape this package
+// exists to not have.
+//
+// ## Everything answers `i64`, and it is the count the sink took
+//
+// Not `void` and not `bool`. A sink that took *some* of the bytes is a real
+// state — `to_bytes` over a full buffer is exactly that — so the answer is a
+// count, and a caller that cares compares it against what it asked for. It is
+// `#render`'s own answer and the two compose: a putter's result is the number a
+// `#render` into the same sink would have added.
+//
+// A nil `proc` takes nothing and answers 0, so an unset `Sink` is inert rather
+// than a fault.
+//
+// ## This package includes nothing, and imports one thing
+//
+// No `foreign` block — so this file emits no `#include` of its own, and a
+// program on a target whose OS is `#NONE` may use every line of it that exists
+// there. That is not an accident of what happened to be needed: it is the
+// reason the stream sinks are **not here**. `stdout` is `<stdio.h>`, a
+// `foreign` block's `#include` reaches every importer of the package holding
+// it, and a `fmt` that dragged `<stdio.h>` behind it would be a formatting
+// library no freestanding program could call. `core:io` owns `^FILE` already
+// and is where a sink over one belongs.
+//
+// The one `import` is `core:io`, and it is what the four printing functions at
+// the foot of this file reach standard output through. It costs an importer
+// nothing it does not ask for, because the emitter follows **liveness** and not
+// imports: those four are templates over a pack, so a program that calls none
+// of them instantiates none of them and emits no `<stdio.h>`. The argument for
+// the rule above is therefore unchanged — what it forbids is a header this
+// package *cannot* avoid emitting, and an import is not one.
+//
+// The same rule keeps `core:math` out: `<math.h>` and `-lm` would ride along
+// with it — unconditionally, because the float path below is concrete and calls
+// it — so that path does its own arithmetic.
+//
+// ## What an importer pays, measured
+//
+// **Everything concrete in a package is emitted whether it is called or not**,
+// and the emitter's one exemption is an uncalled *template*. That is the
+// budget this package is written against, and the sharpened form of the rule is
+// worth stating because it is the half that is not obvious:
+//
+// > A template is free only when nothing **concrete in its own package** calls
+// > it. A concrete function is always emitted, so every template it reaches is
+// > instantiated along with it, into every importer.
+//
+// Measured on this package, with a program calling three of its functions:
+// 954 lines of emitted C and 35 definitions before that rule was applied, and
+// **805 lines and 29 definitions after** — the difference being `put_quoted`
+// reaching the public `put_hex` template and the float path reaching the public
+// `put_unsigned` and `put_signed_pad` ones. Every internal call now goes to a
+// private primitive (`render_base`, `digit`, `write`), so the public templates
+// are instantiated by callers and by nothing else.
+//
+// The float path is 129 of the remaining 568 lines of function bodies — 22% —
+// and it is **not** split into a package of its own. The split was priced: it
+// would have to make `render_base` and `digit` public to serve it, growing the
+// public surface in order to shrink the emitted C, and the `strings/parse`
+// precedent it would be citing is about a **capability** difference (a header
+// decides which targets may import the package) rather than a size one. The
+// numbers are here rather than the split, so a program that finds 129 lines
+// intolerable has them to argue with.
+//
+// ## What is deliberately absent
+//
+// **There is no format string.** A literal is never a format string anywhere in
+// this language — the format is written by the compiler from each argument's
+// type — and a library that introduced one would be re-opening that decision
+// with a second, weaker parser. What replaces it is a `Pad` value and a putter
+// per shape: the opinion is a *value* you can name, hoist and reuse, and it is
+// checked by the type system rather than by a runtime scan of a string.
+package fmt
+
+import "core:io"
+
+// ── the bytes, and reading raw ones ──────────────────────────────────────────
+//
+// A sink's procedure is handed a `rawptr` and a count, which is C's shape and
+// not Dado's. `Raw` is the one name that turns it back into something with a
+// length: a `^char8` is what a `rawptr` converts to for free, and a window taken
+// over it is a `[]char8` of the length the caller stated. Same idiom, same
+// reason, as `core:mem`'s `Bytes`.
+private type Raw: ^char8
+
+// The widest thing `put_base` can produce: 64 binary digits of a `u64`, plus a
+// sign, plus a two-character radix prefix, plus slack. Every scratch buffer in
+// this file is this size so there is one number to reason about.
+private const i32 SCRATCH = 80
+
+private type Scratch: [SCRATCH]char8
+
+// ── writing ─────────────────────────────────────────────────────────────────
+
+// Hand `bytes` to `out`, and answer how many it took.
+//
+// **This is the only place in the package that calls a sink**, which is what
+// makes the nil guard and the zero-length guard true of every function below
+// rather than of the ones that remembered. The `rawptr(&bytes[0])` is the
+// conversion at the boundary and it is guarded, because a zero-length slice has
+// no element 0 whose address could be taken.
+//
+// **Named `put_bytes` and not `write`**, which is the name it had until the
+// printing verbs arrived. `write(Sink, ..#any)` needs the shorter word: the
+// four printing functions are a family, `write` and `writeln` are two of them,
+// and a package cannot spell one name twice. The rename also puts this
+// function where a reader looks for it — beside `put_string` and `put_char`,
+// which is what it is, one putter among the putters.
+i64 put_bytes([]char8 bytes, Sink out):
+    i64 count = #len(bytes)
+    if count <= 0:
+        return 0
+
+    if out.proc == nil:
+        return 0
+
+    return out.proc(out.data, rawptr(&bytes[0]), count)
+
+// The bytes of a `string`, written whole — embedded `\0` included, because a
+// `string` is its length and has no opinion about its contents.
+//
+// `rawptr(s)` reads the pointer slot, which is one of the conversions the
+// language admits, so this costs no window and no walk: a `string` is already
+// the pointer and the count this needs.
+i64 put_string(string8 s, Sink out):
+    i64 count = #len(s)
+    if count <= 0:
+        return 0
+
+    if out.proc == nil:
+        return 0
+
+    return out.proc(out.data, rawptr(s), count)
+
+// The bytes at `c`, up to its `\0`. One walk to find the length C threw away —
+// `string(c)` is the borrowing conversion and `nil` borrows as the empty string,
+// so a `cstring` nobody checked writes nothing rather than faulting.
+i64 put_cstring(cstring c, Sink out):
+    return put_string(string8(c), out)
+
+// One byte.
+i64 put_char(char8 b, Sink out):
+    Scratch one
+    one[0] = b
+    return put_bytes(one[0..<1], out)
+
+// `b`, `n` times. `n <= 0` writes nothing. This is what every alignment in the
+// package is built on, and it is public because a caller drawing a rule or an
+// indent wants it directly.
+i64 put_repeat(char8 b, i32 n, Sink out):
+    if n <= 0:
+        return 0
+
+    Scratch fill
+    i32 chunk = n
+    if chunk > SCRATCH:
+        chunk = SCRATCH
+
+    i32 zero = 0
+    for i in zero..<chunk:
+        fill[i] = b
+
+    i64 wrote = 0
+    i32 left = n
+    for left > 0:
+        i32 take = left
+        if take > SCRATCH:
+            take = SCRATCH
+
+        wrote = wrote + put_bytes(fill[0..<i64(take)], out)
+        left = left - take
+
+    return wrote
+
+// ── alignment ───────────────────────────────────────────────────────────────
+
+// Which side the padding goes on. A plain `i32`-backed enum, so it orders and
+// compares with nothing written.
+enum i32 Align:
+    Left,
+    Right,
+    Center,
+
+// How a field is padded: how wide it is at least, which side the slack goes on,
+// and what the slack is made of. A `width` of 0 or less pads nothing, which is
+// what makes `PLAIN` below the do-nothing value rather than a special case
+// every putter has to test for.
+//
+// It is a value rather than a set of parameters on purpose: a program that
+// formats a table names its column once and passes the name, where a parameter
+// list would have it repeat three arguments at every call and get one of them
+// wrong eventually.
+type Pad:
+    i32   width,
+    Align align,
+    char8 fill,
+
+// No padding. The value an argument takes when a caller does not care.
+const Pad PLAIN = (0, Align.Left, ' ')
+
+// Right-aligned in `width` columns, space-filled — a number in a column.
+Pad right(i32 width):
+    return (width, Align.Right, ' ')
+
+// Left-aligned in `width` columns, space-filled — a name in a column.
+Pad left(i32 width):
+    return (width, Align.Left, ' ')
+
+// Right-aligned in `width` columns, zero-filled — a fixed-width number.
+//
+// **The zero goes where the space would**, which for a negative number puts it
+// between the sign and the digits only because the sign is part of what is being
+// padded. `put_signed_pad(-7, zeros(4), out)` is `0-07` and not `-007`. That is the
+// honest consequence of padding being a property of the *field* rather than of
+// the number, and a caller who wants the other one writes the sign itself.
+Pad zeros(i32 width):
+    return (width, Align.Right, '0')
+
+// The slack before the body, and the slack after it. `n` is how many bytes the
+// body will write, which every caller below already knows without rendering it
+// twice — that is the whole reason these are separate functions rather than one
+// wrapper taking a putter.
+private (i32 before, i32 after) slack(i32 n, Pad p):
+    if p.width <= n:
+        return (0, 0)
+
+    i32 total = p.width - n
+    switch p.align:
+        case Align.Left:
+            return (0, total)
+        case Align.Right:
+            return (total, 0)
+        case Align.Center:
+            i32 head = total / 2
+            return (head, total - head)
+        else:
+            return (0, total)
+
+// ── integers ────────────────────────────────────────────────────────────────
+
+// One digit of `base`, as the character it is written with.
+private char8 digit(u32 d, bool upper):
+    if d < 10:
+        return char8(i32('0') + i32(d))
+
+    if upper:
+        return char8(i32('A') + i32(d) - 10)
+
+    return char8(i32('a') + i32(d) - 10)
+
+// `value` in `base`, into `tmp`, answering how many characters it wrote.
+//
+// The digits come out least-significant first and are reversed in place, which
+// is one pass and one buffer rather than a division count and a second walk.
+// A base outside 2..=36 has no digits to write with and produces nothing, which
+// the two public callers turn into a written 0.
+private i32 render_base(^Scratch tmp, u64 value, u32 base, bool upper):
+    if base < 2 || base > 36:
+        return 0
+
+    i32 n = 0
+    u64 v = value
+    if v == 0:
+        tmp^[0] = '0'
+        return 1
+
+    for v > 0:
+        u64 d = v % u64(base)
+        tmp^[n] = digit(u32(d), upper)
+        n = n + 1
+        v = v / u64(base)
+
+    i32 lo = 0
+    i32 hi = n - 1
+    for lo < hi:
+        char8 swap = tmp^[lo]
+        tmp^[lo] = tmp^[hi]
+        tmp^[hi] = swap
+        lo = lo + 1
+        hi = hi - 1
+
+    return n
+
+// An unsigned value in `base`, with the digits above 9 written in the case
+// asked for. `base` outside 2..=36 writes a single `0` rather than nothing, so
+// the function is total and a caller never has to test a base it computed.
+i64 put_base(u64 value, u32 base, bool upper, Sink out):
+    Scratch tmp
+    i32 n = render_base(&tmp, value, base, upper)
+    if n == 0:
+        return put_char('0', out)
+
+    return put_bytes(tmp[0..<i64(n)], out)
+
+// ── the decimal putters, and why they are templates ─────────────────────────
+//
+// **These bind `$T` rather than taking an `i64`, for two reasons and the second
+// is the one that decided it.**
+//
+// The first is the call site: a program holding an `i32` would otherwise write
+// `put_i64(i64(n), out)` at every call, and a library that makes its caller
+// write a widening conversion to print a number is a library with a `printf`
+// problem in a different shape.
+//
+// The second is what an importer pays. The emitter writes **every** function of
+// every live package, and its one exemption is an uncalled *template* — so a
+// concrete `put_i64` is in the emitted C of a program that never prints an
+// integer, and this is not. Measured on this package before the change: a
+// program calling three of these functions emitted all thirty-five of them and
+// 954 lines of C against a 12-line baseline. Every function here that can
+// honestly bind a `$` now does, and what a program does not call it does not
+// carry.
+//
+// **The signed and unsigned halves cannot be one template**, and the reason is
+// worth knowing because it will come up again. The `int` category admits all
+// eight widths, and the signed body has to ask `v < 0` — which is always false
+// for an unsigned `T` and is a diagnostic under the `-Wextra -Werror` the
+// emitted C is built with. So one template over `int` would compile for four
+// widths and fail the build for the other four. The domain is stated instead,
+// in the one place a domain belongs: a `where` clause, asked at the call, which
+// answers a `put_signed(u32)` with ERR0919 naming the call rather than with a C
+// warning naming a line the caller never wrote.
+//
+// **The `where` says `T is int` first, and not only the list, and that
+// difference is the API.** A whole-type binding is inferred only from an
+// argument that has a type, so `put_signed(42, out)` under a bare `$T` is
+// ERR0504 — an untyped literal supplies no answer of its own. A `where` that
+// pins a category places the literal in the category's default, so the
+// literal binds `i32` and the call reads the way it should; a list alone
+// would place it in its first member, `i8`. The one place the wart survives is a negated literal: `0 - 42` is two
+// untyped literals and still says nothing, so write `i32(0 - 42)` or bind it
+// first.
+
+// A signed integer of any width, in decimal.
+//
+// **The negation is done in `u64`.** The most negative value of a width has no
+// positive counterpart, so negating in the signed width is the one input where
+// the obvious code wraps to itself and prints the wrong number. Widening to
+// `u64` first — which sign-extends, so `-5` becomes `0xFFFF…FB` — and
+// subtracting that from zero is exact for every input including that one.
+i64 put_signed($T value, Sink out) where T is int && T in (i8, i16, i32, i64):
+    if value >= 0:
+        return put_base(u64(value), 10, false, out)
+
+    u64 magnitude = 0 - u64(value)
+    i64 wrote = put_char('-', out)
+    return wrote + put_base(magnitude, 10, false, out)
+
+// An unsigned integer of any width, in decimal.
+i64 put_unsigned($T value, Sink out) where T is int && T in (u8, u16, u32, u64):
+    return put_base(u64(value), 10, false, out)
+
+// Hexadecimal, with an optional `0x` and an optional minimum digit count that
+// is met with leading zeroes. `digits` is a floor and never a ceiling — a value
+// too wide for it is written whole, because a number silently truncated to fit
+// a field is the one failure mode a formatter must not have.
+i64 put_hex($T value, i32 digits, bool upper, bool prefix, Sink out) where T is int && T in (u8, u16, u32, u64):
+    Scratch tmp
+    i32 n = render_base(&tmp, u64(value), 16, upper)
+    i64 wrote = 0
+    if prefix:
+        wrote = wrote + put_char('0', out)
+        if upper:
+            wrote = wrote + put_char('X', out)
+        else:
+            wrote = wrote + put_char('x', out)
+
+    if digits > n:
+        wrote = wrote + put_repeat('0', digits - n, out)
+
+    return wrote + put_bytes(tmp[0..<i64(n)], out)
+
+// Binary, with an optional `0b` and the same floor rule as `put_hex`.
+i64 put_binary($T value, i32 digits, bool prefix, Sink out) where T is int && T in (u8, u16, u32, u64):
+    Scratch tmp
+    i32 n = render_base(&tmp, u64(value), 2, false)
+    i64 wrote = 0
+    if prefix:
+        wrote = wrote + put_char('0', out)
+        wrote = wrote + put_char('b', out)
+
+    if digits > n:
+        wrote = wrote + put_repeat('0', digits - n, out)
+
+    return wrote + put_bytes(tmp[0..<i64(n)], out)
+
+// ── the padded forms ────────────────────────────────────────────────────────
+//
+// Each of these knows its body's width before writing a byte of it, so nothing
+// here renders twice. That is why they are separate functions rather than a
+// wrapper taking a putter: a wrapper would have to measure, and measuring means
+// rendering into a counting sink and throwing it away.
+
+// A `string` in a field.
+i64 put_string_pad(string8 s, Pad p, Sink out):
+    (i32 before, i32 after) = slack(i32(#len(s)), p)
+    i64 wrote = put_repeat(p.fill, before, out)
+    wrote = wrote + put_string(s, out)
+    return wrote + put_repeat(p.fill, after, out)
+
+// A signed decimal in a field.
+i64 put_signed_pad($T value, Pad p, Sink out) where T is int && T in (i8, i16, i32, i64):
+    Scratch tmp
+    bool negative = value < 0
+    u64 magnitude = u64(value)
+    if negative:
+        magnitude = 0 - u64(value)
+
+    i32 n = render_base(&tmp, magnitude, 10, false)
+    i32 body = n
+    if negative:
+        body = body + 1
+
+    (i32 before, i32 after) = slack(body, p)
+    i64 wrote = put_repeat(p.fill, before, out)
+    if negative:
+        wrote = wrote + put_char('-', out)
+
+    wrote = wrote + put_bytes(tmp[0..<i64(n)], out)
+    return wrote + put_repeat(p.fill, after, out)
+
+// An unsigned decimal in a field.
+i64 put_unsigned_pad($T value, Pad p, Sink out) where T is int && T in (u8, u16, u32, u64):
+    Scratch tmp
+    i32 n = render_base(&tmp, u64(value), 10, false)
+    (i32 before, i32 after) = slack(n, p)
+    i64 wrote = put_repeat(p.fill, before, out)
+    wrote = wrote + put_bytes(tmp[0..<i64(n)], out)
+    return wrote + put_repeat(p.fill, after, out)
+
+// ── booleans ────────────────────────────────────────────────────────────────
+
+// `true` or `false`, which is what the compiler's own renderer writes.
+i64 put_bool(bool v, Sink out):
+    if v:
+        return put_string("true", out)
+
+    return put_string("false", out)
+
+// `v` as one of two words the caller chose — `yes`/`no`, `on`/`off`, `1`/`0`.
+// The one opinion about a `bool` a program is likely to have, and the reason it
+// is a parameter rather than three more functions.
+i64 put_bool_as(bool v, string8 when_true, string8 when_false, Sink out):
+    if v:
+        return put_string(when_true, out)
+
+    return put_string(when_false, out)
+
+// ── text with the awkward bytes escaped ─────────────────────────────────────
+
+// `s` between double quotes, with the eight escapes the language's own literals
+// use and `\xHH` for every other byte below `0x20` or at `0x7F`.
+//
+// Bytes at or above `0x80` are written through untouched: they are part of a
+// UTF-8 sequence this package cannot see the rest of, and escaping half of one
+// produces text that says something different from what it was given.
+i64 put_quoted(string8 s, Sink out):
+    i64 wrote = put_char('"', out)
+    i64 count = #len(s)
+    i64 zero = 0
+    for i in zero..<count:
+        char8 b = s[i]
+        if b == '"':
+            wrote = wrote + put_string("\\\"", out)
+        else if b == '\\':
+            wrote = wrote + put_string("\\\\", out)
+        else if b == '\n':
+            wrote = wrote + put_string("\\n", out)
+        else if b == '\r':
+            wrote = wrote + put_string("\\r", out)
+        else if b == '\t':
+            wrote = wrote + put_string("\\t", out)
+        else if b == '\0':
+            wrote = wrote + put_string("\\0", out)
+        else if b < ' ' || b == char8(0x7F):
+            wrote = wrote + put_string("\\x", out)
+            wrote = wrote + put_char(digit(u32(b) / 16, false), out)
+            wrote = wrote + put_char(digit(u32(b) % 16, false), out)
+        else:
+            wrote = wrote + put_char(b, out)
+
+    return wrote + put_char('"', out)
+
+// ── floats ──────────────────────────────────────────────────────────────────
+//
+// **Written in Dado rather than borrowed from C**, and the reason is the same one
+// that keeps `<stdio.h>` out of this package: `%g` is a stream conversion and
+// `snprintf` is not in C99 §4p6's freestanding set, so a float path built on it
+// would decide the target for every importer.
+//
+// **`put_float` is not a shortest-round-trip conversion.** It writes the places
+// the caller asked for, and a value that needs seventeen significant digits to
+// name itself uniquely will not get them from a `decimals` of 6. Nor is it
+// exact at many places: the fraction is scaled by one `f64` multiplication, so
+// past about fifteen places the last digits are that product's and not the
+// value's. The text that names a value exactly and reads back as it is
+// `put_float_shortest`'s, below, which is a different deliverable with its own
+// correctness argument (Ryū) and so has its own name rather than sitting
+// silently underneath this one.
+
+private const f64 SCALE_LIMIT = 1000000000000000000.0
+
+// Whether `x` is a NaN, asked without `<math.h>`: a NaN is the one value that is
+// not equal to itself, which is the definition rather than a trick.
+bool is_nan($T x) where T is float:
+    return x != x
+
+// Whether `x` is an infinity, asked without `<math.h>`.
+//
+// **An infinity is the only non-zero value equal to twice itself.** Doubling a
+// finite number either changes it or overflows to an infinity, which is then not
+// equal to what it came from; doubling an infinity is that infinity. Zero is
+// equal to twice itself too and is excluded first, and a NaN is equal to nothing
+// including itself so it is excluded first as well.
+//
+// The obvious test — comparing against the largest finite `f64` — is what this
+// replaced, and it was wrong in a way worth recording: the largest finite value
+// has no literal in this language that does not itself round to it, and the
+// spelling that was here (`1.0e308 * 10.0`) folds to an infinity, so the
+// comparison read `inf > inf` and answered `false` for every infinity there is.
+bool is_infinite($T x) where T is float:
+    if is_nan(x):
+        return false
+
+    if x == 0.0:
+        return false
+
+    return x == x * 2.0
+
+// `value` with exactly `decimals` places after the point, rounded half away from
+// zero. `decimals` below 0 is read as 0, and above 17 as 17 — past that an `f64`
+// has no more information to hand over and the digits would be an invention.
+//
+// `nan`, `inf` and `-inf` are written as those words. A magnitude at or above
+// 10^18 is written in `d.ddde+NN` form, because the integer part no longer fits
+// a `u64` and a fixed-point rendering of it would be wrong rather than long.
+// **The template is one line over a concrete body**, and that shape is
+// deliberate. Everything concrete in a package is emitted whether it is called
+// or not, and a template a concrete function calls is instantiated along with
+// it — so a template that *is* the implementation drags its whole
+// instantiation into every importer the moment anything else in the package
+// reaches it. Keeping the body concrete and the binder thin means `put_float`
+// costs an importer one instantiation of one line, and the arithmetic below is
+// emitted once regardless of how many widths call it.
+i64 put_float($T value, i32 decimals, Sink out) where T is float:
+    return put_f64(f64(value), decimals, out)
+
+private i64 put_f64(f64 value, i32 decimals, Sink out):
+    if value != value:
+        return put_string("nan", out)
+
+    if value != 0.0 && value == value * 2.0:
+        if value < 0.0:
+            return put_string("-inf", out)
+
+        return put_string("inf", out)
+
+    i32 places = decimals
+    if places < 0:
+        places = 0
+
+    if places > 17:
+        places = 17
+
+    i64 wrote = 0
+    f64 v = value
+    if v < 0.0:
+        wrote = wrote + put_char('-', out)
+        v = 0.0 - v
+
+    if v >= SCALE_LIMIT:
+        return wrote + put_scientific(v, places, out)
+
+    // The whole part and the fraction are taken apart **before** anything is
+    // scaled. Scaling the value itself by `10^places` and splitting afterwards is
+    // the obvious shape and it is wrong: `1e15` at 6 places is `1e21`, past a
+    // `u64`, and an out-of-range float-to-integer conversion saturates — so the
+    // integer came back as `2^64 - 1`, the rounding step wrapped it to 0, and the
+    // answer read `0.000000`. Below `SCALE_LIMIT` the whole part always fits, and
+    // the fraction is below 1, so `fraction * 10^places` is below `10^17` and
+    // fits too, whatever the magnitude and whatever `places` is.
+    //
+    // `v - f64(integral)` is exact: a finite `f64` minus its own truncation is
+    // representable, so the only rounding below is the one multiplication. The
+    // fraction is then carried as an integer of `places` digits so the rounding
+    // is one comparison on a whole number rather than a chain of float
+    // operations whose error compounds with `places`.
+    u64 factor = 1
+    i32 zero = 0
+    for _i in zero..<places:
+        factor = factor * 10
+
+    u64 integral = u64(v)
+    f64 scaled = (v - f64(integral)) * f64(factor)
+    u64 fraction = u64(scaled)
+    f64 remainder = scaled - f64(fraction)
+    if remainder >= 0.5:
+        fraction = fraction + 1
+
+    // Rounding the fraction up can carry into the whole part: `9.9999996` at 6
+    // places is `10.000000`, not `9.1000000`.
+    if fraction >= factor:
+        fraction = fraction - factor
+        integral = integral + 1
+
+    Scratch whole_digits
+    i32 wn = render_base(&whole_digits, integral, 10, false)
+    wrote = wrote + put_bytes(whole_digits[0..<i64(wn)], out)
+    if places == 0:
+        return wrote
+
+    wrote = wrote + put_char('.', out)
+    Scratch tmp
+    i32 n = render_base(&tmp, fraction, 10, false)
+    if places > n:
+        wrote = wrote + put_repeat('0', places - n, out)
+
+    return wrote + put_bytes(tmp[0..<i64(n)], out)
+
+// `d.ddde+NN`, for a magnitude a fixed-point rendering cannot hold. `v` is
+// positive and finite here — both callers have already dealt with the sign and
+// with the specials — so the loop terminates.
+private i64 put_scientific(f64 v, i32 places, Sink out):
+    i32 exponent = 0
+    f64 m = v
+    for m >= 10.0:
+        m = m / 10.0
+        exponent = exponent + 1
+
+    i64 wrote = put_f64(m, places, out)
+    wrote = wrote + put_char('e', out)
+    wrote = wrote + put_char('+', out)
+    Scratch tmp
+    i32 n = render_base(&tmp, u64(exponent), 10, false)
+    if n < 2:
+        wrote = wrote + put_char('0', out)
+
+    return wrote + put_bytes(tmp[0..<i64(n)], out)
+
+// ── the shortest float that reads back ──────────────────────────────────────
+//
+// `put_float` writes the places it is asked for; this writes **the fewest
+// significant digits that read back as the same value**, and of those the
+// ones closest to it. `put_float_shortest(0.1, out)` is `0.1`, not
+// `0.1000000000000000055511151231257827`, and `core:strings/parse`'s
+// `to_f64` of what it writes is the value it was given, bit for bit, for every
+// `f64` there is; the same holds for every `f32` through `to_f32`.
+//
+// **The digits are Ryū's.** `ryu_d2d` and `ryu_f2d` are ports of Ulf Adams'
+// Ryū (`d2s.c`, `f2s.c`, the small-table configuration of
+// `d2s_small_table.h` and its `umul128` fallback, for a language with no
+// 128-bit integer), keeping upstream's names beside Dado's spellings so the two
+// read side by side. Ryū is dual-licensed Apache-2.0 or Boost-1.0; this port
+// takes it under the Boost Software License, whose notice follows.
+//
+//     Copyright 2018 Ulf Adams
+//
+//     Boost Software License - Version 1.0 - August 17th, 2003
+//
+//     Permission is hereby granted, free of charge, to any person or
+//     organization obtaining a copy of the software and accompanying
+//     documentation covered by this license (the "Software") to use,
+//     reproduce, display, distribute, execute, and transmit the Software, and
+//     to prepare derivative works of the Software, and to permit third-parties
+//     to whom the Software is furnished to do so, all subject to the
+//     following:
+//
+//     The copyright notices in the Software and this entire statement,
+//     including the above license grant, this restriction and the following
+//     disclaimer, must be included in all copies of the Software, in whole or
+//     in part, and all derivative works of the Software, unless such copies or
+//     derivative works are solely in the form of machine-executable object
+//     code generated by a source language processor.
+//
+//     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+//     OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+//     MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE AND
+//     NON-INFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR ANYONE
+//     DISTRIBUTING THE SOFTWARE BE LIABLE FOR ANY DAMAGES OR OTHER LIABILITY,
+//     WHETHER IN CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+//     CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//     SOFTWARE.
+//
+// **The layout is Python's `repr`**, which is a fixed rule a reader can
+// predict, and one every float reader accepts: a decimal point position `dp`
+// (the value is `0.d1d2… × 10^dp`) from -3 to 16 is written positionally, with
+// a `.0` when there is no fraction, and anything else as `d.ddd` with an
+// exponent of at least two digits and its sign.
+//
+//     1.0   0.1   100.0   1234567890123456.0   0.0001   -0.0
+//     1e+16   1e-05   1e+23   5e-324   1.7976931348623157e+308
+//     inf   -inf   nan
+//
+// Every NaN is `nan`, whatever its sign bit, as `put_float` and `#render`
+// write it. An `f32` is written from its own shortest digits, so
+// `put_float_shortest(f32(0.1), out)` is `0.1` too, where widening it to
+// `f64` first would write `0.10000000149011612`.
+//
+// **The template picks the width and nothing else**, the same one-line shape
+// `put_float` has, so the arithmetic below is emitted once per width actually
+// used.
+i64 put_float_shortest($T value, Sink out) where T is float:
+    if T == f32:
+        return put_decimal(shortest32(f32(value)), out)
+
+    return put_decimal(shortest64(f64(value)), out)
+
+// A float as Ryū leaves it: `digits × 10^exp` with no trailing zero in
+// `digits`, or one of the three values that have no digits.
+private const i32 DEC_FINITE = 0
+private const i32 DEC_ZERO = 1
+private const i32 DEC_INF = 2
+private const i32 DEC_NAN = 3
+
+private type Decimal:
+    i32  kind,
+    bool neg,
+    u64  digits,
+    i32  exp,
+
+private cunion Float64Bits: (f64 f, u64 u)
+private cunion Float32Bits: (f32 f, u32 u)
+
+private Decimal shortest64(f64 value):
+    Float64Bits b = Float64Bits(value)
+    u64 bits = b.u
+    bool neg = bits >> 63 != 0
+    u64 mantissa = bits & 0xFFFFFFFFFFFFF
+    u32 exponent = u32((bits >> 52) & 0x7FF)
+    if exponent == 0x7FF:
+        if mantissa != 0:
+            return (DEC_NAN, false, 0, 0)
+
+        return (DEC_INF, neg, 0, 0)
+
+    if exponent == 0 && mantissa == 0:
+        return (DEC_ZERO, neg, 0, 0)
+
+    (u64 digits, i32 exp) = ryu_small_int(mantissa, exponent)
+    if digits == 0:
+        (digits, exp) = ryu_d2d(mantissa, exponent)
+
+    return (DEC_FINITE, neg, digits, exp)
+
+private Decimal shortest32(f32 value):
+    Float32Bits b = Float32Bits(value)
+    u32 bits = b.u
+    bool neg = bits >> 31 != 0
+    u32 mantissa = bits & 0x7FFFFF
+    u32 exponent = (bits >> 23) & 0xFF
+    if exponent == 0xFF:
+        if mantissa != 0:
+            return (DEC_NAN, false, 0, 0)
+
+        return (DEC_INF, neg, 0, 0)
+
+    if exponent == 0 && mantissa == 0:
+        return (DEC_ZERO, neg, 0, 0)
+
+    (u32 digits, i32 exp) = ryu_f2d(mantissa, exponent)
+    return (DEC_FINITE, neg, u64(digits), exp)
+
+// Python's `repr` layout, into one buffer and out in one call. The longest
+// text is 24 bytes (`-2.2250738585072014e-308`); `Scratch` is 80.
+private i64 put_decimal(Decimal d, Sink out):
+    if d.kind == DEC_NAN:
+        return put_string("nan", out)
+
+    if d.kind == DEC_INF:
+        if d.neg:
+            return put_string("-inf", out)
+
+        return put_string("inf", out)
+
+    if d.kind == DEC_ZERO:
+        if d.neg:
+            return put_string("-0.0", out)
+
+        return put_string("0.0", out)
+
+    // Ryū's digits carry no trailing zero except on its integer shortcut;
+    // folding any into the exponent makes the layout below the only rule.
+    u64 digits = d.digits
+    i32 exp = d.exp
+    for digits % 10 == 0:
+        digits = digits / 10
+        exp += 1
+
+    Scratch ds
+    i32 n = render_base(&ds, digits, 10, false)
+    i32 dp = exp + n
+
+    Scratch text
+    i32 at = 0
+    if d.neg:
+        text[at] = '-'
+        at += 1
+
+    i32 zero = 0
+    if dp > 0 - 4 && dp <= 16:
+        if dp <= 0:
+            text[at] = '0'
+            text[at + 1] = '.'
+            at += 2
+            for _i in zero..<(0 - dp):
+                text[at] = '0'
+                at += 1
+
+            for i in zero..<n:
+                text[at] = ds[i]
+                at += 1
+        else if dp >= n:
+            for i in zero..<n:
+                text[at] = ds[i]
+                at += 1
+
+            for _i in n..<dp:
+                text[at] = '0'
+                at += 1
+
+            text[at] = '.'
+            text[at + 1] = '0'
+            at += 2
+        else:
+            for i in zero..<dp:
+                text[at] = ds[i]
+                at += 1
+
+            text[at] = '.'
+            at += 1
+            for i in dp..<n:
+                text[at] = ds[i]
+                at += 1
+
+        return put_bytes(text[0..<i64(at)], out)
+
+    text[at] = ds[0]
+    at += 1
+    if n > 1:
+        text[at] = '.'
+        at += 1
+        for i in 1..<n:
+            text[at] = ds[i]
+            at += 1
+
+    text[at] = 'e'
+    at += 1
+    i32 e = dp - 1
+    if e < 0:
+        text[at] = '-'
+        e = 0 - e
+    else:
+        text[at] = '+'
+
+    at += 1
+    if e < 10:
+        text[at] = '0'
+        at += 1
+
+    Scratch es
+    i32 en = render_base(&es, u64(e), 10, false)
+    for i in zero..<en:
+        text[at] = es[i]
+        at += 1
+
+    return put_bytes(text[0..<i64(at)], out)
+
+// ── Ryū: the tables (`d2s_small_table.h`) ───────────────────────────────────
+
+private const i32 POW5_INV_BITCOUNT = 125
+private const i32 POW5_BITCOUNT = 125
+private const i32 FLOAT_POW5_INV_BITCOUNT = 61
+private const i32 FLOAT_POW5_BITCOUNT = 61
+private const u32 POW5_TABLE_SIZE = 26
+
+private [15][2]u64 POW5_INV_SPLIT2 = [
+    [1, 2305843009213693952],
+    [5955668970331000884, 1784059615882449851],
+    [8982663654677661702, 1380349269358112757],
+    [7286864317269821294, 2135987035920910082],
+    [7005857020398200553, 1652639921975621497],
+    [17965325103354776697, 1278668206209430417],
+    [8928596168509315048, 1978643211784836272],
+    [10075671573058298858, 1530901034580419511],
+    [597001226353042382, 1184477304306571148],
+    [1527430471115325346, 1832889850782397517],
+    [12533209867169019542, 1418129833677084982],
+    [5577825024675947042, 2194449627517475473],
+    [11006974540203867551, 1697873161311732311],
+    [10313493231639821582, 1313665730009899186],
+    [12701016819766672773, 2032799256770390445],
+]
+
+private [22]u32 POW5_INV_OFFSETS = [
+    0x54544554, 0x04055545, 0x10041000, 0x00400414, 0x40010000, 0x41155555,
+    0x00000454, 0x00010044, 0x40000000, 0x44000041, 0x50454450, 0x55550054,
+    0x51655554, 0x40004000, 0x01000001, 0x00010500, 0x51515411, 0x05555554,
+    0x50411500, 0x40040000, 0x05040110, 0x00000000,
+]
+
+private [13][2]u64 POW5_SPLIT2 = [
+    [0, 1152921504606846976],
+    [0, 1490116119384765625],
+    [1032610780636961552, 1925929944387235853],
+    [7910200175544436838, 1244603055572228341],
+    [16941905809032713930, 1608611746708759036],
+    [13024893955298202172, 2079081953128979843],
+    [6607496772837067824, 1343575221513417750],
+    [17332926989895652603, 1736530273035216783],
+    [13037379183483547984, 2244412773384604712],
+    [1605989338741628675, 1450417759929778918],
+    [9630225068416591280, 1874621017369538693],
+    [665883850346957067, 1211445438634777304],
+    [14931890668723713708, 1565756531257009982],
+]
+
+private [21]u32 POW5_OFFSETS = [
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x40000000, 0x59695995,
+    0x55545555, 0x56555515, 0x41150504, 0x40555410, 0x44555145, 0x44504540,
+    0x45555550, 0x40004000, 0x96440440, 0x55565565, 0x54454045, 0x40154151,
+    0x55559155, 0x51405555, 0x00000105,
+]
+
+private [26]u64 POW5_TABLE = [
+    1, 5, 25, 125, 625, 3125, 15625, 78125, 390625,
+    1953125, 9765625, 48828125, 244140625, 1220703125, 6103515625,
+    30517578125, 152587890625, 762939453125, 3814697265625,
+    19073486328125, 95367431640625, 476837158203125,
+    2384185791015625, 11920928955078125, 59604644775390625,
+    298023223876953125,
+]
+
+// ── Ryū: the arithmetic (`common.h`, `d2s_intrinsics.h`) ────────────────────
+
+// `umul128`: the full product of two `u64`s, from four 32×32 products.
+private (u64 hi, u64 lo) umul128(u64 a, u64 b):
+    u64 a_lo = a & 0xFFFFFFFF
+    u64 a_hi = a >> 32
+    u64 b_lo = b & 0xFFFFFFFF
+    u64 b_hi = b >> 32
+    u64 b00 = a_lo * b_lo
+    u64 b01 = a_lo * b_hi
+    u64 b10 = a_hi * b_lo
+    u64 b11 = a_hi * b_hi
+    u64 mid1 = b10 + (b00 >> 32)
+    u64 mid2 = b01 + (mid1 & 0xFFFFFFFF)
+    u64 hi = b11 + (mid1 >> 32) + (mid2 >> 32)
+    u64 lo = (mid2 << 32) | (b00 & 0xFFFFFFFF)
+    return (hi, lo)
+
+// `shiftright128`: bits `dist..<dist + 64` of `hi:lo`, `dist` in `1..<64`.
+private u64 shiftright128(u64 lo, u64 hi, i32 dist):
+    return (hi << (64 - dist)) | (lo >> dist)
+
+private i32 pow5bits(i32 e):
+    return i32(((u32(e) * 1217359) >> 19) + 1)
+
+private u32 log10_pow2(i32 e):
+    return (u32(e) * 78913) >> 18
+
+private u32 log10_pow5(i32 e):
+    return (u32(e) * 732923) >> 20
+
+private u32 pow5_factor(u64 value):
+    u64 v = value
+    u32 count = 0
+    for true:
+        v = v * 14757395258967641293
+        if v > 3689348814741910323:
+            break
+
+        count += 1
+
+    return count
+
+private bool multiple_of_pow5(u64 value, u32 p):
+    return pow5_factor(value) >= p
+
+private bool multiple_of_pow2(u64 value, u32 p):
+    return value & ((u64(1) << p) - 1) == 0
+
+// `double_computePow5`: `5^i` in the form Ryū's multiplications need.
+private (u64 lo, u64 hi) compute_pow5(u32 i):
+    u32 base = i / POW5_TABLE_SIZE
+    u32 base2 = base * POW5_TABLE_SIZE
+    u32 offset = i - base2
+    u64 mul0 = POW5_SPLIT2[base][0]
+    u64 mul1 = POW5_SPLIT2[base][1]
+    if offset == 0:
+        return (mul0, mul1)
+
+    u64 m = POW5_TABLE[offset]
+    (u64 high1, u64 low1) = umul128(m, mul1)
+    (u64 high0, u64 low0) = umul128(m, mul0)
+    u64 sum = high0 + low1
+    if sum < high0:
+        high1 += 1
+
+    i32 delta = pow5bits(i32(i)) - pow5bits(i32(base2))
+    u64 corr = u64((POW5_OFFSETS[i / 16] >> ((i % 16) << 1)) & 3)
+    return (shiftright128(low0, sum, delta) + corr, shiftright128(sum, high1, delta))
+
+// `double_computeInvPow5`: `5^-i` in the form Ryū's multiplications need.
+private (u64 lo, u64 hi) compute_inv_pow5(u32 i):
+    u32 base = (i + POW5_TABLE_SIZE - 1) / POW5_TABLE_SIZE
+    u32 base2 = base * POW5_TABLE_SIZE
+    u32 offset = base2 - i
+    u64 mul0 = POW5_INV_SPLIT2[base][0]
+    u64 mul1 = POW5_INV_SPLIT2[base][1]
+    if offset == 0:
+        return (mul0, mul1)
+
+    u64 m = POW5_TABLE[offset]
+    (u64 high1, u64 low1) = umul128(m, mul1)
+    (u64 high0, u64 low0) = umul128(m, mul0 - 1)
+    u64 sum = high0 + low1
+    if sum < high0:
+        high1 += 1
+
+    i32 delta = pow5bits(i32(base2)) - pow5bits(i32(i))
+    u64 corr = u64((POW5_INV_OFFSETS[i / 16] >> ((i % 16) << 1)) & 3)
+    return (shiftright128(low0, sum, delta) + 1 + corr, shiftright128(sum, high1, delta))
+
+// `mulShiftAll64`, the `umul128` variant: `(4m + 2, 4m, 4m - 1 - mm_shift)`
+// times the power, each shifted right by `j`, as `(vr, vp, vm)`.
+private (u64 vr, u64 vp, u64 vm) mul_shift_all64(u64 m_in, u64 mul0, u64 mul1, i32 j, u32 mm_shift):
+    u64 m = m_in << 1
+    (u64 tmp, u64 lo) = umul128(m, mul0)
+    (u64 hi, u64 mid_lo) = umul128(m, mul1)
+    u64 mid = tmp + mid_lo
+    if mid < tmp:
+        hi += 1
+
+    u64 lo2 = lo + mul0
+    u64 mid2 = mid + mul1
+    if lo2 < lo:
+        mid2 += 1
+
+    u64 hi2 = hi
+    if mid2 < mid:
+        hi2 += 1
+
+    u64 vp = shiftright128(mid2, hi2, j - 64 - 1)
+    u64 vm = 0
+    if mm_shift == 1:
+        u64 lo3 = lo - mul0
+        u64 mid3 = mid - mul1
+        if lo3 > lo:
+            mid3 -= 1
+
+        u64 hi3 = hi
+        if mid3 > mid:
+            hi3 -= 1
+
+        vm = shiftright128(mid3, hi3, j - 64 - 1)
+    else:
+        u64 lo3 = lo + lo
+        u64 mid3 = mid + mid
+        if lo3 < lo:
+            mid3 += 1
+
+        u64 hi3 = hi + hi
+        if mid3 < mid:
+            hi3 += 1
+
+        u64 lo4 = lo3 - mul0
+        u64 mid4 = mid3 - mul1
+        if lo4 > lo3:
+            mid4 -= 1
+
+        u64 hi4 = hi3
+        if mid4 > mid3:
+            hi4 -= 1
+
+        vm = shiftright128(mid4, hi4, j - 64)
+
+    return (shiftright128(mid, hi, j - 64 - 1), vp, vm)
+
+// ── Ryū: `f64` (`d2s.c`) ────────────────────────────────────────────────────
+
+// `d2d_small_int`: an integer in `[1, 2^53)` is its own shortest digits.
+// Answers 0 digits when the value is not one.
+private (u64 digits, i32 exp) ryu_small_int(u64 ieee_mantissa, u32 ieee_exponent):
+    u64 m2 = (u64(1) << 52) | ieee_mantissa
+    i32 e2 = i32(ieee_exponent) - 1023 - 52
+    if e2 > 0 || e2 < 0 - 52:
+        return (0, 0)
+
+    u64 mask = (u64(1) << (0 - e2)) - 1
+    if m2 & mask != 0:
+        return (0, 0)
+
+    return (m2 >> (0 - e2), 0)
+
+// `d2d`: the shortest `digits × 10^exp` inside the interval of decimals that
+// round to the value, closest to it, ties to even.
+private (u64 digits, i32 exp) ryu_d2d(u64 ieee_mantissa, u32 ieee_exponent):
+    i32 e2 = 0
+    u64 m2 = 0
+    if ieee_exponent == 0:
+        e2 = 1 - 1023 - 52 - 2
+        m2 = ieee_mantissa
+    else:
+        e2 = i32(ieee_exponent) - 1023 - 52 - 2
+        m2 = (u64(1) << 52) | ieee_mantissa
+
+    bool accept_bounds = m2 & 1 == 0
+
+    // Step 2: the interval of valid decimal representations.
+    u64 mv = 4 * m2
+    u32 mm_shift = 0
+    if ieee_mantissa != 0 || ieee_exponent <= 1:
+        mm_shift = 1
+
+    // Step 3: into a decimal power base, with 128-bit arithmetic.
+    u64 vr = 0
+    u64 vp = 0
+    u64 vm = 0
+    i32 e10 = 0
+    bool vm_is_trailing_zeros = false
+    bool vr_is_trailing_zeros = false
+    if e2 >= 0:
+        u32 q = log10_pow2(e2)
+        if e2 > 3:
+            q -= 1
+
+        e10 = i32(q)
+        i32 k = POW5_INV_BITCOUNT + pow5bits(i32(q)) - 1
+        i32 i = 0 - e2 + i32(q) + k
+        (u64 p_lo, u64 p_hi) = compute_inv_pow5(q)
+        (vr, vp, vm) = mul_shift_all64(m2, p_lo, p_hi, i, mm_shift)
+        if q <= 21:
+            // Only one of mp, mv and mm can be a multiple of 5, if any.
+            if mv % 5 == 0:
+                vr_is_trailing_zeros = multiple_of_pow5(mv, q)
+            else if accept_bounds:
+                vm_is_trailing_zeros = multiple_of_pow5(mv - 1 - u64(mm_shift), q)
+            else if multiple_of_pow5(mv + 2, q):
+                vp -= 1
+    else:
+        u32 q = log10_pow5(0 - e2)
+        if 0 - e2 > 1:
+            q -= 1
+
+        e10 = i32(q) + e2
+        i32 i = 0 - e2 - i32(q)
+        i32 k = pow5bits(i) - POW5_BITCOUNT
+        i32 j = i32(q) - k
+        (u64 p_lo, u64 p_hi) = compute_pow5(u32(i))
+        (vr, vp, vm) = mul_shift_all64(m2, p_lo, p_hi, j, mm_shift)
+        if q <= 1:
+            // mv = 4 * m2 always has at least two trailing 0 bits.
+            vr_is_trailing_zeros = true
+            if accept_bounds:
+                vm_is_trailing_zeros = mm_shift == 1
+            else:
+                vp -= 1
+        else if q < 63:
+            vr_is_trailing_zeros = multiple_of_pow2(mv, q)
+
+    // Step 4: the shortest decimal in the interval.
+    i32 removed = 0
+    u64 last_removed_digit = 0
+    u64 output = 0
+    if vm_is_trailing_zeros || vr_is_trailing_zeros:
+        // The general case, which happens rarely (~0.7%).
+        for vp / 10 > vm / 10:
+            vm_is_trailing_zeros = vm_is_trailing_zeros && vm % 10 == 0
+            vr_is_trailing_zeros = vr_is_trailing_zeros && last_removed_digit == 0
+            last_removed_digit = vr % 10
+            vr = vr / 10
+            vp = vp / 10
+            vm = vm / 10
+            removed += 1
+
+        if vm_is_trailing_zeros:
+            for vm % 10 == 0:
+                vr_is_trailing_zeros = vr_is_trailing_zeros && last_removed_digit == 0
+                last_removed_digit = vr % 10
+                vr = vr / 10
+                vp = vp / 10
+                vm = vm / 10
+                removed += 1
+
+        if vr_is_trailing_zeros && last_removed_digit == 5 && vr % 2 == 0:
+            // Round even if the exact number is .....50..0.
+            last_removed_digit = 4
+
+        output = vr
+        if (vr == vm && (!accept_bounds || !vm_is_trailing_zeros)) || last_removed_digit >= 5:
+            output += 1
+    else:
+        // The common case (~99.3%).
+        bool round_up = false
+        if vp / 100 > vm / 100:
+            round_up = vr % 100 >= 50
+            vr = vr / 100
+            vp = vp / 100
+            vm = vm / 100
+            removed += 2
+
+        for vp / 10 > vm / 10:
+            round_up = vr % 10 >= 5
+            vr = vr / 10
+            vp = vp / 10
+            vm = vm / 10
+            removed += 1
+
+        output = vr
+        if vr == vm || round_up:
+            output += 1
+
+    return (output, e10 + removed)
+
+// ── Ryū: `f32` (`f2s.c`, over the `f64` tables) ─────────────────────────────
+
+// `mulShift32`.
+private u32 mul_shift32(u32 m, u64 factor, i32 shift):
+    u64 factor_lo = factor & 0xFFFFFFFF
+    u64 factor_hi = factor >> 32
+    u64 bits0 = u64(m) * factor_lo
+    u64 bits1 = u64(m) * factor_hi
+    u64 sum = (bits0 >> 32) + bits1
+    return u32(sum >> (shift - 32))
+
+// `mulPow5InvDivPow2`: the table stores `[2^x / 5^y] + 1` in its low word, so
+// the high word alone wants the `+ 1` back.
+private u32 mul_pow5_inv_div_pow2(u32 m, u32 q, i32 j):
+    u64 _, hi = compute_inv_pow5(q)
+    return mul_shift32(m, hi + 1, j)
+
+private u32 mul_pow5_div_pow2(u32 m, u32 i, i32 j):
+    u64 _, hi = compute_pow5(i)
+    return mul_shift32(m, hi, j)
+
+private u32 pow5_factor32(u32 value):
+    u32 v = value
+    u32 count = 0
+    for v % 5 == 0:
+        v = v / 5
+        count += 1
+
+    return count
+
+// `f2d`: `d2d` at single precision.
+private (u32 digits, i32 exp) ryu_f2d(u32 ieee_mantissa, u32 ieee_exponent):
+    i32 e2 = 0
+    u32 m2 = 0
+    if ieee_exponent == 0:
+        e2 = 1 - 127 - 23 - 2
+        m2 = ieee_mantissa
+    else:
+        e2 = i32(ieee_exponent) - 127 - 23 - 2
+        m2 = (u32(1) << 23) | ieee_mantissa
+
+    bool accept_bounds = m2 & 1 == 0
+
+    // Step 2: the interval of valid decimal representations.
+    u32 mv = 4 * m2
+    u32 mp = 4 * m2 + 2
+    u32 mm_shift = 0
+    if ieee_mantissa != 0 || ieee_exponent <= 1:
+        mm_shift = 1
+
+    u32 mm = 4 * m2 - 1 - mm_shift
+
+    // Step 3: into a decimal power base, with 64-bit arithmetic.
+    u32 vr = 0
+    u32 vp = 0
+    u32 vm = 0
+    i32 e10 = 0
+    bool vm_is_trailing_zeros = false
+    bool vr_is_trailing_zeros = false
+    u32 last_removed_digit = 0
+    if e2 >= 0:
+        u32 q = log10_pow2(e2)
+        e10 = i32(q)
+        i32 k = FLOAT_POW5_INV_BITCOUNT + pow5bits(i32(q)) - 1
+        i32 i = 0 - e2 + i32(q) + k
+        vr = mul_pow5_inv_div_pow2(mv, q, i)
+        vp = mul_pow5_inv_div_pow2(mp, q, i)
+        vm = mul_pow5_inv_div_pow2(mm, q, i)
+        if q != 0 && (vp - 1) / 10 <= vm / 10:
+            // One removed digit is needed even when the loop below will not
+            // run.
+            i32 l = FLOAT_POW5_INV_BITCOUNT + pow5bits(i32(q - 1)) - 1
+            last_removed_digit = mul_pow5_inv_div_pow2(mv, q - 1, 0 - e2 + i32(q) - 1 + l) % 10
+
+        if q <= 9:
+            // The largest power of 5 that fits in 24 bits is 5^10, but q <= 9
+            // seems to be safe as well. Only one of mp, mv and mm can be a
+            // multiple of 5, if any.
+            if mv % 5 == 0:
+                vr_is_trailing_zeros = pow5_factor32(mv) >= q
+            else if accept_bounds:
+                vm_is_trailing_zeros = pow5_factor32(mm) >= q
+            else if pow5_factor32(mp) >= q:
+                vp -= 1
+    else:
+        u32 q = log10_pow5(0 - e2)
+        e10 = i32(q) + e2
+        i32 i = 0 - e2 - i32(q)
+        i32 k = pow5bits(i) - FLOAT_POW5_BITCOUNT
+        i32 j = i32(q) - k
+        vr = mul_pow5_div_pow2(mv, u32(i), j)
+        vp = mul_pow5_div_pow2(mp, u32(i), j)
+        vm = mul_pow5_div_pow2(mm, u32(i), j)
+        if q != 0 && (vp - 1) / 10 <= vm / 10:
+            j = i32(q) - 1 - (pow5bits(i + 1) - FLOAT_POW5_BITCOUNT)
+            last_removed_digit = mul_pow5_div_pow2(mv, u32(i + 1), j) % 10
+
+        if q <= 1:
+            // mv = 4 * m2 always has at least two trailing 0 bits.
+            vr_is_trailing_zeros = true
+            if accept_bounds:
+                vm_is_trailing_zeros = mm_shift == 1
+            else:
+                vp -= 1
+        else if q < 31:
+            vr_is_trailing_zeros = u64(mv) & ((u64(1) << (q - 1)) - 1) == 0
+
+    // Step 4: the shortest decimal in the interval.
+    i32 removed = 0
+    u32 output = 0
+    if vm_is_trailing_zeros || vr_is_trailing_zeros:
+        // The general case, which happens rarely (~4.0%).
+        for vp / 10 > vm / 10:
+            vm_is_trailing_zeros = vm_is_trailing_zeros && vm % 10 == 0
+            vr_is_trailing_zeros = vr_is_trailing_zeros && last_removed_digit == 0
+            last_removed_digit = vr % 10
+            vr = vr / 10
+            vp = vp / 10
+            vm = vm / 10
+            removed += 1
+
+        if vm_is_trailing_zeros:
+            for vm % 10 == 0:
+                vr_is_trailing_zeros = vr_is_trailing_zeros && last_removed_digit == 0
+                last_removed_digit = vr % 10
+                vr = vr / 10
+                vp = vp / 10
+                vm = vm / 10
+                removed += 1
+
+        if vr_is_trailing_zeros && last_removed_digit == 5 && vr % 2 == 0:
+            // Round even if the exact number is .....50..0.
+            last_removed_digit = 4
+
+        output = vr
+        if (vr == vm && (!accept_bounds || !vm_is_trailing_zeros)) || last_removed_digit >= 5:
+            output += 1
+    else:
+        // The common case (~96.0%).
+        for vp / 10 > vm / 10:
+            last_removed_digit = vr % 10
+            vr = vr / 10
+            vp = vp / 10
+            vm = vm / 10
+            removed += 1
+
+        output = vr
+        if vr == vm || last_removed_digit >= 5:
+            output += 1
+
+    return (output, e10 + removed)
+
+// ── the sinks this package can own ──────────────────────────────────────────
+//
+// Every sink here writes somewhere the caller already has. A sink over a stream
+// belongs in `core:io`, for the header reason argued at the top of this file.
+
+// ── a caller's own bytes ────────────────────────────────────────────────────
+
+// Where a `to_bytes` sink is up to. `into` is the caller's storage, `used` is
+// how much of it holds bytes, and `overflowed` records that something was
+// dropped — which a byte count alone cannot say, because a sink that filled its
+// buffer exactly and one that was asked for more both answer `#len(into)`.
+type Cursor:
+    []char8 into,
+    i64     used,
+    bool    overflowed,
+
+// A cursor over storage the caller owns.
+Cursor over([]char8 into):
+    return (into, 0, false)
+
+// A sink that fills a cursor and drops what will not fit.
+//
+// **It truncates rather than failing**, and says so in `overflowed`. A formatter
+// that stopped at the boundary would leave the caller a buffer whose contents
+// depend on where the failure landed; one that reported and carried on leaves a
+// prefix that is exactly what fits, which is what a log line or a status field
+// wants. `written` is the prefix and `c.overflowed` is whether to trust it.
+Sink to_bytes(^Cursor c):
+    return (cursor_write, rawptr(c))
+
+// What has landed in the cursor so far, as text. Free — a window over the
+// caller's own storage, taken to the length that has been written.
+string8 written(Cursor c):
+    return string8(c.into[0..<c.used])
+
+// Forget the bytes without forgetting the storage. The overflow flag goes with
+// them, because it is a claim about the bytes.
+void rewind(^Cursor c):
+    c^.used = 0
+    c^.overflowed = false
+    return
+
+private i64 cursor_write(rawptr data, rawptr bytes, i64 len):
+    ^Cursor c = ^Cursor(data)
+    if c == nil || bytes == nil || len <= 0:
+        return 0
+
+    i64 room = #len(c^.into) - c^.used
+    i64 take = len
+    if take > room:
+        take = room
+        c^.overflowed = true
+
+    if take <= 0:
+        return 0
+
+    Raw src = Raw(bytes)
+    []char8 from = src[0..<take]
+    i64 at = c^.used
+    i64 zero = 0
+    for i in zero..<take:
+        c^.into[at + i] = from[i]
+
+    c^.used = at + take
+    return take
+
+// ── an owned, growable run ──────────────────────────────────────────────────
+
+// A sink that appends to a run the caller owns, growing it as needed.
+//
+// **The run is taken by pointer**, and that is not a style choice: a by-value
+// `ref` parameter is the callee's own copy of the handle, so a growth through
+// one writes a new pointer, length and capacity into storage the caller never
+// sees. ERR0813 refuses it and `^ref []char8` is the repair — here the caret is
+// hidden behind the `rawptr` a sink carries, so the pointer is taken at the
+// call to `to_run` and the procedure converts it back.
+//
+// Reserve before rendering if the size is roughly known; a sink cannot, because
+// it learns the length one write at a time.
+Sink to_run(^ref([]char8) dst):
+    return (run_write, rawptr(dst))
+
+private i64 run_write(rawptr data, rawptr bytes, i64 len):
+    ^ref([]char8) r = ^ref([]char8)(data)
+    if r == nil || bytes == nil || len <= 0:
+        return 0
+
+    Raw src = Raw(bytes)
+    []char8 from = src[0..<len]
+    i64 zero = 0
+    for i in zero..<len:
+        if !#append(r^, from[i]):
+            return i
+
+    return len
+
+// ── measuring, and throwing away ────────────────────────────────────────────
+
+// A sink that writes nothing and adds every byte it is offered to `n`.
+//
+// **This is how a length is found without a buffer**, which is the general
+// answer the padded putters above avoid needing: render into one of these,
+// read the count, allocate exactly, render again. The putters do not use it
+// because each of them already knows its own width, and a formatter that
+// rendered everything twice to align it would be paying for the general case
+// at every call.
+Sink counting(^i64 n):
+    return (count_write, rawptr(n))
+
+private i64 count_write(rawptr data, rawptr bytes, i64 len):
+    ^i64 n = ^i64(data)
+    if n == nil || len <= 0:
+        return 0
+
+    n^ = n^ + len
+    return len
+
+// A sink that takes everything and keeps none of it. Useful where a `Sink` is
+// required and the bytes are not wanted — turning off a trace without changing
+// the code that writes it.
+Sink discard():
+    return (discard_write, nil)
+
+private i64 discard_write(rawptr data, rawptr bytes, i64 len):
+    if len <= 0:
+        return 0
+
+    return len
+
+// ── rendering a value of a type this package does not name ──────────────────
+
+// `v`, in the form its type has, into `out`.
+//
+// One line, and the reason it is worth a name: the parameter is `$T`, so this
+// function names no type at all and a caller renders a shape declared in its own
+// package, with no import and nothing registered. It is the seam between the
+// compiler's renderer and this package's destinations — the default form for
+// anything, and every function above for the cases where the default is not what
+// is wanted.
+i64 put($T v, Sink out):
+    return #render(v, out)
+
+// ── print, println, write, writeln ──────────────────────────────────────────
+//
+// The four that take a message and put it somewhere, and the reason this
+// package exists to hold them rather than the compiler: a message is a list of
+// values of different types, one after another with nothing between them, and
+// `..#any` is what lets a Dado function take one. Each element is rendered by
+// `#render` in the form its own type has — the same renderer `#format` uses, so
+// a value looks the same wherever it is written.
+//
+//     import "core:fmt"
+//
+//     fmt.println("n = ", count, " of ", total)
+//
+// **The destination is first on the two that take one**, which inverts this
+// package's own sink-last rule. A pack must be last, so the position is decided
+// by the grammar rather than chosen — and the inversion is safe here for the
+// reason the rule was stated for: a `Sink` is named by its type, so a reader
+// does not count arguments to find it.
+//
+// **They answer nothing.** Everything else in this package answers the count
+// the sink took, because a short write is a real state a caller may want to
+// compare against what it asked for. These four are the case where it is not:
+// a message is written for a person to read, a caller that wanted the count
+// wanted `put` and a sink of its own, and a `void` is what lets a call be a
+// statement with no `_ =` in front of it. That is the whole of the difference,
+// and it is why `write` here and `put_bytes` above are two functions rather
+// than one.
+//
+// **And they do not fail.** A sink that takes nothing is already answered — a
+// nil `proc` takes nothing and answers 0 — so there is no error a caller could
+// act on and no `!` to write. A call site needs no `try`.
+//
+// ## Why the whole family is inside a `when`
+//
+// `#OS == #NONE` is a target with no C library, so there is no stdout to reach:
+// `io.stdout_sink()` is `<stdio.h>`'s `stdout`, and `#render` of a float on a
+// freestanding target is `ERR1004` because the conversion is libc's. Wrapping
+// the family in `when #OS != #NONE:` means that on such a target the four names
+// **do not exist**, and a call is refused with *package `fmt` declares no
+// function `println`* — a refusal naming the target, rather than a link error
+// or the silence a no-op would give. Every other line of this package stays
+// callable there, which is what the wrapper is protecting.
+//
+// ## What this package now imports, and what that costs
+//
+// `import "core:io"` is the one import, and it is written at the top of the
+// file because an `import` inside a `when` is ERR0201. That looks like it
+// breaks the promise made at the head of this file — `<stdio.h>` reaching every
+// importer — and it does not, because the emitter is driven by **liveness** and
+// not by imports: measured on a `#NONE` target, a program that imports this
+// package and calls `put_signed` emits `<stdint.h>` and `<stddef.h>` and
+// nothing else. The four functions below are templates over a pack, so an
+// importer that calls none of them instantiates none of them, reaches
+// `io.stdout_sink` from nowhere, and pays for no header. The `import` itself is
+// at the head of the file, beside `package`, because an `import` anywhere else
+// is ERR0201 — which is also why it cannot be written inside this `when`.
+
+when #OS != #NONE:
+    // `args`, rendered one after another into `out`.
+    //
+    // The `for` is over a pack, so it is unrolled at the call: each copy has
+    // its own `x` at that element's own type, and `#render` picks the form from
+    // it. That is why one function serves every mixture of types a caller
+    // writes, and why there is no format string to get wrong.
+    void write(Sink out, ..#any args):
+        for x in args:
+            _ = #render(x, out)
+
+    // `args`, and then a newline.
+    void writeln(Sink out, ..#any args):
+        for x in args:
+            _ = #render(x, out)
+
+        _ = put_char('\n', out)
+
+    // `args`, on standard output.
+    //
+    // The sink is taken per call rather than held in a package variable. It is
+    // two words built from a `foreign` constant, so there is nothing to cache
+    // and nothing to initialise — and a program that redirected its own output
+    // by other means gets the stream as it is at the call rather than as it was
+    // at startup.
+    void print(..#any args):
+        write(io.stdout_sink(), ..args)
+
+    // `args`, on standard output, and then a newline.
+    void println(..#any args):
+        writeln(io.stdout_sink(), ..args)

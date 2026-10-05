@@ -1,0 +1,340 @@
+@test
+// The runtime library end to end, on the fork, with no emitter in front of it:
+// the modules below are hand-written ES modules in the shape `dado_emit_js`
+// will emit (an exported class with methods, `int` arithmetic through the
+// fork's `__dados_int_*` intrinsics), embedded as C strings, loaded through the
+// engine's module loader, and driven through the calls the generated glue of
+// `#script_vm`, `#script_new` and member calls make.
+//
+// What each part proves, and what would go wrong without it:
+//
+// * **The DadoScript flag reaches the loader.** `__dados_int_add` is an ordinary
+//   unbound name to JavaScript; only code evaluated with `JS_EVAL_FLAG_DADOS`
+//   compiles it to the fork's opcode. A module loaded without the flag throws
+//   `ReferenceError` at its first `add`, which the first `#expect` would name.
+// * **`int` crosses in its tiers, both ways.** 2⁵³ − 1 goes in as the double
+//   tier and comes back one larger as a BigInt; `i64`'s maximum goes in as a
+//   BigInt and one more wraps to its minimum, as Dado's `i64` does.
+// * **A failure's text lands on the error sink and its code comes back.** The
+//   script's `throw`, a method that is not there, and an answer of the wrong
+//   type each fail with their own code and their own sentence.
+// * **The engine lives on the allocator it was given.** Every block QuickJS-ng
+//   takes goes through a counting wrapper over C's heap, and the count is
+//   back to zero once the engine is destroyed: nothing leaked, and nothing
+//   bypassed the allocator (a block the wrapper never saw would be freed
+//   through it and drive the count negative).
+// * **`print` and `println` write to the output sink** in call order.
+package script
+
+import "core:fmt"
+import "core:mem"
+import "core:mem/libc"
+import "core:io"
+
+private const cstring COUNTER_JS = """
+    // What `dado_emit_js` will emit for a DadoScript class `Counter` (K.2).
+    export class Counter {
+        constructor(start) { this.n = start; }
+        add(k) { this.n = __dados_int_add(this.n, k); return this.n; }
+        mul(k) { this.n = __dados_int_mul(this.n, k); return this.n; }
+        label() { return "n=" + String(this.n); }
+        greet(who) { return "hello, " + who + " (" + String(who.length) + ")"; }
+        even() { return __dados_int_mod(this.n, 2) === 0; }
+        half() { return this.n / 2; }
+        boom() { throw new Error("boom at " + String(this.n)); }
+        async later(k) { await null; this.n = __dados_int_add(this.n, k); return this.n; }
+        async refused() { await null; throw new Error("refused at " + String(this.n)); }
+        never() { return new Promise(() => {}); }
+    }
+    """
+
+private const cstring MAIN_JS = """
+    import { Counter } from "counter";
+    export function main(start) {
+        println("hello from DadoScript");
+        const c = new Counter(start);
+        c.add(2);
+        print("answer ");
+        println(c.n);
+        return c.n;
+    }
+    """
+
+// What a script's calls of Dado functions go through: a module importing two
+// functions from the native module `dado:probe`, whose thunks are written in
+// Dado here as the compiler writes them in C — an argument of the wrong type,
+// or none, throws `TypeError` and is never coerced, and a failure code is
+// thrown as an `Error` carrying it.
+private const cstring GLUE_JS = """
+    import { twice, refuse } from "dado:probe";
+    export function run() {
+        const out = [String(twice(21))];
+        try { twice("3"); } catch (e) { out.push(String(e)); }
+        try { twice(); } catch (e) { out.push(String(e)); }
+        try { refuse(); } catch (e) { out.push(String(e) + " (code " + String(e.code) + ")"); }
+        return out.join("|");
+    }
+    """
+
+private JSValue twice(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    try i64 n = take_int(ctx, argv, 0, "probe.twice", "n") else:
+        return raised()
+    return give_int(ctx, n * 2)
+
+private JSValue refuse(^JSContext ctx, JSValue this_val, i32 argc, ^JSValue argv):
+    return failed(ctx, "probe.refuse", 16)
+
+// ── a counting allocator over C's heap ───────────────────────────────────────
+
+private type Count:
+    i64 blocks,
+    i64 bytes,
+    i64 calls,
+
+private Count counted
+
+private rawptr counting(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) c = libc.allocator()
+    counted.calls += 1
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            rawptr p = c.proc(c.data, mode, nbytes, align, old, old_size)
+            if p != nil:
+                counted.blocks += 1
+                counted.bytes += i64(nbytes)
+            return p
+        case mem.AllocatorMode.Resize:
+            rawptr p = c.proc(c.data, mode, nbytes, align, old, old_size)
+            if p != nil:
+                counted.bytes += i64(nbytes) - i64(old_size)
+            return p
+        case mem.AllocatorMode.Free:
+            counted.blocks -= 1
+            counted.bytes -= i64(old_size)
+            return c.proc(c.data, mode, nbytes, align, old, old_size)
+        case mem.AllocatorMode.FreeAll:
+            return nil
+        else:
+            return nil
+
+// ── buffers for the two sinks ────────────────────────────────────────────────
+
+private [512]char8 out_store
+private [2048]char8 err_store
+private fmt.Cursor out_c
+private fmt.Cursor err_c
+
+// An unexpected failure: what failed, its code and what the engine said.
+private i32 stop(string8 what, i32 code):
+    fmt.writeln(io.stderr_sink(), what, " failed with ", code, ": ", fmt.written(err_c))
+    return 1
+
+private bool has(string8 text, string8 part):
+    i64 n = #len(part)
+    for i in 0..=(#len(text) - n):
+        if text[i..<i + n] == part:
+            return true
+    return false
+
+i32 test():
+    bool ok = true
+    out_c = fmt.over(out_store[:])
+    err_c = fmt.over(err_store[:])
+
+    try Engine e = create((counting, nil)) else code:
+        _ = #expect(false, "create failed with ", code)
+        return 1
+    set_sinks(e, fmt.to_bytes(&out_c), fmt.to_bytes(&err_c))
+    ok = #expect(counted.blocks > 0, "the engine took nothing from the allocator it was given") && ok
+    (i64 blocks, i64 bytes) = held(e)
+    ok = #expect(blocks > 0 && bytes > 0, "the engine counts no blocks of its own") && ok
+
+    try add_module(e, "counter", COUNTER_JS) else code:
+        return stop("add_module(e, \"counter\", COUNTER_JS)", code)
+    try add_module(e, "main", MAIN_JS) else code:
+        return stop("add_module(e, \"main\", MAIN_JS)", code)
+
+    // ── a module that imports another, and a function it exports ────────────
+    try Handle main_ns = load(e, "main") else code:
+        _ = #expect(false, "load(main) failed with ", code, ": ", fmt.written(err_c))
+        return 1
+    arg_i64(e, 40)
+    try call(e, main_ns, "main") else code:
+        _ = #expect(false, "main() failed with ", code, ": ", fmt.written(err_c))
+        return 1
+    try i64 answer = result_i64(e) else code:
+        return stop("result_i64(e)", code)
+    ok = #expect(answer == 42, "main(40) answered ", answer) && ok
+    string8 printed = fmt.written(out_c)
+    ok = #expect(printed == "hello from DadoScript\nanswer 42\n", "the script printed \"", printed, "\"") && ok
+
+    // ── a class, constructed and driven by method ───────────────────────────
+    try Handle counter_ns = load(e, "counter") else code:
+        return stop("load(e, \"counter\")", code)
+    arg_i64(e, 20)
+    try Handle c = construct(e, counter_ns, "Counter") else code:
+        _ = #expect(false, "new Counter failed with ", code, ": ", fmt.written(err_c))
+        return 1
+    arg_i64(e, 1)
+    try call_method(e, c, "add") else code:
+        _ = #expect(false, "add failed with ", code, ": ", fmt.written(err_c))
+        return 1
+    arg_i64(e, 2)
+    try call_method(e, c, "mul") else code:
+        return stop("call_method(e, c, \"mul\")", code)
+    try i64 n = result_i64(e) else code:
+        return stop("result_i64(e)", code)
+    ok = #expect(n == 42, "(20 + 1) * 2 answered ", n) && ok
+    try call_method(e, c, "even") else code:
+        return stop("call_method(e, c, \"even\")", code)
+    try bool even = result_bool(e) else code:
+        return stop("result_bool(e)", code)
+    ok = #expect(even, "42 is not even to the script") && ok
+    try call_method(e, c, "half") else code:
+        return stop("call_method(e, c, \"half\")", code)
+    try f64 half = result_f64(e) else code:
+        return stop("result_f64(e)", code)
+    ok = #expect(half == 21.0, "half of 42 was ", half) && ok
+    try call_method(e, c, "label") else code:
+        return stop("call_method(e, c, \"label\")", code)
+    try string8 label = result_string(e) else code:
+        return stop("result_string(e)", code)
+    ok = #expect(label == "n=42", "label() answered \"", label, "\"") && ok
+
+    // ── strings in and out, UTF-8 both ways, and the empty one ────────────
+    arg_string(e, "wörld")
+    try call_method(e, c, "greet") else code:
+        return stop("greet(wörld)", code)
+    try string8 greeting = result_string(e) else code:
+        return stop("result_string(e)", code)
+    ok = #expect(greeting == "hello, wörld (5)", "greet answered \"", greeting, "\"") && ok
+    arg_string(e, "")
+    try call_method(e, c, "greet") else code:
+        return stop("greet()", code)
+    try string8 empty = result_string(e) else code:
+        return stop("result_string(e)", code)
+    ok = #expect(empty == "hello,  (0)", "greet(\"\") answered \"", empty, "\"") && ok
+
+    // ── more arguments than the table holds fails the call, not the program ─
+    for i in 0..<17:
+        arg_i64(e, i64(i))
+    i32 got = 0
+    try call_method(e, c, "add") else code:
+        got = code
+    ok = #expect(got == NO_MEMORY, "a call with 17 arguments failed with ", got) && ok
+    ok = #expect(fmt.written(err_c) == "script: a call was given more than 16 arguments\n", "the error sink holds \"", fmt.written(err_c), "\"") && ok
+    fmt.rewind(&err_c)
+
+    // ── int across 2⁵³ and across 2⁶³ ──────────────────────────────────────
+    arg_i64(e, 9007199254740991)
+    try Handle big = construct(e, counter_ns, "Counter") else code:
+        return stop("construct(e, counter_ns, \"Counter\")", code)
+    arg_i64(e, 1)
+    try call_method(e, big, "add") else code:
+        return stop("call_method(e, big, \"add\")", code)
+    try i64 past = result_i64(e) else code:
+        return stop("result_i64(e)", code)
+    ok = #expect(past == 9007199254740992, "2^53 - 1 + 1 answered ", past) && ok
+    arg_i64(e, 3)
+    try call_method(e, big, "mul") else code:
+        return stop("call_method(e, big, \"mul\")", code)
+    try i64 tripled = result_i64(e) else code:
+        return stop("result_i64(e)", code)
+    ok = #expect(tripled == 27021597764222976, "2^53 * 3 answered ", tripled) && ok
+    release(e, big)
+
+    arg_i64(e, 9223372036854775807)
+    try Handle top = construct(e, counter_ns, "Counter") else code:
+        return stop("construct(e, counter_ns, \"Counter\")", code)
+    arg_i64(e, 1)
+    try call_method(e, top, "add") else code:
+        return stop("call_method(e, top, \"add\")", code)
+    try i64 wrapped = result_i64(e) else code:
+        return stop("result_i64(e)", code)
+    ok = #expect(wrapped == 0 - 9223372036854775807 - 1, "i64 max + 1 answered ", wrapped, ", not i64 min") && ok
+    release(e, top)
+
+    // ── failure: a throw, a missing method, a wrong answer type ─────────────
+    got = 0
+    try call_method(e, c, "boom") else code:
+        got = code
+    ok = #expect(got == THREW, "boom() failed with ", got, ", not THREW") && ok
+    string8 said = fmt.written(err_c)
+    ok = #expect(has(said, "Error: boom at 42\n"), "the error sink holds \"", said, "\"") && ok
+    ok = #expect(has(said, "at boom (counter"), "the error sink holds no stack: \"", said, "\"") && ok
+    fmt.rewind(&err_c)
+
+    // ── async: a call answering a promise runs the engine's jobs until it
+    // settles — its value is the answer, its rejection a throw — and one
+    // that can never settle fails ───────────────────────────────────────────
+    arg_i64(e, 5)
+    try Handle w = construct(e, counter_ns, "Counter") else code:
+        return stop("construct(e, counter_ns, \"Counter\")", code)
+    arg_i64(e, 2)
+    try call_method(e, w, "later") else code:
+        return stop("call_method(e, w, \"later\")", code)
+    try i64 later = result_i64(e) else code:
+        return stop("result_i64(e)", code)
+    ok = #expect(later == 7, "later(2) answered ", later, ", not 7") && ok
+    got = 0
+    try call_method(e, w, "refused") else code:
+        got = code
+    ok = #expect(got == THREW, "refused() failed with ", got, ", not THREW") && ok
+    ok = #expect(has(fmt.written(err_c), "Error: refused at 7\n"), "the error sink holds \"", fmt.written(err_c), "\"") && ok
+    fmt.rewind(&err_c)
+    got = 0
+    try call_method(e, w, "never") else code:
+        got = code
+    ok = #expect(got == THREW, "never() failed with ", got, ", not THREW") && ok
+    ok = #expect(has(fmt.written(err_c), "never settled"), "the error sink holds \"", fmt.written(err_c), "\"") && ok
+    fmt.rewind(&err_c)
+    release(e, w)
+
+    got = 0
+    try call_method(e, c, "nothing") else code:
+        got = code
+    ok = #expect(got == NO_SUCH, "nothing() failed with ", got, ", not NO_SUCH") && ok
+    ok = #expect(fmt.written(err_c) == "script: no method named `nothing`\n", "the error sink holds \"", fmt.written(err_c), "\"") && ok
+    fmt.rewind(&err_c)
+
+    try call_method(e, c, "label") else code:
+        return stop("call_method(e, c, \"label\")", code)
+    got = 0
+    i64 not_an_int = 0
+    try not_an_int = result_i64(e) else code:
+        got = code
+    ok = #expect(got == TYPE && not_an_int == 0, "reading a string as an int failed with ", got) && ok
+    ok = #expect(fmt.written(err_c) == "script: the answer is not an int\n", "the error sink holds \"", fmt.written(err_c), "\"") && ok
+    fmt.rewind(&err_c)
+
+    got = 0
+    Handle absent = 0
+    try absent = load(e, "absent") else code:
+        got = code
+    ok = #expect(got == THREW && absent == 0, "loading a module nobody embedded failed with ", got) && ok
+    ok = #expect(has(fmt.written(err_c), "no embedded module named 'absent'"), "the error sink holds \"", fmt.written(err_c), "\"") && ok
+
+    // ── a native module of thunks: tags checked, codes thrown ──────────────
+    fmt.rewind(&err_c)
+    [3]Bound glue_rows
+    glue_rows[0] = ("dado:probe", "twice", twice, 1)
+    glue_rows[1] = ("dado:probe", "refuse", refuse, 0)
+    e^.bound = rawptr(&glue_rows)
+    try add_module(e, "glue", GLUE_JS) else code:
+        return stop("add_module(e, \"glue\", GLUE_JS)", code)
+    try Handle glue = load(e, "glue") else code:
+        return stop("load(e, \"glue\")", code)
+    try call(e, glue, "run") else code:
+        return stop("call(e, glue, \"run\")", code)
+    try string8 crossed = result_string(e) else code:
+        return stop("result_string(e)", code)
+    ok = #expect(crossed == "42|TypeError: `probe.twice`'s parameter `n` takes an int, and was given a string|TypeError: `probe.twice`'s parameter `n` takes an int, and was given nothing|Error: `probe.refuse` failed with code 16 (code 16)", "the glue answered \"", crossed, "\"") && ok
+    release(e, glue)
+
+    release(e, c)
+    destroy(e)
+    ok = #expect(counted.blocks == 0 && counted.bytes == 0, "after destroy the allocator still holds ", counted.blocks, " block(s), ", counted.bytes, " byte(s)") && ok
+
+    if ok:
+        return 0
+    return 1

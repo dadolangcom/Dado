@@ -1,0 +1,954 @@
+// app:graph — the neutral scene graph: parent/child, composed
+// Node2D transforms, lifecycle by tree walk, in ordinary program memory.
+//
+//     import "app:graph"
+//
+//     appgraph.Graph g = graph.init() using app.allocator()
+//     appgraph.Node player = graph.create(&g, position: (10.0, 5.0))
+//     graph.set_on_process(&g, player, on_player_process)
+//     appgraph.Node weapon = graph.create(&g, position: (1.0, 0.0))
+//     graph.add_child(&g, appgraph.INVALID, player)   // a root
+//     graph.add_child(&g, player, weapon)             // rides along with the player
+//
+//     void process(f32 dt):
+//         graph.process(&g, dt)                        // walks the tree, fires on_process
+//         [2]f32 muzzle = graph.to_global(&g, weapon, (0.5, 0.0))
+//
+// ── Neutral, not graphical ─────────────────────────────────────────────────
+//
+// A headless server builds this same tree, positions nodes and runs their
+// `process` hook — it just never draws them. Drawing a node is
+// a presentation layer's job, gated on `VectorDraw`; nothing here imports a
+// backend or knows one exists.
+//
+// ── An explicit value, not a singleton ─────────────────────────────────────
+//
+// `app:log`/`app:input`/`app:net` are process-wide singletons because what
+// they wrap genuinely has one instance per program (one keyboard, one log
+// stream, one network host). A scene graph does not — it is app-defined
+// state, the same way `app:ui`'s `UIGraph` is, and the two are drawn as
+// trees as siblings on purpose. So `Graph` is a value the caller creates
+// with `init` and passes explicitly to every call here, exactly like
+// `app:ui`'s `^UIGraph` parameter, not a package-level global.
+//
+// ── Handles, not pointers (`Node` is `(i32 index, u32 generation)`) ────────
+//
+// Nodes live in one growable `ref []Slot` the `Graph` owns. A `ref` can
+// move when it grows (`resize`), so a raw `^Slot` a caller held across a
+// `create`/`add_child`/`remove` call could dangle — the same class of bug
+// `app:events` hit for a `rawptr` held past its pointee's lifetime, before
+// it gave way to typed signals.
+// A `Node` handle is a slot index (stable across a resize) plus a
+// generation (bumped when a slot is freed), so a handle held past `remove`
+// reads as invalid at the next call rather than silently reaching whatever
+// node has since reused that slot. Every function below re-derives its own
+// `^Slot` from a `Node` immediately before use and never holds one across a
+// call into a lifecycle hook — a hook is caller code and is free to
+// `create`/`add_child`/`set_parent`/`remove` on this same `Graph`, including
+// on the very node it was called for.
+//
+// ── Lifecycle: hooks, not methods — Dado has neither ────────────────────────
+//
+// Godot's `_enter_tree`/`_ready`/`_process` become function-ref
+// fields a node carries, the same `fn` + `data` dispatch shape `core:jobs`'
+// `JobFn` and `app:app`'s `Backend` already use — `userdata` is what lets one
+// function serve many node instances (Dado has no closures either), and the
+// leading `^Graph` is what lets that same function read or write the very
+// node it was called for (there is no other way back to the tree from
+// inside a hook — no singleton, no implicit self). Only
+// three of Godot's lifecycle notifications are here: `on_enter_tree` /
+// `on_exit_tree` fire once, synchronously, inside `add_child`/`remove`;
+// `on_ready` fires once, synchronously, immediately after `on_enter_tree`
+// — there is no "end of frame" to defer it to the way Godot does, because
+// this tree has no frame of its own, only whatever `process` calls it from.
+// `_physics_process`/`_input`/`_unhandled_input` are left out: input
+// dispatch onto scene nodes is graphical-backend-shaped work
+// for a presentation layer, not for this neutral one.
+//
+// ── The zero-node case: lazy, and no synthetic root ────────────────────────
+//
+// "Mandatory or lazy" was left for the scene-graph design to decide.
+// Settled: **lazy**. `init` allocates nothing; the node pool (`Graph.slots`)
+// is only ever `make`d on the first `create`. There is also no single
+// mandatory root node — a `Node` attached with an invalid parent simply *is*
+// a root, and a `Graph` may hold any number of them side by side. Forcing one
+// synthetic root a program never asked for, and would then have to guard
+// against removing, buys nothing a pure TUI or immediate-mode program (or a
+// server hosting several independent top-level entities) needs — the
+// "pay for what you use" applies here exactly as it does to the walking
+// skeleton itself.
+//
+// `destroy` is `init`'s counterpart and the only thing that gives the pool
+// back. `remove` returns a node's slot to the free list, which is reuse and
+// not release — the run itself is never shrunk — so a `Graph` that outlives
+// its owner and is merely dropped leaks every byte `create` ever doubled
+// into. A caller that owns a `Graph` for a while (a canvas, a scene, a level)
+// needs a verb for the end of that while, and this is it.
+//
+// ── Where the pool lands ───────────────────────────────────────────────────
+//
+// `init` takes no allocator. It allocates nothing, so there is nothing for one
+// to place; what it does is **read the ambient** — `#default`, whatever the
+// caller has arranged at that line — and keep it in `Graph.alloc` for the
+// `create` that first needs a pool. So the caller decides with one word at the
+// call site and this package never carries an allocator through a parameter
+// list:
+//
+//     Graph g = init()                          // wherever the caller's default is
+//     Graph g = init() using arena.allocator(&a) // the pool lands in `a`
+//
+// **`Graph.alloc` survives, and it is not there for `destroy`.** Freeing never
+// needed it: `#delete` and `#resize` use the allocator the `ref` itself
+// carries, so `destroy` would work with the slot gone. It is there because the
+// pool is *lazy* — `alloc_slot` mints it on the first `create`, which is an
+// arbitrary distance from `init` — and without the slot that `#make` would
+// read whatever ambient happened to be live at that call. A `create` inside a
+// scratch frame would then put the node pool in the scratch arena and the
+// rollback would take the whole tree with it. Capturing the ambient once, at
+// `init`, is what makes the pool's home the same fact it was when this was a
+// parameter, and `using` is now how the caller states it.
+//
+// ── Order is insertion order, in both directions ───────────────────────────
+//
+// **This changed, and the old behaviour was documented.** `add_child` used
+// to push a child onto the front of its parent's list, so sibling order was
+// *reverse* insertion order; and the roots were whatever `0..<used` happened
+// to yield, which is slot-index order. Both were fine while the only thing
+// a walk produced was a side effect. Neither survives a consumer that paints:
+// paint order is sibling order, and a program that writes a background and
+// then a label on top of it means exactly what it wrote.
+//
+// So a child is **appended**, and each `Slot` carries a `last_child` to make
+// that O(1) rather than a walk to the end — the same 8 bytes per node
+// `app:ui`'s own tree already spends for the same reason. And the roots are
+// an **explicit ordered list** threaded through the same `next_sibling` field
+// the children use, with `first_root`/`last_root` on the `Graph`: no second
+// allocation, and the lazy-`init` promise above is kept.
+//
+// The slot scan had a second defect the order change would not have fixed:
+// free-list reuse moves a node's slot index, so removing a root and creating
+// another put the new one wherever the free list happened to point. An
+// explicit list is stable because nothing but `add_child`/`set_parent`/`remove`
+// ever touches it.
+//
+// One behaviour follows from the list and is worth stating: a node that was
+// `create`d and never attached is **not** walked. Under the slot scan it was,
+// because "alive with no parent" and "a root" were the same test. They are
+// not the same thing — `add_child` is what puts a node in the tree, and it is
+// what fires `on_enter_tree` — so a detached node no longer ticks.
+//
+// ── Presentation properties, carried and never interpreted ─────────────────
+//
+// `visible`, `modulate`, `self_modulate`, `z_index`, `z_as_relative`, `clip`
+// with its custom rect, and `payload` are all stored here and read by nothing
+// in this file. That is the point. A renderer built on this tree needs
+// somewhere to put them, and the alternatives are a parallel array it keys by
+// `Node` — which then has to be resized, freed and generation-checked in
+// lockstep with this one, twice the bookkeeping for the same facts — or a
+// second tree, which is two trees to keep in step. Neither is worth the
+// backend-neutrality it would buy back, because carrying a `[4]u8` costs this
+// package no import and no opinion: `modulate` is four bytes here and a colour
+// only where somebody multiplies by it.
+//
+// **`payload` is deliberately not `userdata`.** The four lifecycle hooks
+// already own `userdata` — it is the only thing standing in for a closure —
+// so a renderer naming its command list there would be fighting the program's
+// own hooks for one field. `payload` is a bare `u32` this package never
+// dereferences, which is what lets it name a handle into something this
+// package has never heard of.
+//
+// ── The local transform is a matrix; the TRS triple is a view on it ────────
+//
+// A `Slot` holds both `xform.Transform2D local` and the
+// `(position, rotation, scale)` triple, and the triple's setters rebuild the
+// matrix as they write. That is one `from_trs` — one `sin`/`cos` pair — per
+// *edit* rather than per node per frame, which is what the walk used to pay;
+// a tree where most nodes hold still between frames now does no trigonometry
+// at all. `set_transform` writes the matrix directly and decomposes it back
+// into the triple so `position`/`rotation`/`scale` keep answering.
+//
+// The decomposition is lossy exactly where `core:geom/xform` says it is: a
+// matrix carrying shear has no TRS triple, so `set_transform` followed by
+// `rotation` can answer something the caller did not write. The matrix itself
+// is kept verbatim and is what composes, so nothing downstream of
+// `global_transform` loses anything — only the three readers do, and they
+// were already documented as a decomposition.
+//
+// ── `process` and `update_transforms` are one walk ─────────────────────────
+//
+// A renderer must not tick game logic in order to find out where things are.
+// So the composition — parent's global times the node's own local, written
+// into `Slot.global` — is one traversal with a flag, and `process` and
+// `update_transforms` are the two ways to enter it. They are not two walks:
+// a second copy of the composition arithmetic is the sort of duplication that
+// stays correct for exactly as long as nobody edits one of them.
+package appgraph
+
+import "core:geom/xform"
+
+// ── handles ──────────────────────────────────────────────────────────────
+
+// A handle to one node. See the package doc comment for why this is an
+// index+generation pair rather than a pointer.
+type Node: (i32 index, u32 generation)
+
+// The handle that names "no node" — an invalid parent (a root), an absent
+// child, an absent sibling.
+const Node INVALID = (-1, 0)
+
+bool valid(Node n):
+    return n.index >= 0
+
+// ── lifecycle hooks ─────────────────────────────────────────────────────
+//
+// Each takes the `Graph` it belongs to (there is no implicit self and no
+// singleton to reach for, per the package doc comment above — a hook
+// that wants to read or write its *own* node's transform, or walk to a
+// parent or a sibling, needs the `Graph` to do it with), the node's own
+// handle, and the `userdata` it was created with.
+type ReadyFn:   void(^Graph, Node, rawptr)
+type ProcessFn: void(^Graph, Node, f32, rawptr)
+type TreeFn:    void(^Graph, Node, rawptr)      // on_enter_tree / on_exit_tree
+
+// ── storage ──────────────────────────────────────────────────────────────
+
+private type Slot: (
+    bool alive,
+    u32  generation,
+    i32  free_next,              // meaningful only when !alive
+
+    bool attached,               // in a parent's child list, or in the root list
+    Node parent,
+    Node first_child,
+    Node last_child,             // O(1) append, so siblings keep insertion order
+    Node next_sibling,           // also threads the root list, for a root
+
+    [2]f32 position,
+    f32    rotation,
+    [2]f32 scale,
+    xform.Transform2D local,     // rebuilt by every setter above, never by the walk
+    xform.Transform2D global,    // valid after the tree walk that last covered it
+
+    bool   visible,
+    [4]u8  modulate,             // composes down a renderer's tree
+    [4]u8  self_modulate,        // this node only
+    i32    z_index,
+    bool   z_as_relative,
+    bool   clip,
+    [4]f32 custom_rect,          // x, y, w, h — meaningful to whoever set `clip`
+    u32    payload,              // opaque; see the package doc comment
+
+    rawptr    userdata,
+    ReadyFn   on_ready,
+    ProcessFn on_process,
+    TreeFn    on_enter_tree,
+    TreeFn    on_exit_tree,
+)
+
+// The tree. See the package doc comment for the ownership model, and for why
+// the roots are a list rather than whatever a scan of the pool turned up.
+type Graph: (
+    // Where the lazy node pool goes: the ambient `init` was called under, kept
+    // because `alloc_slot` mints the pool long after `init` returns. See "Where
+    // the pool lands" in the package doc comment.
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data)   alloc,
+    ref []Slot slots,
+    i32         used,        // high-water mark: slots[0..<used] are meaningful
+    i32         free_head,   // -1 when the free list is empty
+    Node        first_root,
+    Node        last_root,
+)
+
+// A fresh, empty graph. Allocates nothing until the first `create`, and the
+// `Graph` itself is a value the caller holds — this answers one, it does not
+// mint one.
+//
+// It takes no allocator: it reads the ambient one and remembers it for the
+// first `create`, so `init() using a` is how a caller puts the node pool in
+// `a`. See "Where the pool lands" in the package doc comment.
+Graph init():
+    Graph g
+    g.alloc = #default
+    g.free_head = -1
+    // Written out because a zeroed `Node` is `(0, 0)`, and index 0 is a
+    // perfectly valid slot — "no node" is -1 and nothing else.
+    g.first_root = INVALID
+    g.last_root = INVALID
+    return g
+
+// Tear the tree down, give the node pool back, and leave `g` in exactly the
+// state `init` answers — so a `create` after a `destroy` works on the same
+// value, and a second `destroy` is a no-op. That re-entrancy is the same
+// promise `shutdown` makes elsewhere in this tree, and it is what lets an
+// owner call this on a path it is not sure it has already taken.
+//
+// **The tree is torn down, not merely freed**, which is the question a caller
+// has: every node still *in* the tree leaves it, firing `on_exit_tree` once,
+// in `remove`'s order — a node before its children, top-down, the same order
+// `add_child` fires `on_enter_tree` in. This is `remove` over each root in
+// turn and not a scan of the pool, so a hook sees the same tree, in the same
+// shape, that removing that root by hand would have shown it, and is free to
+// do what any other `on_exit_tree` may do. A hook that attaches a new root on
+// its way out has that root torn down too, in the same pass.
+//
+// A node that was `create`d and never attached fires nothing, because it
+// never entered the tree and `on_exit_tree` would be reporting a departure
+// that never happened. Its storage goes with the rest.
+//
+// **A handle held across this call is refused afterwards** — `g.used` is
+// zero, so `slot_at` turns every one of them away. It is refused rather than
+// detected: the generations went with the run that carried them, so a `create`
+// on the emptied `Graph` mints `(0, 0)` again, and a handle that happened to
+// be `(0, 0)` before will address the new node. A handle does not survive the
+// `Graph` it names, the same way it does not survive the program.
+void destroy(^Graph g):
+    for valid(g.first_root):
+        Node root = g.first_root
+        remove(g, root)
+        if g.first_root == root:
+            break   // the list did not move; leaving is better than spinning
+    #delete(g.slots)
+    // The pool's home is carried across, so a `create` after a `destroy` puts
+    // the fresh pool where the first one went. `init` reads the ambient, and
+    // the ambient here is the caller of `destroy`'s, which is not the same
+    // fact — hence the `using`.
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) home = g.alloc
+    g^ = init() using home
+
+// ── slot access (private: every public function re-derives its own
+// pointer immediately before use, per the package doc comment) ───────────
+
+private ^Slot slot_at(^Graph g, Node n):
+    if n.index < 0 || n.index >= g.used:
+        return nil
+    ^Slot s = &g.slots[n.index]
+    if !s.alive || s.generation != n.generation:
+        return nil
+    return s
+
+private i32 alloc_slot(^Graph g):
+    if g.free_head >= 0:
+        i32 idx = g.free_head
+        g.free_head = g.slots[idx].free_next
+        return idx
+    if g.used >= #len(g.slots):
+        i64 newcap = #len(g.slots)
+        if newcap == 0:
+            newcap = 8
+        else:
+            newcap = newcap * 2
+        if g.slots == nil:
+            g.slots = #make([]Slot, newcap, g.alloc)
+        else:
+            bool grew = #resize(g.slots, newcap)
+            #assert(grew, "app:graph: out of memory growing the node pool")
+    i32 idx = g.used
+    g.used = g.used + 1
+    return idx
+
+private void free_slot(^Graph g, i32 idx):
+    ^Slot s = &g.slots[idx]
+    s.alive = false
+    s.generation = s.generation + 1
+    s.free_next = g.free_head
+    g.free_head = idx
+
+// ── creating nodes ───────────────────────────────────────────────────────
+
+// Create a detached node — not yet part of the tree, and so not walked by
+// `process` or `update_transforms`. `add_child` attaches it, which is what
+// fires `on_enter_tree`/`on_ready`. Set hooks/`userdata` and the presentation
+// properties with the setters below before `add_child`, if the node needs
+// them — **not** constructor parameters here, because a parameter default
+// must be a compile-time constant, and `nil` is not one for a pointer
+// or function-ref type (confirmed against the compiler: `T fn = nil` as a
+// default is refused, ERR0901, "nil… is not something the compiler can
+// evaluate," even though an *ordinary statement* assigning `nil` to the
+// same field, below, compiles fine — the restriction is specific to a
+// folded default, not to `nil` itself).
+Node create(^Graph g, [2]f32 position = (0.0, 0.0), f32 rotation = 0.0,
+            [2]f32 scale = (1.0, 1.0)):
+    i32 idx = alloc_slot(g)
+    ^Slot s = &g.slots[idx]
+    s.alive = true
+    s.attached = false
+    s.parent = INVALID
+    s.first_child = INVALID
+    s.last_child = INVALID
+    s.next_sibling = INVALID
+    s.position = position
+    s.rotation = rotation
+    s.scale = scale
+    s.local = xform.from_trs(position, rotation, scale)
+    s.global = s.local
+    // Defaults chosen so that a node nobody configures is the node a
+    // renderer would draw plainly: shown, untinted, unclipped, on the layer
+    // its parent is on. Every one of them is written out for the same reason
+    // the hooks below are — a slot recycled from the free list still holds
+    // its previous occupant's values, and a reused slot never gets the
+    // zero-fill a `make`d one does. An opaque white `modulate` is the
+    // identity of whatever multiplies by it, which is what makes "unset"
+    // and "set to white" indistinguishable downstream, on purpose.
+    s.visible = true
+    s.modulate = (255, 255, 255, 255)
+    s.self_modulate = (255, 255, 255, 255)
+    s.z_index = 0
+    s.z_as_relative = true
+    s.clip = false
+    s.custom_rect = (0.0, 0.0, 0.0, 0.0)
+    s.payload = 0
+    s.userdata = nil
+    s.on_ready = nil
+    s.on_process = nil
+    s.on_enter_tree = nil
+    s.on_exit_tree = nil
+    return (idx, s.generation)
+
+// ── hooks and userdata (set before `add_child`, if the node needs them) ──
+
+void set_userdata(^Graph g, Node n, rawptr ud):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.userdata = ud
+
+void set_on_ready(^Graph g, Node n, ReadyFn fn):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.on_ready = fn
+
+void set_on_process(^Graph g, Node n, ProcessFn fn):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.on_process = fn
+
+void set_on_enter_tree(^Graph g, Node n, TreeFn fn):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.on_enter_tree = fn
+
+void set_on_exit_tree(^Graph g, Node n, TreeFn fn):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.on_exit_tree = fn
+
+// ── tree edits ───────────────────────────────────────────────────────────
+
+private void fire_enter_tree_and_ready(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return
+    TreeFn enter = s.on_enter_tree
+    rawptr ud = s.userdata
+    if enter != nil:
+        enter(g, n, ud)
+    // Re-derive: the hook above is caller code and may have grown the pool
+    // (a resize moves `g.slots`) or freed `n` itself.
+    s = slot_at(g, n)
+    if s == nil:
+        return
+    ReadyFn ready = s.on_ready
+    ud = s.userdata
+    if ready != nil:
+        ready(g, n, ud)
+
+// Put a detached `child` at the end of `parent`'s child list, or at the end
+// of the root list when `parent == INVALID`. The one place either list is
+// grown, so `add_child` and `set_parent` cannot disagree about what "last"
+// means. Fires nothing: the hooks belong to entering the tree, and this is
+// only the linking half of it.
+private void attach(^Graph g, Node parent, Node child):
+    ^Slot cs = slot_at(g, child)
+    if cs == nil:
+        return
+    cs.next_sibling = INVALID
+    cs.attached = true
+    if valid(parent):
+        ^Slot ps = slot_at(g, parent)
+        if ps == nil:
+            return
+        cs.parent = parent
+        if valid(ps.last_child):
+            ^Slot ls = slot_at(g, ps.last_child)
+            if ls != nil:
+                ls.next_sibling = child
+            ps.last_child = child
+        else:
+            ps.first_child = child
+            ps.last_child = child
+    else:
+        cs.parent = INVALID
+        if valid(g.last_root):
+            ^Slot ls = slot_at(g, g.last_root)
+            if ls != nil:
+                ls.next_sibling = child
+            g.last_root = child
+        else:
+            g.first_root = child
+            g.last_root = child
+
+// Attach `child` under `parent`, or as a root when `parent == INVALID`,
+// **appended after whatever is already there** so that sibling order and root
+// order are insertion order — see the package doc comment, which also records
+// that this used to prepend. Fires `on_enter_tree` then `on_ready`, in that
+// order, once, synchronously (see the package doc comment for why there is no
+// deferred-`ready` semantics here). `child` must not already be in the tree;
+// `set_parent` is how an attached node moves.
+void add_child(^Graph g, Node parent, Node child):
+    ^Slot cs = slot_at(g, child)
+    #assert(cs != nil, "app:graph.add_child: child handle is not alive")
+    #assert(!cs.attached, "app:graph.add_child: child is already in the tree")
+    if valid(parent):
+        #assert(slot_at(g, parent) != nil, "app:graph.add_child: parent handle is not alive")
+    attach(g, parent, child)
+    fire_enter_tree_and_ready(g, child)
+
+private void unlink_from_parent(^Graph g, Node parent, Node child):
+    ^Slot ps = slot_at(g, parent)
+    if ps == nil:
+        return
+    if ps.first_child == child:
+        ^Slot cs = slot_at(g, child)
+        if cs == nil:
+            ps.first_child = INVALID
+            ps.last_child = INVALID
+            return
+        ps.first_child = cs.next_sibling
+        if ps.last_child == child:
+            ps.last_child = INVALID
+        return
+    Node cur = ps.first_child
+    for valid(cur):
+        ^Slot curs = slot_at(g, cur)
+        if curs == nil:
+            break
+        if curs.next_sibling == child:
+            ^Slot cs = slot_at(g, child)
+            if cs == nil:
+                curs.next_sibling = INVALID
+            else:
+                curs.next_sibling = cs.next_sibling
+            if ps.last_child == child:
+                ps.last_child = cur
+            return
+        cur = curs.next_sibling
+
+// The root list's half of `unlink_from_parent`, walking `first_root` instead
+// of a parent's `first_child`. Two functions rather than one over a pair of
+// pointers, because the head of one list lives on a `Slot` and the head of
+// the other lives on the `Graph`, and Dado has nothing that addresses both.
+private void unlink_from_roots(^Graph g, Node n):
+    if g.first_root == n:
+        ^Slot s = slot_at(g, n)
+        if s == nil:
+            g.first_root = INVALID
+            g.last_root = INVALID
+            return
+        g.first_root = s.next_sibling
+        if g.last_root == n:
+            g.last_root = INVALID
+        return
+    Node cur = g.first_root
+    for valid(cur):
+        ^Slot curs = slot_at(g, cur)
+        if curs == nil:
+            break
+        if curs.next_sibling == n:
+            ^Slot s = slot_at(g, n)
+            if s == nil:
+                curs.next_sibling = INVALID
+            else:
+                curs.next_sibling = s.next_sibling
+            if g.last_root == n:
+                g.last_root = cur
+            return
+        cur = curs.next_sibling
+
+// Take `n` out of whichever list holds it and leave it detached. A no-op on a
+// node that was never attached, which is what keeps `remove` cheap for a node
+// that was `create`d and then thrown away.
+private void detach(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return
+    if !s.attached:
+        return
+    if valid(s.parent):
+        unlink_from_parent(g, s.parent, n)
+    else:
+        unlink_from_roots(g, n)
+    s.parent = INVALID
+    s.next_sibling = INVALID
+    s.attached = false
+
+// Whether `probe` is `n` itself or sits somewhere above it. Walks parents,
+// which is the short direction — a tree's depth rather than its size — and
+// is what makes the cycle refusal below cheap enough to do unconditionally.
+private bool is_ancestor_or_self(^Graph g, Node probe, Node n):
+    Node cur = n
+    for valid(cur):
+        if cur == probe:
+            return true
+        ^Slot s = slot_at(g, cur)
+        if s == nil:
+            return false
+        cur = s.parent
+    return false
+
+// Move `child` under `parent`, or into the root list when
+// `parent == INVALID`, appended at the end the way `add_child` appends.
+//
+// Answers whether the move happened. The one refusal is the one that would
+// corrupt the tree: a `parent` that is `child` itself or sits below it would
+// close the parent chain into a ring, and every walk here — the traversal,
+// `unlink_from_parent`, `is_ancestor_or_self` — would then run forever. That
+// is a question about the caller's own data rather than a broken handle, and
+// a caller dragging a node in a tree view can answer it (refuse the drop),
+// so it is returned rather than asserted. A dead handle stays an `#assert`,
+// because nothing recovers from one.
+//
+// A `child` that is not yet in the tree is attached, which fires
+// `on_enter_tree` and `on_ready` exactly as `add_child` does. One that is
+// already in the tree is **moved**, and a move fires nothing: the node never
+// left the tree, and firing `on_exit_tree` for a node that is still in it
+// would be a lie told to every hook that reads it.
+bool set_parent(^Graph g, Node child, Node parent):
+    ^Slot cs = slot_at(g, child)
+    #assert(cs != nil, "app:graph.set_parent: child handle is not alive")
+    if valid(parent):
+        #assert(slot_at(g, parent) != nil, "app:graph.set_parent: parent handle is not alive")
+        if is_ancestor_or_self(g, child, parent):
+            return false
+    if !cs.attached:
+        add_child(g, parent, child)
+        return true
+    detach(g, child)
+    attach(g, parent, child)
+    return true
+
+private void free_subtree(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return
+    TreeFn exit_fn = s.on_exit_tree
+    rawptr ud = s.userdata
+    if exit_fn != nil:
+        exit_fn(g, n, ud)
+    s = slot_at(g, n)
+    if s == nil:
+        return   // the hook already removed this node itself
+    Node child = s.first_child
+    for valid(child):
+        ^Slot cs = slot_at(g, child)
+        if cs == nil:
+            break
+        Node next = cs.next_sibling
+        free_subtree(g, child)
+        child = next
+    s = slot_at(g, n)
+    if s == nil:
+        return
+    free_slot(g, n.index)
+
+// Detach `n` from its parent (or from the root list) and free it and its
+// whole subtree, firing `on_exit_tree` on every freed node, parent before
+// children — consistently top-down, the same order `add_child`'s
+// `on_enter_tree` uses, rather than mixing two orderings. Every handle into
+// the freed subtree reads as invalid (`slot_at` returns `nil`) from this
+// call onward. A no-op on an already-invalid `n`.
+void remove(^Graph g, Node n):
+    detach(g, n)
+    free_subtree(g, n)
+
+// ── the tree walk ────────────────────────────────────────────────────────
+
+// The one traversal. `fire_process` is what `process` and `update_transforms`
+// differ by and it is the whole difference between them — see the package doc
+// comment for why there is not a second copy of the two lines above it.
+private void walk_subtree(^Graph g, Node n, xform.Transform2D parent_global, f32 dt,
+                          bool fire_process):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return
+    xform.Transform2D global = parent_global * s.local
+    s.global = global
+    if fire_process:
+        ProcessFn fn = s.on_process
+        rawptr ud = s.userdata
+        if fn != nil:
+            fn(g, n, dt, ud)
+        // Re-derive: the hook above may have added, removed or reparented
+        // nodes (including `n` itself), and may have grown the pool.
+        s = slot_at(g, n)
+        if s == nil:
+            return
+    Node child = s.first_child
+    for valid(child):
+        ^Slot cs = slot_at(g, child)
+        if cs == nil:
+            break
+        Node next = cs.next_sibling
+        walk_subtree(g, child, global, dt, fire_process)
+        child = next
+
+private void walk_roots(^Graph g, f32 dt, bool fire_process):
+    Node root = g.first_root
+    for valid(root):
+        ^Slot rs = slot_at(g, root)
+        if rs == nil:
+            break
+        Node next = rs.next_sibling
+        walk_subtree(g, root, xform.IDENTITY, dt, fire_process)
+        root = next
+
+// Walk every root and its descendants in order, recomputing each node's
+// global transform (parent's global composed with the node's own local one —
+// see `core:geom/xform`) and firing `on_process(n, dt, userdata)`. A node
+// added by a hook during this walk is not visited until the *next* `process`
+// call — matching `on_ready` firing at `add_child` time rather than
+// mid-walk (package doc comment).
+void process(^Graph g, f32 dt):
+    walk_roots(g, dt, true)
+
+// The same walk with the hooks left alone: every node's global transform is
+// brought up to date and **no `on_process` fires**. This is what a renderer
+// calls, because finding out where things are must not advance anything: a
+// frame that is redrawn twice, or drawn without having been stepped, would
+// otherwise tick game logic once per draw.
+void update_transforms(^Graph g):
+    walk_roots(g, 0.0, false)
+
+// ── reading the tree ─────────────────────────────────────────────────────
+
+Node parent_of(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return INVALID
+    return s.parent
+
+Node first_child_of(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return INVALID
+    return s.first_child
+
+Node last_child_of(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return INVALID
+    return s.last_child
+
+Node next_sibling_of(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return INVALID
+    return s.next_sibling
+
+// The first root, and the root after `n` — the same two readers
+// `first_child_of`/`next_sibling_of` are, over the list the package doc
+// comment describes. A caller walks roots with these rather than scanning the
+// pool, which is the whole point of the list existing.
+Node first_root(^Graph g):
+    return g.first_root
+
+Node next_root(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil || valid(s.parent):
+        return INVALID
+    return s.next_sibling
+
+// Whether `n` is in the tree — attached to a parent or standing in the root
+// list. A `create`d node is not, until `add_child` or `set_parent` puts it
+// there.
+bool in_tree(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return false
+    return s.attached
+
+// ── local transform (what a program edits) ──────────────────────────────
+
+[2]f32 position(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return (0.0, 0.0)
+    return s.position
+
+void set_position(^Graph g, Node n, [2]f32 p):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.position = p
+        s.local = xform.from_trs(p, s.rotation, s.scale)
+
+f32 rotation(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return 0.0
+    return s.rotation
+
+void set_rotation(^Graph g, Node n, f32 r):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.rotation = r
+        s.local = xform.from_trs(s.position, r, s.scale)
+
+[2]f32 scale(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return (1.0, 1.0)
+    return s.scale
+
+void set_scale(^Graph g, Node n, [2]f32 sc):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.scale = sc
+        s.local = xform.from_trs(s.position, s.rotation, sc)
+
+// The node's own transform, as the matrix everything here composes with.
+xform.Transform2D transform(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return xform.IDENTITY
+    return s.local
+
+// Set the local transform from a matrix, for a caller that has one — a
+// transform read off another node, an inverse, a product — rather than a
+// triple to feed `from_trs`. The matrix is stored as written; the triple is
+// decomposed out of it so `position`/`rotation`/`scale` keep answering, and
+// loses shear exactly where `core:geom/xform`'s own `rotation_of`/`scale_of`
+// document that they do. Nothing downstream of `global_transform` is
+// affected by that: composition uses the matrix.
+void set_transform(^Graph g, Node n, xform.Transform2D t):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.local = t
+        s.position = xform.position_of(t)
+        s.rotation = xform.rotation_of(t)
+        s.scale = xform.scale_of(t)
+
+// ── presentation properties (carried, never read here) ───────────────────
+//
+// See the package doc comment for why these live on a backend-neutral tree
+// at all, and for why `payload` is not `userdata`.
+
+bool visible(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return false
+    return s.visible
+
+void set_visible(^Graph g, Node n, bool v):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.visible = v
+
+// The tint a renderer composes down through this node's whole subtree.
+[4]u8 modulate(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return (255, 255, 255, 255)
+    return s.modulate
+
+void set_modulate(^Graph g, Node n, [4]u8 c):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.modulate = c
+
+// The tint that applies to this node alone and is not handed to its children
+// — Godot's own split, kept because "fade this one thing" and "fade this
+// whole branch" are different edits and a caller that has only one of them
+// ends up multiplying the other back out by hand.
+[4]u8 self_modulate(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return (255, 255, 255, 255)
+    return s.self_modulate
+
+void set_self_modulate(^Graph g, Node n, [4]u8 c):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.self_modulate = c
+
+i32 z_index(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return 0
+    return s.z_index
+
+void set_z_index(^Graph g, Node n, i32 z):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.z_index = z
+
+// Whether `z_index` is read as an offset from the parent's layer (the
+// default, and Godot's) or as an absolute one.
+bool z_as_relative(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return true
+    return s.z_as_relative
+
+void set_z_as_relative(^Graph g, Node n, bool rel):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.z_as_relative = rel
+
+bool clip(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return false
+    return s.clip
+
+void set_clip(^Graph g, Node n, bool on):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.clip = on
+
+// The rectangle `clip` clips to, as `(x, y, w, h)`. Stored whether or not
+// `clip` is on, so that turning clipping off and on again does not lose the
+// rect — the two are set by two different call sites in every consumer
+// written so far.
+[4]f32 custom_rect(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return (0.0, 0.0, 0.0, 0.0)
+    return s.custom_rect
+
+void set_custom_rect(^Graph g, Node n, [4]f32 r):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.custom_rect = r
+
+// An opaque `u32` this package stores and never interprets — a renderer's
+// name for whatever it hangs off a node. Zero on a fresh node, and zero is
+// not special here: what it means is the caller's to decide.
+u32 payload(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return 0
+    return s.payload
+
+void set_payload(^Graph g, Node n, u32 p):
+    ^Slot s = slot_at(g, n)
+    if s != nil:
+        s.payload = p
+
+// ── global transform (read-only: valid as of the last `process` or
+// `update_transforms` call that covered this node) ───────────────────────
+
+xform.Transform2D global_transform(^Graph g, Node n):
+    ^Slot s = slot_at(g, n)
+    if s == nil:
+        return xform.IDENTITY
+    return s.global
+
+[2]f32 global_position(^Graph g, Node n):
+    return xform.position_of(global_transform(g, n))
+
+// A point in `n`'s local space, expressed in the tree's root space.
+[2]f32 to_global(^Graph g, Node n, [2]f32 local_point):
+    return xform.transform_point(global_transform(g, n), local_point)
+
+// A point in the tree's root space, expressed in `n`'s local space.
+[2]f32 to_local(^Graph g, Node n, [2]f32 global_point):
+    xform.Transform2D inv = xform.inverse(global_transform(g, n))
+    return xform.transform_point(inv, global_point)

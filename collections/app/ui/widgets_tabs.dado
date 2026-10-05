@@ -1,0 +1,499 @@
+// app:ui — `TabBar`: one row of tabs, the strip above a pane of documents.
+//
+// Each tab is an owned copy of a title, a `modified` flag and a place in the
+// row. A tab is drawn in `TAB_EXTRA` cells more than its title: a blank, the
+// title, a blank, the modified mark (`TAB_MARK`, or a blank when the tab is
+// not modified), the close mark (`TAB_CLOSE`) and a blank; every cell is
+// written in the tab's look from `TabTheme`, so the marks are cells, not
+// chrome. Cells after the last tab take the bar's background.
+//
+// **The bar reports; the program decides.** A left click on a tab selects it
+// and emits `tab_selected` when the selection changed; a left click on its
+// close mark, or a middle click anywhere on it, emits `tab_close_requested`
+// and changes nothing. `tab_bar_signal_index` answers which tab the last
+// signal was about. The bar never removes a tab itself — the program does,
+// with `tab_bar_remove`, after whatever prompt unsaved changes need. Calls
+// (`tab_bar_select`, `tab_bar_remove`, ...) emit nothing.
+//
+// **Too many tabs.** When the tabs at their full titles are wider than the
+// bar, every title is cut to the same cap — the widest that fits, but never
+// below `TAB_TITLE_MIN` columns — and a cut title ends in `TAB_ELLIPSIS`
+// (`tab_title_cap`). If the tabs still do not fit, the strip scrolls sideways,
+// by the least that shows the whole selected tab (`tab_follow`); nothing else
+// scrolls it, so a tab out of view is reached by selecting it (the program's
+// keys, or a click once it is in view).
+//
+// **Focus.** The bar is not focusable. The selected tab is drawn
+// `selected` while focus is inside the bar's pane — its parent, or what
+// `tab_bar_set_pane` names — and `selected_unfocused` otherwise; the bar asks
+// to be repainted on every focus move (`set_focus_repaint`) to keep that true.
+// Its minimum is one row by one minimal tab's columns (none with no tabs);
+// it expands horizontally.
+package ui
+
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+import "core:chars"
+import "core:math"
+
+// Title columns a tab is never cut below.
+const i32 TAB_TITLE_MIN = 4
+// Cells a tab takes beyond its title (see the file's head).
+const i32 TAB_EXTRA = 5
+// The three marks, each one column.
+const string8 TAB_MARK = "\xE2\x97\x8F"
+const string8 TAB_CLOSE = "\xC3\x97"
+const string8 TAB_ELLIPSIS = "\xE2\x80\xA6"
+
+// ── Pure arithmetic ────────────────────────────────────────────────────────
+
+// The title cap for tabs whose titles are `title_cols` columns in a bar
+// `bar_cols` wide: the longest title's columns when every tab fits whole;
+// otherwise the largest cap, not below `TAB_TITLE_MIN`, at which the cut tabs
+// fit; `TAB_TITLE_MIN` when even that does not. A title shorter than the cap
+// is never padded. Negative columns read as zero.
+i32 tab_title_cap([]i32 title_cols, i32 bar_cols):
+    i32 longest = 0
+    for t in title_cols:
+        if t > longest:
+            longest = t
+    if tabs_width(title_cols, longest) <= i64(bar_cols):
+        return longest
+    if longest <= TAB_TITLE_MIN:
+        return longest
+    i32 lo = TAB_TITLE_MIN
+    i32 hi = longest
+    if tabs_width(title_cols, lo) > i64(bar_cols):
+        return lo
+    // `lo` fits and `hi` does not: the largest that fits is in `[lo, hi)`.
+    for hi - lo > 1:
+        i32 mid = lo + (hi - lo) / 2
+        if tabs_width(title_cols, mid) <= i64(bar_cols):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+// The whole strip's width at title cap `cap`.
+private i64 tabs_width([]i32 title_cols, i32 cap):
+    i64 w = 0
+    for t in title_cols:
+        w = w + i64(tab_width(t, cap))
+    return w
+
+// One tab's cells: its title's columns cut to `cap`, plus `TAB_EXTRA`.
+i32 tab_width(i32 title_cols, i32 cap):
+    i32 t = clamp0(title_cols)
+    if t > clamp0(cap):
+        t = clamp0(cap)
+    return t + TAB_EXTRA
+
+// The strip's scroll, in columns, for tabs `widths` wide in a bar `bar_cols`
+// wide, the selected tab `selected` and the scroll before `scroll`: the least
+// change that shows the whole selected tab (its start, when it is wider than
+// the bar), held to `[0, max(0, total - bar_cols)]`. With no tab selected it
+// is only held to that range.
+i32 tab_follow([]i32 widths, i32 selected, i32 bar_cols, i32 scroll):
+    i64 total = 0
+    i64 start = 0
+    i64 w = 0
+    for k in 0..<#len(widths):
+        if i32(k) == selected:
+            start = total
+            w = i64(clamp0(widths[k]))
+        total = total + i64(clamp0(widths[k]))
+    i64 bar = i64(clamp0(bar_cols))
+    i64 s = i64(scroll)
+    if selected >= 0 && selected < i32(#len(widths)):
+        if start + w > s + bar:
+            s = start + w - bar
+        if start < s || w > bar:
+            s = start
+    i64 max = total - bar
+    if max < 0:
+        max = 0
+    if s > max:
+        s = max
+    if s < 0:
+        s = 0
+    return i32(s)
+
+// Which tab column `x` of the bar (0 its left edge) falls on, with the strip
+// scrolled by `scroll`, and whether it is that tab's close mark: `(-1, false)`
+// past the last tab and left of the bar.
+(i32 index, bool close) tab_hit([]i32 widths, i32 scroll, i32 x):
+    if x < 0:
+        return (-1, false)
+    i64 at = i64(x) + i64(scroll)
+    i64 start = 0
+    for k in 0..<#len(widths):
+        i64 w = i64(clamp0(widths[k]))
+        if at < start + w:
+            return (i32(k), at == start + w - 2)
+        start = start + w
+    return (-1, false)
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+private type Tab: (ref []char8 title, bool modified)
+
+// `widths` holds each tab's cells as the last `tab_layout` found them, and
+// `cap` the title cap then; `scroll` is the strip's scroll in columns.
+private type TabState: (
+    ref []Tab tabs,
+    i32       count,
+    i32       selected,
+    i32       scroll,
+    i32       cap,
+    ref []i32 widths,
+    i32       sig_index,
+    bool      has_pane,
+    Control   pane,
+)
+private type TabPtr: ^TabState
+
+private Kind g_tab_kind = NO_KIND
+private i32  g_sig_tab_selected = -1
+private i32  g_sig_tab_close = -1
+
+private Kind tab_kind():
+    if !kind_ok(g_tab_kind):
+        Hooks h
+        h.measure = tab_measure_hook
+        h.paint = tab_paint_hook
+        h.input = tab_input_hook
+        h.free = tab_free_hook
+        g_tab_kind = register_kind("tab_bar", h)
+    return g_tab_kind
+
+private bool is_tab_bar(Control c):
+    return kind(c) == g_tab_kind && state(c) != nil
+
+// A bar that may be changed now: not while `update` runs.
+private bool tab_changeable(Control c):
+    return is_tab_bar(c) && g_phase == PHASE_IDLE
+
+private string8 tab_title_of(^TabState s, i32 i):
+    if i < 0 || i >= s.count || s.tabs[i].title == nil:
+        return ""
+    return string8(s.tabs[i].title[:])
+
+// An owned copy of `text` from the tree's allocator; nil for the empty string
+// and when it cannot be made.
+private ref []char8 tab_copy(string8 text):
+    capture_alloc()
+    if #len(text) == 0:
+        return nil
+    ref []char8 t = #make([]char8, #len(text), g_alloc)
+    if t != nil:
+        for i in 0..<#len(text):
+            t[i] = text[i]
+    return t
+
+// Bring `widths`, `cap` and `scroll` up to date for the bar's rectangle now.
+// Answers false when the widths run cannot grow.
+private bool tab_layout(Control c, ^TabState s):
+    capture_alloc()
+    i32 want = math.max(s.count, 4)
+    if s.widths == nil:
+        s.widths = #make([]i32, want, g_alloc)
+        if s.widths == nil:
+            return false
+    if i32(#len(s.widths)) < s.count && !#resize(s.widths, want):
+        return false
+    for i in 0..<s.count:
+        s.widths[i] = cell.columns(tab_title_of(s, i32(i)))
+    i32 bar = rect(c).cols
+    s.cap = tab_title_cap(s.widths[0..<s.count], bar)
+    for i in 0..<s.count:
+        s.widths[i] = tab_width(s.widths[i], s.cap)
+    s.scroll = tab_follow(s.widths[0..<s.count], s.selected, bar, s.scroll)
+    return true
+
+// ── Hooks ──────────────────────────────────────────────────────────────────
+
+private cell.CellPoint tab_measure_hook(Control c, rawptr st):
+    _ = c
+    ^TabState s = TabPtr(st)
+    cell.CellPoint p = (0, 1)
+    if s.count > 0:
+        p.col = TAB_TITLE_MIN + TAB_EXTRA
+    return p
+
+// The title's first `cols` columns, whole clusters only: the bytes of `t` a
+// cut title keeps before its ellipsis.
+private string8 tab_prefix(string8 t, i32 cols):
+    i32 n = i32(#len(t))
+    i32 at = 0
+    i32 col = 0
+    for at < n:
+        i32 w = cell.cluster_columns_at(t, at, col)
+        if col + w > cols:
+            break
+        col = col + w
+        at = chars.cluster_end(t, at)
+    return t[0..<at]
+
+private void tab_paint_hook(Control c, rawptr st, cell.CellRect clip):
+    ^TabState s = TabPtr(st)
+    TabTheme th = theme_tab()
+    grid.clip(clip)
+    defer grid.unclip()
+    grid.fill(clip, th.bar_bg, th.bar_bg)
+    if !tab_layout(c, s):
+        return
+    cell.CellRect r = rect(c)
+    Control pane = parent(c)
+    if s.has_pane:
+        pane = s.pane
+    bool focus_in = focus_within(pane)
+    i32 x = r.col - s.scroll
+    for i in 0..<s.count:
+        i32 w = s.widths[i]
+        cell.CellRect tr = cell.rect(x, r.row, w, 1)
+        if !cell.is_empty(cell.intersect(tr, clip)):
+            CellLook look = th.tab
+            if i32(i) == s.selected && focus_in:
+                look = th.selected
+            else if i32(i) == s.selected:
+                look = th.selected_unfocused
+            grid.fill(tr, look.fg, look.bg)
+            string8 t = tab_title_of(s, i32(i))
+            i32 shown = w - TAB_EXTRA
+            if cell.columns(t) > shown && shown > 0:
+                string8 head = tab_prefix(t, shown - 1)
+                _ = grid.text(x + 1, r.row, head, shown - 1, look.fg, look.bg)
+                _ = grid.text(x + shown, r.row, TAB_ELLIPSIS, 1, look.fg, look.bg)
+            else:
+                _ = grid.text(x + 1, r.row, t, shown, look.fg, look.bg)
+            if s.tabs[i].modified:
+                _ = grid.text(x + w - 3, r.row, TAB_MARK, 1, look.fg, look.bg)
+            _ = grid.text(x + w - 2, r.row, TAB_CLOSE, 1, look.fg, look.bg)
+        x = x + w
+
+private bool tab_input_hook(Control c, rawptr st, input.Event e):
+    ^TabState s = TabPtr(st)
+    if input.mouse_kind(e) != input.MouseKind.Press:
+        return false
+    i32 button = input.mouse_button(e)
+    if button != 0 && button != 2:
+        return false
+    cell.CellPoint p = event_cell(e)
+    cell.CellRect r = rect(c)
+    if p.row != r.row || !tab_layout(c, s):
+        return false
+    (i32 i, bool on_close) = tab_hit(s.widths[0..<s.count], s.scroll, p.col - r.col)
+    if i < 0:
+        return false
+    if on_close || button == 2:
+        s.sig_index = i
+        _ = emit(c, tab_close_requested_signal())
+        return true
+    if i != s.selected:
+        tab_bar_select(c, i)
+        s.sig_index = i
+        _ = emit(c, tab_selected_signal())
+    return true
+
+private void tab_free_hook(Control c, rawptr st):
+    _ = c
+    ^TabState s = TabPtr(st)
+    if s.tabs != nil:
+        for i in 0..<s.count:
+            if s.tabs[i].title != nil:
+                #delete(s.tabs[i].title)
+        #delete(s.tabs)
+        s.tabs = nil
+    if s.widths != nil:
+        #delete(s.widths)
+        s.widths = nil
+    s.count = 0
+
+// ── The surface ────────────────────────────────────────────────────────────
+
+// An empty tab bar under `parent` (under the root for `NIL`), expanding
+// horizontally, with nothing selected; `NIL` wherever `create` would answer
+// it.
+Control tab_bar(Control parent):
+    Control c = create_owned(tab_kind(), parent, i64(#size(TabState)))
+    if !valid(c):
+        return NIL
+    ^TabState s = TabPtr(state(c))
+    s.selected = -1
+    s.sig_index = -1
+    set_expand(c, true, false)
+    set_focus_repaint(c, true)
+    return c
+
+// Emitted when a click selected a different tab; `tab_bar_signal_index` is
+// the tab now selected.
+i32 tab_selected_signal():
+    if g_sig_tab_selected < 0:
+        g_sig_tab_selected = signal("tab_selected")
+    return g_sig_tab_selected
+
+// Emitted when a click asked to close a tab; `tab_bar_signal_index` is that
+// tab. The bar changes nothing.
+i32 tab_close_requested_signal():
+    if g_sig_tab_close < 0:
+        g_sig_tab_close = signal("tab_close_requested")
+    return g_sig_tab_close
+
+// Connect to `tab_selected_signal` on `c`.
+void on_tab_selected(Control c, SignalFn fn, rawptr ctx):
+    connect(c, tab_selected_signal(), fn, ctx)
+
+// Connect to `tab_close_requested_signal` on `c`.
+void on_tab_close_requested(Control c, SignalFn fn, rawptr ctx):
+    connect(c, tab_close_requested_signal(), fn, ctx)
+
+// The tab the bar's last signal was about; -1 before any, and for anything
+// that is not a tab bar. Removing tabs does not renumber it.
+i32 tab_bar_signal_index(Control c):
+    if !is_tab_bar(c):
+        return -1
+    return TabPtr(state(c)).sig_index
+
+// Append a tab titled with a copy of `text`, not modified, and answer its
+// index; the first tab added to an empty bar is selected. -1, adding nothing,
+// for anything that is not a tab bar, when the tabs cannot grow, or while
+// `update` runs.
+i32 tab_bar_add(Control c, string8 title):
+    if !tab_changeable(c):
+        return -1
+    ^TabState s = TabPtr(state(c))
+    capture_alloc()
+    if s.tabs == nil:
+        s.tabs = #make([]Tab, 4, g_alloc)
+        if s.tabs == nil:
+            return -1
+    if s.count >= i32(#len(s.tabs)) && !#resize(s.tabs, s.count * 2):
+        return -1
+    s.tabs[s.count].title = tab_copy(title)
+    s.tabs[s.count].modified = false
+    s.count = s.count + 1
+    if s.selected < 0:
+        s.selected = 0
+    mark_layout(c)
+    return s.count - 1
+
+// Remove tab `i`. A tab before the selected one moves the selection with its
+// tab; removing the selected tab selects the one that took its place, or the
+// new last tab, or nothing when none is left. Emits nothing. Does nothing for
+// an index out of range, anything that is not a tab bar, or while `update`
+// runs.
+void tab_bar_remove(Control c, i32 i):
+    if !tab_changeable(c):
+        return
+    ^TabState s = TabPtr(state(c))
+    if i < 0 || i >= s.count:
+        return
+    if s.tabs[i].title != nil:
+        #delete(s.tabs[i].title)
+    for k in i..<s.count - 1:
+        s.tabs[k] = s.tabs[k + 1]
+    s.count = s.count - 1
+    s.tabs[s.count].title = nil
+    if i < s.selected:
+        s.selected = s.selected - 1
+    if s.selected >= s.count:
+        s.selected = s.count - 1
+    mark_layout(c)
+
+// Give tab `i` a copy of `title`. Does nothing for an index out of range,
+// anything that is not a tab bar, or while `update` runs.
+void tab_bar_set_title(Control c, i32 i, string8 title):
+    if !tab_changeable(c):
+        return
+    ^TabState s = TabPtr(state(c))
+    if i < 0 || i >= s.count:
+        return
+    if s.tabs[i].title != nil:
+        #delete(s.tabs[i].title)
+    s.tabs[i].title = tab_copy(title)
+    mark_paint(c)
+
+// Tab `i`'s title, as a view valid until it next changes; "" for an index out
+// of range and anything that is not a tab bar.
+string8 tab_bar_title(Control c, i32 i):
+    if !is_tab_bar(c):
+        return ""
+    return tab_title_of(TabPtr(state(c)), i)
+
+// Show or hide tab `i`'s modified mark. Same refusals as `tab_bar_set_title`.
+void tab_bar_set_modified(Control c, i32 i, bool modified):
+    if !tab_changeable(c):
+        return
+    ^TabState s = TabPtr(state(c))
+    if i < 0 || i >= s.count || s.tabs[i].modified == modified:
+        return
+    s.tabs[i].modified = modified
+    mark_paint(c)
+
+// Whether tab `i` shows its modified mark; false out of range.
+bool tab_bar_modified(Control c, i32 i):
+    if !is_tab_bar(c):
+        return false
+    ^TabState s = TabPtr(state(c))
+    if i < 0 || i >= s.count:
+        return false
+    return s.tabs[i].modified
+
+// Select tab `i`, scrolling the strip to show it at the next paint. Emits
+// nothing. Same refusals as `tab_bar_set_title`.
+void tab_bar_select(Control c, i32 i):
+    if !tab_changeable(c):
+        return
+    ^TabState s = TabPtr(state(c))
+    if i < 0 || i >= s.count || i == s.selected:
+        return
+    s.selected = i
+    mark_paint(c)
+
+// The selected tab; -1 with no tabs and for anything that is not a tab bar.
+i32 tab_bar_selected(Control c):
+    if !is_tab_bar(c):
+        return -1
+    return TabPtr(state(c)).selected
+
+// How many tabs the bar has; zero for anything that is not a tab bar.
+i32 tab_bar_count(Control c):
+    if !is_tab_bar(c):
+        return 0
+    return TabPtr(state(c)).count
+
+// Take `pane` as the subtree whose focus decides the selected tab's look, in
+// place of the bar's parent; `NIL` goes back to the parent. Marks the bar for
+// paint.
+void tab_bar_set_pane(Control c, Control pane):
+    if !tab_changeable(c):
+        return
+    ^TabState s = TabPtr(state(c))
+    s.has_pane = pane != NIL
+    s.pane = pane
+    mark_paint(c)
+
+// The strip's scroll in columns, brought up to date for the bar's rectangle
+// now; zero for anything that is not a tab bar.
+i32 tab_bar_scroll(Control c):
+    if !is_tab_bar(c):
+        return 0
+    ^TabState s = TabPtr(state(c))
+    _ = tab_layout(c, s)
+    return s.scroll
+
+// Tab `i`'s cells on the screen as the bar would draw it now (unclipped: part
+// or all of it may be scrolled out of the bar); empty out of range and for
+// anything that is not a tab bar.
+cell.CellRect tab_bar_tab_rect(Control c, i32 i):
+    if !is_tab_bar(c):
+        return cell.rect(0, 0, 0, 0)
+    ^TabState s = TabPtr(state(c))
+    if i < 0 || i >= s.count || !tab_layout(c, s):
+        return cell.rect(0, 0, 0, 0)
+    cell.CellRect r = rect(c)
+    i32 x = r.col - s.scroll
+    for k in 0..<i:
+        x = x + s.widths[k]
+    return cell.rect(x, r.row, s.widths[i], 1)

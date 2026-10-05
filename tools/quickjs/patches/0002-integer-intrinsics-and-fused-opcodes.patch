@@ -1,0 +1,428 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: S2a lab <s2a@lab>
+Date: Fri, 25 Sep 2026 14:48:31 -0800
+Subject: [PATCH] Integer intrinsics and fused integer opcodes for DadoScript
+ output
+
+DadoScript fork patches C1 and C2 (additive). They share the three free opcode
+slots (252-254 of 256): OP_dados_add_i32, OP_dados_op1 and OP_dados_op2
+(u8 sub-opcode), emitted only by the final pass so no existing opcode
+is renumbered.
+
+C2: a final-pass peephole fuses 'add push_i32(0) or' and
+'sub push_i32(0) or' - the (a op b) | 0 dadoc emits for every int32
+operation - into one opcode with an int fast path and a slow path that
+runs exactly the unfused operators.
+
+C1: with JS_EVAL_FLAG_DADOS, a call whose callee is the identifier
+__dados_imul, __dados_clz32, __dados_fround, __dados_i32, __dados_add32,
+__dados_sub32, __dados_add64, __dados_sub64 or __dados_mul64 compiles to one
+opcode. The name is never looked up, so no script can rebind it; the
+web glue defines the same names as ordinary functions.
+---
+ quickjs-opcode.h            |   5 +
+ quickjs.c                   | 262 ++++++++++++++++++++++++++++++++++++
+ quickjs.h                   |   2 +
+ tests/test_dados_int_ops.js |  25 ++++
+ 4 files changed, 294 insertions(+)
+ create mode 100644 tests/test_dados_int_ops.js
+
+diff --git a/quickjs-opcode.h b/quickjs-opcode.h
+index ec2a5ad..057d7dd 100644
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -372,6 +372,11 @@ DEF(        is_null, 1, 1, 1, none)
+ DEF(typeof_is_undefined, 1, 1, 1, none)
+ DEF( typeof_is_function, 1, 1, 1, none)
+ 
++/* DadoScript fork (C1, C2): emitted only by the final pass, after the short opcodes */
++DEF(   dados_add_i32, 1, 2, 1, none) /* (a + b) | 0 */
++DEF(       dados_op1, 2, 1, 1, u8)   /* unary intrinsic, sub-opcode in u8 */
++DEF(       dados_op2, 2, 2, 1, u8)   /* binary intrinsic, sub-opcode in u8 */
++
+ #undef DEF
+ #undef def
+ #endif  /* DEF */
+diff --git a/quickjs.c b/quickjs.c
+index 6f9952d..77f91a9 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -18036,6 +18036,27 @@ static bool needs_backtrace(JSValue exc)
+ }
+ 
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
++/* DadoScript fork (C1, C2): sub-opcodes of OP_dados_op1 / OP_dados_op2 */
++enum {
++    DADOS_OP1_TO_I32,   /* __dados_i32(x)      x | 0 */
++    DADOS_OP1_CLZ32,    /* __dados_clz32(x)    Math.clz32(x) */
++    DADOS_OP1_FROUND,   /* __dados_fround(x)   Math.fround(x) */
++    DADOS_OP1_COUNT
++};
++enum {
++    DADOS_OP2_IMUL,     /* __dados_imul(a, b)  Math.imul(a, b) */
++    DADOS_OP2_SUB_I32,  /* __dados_sub32(a, b) (a - b) | 0 */
++    DADOS_OP2_ADD64,    /* __dados_add64(a, b) BigInt.asIntN(64, a + b) */
++    DADOS_OP2_SUB64,    /* __dados_sub64(a, b) BigInt.asIntN(64, a - b) */
++    DADOS_OP2_MUL64,    /* __dados_mul64(a, b) BigInt.asIntN(64, a * b) */
++    DADOS_OP2_ADD_I32,  /* __dados_add32(a, b) (a + b) | 0 */
++    DADOS_OP2_COUNT
++};
++#define DADOS_APPLY_MAGIC 0x7000 /* OP_apply operand carrying an intrinsic to phase 3 */
++static double js_math_fround(double a);
++static JSValue js_bigint_asUintN(JSContext *ctx, JSValueConst this_val,
++                                 int argc, JSValueConst *argv, int asIntN);
++
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags)
+@@ -20912,6 +20933,151 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             JS_FreeValue(ctx, sp[-1]);
+             sp[-1] = JS_FALSE;
+             BREAK;
++        /* DadoScript fork (C1, C2): intrinsic and fused integer opcodes. Each has
++           a fast path for the operand tags dadoc's output always has, and a
++           slow path that runs exactly what the unfused JavaScript would. */
++        CASE(OP_dados_add_i32):
++            {
++                JSValue op1 = sp[-2], op2 = sp[-1];
++                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
++                    sp[-2] = js_int32((int32_t)((uint32_t)JS_VALUE_GET_INT(op1) +
++                                                (uint32_t)JS_VALUE_GET_INT(op2)));
++                    sp--;
++                    BREAK;
++                }
++                if (js_add_slow(ctx, sp))
++                    goto exception;
++                sp--;
++                goto dados_to_i32;
++            }
++        CASE(OP_dados_op1):
++            {
++                JSValue op1 = sp[-1];
++                int sub = *pc++;
++                switch (sub) {
++                case DADOS_OP1_TO_I32:
++                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
++                        BREAK; /* braced: BREAK is two statements with dumps enabled */
++                    }
++                dados_to_i32:
++                    *sp++ = js_int32(0);
++                    if (js_binary_logic_slow(ctx, sp, OP_or))
++                        goto exception;
++                    sp--;
++                    BREAK;
++                case DADOS_OP1_CLZ32:
++                    {
++                        uint32_t x32;
++                        if (likely(JS_VALUE_GET_TAG(op1) == JS_TAG_INT)) {
++                            x32 = JS_VALUE_GET_INT(op1);
++                        } else {
++                            if (JS_ToUint32(ctx, &x32, op1))
++                                goto exception;
++                            JS_FreeValue(ctx, op1);
++                        }
++                        sp[-1] = js_int32(x32 == 0 ? 32 : clz32(x32));
++                    }
++                    BREAK;
++                case DADOS_OP1_FROUND:
++                    {
++                        double d;
++                        if (JS_VALUE_GET_TAG(op1) == JS_TAG_FLOAT64) {
++                            d = JS_VALUE_GET_FLOAT64(op1);
++                        } else {
++                            if (JS_ToFloat64(ctx, &d, op1))
++                                goto exception;
++                            JS_FreeValue(ctx, op1);
++                        }
++                        sp[-1] = js_float64(js_math_fround(d));
++                    }
++                    BREAK;
++                default:
++                    goto invalid_dados_op;
++                }
++            }
++        CASE(OP_dados_op2):
++            {
++                JSValue op1 = sp[-2], op2 = sp[-1];
++                int sub = *pc++;
++                switch (sub) {
++                case DADOS_OP2_IMUL:
++                    {
++                        uint32_t x32, y32;
++                        if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
++                            x32 = JS_VALUE_GET_INT(op1);
++                            y32 = JS_VALUE_GET_INT(op2);
++                        } else {
++                            if (JS_ToUint32(ctx, &x32, op1) || JS_ToUint32(ctx, &y32, op2))
++                                goto exception;
++                            JS_FreeValue(ctx, op1);
++                            JS_FreeValue(ctx, op2);
++                        }
++                        sp[-2] = js_int32((int32_t)(x32 * y32));
++                        sp--;
++                    }
++                    BREAK;
++                case DADOS_OP2_SUB_I32:
++                    if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
++                        sp[-2] = js_int32((int32_t)((uint32_t)JS_VALUE_GET_INT(op1) -
++                                                    (uint32_t)JS_VALUE_GET_INT(op2)));
++                        sp--;
++                        BREAK;
++                    }
++                    if (js_binary_arith_slow(ctx, sp, OP_sub))
++                        goto exception;
++                    sp--;
++                    goto dados_to_i32;
++                case DADOS_OP2_ADD64:
++                case DADOS_OP2_SUB64:
++                case DADOS_OP2_MUL64:
++                    {
++                        int t1 = JS_VALUE_GET_TAG(op1), t2 = JS_VALUE_GET_TAG(op2);
++                        int64_t x64, y64;
++                        uint64_t r;
++                        JSValue args[2];
++                        if (likely((t1 == JS_TAG_SHORT_BIG_INT || t1 == JS_TAG_BIG_INT) &&
++                                   (t2 == JS_TAG_SHORT_BIG_INT || t2 == JS_TAG_BIG_INT))) {
++                            /* ToBigInt64 of a BigInt is its value mod 2^64: the
++                               asIntN(64, a op b) of the unfused code */
++                            JS_ToBigInt64(ctx, &x64, op1);
++                            JS_ToBigInt64(ctx, &y64, op2);
++                            if (sub == DADOS_OP2_ADD64)
++                                r = (uint64_t)x64 + (uint64_t)y64;
++                            else if (sub == DADOS_OP2_SUB64)
++                                r = (uint64_t)x64 - (uint64_t)y64;
++                            else
++                                r = (uint64_t)x64 * (uint64_t)y64;
++                            JS_FreeValue(ctx, op1);
++                            JS_FreeValue(ctx, op2);
++                            sp[-2] = JS_NewBigInt64(ctx, (int64_t)r);
++                            sp--;
++                            if (unlikely(JS_IsException(sp[-1]))) {
++                                sp--;
++                                goto exception;
++                            }
++                            BREAK;
++                        }
++                        /* slow: the unfused a op b, then BigInt.asIntN(64, _) */
++                        if (sub == DADOS_OP2_ADD64 ? js_add_slow(ctx, sp) :
++                            js_binary_arith_slow(ctx, sp, sub == DADOS_OP2_SUB64 ? OP_sub : OP_mul))
++                            goto exception;
++                        sp--;
++                        args[0] = js_int32(64);
++                        args[1] = sp[-1];
++                        ret_val = js_bigint_asUintN(ctx, JS_UNDEFINED, 2, vc(args), 1);
++                        JS_FreeValue(ctx, sp[-1]);
++                        sp[-1] = ret_val;
++                        if (JS_IsException(ret_val)) {
++                            sp--;
++                            goto exception;
++                        }
++                    }
++                    BREAK;
++                default:
++                    goto invalid_dados_op;
++                }
++            }
++        invalid_dados_op:
+         CASE(OP_invalid):
+         DEFAULT:
+             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
+@@ -22430,6 +22596,7 @@ typedef struct JSParseState {
+     JSFunctionDef *cur_func;
+     bool is_module; /* parsing a module */
+     bool allow_html_comments;
++    bool dados; /* DadoScript fork (C1): __dados_* intrinsics recognised (JS_EVAL_FLAG_DADOS) */
+ } JSParseState;
+ 
+ typedef struct JSOpCode {
+@@ -24029,6 +24196,41 @@ static void emit_u32(JSParseState *s, uint32_t val)
+     dbuf_put_u32(&s->cur_func->byte_code, val);
+ }
+ 
++/* DadoScript fork (C1): intrinsics. In code evaluated with JS_EVAL_FLAG_DADOS (the
++   JavaScript dadoc emits) a call whose callee is one of these identifiers
++   compiles to one opcode instead of a call. The name is never looked up, so
++   nothing a script does can rebind it; in a browser the same names are
++   ordinary functions (Math.imul, ...) and give the same answers. */
++
++static const struct { const char *name; uint8_t arity, sub; } dados_intrinsics[] = {
++    { "__dados_i32", 1, DADOS_OP1_TO_I32 },
++    { "__dados_clz32", 1, DADOS_OP1_CLZ32 },
++    { "__dados_fround", 1, DADOS_OP1_FROUND },
++    { "__dados_imul", 2, DADOS_OP2_IMUL },
++    { "__dados_sub32", 2, DADOS_OP2_SUB_I32 },
++    { "__dados_add64", 2, DADOS_OP2_ADD64 },
++    { "__dados_sub64", 2, DADOS_OP2_SUB64 },
++    { "__dados_mul64", 2, DADOS_OP2_MUL64 },
++    { "__dados_add32", 2, DADOS_OP2_ADD_I32 },
++};
++
++/* returns the index in dados_intrinsics[], or -1 */
++static int dados_intrinsic_find(JSContext *ctx, JSAtom name)
++{
++    char buf[ATOM_GET_STR_BUF_SIZE];
++    const char *str;
++    size_t i;
++
++    str = JS_AtomGetStr(ctx, buf, sizeof(buf), name);
++    if (strncmp(str, "__dados_", 8) != 0)
++        return -1;
++    for (i = 0; i < countof(dados_intrinsics); i++) {
++        if (!strcmp(str, dados_intrinsics[i].name))
++            return i;
++    }
++    return -1;
++}
++
+ static void emit_source_loc_at(JSParseState *s, int line_num, int col_num)
+ {
+     JSFunctionDef *fd = s->cur_func;
+@@ -27076,6 +27278,7 @@ static void optional_chain_test(JSParseState *s, int *poptional_chaining_label,
+ /* allowed parse_flags: PF_POSTFIX_CALL */
+ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+ {
++    int dados_intrinsic = -1; /* DadoScript fork (C1) */
+     FuncCallType call_type;
+     int optional_chaining_label;
+     bool accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
+@@ -27463,6 +27666,17 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                         if (name == JS_ATOM_eval && call_type == FUNC_CALL_NORMAL && !has_optional_chain) {
+                             /* direct 'eval' */
+                             opcode = OP_eval;
++                        } else if (s->dados && call_type == FUNC_CALL_NORMAL && !has_optional_chain &&
++                                   (dados_intrinsic = dados_intrinsic_find(s->ctx, name)) >= 0) {
++                            /* DadoScript fork (C1): drop the callee load; the
++                               arguments are followed by one opcode */
++                            int at = fd->last_opcode_pos, len = 1 + 4 + 2;
++                            memmove(fd->byte_code.buf + at, fd->byte_code.buf + at + len,
++                                    fd->byte_code.size - at - len);
++                            fd->byte_code.size -= len;
++                            fd->last_opcode_pos = -1;
++                            JS_FreeAtom(s->ctx, name);
++                            opcode = OP_apply;
+                         } else {
+                             /* verify if function name resolves to a simple
+                                get_loc/get_arg: a function call inside a `with`
+@@ -27535,6 +27749,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                 if (js_parse_expect(s, ','))
+                     return -1;
+             }
++            if (s->token.val == TOK_ELLIPSIS && opcode == OP_apply)
++                return js_parse_error(s, "spread argument to a DadoScript intrinsic");
+             if (s->token.val == TOK_ELLIPSIS) {
+                 emit_op(s, OP_array_from);
+                 emit_u16(s, arg_count);
+@@ -27614,6 +27830,14 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                     return -1;
+             emit_func_call:
+                 switch(opcode) {
++                case OP_apply: /* DadoScript fork (C1): an intrinsic, rewritten in phase 3 */
++                    if (arg_count != dados_intrinsics[dados_intrinsic].arity)
++                        return js_parse_error(s, "%s takes %d argument(s)",
++                                              dados_intrinsics[dados_intrinsic].name,
++                                              dados_intrinsics[dados_intrinsic].arity);
++                    emit_op(s, OP_apply);
++                    emit_u16(s, DADOS_APPLY_MAGIC | dados_intrinsic);
++                    break;
+                 case OP_get_field:
+                 case OP_scope_get_private_field:
+                 case OP_get_array_el:
+@@ -36301,6 +36525,43 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+             }
+             goto no_change;
+ 
++        case OP_apply:
++            /* DadoScript fork (C1): an intrinsic carried from the parser */
++            {
++                int magic = get_u16(bc_buf + pos + 1);
++                if ((magic & 0xff00) == DADOS_APPLY_MAGIC) {
++                    int k = magic & 0xff;
++                    add_pc2line_info(s, bc_out.size, line_num, col_num);
++                    if (dados_intrinsics[k].sub == DADOS_OP2_ADD_I32 && dados_intrinsics[k].arity == 2) {
++                        dbuf_putc(&bc_out, OP_dados_add_i32);
++                    } else {
++                        dbuf_putc(&bc_out, dados_intrinsics[k].arity == 1 ? OP_dados_op1 : OP_dados_op2);
++                        dbuf_putc(&bc_out, dados_intrinsics[k].sub);
++                    }
++                    break;
++                }
++            }
++            goto no_change;
++
++        case OP_add:
++        case OP_sub:
++            /* DadoScript fork (C2): add push_i32(0) or -> dados_add_i32,
++               sub push_i32(0) or -> dados_op2(sub_i32) */
++            if (code_match(&cc, pos_next, OP_push_i32, OP_or, -1) && cc.label == 0) {
++                if (cc.line_num >= 0) line_num = cc.line_num;
++                if (cc.col_num >= 0) col_num = cc.col_num;
++                add_pc2line_info(s, bc_out.size, line_num, col_num);
++                if (op == OP_add) {
++                    dbuf_putc(&bc_out, OP_dados_add_i32);
++                } else {
++                    dbuf_putc(&bc_out, OP_dados_op2);
++                    dbuf_putc(&bc_out, DADOS_OP2_SUB_I32);
++                }
++                pos_next = cc.pos;
++                break;
++            }
++            goto no_change;
++
+         case OP_insert2:
+             /* Transformation:
+                insert2 put_field(a) drop -> put_field(a)
+@@ -38235,6 +38496,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     }
+     s->is_module = (m != NULL);
+     s->allow_html_comments = !s->is_module;
++    s->dados = (flags & JS_EVAL_FLAG_DADOS) != 0; /* DadoScript fork (C1) */
+ 
+     push_scope(s); /* body scope */
+     fd->body_scope = fd->scope_level;
+diff --git a/quickjs.h b/quickjs.h
+index b5e5576..47a1d39 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -460,6 +460,8 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
+ /* allow top-level await in normal script. JS_Eval() returns a
+    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
+ #define JS_EVAL_FLAG_ASYNC (1 << 7)
++/* DadoScript fork (C1): recognise the __dados_* intrinsics (code emitted by dadoc) */
++#define JS_EVAL_FLAG_DADOS (1 << 24)
+ 
+ typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+ typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+diff --git a/tests/test_dados_int_ops.js b/tests/test_dados_int_ops.js
+new file mode 100644
+index 0000000..05226c1
+--- /dev/null
++++ b/tests/test_dados_int_ops.js
+@@ -0,0 +1,25 @@
++// DadoScript fork (C2): the fused `(a + b) | 0` and `(a - b) | 0` opcodes must give
++// exactly what the unfused operators give, for every operand type.
++import { assert } from "./assert.js";
++
++let zero = 0; // `| zero` is never fused: the reference
++let calls = 0;
++const obj = { valueOf() { calls++; return 7; } };
++const vals = [0, -0, 1, -1, 0x7fffffff, -0x80000000, 0x80000000, 0xffffffff,
++    2 ** 53, 1.5, -1.5, 1e300, Infinity, -Infinity, NaN, "12", "x", "", true,
++    null, undefined, obj, [5], {}, 1n];
++
++function r(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
++
++for (const a of vals) {
++    for (const b of vals) {
++        assert(r(() => (a + b) | 0), r(() => (a + b) | zero), `(${String(a)} + ${String(b)}) | 0`);
++        assert(r(() => (a - b) | 0), r(() => (a - b) | zero), `(${String(a)} - ${String(b)}) | 0`);
++    }
++}
++calls = 0; (obj + obj) | 0; const c1 = calls;
++calls = 0; (obj + obj) | zero; const c2 = calls;
++assert(c1, c2, "valueOf calls");
++let acc = 0;
++for (let i = 0; i < 100000; i++) acc = (acc + i * 7919) | 0;
++assert(acc, -699451824);
+-- 
+2.43.0
+

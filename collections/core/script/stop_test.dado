@@ -1,0 +1,200 @@
+@test
+// The engine word and the interrupt hook in isolation (`stop.dado`), on the
+// fork, with no emitter in front: hand-written ES modules that never return,
+// run by a second thread through `enter`/`call`/`leave` — the shape every run
+// the verbs lower to has — and stopped from this one.
+//
+// * **Asked, a script's `finally` runs.** The hook throws an `Error` of code
+//   `STOPPED` and answers `JS_INTERRUPT_RAISE` (the fork's patch 0007), so
+//   the engine raises it catchable: a `finally` prints, and the run fails
+//   `STOPPED` with nothing on the error sink.
+// * **Forced, nothing more runs.** A script that catches the stop and spins
+//   on prints what it caught once, and once the timeout passes the engine's
+//   uncatchable error skips its `finally`.
+// * **Ending frees the heap in one step.** Once a stop has ended the engine,
+//   the only block left on the allocator it was given is the engine's own
+//   state, which `destroy` frees.
+// * **A VM belongs to the thread that made it** (Sam's change request R1):
+//   the spinning thread is handed each engine as its own before it runs it,
+//   as a VM it made would be, and a run from any other thread — this one,
+//   asking a stopped or a paused engine — fails `THREAD`.
+// * **A paused engine is busy** to its own thread, and a stopped one refuses
+//   every run.
+package script
+
+import "core:fmt"
+import "core:mem"
+import "core:mem/libc"
+import "core:threads"
+import "core:time"
+
+private const cstring SPIN_JS = """
+    export function polite() {
+        try { for (;;) {} } finally { println("polite: finally"); }
+    }
+    export function stubborn() {
+        try {
+            for (;;) {
+                try { for (;;) {} } catch (e) { println("stubborn: caught " + String(e.code)); }
+            }
+        } finally { println("stubborn: finally"); }
+    }
+    """
+
+private type Tally:
+    i64 blocks,
+
+private Tally counted
+
+private rawptr counting(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) c = libc.allocator()
+    if mode == mem.AllocatorMode.Alloc:
+        rawptr p = c.proc(c.data, mode, nbytes, align, old, old_size)
+        if p != nil:
+            _ = #atomic_fetch_add(&counted.blocks, 1, #RELAXED)
+        return p
+    if mode == mem.AllocatorMode.Free:
+        _ = #atomic_fetch_sub(&counted.blocks, 1, #RELAXED)
+    return c.proc(c.data, mode, nbytes, align, old, old_size)
+
+private [1024]char8 out_store
+private [1024]char8 err_store
+private fmt.Cursor out_c
+private fmt.Cursor err_c
+
+// What the spinning thread runs, and what its run failed with.
+private Engine g_engine
+private Handle g_module
+private cstring g_entry
+private i32 g_code
+
+private rawptr spinner(rawptr arg):
+    g_code = 0
+    // The engine is handed to this thread, as one it made would be its own.
+    hold_lock(g_engine)
+    g_engine^.stop.owner = this_thread()
+    drop_lock(g_engine)
+    try enter(g_engine) else code:
+        g_code = code
+        return nil
+    try call(g_engine, g_module, g_entry) else code:
+        g_code = leaving(g_engine, script_code(g_engine, code))
+        return nil
+    leave(g_engine)
+    return nil
+
+// A fresh engine holding `SPIN_JS`, its sinks the two buffers.
+private !Engine spin_engine():
+    try Engine e = create((counting, nil))
+    set_sinks(e, fmt.to_bytes(&out_c), fmt.to_bytes(&err_c))
+    try add_module(e, "spin", SPIN_JS)
+    try Handle m = load(e, "spin") else code:
+        destroy(e)
+        fail code
+    g_engine = e
+    g_module = m
+    return e
+
+// Spawn the spinner on `entry` and wait until its run is inside the engine.
+private rawptr start(cstring entry):
+    g_entry = entry
+    rawptr t = threads.spawn(spinner, nil)
+    for !running_now(g_engine):
+        time.nap(1)
+    time.nap(5)
+    return t
+
+private bool running_now(Engine e):
+    hold_lock(e)
+    bool r = e^.stop.running > 0
+    drop_lock(e)
+    return r
+
+i32 test():
+    bool ok = true
+    out_c = fmt.over(out_store[:])
+    err_c = fmt.over(err_store[:])
+
+    // ── asked: the `finally` runs, and the run fails STOPPED, quietly ───────
+    try Engine a = spin_engine() else code:
+        _ = #expect(false, "the engine failed with ", code)
+        return 1
+    rawptr t = start("polite")
+    finish(a, 5000)
+    _ = threads.join(t)
+    ok = #expect(g_code == STOPPED, "the asked run failed with ", g_code, ", not STOPPED") && ok
+    ok = #expect(fmt.written(out_c) == "polite: finally\n", "the output sink holds \"", fmt.written(out_c), "\"") && ok
+    ok = #expect(fmt.written(err_c) == "", "a stop wrote \"", fmt.written(err_c), "\" on the error sink") && ok
+    ok = #expect(counted.blocks == 1, "an ended engine holds ", counted.blocks, " block(s), not its state alone") && ok
+    // A run from a thread that did not make the engine is refused first; a
+    // stopped engine refuses every run of its own thread; a second stop does
+    // nothing.
+    i32 got = 0
+    try enter(a) else code:
+        got = code
+    ok = #expect(got == THREAD, "a run from another thread failed with ", got, ", not THREAD") && ok
+    hold_lock(a)
+    a^.stop.owner = this_thread()
+    drop_lock(a)
+    got = 0
+    try enter(a) else code:
+        got = code
+    ok = #expect(got == STOPPED, "a run on an ended engine failed with ", got) && ok
+    finish(a, 0)
+    destroy(a)
+    ok = #expect(counted.blocks == 0, "after destroy the allocator holds ", counted.blocks, " block(s)") && ok
+
+    // ── forced: caught once, then nothing more — not its `finally` ──────────
+    out_c = fmt.over(out_store[:])
+    try Engine b = spin_engine() else code:
+        _ = #expect(false, "the engine failed with ", code)
+        return 1
+    t = start("stubborn")
+    f64 began = time.now()
+    finish(b, 30)
+    f64 took = time.since(began)
+    _ = threads.join(t)
+    ok = #expect(g_code == STOPPED, "the forced run failed with ", g_code, ", not STOPPED") && ok
+    ok = #expect(took >= 0.03, "the force did not wait out its timeout: ", took, " s") && ok
+    ok = #expect(fmt.written(out_c) == "stubborn: caught -2147483647\n", "the output sink holds \"", fmt.written(out_c), "\"") && ok
+    destroy(b)
+
+    // ── paused: refused to another thread, and stopped into its `finally` ───
+    out_c = fmt.over(out_store[:])
+    try Engine c = spin_engine() else code:
+        _ = #expect(false, "the engine failed with ", code)
+        return 1
+    t = start("polite")
+    _ = #atomic_fetch_or(&c^.stop.word, 4, #ACQ_REL)
+    got = 0
+    try enter(c) else code:
+        got = code
+    ok = #expect(got == THREAD, "a run from another thread on a paused engine failed with ", got, ", not THREAD") && ok
+    finish(c, 5000)
+    _ = threads.join(t)
+    ok = #expect(g_code == STOPPED, "the paused run failed with ", g_code, ", not STOPPED") && ok
+    ok = #expect(fmt.written(out_c) == "polite: finally\n", "a stop did not resume the paused script into its finally: \"", fmt.written(out_c), "\"") && ok
+    destroy(c)
+
+    // ── paused, on its own thread: busy until resumed ───────────────────────
+    try Engine d = spin_engine() else code:
+        _ = #expect(false, "the engine failed with ", code)
+        return 1
+    _ = #atomic_fetch_or(&d^.stop.word, 4, #ACQ_REL)
+    got = 0
+    try enter(d) else code:
+        got = code
+    ok = #expect(got == BUSY, "a run on a paused engine failed with ", got, ", not BUSY") && ok
+    _ = #atomic_fetch_and(&d^.stop.word, 0xFFFFFFFB, #ACQ_REL)
+    got = 0
+    try enter(d) else code:
+        got = code
+    ok = #expect(got == 0, "a run on the resumed engine failed with ", got) && ok
+    if got == 0:
+        leave(d)
+    destroy(d)
+    ok = #expect(counted.blocks == 0, "the allocator holds ", counted.blocks, " block(s) at the end") && ok
+
+    if ok:
+        return 0
+    return 1

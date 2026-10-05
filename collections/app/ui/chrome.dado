@@ -1,0 +1,194 @@
+// app:ui — chrome: every visible node's `StyleBox` as the grid's pixel boxes.
+//
+// **The tree does not know widget kinds.** A kind that is drawn with a box
+// has a `style` hook answering the box for its current state (`Hooks.style`);
+// the tree asks every visible node's hook and nothing else. The panel, the
+// label and the text edit have one.
+//
+// **What a box becomes.** `chrome_of` is the whole conversion, pure over its
+// arguments. The rectangle is the node's own intersected with every
+// ancestor's — the clip its paint gets, so a scrolled-away child's box is cut
+// where its cells are — in framebuffer pixels: cell `(c, r)` is pixels
+// `c * cell_w` to `(c + 1) * cell_w` across and `r * cell_h` down (the grid's
+// origin is the framebuffer's). A `Flat` box keeps its fill, border widths
+// and colour, radius and shadow as they are: those were pixels already. A
+// `Line` becomes a box filled with the line's colour, `line_px` thick but
+// never thicker than the rectangle, centred across it (down it, when
+// `vertical`), so a line never inks outside its node and never bleeds. Every
+// pixel field is held to `STYLE_PX_MAX` (theme.dado) on the way. An `Empty` box, a
+// `Line` of no thickness, a `Flat` box with nothing visible, and an empty
+// rectangle become nothing.
+//
+// **Order is stacking.** `chrome_collect` walks the visible tree in tree
+// order, a parent before its children, and appends each box to the list of
+// the layer the node paints into; the grid draws each layer's list in order
+// and then the layer's cells over it.
+//
+// **Rebuilt when something changed, never on an idle frame.** `chrome_sync`
+// rebuilds every layer's list when a node's rectangle changed, a node was
+// removed, focus moved, a node's layer changed, the theme's generation or
+// the cell size changed since the last rebuild, or a widget said its box
+// changed (`chrome_changed`); otherwise it reads four numbers and returns.
+// A rebuild costs one walk of the visible tree. The grid keeps the lists
+// across a resize, but a resize moves every rectangle, so it rebuilds then
+// anyway.
+//
+// **No bleed rule, on purpose.** A shadow is ink outside the node's
+// rectangle, but it is chrome, not cells: the chrome pass redraws every box
+// whole each frame from the list, and the cells hold no ink of it, so a
+// shadow that moves or goes leaves nothing stale in any cell, and marking
+// the parent for paint when a shadowed node changed (which an earlier
+// version did) cost a parent repaint and fixed nothing. `bleed_cells` is
+// still every box's declared reach in cells, for whatever redraws chrome by
+// dirty rectangle rather than whole — that will need to dirty what a box
+// bleeds into — and for nothing here yet.
+package ui
+
+import "app:ui/cell"
+import "app:ui/grid"
+
+// One box of chrome, the node it came from and the layer it goes to.
+type ChromeItem: (Control node, i32 layer, grid.ChromeBox box)
+
+private bool g_chrome_dirty = true
+private i64  g_chrome_gen = -1
+private i32  g_chrome_cw = -1
+private i32  g_chrome_ch = -1
+private i64  g_chrome_rebuilds
+private i32  g_chrome_boxes
+private bool g_chrome_last
+private ref []ChromeItem g_chrome_items
+
+// The box `c` is drawn with now, from its kind's `style` hook;
+// `style_empty()` for a kind without one and for a dead handle.
+StyleBox style_now(Control c):
+    i32 i = index(c)
+    if i < 0:
+        return style_empty()
+    StyleFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.style
+    if fn == nil:
+        return style_empty()
+    return fn(c, g_nodes[i].state)
+
+// Whether a Flat box draws anything at all.
+private bool flat_visible(StyleBox b):
+    if b.fill[3] > 0 || style_has_shadow(b):
+        return true
+    if b.border[3] == 0:
+        return false
+    return b.border_l > 0 || b.border_t > 0 || b.border_r > 0 || b.border_b > 0
+
+// `b` over the cell rectangle `r` at `cell_w` x `cell_h` pixels a cell, as a
+// pixel box; false when it draws nothing (see the package comment).
+(bool ok, grid.ChromeBox box) chrome_of(StyleBox b, cell.CellRect r, i32 cell_w, i32 cell_h):
+    grid.ChromeBox none = grid.chrome_box(0, 0, 0, 0)
+    if cell.is_empty(r) || cell_w <= 0 || cell_h <= 0:
+        return (false, none)
+    i32 x = r.col * cell_w
+    i32 y = r.row * cell_h
+    i32 w = r.cols * cell_w
+    i32 h = r.rows * cell_h
+    if b.kind == StyleKind.Line:
+        i32 t = px_size(b.line_px)
+        if b.vertical && t > w:
+            t = w
+        if !b.vertical && t > h:
+            t = h
+        if t == 0 || b.border[3] == 0:
+            return (false, none)
+        grid.ChromeBox ln = grid.chrome_box(x, y + (h - t) / 2, w, t)
+        if b.vertical:
+            ln = grid.chrome_box(x + (w - t) / 2, y, t, h)
+        ln.fill = b.border
+        return (true, ln)
+    if b.kind != StyleKind.Flat || !flat_visible(b):
+        return (false, none)
+    grid.ChromeBox o = grid.chrome_box(x, y, w, h)
+    o.fill = b.fill
+    o.border = b.border
+    o.border_l = px_size(b.border_l)
+    o.border_t = px_size(b.border_t)
+    o.border_r = px_size(b.border_r)
+    o.border_b = px_size(b.border_b)
+    o.radius = px_size(b.radius)
+    o.shadow = b.shadow
+    o.shadow_size = px_size(b.shadow_size)
+    o.shadow_dx = px_offset(b.shadow_dx)
+    o.shadow_dy = px_offset(b.shadow_dy)
+
+    return (true, o)
+
+// Every visible node's chrome in tree order, into `out` as far as it goes;
+// answers how many there are, which may be more than `out` holds. Pure over
+// the tree: it changes nothing, so a test calls it with any cell size.
+i32 chrome_collect([]ChromeItem out, i32 cell_w, i32 cell_h):
+    if g_nodes == nil || g_root < 0:
+        return 0
+    return collect_at(g_root, g_nodes[g_root].area, out, 0, cell_w, cell_h)
+
+private i32 collect_at(i32 i, cell.CellRect outer, []ChromeItem out, i32 n, i32 cw, i32 ch):
+    if !g_nodes[i].shown:
+        return n
+    cell.CellRect clip = cell.intersect(g_nodes[i].area, outer)
+    if cell.is_empty(clip):
+        return n
+    i32 k = n
+    StyleFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.style
+    if fn != nil:
+        (bool ok, grid.ChromeBox b) = chrome_of(fn(handle(i), g_nodes[i].state), clip, cw, ch)
+        if ok:
+            if k < i32(#len(out)):
+                out[k].node = handle(i)
+                out[k].layer = g_nodes[i].layer
+                out[k].box = b
+            k = k + 1
+    i32 c = g_nodes[i].first_child
+    for c >= 0:
+        k = collect_at(c, clip, out, k, cw, ch)
+        c = g_nodes[c].next_sibling
+    return k
+
+// A widget's box changed for a reason the tree cannot see: the next
+// `chrome_sync` rebuilds.
+void chrome_changed():
+    g_chrome_dirty = true
+
+// Rebuild the grid's chrome lists when anything they depend on changed, and
+// answer whether it did. The frame calls it after every `update`; it does
+// nothing while `update` runs.
+bool chrome_sync():
+    g_chrome_last = false
+    if g_phase != PHASE_IDLE:
+        return false
+    i32 cw = grid.cell_w()
+    i32 ch = grid.cell_h()
+    i64 gen = theme_generation()
+    if !g_chrome_dirty && gen == g_chrome_gen && cw == g_chrome_cw && ch == g_chrome_ch:
+        return false
+    capture_alloc()
+    if g_chrome_items == nil:
+        g_chrome_items = #make([]ChromeItem, 16, g_alloc)
+        if g_chrome_items == nil:
+            return false
+    i32 n = chrome_collect(g_chrome_items[:], cw, ch)
+    if n > i32(#len(g_chrome_items)):
+        if !#resize(g_chrome_items, i64(n)):
+            return false
+        n = chrome_collect(g_chrome_items[:], cw, ch)
+    for l in 0..<grid.MAX_LAYERS:
+        grid.chrome_clear(i32(l))
+    for k in 0..<n:
+        _ = grid.chrome_add(g_chrome_items[k].layer, g_chrome_items[k].box)
+    g_chrome_dirty = false
+    g_chrome_gen = gen
+    g_chrome_cw = cw
+    g_chrome_ch = ch
+    g_chrome_rebuilds = g_chrome_rebuilds + 1
+    g_chrome_boxes = n
+    g_chrome_last = true
+    return true
+
+// Rebuilds since the program began, the boxes the last one made, and whether
+// the last `chrome_sync` rebuilt — the counters an instrument reads.
+(i64 rebuilds, i32 boxes, bool last) chrome_counters():
+    return (g_chrome_rebuilds, g_chrome_boxes, g_chrome_last)

@@ -1,0 +1,178 @@
+// display/src — the private sokol substrate behind app:display.
+//
+// Everything here is implementation the public `display` facade tucks out of
+// sight: the sokol frame loop and its callbacks, and the clear colour. The
+// public interface — what the module *provides* — is one directory up in
+// `display.dado`. Nothing here is meant to be imported except by that facade.
+//
+// **This package owns no runtime.** It used to: it kept five hooks, a
+// per-frame scratch arena and a `draw` phase of its own, which made it a second
+// runtime beside `app:app`'s and the two did not reconcile. There is one
+// runtime now and it is `app:app`'s. What is left here is the part sokol
+// genuinely forces on somebody — `sapp_run` fuses window creation with the loop,
+// so the loop entry cannot live above the sokol layer — reduced to four
+// callbacks that carry no allocator and make no policy:
+//
+//     ready()      after sg_setup, before the first frame
+//     frame(dt)    once per frame; the caller decides what a frame is
+//     event(ev)    one raw sapp_event address, whenever sokol has one
+//     finish()     before sg_shutdown
+//
+// and the clear pass split into `begin_pass`/`end_pass` so the caller — not this
+// package — chooses what sits between them.
+package backend
+
+import "vendor:sokol/sokol_app"
+import "vendor:sokol/sokol_gfx"
+import "vendor:sokol/sokol_glue"
+import "vendor:sokol/sokol_log"
+import "core:strings"
+import "core:mem/libc"
+
+// ── Runtime state ──────────────────────────────────────────────────────────
+private void() g_ready
+private void(f32) g_frame
+private void(rawptr) g_event
+private void() g_finish
+
+private f32 g_bg_r
+private f32 g_bg_g
+private f32 g_bg_b
+private f32 g_bg_a
+private bool g_bg_set
+
+// True only between begin_pass and end_pass.
+private bool g_in_draw
+
+// ── Lifecycle (called by the facade) ───────────────────────────────────────
+
+// Open the window, install the callbacks, run sokol's frame loop until it
+// closes. The facade unpacks its Config/Hooks into these primitives so this
+// package needs no public types.
+void run(i32 width, i32 height, string8 title, i32 clipboard_bytes,
+         i32 max_dropped_files, i32 max_dropped_path_bytes,
+         void() ready, void(f32) frame, void(rawptr) event, void() finish):
+    g_ready = ready
+    g_frame = frame
+    g_event = event
+    g_finish = finish
+    if !g_bg_set:
+        set_background(0.1, 0.1, 0.1, 1.0)
+
+    sokol_app.sapp_desc desc
+    desc.init_cb = _init
+    desc.frame_cb = _frame
+    desc.cleanup_cb = _cleanup
+    desc.event_cb = _event
+    desc.width = width
+    desc.height = height
+    // The clipboard is off in sokol unless asked for: `sapp_get_clipboard_string`
+    // returns "" and `sapp_set_clipboard_string` is a no-op while
+    // `enable_clipboard` is false. It is on here because `app:graphical`
+    // advertises `app.Capability.Clipboard`, and that advertisement has to be
+    // true.
+    desc.enable_clipboard = true
+    // The size is the facade's policy, not this package's — see
+    // `display.CLIPBOARD_BYTES`. It arrives as a parameter for the same reason
+    // the hooks do: `src/` makes no policy.
+    desc.clipboard_size = clipboard_bytes
+    // Drag-and-drop is off in sokol unless asked for, and asking is what makes
+    // the window advertise it: `enable_dragndrop` is the only thing that puts
+    // an `XdndAware` property on the X11 window, and without that property no
+    // drag source will offer this window a drop at all. So the flag is not a
+    // filter on drops that would otherwise arrive — it is what makes them
+    // possible. Off unless the facade asked, for the reason `display.Config`
+    // gives: advertising drops a program does not handle is worse than
+    // declining them.
+    if max_dropped_files > 0:
+        desc.enable_dragndrop = true
+        desc.max_dropped_files = max_dropped_files
+        desc.max_dropped_file_path_length = max_dropped_path_bytes
+    // A runtime string does not cross to cstring implicitly (only a literal
+    // does), because the crossing allocates; clone_to_cstring is it. sokol
+    // copies the title during run, so the clone is released when run returns.
+    ref []char8 title_c = strings.clone_to_cstring(title, libc.allocator())
+    defer #delete(title_c)
+    desc.window_title = cstring(title_c)
+    desc.logger.func = sokol_log.slog_func
+    sokol_app.sapp_run(&desc)
+
+// The colour the frame is cleared to each frame (0..1 per channel).
+void set_background(f32 r, g, b, a):
+    g_bg_r = r
+    g_bg_g = g
+    g_bg_b = b
+    g_bg_a = a
+    g_bg_set = true
+
+// True only inside the render pass (between begin_pass and end_pass).
+bool drawing():
+    return g_in_draw
+
+// ── The render pass, as two calls ──────────────────────────────────────────
+//
+// Written in Dado. `sg_pass_action` is a transparent foreign struct whose
+// `colors` field is a C array, and indexing one (`pa.colors[0]`) is a thing Dado
+// could not do when this package was written.
+
+// Begin the default swapchain pass, clearing to the background colour.
+void begin_pass():
+    sokol_gfx.sg_pass pass
+    pass.action.colors[0].load_action = sokol_gfx.sg_load_action.SG_LOADACTION_CLEAR
+    pass.action.colors[0].clear_value.r = g_bg_r
+    pass.action.colors[0].clear_value.g = g_bg_g
+    pass.action.colors[0].clear_value.b = g_bg_b
+    pass.action.colors[0].clear_value.a = g_bg_a
+    pass.swapchain = sokol_glue.sglue_swapchain()
+    sokol_gfx.sg_begin_pass(&pass)
+    g_in_draw = true
+
+// End the pass and present the frame.
+void end_pass():
+    g_in_draw = false
+    sokol_gfx.sg_end_pass()
+    sokol_gfx.sg_commit()
+
+// ── Internal sokol callbacks ───────────────────────────────────────────────
+
+private void _init():
+    sokol_gfx.sg_desc d
+    d.environment = sokol_glue.sglue_environment()
+    d.logger.func = sokol_log.slog_func
+    sokol_gfx.sg_setup(&d)
+    if g_ready != nil:
+        g_ready()
+
+private void _frame():
+    if g_frame != nil:
+        g_frame(f32(sokol_app.sapp_frame_duration()))
+
+private void _cleanup():
+    if g_finish != nil:
+        g_finish()
+    sokol_gfx.sg_shutdown()
+
+// The parameter is spelled with the qualifier because `sapp_desc.event_cb` is
+// `void(^const sapp_event)` — C's `void (*)(const sapp_event *)`, restated in
+// Dado rather than worked around. A function whose parameter *is* that type
+// needs no conversion to reach the field, so the field takes this symbol
+// directly and sokol calls it through the type it declares.
+//
+// `g_event` carries the event on as a `rawptr`, which is the facade's shape and
+// stays the facade's shape: `display.Hooks.event`, `app:graphical`'s hook and
+// `sokol_input.decode` all read one, and widening them would be four packages
+// moved to do what the conversion below does once. So this is where the promise
+// is dropped, and it is dropped by a **written** conversion. Nothing here — nor
+// anything the hook reaches — writes through the event, and an object pointer
+// losing a `const` it is never written through is defined.
+//
+// `rawptr(ev)` is the whole of the crossing and emits C's own `(void *)ev`,
+// which is the cast the hand-written shim this replaced wrote at the same
+// place and defended in the same words. It used to be spelled
+// `rawptr(#c.uintptr_t(rawptr(ev)))` — a round trip through an integer, taken
+// only because a bare `rawptr(ev)` emitted no cast at all and `gcc` then
+// refused the argument under `-Werror=discarded-qualifiers`. The compiler
+// writes the cast now, so the detour says nothing the one conversion does not.
+private void _event(^const sokol_app.sapp_event ev):
+    if g_event != nil:
+        g_event(rawptr(ev))

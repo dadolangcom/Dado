@@ -1,0 +1,477 @@
+// Where the toolchain is, what this directory is, and the two tabs that
+// show them: Home and Toolchain.
+//
+// **Everything is asked, nothing is assumed.** `dado where` answers the
+// toolchain's paths (the compiler, the collections, the build directory, the
+// C compiler); `dado doctor --format=json` answers whether it works, each
+// failing check with its repair; `dadoc --emit=packages .` answers whether
+// the working directory is a package. Each is a query (`jobs.dado`), so the
+// screen is up before any of them has answered and says "reading…" until
+// they do.
+//
+// **Update and upgrade availability is read, never fetched.** The `dado` in
+// front of the dashboard checks the repository at most once an interval and
+// writes what it heard into the install's `state` (`remote_head`,
+// `remote_release`); this compares those with the checkout's `HEAD` and the
+// compiler's version. The dashboard never asks the network itself and never
+// writes those lines.
+package dashboard
+
+import tui "vendor:tui"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+// ── what `dado where` said ─────────────────────────────────────────────────
+
+private ref []char8 g_dado               // the dado this dashboard runs
+private ref []char8 g_cwd                // the working directory, absolute
+private ref []char8 g_root
+private ref []char8 g_dadoc
+private ref []char8 g_lsp
+private ref []char8 g_collections
+private ref []char8 g_layout             // "monorepo" or "install"
+private ref []char8 g_build_dir
+private ref []char8 g_c_compiler
+private ref []char8 g_install            // the install's folder, or nil
+private ref []char8 g_where_error
+private bool g_where_known
+private bool g_settings_loaded
+
+private bool in_install(): return txt(g_layout) == "install"
+private bool where_broken(): return filled(txt(g_where_error))
+
+private void where_answered(string8 text, bool ok):
+    if !ok:
+        where_failed(#format("`dado where` failed: ", strings.trim(text), tui.mem))
+        return
+    (string8 root, bool _) = value_of(text, "root")
+    (string8 dadoc, bool _) = value_of(text, "compiler")
+    (string8 lsp, bool _) = value_of(text, "lsp")
+    (string8 coll, bool _) = value_of(text, "collections")
+    (string8 layout, bool _) = value_of(text, "layout")
+    (string8 build, bool _) = value_of(text, "build")
+    (string8 cc, bool _) = value_of(text, "cc")
+    g_root = own(g_root, root)
+    g_dadoc = own(g_dadoc, dadoc)
+    g_lsp = own(g_lsp, lsp)
+    g_collections = own(g_collections, coll)
+    g_layout = own(g_layout, layout)
+    g_build_dir = own(g_build_dir, build)
+    g_c_compiler = own(g_c_compiler, cc)
+    g_where_error = own(g_where_error, "")
+    #delete(g_install)
+    g_install = nil
+    if layout == "install":
+        ref []char8 up = path.dir(root)
+        g_install = own(g_install, txt(up))
+        #delete(up)
+    g_where_known = true
+    if #len(dadoc) == 0:
+        g_where_error = own(g_where_error, "dado found no compiler it can run. Run `dado doctor` in a shell: it says which part is missing and how to get it.")
+    if !g_settings_loaded:
+        g_settings_loaded = true
+        settle_state_path()
+        load_settings()
+        apply_wanted_package()
+    read_availability()
+    want_project()
+    index_restart()
+
+private void where_failed(string8 why):
+    g_where_error = own(g_where_error, why)
+    g_where_known = false
+
+// ── what `dado doctor` said ────────────────────────────────────────────────
+
+// One line per check: name, status, detail, repair, tab-separated.
+private tui.Log g_doctor
+private bool g_doctor_known
+private ref []char8 g_doctor_error
+private ref []char8 g_dadoc_version
+private ref []char8 g_engine_cache
+
+private void doctor_answered(string8 text, bool ok):
+    tui.log_clear(&g_doctor)
+    g_doctor_error = own(g_doctor_error, "")
+    string8 rest = text
+    i32 seen = 0
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        string8 name = json_text(l, "name")
+        if #len(name) > 0:
+            string8 status = json_text(l, "status")
+            string8 detail = json_text(l, "detail")
+            string8 repair = json_text(l, "repair")
+            tui.log_say(&g_doctor, #format(name, "\t", status, "\t", detail, "\t", repair, tui.mem))
+            seen = seen + 1
+            if name == "dadoc":
+                // "dadoc 1.0.0-dev+1eb4a2567aaf at /path": the second word.
+                (string8 _, string8 after, bool _) = strings.split_first(detail, " ")
+                (string8 version, string8 _, bool _) = strings.split_first(after, " ")
+                g_dadoc_version = own(g_dadoc_version, version)
+            if name == "quickjs":
+                (string8 _, string8 at, bool found) = strings.split_first(detail, " at ")
+                if found: g_engine_cache = own(g_engine_cache, at)
+        if !more: break
+        rest = tail
+    g_doctor_known = seen > 0
+    if seen == 0:
+        if ok: doctor_failed("`dado doctor --format=json` answered nothing this dashboard can read: the driver and the dashboard are from different versions. Run `dado tools rebuild dashboard`.")
+        else: doctor_failed(#format("`dado doctor` failed: ", strings.trim(text), tui.mem))
+    read_availability()
+
+private void doctor_failed(string8 why):
+    g_doctor_error = own(g_doctor_error, why)
+
+private (i32 good, i32 warned, i32 failed) doctor_counts():
+    i32 good = 0
+    i32 warned = 0
+    i32 failed = 0
+    for i in 0..<tui.log_lines(g_doctor):
+        string8 st = field(tui.log_at(&g_doctor, i), 1)
+        if st == "ok": good = good + 1
+        else if st == "warn": warned = warned + 1
+        else if st == "fail" || st == "error": failed = failed + 1
+    return (good, warned, failed)
+
+// ── this project ───────────────────────────────────────────────────────────
+
+// The `--emit=packages .` lines: the working directory first when it is a
+// package, then each package directly under it.
+private tui.Log g_project
+private bool g_project_known
+private ref []char8 g_project_error
+
+private void project_answered(string8 text, bool ok):
+    tui.log_clear(&g_project)
+    g_project_error = own(g_project_error, "")
+    string8 rest = text
+    for #len(rest) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(rest)
+        if strings.starts_with(l, "package\t"): tui.log_say(&g_project, l)
+        if !more: break
+        rest = tail
+    g_project_known = true
+    if !ok && tui.log_lines(g_project) == 0 && filled(strings.trim(text)):
+        project_failed(#format("dadoc could not read this directory: ", strings.trim(text), tui.mem))
+    packages_answered(".", text, true)
+
+private void project_failed(string8 why):
+    g_project_error = own(g_project_error, why)
+    g_project_known = true
+
+// The line for the working directory itself, or "".
+private string8 project_line():
+    for i in 0..<tui.log_lines(g_project):
+        string8 l = tui.log_at(&g_project, i)
+        string8 dir = field(l, 1)
+        if dir == "." || dir == "./" || dir == txt(g_cwd): return l
+    return ""
+
+private bool cwd_is_package():
+    return filled(project_line()) || (node_count() > 0 && node_is_package(0) && node_depth(0) == 0)
+
+// ── updates, read from the state file ──────────────────────────────────────
+
+private ref []char8 g_remote_head
+private ref []char8 g_remote_release
+private ref []char8 g_local_head
+
+private void read_availability():
+    if !in_install(): return
+    string8 inst = txt(g_install)
+    ref []char8 state_p = path.join(inst, "state")
+    defer #delete(state_p)
+    try ref []char8 st = fs.read_file(txt(state_p)) else:
+        return
+    defer #delete(st)
+    string8 text = st
+    (string8 head, bool _) = value_of(text, "remote_head")
+    (string8 rel, bool _) = value_of(text, "remote_release")
+    g_remote_head = own(g_remote_head, strings.trim(head))
+    g_remote_release = own(g_remote_release, strings.trim(rel))
+    g_local_head = own(g_local_head, checkout_head(txt(g_root)))
+
+// The commit the checkout at `root` is on, read from `.git` without running
+// git: a detached `HEAD` holds the commit, and a branch's is in its ref file
+// or in `packed-refs`.
+private string8 checkout_head(string8 root):
+    ref []char8 hp = path.join(root, ".git", "HEAD")
+    defer #delete(hp)
+    try ref []char8 h = fs.read_file(txt(hp)) else:
+        return ""
+    string8 head = strings.trim(txt(h))
+    if !strings.starts_with(head, "ref: "):
+        string8 sha = #format(head, tui.mem)
+        #delete(h)
+        return sha
+    string8 ref_name = strings.trim(strings.rest(head, 5))
+    ref []char8 rp = path.join(root, ".git", ref_name)
+    defer #delete(rp)
+    try ref []char8 r = fs.read_file(txt(rp)) else:
+        ref []char8 pp = path.join(root, ".git", "packed-refs")
+        defer #delete(pp)
+        try ref []char8 packed = fs.read_file(txt(pp)) else:
+            #delete(h)
+            return ""
+        string8 rest = txt(packed)
+        for #len(rest) > 0:
+            (string8 l, string8 tail, bool more) = strings.line(rest)
+            (string8 sha, string8 name, bool sp) = strings.split_first(l, " ")
+            if sp && strings.trim(name) == ref_name:
+                string8 found = #format(sha, tui.mem)
+                #delete(packed)
+                #delete(h)
+                return found
+            if !more: break
+            rest = tail
+        #delete(packed)
+        #delete(h)
+        return ""
+    string8 sha2 = #format(strings.trim(txt(r)), tui.mem)
+    #delete(r)
+    #delete(h)
+    return sha2
+
+private bool update_available():
+    string8 remote = txt(g_remote_head)
+    return in_install() && #len(remote) > 0 && filled(txt(g_local_head)) && remote != txt(g_local_head)
+
+private bool upgrade_available():
+    return in_install() && filled(txt(g_remote_release)) && filled(txt(g_dadoc_version)) && newer(txt(g_remote_release), txt(g_dadoc_version))
+
+// ── Home ───────────────────────────────────────────────────────────────────
+
+private void home_tab():
+    if first_run():
+        welcome()
+        return
+    for tui.row(height: tui.REST, gap: 1, tag: "home"):
+        for tui.column(width: tui.pct(50), gap: 0, tag: "home-left"):
+            project_panel()
+            updates_panel()
+        for tui.column(width: tui.REST, gap: 0, tag: "home-right"):
+            toolchain_summary()
+            doctor_panel()
+
+// An empty directory: no package here and none below, once both are known.
+private bool first_run():
+    return g_project_known && g_tree_known && node_count() == 0 && blank(project_line())
+
+private void welcome():
+    if tui.panel(title: "Welcome to Dado", height: tui.REST, pad: 2):
+        defer tui.end()
+        tui.space()
+        tui.text(s: "No Dado package here, or in any directory below.", color: tui.now().text, attr: tui.Attr.BOLD)
+        tui.space()
+        _ = tui.paragraph(s: "A package is a directory of .dado files. To start one, create main.dado here in your editor (the dashboard reads source and never writes it):", color: tui.now().subtext)
+        tui.space()
+        tui.text(s: "    package main", color: tui.now().accent)
+        tui.text(s: "", color: tui.now().accent)
+        tui.text(s: "    i32 main():", color: tui.now().accent)
+        tui.text(s: "        return 0", color: tui.now().accent)
+        tui.space()
+        _ = tui.paragraph(s: "Then press ctrl+r: the package appears under Packages (2), and b builds it. To work on a project that already exists, quit (q), cd into it and run dado again.", color: tui.now().subtext)
+        tui.space()
+        kv_path("here", txt(g_cwd))
+        tui.kv_text("help", "? lists every key")
+
+private void project_panel():
+    if tui.panel(title: "This project", height: 9, pad: 1):
+        defer tui.end()
+        string8 l = project_line()
+        if filled(txt(g_project_error)):
+            _ = tui.paragraph(s: txt(g_project_error), color: tui.now().err)
+            return
+        if #len(l) == 0:
+            if !g_project_known:
+                tui.muted("reading…")
+                return
+            _ = tui.paragraph(s: "This directory is not a package itself. Pick one under Packages (2); the Build tab acts on the selection.", color: tui.now().subtext)
+            kv_path("here", txt(g_cwd))
+            kv_path("selected", selected_or_none())
+            return
+        tui.kv_text("package", field(l, 2))
+        kv_path("directory", txt(g_cwd))
+        tui.kv_text("files", #format(field(l, 3), " (", field(l, 4), " @test)", tui.mem))
+        tui.kv_text("kind", entry_word(field(l, 5)))
+        string8 st = field(l, 6)
+        if st == "ok": tui.kv_text("checks", "clean")
+        else: tui.kv_text("checks", "has errors: Diagnostics (4) after a check")
+
+private string8 entry_word(string8 e):
+    if e == "main": return "a program (has main)"
+    if e == "test": return "tests only"
+    return "a library"
+
+private string8 selected_or_none():
+    string8 s = selected_package()
+    if #len(s) == 0: return "none yet"
+    return s
+
+private void updates_panel():
+    if tui.panel(title: "Updates", height: tui.REST, pad: 1):
+        defer tui.end()
+        if !g_where_known:
+            tui.muted("reading…")
+            return
+        if !in_install():
+            _ = tui.paragraph(s: "A checkout of the repository: git pull updates it, and ./dado rebuilds what changed. update and upgrade are for an install.", color: tui.now().subtext)
+            return
+        if update_available(): tui.kv_text("collections", "new commits: Toolchain (6) → Update")
+        else if blank(txt(g_remote_head)): tui.kv_text("collections", "not checked yet")
+        else: tui.kv_text("collections", "up to date")
+        if upgrade_available(): tui.kv_text("dadoc", #format(txt(g_remote_release), " is out: Toolchain (6) → Upgrade", tui.mem))
+        else if blank(txt(g_remote_release)): tui.kv_text("dadoc", "not checked yet")
+        else: tui.kv_text("dadoc", "the newest release")
+        _ = tui.paragraph(s: "dado checks at most once a day, when you run it; this reads what it heard.", color: tui.now().muted)
+
+private void toolchain_summary():
+    if tui.panel(title: "Toolchain", height: 9, pad: 1):
+        defer tui.end()
+        if filled(txt(g_where_error)):
+            _ = tui.paragraph(s: txt(g_where_error), color: tui.now().err)
+            return
+        if !g_where_known:
+            tui.muted("reading…")
+            return
+        kv_path("dadoc", version_or_reading())
+        tui.kv_text("layout", layout_word())
+        kv_path("C compiler", or_none(txt(g_c_compiler)))
+        kv_path("builds into", or_none(txt(g_build_dir)))
+        tui.kv_text("palette", g_theme_name)
+
+private string8 version_or_reading():
+    if filled(txt(g_dadoc_version)): return txt(g_dadoc_version)
+    if filled(txt(g_doctor_error)): return "unknown (doctor failed)"
+    return "reading…"
+
+private string8 layout_word():
+    if in_install(): return "an install"
+    if txt(g_layout) == "monorepo": return "a checkout"
+    return or_none(txt(g_layout))
+
+private string8 or_none(string8 s):
+    if #len(s) == 0: return "none"
+    return s
+
+private void doctor_panel():
+    if tui.panel(title: "dado doctor", height: tui.REST, pad: 1):
+        defer tui.end()
+        if filled(txt(g_doctor_error)):
+            _ = tui.paragraph(s: txt(g_doctor_error), color: tui.now().err)
+            return
+        if !g_doctor_known:
+            tui.muted("checking… (esc cancels; ctrl+r checks again)")
+            return
+        (i32 good, i32 warned, i32 failed) = doctor_counts()
+        tui.kv_text("checks", #format(good, " ok, ", warned, " to look at, ", failed, " failing", tui.mem))
+        i32 shown = 0
+        for i in 0..<tui.log_lines(g_doctor):
+            string8 l = tui.log_at(&g_doctor, i)
+            string8 st = field(l, 1)
+            if st == "ok" || st == "note": continue
+            tui.Color c = tui.now().err if st != "warn" else tui.now().warn
+            _ = tui.paragraph(s: #format(field(l, 0), ": ", field(l, 2), tui.mem), color: c)
+            if filled(field(l, 3)): _ = tui.paragraph(s: #format("→ ", field(l, 3), tui.mem), color: tui.now().subtext)
+            shown = shown + 1
+            if shown >= 2: break
+        if shown == 0: tui.text(s: "everything dado needs works here", color: tui.now().ok)
+
+// ── Toolchain ──────────────────────────────────────────────────────────────
+
+private bool g_confirm_verb
+private i32 g_verb_pick                  // which of VERBS the modal asks about
+
+private const i32 N_VERBS = 4
+private [N_VERBS]string8 VERB_TITLES = [
+    "Update the collections?",
+    "Upgrade dadoc and dado-lsp?",
+    "Roll back the last update?",
+    "Roll back the last upgrade?",
+]
+private [N_VERBS]string8 VERB_SAYS = [
+    "dado update moves the install's collections to the newest commit this dadoc allows, then rebuilds dado and the tools. It refuses while the checkout has edits of its own.",
+    "dado upgrade --yes downloads the newest release of dadoc and dado-lsp, checks it, and replaces them, keeping the old ones for a rollback.",
+    "dado update --rollback returns the collections to the commit the last update replaced.",
+    "dado upgrade --rollback puts back the dadoc and dado-lsp the last upgrade replaced.",
+]
+private [N_VERBS]string8 VERB_LABELS = ["update", "upgrade", "update rollback", "upgrade rollback"]
+
+private void toolchain_tab():
+    for tui.row(height: tui.REST, gap: 1, tag: "tc"):
+        toolchain_info()
+        for tui.panel(title: "Output", height: tui.REST, pad: 1):
+            _ = tui.log(l: &g_out, height: tui.REST, tag: "tc-log", paint: paint)
+
+// A helper of its own because its body returns early, and a `return` out of a
+// `for tui.<container>` skips that container's close.
+private void toolchain_info():
+    if tui.panel(title: "Toolchain", width: 44, height: tui.REST, pad: 1):
+        defer tui.end()
+        tui.kv_text("dadoc", version_or_reading())
+        kv_path("compiler", or_none(txt(g_dadoc)))
+        kv_path("dado", or_none(txt(g_dado)))
+        tui.kv_text("layout", layout_word())
+        if in_install(): kv_path("install", txt(g_install))
+        else: kv_path("root", or_none(txt(g_root)))
+        kv_path("collections", or_none(txt(g_collections)))
+        kv_path("C compiler", or_none(txt(g_c_compiler)))
+        kv_path("engine cache", engine_cache())
+        kv_path("build dir", or_none(txt(g_build_dir)))
+        kv_path("settings", or_none(txt(g_state_path)))
+        tui.rule("install")
+        if !in_install():
+            _ = tui.paragraph(s: "update, upgrade and rollback act on an install; this is a checkout, which git updates.", color: tui.now().muted)
+            return
+        for tui.row(height: 1, gap: 1, tag: "tc-buttons"):
+            if tui.button(label: "Update", enabled: !g_running): ask_verb(0)
+            if tui.button(label: "Upgrade", enabled: !g_running): ask_verb(1)
+        for tui.row(height: 1, gap: 1, tag: "tc-rollback"):
+            if tui.button(label: "Roll back update", enabled: !g_running): ask_verb(2)
+            if tui.button(label: "Roll back upgrade", enabled: !g_running): ask_verb(3)
+
+private string8 engine_cache():
+    (ref []char8 v, bool set) = os.get_env("DADO_QJS_CACHE")
+    if set:
+        string8 s = #format(txt(v), tui.mem)
+        #delete(v)
+        return s
+    #delete(v)
+    if filled(txt(g_engine_cache)): return txt(g_engine_cache)
+    if !g_doctor_known: return "reading…"
+    return "not built yet (the first DadoScript build makes it)"
+
+private void ask_verb(i32 which):
+    if !in_install() || g_running: return
+    g_verb_pick = which
+    g_confirm_verb = true
+
+private void verb_modal():
+    if tui.modal(title: VERB_TITLES[g_verb_pick], open: &g_confirm_verb, width: 64, height: 9):
+        defer tui.end()
+        _ = tui.paragraph(VERB_SAYS[g_verb_pick])
+        tui.space()
+        for tui.row(height: 1, gap: 2, tag: "verb-buttons"):
+            if tui.button("Run it"):
+                g_confirm_verb = false
+                run_verb(g_verb_pick)
+            if tui.button("Cancel"): g_confirm_verb = false
+
+private void run_verb(i32 which):
+    args_reset()
+    arg(txt(g_dado))
+    switch which:
+        case 0: arg("update")
+        case 1:
+            arg("upgrade")
+            arg("--yes")
+        case 2:
+            arg("update")
+            arg("--rollback")
+        else:
+            arg("upgrade")
+            arg("--rollback")
+    _ = start_run(RUN_VERB, VERB_LABELS[which], "", "", "", "", "")

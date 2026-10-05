@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: S2a lab <s2a@lab>
+Date: Fri, 25 Sep 2026 14:40:15 -0800
+Subject: [PATCH] C3: lean call path (in-interpreter calls for bytecode
+ functions)
+
+TOYS fork prototype C3. Measured and not kept: see REPORT.
+---
+ quickjs.c                    | 171 +++++++++++++++++++++++++++++++++++
+ tests/test_toys_lean_call.js | 102 +++++++++++++++++++++
+ 2 files changed, 273 insertions(+)
+ create mode 100644 tests/test_toys_lean_call.js
+
+diff --git a/quickjs.c b/quickjs.c
+index 1357a19..c5a0978 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -335,6 +335,10 @@ typedef struct JSClass {
+ } JSClass;
+ 
+ struct JSRuntime {
++    /* TOYS fork (C3): the lean-call stack. Frames of bytecode functions
++       called from bytecode run in the caller's interpreter activation, with
++       their locals here instead of on the C stack. Allocated on first use. */
++    uint8_t *lean_base, *lean_top, *lean_end;
+     JSMallocFunctions mf;
+     JSMallocState malloc_state;
+     JSArenaState arena_state;
+@@ -2642,6 +2646,9 @@ void JS_FreeRuntime(JSRuntime *rt)
+     bool leak = false;
+     int i;
+ 
++    if (rt->lean_base) /* TOYS fork (C3) */
++        js_free_rt(rt, rt->lean_base);
++
+     rt->in_free = true;
+     JS_FreeValueRT(rt, rt->current_exception);
+ 
+@@ -18036,10 +18043,71 @@ static bool needs_backtrace(JSValue exc)
+ }
+ 
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
++/* TOYS fork (C3): a lean call path. A call from bytecode to a normal
++   (non-generator, non-async) bytecode function with at least as many
++   arguments as it declares does not recurse into JS_CallInternal: the
++   callee's frame is pushed on rt's lean stack and run by the caller's
++   activation, which saves the C prologue/epilogue, the alloca and the
++   interrupt/stack checks of a C-level call. The caller's interpreter state
++   is kept in the frame and restored at return or when an exception leaves
++   the callee. Everything else (C functions, constructors, too few
++   arguments, lean stack full) takes the ordinary path. Borrowed from Lua's
++   and JavaScriptCore LLInt's in-interpreter calls. */
++#define JS_LEAN_STACK_SIZE (256 * 1024)
++
++typedef struct JSLeanFrame {
++    JSStackFrame sf;          /* the callee's frame, linked like any other */
++    uint32_t size;            /* bytes this frame takes on the lean stack */
++    uint16_t call_argc;       /* the call: its arguments are sf.arg_buf[0..] */
++    uint8_t call_extra;       /* 1 for a function call, 2 for a method call */
++    /* the caller's interpreter state that its JSStackFrame does not hold */
++    JSContext *caller_ctx;
++    JSValue *local_buf;
++    JSValue this_obj, new_target;
++    JSValue *argv;
++    int argc;
++    JSValue vals[]; /* var_buf, then stack_buf, then var_refs */
++} JSLeanFrame;
++
++/* returns the frame to use, or NULL for the ordinary path */
++static inline JSLeanFrame *js_lean_alloc(JSRuntime *rt, JSValueConst f, int argc)
++{
++    JSObject *p;
++    JSFunctionBytecode *b;
++    size_t need;
++    JSLeanFrame *lf;
++
++    if (JS_VALUE_GET_TAG(f) != JS_TAG_OBJECT)
++        return NULL;
++    p = JS_VALUE_GET_OBJ(f);
++    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
++        return NULL;
++    b = p->u.func.function_bytecode;
++    if (b->func_kind != JS_FUNC_NORMAL || argc < b->arg_count)
++        return NULL;
++    need = (sizeof(JSLeanFrame) + sizeof(JSValue) * (b->var_count + b->stack_size) +
++            sizeof(JSVarRef *) * b->var_ref_count + 15) & ~(size_t)15;
++    if (unlikely((size_t)(rt->lean_end - rt->lean_top) < need)) {
++        if (rt->lean_base)
++            return NULL; /* full: the ordinary path, on the C stack */
++        rt->lean_base = js_malloc_rt(rt, JS_LEAN_STACK_SIZE);
++        if (!rt->lean_base)
++            return NULL;
++        rt->lean_top = rt->lean_base;
++        rt->lean_end = rt->lean_base + JS_LEAN_STACK_SIZE;
++    }
++    lf = (JSLeanFrame *)rt->lean_top;
++    rt->lean_top += need;
++    lf->size = need;
++    return lf;
++}
++
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags)
+ {
++    int lean_depth = 0; /* TOYS fork (C3): lean frames this activation runs */
++    JSLeanFrame *lf;
+     JSRuntime *rt = caller_ctx->rt;
+     JSContext *ctx;
+     JSObject *p;
+@@ -18536,6 +18604,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             has_call_argc:
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (opcode != OP_tail_call &&
++                    (lf = js_lean_alloc(rt, call_argv[-1], call_argc))) {
++                    lf->call_extra = 1;
++                    lf->this_obj = this_obj;
++                    this_obj = JS_UNDEFINED;
++                    goto lean_call;
++                }
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
+@@ -18573,6 +18648,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 pc += 2;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (opcode != OP_tail_call_method &&
++                    (lf = js_lean_alloc(rt, call_argv[-1], call_argc))) {
++                    lf->call_extra = 2;
++                    lf->this_obj = this_obj;
++                    this_obj = call_argv[-2];
++                    goto lean_call;
++                }
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
+@@ -18586,6 +18668,59 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 *sp++ = ret_val;
+             }
+             BREAK;
++        lean_call:
++            /* TOYS fork (C3): enter the callee in this activation. lf holds
++               the caller's this_obj already; this_obj is the callee's. No
++               interrupt poll here: loops poll at their back edges and
++               recursion is bounded by the stacks, so every non-terminating
++               program still reaches a poll. */
++            {
++                JSObject *np = JS_VALUE_GET_OBJ(call_argv[-1]);
++                JSFunctionBytecode *nb = np->u.func.function_bytecode;
++                JSStackFrame *nsf = &lf->sf;
++
++                lf->call_argc = call_argc;
++                lf->caller_ctx = caller_ctx;
++                lf->local_buf = local_buf;
++                lf->new_target = new_target;
++                lf->argv = (JSValue *)argv;
++                lf->argc = argc;
++                nsf->is_strict_mode = nb->is_strict_mode;
++                nsf->is_constructor = false;
++                nsf->arg_count = call_argc;
++                nsf->cur_func = call_argv[-1];
++                arg_buf = call_argv;
++                var_buf = lf->vals;
++                for (i = 0; i < nb->var_count; i++)
++                    var_buf[i] = JS_UNDEFINED;
++                nsf->var_buf = var_buf;
++                nsf->arg_buf = arg_buf;
++                stack_buf = var_buf + nb->var_count;
++                nsf->var_refs = (JSVarRef **)(stack_buf + nb->stack_size);
++                nsf->var_ref_count = nb->var_ref_count;
++                for (i = 0; i < nb->var_ref_count; i++)
++                    nsf->var_refs[i] = NULL;
++                nsf->cur_gc_obj = NULL;
++                nsf->cur_pc = NULL;
++                nsf->cur_sp = NULL;
++                nsf->prev_frame = sf;
++                rt->current_stack_frame = nsf;
++                local_buf = var_buf;
++                sp = stack_buf;
++                pc = nb->byte_code_buf;
++                caller_ctx = ctx;
++                ctx = nb->realm;
++                b = nb;
++                p = np;
++                sf = nsf;
++                var_refs = np->u.func.var_refs;
++                func_obj = call_argv[-1];
++                new_target = JS_UNDEFINED;
++                argc = call_argc;
++                argv = call_argv;
++                lean_depth++;
++            }
++            BREAK;
+         CASE(OP_array_from):
+             {
+                 call_argc = get_u16(pc);
+@@ -20966,6 +21101,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         for(pval = local_buf; pval < sp; pval++) {
+             JS_FreeValue(ctx, *pval);
+         }
++        if (lean_depth > 0) {
++            /* TOYS fork (C3): return from a lean frame to its caller. The
++               caller's registers come back from its JSStackFrame and the few
++               the lean frame saved. */
++            JSValue *cargv = arg_buf;
++            int k;
++            lf = container_of(sf, JSLeanFrame, sf);
++            k = lf->call_extra;
++            sf = sf->prev_frame;
++            rt->current_stack_frame = sf;
++            func_obj = sf->cur_func;
++            p = JS_VALUE_GET_OBJ(func_obj);
++            b = p->u.func.function_bytecode;
++            ctx = b->realm;
++            var_refs = p->u.func.var_refs;
++            var_buf = sf->var_buf;
++            arg_buf = sf->arg_buf;
++            stack_buf = var_buf + b->var_count;
++            pc = sf->cur_pc;
++            caller_ctx = lf->caller_ctx;
++            local_buf = lf->local_buf;
++            this_obj = lf->this_obj;
++            new_target = lf->new_target;
++            argv = lf->argv;
++            argc = lf->argc;
++            i = lf->call_argc;
++            rt->lean_top -= lf->size;
++            lean_depth--;
++            while (--i >= -k)
++                JS_FreeValue(ctx, cargv[i]);
++            sp = cargv - k;
++            if (unlikely(JS_IsException(ret_val)))
++                goto exception;
++            *sp++ = ret_val;
++            goto restart;
++        }
+     }
+     rt->current_stack_frame = sf->prev_frame;
+     return ret_val;
+diff --git a/tests/test_toys_lean_call.js b/tests/test_toys_lean_call.js
+new file mode 100644
+index 0000000..5a329c5
+--- /dev/null
++++ b/tests/test_toys_lean_call.js
+@@ -0,0 +1,102 @@
++// TOYS fork (C3): calls taken by the lean call path must behave exactly as
++// ordinary calls: returns, exceptions, backtraces, closures, `this`,
++// `arguments`, recursion past the lean stack, re-entry from C.
++import { assert, assertThrows } from "./assert.js";
++
++function add(a, b) { return (a + b) | 0; }
++function thrower(x) { if (x > 2) throw new RangeError("x=" + x); return x; }
++function catcher(x) { try { return thrower(x); } catch (e) { return -1; } }
++function outer(x) { return thrower(x) + 1; }
++function mkcounter() { let c = 0; return function () { return ++c; }; }
++function args_len() { return arguments.length; }
++function sum_args(a) { let s = 0; for (let i = 0; i < arguments.length; i++) s += arguments[i]; return s; }
++function deep(n) { return n === 0 ? 0 : 1 + deep(n - 1); }
++function inf(n) { return inf(n + 1) + 1; }
++function stack_of() { return new Error("here").stack; }
++function via_stack() { return stack_of(); }
++class P {
++    constructor(x) { this.x = x; }
++    get2() { return this.x * 2; }
++    chain() { return this.get2() + 1; }
++}
++function fsloppy_this() { return this; }
++
++function test_basic() {
++    let a = 0;
++    for (let i = 0; i < 1000; i++) a = add(a, i);
++    assert(a, 499500);
++    assert(add(1, 2, 3), 3, "extra arguments");
++    assert(add(1), 0, "too few arguments takes the ordinary path");
++}
++
++function test_exceptions() {
++    assert(catcher(1), 1);
++    assert(catcher(5), -1, "caught in a lean frame");
++    let caught = null;
++    try { outer(7); } catch (e) { caught = e; }
++    assert(caught instanceof RangeError, true);
++    assert(caught.message, "x=7");
++    assert(outer(1), 2, "the activation continues after an exception unwound frames");
++    // many throws through lean frames must not leak the lean stack
++    for (let i = 0; i < 10000; i++) { try { outer(9); } catch (e) {} }
++    assert(deep(200), 200);
++}
++
++function test_backtrace() {
++    const s = via_stack();
++    assert(s.includes("stack_of"), true, s);
++    assert(s.includes("via_stack"), true, s);
++    assert(s.includes("test_backtrace"), true, s);
++    let st = "";
++    try { outer(8); } catch (e) { st = e.stack; }
++    assert(st.includes("thrower"), true, st);
++    assert(st.includes("outer"), true, st);
++}
++
++function test_closures() {
++    const c = mkcounter();
++    assert(c(), 1);
++    assert(c(), 2);
++    const fs = [];
++    function mk(i) { let v = i * 10; return () => v; }
++    for (let i = 0; i < 5; i++) fs.push(mk(i));
++    assert(fs.map(f => f()).join(","), "0,10,20,30,40", "captured locals outlive a lean frame");
++}
++
++function test_this_and_arguments() {
++    const p = new P(21);
++    assert(p.get2(), 42);
++    assert(p.chain(), 43);
++    assert(args_len(1, 2, 3), 3);
++    assert(sum_args(1, 2, 3, 4), 10);
++    assert(fsloppy_this(), undefined, "module code is strict");
++}
++
++function probe(n) { try { return probe(n + 1); } catch (e) { return n; } }
++function test_recursion_past_lean_stack() {
++    // the lean stack holds several hundred frames; past it calls fall back
++    // to the C stack, whose overflow still throws RangeError
++    const maxd = probe(0);
++    const d = Math.floor(maxd * 0.8);
++    assert(deep(d), d, "deep recursion, max " + maxd);
++    assertThrows(RangeError, () => inf(0));
++    assert(deep(100), 100, "recovers after a stack overflow");
++}
++
++function test_reentry_from_c() {
++    const a = [3, 1, 2];
++    a.sort((x, y) => add(x, -y));
++    assert(a.join(), "1,2,3");
++    const r = [1, 2, 3].map(x => add(x, 1)).reduce((s, x) => add(s, x), 0);
++    assert(r, 9);
++    const o = { get v() { return add(20, 22); } };
++    assert(o.v, 42);
++}
++
++test_basic();
++test_exceptions();
++test_backtrace();
++test_closures();
++test_this_and_arguments();
++test_recursion_past_lean_stack();
++test_reentry_from_c();
+-- 
+2.43.0
+

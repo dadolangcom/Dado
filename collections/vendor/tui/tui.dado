@@ -1,0 +1,463 @@
+// vendor:tui — a terminal UI you can throw together in seconds.
+//
+//     import tui "vendor:tui"
+//
+//     private bool notify = true
+//
+//     private void frame():
+//         tui.title("Preferences")
+//         tui.checkbox("Notify me", &notify)
+//         if tui.button("Quit"): tui.quit()
+//
+//     i32 main():
+//         if !tui.open(): #panic("not a terminal")
+//         defer tui.close()
+//         tui.run(frame)
+//         return 0
+//
+// ── the three rules worth knowing before you use it ────────────────────────
+//
+// **It is immediate mode, because Dado has no closures.** There are no widget
+// objects, no handlers to register and no ids to hold: the frame function runs
+// from the top every time, and the code that would have been a callback is the
+// code on the next line, in a scope that can see every local it needs. This is
+// not a performance style, it is the answer to a language constraint — and it
+// is why a Dado TUI library can be *more* ergonomic than a C one rather than
+// less.
+//
+// **You own the value; the library owns the interaction.** `&notify` is yours.
+// Which widget is hot, which has focus, where a scroll pane sits, where the
+// caret is in a line edit — ours, keyed by an id derived from where the widget
+// was called rather than from anything you have to hold.
+//
+// **A widget call answers `bool`, and it means "activated or changed on this
+// frame."** One rule for every widget in the library, which is what makes
+// `if tui.button("Save"): save()` the whole idiom.
+//
+// ── and one more ───────────────────────────────────────────────────────────
+//
+// **It is a singleton.** One terminal per process, and the alternative is a
+// `^Ui` first parameter on every call in the library — which is the entire
+// sugar budget spent on nothing. `open` refuses a second one.
+package tui
+
+import "core:io"
+import "core:mem/arena"
+import "core:os/proc"
+import "core:time"
+
+// ── the platform floor ─────────────────────────────────────────────────────
+//
+// Raw mode, the window size, a read with a timeout, stopping, and the signal
+// handlers. Everything else in this package is Dado, because none of the rest is
+// a fact about the platform.
+//
+// They were a `foreign "./tty.h"` block here and 398 lines of hand-written C
+// beside it. They are `tty.dado` now — `tty_raw`, `tty_measure`, `tty_read` and
+// the rest, private to this package — and that file's own doc comment carries
+// the accounting, including why the `volatile sig_atomic_t` the C said Dado
+// could not spell was the reason that had already expired.
+//
+// Draining a child's output was here for one turn too, because `proc` handed
+// out a `^io.FILE` and this needed the descriptor under it. It is `proc.drain`
+// now, Dado over `poll`, and that is the shape the rest of the floor took.
+
+// ── the frame function ─────────────────────────────────────────────────────
+
+// What you hand `run` and `step`. It takes nothing and returns nothing,
+// because everything it needs is in scope where it was written.
+type Frame: void()
+
+// ── storage ────────────────────────────────────────────────────────────────
+//
+// One arena, **reset at the top of every frame**. Anything a frame builds — a
+// formatted string, a wrapped paragraph, a filtered list — comes from here and
+// is never freed by anybody, because the whole thing is released before the
+// next frame begins.
+//
+//     tui.text(#format("hits: ", n, tui.mem))
+//
+// has no cleanup and no leak, and that is the sugar that makes formatting
+// inside a frame free to write. After the first frame the arena is the size
+// the program actually needs and steady state asks the heap for nothing.
+//
+// It is a package variable and not a function because it is written where an
+// allocator argument goes, and `tui.mem` reads as a place rather than a call.
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) mem
+
+private arena.Arena g_arena
+// What `open` was handed. The frame arena's blocks come from it, and so does
+// anything with a lifetime longer than a frame — a line edit's buffer.
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) g_backing
+private bool g_open
+private bool g_quit
+private bool g_ended
+private bool g_dirty = true
+private f64 g_started
+
+// ── lifetime ───────────────────────────────────────────────────────────────
+
+// Whether there is a terminal to draw on, asked without changing anything. A
+// program that means to print a summary instead when the answer is no reads
+// better asking than reading `open`'s refusal as a question.
+bool is_terminal():
+    return tty_is_terminal() != 0
+
+// Enter raw mode, switch to the alternate screen, turn on SGR mouse reporting
+// and bracketed paste, and hide the cursor.
+//
+// False when stdin is not a terminal, which is the honest answer for a program
+// in a pipe and is worth checking rather than writing escape codes into
+// somebody's log.
+bool open(i32 pad = 1):
+    return open_over(#heap, pad)
+
+// The same, over an allocator you supply. Everything the library allocates —
+// the cell grids and the frame arena's blocks — comes from it.
+bool open_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, i32 pad = 1):
+    if g_open: return false
+    if tty_measure() < 0: return false
+    if tty_raw(1) != 0: return false
+
+    g_backing = backing
+    g_arena = arena.sized(backing, 65536)
+    mem = arena.allocator(&g_arena)
+    g_quit = false
+    g_ended = false
+    g_dirty = true
+    g_force = true
+    g_root_pad = pad
+    g_started = time.now()
+    reset_state()
+    detect_colors()
+
+    ensure_out()
+    // Alternate screen, reset, cursor off, all-motion mouse reporting in the
+    // SGR-1006 encoding, bracketed paste.
+    _ = io.write(io.stdout(), cstring("\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h"))
+    if io.flush(io.stdout()) != 0: return false
+    g_open = true
+    return true
+
+// Put the terminal back, in reverse. Safe to call twice, and `tty_onsignal`
+// runs the same two steps — which is why the epilogue string is one constant in
+// one place (`EPILOGUE`, `tty.dado`) that both paths write.
+void close():
+    if !g_open: return
+    g_open = false
+    if g_headless:
+        g_headless = false
+        free_grid()
+        arena.destroy(&g_arena)
+        return
+    _ = io.flush(io.stdout())
+    tty_epilogue()
+    _ = tty_raw(0)
+    _ = io.flush(io.stdout())
+    free_grid()
+    arena.destroy(&g_arena)
+
+// End the loop after this frame. The ordinary way a program stops.
+void quit():
+    g_quit = true
+
+// Ask for a repaint. A program whose state changed outside a frame — a child
+// process wrote a line, a timer fired, a socket answered — calls this, and the
+// next `step` composes a frame instead of sleeping through it.
+void wake():
+    g_dirty = true
+
+// Whether stdin has ended: Ctrl-D, or a closed pipe. A loop that ignores this
+// spins.
+bool closed():
+    return g_ended
+
+// Seconds since `open`. The clock every animated widget in the library reads,
+// so a spinner and a blinking caret cannot disagree about what time it is.
+f64 clock():
+    return time.since(g_started)
+
+// Which of `frames` frames an animation running at `rate` frames a second is
+// on, `seconds` into it: the spinner's glyph and the caret's blink.
+//
+// **Through an `i64` and not an `i32`.** `i32(clock() * 8.0)` runs out of
+// `i32` after 2^31 / 8 seconds — eight and a half years for the spinner, and
+// 34 for the caret — and the conversion saturates, so past that the spinner
+// stops on one glyph for good. An `i64` of frames runs out after 36 billion
+// years at 8 a second, and saturating there would be harmless anyway, since it
+// is only ever reduced modulo `frames`. A NaN is frame 0, and a negative time
+// (which `clock` never answers) still lands in `0 ..< frames`, since the
+// result is an index.
+private i32 anim_frame(f64 seconds, f64 rate, i32 frames):
+    i64 n = i64(seconds * rate) % i64(frames)
+    if n < 0: n = n + i64(frames)
+    return i32(n)
+
+// ── giving the terminal back ───────────────────────────────────────────────
+//
+// A TUI owns the terminal, which means anything else that wants it — an editor,
+// a pager, a `git rebase -i`, the shell you get from Ctrl-Z — has to be handed
+// it and given it back. That is one pair of calls, and getting them exactly
+// right once here is the difference between "opens my editor" and "leaves my
+// terminal in raw mode with the cursor hidden".
+//
+// `shell_out` is the form to use, because the pair is what is easy to get
+// wrong: a `defer` inside it puts the terminal back on every path, including
+// the ones where the child failed to start.
+
+private bool g_suspended
+
+// Put the terminal back the way it was found, without closing the UI. The
+// screen, the modes and the cursor are all restored; the grid and every
+// widget's state are kept.
+void suspend():
+    if !g_open || g_suspended: return
+    g_suspended = true
+    g_frame_handed_over = true
+    _ = io.flush(io.stdout())
+    tty_epilogue()
+    _ = tty_raw(0)
+    _ = io.flush(io.stdout())
+
+// Take it back. The next frame is a full repaint, because whatever ran in
+// between wrote to the same screen and the compositor's front buffer is now a
+// description of something that is no longer there.
+void resume():
+    if !g_open || !g_suspended: return
+    g_suspended = false
+    if tty_raw(1) != 0: return
+    _ = io.write(io.stdout(), cstring("\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h"))
+    _ = io.flush(io.stdout())
+    _ = tty_measure()
+    forget_mouse()
+    g_force = true
+    g_dirty = true
+
+// Whether the UI is currently handed over.
+bool suspended():
+    return g_suspended
+
+// Run `command` with the terminal, and take it back afterwards.
+//
+//     _ = tui.shell_out(cstring("$EDITOR +11 src/main.dado"))
+//
+// The child inherits this program's streams, so it gets a real terminal and
+// behaves as it would from a shell. Answers what `core:os/proc` answers:
+// whether it ended by returning, and with what.
+(bool exited, i32 status) shell_out(cstring command):
+    if !g_open: return proc.run(command)
+    suspend()
+    defer resume()
+    return proc.run(command)
+
+// Stop the way Ctrl-Z does, and come back when continued.
+//
+// **You do not need to bind Ctrl-Z, and you cannot.** With `ISIG` on — which it
+// is, so that Ctrl-C still works — the line discipline turns `^Z` into SIGTSTP
+// before the program sees a byte, so `key("ctrl+z")` can never fire.
+// `tty_onstop` handles the signal instead: it restores the terminal, stops for
+// real, and the loop re-enters raw mode when SIGCONT arrives. Ctrl-Z works in any program
+// using this library, with nothing written.
+//
+// This is the same thing asked for from inside the program — a menu item, a
+// key of your own choosing — and it takes the identical path.
+void stop():
+    if !g_open: return
+    suspend()
+    defer resume()
+    tty_stop()
+
+// ── the frame ──────────────────────────────────────────────────────────────
+
+private i32 g_root_pad = 1
+private bool g_headless
+private i32 g_hw
+private i32 g_hh
+
+// ── headless ───────────────────────────────────────────────────────────────
+
+// Open a UI of a fixed size with no terminal anywhere: no raw mode, no
+// alternate screen, no reading from stdin. `compose` then runs one frame and
+// `snapshot` renders the result as plain text.
+//
+// This is what makes the library testable, and it is a design requirement
+// rather than a convenience: the tuibox port could not be tested at all,
+// because every path through it went to a file descriptor. A layout regression
+// here is an ordinary `@test` file that asserts a string.
+bool open_headless(i32 w, i32 h, i32 pad = 1):
+    return open_headless_over(w, h, #heap, pad)
+
+bool open_headless_over(i32 w, i32 h, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, i32 pad = 1):
+    if g_open: return false
+    g_backing = backing
+    g_arena = arena.sized(backing, 65536)
+    mem = arena.allocator(&g_arena)
+    g_headless = true
+    g_hw = w
+    g_hh = h
+    g_root_pad = pad
+    g_quit = false
+    g_ended = false
+    g_force = true
+    g_started = time.now()
+    reset_state()
+    g_open = true
+    return true
+
+// Run one frame into the back buffer, without presenting it. Pairs with
+// `snapshot`.
+void compose(Frame f):
+    if !g_open: return
+    begin_frame()
+    f()
+    end_frame_quiet()
+
+private void end_frame_quiet():
+    for g_depth > 0:
+        end()
+    draw_toasts()
+    draw_warning()
+    settle_input()
+
+private void begin_frame():
+    arena.reset(&g_arena)
+    tick_state()
+    g_depth = 0
+    g_id_salt = 0
+    g_overflowed = false
+    clear_warning()
+    reset_hints()
+
+    i32 w = g_hw
+    i32 h = g_hh
+    if !g_headless:
+        w = tty_cols()
+        h = tty_rows()
+    if w < 1: w = 1
+    if h < 1: h = 1
+    if w > MAX_COLS: w = MAX_COLS
+    if h > MAX_ROWS: h = MAX_ROWS
+    if !ensure_grid(w, h): return
+
+    set_clip(screen())
+    clear_back()
+    Rect root = inset(screen(), g_root_pad)
+    [MAX_TABLE_COLS]i32 nocols
+    g_stack[0] = (root, 0, 0, 0, Axis.Down, 0, Anchor.START, FNV_OFFSET, 0,
+                  screen(), false, NOWHERE, "", false, 0, false, NOWHERE, 0, nocols,
+                  true, g_theme.base, false)
+
+private void end_frame():
+    // A region left open is a `break` out of a `for tui.panel(...)`. Close it
+    // so the frame is at least coherent, and say so, because the layout after
+    // the break went somewhere the author did not mean.
+    // A region left open is a `break` or a `return` out of a
+    // `for tui.<container>()`. Close it so the frame is at least coherent, and
+    // say so **on the screen** — printing here would write over the UI and
+    // desynchronise the compositor's front buffer, so the report would destroy
+    // more than the bug it is reporting.
+    for g_depth > 0:
+        warn("a container was left open — use `if ...: defer tui.end()` where the body returns")
+        end()
+    if g_overflowed:
+        warn("too many nested containers")
+    draw_toasts()
+    draw_warning()
+    settle_input()
+    present()
+
+// One iteration: wait up to `timeout_ms` for input, then compose a frame if
+// anything changed. Answers false when the program should stop — `quit` was
+// called, or stdin ended.
+//
+// This is the form a program owning its own loop wants, and the reason it
+// exists: a dashboard that shells out to a compiler has to keep drawing while
+// a child writes, and there is nowhere to put that work inside a `run`.
+//
+//     for tui.step(frame, 30):
+//         drain_build_output()
+bool step(Frame f, i32 timeout_ms):
+    if !g_open: return false
+    if g_quit: return false
+
+    // A Ctrl-Z that the kernel handled: the terminal was restored from a
+    // signal handler and this is the first pass after SIGCONT, so take it back
+    // here — where writing escape sequences is allowed.
+    if tty_continued_since() != 0:
+        g_suspended = true
+        resume()
+
+    poll(timeout_ms)
+    if resized(): g_dirty = true
+    if g_animating: g_dirty = true
+
+    if g_dirty:
+        g_dirty = false
+        f64 began = time.now()
+        g_frame_handed_over = false
+        begin_frame()
+        f()
+        end_frame()
+        // A frame that handed the terminal to another program (an editor
+        // through `shell_out`) waited for it, and that wait is not drawing.
+        if !g_frame_handed_over: count_frame(time.now() - began)
+
+    if g_quit: return false
+    if g_ended: return false
+    return true
+
+// ── what frames cost ───────────────────────────────────────────────────────
+//
+// Every frame `step` composes is timed from the top of `begin_frame` to the
+// end of `present` — the program's own frame function, the compositor and the
+// write — so a program can report what it costs on the machine it is on
+// instead of asserting a number measured somewhere else. A frame that
+// suspended the UI (`shell_out`) is not counted.
+
+private bool g_frame_handed_over
+private i32 g_frames
+private f64 g_frame_last
+private f64 g_frame_worst
+private f64 g_frame_total
+private i32 g_frames_over
+private f64 g_frame_budget = 0.004
+
+private void count_frame(f64 seconds):
+    g_frames = g_frames + 1
+    g_frame_last = seconds
+    g_frame_total = g_frame_total + seconds
+    if seconds > g_frame_worst: g_frame_worst = seconds
+    if seconds > g_frame_budget: g_frames_over = g_frames_over + 1
+
+// The frames composed since `open`, the last one's time, the worst and the
+// mean, in milliseconds, and how many took longer than `frame_budget` (4 ms
+// unless set).
+(i32 frames, f64 last_ms, f64 worst_ms, f64 mean_ms, i32 over) frame_times():
+    f64 mean = 0.0
+    if g_frames > 0: mean = (g_frame_total / f64(g_frames)) * 1000.0
+    return (g_frames, g_frame_last * 1000.0, g_frame_worst * 1000.0, mean, g_frames_over)
+
+// The time a frame may take before `frame_times` counts it as over.
+void frame_budget(f64 ms):
+    g_frame_budget = ms / 1000.0
+
+// The whole loop, until `quit`. Sleeps when nothing is happening: the timeout
+// is short while something is animating and long when nothing is, so an idle
+// TUI costs nothing at all.
+void run(Frame f):
+    for step(f, idle_timeout()):
+        pass
+
+private i32 idle_timeout():
+    if g_animating: return 50
+    // Not infinite: a window resize is polled rather than delivered, because a
+    // signal handler that mutates a UI is a race and one `ioctl` four times a
+    // second is cheaper than getting that right.
+    return 250
+
+// Re-read the window size; true when it changed.
+bool resized():
+    if tty_measure() != 0:
+        g_force = true
+        return true
+    return false

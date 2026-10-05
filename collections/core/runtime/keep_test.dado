@@ -1,0 +1,117 @@
+@test
+// The three calls a function needs to hand a result out of heavy scratch work without
+// keeping the work, and without running the work twice:
+//
+//   * `temp_allocs` — whether anything drew memory from the scratch between two
+//     readings, directly or through an allocator drawn from it, which `is_temp` cannot
+//     see (an arena over `temp()`);
+//   * `close_temp_hoisting` — close a frame, rolling it back, but keep its last
+//     allocation, moved down to where the frame began; nested frames hoist it again;
+//   * `close_temp_keep` — close a frame without rolling it back, decided at the close.
+package runtime
+
+import "core:mem"
+import "core:mem/arena"
+import "core:mem/libc"
+
+private type Words: ^u64
+
+private void fill_words(rawptr p, i64 n, u64 seed):
+    Words w = Words(p)
+    []u64 span = w[0..<n]
+    for i in 0..<n:
+        span[i] = seed * 1000 + u64(i)
+    return
+
+private bool has_words(rawptr p, i64 n, u64 seed):
+    Words w = Words(p)
+    []u64 span = w[0..<n]
+    for i in 0..<n:
+        if span[i] != seed * 1000 + u64(i):
+            return false
+    return true
+
+private rawptr take((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, u64 n):
+    return a.proc(a.data, mem.AllocatorMode.Alloc, n, 16, nil, 0)
+
+i32 test():
+    bool ok = init_scratch()
+    #assert(ok, "init_scratch")
+    defer destroy_scratch()
+
+    // ── temp_allocs: directly, through an arena drawn from it, and not otherwise ──
+    u64 a0 = temp_allocs()
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) heap = libc.allocator()
+    rawptr heap_block = take(heap, 64)
+    ok = #expect(temp_allocs() == a0, "a heap allocation moved temp_allocs") && ok
+    _ = heap.proc(heap.data, mem.AllocatorMode.Free, 0, 0, heap_block, 64)
+    using enter_temp():
+        _ = take(temp(), 32)
+        ok = #expect(temp_allocs() == a0 + 1, "an allocation from temp() did not count once: ", temp_allocs() - a0) && ok
+        arena.Arena over_temp = arena.sized(temp(), 256)
+        (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) ot = arena.allocator(&over_temp)
+        u64 a1 = temp_allocs()
+        _ = take(ot, 16) // the arena's first block, from temp()
+        ok = #expect(temp_allocs() > a1, "an arena over temp() drew its block unseen") && ok
+        u64 a2 = temp_allocs()
+        _ = take(ot, 16) // fits the arena's block: nothing from temp()
+        ok = #expect(temp_allocs() == a2, "an allocation inside the arena's own block counted") && ok
+        _ = temp().proc(temp().data, mem.AllocatorMode.Free, 0, 0, nil, 0)
+        ok = #expect(temp_allocs() == a2, "a Free counted") && ok
+    ok = #expect(close_temp(), "closing the first frame") && ok
+
+    // ── close_temp_hoisting: the work goes, the last allocation stays ────────
+    ok = #expect(temp_depth() == 0, "depth before: ", temp_depth()) && ok
+    _ = enter_temp() // the outer frame, which receives the hoisted bytes
+    u64 outer_used = temp_used()
+    _ = enter_temp() // the working frame
+    _ = take(temp(), 5000) // the "work"
+    _ = take(temp(), 70000) // enough to need another block
+    rawptr blob = take(temp(), 800)
+    fill_words(blob, 100, 3)
+    u64 depth_in = temp_depth()
+    rawptr moved = close_temp_hoisting(blob, 800)
+    ok = #expect(moved != nil && has_words(moved, 100, 3), "hoisting lost the bytes") && ok
+    ok = #expect(temp_depth() == depth_in - 1, "hoisting left depth ", temp_depth(), ", not ", depth_in - 1) && ok
+    ok = #expect(temp_used() <= outer_used + 800 + 16, "hoisting kept the work: used ", temp_used() - outer_used, " above the outer frame's start") && ok
+    // Hoisted again from a nested frame over it: the bytes are its enclosing frame's
+    // last allocation, so a frame opened now sits above them.
+    _ = enter_temp()
+    _ = take(temp(), 3000)
+    rawptr blob2 = take(temp(), 160)
+    fill_words(blob2, 20, 4)
+    rawptr moved2 = close_temp_hoisting(blob2, 160)
+    ok = #expect(moved2 != nil && has_words(moved2, 20, 4) && has_words(moved, 100, 3), "the second hoist lost bytes") && ok
+    ok = #expect(temp_used() <= outer_used + 800 + 160 + 32, "the second hoist kept its work") && ok
+    ok = #expect(close_temp() && temp_used() == outer_used, "the outer frame did not reclaim the hoisted bytes: used ", temp_used()) && ok
+
+    // Refusals: not the frame's last allocation (the frame is still closed, rolled
+    // back), and no frame open at all.
+    _ = enter_temp()
+    rawptr first = take(temp(), 64)
+    _ = take(temp(), 64)
+    ok = #expect(close_temp_hoisting(first, 64) == nil && temp_depth() == 0, "hoisting a non-last allocation answered, or left the frame open") && ok
+    ok = #expect(close_temp_hoisting(first, 64) == nil, "hoisting with no frame open answered") && ok
+    // An escaping frame rolls nothing back, so the bytes stay where they are.
+    _ = enter_temp()
+    _ = enter_temp(true)
+    rawptr esc = take(temp(), 64)
+    fill_words(esc, 8, 5)
+    ok = #expect(close_temp_hoisting(esc, 64) == esc && has_words(esc, 8, 5) && temp_depth() == 1, "an escaping frame's hoist moved the bytes, or left depth ", temp_depth()) && ok
+    ok = #expect(close_temp(), "closing the frame over the escaping one") && ok
+
+    // ── close_temp_keep: decided at the close, not the door ──────────────────
+    _ = enter_temp()
+    u64 keep_base = temp_used()
+    _ = enter_temp()
+    rawptr kept = take(temp(), 256)
+    fill_words(kept, 32, 6)
+    ok = #expect(close_temp_keep() && temp_depth() == 1, "close_temp_keep did not close the frame") && ok
+    ok = #expect(temp_used() >= keep_base + 256 && has_words(kept, 32, 6), "close_temp_keep rolled the frame back") && ok
+    ok = #expect(close_temp() && temp_used() == keep_base, "the enclosing frame did not reclaim what was kept") && ok
+    ok = #expect(!close_temp_keep(), "close_temp_keep with no frame open answered true") && ok
+    ok = #expect(deferrals() == 0, "a rollback was deferred: ", deferrals()) && ok
+
+    if ok:
+        return 0
+    return 1

@@ -1,0 +1,165 @@
+@test
+// app:log unit test. `core:log`'s own suite covers `Record`/`Sink`/`emit`;
+// what's this package's own judgement is the ring/flush machinery:
+//
+//   * **ordering** — records reach a sink in worker-ascending, then
+//     call-ascending order, regardless of the order `log.*` was called in.
+//   * **overflow drops the newest** and `dropped()` counts it, per worker.
+//   * **`flush` clears** — a second `flush` with nothing new logged
+//     dispatches nothing.
+//   * **every registered sink** gets every record, not just the latest one
+//     added.
+//   * **real concurrency** — a pooled `core:jobs` scheduler, several worker
+//     threads actually logging at once, no lock: every message this test
+//     sends arrives exactly once, byte-for-byte, which is the property "no
+//     interleaving, no lock" is actually claiming.
+package applog
+
+import corelog "core:log"
+import "core:jobs"
+import "core:strings"
+// `STR-FREESTANDING` (2026-09-02): `to_i32` moved out of `core:strings` into
+// `core:strings/parse`, so that importing the string operations costs no hosted
+// header. This suite parses an index back out of a captured message, so it asks
+// for the parse by name.
+import "core:strings/parse"
+
+// ── a capturing sink (used by every section below) ─────────────────────────
+
+private const i32 CAP = 512
+private [CAP]corelog.Record g_captured
+private i32 g_ncaptured
+
+private void capture_fn(^corelog.Record r, rawptr _data):
+    if g_ncaptured < CAP:
+        g_captured[g_ncaptured] = r^
+        g_ncaptured = g_ncaptured + 1
+
+private void reset_capture():
+    g_ncaptured = 0
+
+// a second, independent capturing sink — proves `add_sink` fans out to
+// every sink, not just the one most recently added
+private [CAP]corelog.Record g_captured2
+private i32 g_ncaptured2
+
+private void capture2_fn(^corelog.Record r, rawptr _data):
+    if g_ncaptured2 < CAP:
+        g_captured2[g_ncaptured2] = r^
+        g_ncaptured2 = g_ncaptured2 + 1
+
+i32 test():
+    bool ok = true
+    add_sink((capture_fn, nil))
+
+    // ── ordering: worker-ascending, then call-ascending within a worker ────
+
+    reset_capture()
+    info("a", "w0-first", 0)
+    info("a", "w2-first", 2)
+    info("a", "w0-second", 0)
+    info("a", "w1-first", 1)
+    flush()
+
+    ok = #expect(g_ncaptured == 4, "ordering: captured ", g_ncaptured, " want 4") && ok
+    if g_ncaptured == 4:
+        string8 m0 = corelog.msg_str(&g_captured[0].message, g_captured[0].msg_len)
+        string8 m1 = corelog.msg_str(&g_captured[1].message, g_captured[1].msg_len)
+        string8 m2 = corelog.msg_str(&g_captured[2].message, g_captured[2].msg_len)
+        string8 m3 = corelog.msg_str(&g_captured[3].message, g_captured[3].msg_len)
+        ok = #expect(m0 == "w0-first", "slot 0 was ", m0) && ok
+        ok = #expect(m1 == "w0-second", "slot 1 was ", m1) && ok
+        ok = #expect(m2 == "w1-first", "slot 2 was ", m2) && ok
+        ok = #expect(m3 == "w2-first", "slot 3 was ", m3) && ok
+
+    // level and tag survive the round trip too.
+    reset_capture()
+    warn("net", "retry", 0)
+    flush()
+    ok = #expect(g_ncaptured == 1, "level/tag section: captured ", g_ncaptured) && ok
+    if g_ncaptured == 1:
+        ok = #expect(g_captured[0].level == corelog.Level.Warn, "level did not survive flush") && ok
+        string8 tag = corelog.tag_str(&g_captured[0].tag, g_captured[0].tag_len)
+        ok = #expect(tag == "net", "tag did not survive flush: ", tag) && ok
+
+    // ── flush clears: a second flush with nothing new dispatches nothing ───
+
+    reset_capture()
+    flush()
+    ok = #expect(g_ncaptured == 0, "flush with nothing logged dispatched ", g_ncaptured) && ok
+
+    // ── overflow drops the newest, dropped() counts it ──────────────────────
+
+    reset_capture()
+    i32 sent = RING_CAP + 10
+    for i in 0..<sent:
+        debug("spam", "x", 0)
+    ok = #expect(dropped(0) == 10, "dropped(0) was ", dropped(0), " want 10") && ok
+    flush()
+    ok = #expect(g_ncaptured == RING_CAP, "overflow: captured ", g_ncaptured, " want RING_CAP") && ok
+    ok = #expect(dropped(0) == 0, "dropped(0) after flush was ", dropped(0), " want 0 (flush clears it)") && ok
+
+    // ── every registered sink gets every record ─────────────────────────────
+
+    add_sink((capture2_fn, nil))
+    reset_capture()
+    g_ncaptured2 = 0
+    error("both", "seen-by-both", 0)
+    flush()
+    ok = #expect(g_ncaptured == 1 && g_ncaptured2 == 1, "both sinks should have gotten one record each: ", g_ncaptured, " ", g_ncaptured2) && ok
+
+    // ── real concurrency: a pooled scheduler, several threads logging ──────
+    //
+    // N is picked so that even if the scheduler handed every single chunk to
+    // one worker (the degenerate, maximally-unfair case), that worker's ring
+    // (capacity RING_CAP) still would not overflow — so a failure below is a
+    // correctness bug, never a capacity artefact of this test's own choices.
+    const i32 N = 40
+    ok = #expect(N < RING_CAP, "fixture: N must stay under RING_CAP to rule out overflow noise") && ok
+    ok = #expect(jobs.start(&g_sched, 3), "jobs.start failed") && ok
+    jobs.parallel_for(&g_sched, N, 1, log_index_job, nil)
+    // parallel_for already joined, so every logging job has finished — safe
+    // to flush per the package doc comment's contract.
+    reset_capture()
+    flush()
+    jobs.stop(&g_sched)
+
+    ok = #expect(g_ncaptured == N, "concurrent logging: captured ", g_ncaptured, " want ", N) && ok
+    [N]bool seen
+    i32 dupes = 0
+    i32 unparsed = 0
+    for i in 0..<g_ncaptured:
+        string8 msg = corelog.msg_str(&g_captured[i].message, g_captured[i].msg_len)
+        ref []char8 c = strings.clone_to_cstring(msg, #default)
+        i32 idx = parse.to_i32(cstring(c))
+        #delete(c)
+        if idx < 0 || idx >= N:
+            unparsed = unparsed + 1
+        else if seen[idx]:
+            dupes = dupes + 1
+        else:
+            seen[idx] = true
+    ok = #expect(unparsed == 0, "concurrent logging: ", unparsed, " message(s) didn't parse back to a valid index — corruption") && ok
+    ok = #expect(dupes == 0, "concurrent logging: ", dupes, " duplicate index/indices — a record was double-delivered") && ok
+    i32 missing = 0
+    for i in 0..<N:
+        if !seen[i]:
+            missing = missing + 1
+    ok = #expect(missing == 0, "concurrent logging: ", missing, " index/indices never arrived — a record was lost") && ok
+
+    if ok:
+        return 0
+    return 1
+
+// ── the concurrent-logging fixture ──────────────────────────────────────────
+
+private jobs.Scheduler g_sched
+
+// Every index in [a.begin, a.end) logs its own index as the message, from
+// its own worker (`a.worker`) — real concurrent writers, each to its own
+// ring, no shared state but the ring array itself (which the package doc
+// comment argues is safe without a lock).
+private void log_index_job(^jobs.JobArgs a):
+    for idx in a.begin..<a.end:
+        ref []char8 m = #format(idx, a.scratch)
+        info("concurrent", string8(m[:]), a.worker)

@@ -1,0 +1,634 @@
+@test
+package appgraph
+
+import "core:mem/libc"
+import "core:mem/arena"
+import "core:math"
+import "core:geom/xform"
+
+private f32 EPS = 0.001
+
+private bool near2([2]f32 a, [2]f32 b):
+    return (
+        math.magnitude(f64(a.x) - f64(b.x)) < f64(EPS) &&
+        math.magnitude(f64(a.y) - f64(b.y)) < f64(EPS)
+    )
+
+// ── on_process bookkeeping: how many times, and in what order, nodes were
+// visited this call. Package-level, not per-Slot userdata, because several
+// of the scenarios below want to see the *global* visit order across many
+// nodes, which a single node's own userdata can't record.
+private i32 g_visits
+private [16]Node g_visit_order
+
+private void record_process(^Graph g, Node n, f32 dt, rawptr ud):
+    if g_visits < #len(g_visit_order):
+        g_visit_order[g_visits] = n
+    g_visits = g_visits + 1
+
+private void reset_visits():
+    g_visits = 0
+
+// ── a hook that mutates the tree it was called from, to exercise the
+// pointer-invalidation discipline the package doc comment promises: adding
+// a node (which can grow the pool / move `g.slots`) from inside a walk must
+// not corrupt the walk in progress. Uses the `^Graph` the hook itself is
+// handed rather than a package-level global — the whole reason every hook
+// signature carries one.
+private Node g_mutating_parent
+private i32 g_mutations_left
+
+private void mutate_during_process(^Graph g, Node n, f32 dt, rawptr ud):
+    g_visits = g_visits + 1
+    if g_mutations_left > 0:
+        g_mutations_left = g_mutations_left - 1
+        Node fresh = create(g, (f32(g_mutations_left), 0.0))
+        add_child(g, g_mutating_parent, fresh)
+
+// ── enter/exit tree bookkeeping ──────────────────────────────────────────
+private i32 g_enters
+private i32 g_exits
+
+private void on_enter(^Graph g, Node n, rawptr ud):
+    g_enters = g_enters + 1
+
+private void on_exit(^Graph g, Node n, rawptr ud):
+    g_exits = g_exits + 1
+
+// ── ready-fires-once bookkeeping ─────────────────────────────────────────
+private i32 g_ready_count
+
+private void on_ready_once(^Graph g, Node n, rawptr ud):
+    g_ready_count = g_ready_count + 1
+
+// ── exit-order bookkeeping: which nodes left the tree, and in what order.
+// `on_exit` above only counts, and "a node before its children" is a claim
+// about order that a count cannot witness.
+private i32 g_exit_n
+private [8]Node g_exit_order
+
+private void record_exit(^Graph g, Node n, rawptr ud):
+    if g_exit_n < #len(g_exit_order):
+        g_exit_order[g_exit_n] = n
+    g_exit_n = g_exit_n + 1
+
+// ── what a hook sees of `payload` and `userdata` at the same moment, which
+// is how "they are two slots" is asserted rather than asserted about.
+private u32 g_seen_payload
+private bool g_seen_ud_nil
+
+private void record_payload(^Graph g, Node n, f32 dt, rawptr ud):
+    g_seen_payload = payload(g, n)
+    g_seen_ud_nil = ud == nil
+
+// ── list readers. One buffer, because no two of the scenarios below hold a
+// child list and a root list at the same time, and a second one would only
+// be a second thing to reset.
+private i32 g_list_n
+private [8]Node g_list
+
+private void collect_children(^Graph g, Node parent):
+    g_list_n = 0
+    Node c = first_child_of(g, parent)
+    for valid(c):
+        if g_list_n < #len(g_list):
+            g_list[g_list_n] = c
+        g_list_n = g_list_n + 1
+        c = next_sibling_of(g, c)
+
+private void collect_roots(^Graph g):
+    g_list_n = 0
+    Node c = first_root(g)
+    for valid(c):
+        if g_list_n < #len(g_list):
+            g_list[g_list_n] = c
+        g_list_n = g_list_n + 1
+        c = next_root(g, c)
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = libc.allocator()
+
+    // A fresh graph allocates nothing.
+    Graph g = init() using alloc
+    ok = #expect(g.slots == nil, "init allocated eagerly") && ok
+    ok = #expect(g.used == 0, "init had a nonzero high-water mark") && ok
+
+    // Handles: INVALID is never valid; a fresh graph has no live nodes.
+    ok = #expect(!valid(INVALID), "INVALID read as valid") && ok
+
+    // Basic create + roots-only process.
+    reset_visits()
+    Node a = create(&g, (1.0, 2.0))
+    set_on_process(&g, a, record_process)
+    add_child(&g, INVALID, a)
+    ok = #expect(valid(a), "create returned an invalid handle") && ok
+    ok = #expect(parent_of(&g, a) == INVALID, "root has a parent") && ok
+    process(&g, 0.016)
+    ok = #expect(g_visits == 1, "expected 1 visit, got ", g_visits) && ok
+    ok = #expect(near2(global_position(&g, a), (1.0, 2.0)), "root global position wrong") && ok
+
+    // Parent/child composition: a child's global position is the parent's
+    // translation plus the child's own local position (both axis-aligned,
+    // no rotation/scale, so this is plain vector addition).
+    reset_visits()
+    Node parent = create(&g, (10.0, 0.0))
+    Node child = create(&g, (1.0, 1.0))
+    set_on_process(&g, child, record_process)
+    add_child(&g, INVALID, parent)
+    add_child(&g, parent, child)
+    ok = #expect(parent_of(&g, child) == parent, "child's parent_of is wrong") && ok
+    ok = #expect(first_child_of(&g, parent) == child, "parent's first_child_of is wrong") && ok
+    process(&g, 0.016)
+    ok = #expect(near2(global_position(&g, child), (11.0, 1.0)), "child global position wrong: ", global_position(&g, child).x, ", ", global_position(&g, child).y) && ok
+
+    // to_global / to_local round-trip through a non-trivial transform.
+    set_rotation(&g, parent, f32(math.PI) / 2.0)
+    process(&g, 0.016)
+    [2]f32 gp = to_global(&g, parent, (2.0, 0.0))
+    [2]f32 back = to_local(&g, parent, gp)
+    ok = #expect(near2(back, (2.0, 0.0)), "to_local(to_global(p)) round-trip failed") && ok
+
+    // enter_tree / exit_tree fire exactly once each, and ready fires once.
+    g_enters = 0
+    g_exits = 0
+    g_ready_count = 0
+    Node tracked = create(&g)
+    set_on_enter_tree(&g, tracked, on_enter)
+    set_on_exit_tree(&g, tracked, on_exit)
+    set_on_ready(&g, tracked, on_ready_once)
+    add_child(&g, INVALID, tracked)
+    ok = #expect(g_enters == 1, "on_enter_tree fired ", g_enters, " times") && ok
+    ok = #expect(g_ready_count == 1, "on_ready fired ", g_ready_count, " times") && ok
+    ok = #expect(g_exits == 0, "on_exit_tree fired before remove") && ok
+    remove(&g, tracked)
+    ok = #expect(g_exits == 1, "on_exit_tree fired ", g_exits, " times") && ok
+    ok = #expect(!valid(parent_of(&g, tracked)) && slot_dead(&g, tracked), "removed node still looks alive") && ok
+
+    // remove() frees an entire subtree, firing exit_tree on every node in
+    // it, and every handle in that subtree reads as invalid afterward.
+    g_exits = 0
+    Node top = create(&g)
+    Node mid = create(&g)
+    set_on_exit_tree(&g, mid, on_exit)
+    Node leaf = create(&g)
+    set_on_exit_tree(&g, leaf, on_exit)
+    add_child(&g, INVALID, top)
+    add_child(&g, top, mid)
+    add_child(&g, mid, leaf)
+    remove(&g, top)
+    ok = #expect(g_exits == 2, "subtree remove fired exit_tree ", g_exits, " times, wanted 2") && ok
+    ok = #expect(slot_dead(&g, mid) && slot_dead(&g, leaf), "subtree remove left a node alive") && ok
+
+    // A freed slot is reused by the next create(), and the new handle's
+    // generation differs from the stale one — a stale handle into the
+    // reused slot must not read as the new node.
+    Node reused_check = create(&g)
+    add_child(&g, INVALID, reused_check)
+    Node stale = reused_check
+    remove(&g, reused_check)
+    Node fresh_in_same_slot = create(&g)
+    add_child(&g, INVALID, fresh_in_same_slot)
+    if fresh_in_same_slot.index == stale.index:
+        ok = #expect(fresh_in_same_slot.generation != stale.generation, "reused slot kept the stale generation") && ok
+        ok = #expect(!valid(parent_of(&g, stale)) || slot_dead(&g, stale), "stale handle still resolves into the reused slot") && ok
+
+    // A hook that mutates the tree mid-walk (adding a new child every time
+    // it fires, which repeatedly grows — and moves — the node pool) must
+    // not corrupt the walk in progress: a node added this way is not
+    // required to be visited in the *same* `process` call (documented in
+    // the package doc comment — there is no "end of frame" to catch up to
+    // mid-walk), but repeated `process` calls must eventually reach every
+    // node the hook ever creates, the pool must actually grow past its
+    // initial capacity (proving this exercises a real `resize`, not just
+    // free-list reuse), and nothing may crash or read through a pointer a
+    // resize moved out from under it — which a clean run under ASan/UBSan
+    // (`--cc gcc`, part of this project's own verification) is the real
+    // witness for.
+    Graph mg = init() using alloc
+    Node mroot = create(&mg)
+    add_child(&mg, INVALID, mroot)
+    g_mutating_parent = mroot
+    g_mutations_left = 20   // deliberately forces several pool growths (starts at cap 8)
+    Node mchild = create(&mg)
+    set_on_process(&mg, mchild, mutate_during_process)
+    add_child(&mg, mroot, mchild)
+    i32 rounds = 0
+    for g_mutations_left > 0 && rounds < 64:
+        process(&mg, 0.016)
+        rounds = rounds + 1
+    ok = #expect(g_mutations_left == 0, "mutate-during-walk: ", g_mutations_left, " mutations never got visited after ", rounds, " rounds") && ok
+    ok = #expect(mg.used > 8, "mutate-during-walk: pool never grew past its initial capacity (used = ", mg.used, ")") && ok
+    // 1 root + 1 original child + 20 hook-created children, and every one
+    // of them is still alive (nothing this hook does ever removes a node).
+    i32 alive_count = 0
+    for i in 0..<mg.used:
+        if mg.slots[i].alive:
+            alive_count = alive_count + 1
+    ok = #expect(alive_count == 22, "mutate-during-walk: ", alive_count, " nodes alive, wanted 22") && ok
+
+    // ── the presentation properties: what a fresh node carries, and that
+    // every setter round-trips through its own getter. Nothing in the
+    // package reads any of them, so a round trip is the whole contract.
+    Graph pg = init() using alloc
+    Node props = create(&pg)
+    add_child(&pg, INVALID, props)
+    ok = #expect(visible(&pg, props), "a fresh node is not visible") && ok
+    ok = #expect(modulate(&pg, props) == (255, 255, 255, 255), "modulate does not default to opaque white") && ok
+    ok = #expect(self_modulate(&pg, props) == (255, 255, 255, 255), "self_modulate does not default to opaque white") && ok
+    ok = #expect(z_index(&pg, props) == 0, "z_index does not default to 0") && ok
+    ok = #expect(z_as_relative(&pg, props), "z_as_relative does not default to true") && ok
+    ok = #expect(!clip(&pg, props), "clip does not default to off") && ok
+    ok = #expect(custom_rect(&pg, props) == (0.0, 0.0, 0.0, 0.0), "custom_rect does not default to an empty rect") && ok
+    ok = #expect(payload(&pg, props) == 0, "payload does not default to 0") && ok
+
+    set_visible(&pg, props, false)
+    set_modulate(&pg, props, (1, 2, 3, 4))
+    set_self_modulate(&pg, props, (5, 6, 7, 8))
+    set_z_index(&pg, props, -3)
+    set_z_as_relative(&pg, props, false)
+    set_clip(&pg, props, true)
+    set_custom_rect(&pg, props, (1.0, 2.0, 30.0, 40.0))
+    set_payload(&pg, props, 4242)
+    ok = #expect(!visible(&pg, props), "set_visible did not take") && ok
+    ok = #expect(modulate(&pg, props) == (1, 2, 3, 4), "set_modulate did not take") && ok
+    ok = #expect(self_modulate(&pg, props) == (5, 6, 7, 8), "set_self_modulate did not take") && ok
+    ok = #expect(modulate(&pg, props) != self_modulate(&pg, props), "modulate and self_modulate share one slot") && ok
+    ok = #expect(z_index(&pg, props) == -3, "set_z_index did not take") && ok
+    ok = #expect(!z_as_relative(&pg, props), "set_z_as_relative did not take") && ok
+    ok = #expect(clip(&pg, props), "set_clip did not take") && ok
+    ok = #expect(custom_rect(&pg, props) == (1.0, 2.0, 30.0, 40.0), "set_custom_rect did not take") && ok
+    ok = #expect(payload(&pg, props) == 4242, "set_payload did not take") && ok
+
+    // The custom rect outlives `clip` being switched off and on again — the
+    // two are set by two different call sites in every consumer so far.
+    set_clip(&pg, props, false)
+    set_clip(&pg, props, true)
+    ok = #expect(custom_rect(&pg, props) == (1.0, 2.0, 30.0, 40.0), "toggling clip lost the custom rect") && ok
+
+    // `payload` is not `userdata`: the hook sees the `userdata` it was
+    // created with (nil, since nothing set one) while `payload` reads 4242.
+    g_seen_payload = 0
+    g_seen_ud_nil = false
+    set_on_process(&pg, props, record_payload)
+    process(&pg, 0.016)
+    ok = #expect(g_seen_payload == 4242, "a hook read ", g_seen_payload, " as the payload, wanted 4242") && ok
+    ok = #expect(g_seen_ud_nil, "setting a payload wrote through to userdata") && ok
+
+    // A fresh node's properties are the defaults even when its slot is
+    // recycled — a reused slot never gets the zero-fill a `make`d one does,
+    // so every default is written out by `create`.
+    remove(&pg, props)
+    Node recycled = create(&pg)
+    add_child(&pg, INVALID, recycled)
+    ok = #expect(recycled.index == props.index, "the free list did not recycle the slot under test") && ok
+    ok = #expect(visible(&pg, recycled), "a recycled slot kept its old `visible`") && ok
+    ok = #expect(modulate(&pg, recycled) == (255, 255, 255, 255), "a recycled slot kept its old modulate") && ok
+    ok = #expect(self_modulate(&pg, recycled) == (255, 255, 255, 255), "a recycled slot kept its old self_modulate") && ok
+    ok = #expect(z_index(&pg, recycled) == 0, "a recycled slot kept its old z_index") && ok
+    ok = #expect(z_as_relative(&pg, recycled), "a recycled slot kept its old z_as_relative") && ok
+    ok = #expect(!clip(&pg, recycled), "a recycled slot kept its old clip flag") && ok
+    ok = #expect(custom_rect(&pg, recycled) == (0.0, 0.0, 0.0, 0.0), "a recycled slot kept its old custom rect") && ok
+    ok = #expect(payload(&pg, recycled) == 0, "a recycled slot kept its old payload") && ok
+
+    // ── `set_transform`: a matrix in, the TRS triple decomposed back out of
+    // it, and the matrix itself — not the triple — is what composes.
+    Graph tg = init() using alloc
+    Node tn = create(&tg)
+    add_child(&tg, INVALID, tn)
+    set_transform(&tg, tn, xform.from_trs((4.0, 9.0), 0.0, (2.0, 3.0)))
+    ok = #expect(near2(position(&tg, tn), (4.0, 9.0)), "set_transform's translation did not reach `position`") && ok
+    ok = #expect(near2(scale(&tg, tn), (2.0, 3.0)), "set_transform's scale did not reach `scale`") && ok
+    ok = #expect(near2(xform.position_of(transform(&tg, tn)), (4.0, 9.0)), "`transform` did not answer what was set") && ok
+    update_transforms(&tg)
+    ok = #expect(near2(global_position(&tg, tn), (4.0, 9.0)), "set_transform's translation did not reach the global") && ok
+    ok = #expect(near2(to_global(&tg, tn, (1.0, 1.0)), (6.0, 12.0)), "set_transform's scale did not reach the global") && ok
+
+    // ── `update_transforms` refreshes globals and fires nothing. The visit
+    // counter is the witness: `process` over this same tree moves it by 2.
+    Graph ug = init() using alloc
+    Node uroot = create(&ug, (5.0, 0.0))
+    Node ukid = create(&ug, (2.0, 0.0))
+    set_on_process(&ug, uroot, record_process)
+    set_on_process(&ug, ukid, record_process)
+    add_child(&ug, INVALID, uroot)
+    add_child(&ug, uroot, ukid)
+    reset_visits()
+    process(&ug, 0.016)
+    ok = #expect(g_visits == 2, "process visited ", g_visits, " nodes, wanted 2") && ok
+    ok = #expect(near2(global_position(&ug, ukid), (7.0, 0.0)), "the child's global is wrong after process") && ok
+    set_position(&ug, uroot, (50.0, 0.0))
+    ok = #expect(near2(global_position(&ug, ukid), (7.0, 0.0)), "a local edit moved a global with no walk between") && ok
+    reset_visits()
+    update_transforms(&ug)
+    ok = #expect(g_visits == 0, "update_transforms fired on_process ", g_visits, " times") && ok
+    ok = #expect(near2(global_position(&ug, ukid), (52.0, 0.0)), "update_transforms did not refresh the child's global") && ok
+    ok = #expect(near2(global_position(&ug, uroot), (50.0, 0.0)), "update_transforms did not refresh the root's global") && ok
+
+    // ── a created-but-unattached node is not in the tree and is not walked.
+    // Under the slot scan this package used to do, "alive with no parent"
+    // and "a root" were one test; they are not one thing.
+    Graph dg = init() using alloc
+    Node loose = create(&dg)
+    set_on_process(&dg, loose, record_process)
+    ok = #expect(!in_tree(&dg, loose), "a created node already reads as in the tree") && ok
+    reset_visits()
+    process(&dg, 0.016)
+    ok = #expect(g_visits == 0, "a detached node was walked ", g_visits, " times") && ok
+    add_child(&dg, INVALID, loose)
+    ok = #expect(in_tree(&dg, loose), "an attached node does not read as in the tree") && ok
+    reset_visits()
+    process(&dg, 0.016)
+    ok = #expect(g_visits == 1, "an attached root was walked ", g_visits, " times, wanted 1") && ok
+
+    // `set_parent` on a node that is not yet in the tree is an attach, and
+    // an attach fires `on_enter_tree` then `on_ready` exactly as `add_child`
+    // does.
+    g_enters = 0
+    g_ready_count = 0
+    Node adopt = create(&dg)
+    set_on_enter_tree(&dg, adopt, on_enter)
+    set_on_ready(&dg, adopt, on_ready_once)
+    ok = #expect(set_parent(&dg, adopt, loose), "set_parent refused to attach a detached node") && ok
+    ok = #expect(g_enters == 1, "attaching via set_parent fired on_enter_tree ", g_enters, " times") && ok
+    ok = #expect(g_ready_count == 1, "attaching via set_parent fired on_ready ", g_ready_count, " times") && ok
+    ok = #expect(parent_of(&dg, adopt) == loose, "set_parent did not attach the node") && ok
+
+    // ── `add_child` appends: three children come out in the order they went
+    // in, `first_child_of`/`last_child_of` name the ends, and the walk
+    // visits them in that same order. (This package used to prepend, so
+    // every one of these would have read backwards.)
+    Graph ag = init() using alloc
+    Node ap = create(&ag)
+    add_child(&ag, INVALID, ap)
+    Node c1 = create(&ag)
+    Node c2 = create(&ag)
+    Node c3 = create(&ag)
+    add_child(&ag, ap, c1)
+    add_child(&ag, ap, c2)
+    add_child(&ag, ap, c3)
+    collect_children(&ag, ap)
+    ok = #expect(g_list_n == 3, "the parent has ", g_list_n, " children, wanted 3") && ok
+    ok = #expect(g_list[0] == c1 && g_list[1] == c2 && g_list[2] == c3, "children are not in insertion order") && ok
+    ok = #expect(first_child_of(&ag, ap) == c1, "first_child_of is not the first-added child") && ok
+    ok = #expect(last_child_of(&ag, ap) == c3, "last_child_of is not the last-added child") && ok
+    set_on_process(&ag, c1, record_process)
+    set_on_process(&ag, c2, record_process)
+    set_on_process(&ag, c3, record_process)
+    reset_visits()
+    process(&ag, 0.016)
+    ok = #expect(g_visits == 3, "the walk visited ", g_visits, " children, wanted 3") && ok
+    ok = #expect(g_visit_order[0] == c1 && g_visit_order[1] == c2 && g_visit_order[2] == c3, "the walk did not visit siblings in insertion order") && ok
+
+    // ── reparenting: a node moves between two parents and both child lists
+    // are left correct — including `last_child`, which is the link a walk
+    // never reads and so the one a broken unlink hides in.
+    Graph mg2 = init() using alloc
+    Node pa = create(&mg2)
+    Node pb = create(&mg2)
+    add_child(&mg2, INVALID, pa)
+    add_child(&mg2, INVALID, pb)
+    Node k1 = create(&mg2)
+    Node k2 = create(&mg2)
+    Node k3 = create(&mg2)
+    Node m1 = create(&mg2)
+    add_child(&mg2, pa, k1)
+    add_child(&mg2, pa, k2)
+    add_child(&mg2, pa, k3)
+    add_child(&mg2, pb, m1)
+
+    // the middle child: an unlink from the middle of a chain.
+    ok = #expect(set_parent(&mg2, k2, pb), "set_parent refused a legal move") && ok
+    collect_children(&mg2, pa)
+    ok = #expect(g_list_n == 2 && g_list[0] == k1 && g_list[1] == k3, "the old parent's child list is wrong after a move") && ok
+    ok = #expect(last_child_of(&mg2, pa) == k3, "the old parent's last_child is wrong after a move") && ok
+    collect_children(&mg2, pb)
+    ok = #expect(g_list_n == 2 && g_list[0] == m1 && g_list[1] == k2, "the new parent did not get the moved node appended") && ok
+    ok = #expect(last_child_of(&mg2, pb) == k2, "the new parent's last_child is wrong after a move") && ok
+    ok = #expect(parent_of(&mg2, k2) == pb, "the moved node's parent_of is wrong") && ok
+    ok = #expect(next_sibling_of(&mg2, k2) == INVALID, "the moved node kept its old next_sibling") && ok
+
+    // the last child: the `last_child` fixup the middle case never reaches.
+    ok = #expect(set_parent(&mg2, k3, pb), "set_parent refused a legal move") && ok
+    collect_children(&mg2, pa)
+    ok = #expect(g_list_n == 1 && g_list[0] == k1, "moving the last child left the old list wrong") && ok
+    ok = #expect(last_child_of(&mg2, pa) == k1, "last_child was not pulled back to the new tail") && ok
+
+    // the only child: the head case, which must clear both ends.
+    ok = #expect(set_parent(&mg2, k1, pb), "set_parent refused a legal move") && ok
+    ok = #expect(first_child_of(&mg2, pa) == INVALID, "an emptied parent kept a first_child") && ok
+    ok = #expect(last_child_of(&mg2, pa) == INVALID, "an emptied parent kept a last_child") && ok
+    collect_children(&mg2, pb)
+    ok = #expect(g_list_n == 4, "the receiving parent has ", g_list_n, " children, wanted 4") && ok
+    ok = #expect(g_list[0] == m1 && g_list[1] == k2 && g_list[2] == k3 && g_list[3] == k1, "moves did not append in the order they were made") && ok
+
+    // a move is not a leave-and-enter: the node never left the tree, so no
+    // lifecycle hook fires for it.
+    g_enters = 0
+    g_exits = 0
+    Node hk = create(&mg2)
+    set_on_enter_tree(&mg2, hk, on_enter)
+    set_on_exit_tree(&mg2, hk, on_exit)
+    add_child(&mg2, pa, hk)
+    ok = #expect(g_enters == 1 && g_exits == 0, "add_child did not fire on_enter_tree exactly once") && ok
+    ok = #expect(set_parent(&mg2, hk, pb), "set_parent refused a legal move") && ok
+    ok = #expect(g_enters == 1, "a move fired on_enter_tree again") && ok
+    ok = #expect(g_exits == 0, "a move fired on_exit_tree") && ok
+
+    // a node moved into the root list is appended there, and leaves its old
+    // parent's list correct.
+    ok = #expect(set_parent(&mg2, k2, INVALID), "set_parent refused a move into the root list") && ok
+    ok = #expect(parent_of(&mg2, k2) == INVALID, "a node moved to the root list kept a parent") && ok
+    collect_roots(&mg2)
+    ok = #expect(g_list_n == 3 && g_list[0] == pa && g_list[1] == pb && g_list[2] == k2, "a node moved to the root list was not appended") && ok
+    collect_children(&mg2, pb)
+    ok = #expect(g_list_n == 4 && g_list[0] == m1 && g_list[1] == k3 && g_list[2] == k1 && g_list[3] == hk, "the old parent's list is wrong after a move out to the roots") && ok
+
+    // ── a reparent that would make a node its own ancestor is refused, and
+    // refused without touching anything: an accepted one would close the
+    // parent chain into a ring and every walk here would run forever.
+    Graph cg = init() using alloc
+    Node ca = create(&cg)
+    Node cb = create(&cg)
+    Node ccc = create(&cg)
+    add_child(&cg, INVALID, ca)
+    add_child(&cg, ca, cb)
+    add_child(&cg, cb, ccc)
+    ok = #expect(!set_parent(&cg, ca, ccc), "a reparent under a descendant was allowed") && ok
+    ok = #expect(!set_parent(&cg, ca, ca), "a node was allowed to parent itself") && ok
+    ok = #expect(!set_parent(&cg, cb, ccc), "a reparent under a direct child was allowed") && ok
+    ok = #expect(parent_of(&cg, ca) == INVALID, "the refused reparent moved the node anyway") && ok
+    ok = #expect(first_child_of(&cg, ccc) == INVALID, "the refused reparent linked a node under the descendant") && ok
+    ok = #expect(last_child_of(&cg, ccc) == INVALID, "the refused reparent left a last_child behind") && ok
+    ok = #expect(first_child_of(&cg, ca) == cb, "the refused reparent disturbed the ancestor's child list") && ok
+    collect_roots(&cg)
+    ok = #expect(g_list_n == 1 && g_list[0] == ca, "the refused reparent disturbed the root list") && ok
+    // the legal direction of the same edit still goes through.
+    ok = #expect(set_parent(&cg, ccc, ca), "moving a grandchild up to its grandparent was refused") && ok
+    ok = #expect(parent_of(&cg, ccc) == ca, "the legal move did not take") && ok
+
+    // ── root order is insertion order and is stable across a free-and-
+    // recreate. The removed root is the middle one, so the free list hands
+    // its slot index back for the next `create` — which is exactly where a
+    // slot scan would have put the new root, and is not where it belongs.
+    Graph rg = init() using alloc
+    Node r0 = create(&rg)
+    Node r1 = create(&rg)
+    Node r2 = create(&rg)
+    add_child(&rg, INVALID, r0)
+    add_child(&rg, INVALID, r1)
+    add_child(&rg, INVALID, r2)
+    collect_roots(&rg)
+    ok = #expect(g_list_n == 3, "the graph has ", g_list_n, " roots, wanted 3") && ok
+    ok = #expect(g_list[0] == r0 && g_list[1] == r1 && g_list[2] == r2, "roots are not in insertion order") && ok
+    ok = #expect(first_root(&rg) == r0, "first_root is not the first-added root") && ok
+    remove(&rg, r1)
+    collect_roots(&rg)
+    ok = #expect(g_list_n == 2 && g_list[0] == r0 && g_list[1] == r2, "removing a middle root left the list wrong") && ok
+    Node r3 = create(&rg)
+    add_child(&rg, INVALID, r3)
+    ok = #expect(r3.index == r1.index, "the free list did not recycle the middle slot, so this proves nothing") && ok
+    collect_roots(&rg)
+    ok = #expect(g_list_n == 3, "the graph has ", g_list_n, " roots after the recreate, wanted 3") && ok
+    ok = #expect(g_list[0] == r0 && g_list[1] == r2 && g_list[2] == r3, "root order was not stable across a free-and-recreate") && ok
+    // and the walk agrees with the list.
+    set_on_process(&rg, r0, record_process)
+    set_on_process(&rg, r2, record_process)
+    set_on_process(&rg, r3, record_process)
+    reset_visits()
+    process(&rg, 0.016)
+    ok = #expect(g_visits == 3, "the walk visited ", g_visits, " roots, wanted 3") && ok
+    ok = #expect(g_visit_order[0] == r0 && g_visit_order[1] == r2 && g_visit_order[2] == r3, "the walk did not visit roots in list order") && ok
+    // removing the last root pulls `last_root` back, which nothing above
+    // reads: the next root added has to land after `r2`, not after a
+    // dangling tail.
+    remove(&rg, r3)
+    Node r4 = create(&rg)
+    add_child(&rg, INVALID, r4)
+    collect_roots(&rg)
+    ok = #expect(g_list_n == 3 && g_list[0] == r0 && g_list[1] == r2 && g_list[2] == r4, "removing the last root left the tail wrong") && ok
+
+    // ── `destroy`: the tree leaves before the pool does, and what is left
+    // behind is what `init` answers.
+    //
+    //     zr ─┬─ za ── za1        zs (a second root)
+    //         └─ zb              zloose (created, never attached)
+    //
+    Graph zg = init() using alloc
+    Node zr = create(&zg, (1.0, 0.0))
+    Node za = create(&zg)
+    Node za1 = create(&zg)
+    Node zb = create(&zg)
+    Node zs = create(&zg)
+    Node zloose = create(&zg)
+    add_child(&zg, INVALID, zr)
+    add_child(&zg, zr, za)
+    add_child(&zg, za, za1)
+    add_child(&zg, zr, zb)
+    add_child(&zg, INVALID, zs)
+    set_on_exit_tree(&zg, zr, record_exit)
+    set_on_exit_tree(&zg, za, record_exit)
+    set_on_exit_tree(&zg, za1, record_exit)
+    set_on_exit_tree(&zg, zb, record_exit)
+    set_on_exit_tree(&zg, zs, record_exit)
+    set_on_exit_tree(&zg, zloose, on_exit)   // never attached: must not fire
+    g_exit_n = 0
+    g_exits = 0
+    ok = #expect(zg.slots != nil, "the graph under test never allocated, so giving the pool back proves nothing") && ok
+    destroy(&zg)
+    ok = #expect(g_exit_n == 5, "destroy fired on_exit_tree ", g_exit_n, " times, wanted 5") && ok
+    ok = #expect(g_exit_order[0] == zr, "destroy did not fire the first root's own hook first") && ok
+    ok = #expect(g_exit_order[1] == za && g_exit_order[2] == za1 && g_exit_order[3] == zb, "destroy did not tear a root down parent-before-children, in sibling order") && ok
+    ok = #expect(g_exit_order[4] == zs, "destroy did not reach the second root after the first") && ok
+    ok = #expect(g_exits == 0, "destroy fired on_exit_tree for a node that never entered the tree") && ok
+
+    // the pool is given back, and the value reads exactly as `init` answers.
+    ok = #expect(zg.slots == nil, "destroy did not give the node pool back") && ok
+    ok = #expect(zg.used == 0, "destroy left a nonzero high-water mark") && ok
+    ok = #expect(zg.free_head == -1, "destroy left the free list populated") && ok
+    ok = #expect(!valid(first_root(&zg)), "destroy left a root in the list") && ok
+
+    // every handle held across the call is refused afterwards.
+    ok = #expect(!in_tree(&zg, zr), "a handle from before destroy still reads as in the tree") && ok
+    ok = #expect(parent_of(&zg, za) == INVALID, "a handle from before destroy still answers a parent") && ok
+    ok = #expect(first_child_of(&zg, zr) == INVALID, "a handle from before destroy still answers a child") && ok
+    ok = #expect(!visible(&zg, zr), "a handle from before destroy still answers a property") && ok
+    ok = #expect(slot_dead(&zg, za1), "a handle from before destroy still reaches a live slot") && ok
+
+    // a second destroy is a no-op: nothing to tear down, nothing to free.
+    g_exit_n = 0
+    destroy(&zg)
+    ok = #expect(g_exit_n == 0, "the second destroy fired ", g_exit_n, " exit hooks") && ok
+    ok = #expect(zg.slots == nil, "the second destroy left a pool behind") && ok
+    ok = #expect(zg.used == 0, "the second destroy moved the high-water mark") && ok
+
+    // and the same `Graph` value is usable again: create, attach, walk.
+    reset_visits()
+    Node zagain = create(&zg, (3.0, 4.0))
+    set_on_process(&zg, zagain, record_process)
+    add_child(&zg, INVALID, zagain)
+    ok = #expect(zg.slots != nil, "a create after a destroy did not allocate a fresh pool") && ok
+    ok = #expect(in_tree(&zg, zagain), "a node created after a destroy is not in the tree") && ok
+    collect_roots(&zg)
+    ok = #expect(g_list_n == 1 && g_list[0] == zagain, "the root list after a destroy is not the one root just added") && ok
+    process(&zg, 0.016)
+    ok = #expect(g_visits == 1, "a walk after a destroy visited ", g_visits, " nodes, wanted 1") && ok
+    ok = #expect(near2(global_position(&zg, zagain), (3.0, 4.0)), "a walk after a destroy did not compose the global") && ok
+    destroy(&zg)
+
+    // ── `using` is what places the pool ───────────────────────────────────
+    //
+    // This is the claim the `Allocator` parameter used to make, restated in
+    // the idiom that replaced it, and it is the only thing that proves the
+    // replacement is not decorative: a `Graph` brought up under an arena puts
+    // its node pool **in that arena**, and neither `init`, `create` nor
+    // `alloc_slot` writes the word.
+    //
+    // It also pins the laziness from the other side. `init` under the arena
+    // must move nothing; the first `create` must move it.
+    arena.Arena home = arena.over(alloc)
+    u64 empty = arena.used(home)
+    Graph hg = init() using arena.allocator(&home)
+    ok = #expect(arena.used(home) == empty, "init under an arena allocated eagerly: ", arena.used(home)) && ok
+    Node hn = create(&hg)
+    add_child(&hg, INVALID, hn)
+    ok = #expect(hg.slots != nil, "the create under test never made a pool, so where it went proves nothing") && ok
+    u64 spent = arena.used(home)
+    ok = #expect(spent > empty, "the node pool did not land in the arena `init` was told to use — it went to ", spent) && ok
+
+    // And the home survives a `destroy`: the second pool goes where the first
+    // one did, not wherever the caller of `destroy` happened to be.
+    destroy(&hg)
+    Node hn2 = create(&hg)
+    add_child(&hg, INVALID, hn2)
+    ok = #expect(arena.used(home) > spent, "the pool a create-after-destroy made did not go back to the arena") && ok
+    destroy(&hg)
+    arena.destroy(&home)
+
+    // Every `Graph` this test built, given back. `destroy` is the only verb
+    // that shrinks the pool, so a suite that proves it works and then leaks
+    // ten arenas would be asserting the opposite of what it just showed.
+    // After the assertions, deliberately: these fire exit hooks, and the
+    // counters they move are ones nothing below reads.
+    destroy(&g)
+    destroy(&mg)
+    destroy(&pg)
+    destroy(&tg)
+    destroy(&ug)
+    destroy(&dg)
+    destroy(&ag)
+    destroy(&mg2)
+    destroy(&cg)
+    destroy(&rg)
+
+    if ok:
+        return 0
+    return 1
+
+// A test-only escape hatch: whether `n`'s slot is currently free (used to
+// assert removal actually recycled the slot, not just unlinked it from its
+// parent). Package-private, so it only exists inside this test binary.
+private bool slot_dead(^Graph g, Node n):
+    if n.index < 0 || n.index >= g.used:
+        return true
+    return !g.slots[n.index].alive

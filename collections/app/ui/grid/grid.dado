@@ -1,0 +1,1750 @@
+// app:ui/grid — the cell-grid renderer: a screen of `cell.Cell`s, the glyph
+// atlas behind them, and one instanced draw that paints the lot.
+//
+//     grid.up(display.window_get_dpi_scale())     // once, after sokol_gfx is set up
+//     if grid.begin(fb_w, fb_h): repaint_all()    // per frame, before writing
+//     grid.text(0, 0, "hello", 80, fg, bg)
+//     grid.prepare()                              // per frame, outside the pass
+//     grid.render(fb_w, fb_h)                     // per frame, inside the pass
+//     grid.down()
+//
+//     grid.set_layers(2)                          // a floating layer over the base
+//     grid.target(1)                              // writers now write layer 1
+//     _ = grid.chrome_add(1, box)                 // free-pixel chrome under it
+//
+// **An engine: the mechanism is hidden and every piece of it can be read.**
+// No program names a face, a slot, a texture or a buffer. The face chain is
+// chosen here; printable ASCII is made resident by `up`, any other cluster
+// the first time a writer meets it; the page is uploaded when it changed. Each of those has a
+// reader — `stats`, `cell_w`, `cell_at`, `face_count` and the rest — so a test
+// or an instrument can see what the engine did without reaching into it.
+//
+// ## The cell is derived from the live face
+//
+// The requested pixel height is `PIXEL_HEIGHT` times the display's DPI scale,
+// which the caller hands to `up`.
+// The primary face's advance of `'0'` at that height is `adv`; the cell is
+// `cw = round(adv)` pixels wide, and the face is then rasterised at the
+// pixel height that makes its advance exactly `cw` — `px = requested * cw /
+// adv`, since an advance scales linearly with the pixel height. Rounding the
+// face rather than the grid is the point: every glyph lands on whole pixels
+// with no drift across a line. The cell is `ceil(ascent - descent + line_gap)`
+// pixels tall at `px`, and the baseline `round(ascent)` pixels below its top.
+// `cell_size_for`, `cell_height_for` and `baseline_for` are that arithmetic,
+// pure, with the face's numbers as arguments.
+//
+// ## Cells are retained
+//
+// `begin` sizes the screen to whole cells and clears it **only when the size
+// changed**, answering true so the caller repaints everything. Otherwise the
+// cells a caller wrote last frame are still there; nothing clears them. Each
+// drawn layer's whole buffer is still uploaded every frame — `cols * rows *
+// 12` bytes a layer, which `stats().upload_bytes` sums — because one upload of
+// a contiguous run is what an instanced draw wants, and tracking dirty cells
+// would not save it.
+//
+// The grid's origin is the framebuffer's (0, 0): cell (`col`, `row`) covers
+// pixels `col * cell_w()` to `(col + 1) * cell_w()` across and `row *
+// cell_h()` to `(row + 1) * cell_h()` down, which is how a caller turns a
+// cell rectangle into the pixel rectangle of chrome that sits under it.
+//
+// ## Layer groups
+//
+// A layer is a whole screen of cells at one depth — the base UI, a floating
+// window, a tooltip — each with its own cell buffer and its own chrome
+// (`chrome.dado`), drawn in layer order, each as its chrome and then its cells
+// in one instanced draw. Layer 0 is `BASE`; `set_layers` says how many there
+// are, up to `MAX_LAYERS`. Every writer writes the layer `target` names, and a
+// target that names no layer writes nowhere. `begin` points the target back
+// at `BASE`, so a paint that targets a layer and forgets to point back loses
+// at most one frame of the base's writes rather than every one after it.
+//
+// A layer above the base starts fully transparent — every cell blank, with
+// background alpha 0, which is what a zeroed `cell.Cell` is — so the layers
+// below show through everywhere it was not written. Its cell buffer is not
+// allocated until something writes to it, and a layer that has not been
+// written since it was last cleared (`clear_layer`, or `begin` on a resize) is
+// neither uploaded nor drawn; its chrome still is. The base always draws.
+// Measured under Xvfb with Mesa's software GL, 2026-09-22, at 1000 x 360
+// pixels of 8 x 16 cells (125 x 22 = 2750 cells): one layer uploaded 33000
+// bytes and made one instanced draw; a second, written layer made that 66000
+// bytes and two; the same second layer cleared went back to 33000 and one.
+//
+// ## The atlas upload is once a frame, outside the keystroke
+//
+// A writer that meets a new cluster rasterises it into its slot at once —
+// the cell needs the slot number now — and only marks the page dirty. The
+// upload is `prepare`'s, once per frame at most, whatever number of clusters
+// arrived since the last one; it is the whole page, because `sg_update_image`
+// has no partial form. Since `up` makes printable ASCII resident before the
+// first upload, typing ordinary text uploads nothing; a new character of
+// another script costs one upload of the page's current size, which the atlas
+// keeps as small as what it holds (see `atlas.dado`). `stats` says what each
+// frame sent: `frame_page_upload_bytes`.
+//
+// ## Memory
+//
+// Everything this package allocates comes from the allocator that was ambient
+// when `up` ran, captured there. The writers, `begin` and `chrome_add` run
+// later, inside a program's per-frame temporary arena, and a cell buffer, a
+// layer's cells made at its first write, a chrome list or an atlas entry
+// placed there would be rolled back under the renderer at the end of the
+// frame. Before `up` nothing is allocated: a write to a layer above the base
+// is dropped and `chrome_add` answers false.
+//
+// ## Scrolling regions
+//
+// The window keeps its one cell grid for layout and hit-testing. A **region**
+// is a cell-aligned rectangle of that grid whose interior is drawn from a cell
+// buffer of its own, shifted up by a sub-cell number of pixels and clipped to
+// the rectangle, so a list or a document can scroll smoothly while every
+// other cell stays on the lattice.
+//
+//     i32 id = grid.region_make(grid.BASE)       // once; -1 when refused
+//     if grid.region_set_rect(id, r): repaint(id) // true: remade blank
+//     grid.target_region(id)                     // writers now write it
+//     _ = grid.text(r.col, r.row + 3, "...", r.cols, fg, bg)
+//     grid.region_set_offset(id, dy)             // 0 <= dy < cell_h()
+//     grid.region_scroll_rows(id, 1)             // content up a whole row
+//     grid.target(grid.BASE)
+//
+// **The buffer is `rect.cols` x `(rect.rows + 1)` cells.** Shifted up by `dy`
+// pixels, the rect's `rect.rows` rows show the bottom `cell_h() - dy` pixels
+// of buffer row 0, rows 1 .. `rect.rows - 1` whole, and the top `dy` pixels
+// of buffer row `rect.rows` — the spare row, one below the rect, which is
+// why it exists: a partially visible bottom row always has content. A
+// scroll by a pixel is therefore `region_set_offset` alone, which uploads
+// nothing; when the offset would reach a whole cell the caller instead sets
+// it back to 0, calls `region_scroll_rows(id, 1)` — a `memmove` of the
+// buffer, not a repaint — and paints the one row it exposed. Only vertical
+// pixel offsets exist: a horizontal scroll stays column-granular, done by
+// repainting from a different line column (`text_from`).
+//
+// **Writers speak screen cells.** While a region is targeted, `put`, `fill`,
+// `text` and `text_from` take the same screen coordinates as ever, and a cell
+// is stored when it lies in the region's **extent** — the rect's columns,
+// rows `rect.row` .. `rect.row + rect.rows` inclusive, the last being the
+// spare row — and, while a clip is set, in the clip as `region_clip_for`
+// extends it: a clip whose bottom edge is the rect's own bottom edge is
+// grown by the spare row, since a widget clipped to the region's rect must be
+// able to paint the row that scrolls into it; any other clip is used as it
+// is. The screen's edge does not clip a region (its spare row may lie below
+// the screen). `target(layer)` points the writers back at a layer, and so
+// does `begin`.
+//
+// **Drawing.** `render` draws each layer as its chrome, its cells, then its
+// regions in creation order, then its ink lists (`ink_make`). A region's
+// buffer is uploaded only when it was written, scrolled or remade since its
+// last upload — a frame that only moves the offset sends nothing — then the
+// same pipeline draws it with the uniforms' grid origin at the rect's pixel
+// origin less `(0, dy)` and its column count at the rect's, one instanced draw
+// of `cols * (rows + 1)` cells, under a scissor of the rect's pixels, and the
+// scissor goes back to the whole framebuffer. The shader is unchanged: its
+// origin uniform already places the grid, and `dy` is whole pixels, so every
+// corner still lands on a pixel edge and the NEAREST sampler still reads each
+// texel once.
+//
+// **Bookkeeping.** A region's cells are not in its layer's buffer; the
+// layer's own cells under the rect should be left transparent by the caller
+// (a zeroed cell is), because the region draws over them and whatever they
+// hold shows through the region's own transparent cells. A rect that changes
+// remakes the buffer blank and `region_set_rect` answers true so the caller
+// repaints. Regions survive `begin`'s resize with their buffers, but the rect
+// is in cells and only the caller knows where it goes at the new size, so it
+// is the caller's to set again. A region on a layer that `set_layers` has
+// since dropped is kept and not drawn. An id that names no live region does
+// nothing anywhere; ids are reused after `region_free`. The region table
+// grows by doubling from the captured allocator, with no fixed cap.
+//
+// ## The ASCII fast path
+//
+// `text` spends most of a plain line finding clusters and looking them up:
+// a UTF-8 decode and a cluster scan in `layout`, then a decode and a hashed
+// table probe in `atlas_slot`, per cell. A printable ASCII byte (0x20..0x7E)
+// whose next byte is also below 0x80 is a cluster of its own — no combining
+// mark, variation selector or joiner is ASCII, and the only ASCII pair a
+// cluster joins is CR LF, whose CR is not printable — and one column wide, so
+// it goes straight to its slot through the 95-entry table `atlas_prewarm`
+// fills. A tab, any other byte, and a printable byte followed by one at or
+// above 0x80 take the general path, one cluster at a time, and the fast path
+// resumes after it. The table is the atlas's, so a rebuilt atlas starts with
+// an empty one and every byte takes the general path until it is prewarmed.
+// A line written as several coloured runs (`text_span`, one call a run) takes
+// the fast path on exactly the cells one `text_from` over the whole line
+// would: the lookahead reads the line past the run's end, and a run resumes
+// at the byte and column the last one answered.
+//
+// ## Headless
+//
+// Under `-D BACKEND=dummy` the package compiles and `up` answers false: the
+// shader compiler writes no shader for sokol's dummy backend, so there is
+// nothing to draw with, and `last_error` says so. The pure arithmetic and the
+// atlas work the same either way; the tests use nothing else. A test that
+// needs cells stored — layers, regions, a widget's paint — takes a cell size
+// and the allocator with `up_headless` instead, which touches no GPU.
+//
+// That is why the DPI scale is an argument to `up` and not read here:
+// `app:display` imports `sokol_app`, which has no dummy backend and refuses
+// to compile under one, so importing it would take the headless build away.
+// For the same reason `up` makes the instance buffer one cell long rather
+// than sized to the window, and `render` grows it on the first frame.
+package grid
+
+import "app:font"
+import "app:ui/cell"
+import "core:chars"
+import "core:mem"
+import "vendor:sokol/sokol_gfx"
+import "vendor:stb/stb_truetype"
+
+// `#include` order is the order `foreign` blocks are met, and a header is
+// included once at its first mention. The generated shader header needs
+// `sokol_gfx.h` above it and says so with an `#error`, so this block names
+// `sokol_gfx.h` first and declares nothing. A block with no body must carry a
+// clause, and this one restates the `define` the binding already writes:
+// defines are emitted once each, so it costs nothing.
+foreign "sokol_gfx.h" define "SOKOL_IMPL"
+
+foreign "./grid.glsl.h" define "SOKOL_SHDC_IMPL":
+    ^const sokol_gfx.sg_shader_desc ui_grid_grid_shader_desc(sokol_gfx.sg_backend backend)
+
+// libc's, for `region_scroll_rows`: shifting a region's rows is one
+// overlapping copy, which is what `memmove` is. Marked `@macro` because a
+// fortified `<string.h>` (macOS's, by default) defines it as a macro, and an
+// unmarked binding of one is a build error there.
+private foreign "string.h":
+    @macro rawptr memmove(rawptr dst, rawptr src, u64 n)
+
+// The requested text height in logical pixels, before the DPI scale.
+@const f32 PIXEL_HEIGHT = 16.0
+
+// The base layer, which always exists and always draws, and the most layers
+// there can be. Eight is a choice: the base, a few floating windows, a menu
+// and a tooltip, with room left. Each costs a screen of cells only once
+// something writes to it.
+const i32 BASE = 0
+const i32 MAX_LAYERS = 8
+
+// The id of the one face chain there is. A key in the atlas carries it, so a
+// second chain (a bold one, say) can share the table without sharing slots.
+const u32 CHAIN_ID = 1
+
+// The candidate faces, in the order a code point tries them. The first that
+// loads is the primary and sets the cell; a path that does not load is
+// skipped. Linux: DejaVu Sans Mono, then DejaVu Sans (symbols and Hebrew,
+// which the mono face lacks — measured: `stbtt_FindGlyphIndex` answers 0 for
+// U+05D0 in DejaVu Sans Mono and 1319 in DejaVu Sans), then the Japanese
+// gothic face Debian installs at that name (U+65E5 present). All three were
+// checked to exist on the Linux box this was written on; on the other systems
+// only `font.default_path()` is tried, and that path is unverified there.
+private string8 chain_path(i32 i):
+    if i == 0:
+        return font.default_path()
+    when #OS == #LINUX || #OS == #FREEBSD:
+        if i == 1:
+            return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        if i == 2:
+            return "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf"
+    return ""
+
+private const i32 MAX_FACES = 3
+
+// ── Pure arithmetic ─────────────────────────────────────────────────────────
+
+// The cell width and the pixel height to rasterise at, from the requested
+// pixel height and the face's advance of `'0'` measured at that height.
+// `cw = max(1, round(adv))` and `px = requested * cw / adv`, which makes the
+// advance at `px` exactly `cw`. A requested height below 1 (or NaN) reads as
+// 1. An advance that is not positive (or NaN) cannot be scaled to anything,
+// so the answer is the requested height unchanged and a cell half of it wide,
+// rounded, at least 1 — a guess, stated as one, so that a face with no `'0'`
+// still draws.
+(i32 cw, f32 px) cell_size_for(f32 requested, f32 adv):
+    f32 r = requested
+    if !(r >= 1.0):
+        r = 1.0
+    if !(adv > 0.0) || adv > 1000000.0:
+        i32 g = i32(round_half_up(r * 0.5))
+        if g < 1:
+            g = 1
+        return (g, r)
+    i32 cw = i32(round_half_up(adv))
+    if cw < 1:
+        cw = 1
+    return (cw, r * f32(cw) / adv)
+
+// The cell height for a face whose ascent, descent (negative, below the
+// baseline) and line gap are given in pixels at the chosen height:
+// `ceil(ascent - descent + line_gap)`, at least 1.
+//
+// The ceiling forgives `CEIL_SLACK` of a pixel. The three metrics are integer
+// design units times one `f32` scale, and `stbtt_ScaleForPixelHeight` picks
+// that scale so ascent minus descent is the pixel height exactly — which in
+// `f32` comes out a hair over: DejaVu Sans Mono at 16 px measured here as
+// 12.7584 + 3.24161 = 16.00001, whose plain ceiling is 17, a whole blank row
+// under every line. A 64th of a pixel is far above that rounding noise and
+// far below anything a rasteriser can show.
+i32 cell_height_for(f32 ascent, f32 descent, f32 line_gap):
+    f32 h = ascent - descent + line_gap - CEIL_SLACK
+    if !(h > 1.0) || h > 1000000.0:
+        return 1
+    i32 n = i32(h)
+    if f32(n) < h:
+        n = n + 1
+    return n
+
+private const f32 CEIL_SLACK = 0.015625
+
+// The baseline's pixel row within a cell `ch` tall: `round(ascent)`, held
+// inside the cell.
+i32 baseline_for(f32 ascent, i32 ch):
+    if !(ascent > 0.0):
+        return 0
+    i32 b = i32(round_half_up(ascent))
+    if b > ch:
+        b = ch
+    return b
+
+// Where the underline and the strike line go within a cell, and their shared
+// thickness, all whole pixels. `ul_pos` is pixels below the baseline and
+// `ul_thick` the thickness, as `font.underline` answers them; `x_height` is
+// the face's. Thickness is `round(ul_thick)`, at least 1. The underline starts
+// `round(ul_pos)` rows below the baseline and the strike line is centred on
+// half the x-height above it; both are held inside the cell.
+(i32 underline, i32 strike, i32 thick) lines_for(i32 baseline, i32 ch, f32 ul_pos, f32 ul_thick, f32 x_height):
+    if ch < 1:
+        return (0, 0, 0)
+    i32 t = i32(round_half_up(ul_thick))
+    if t < 1:
+        t = 1
+    if t > ch:
+        t = ch
+    // Both offsets are held to a cell either way before they become integers:
+    // the answer is clamped into the cell below regardless, but a float
+    // becoming an `i32` saturates, and `baseline` plus or minus a saturated
+    // offset is an overflow and a trap. NaN stays NaN and converts to 0.
+    f32 span = f32(ch)
+    f32 pos = ul_pos
+    if pos > span: pos = span
+    if pos < 0.0 - span: pos = 0.0 - span
+    f32 half_x = x_height * 0.5
+    if half_x > span: half_x = span
+    if half_x < 0.0 - span: half_x = 0.0 - span
+    i32 u = baseline + i32(round_half_up(pos))
+    if u + t > ch:
+        u = ch - t
+    if u < 0:
+        u = 0
+    i32 s = baseline - i32(round_half_up(half_x)) - t / 2
+    if s + t > ch:
+        s = ch - t
+    if s < 0:
+        s = 0
+    return (u, s, t)
+
+// The screen in whole cells for a framebuffer `fb_w` x `fb_h`: a partial cell
+// at the right or bottom edge is not drawn. Zero either way for a
+// non-positive framebuffer or cell.
+(i32 cols, i32 rows) grid_size_for(i32 fb_w, i32 fb_h, i32 cw, i32 ch):
+    if fb_w < 1 || fb_h < 1 || cw < 1 || ch < 1:
+        return (0, 0)
+    return (fb_w / cw, fb_h / ch)
+
+// What one cluster of a laid-out string becomes. `Glyph` is drawn from the
+// atlas across `cols` cells (2 for a wide cluster); `Blank` is `cols` blank
+// cells — a tab, or a wide cluster that would straddle the column limit.
+enum SpanKind: (
+    Glyph = 0,
+    Blank = 1,
+)
+
+// One cluster: bytes `at` up to `end`, starting at column `col` (counted from
+// the start of the string, where tab stops are measured from) and taking
+// `cols` columns.
+type Span: (i32 at, i32 end, i32 col, i32 cols, SpanKind kind)
+
+// Lay out `s` from byte `at`, which sits at column `col`, up to column `limit`,
+// one `Span` per cluster into `out`; answers how many were written. It stops
+// at the end of `s`, at `limit`, or when `out` is full, and a caller resumes
+// from the last span's `end` and `col + cols`. Every span written makes
+// progress, so a resume loop that stops on zero ends.
+//
+// The rules: a tab reaches the next stop (`cell.cluster_columns_at`) and is
+// blank, cut short at `limit`; a wide cluster whose second column would pass
+// `limit` becomes one blank column; any other cluster — a control included,
+// which the atlas draws as U+FFFD — is a glyph of the columns `cell` gives it.
+// Combining marks ride in their base's span and take no column of their own.
+i32 layout(string8 s, i32 at, i32 col, i32 limit, []Span out):
+    i32 n = i32(#len(s))
+    i32 room = i32(#len(out))
+    if at < 0:
+        at = 0
+    if col < 0:
+        col = 0
+    i32 k = 0
+    for at < n && col < limit && k < room:
+        i32 end = chars.cluster_end(s, at)
+        i32 w = cell.cluster_columns_at(s, at, col)
+        Span sp = (at, end, col, w, SpanKind.Glyph)
+        if s[at] == '\t':
+            sp.kind = SpanKind.Blank
+            if col + w > limit:
+                sp.cols = limit - col
+        else if w == 2 && col + 2 > limit:
+            sp.kind = SpanKind.Blank
+            sp.cols = 1
+        out[k] = sp
+        k = k + 1
+        at = end
+        col = col + sp.cols
+    return k
+
+// ── State ───────────────────────────────────────────────────────────────────
+
+private bool g_up
+private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) g_alloc
+private string8 g_error
+
+private [3]Face g_faces
+private i32 g_nfaces
+private [3]string8 g_face_paths
+
+private f32 g_requested
+private f32 g_px
+private i32 g_cw
+private i32 g_ch
+private i32 g_baseline
+private i32 g_ul_row
+private i32 g_strike_row
+private i32 g_line_thick
+
+private Atlas g_atlas
+private bool g_atlas_made
+
+// One layer: its cells (nil until the first write, except the base's, which
+// `begin` makes), whether anything has been written since it was last
+// cleared, its chrome, and its instance buffer on the GPU. sokol_gfx allows
+// one update of a buffer per frame, so each layer has its own.
+private type CellLayer: (
+    ref []cell.Cell cells,
+    bool touched,
+    ChromeList chrome,
+    sokol_gfx.sg_buffer buf,
+    i32 buf_cells,
+    bool buf_sent,
+)
+
+private [MAX_LAYERS]CellLayer g_layers
+private i32 g_nlayers = 1
+private i32 g_target = 0
+// Whether `g_alloc` has been captured: `up` sets it, and nothing may allocate
+// before.
+private bool g_have_alloc
+private i32 g_cols
+private i32 g_rows
+
+private sokol_gfx.sg_image g_img
+// The page image's size on the GPU. It trails the atlas's page by at most a
+// frame: the page grows at a lookup, the image is remade to match at the next
+// `prepare`.
+private i32 g_img_w
+private i32 g_img_h
+// The last page size the device refused an image for (`prepare`); 0 x 0 for
+// none.
+private i32 g_refused_w
+private i32 g_refused_h
+private sokol_gfx.sg_view g_view
+private sokol_gfx.sg_sampler g_smp
+private sokol_gfx.sg_shader g_shd
+private sokol_gfx.sg_pipeline g_pip
+
+// sokol_gfx allows one update of an image, and of a buffer, per frame. This
+// and each layer's `buf_sent` are cleared by `begin`, so each is updated at
+// most once between two `begin`s however often `prepare` and `render` are
+// called.
+private bool g_page_sent
+
+private i32 g_cells_written
+private i64 g_upload_bytes
+private i32 g_draw_calls
+private i32 g_layers_drawn
+private i32 g_chrome_tris
+private i32 g_chrome_failures
+private i32 g_chrome_dropped
+private i32 g_chrome_flushes
+// Chrome triangles handed to sokol_gp since the last `begin`, across layers
+// and `render`s: what `CHROME_FRAME_PERCENT` is counted against.
+private i32 g_chrome_frame_used
+private i32 g_page_uploads
+private i64 g_page_upload_bytes
+private i64 g_frame_page_bytes
+private i32 g_region_draws
+private i32 g_region_uploads
+private i64 g_region_upload_bytes
+private i64 g_region_rows_shifted
+private i32 g_ascii_cells
+// Cells written to the base layer (or a region drawn with it) since `begin`,
+// counted by the run rather than by the cell: `g_cells_written` as it stood
+// when the writers were last pointed somewhere (`g_seg_from`), and whether
+// that somewhere is the base (`g_seg_base`); each switch of target adds the
+// run just ended. `poke` — the hottest function here — pays nothing for it.
+private i32 g_base_cells
+private i32 g_seg_from
+private bool g_seg_base = true
+
+// One scrolling region: whether its id is live, the layer it draws with, its
+// rect in screen cells and its pixel offset, its cells (`rect.cols` x
+// `(rect.rows + 1)`, nil while the rect is empty), whether they changed since
+// they were last uploaded, its instance buffer, and its own counts since it
+// was made.
+private type Region: (
+    bool live,
+    i32 layer,
+    cell.CellRect rect,
+    i32 dy,
+    ref []cell.Cell cells,
+    bool dirty,
+    sokol_gfx.sg_buffer buf,
+    i32 buf_cells,
+    bool buf_sent,
+    i32 uploads,
+    i64 upload_bytes,
+    i64 rows_shifted,
+    i64 bytes_moved,
+)
+
+// The region table, indexed by id, and the live ids in creation order (the
+// order `render` draws them in). Both grow together by doubling from the
+// captured allocator; `g_region_live` of the order are used.
+private ref []Region g_regions
+private ref []i32 g_region_order
+private i32 g_region_live
+// Whether the writers write a region (`g_target_region`) rather than the
+// layer `g_target` names.
+private bool g_region_targeted
+private i32 g_target_region
+
+// The widest and tallest rect a region takes, in cells: a choice, past any
+// screen (4096 columns of an 8-pixel cell is 32768 pixels), and small enough
+// that a buffer's cell count, 4096 x 4097, and its pixel extent stay far
+// inside `i32`. A rect past it is taken as empty.
+const i32 MAX_REGION_SIDE = 4096
+
+// ── Readers ─────────────────────────────────────────────────────────────────
+
+type Stats: (
+    // Cells stored by the writers since the last `begin`.
+    i32 cells_written,
+    // Instance bytes the last `render` uploaded, summed over the layers it
+    // uploaded, and its instanced draw calls, one per layer drawn. sokol_gp's
+    // draws for the chrome are not in `draw_calls`.
+    i64 upload_bytes,
+    i32 draw_calls,
+    i32 atlas_pages,
+    i32 resident_clusters,
+    // Page uploads and their bytes since `up`.
+    i32 page_uploads,
+    i64 page_upload_bytes,
+    // Texels of ink dropped at a slot's edge since `up`.
+    i32 clipped_px,
+    // Lookups that found the page full and answered `.notdef`.
+    i32 overflows,
+    // Page bytes uploaded since the last `begin`: 0 on a frame that uploaded
+    // nothing, else the page's width times its height. Read before the next
+    // `begin` (a program's own process hook runs before the framework's), it
+    // is what the previous frame sent.
+    i64 frame_page_upload_bytes,
+    // Times the page has grown a rung since `up`.
+    i32 page_grows,
+    // Layers whose cells the last `render` drew (the base, and every layer
+    // written since its last clear).
+    i32 layers_drawn,
+    // Chrome triangles the last `render` handed sokol_gp, all layers; three
+    // vertices each of sokol_gp's per-frame budget.
+    i32 chrome_triangles,
+    // Layers whose chrome the last `render` could not draw: sokol_gp not set
+    // up, or a flush it refused.
+    i32 chrome_failures,
+    // Chrome boxes the last `render` dropped for want of budget or to a
+    // refused flush — each layer's last ones in list order — and the
+    // sokol_gp flushes its chrome took.
+    i32 chrome_dropped,
+    i32 chrome_flushes,
+    // Region draws the last `render` made (one instanced draw each; not in
+    // `draw_calls`), the region buffers it uploaded and their bytes (not in
+    // `upload_bytes`): 0 and 0 on a frame that only moved offsets.
+    i32 region_draws,
+    i32 region_uploads,
+    i64 region_upload_bytes,
+    // Rows `region_scroll_rows` shifted since the last `begin`, all regions.
+    i64 region_rows_shifted,
+    // Cells the writers stored through the ASCII fast path since the last
+    // `begin`: a part of `cells_written`.
+    i32 ascii_cells,
+    // Cells stored into the base layer, or into a region drawn with it, since
+    // the last `begin`: the part of `cells_written` under every floating
+    // layer, which an overlay opening or closing over it should not touch.
+    i32 base_cells,
+)
+
+// The base's count with the run still open added, when it is the base's.
+private i32 base_cells_now():
+    if g_seg_base:
+        return g_base_cells + (g_cells_written - g_seg_from)
+    return g_base_cells
+
+Stats stats():
+    i32 pages = 0
+    if g_atlas_made && g_atlas.page.pixels != nil:
+        pages = 1
+    Stats s = (g_cells_written, g_upload_bytes, g_draw_calls, pages, g_atlas.table.count,
+               g_page_uploads, g_page_upload_bytes, g_atlas.clipped, g_atlas.overflows,
+               g_frame_page_bytes, g_atlas.page.grows, g_layers_drawn, g_chrome_tris,
+               g_chrome_failures, g_chrome_dropped, g_chrome_flushes, g_region_draws,
+               g_region_uploads, g_region_upload_bytes, g_region_rows_shifted, g_ascii_cells, base_cells_now())
+    return s
+
+bool is_up():
+    return g_up
+
+string8 last_error():
+    return g_error
+
+// The cell in framebuffer pixels; 0 before `up`.
+i32 cell_w():
+    return g_cw
+
+i32 cell_h():
+    return g_ch
+
+// The baseline's pixel row within a cell, and the pixel height the chain is
+// rasterised at (the derived `px`, not the requested one).
+i32 baseline():
+    return g_baseline
+
+f32 pixel_height():
+    return g_px
+
+f32 requested_height():
+    return g_requested
+
+// The underline row, the strike row and their thickness, within a cell.
+(i32 underline, i32 strike, i32 thick) lines():
+    return (g_ul_row, g_strike_row, g_line_thick)
+
+// The screen in cells, as the last `begin` sized it.
+i32 cols():
+    return g_cols
+
+i32 rows():
+    return g_rows
+
+// The cell at (`col`, `row`) of the base layer; off-screen answers the blank
+// cell.
+cell.Cell cell_at(i32 col, i32 row):
+    return cell_at_layer(BASE, col, row)
+
+// The cell at (`col`, `row`) of `layer`; off-screen, a layer that does not
+// exist and one never written answer the blank cell.
+cell.Cell cell_at_layer(i32 layer, i32 col, i32 row):
+    if layer < 0 || layer >= g_nlayers || col < 0 || row < 0 || col >= g_cols || row >= g_rows:
+        return cell.blank()
+    if g_layers[layer].cells == nil:
+        return cell.blank()
+    return g_layers[layer].cells[i64(row) * i64(g_cols) + i64(col)]
+
+// ── Layers ──────────────────────────────────────────────────────────────────
+
+// Have `n` layers, held to 1..`MAX_LAYERS`. Layers dropped by a smaller `n`
+// give back their cells, their chrome and their buffer; layers added start
+// transparent and allocate nothing until written. The target is left alone,
+// so a target past the new count writes nowhere.
+void set_layers(i32 n):
+    if n < 1:
+        n = 1
+    if n > MAX_LAYERS:
+        n = MAX_LAYERS
+    for i in n..<MAX_LAYERS:
+        release_layer(i32(i))
+    g_nlayers = n
+
+i32 layers():
+    return g_nlayers
+
+// Point every writer at `layer`. One that does not exist is accepted and
+// writes nowhere.
+void target(i32 layer):
+    seg_switch(layer == BASE)
+    g_target = layer
+    g_region_targeted = false
+
+i32 targeted():
+    return g_target
+
+// Make `layer` fully transparent again — every cell blank with background
+// alpha 0 — and not drawn until written. Its chrome is kept (`chrome_clear`).
+void clear_layer(i32 layer):
+    if layer < 0 || layer >= g_nlayers:
+        return
+    ^CellLayer l = &g_layers[layer]
+    if l.cells != nil:
+        cell.Cell none = cell.blank()
+        for i in 0..<#len(l.cells):
+            l.cells[i] = none
+    l.touched = false
+
+// Whether `layer` has been written since it was last cleared. The base
+// answers it like any other, though it draws either way.
+bool layer_touched(i32 layer):
+    if layer < 0 || layer >= g_nlayers:
+        return false
+    return g_layers[layer].touched
+
+// Whether a layer's cells are uploaded and drawn: the base always; any other
+// only when written since its last clear.
+bool layer_draws(i32 layer, bool touched):
+    return layer == BASE || touched
+
+// Forget `layer`'s chrome.
+void chrome_clear(i32 layer):
+    if layer < 0 || layer >= g_nlayers:
+        return
+    chrome_list_clear(&g_layers[layer].chrome)
+
+// Add `b` to `layer`'s chrome, after what is there. Answers false for a layer
+// that does not exist, before `up` (whose allocator the list must live in),
+// and when the list could not grow.
+bool chrome_add(i32 layer, ChromeBox b):
+    if layer < 0 || layer >= g_nlayers || !g_have_alloc:
+        return false
+    return chrome_list_add(&g_layers[layer].chrome, b, g_alloc)
+
+i32 chrome_count(i32 layer):
+    if layer < 0 || layer >= g_nlayers:
+        return 0
+    return g_layers[layer].chrome.n
+
+// The `i`th box of `layer`'s chrome; a zero box off the end.
+ChromeBox chrome_at(i32 layer, i32 i):
+    ChromeBox none
+    if layer < 0 || layer >= g_nlayers || i < 0 || i >= g_layers[layer].chrome.n:
+        return none
+    return g_layers[layer].chrome.boxes[i]
+
+// Give back one layer's cells, chrome and buffer. The buffer is destroyed
+// only when it was made, so a layer that never drew calls no sokol function.
+private void release_layer(i32 i):
+    ^CellLayer l = &g_layers[i]
+    if l.cells != nil:
+        #delete(l.cells)
+        l.cells = nil
+    l.touched = false
+    l.buf_sent = false
+    chrome_list_free(&l.chrome)
+    if l.buf.id != 0:
+        if sokol_gfx.sg_isvalid():
+            sokol_gfx.sg_destroy_buffer(l.buf)
+        l.buf.id = 0
+    l.buf_cells = 0
+
+// The faces of the chain that loaded, primary first, and their paths.
+i32 face_count():
+    return g_nfaces
+
+string8 face_path(i32 i):
+    if i < 0 || i >= g_nfaces:
+        return ""
+    return g_face_paths[i]
+
+// The pixel row within a cell where face `i` stands; -1 for no such face.
+i32 face_baseline_at(i32 i):
+    if i < 0 || i >= g_nfaces:
+        return -1
+    return g_faces[i].baseline
+
+// Slots across one page row and the page's capacity in slots; slots handed
+// out; whether the page awaits upload.
+i32 atlas_across():
+    return g_atlas.slots.across
+
+i32 atlas_capacity():
+    return g_atlas.slots.capacity
+
+i32 atlas_slots_used():
+    return slots_used(&g_atlas.slots)
+
+bool atlas_dirty():
+    return g_atlas.page.dirty
+
+// The atlas page's size in pixels now, and the height it may grow to. Zero
+// before `up`.
+i32 atlas_page_w():
+    return g_atlas.page.w
+
+i32 atlas_page_h():
+    return g_atlas.page.h
+
+i32 atlas_page_max_h():
+    return g_atlas.page.max_h
+
+// ── Bringing it up and down ─────────────────────────────────────────────────
+
+private bool fail(string8 why):
+    down()
+    g_error = why
+    return false
+
+private bool valid_image(sokol_gfx.sg_image x):
+    return sokol_gfx.sg_query_image_state(x) == sokol_gfx.sg_resource_state.SG_RESOURCESTATE_VALID
+
+// Load the face chain, derive the cell, make the atlas and the GPU objects.
+// Idempotent: a second call while up answers true and does nothing, whatever
+// `dpi_scale` it is given. Call it once sokol_gfx is set up — a program's
+// ready hook, with `display.window_get_dpi_scale()` — under the allocator
+// that should hold everything this package will ever allocate. A scale that
+// is not positive (or NaN) reads as 1.
+bool up(f32 dpi_scale):
+    if g_up:
+        return true
+    g_error = ""
+    if !sokol_gfx.sg_isvalid():
+        return fail("grid: sokol_gfx is not set up")
+    g_alloc = #default
+    g_have_alloc = true
+
+    f32 dpi = dpi_scale
+    if !(dpi > 0.0):
+        dpi = 1.0
+    g_requested = PIXEL_HEIGHT * dpi
+
+    g_nfaces = 0
+    for i in 0..<MAX_FACES:
+        string8 path = chain_path(i32(i))
+        if path == "":
+            continue
+        (font.Font f, bool ok) = font.load_file(path, g_requested)
+        if !ok || f.info == nil:
+            font.destroy(&f)
+            continue
+        g_faces[g_nfaces].f = f
+        g_face_paths[g_nfaces] = path
+        g_nfaces = g_nfaces + 1
+    if g_nfaces == 0:
+        return fail("grid: no face in the chain loaded")
+
+    ^font.Font primary = &g_faces[0].f
+    (i32 cw, f32 px) = cell_size_for(g_requested, measured_zero(primary, g_requested))
+    g_cw = cw
+    g_px = px
+    // Ascent, descent and gap at `px`: `app:font` measured them at the
+    // requested height, and every vertical metric scales by `px / requested`.
+    f32 k = g_px / font.pixel_height(primary)
+    g_ch = cell_height_for(font.ascent(primary) * k, font.descent(primary) * k, primary.line_gap_px * k)
+    g_baseline = baseline_for(font.ascent(primary) * k, g_ch)
+    (f32 ulp, f32 ult, bool _) = font.underline(primary)
+    (i32 u, i32 s, i32 t) = lines_for(g_baseline, g_ch, ulp * k, ult * k, font.x_height(primary) * k)
+    g_ul_row = u
+    g_strike_row = s
+    g_line_thick = t
+    for i in 0..<g_nfaces:
+        g_faces[i].scale = stb_scale(&g_faces[i].f, g_px)
+        g_faces[i].baseline = face_baseline(&g_faces[i].f, g_faces[i].scale, g_ch)
+
+    // The device's largest texture side bounds the page ladder, so a grown
+    // page is never an image the backend refuses.
+    sokol_gfx.sg_limits lim = sokol_gfx.sg_query_limits()
+    g_atlas = atlas_make(g_cw, g_ch, g_px, CHAIN_ID, lim.max_image_size_2d)
+    g_atlas_made = true
+    if g_atlas.page.pixels == nil:
+        return fail("grid: the atlas page could not be allocated")
+    atlas_ink_notdef(&g_atlas, g_faces[0..<g_nfaces])
+    _ = atlas_prewarm(&g_atlas, g_faces[0..<g_nfaces])
+
+    ^const sokol_gfx.sg_shader_desc sd = ui_grid_grid_shader_desc(sokol_gfx.sg_query_backend())
+    if sd == nil:
+        return fail("grid: no shader for this sokol_gfx backend")
+    g_shd = sokol_gfx.sg_make_shader(sd)
+
+    _ = make_page_image(g_atlas.page.w, g_atlas.page.h)
+
+    // NEAREST: a cell origin is a whole pixel and a slot is exactly one cell,
+    // so every fragment lands on one texel and nothing should blend.
+    sokol_gfx.sg_sampler_desc smd
+    smd.min_filter = sokol_gfx.sg_filter.SG_FILTER_NEAREST
+    smd.mag_filter = sokol_gfx.sg_filter.SG_FILTER_NEAREST
+    smd.wrap_u = sokol_gfx.sg_wrap.SG_WRAP_CLAMP_TO_EDGE
+    smd.wrap_v = sokol_gfx.sg_wrap.SG_WRAP_CLAMP_TO_EDGE
+    smd.label = "app:ui/grid sampler"
+    g_smp = sokol_gfx.sg_make_sampler(&smd)
+
+    // One per-instance buffer, stride `cell.CELL_BYTES`: `slot` and `flags`
+    // read together as one USHORT2 (a `uvec2`), `fg` and `bg` as UBYTE4N (a
+    // normalised `vec4`). No vertex buffer and no index buffer. The fragment
+    // shader writes premultiplied colour, so "over" is ONE and
+    // ONE_MINUS_SRC_ALPHA on colour and alpha alike.
+    sokol_gfx.sg_pipeline_desc pd
+    pd.shader = g_shd
+    pd.layout.buffers[0].stride = cell.CELL_BYTES
+    pd.layout.buffers[0].step_func = sokol_gfx.sg_vertex_step.SG_VERTEXSTEP_PER_INSTANCE
+    pd.layout.attrs[0].buffer_index = 0
+    pd.layout.attrs[0].offset = 0
+    pd.layout.attrs[0].format = sokol_gfx.sg_vertex_format.SG_VERTEXFORMAT_USHORT2
+    pd.layout.attrs[1].buffer_index = 0
+    pd.layout.attrs[1].offset = 4
+    pd.layout.attrs[1].format = sokol_gfx.sg_vertex_format.SG_VERTEXFORMAT_UBYTE4N
+    pd.layout.attrs[2].buffer_index = 0
+    pd.layout.attrs[2].offset = 8
+    pd.layout.attrs[2].format = sokol_gfx.sg_vertex_format.SG_VERTEXFORMAT_UBYTE4N
+    pd.colors[0].blend.enabled = true
+    pd.colors[0].blend.src_factor_rgb = sokol_gfx.sg_blend_factor.SG_BLENDFACTOR_ONE
+    pd.colors[0].blend.dst_factor_rgb = sokol_gfx.sg_blend_factor.SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA
+    pd.colors[0].blend.src_factor_alpha = sokol_gfx.sg_blend_factor.SG_BLENDFACTOR_ONE
+    pd.colors[0].blend.dst_factor_alpha = sokol_gfx.sg_blend_factor.SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA
+    pd.label = "app:ui/grid pipeline"
+    g_pip = sokol_gfx.sg_make_pipeline(&pd)
+
+    if !make_buffer(&g_layers[BASE], 1):
+        return fail("grid: the instance buffer could not be made")
+
+    sokol_gfx.sg_resource_state valid = sokol_gfx.sg_resource_state.SG_RESOURCESTATE_VALID
+    if sokol_gfx.sg_query_shader_state(g_shd) != valid:
+        return fail("grid: the shader did not compile")
+    if sokol_gfx.sg_query_pipeline_state(g_pip) != valid:
+        return fail("grid: the pipeline was refused")
+    if !valid_image(g_img) || sokol_gfx.sg_query_view_state(g_view) != valid:
+        return fail("grid: the atlas page image was refused")
+    if sokol_gfx.sg_query_sampler_state(g_smp) != valid:
+        return fail("grid: the sampler was refused")
+    g_up = true
+    return true
+
+// The advance of `'0'` in `f` at `height` pixels, from the face's own
+// horizontal metrics; 0 when the face has no `'0'` or no TrueType data.
+private f32 measured_zero(^font.Font f, f32 height):
+    if f.info == nil:
+        return 0.0
+    i32 gi = stb_truetype.stbtt_FindGlyphIndex(f.info, 48)
+    if gi == 0:
+        return 0.0
+    i32 adv = 0
+    i32 lsb = 0
+    stb_truetype.stbtt_GetGlyphHMetrics(f.info, gi, &adv, &lsb)
+    return f32(adv) * stb_scale(f, height)
+
+// (Re)make the page image and its view at `w` x `h`. The new pair is made
+// first and the old one destroyed only when the new one is valid, so a
+// refused image leaves the old pair bound; answers whether it was made.
+private bool make_page_image(i32 w, i32 h):
+    sokol_gfx.sg_image_desc idesc
+    idesc.type_ = sokol_gfx.sg_image_type.SG_IMAGETYPE_2D
+    idesc.usage.dynamic_update = true
+    idesc.width = w
+    idesc.height = h
+    idesc.num_slices = 1
+    idesc.num_mipmaps = 1
+    idesc.pixel_format = sokol_gfx.sg_pixel_format.SG_PIXELFORMAT_R8
+    idesc.sample_count = 1
+    idesc.label = "app:ui/grid page"
+    sokol_gfx.sg_image img = sokol_gfx.sg_make_image(&idesc)
+    sokol_gfx.sg_view_desc vdesc
+    vdesc.texture.image = img
+    sokol_gfx.sg_view vw = sokol_gfx.sg_make_view(&vdesc)
+    bool ok = valid_image(img) && sokol_gfx.sg_query_view_state(vw) == sokol_gfx.sg_resource_state.SG_RESOURCESTATE_VALID
+    if !ok && g_img.id != 0:
+        sokol_gfx.sg_destroy_view(vw)
+        sokol_gfx.sg_destroy_image(img)
+        return false
+    if g_view.id != 0:
+        sokol_gfx.sg_destroy_view(g_view)
+    if g_img.id != 0:
+        sokol_gfx.sg_destroy_image(g_img)
+    g_img = img
+    g_view = vw
+    g_img_w = w
+    g_img_h = h
+    return ok
+
+// (Re)make a layer's instance buffer with room for `n` cells, at least one.
+// The old buffer, if any, is destroyed first.
+private bool make_buffer(^CellLayer l, i32 n):
+    return make_instances(&l.buf, &l.buf_cells, n, true)
+
+// (Re)make an instance buffer `buf` with room for `n` cells, at least one,
+// recording the room in `room`. `stream` picks sokol's usage: a layer's
+// buffer is replaced every frame (stream), a region's only when it changed
+// (dynamic, which is what sokol_gfx asks of a buffer updated now and then).
+private bool make_instances(^sokol_gfx.sg_buffer buf, ^i32 room, i32 n, bool stream):
+    if n < 1:
+        n = 1
+    if buf.id != 0:
+        sokol_gfx.sg_destroy_buffer(buf^)
+        buf.id = 0
+        room^ = 0
+    sokol_gfx.sg_buffer_desc bd
+    bd.size = #c.size_t(u64(n) * u64(cell.CELL_BYTES))
+    bd.usage.vertex_buffer = true
+    if stream:
+        bd.usage.stream_update = true
+    else:
+        bd.usage.dynamic_update = true
+    bd.label = "app:ui/grid cells"
+    buf^ = sokol_gfx.sg_make_buffer(&bd)
+    if sokol_gfx.sg_query_buffer_state(buf^) != sokol_gfx.sg_resource_state.SG_RESOURCESTATE_VALID:
+        return false
+    room^ = n
+    return true
+
+// Give back everything: GPU objects, the atlas, the faces, the cells. Safe
+// before `up`, after a failed `up`, and twice.
+void down():
+    for i in 0..<MAX_LAYERS:
+        release_layer(i32(i))
+    release_regions()
+    release_inks()
+    g_nlayers = 1
+    g_target = BASE
+    if sokol_gfx.sg_isvalid():
+        if g_pip.id != 0:
+            sokol_gfx.sg_destroy_pipeline(g_pip)
+        if g_shd.id != 0:
+            sokol_gfx.sg_destroy_shader(g_shd)
+        if g_smp.id != 0:
+            sokol_gfx.sg_destroy_sampler(g_smp)
+        if g_view.id != 0:
+            sokol_gfx.sg_destroy_view(g_view)
+        if g_img.id != 0:
+            sokol_gfx.sg_destroy_image(g_img)
+    g_pip.id = 0
+    g_shd.id = 0
+    g_smp.id = 0
+    g_view.id = 0
+    g_img.id = 0
+    g_img_w = 0
+    g_img_h = 0
+    g_refused_w = 0
+    g_refused_h = 0
+    if g_atlas_made:
+        atlas_free(&g_atlas)
+        g_atlas_made = false
+    Atlas none
+    g_atlas = none
+    for i in 0..<g_nfaces:
+        font.destroy(&g_faces[i].f)
+        g_face_paths[i] = ""
+    g_nfaces = 0
+    g_cols = 0
+    g_rows = 0
+    g_cw = 0
+    g_ch = 0
+    g_px = 0.0
+    g_baseline = 0
+    g_up = false
+    g_have_alloc = false
+
+// Take a cell of `cw` x `ch` pixels and the ambient allocator, as `up` does,
+// with no GPU, no face and no atlas: for a test that drives a widget tree
+// headless and needs a real cell height, layers and regions. The writers,
+// `begin`, the layers and the regions then work on cells as they do when up,
+// except that every cluster is stored as the blank slot (no atlas holds a
+// glyph); `is_up` stays false, so `prepare` and `render` still do nothing.
+// Answers false, changing nothing, while up and for a side below 1. `down`
+// undoes it.
+bool up_headless(i32 cw, i32 ch):
+    if g_up || cw < 1 || ch < 1:
+        return false
+    g_alloc = #default
+    g_have_alloc = true
+    g_cw = cw
+    g_ch = ch
+    return true
+
+// ── Per frame ───────────────────────────────────────────────────────────────
+
+// Size the screen for a framebuffer `fb_w` x `fb_h`, and point the writers at
+// `BASE`. Answers true when the size in cells changed: every layer's cells are
+// then given back and remade blank — the base's here, the others at their
+// next write — every layer counts as unwritten, and the caller must repaint
+// everything. Otherwise every layer's cells are kept as they were. Chrome is
+// in pixels and is kept either way. Before `up` the screen is 0 x 0.
+bool begin(i32 fb_w, i32 fb_h):
+    g_cells_written = 0
+    g_page_sent = false
+    for i in 0..<MAX_LAYERS:
+        g_layers[i].buf_sent = false
+    g_frame_page_bytes = 0
+    g_chrome_frame_used = 0
+    g_target = BASE
+    g_region_targeted = false
+    g_region_rows_shifted = 0
+    g_ascii_cells = 0
+    g_base_cells = 0
+    g_seg_from = 0
+    g_seg_base = true
+    for i in 0..<region_capacity():
+        g_regions[i].buf_sent = false
+    (i32 c, i32 r) = grid_size_for(fb_w, fb_h, g_cw, g_ch)
+    if c == g_cols && r == g_rows && (g_layers[BASE].cells != nil || c * r == 0):
+        return false
+    for i in 0..<MAX_LAYERS:
+        ^CellLayer l = &g_layers[i]
+        if l.cells != nil:
+            #delete(l.cells)
+            l.cells = nil
+        l.touched = false
+    g_cols = 0
+    g_rows = 0
+    if c * r > 0:
+        g_layers[BASE].cells = #make([]cell.Cell, i64(c) * i64(r), g_alloc)
+        if g_layers[BASE].cells == nil:
+            return true
+        g_cols = c
+        g_rows = r
+    return true
+
+// A rectangle every writer is further clipped to, while `g_clipping` is set.
+// A widget's paint sets it to the rectangle it was given, so text laid out
+// from the widget's own edge cannot land in cells an ancestor cut away.
+private cell.CellRect g_clip
+private bool g_clipping
+
+// Clip every writer to `r` (as well as to the screen) until `unclip`.
+void clip(cell.CellRect r):
+    g_clip = r
+    g_clipping = true
+
+void unclip():
+    g_clipping = false
+
+// Store one cell in the targeted layer, clipped to the screen and to the
+// current clip. A layer above the base gets its cells here, at its first
+// write, from the captured allocator.
+private void poke(i32 col, i32 row, u16 slot, u16 flags, [4]u8 fg, [4]u8 bg):
+    if g_region_targeted:
+        poke_region(col, row, slot, flags, fg, bg)
+        return
+    if g_target < 0 || g_target >= g_nlayers:
+        return
+    if col < 0 || row < 0 || col >= g_cols || row >= g_rows:
+        return
+    if g_clipping && !cell.contains(g_clip, col, row):
+        return
+    ^CellLayer l = &g_layers[g_target]
+    if l.cells == nil:
+        if !g_have_alloc:
+            return
+        l.cells = #make([]cell.Cell, i64(g_cols) * i64(g_rows), g_alloc)
+        if l.cells == nil:
+            return
+    l.touched = true
+    ^cell.Cell c = &l.cells[i64(row) * i64(g_cols) + i64(col)]
+    c.slot = slot
+    c.flags = flags
+    c.fg = fg
+    c.bg = bg
+    g_cells_written = g_cells_written + 1
+
+// Store one cell in the targeted region, at screen cell (`col`, `row`),
+// clipped to the region's extent and to the current clip as
+// `region_clip_for` extends it.
+private void poke_region(i32 col, i32 row, u16 slot, u16 flags, [4]u8 fg, [4]u8 bg):
+    if !region_valid(g_target_region):
+        return
+    ^Region g = &g_regions[g_target_region]
+    if g.cells == nil || !cell.contains(region_extent(g.rect), col, row):
+        return
+    if g_clipping && !cell.contains(region_clip_for(g_clip, g.rect), col, row):
+        return
+    ^cell.Cell c = &g.cells[i64(row - g.rect.row) * i64(g.rect.cols) + i64(col - g.rect.col)]
+    c.slot = slot
+    c.flags = flags
+    c.fg = fg
+    c.bg = bg
+    g.dirty = true
+    g_cells_written = g_cells_written + 1
+
+// Store `c` at (`col`, `row`); off-screen is ignored.
+void put(i32 col, i32 row, cell.Cell c):
+    poke(col, row, c.slot, c.flags, c.fg, c.bg)
+
+// Blank every cell of `r` on the screen, in the given colours — or, while a
+// region is targeted, of `r` within the region's extent.
+void fill(cell.CellRect r, [4]u8 fg, [4]u8 bg):
+    cell.CellRect bound = cell.rect(0, 0, g_cols, g_rows)
+    if g_region_targeted:
+        if !region_valid(g_target_region):
+            return
+        bound = region_extent(g_regions[g_target_region].rect)
+    cell.CellRect on = cell.intersect(r, bound)
+    if cell.is_empty(on):
+        return
+    for y in on.row..<(on.row + on.rows):
+        for x in on.col..<(on.col + on.cols):
+            poke(x, y, BLANK_SLOT, 0, fg, bg)
+
+// The atlas slot of the cluster at bytes `at` up to `end` of `s`, made
+// resident if it was not; for a wide cluster, the left slot (the right is one
+// more). A range that is empty, out of bounds or inverted, a tab, and any call
+// before `up` answer the blank slot.
+u16 slot_of(string8 s, i32 at, i32 end):
+    i32 n = i32(#len(s))
+    if !g_up || at < 0 || end > n || at >= end:
+        return BLANK_SLOT
+    string8 c = s[at..<end]
+    return atlas_slot(&g_atlas, g_faces[0..<g_nfaces], c, cell.cluster_columns_at(c, 0, 0))
+
+// Write `s` from (`col`, `row`) in at most `max_cols` columns, one cluster per
+// cell (two for a wide one), by `layout`'s rules; answers the columns laid
+// out, which does not depend on where the screen ends — cells past its edge
+// are dropped, not refused. A wide cluster's left cell carries
+// `cell.WIDE_LEFT` and its right cell `cell.WIDE_RIGHT` and the slot beside
+// the left one, unless the atlas answered `.notdef` for a full page, in which
+// case the right cell is blank. `max_cols` at or below zero writes nothing.
+i32 text(i32 col, i32 row, string8 s, i32 max_cols, [4]u8 fg, [4]u8 bg):
+    return text_from(col, row, s, 0, 0, max_cols, fg, bg)
+
+// Like `text`, but starting part-way into a line: the cluster at byte `at`
+// sits at line column `at_col`, and line column `at_col` lands on screen column
+// `col`. Tab stops are counted from the line's own column 0, so a line drawn
+// scrolled left keeps its tabs where they were. Answers the line column after
+// the last one laid out.
+//
+// A run of printable ASCII takes the fast path (see the file's head): each
+// byte whose next byte is below 0x80 is stored with the slot `atlas_prewarm`
+// recorded for it, one column, with no decode, no cluster scan and no table
+// probe. Everything else is laid out by `layout` one cluster at a time, so the
+// fast path resumes right after it. `layout` holds a negative starting column
+// at 0, and so does this, which is why `c` starts there.
+i32 text_from(i32 col, i32 row, string8 s, i32 at, i32 at_col, i32 max_cols, [4]u8 fg, [4]u8 bg):
+    (i32 _, i32 c) = text_span(col, row, s, at, i32(#len(s)), at_col, max_cols, fg, bg)
+    return c
+
+// `text_from` for the clusters that begin before byte `end` only — one styled
+// run of a line, so a line in several colours is written as consecutive runs,
+// each resuming where the last stopped. Answers the byte and the line column
+// after the last cluster laid out (`at` and `at_col` when nothing was): the
+// next run's `at` and `at_col`. A cluster that begins before `end` is laid
+// out whole, so the byte answered can pass `end`; the caller's next run then
+// starts there. Every cluster is still read against all of `s`, so a run
+// that stops at `end` takes the ASCII fast path exactly where one call over
+// the whole line would: the lookahead that decides it reads the byte after,
+// wherever `end` is. An `end` past the string is its length.
+(i32 at, i32 col) text_span(i32 col, i32 row, string8 s, i32 at, i32 end, i32 at_col, i32 max_cols, [4]u8 fg, [4]u8 bg):
+    if max_cols <= 0:
+        return (at, at_col)
+    // One span is used. Two are declared because `dadoc` types a slice of a
+    // one-element array of records as a slice of its first field's type
+    // (ERR0504 at the call: "[]Span ... and this is []i32").
+    [2]Span spans
+    i32 n = i32(#len(s))
+    if end > n:
+        end = n
+    i32 limit = at_col + max_cols
+    i32 c = at_col
+    if c < 0:
+        c = 0
+    if at < 0:
+        at = 0
+    i32 start = at
+    bool moved = false
+    for at < end && c < limit:
+        for at < end && c < limit:
+            i32 b = i32(u8(s[at]))
+            if b < PREWARM_FIRST || b > PREWARM_LAST:
+                break
+            if at + 1 < n && u8(s[at + 1]) >= 0x80:
+                break
+            u16 slot = g_atlas.ascii[b - PREWARM_FIRST]
+            if slot == BLANK_SLOT:
+                break
+            poke(col + c - at_col, row, slot, 0, fg, bg)
+            g_ascii_cells = g_ascii_cells + 1
+            at = at + 1
+            c = c + 1
+            moved = true
+        if at >= end || c >= limit:
+            break
+        if layout(s, at, c, limit, spans[0..<1]) == 0:
+            break
+        Span sp = spans[0]
+        i32 x = col + sp.col - at_col
+        if sp.kind == SpanKind.Blank:
+            for j in 0..<sp.cols:
+                poke(x + j, row, BLANK_SLOT, 0, fg, bg)
+        else if sp.cols == 2:
+            u16 left = slot_of(s, sp.at, sp.end)
+            u16 right = BLANK_SLOT
+            if left != NOTDEF_SLOT && left != BLANK_SLOT:
+                right = left + 1
+            poke(x, row, left, cell.WIDE_LEFT, fg, bg)
+            poke(x + 1, row, right, cell.WIDE_RIGHT, fg, bg)
+        else:
+            poke(x, row, slot_of(s, sp.at, sp.end), 0, fg, bg)
+        at = sp.end
+        c = sp.col + sp.cols
+        moved = true
+    if !moved:
+        return (start, at_col)
+    return (at, c)
+
+// Upload the atlas page if it changed. Outside the render pass, once per
+// frame: a second call before the next `begin` does nothing, and a page
+// dirtied after the upload goes up next frame. A page that grew since the
+// last upload first gets a new image of its new size; if the device refuses
+// that image, the old one keeps the rows it has room for (the page's first
+// rows, since a grown page is its old self with rows added below), and the
+// slots below them sample nothing. A refused size is remembered and not asked
+// for again: the page is uploaded once more into the old image, and after that
+// it counts as clean (`atlas_dirty` answers false) until a glyph changes it
+// again — a refusal that retried every frame would re-upload the page, and
+// have the frame redraw, on every frame for ever. A page that grows past the
+// refused size tries once more.
+void prepare():
+    if !g_up || g_page_sent || !g_atlas.page.dirty:
+        return
+    if g_atlas.page.w != g_img_w || g_atlas.page.h != g_img_h:
+        bool refused_before = g_atlas.page.w == g_refused_w && g_atlas.page.h == g_refused_h
+        if !refused_before && !make_page_image(g_atlas.page.w, g_atlas.page.h):
+            g_error = "grid: the grown atlas page image was refused"
+            g_refused_w = g_atlas.page.w
+            g_refused_h = g_atlas.page.h
+    i64 nbytes = i64(g_img_w) * i64(g_img_h) * i64(texel_bytes(g_atlas.page.format))
+    if nbytes < 1 || nbytes > #len(g_atlas.page.pixels):
+        return
+    sokol_gfx.sg_image_data data
+    data.mip_levels[0].ptr = rawptr(&g_atlas.page.pixels[0])
+    data.mip_levels[0].size = #c.size_t(nbytes)
+    sokol_gfx.sg_update_image(g_img, &data)
+    // Still dirty only when the image is short of the page for a reason a
+    // later frame can fix; a size already refused is not one.
+    g_atlas.page.dirty = g_img_h != g_atlas.page.h && !(g_atlas.page.w == g_refused_w && g_atlas.page.h == g_refused_h)
+    g_page_sent = true
+    g_page_uploads = g_page_uploads + 1
+    g_page_upload_bytes = g_page_upload_bytes + nbytes
+    g_frame_page_bytes = nbytes
+
+// Draw the screen: inside the pass, layer by layer from `BASE` up, each as
+// its chrome (sokol_gp), then its cells (one instanced draw at the
+// framebuffer's origin), then its regions in creation order (one scissored
+// instanced draw each; see the file's head), then its ink (sokol_gp, one
+// scissor a list; `draw_inks`). A layer's instance buffer is uploaded whole once per
+// frame (a second `render` before the next `begin` draws what is already
+// there) and remade larger when the screen outgrew it; a layer above the base
+// that has not been written since its last clear is neither uploaded nor
+// drawn. Nothing is drawn before `up`, for an empty screen, or for a
+// non-positive framebuffer.
+void render(i32 fb_w, i32 fb_h):
+    g_upload_bytes = 0
+    g_draw_calls = 0
+    g_region_draws = 0
+    g_region_uploads = 0
+    g_region_upload_bytes = 0
+    g_layers_drawn = 0
+    g_chrome_tris = 0
+    g_chrome_failures = 0
+    g_chrome_dropped = 0
+    g_chrome_flushes = 0
+    ink_frame_reset()
+    i32 n = g_cols * g_rows
+    if !g_up || g_layers[BASE].cells == nil || n < 1 || fb_w < 1 || fb_h < 1:
+        return
+
+    [16]f32 u = [f32(fb_w), f32(fb_h), 0.0, 0.0,
+                 f32(g_cw), f32(g_ch), f32(g_cols), f32(g_atlas.slots.across),
+                 f32(g_img_w), f32(g_img_h), 0.0, 0.0,
+                 f32(g_ul_row), f32(g_strike_row), f32(g_line_thick), 0.0]
+    sokol_gfx.sg_range ur
+    ur.ptr = rawptr(&u[0])
+    ur.size = #c.size_t(64)
+
+    for i in 0..<g_nlayers:
+        ^CellLayer l = &g_layers[i]
+        if l.chrome.n > 0:
+            i32 left = chrome_frame_tris() - g_chrome_frame_used
+            if left < 0:
+                left = 0
+            ChromeDrawn d = chrome_draw(&l.chrome, fb_w, fb_h, left)
+            g_chrome_frame_used = g_chrome_frame_used + d.tris
+            g_chrome_tris = g_chrome_tris + d.tris
+            g_chrome_dropped = g_chrome_dropped + d.dropped
+            g_chrome_flushes = g_chrome_flushes + d.flushes
+            if d.failed:
+                g_chrome_failures = g_chrome_failures + 1
+        if layer_draws(i32(i), l.touched) && l.cells != nil && upload_layer(l, n):
+            // Applied afresh for every layer: the chrome just drawn went
+            // through sokol_gp's own pipeline and bindings.
+            draw_cells(l.buf, &ur, n)
+            g_draw_calls = g_draw_calls + 1
+            g_layers_drawn = g_layers_drawn + 1
+        draw_regions(i32(i), fb_w, fb_h, u)
+        draw_inks(i32(i), fb_w, fb_h)
+
+// One instanced draw of `n` cells from `buf` with the grid's pipeline, its
+// atlas and the uniforms `ur`.
+private void draw_cells(sokol_gfx.sg_buffer buf, ^sokol_gfx.sg_range ur, i32 n):
+    sokol_gfx.sg_bindings b
+    b.vertex_buffers[0] = buf
+    b.views[0] = g_view
+    b.samplers[0] = g_smp
+    sokol_gfx.sg_apply_pipeline(g_pip)
+    sokol_gfx.sg_apply_bindings(&b)
+    sokol_gfx.sg_apply_uniforms(0, ur)
+    sokol_gfx.sg_draw(0, 6, n)
+
+// The pixel rectangle a region's rect covers in a framebuffer `fb_w` x
+// `fb_h`, cut to the framebuffer: `x, y, w, h`, top-left origin, with `w` or
+// `h` 0 when nothing of it is on screen. Pure. The products are `i64`, since
+// a rect's column may be anywhere in `i32`.
+(i32 x, i32 y, i32 w, i32 h) region_scissor(cell.CellRect r, i32 cw, i32 ch, i32 fb_w, i32 fb_h):
+    if cell.is_empty(r) || cw < 1 || ch < 1 || fb_w < 1 || fb_h < 1:
+        return (0, 0, 0, 0)
+    i64 x0 = i64(r.col) * i64(cw)
+    i64 y0 = i64(r.row) * i64(ch)
+    i64 x1 = x0 + i64(r.cols) * i64(cw)
+    i64 y1 = y0 + i64(r.rows) * i64(ch)
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > i64(fb_w):
+        x1 = i64(fb_w)
+    if y1 > i64(fb_h):
+        y1 = i64(fb_h)
+    if x1 <= x0 || y1 <= y0:
+        return (0, 0, 0, 0)
+    return (i32(x0), i32(y0), i32(x1 - x0), i32(y1 - y0))
+
+// Draw `layer`'s regions in creation order, each under a scissor of its rect
+// with the grid's origin at the rect's pixel origin less `(0, dy)`. A region
+// wholly off the framebuffer is neither uploaded nor drawn; its changes wait
+// in its dirty flag.
+private void draw_regions(i32 layer, i32 fb_w, i32 fb_h, [16]f32 u):
+    for k in 0..<g_region_live:
+        ^Region g = &g_regions[g_region_order[k]]
+        if g.layer != layer || g.cells == nil:
+            continue
+        (i32 sx, i32 sy, i32 sw, i32 sh) = region_scissor(g.rect, g_cw, g_ch, fb_w, fb_h)
+        if sw < 1 || sh < 1:
+            continue
+        i32 count = g.rect.cols * (g.rect.rows + 1)
+        if !upload_region(g, count):
+            continue
+        // The rect is on screen, so its origin is within a rect's extent
+        // (`MAX_REGION_SIDE` cells) of the framebuffer: far below 2^24,
+        // where an `f32` stops holding whole pixels.
+        [16]f32 v = u
+        v[2] = f32(g.rect.col * g_cw)
+        v[3] = f32(g.rect.row * g_ch - g.dy)
+        v[6] = f32(g.rect.cols)
+        sokol_gfx.sg_range vr
+        vr.ptr = rawptr(&v[0])
+        vr.size = #c.size_t(64)
+        sokol_gfx.sg_apply_scissor_rect(sx, sy, sw, sh, true)
+        draw_cells(g.buf, &vr, count)
+        sokol_gfx.sg_apply_scissor_rect(0, 0, fb_w, fb_h, true)
+        g_region_draws = g_region_draws + 1
+
+// Send a layer's `n` cells to its instance buffer, once a frame, remaking the
+// buffer when the screen outgrew it. Answers whether the buffer holds them.
+private bool upload_layer(^CellLayer l, i32 n):
+    if n > l.buf_cells:
+        if !make_buffer(l, n):
+            return false
+        l.buf_sent = false
+    if !l.buf_sent:
+        sokol_gfx.sg_range data
+        data.ptr = rawptr(&l.cells[0])
+        data.size = #c.size_t(u64(n) * u64(cell.CELL_BYTES))
+        sokol_gfx.sg_update_buffer(l.buf, &data)
+        l.buf_sent = true
+        g_upload_bytes = g_upload_bytes + i64(n) * i64(cell.CELL_BYTES)
+    return true
+
+// Send a region's `n` cells to its instance buffer when they changed since
+// the last upload, remaking the buffer when the rect outgrew it (a fresh
+// buffer holds nothing, so it is sent whatever the flag said). At most once
+// a frame, like a layer's: cells changed after the upload go up next frame.
+private bool upload_region(^Region g, i32 n):
+    if n > g.buf_cells:
+        if !make_instances(&g.buf, &g.buf_cells, n, false):
+            return false
+        g.buf_sent = false
+        g.dirty = true
+    if g.dirty && !g.buf_sent:
+        i64 bytes = i64(n) * i64(cell.CELL_BYTES)
+        sokol_gfx.sg_range data
+        data.ptr = rawptr(&g.cells[0])
+        data.size = #c.size_t(bytes)
+        sokol_gfx.sg_update_buffer(g.buf, &data)
+        g.buf_sent = true
+        g.dirty = false
+        g.uploads = g.uploads + 1
+        g.upload_bytes = g.upload_bytes + bytes
+        g_region_uploads = g_region_uploads + 1
+        g_region_upload_bytes = g_region_upload_bytes + bytes
+    return true
+
+// ── Scrolling regions ───────────────────────────────────────────────────────
+
+// The cells a region's writers reach: the rect and the spare row below it.
+// Empty for an empty rect. Pure.
+cell.CellRect region_extent(cell.CellRect r):
+    if cell.is_empty(r):
+        return cell.rect(0, 0, 0, 0)
+    return cell.rect(r.col, r.row, r.cols, r.rows + 1)
+
+// The clip a region's writers are held to while `clip` is set: `clip` grown
+// by one row at the bottom when its bottom edge is the rect's, so that a
+// clip set to the rect — or to anything reaching its last row — also admits
+// the spare row; otherwise `clip` unchanged. Pure.
+cell.CellRect region_clip_for(cell.CellRect clip, cell.CellRect r):
+    if cell.is_empty(clip) || cell.is_empty(r):
+        return clip
+    if clip.row + clip.rows == r.row + r.rows:
+        return cell.rect(clip.col, clip.row, clip.cols, clip.rows + 1)
+    return clip
+
+private i32 region_capacity():
+    if g_regions == nil:
+        return 0
+    return i32(#len(g_regions))
+
+// Whether `id` names a live region.
+bool region_valid(i32 id):
+    return id >= 0 && id < region_capacity() && g_regions[id].live
+
+// Live regions.
+i32 region_count():
+    return g_region_live
+
+// Double the region table and the order with it (four to start), the new
+// entries dead. Answers false, having changed neither's length past what
+// both hold, when an allocation failed.
+private bool grow_regions():
+    i32 cap = region_capacity()
+    i32 want = cap * 2
+    if want < 4:
+        want = 4
+    if g_regions == nil:
+        g_regions = #make([]Region, i64(want), g_alloc)
+        if g_regions == nil:
+            return false
+    else if !#resize(g_regions, i64(want)):
+        return false
+    Region none
+    for i in cap..<want:
+        g_regions[i] = none
+    if g_region_order == nil:
+        g_region_order = #make([]i32, i64(want), g_alloc)
+        if g_region_order == nil:
+            return false
+    else if i32(#len(g_region_order)) < want:
+        if !#resize(g_region_order, i64(want)):
+            return false
+    return true
+
+// A new region on `layer`, with an empty rect and offset 0; answers its id,
+// or -1 for a layer that does not exist, before `up` (whose allocator the
+// table lives in), and when the table could not grow. A freed id is reused.
+i32 region_make(i32 layer):
+    if layer < 0 || layer >= g_nlayers || !g_have_alloc:
+        return -1
+    i32 cap = region_capacity()
+    i32 id = -1
+    for i in 0..<cap:
+        if !g_regions[i].live:
+            id = i32(i)
+            break
+    if id < 0 || g_region_order == nil || g_region_live >= i32(#len(g_region_order)):
+        if !grow_regions():
+            return -1
+        if id < 0:
+            id = cap
+    Region fresh
+    fresh.live = true
+    fresh.layer = layer
+    g_regions[id] = fresh
+    g_region_order[g_region_live] = id
+    g_region_live = g_region_live + 1
+    return id
+
+// Give back a region's cells and buffer; its id is then free for reuse.
+private void release_region(^Region g):
+    if g.cells != nil:
+        #delete(g.cells)
+        g.cells = nil
+    if g.buf.id != 0:
+        if sokol_gfx.sg_isvalid():
+            sokol_gfx.sg_destroy_buffer(g.buf)
+        g.buf.id = 0
+    Region none
+    g^ = none
+
+// Free region `id`; a bad id does nothing. A writer still aimed at it writes
+// nowhere — the aim is moved to no region (`targeted_region` answers -1), so
+// a later `region_make` that reuses the id is not written through it.
+void region_free(i32 id):
+    if !region_valid(id):
+        return
+    if g_region_targeted && g_target_region == id:
+        g_target_region = -1
+    release_region(&g_regions[id])
+    i32 j = 0
+    for k in 0..<g_region_live:
+        if g_region_order[k] != id:
+            g_region_order[j] = g_region_order[k]
+            j = j + 1
+    g_region_live = j
+
+// Every region, and the table itself: `down`'s.
+private void release_regions():
+    for i in 0..<region_capacity():
+        release_region(&g_regions[i])
+    if g_regions != nil:
+        #delete(g_regions)
+        g_regions = nil
+    if g_region_order != nil:
+        #delete(g_region_order)
+        g_region_order = nil
+    g_region_live = 0
+    g_region_targeted = false
+
+// Set the screen cells region `id` covers. **Answers true when the rect
+// changed**: the buffer is then remade blank, `rect.cols` x `(rect.rows +
+// 1)`, and the caller repaints it. The same rect again answers false and keeps
+// the cells. An empty rect, or one wider or taller than `MAX_REGION_SIDE`,
+// leaves the region with no cells, drawing and taking nothing; so does a
+// failed allocation, after which `region_rect` answers the empty rect and the
+// same call tries again. A bad id answers false.
+bool region_set_rect(i32 id, cell.CellRect r):
+    if !region_valid(id):
+        return false
+    ^Region g = &g_regions[id]
+    cell.CellRect want = r
+    if cell.is_empty(r) || r.cols > MAX_REGION_SIDE || r.rows > MAX_REGION_SIDE:
+        want = cell.rect(0, 0, 0, 0)
+    if want == g.rect:
+        return false
+    if g.cells != nil:
+        #delete(g.cells)
+        g.cells = nil
+    g.rect = cell.rect(0, 0, 0, 0)
+    g.dirty = false
+    if !cell.is_empty(want):
+        g.cells = #make([]cell.Cell, i64(want.cols) * i64(want.rows + 1), g_alloc)
+        if g.cells != nil:
+            g.rect = want
+            g.dirty = true
+    return true
+
+// Draw region `id`'s content shifted up by `dy` pixels, held to 0 ..
+// `cell_h() - 1` (0 before `up`). Uploads nothing: the offset is a uniform.
+void region_set_offset(i32 id, i32 dy):
+    if !region_valid(id):
+        return
+    i32 d = dy
+    if d > g_ch - 1:
+        d = g_ch - 1
+    if d < 0:
+        d = 0
+    g_regions[id].dy = d
+
+// Shift region `id`'s buffer up by `n` rows (down for `n` < 0): one
+// `memmove` of the rows that stay, and the `|n|` rows exposed at the far edge
+// made blank — slot 0, transparent both ways — for the caller to paint. `|n|`
+// at or past the buffer's `rows + 1` rows clears it all. The rows counted are
+// `|n|` held to `rows + 1`; the bytes moved are the rows that stay times the
+// row's bytes.
+void region_scroll_rows(i32 id, i32 n):
+    if !region_valid(id) || n == 0:
+        return
+    ^Region g = &g_regions[id]
+    if g.cells == nil:
+        return
+    i64 cols = i64(g.rect.cols)
+    i64 total = i64(g.rect.rows) + 1
+    i64 m = i64(n)
+    if m < 0:
+        m = 0 - m
+    if m > total:
+        m = total
+    i64 keep = (total - m) * cols
+    cell.Cell none = cell.blank()
+    if keep > 0:
+        i64 bytes = keep * i64(cell.CELL_BYTES)
+        if n > 0:
+            _ = memmove(rawptr(&g.cells[0]), rawptr(&g.cells[m * cols]), u64(bytes))
+            for i in keep..<(total * cols):
+                g.cells[i] = none
+        else:
+            _ = memmove(rawptr(&g.cells[m * cols]), rawptr(&g.cells[0]), u64(bytes))
+            for i in 0..<(m * cols):
+                g.cells[i] = none
+        g.bytes_moved = g.bytes_moved + bytes
+    else:
+        for i in 0..<(total * cols):
+            g.cells[i] = none
+    g.rows_shifted = g.rows_shifted + m
+    g_region_rows_shifted = g_region_rows_shifted + m
+    g.dirty = true
+
+// Point every writer at region `id`, in screen cells (see the file's head).
+// A bad id is accepted and writes nowhere. `target` or `begin` points them
+// back at a layer.
+void target_region(i32 id):
+    seg_switch(region_valid(id) && g_regions[id].layer == BASE)
+    g_region_targeted = true
+    g_target_region = id
+
+// The writers are being pointed at the base (`base`) or elsewhere: close the
+// run of cells written since the last switch into the base's count if it was
+// the base's.
+private void seg_switch(bool base):
+    if g_seg_base:
+        g_base_cells = g_base_cells + (g_cells_written - g_seg_from)
+    g_seg_from = g_cells_written
+    g_seg_base = base
+
+// The region the writers write, or -1 while they write a layer.
+i32 targeted_region():
+    if !g_region_targeted:
+        return -1
+    return g_target_region
+
+// A region's rect (empty for a bad id), offset, and layer (-1 for a bad id).
+cell.CellRect region_rect(i32 id):
+    if !region_valid(id):
+        return cell.rect(0, 0, 0, 0)
+    return g_regions[id].rect
+
+i32 region_offset(i32 id):
+    if !region_valid(id):
+        return 0
+    return g_regions[id].dy
+
+i32 region_layer(i32 id):
+    if !region_valid(id):
+        return -1
+    return g_regions[id].layer
+
+// The cell of region `id` at screen cell (`col`, `row`), the spare row
+// included; outside its extent, or for a bad id, the blank cell.
+cell.Cell region_cell_at(i32 id, i32 col, i32 row):
+    if !region_valid(id):
+        return cell.blank()
+    ^Region g = &g_regions[id]
+    if g.cells == nil || !cell.contains(region_extent(g.rect), col, row):
+        return cell.blank()
+    return g.cells[i64(row - g.rect.row) * i64(g.rect.cols) + i64(col - g.rect.col)]
+
+// What one region has done since it was made: buffer uploads and their
+// bytes, rows shifted and bytes moved by `region_scroll_rows`, and whether its
+// cells changed since the last upload. Zero for a bad id.
+type RegionStats: (i32 uploads, i64 upload_bytes, i64 rows_shifted, i64 bytes_moved, bool dirty)
+
+RegionStats region_stats(i32 id):
+    RegionStats none
+    if !region_valid(id):
+        return none
+    ^Region g = &g_regions[id]
+    RegionStats r = (g.uploads, g.upload_bytes, g.rows_shifted, g.bytes_moved, g.dirty)
+    return r

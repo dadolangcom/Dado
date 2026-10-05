@@ -1,0 +1,359 @@
+// app:display — the display server.
+//
+// "Server" is Godot parlance. This is not Godot's server architecture; it
+// approximates the *surface* of Godot's DisplayServer (see
+// Godot's own, held only as reference material) over vendor:sokol.
+//
+// This file is the whole public interface — the window/mouse/clipboard/timing
+// surface and the run entry. The private sokol machinery (the sokol callbacks
+// and the clear colour) lives in `src/` and is not imported from anywhere but
+// here; see `src/backend.dado`.
+//
+// Two deliberate differences from Godot's DisplayServer, both forced by the
+// substrate:
+//   * It is single-window. sokol_app is a single-window library.
+//   * It also owns the frame loop entry, because sokol_app fuses window
+//     creation with the loop — sapp_run is the only way to open the window.
+//
+// **`Config`, `Hooks`, `run`, `begin_pass` and `end_pass` are the seam
+// `app:graphical` drives, and a program should not call them.** Write a program
+// against `app:app` + `app:graphical`: `graphical.new(w, h, title)` installs a
+// real `app.Backend` on the singleton and `app.run()` opens the window. The
+// seam stays *here* rather than moving into `graphical` for one reason: sokol's
+// window handle, its `sapp_desc` and its `^const sapp_event` are the substrate
+// this package exists to be the only importer of, and exporting the loop entry
+// would export them with it. Everything below `run` is ordinary
+// public surface a program may call from `ready`/`process`.
+package display
+
+import "vendor:sokol/sokol_app"
+import "core:strings"
+import "core:mem/libc"
+import backend "./src"
+
+// ── Godot-approximating enums ──────────────────────────────────────────────
+
+// Window presentation mode. sokol_app exposes only windowed vs fullscreen;
+// Godot's MINIMIZED / MAXIMIZED / EXCLUSIVE_FULLSCREEN have no sokol surface.
+enum WindowMode: (Windowed, Fullscreen)
+
+// Pointer mode, after Godot's MouseMode. sokol supports these three; Godot's
+// CONFINED / CONFINED_HIDDEN have no sokol surface.
+enum MouseMode: (Visible, Hidden, Captured)
+
+// Cursor shape — the subset of Godot's CursorShape that sokol_app provides. The
+// backing values are sokol's own sapp_mouse_cursor numbers, so the sokol call
+// needs no lookup table: `cursor_set_shape` converts the number straight across
+// rather than mapping member to member.
+enum u32 CursorShape:
+    Arrow = 1,
+    Ibeam = 2,
+    Crosshair = 3,
+    PointingHand = 4,
+    ResizeEW = 5,
+    ResizeNS = 6,
+    ResizeNWSE = 7,
+    ResizeNESW = 8,
+    ResizeAll = 9,
+    NotAllowed = 10,
+
+// ── Opening the display ────────────────────────────────────────────────────
+
+// How to open the window.
+//
+//   width, height           the window's size, in logical pixels
+//   title                   the window title
+//   max_dropped_files       how many file paths one drop may land. **`0` turns
+//                           drag-and-drop off**, which is what
+//                           `sapp_desc.enable_dragndrop` becomes.
+//   max_dropped_path_bytes  the longest path sokol will accept, terminator
+//                           included. Read only when `max_dropped_files` is
+//                           above 0.
+//
+// **Drops are off by default and the default is the safe one.** At `0` the
+// window sets no `XdndAware` property at all, so no drag source ever offers it
+// a drop, and a program that has written no drop handling *declines* the
+// gesture rather than swallowing it. Measured under `Xvfb`: with the flag
+// unset `XGetWindowProperty(XdndAware)` answers `nitems=0`; with it set the
+// same window answers `version=5` and completes a real
+// `XdndEnter`/`XdndPosition`/`XdndDrop` handshake. A window that advertises
+// drops and then drops them on the floor is the worse of the two, because the
+// file vanishes either way and only that one looked like it would work.
+//
+// **A `Config` field and not a `@const` build knob** — the shape
+// `CLIPBOARD_BYTES` takes. A buffer size is a build's business; this is a
+// *behaviour* a program either implements or does not, and two programs in one
+// build differ on it. `graphical.set_file_drop` is what a program calls; this
+// is the seat it reaches, and it costs one tuple literal because `Config` is
+// constructed in exactly one place in the tree (`run_loop`, `app:graphical`).
+type Config: (i32 width, i32 height, string8 title,
+              i32 max_dropped_files, i32 max_dropped_path_bytes)
+
+// Lifecycle callbacks `run` invokes. Any may be nil.
+//
+// **Four, and none of them carries an allocator.** The five-hook shape this
+// replaces had a `draw` phase of its own and passed a per-frame `Allocator`
+// that `display` owned and reset — a second runtime beside `app:app`'s, with a
+// second scratch arena and an incompatible hook shape. `app:app`'s three hooks
+// and its ambient `app.scratch()` won, because that is what every other `app:`
+// package and every example is written against; these four are the *seam*
+// underneath them, not a rival to them.
+//
+//   ready  — once, after graphics are up
+//   frame  — once per frame; dt is seconds since the last frame. What a frame
+//            *is* — the pass bracket, the barrier, the scratch reset — is the
+//            caller's, not this package's.
+//   event  — once per input event; the payload is the raw `sapp_event` address
+//   finish — once, on shutdown, before sg_shutdown
+type Hooks: (
+    void() ready,
+    void(f32) frame,
+    void(rawptr) event,
+    void() finish,
+)
+
+// Open the window described by `cfg`, install `hooks`, and run the frame loop
+// until the window closes. Blocks until then.
+void run(Config cfg, Hooks hooks):
+    backend.run(cfg.width, cfg.height, cfg.title, CLIPBOARD_BYTES,
+                cfg.max_dropped_files, cfg.max_dropped_path_bytes,
+                hooks.ready, hooks.frame, hooks.event, hooks.finish)
+
+// ── The render pass ────────────────────────────────────────────────────────
+//
+// Two calls rather than a `draw` hook, so the caller chooses what sits between
+// them. `app:graphical` puts them in `app.Backend.begin_frame`/`end_frame`,
+// which is the bracket `app:app` already wraps around `process`.
+
+// Begin the default swapchain pass, clearing to the background colour.
+void begin_pass():
+    backend.begin_pass()
+
+// End the pass and present the frame.
+void end_pass():
+    backend.end_pass()
+
+// ── Surface: background ────────────────────────────────────────────────────
+
+// The colour the frame is cleared to each frame (0..1 per channel).
+void set_background(f32 r, g, b, a):
+    backend.set_background(r, g, b, a)
+
+// ── Surface: window ────────────────────────────────────────────────────────
+
+i32 window_get_width():
+    return sokol_app.sapp_width()
+
+i32 window_get_height():
+    return sokol_app.sapp_height()
+
+(i32, i32) window_get_size():
+    return (sokol_app.sapp_width(), sokol_app.sapp_height())
+
+f32 window_get_dpi_scale():
+    return sokol_app.sapp_dpi_scale()
+
+bool window_is_high_dpi():
+    return sokol_app.sapp_high_dpi()
+
+void window_set_title(string8 title):
+    ref []char8 tc = strings.clone_to_cstring(title, libc.allocator())
+    defer #delete(tc)
+    sokol_app.sapp_set_window_title(cstring(tc))
+
+WindowMode window_get_mode():
+    if sokol_app.sapp_is_fullscreen():
+        return WindowMode.Fullscreen
+    return WindowMode.Windowed
+
+void window_set_mode(WindowMode mode):
+    bool want_fs = mode == WindowMode.Fullscreen
+    if sokol_app.sapp_is_fullscreen() != want_fs:
+        sokol_app.sapp_toggle_fullscreen()
+
+// ── Surface: mouse & cursor ────────────────────────────────────────────────
+
+void mouse_set_mode(MouseMode mode):
+    switch mode:
+        case MouseMode.Visible:
+            sokol_app.sapp_show_mouse(true)
+            sokol_app.sapp_lock_mouse(false)
+        case MouseMode.Hidden:
+            sokol_app.sapp_show_mouse(false)
+            sokol_app.sapp_lock_mouse(false)
+        case MouseMode.Captured:
+            sokol_app.sapp_show_mouse(false)
+            sokol_app.sapp_lock_mouse(true)
+        else:
+            return
+
+MouseMode mouse_get_mode():
+    if sokol_app.sapp_mouse_locked():
+        return MouseMode.Captured
+    if sokol_app.sapp_mouse_shown():
+        return MouseMode.Visible
+    return MouseMode.Hidden
+
+void cursor_set_shape(CursorShape shape):
+    sokol_app.sapp_set_mouse_cursor(sokol_app.sapp_mouse_cursor(u32(shape)))
+
+// The cursors a UI toolkit asks for by name, as plain `i32`s so a widget's
+// hook can answer one without importing this package's enum: the system's
+// default pointer, the text I-beam, the pointing hand over something that
+// acts when clicked, and the two splitter arrows. `app:ui` re-exports them.
+const i32 CURSOR_DEFAULT   = 0
+const i32 CURSOR_IBEAM     = 1
+const i32 CURSOR_POINTER   = 2
+const i32 CURSOR_RESIZE_EW = 3
+const i32 CURSOR_RESIZE_NS = 4
+
+// The `sapp_mouse_cursor` number a `CURSOR_*` names. `CURSOR_DEFAULT`, and
+// any number that is none of the five, is `SAPP_MOUSECURSOR_DEFAULT` — the
+// platform's own arrow, which `CursorShape` has no member for (its `Arrow` is
+// sokol's explicit arrow, not "whatever the system shows"). Pure, so the
+// mapping is checkable with no window.
+u32 cursor_sapp_value(i32 cursor):
+    if cursor == CURSOR_IBEAM:
+        return u32(CursorShape.Ibeam)
+    if cursor == CURSOR_POINTER:
+        return u32(CursorShape.PointingHand)
+    if cursor == CURSOR_RESIZE_EW:
+        return u32(CursorShape.ResizeEW)
+    if cursor == CURSOR_RESIZE_NS:
+        return u32(CursorShape.ResizeNS)
+    return 0
+
+// Show `cursor` (a `CURSOR_*`) over the window. **A no-op with no window
+// open** — headless, in a test, before `run` or after it returns — rather
+// than sokol's assertion on uninitialised state. sokol itself skips a call
+// that names the cursor already shown, so a caller that repeats one pays a
+// comparison; `app:ui` calls this only when the effective cursor changes.
+void set_cursor(i32 cursor):
+    if !sokol_app.sapp_isvalid():
+        return
+    sokol_app.sapp_set_mouse_cursor(sokol_app.sapp_mouse_cursor(cursor_sapp_value(cursor)))
+
+// ── Surface: clipboard ─────────────────────────────────────────────────────
+//
+// **The clipboard is a fixed buffer, and it used to truncate silently (E6).**
+// sokol allocates `sapp_desc.clipboard_size` bytes once, inside `sapp_run`, and
+// `sapp_set_clipboard_string` copies into it with a bounded `strcpy`: a longer
+// string was cut to fit, the tail was lost, and the only report was a
+// `CLIPBOARD_STRING_TOO_BIG` line on **sokol's** logger, which nothing in Dado
+// reads. Measured by `example/edit`: select-all on a 19 551-byte file, copy,
+// paste — **8 191 bytes arrived**, with `clipboard_set` having answered
+// nothing at all. The client's only recourse was to set, read back, and
+// compare lengths.
+//
+// Two changes: `clipboard_set` answers `bool`, and it refuses rather than
+// truncates — a clipboard holding the first 40% of a selection is worse than a
+// clipboard that still holds what it had, because the user pastes it. And
+// `clipboard_capacity()` says how much fits, so a program can decide in advance
+// instead of discovering it afterwards.
+
+// How many bytes `clipboard_set` will accept, not counting the terminator.
+//
+// A build constant, not a runtime one: sokol allocates the buffer inside
+// `sapp_run` from `sapp_desc.clipboard_size` and never resizes it, so any
+// runtime setter would be a lie everywhere except before the window opens.
+i32 clipboard_capacity():
+    return CLIPBOARD_BYTES - 1
+
+// The clipboard buffer sokol is asked for, in bytes.
+//
+// **8 192 was sokol's default and it is far too small**: it is 8 KB of text —
+// an editor exceeds it on a nine-kilobyte file, which is a small source file.
+// The buffer is one `malloc` at window creation that lives for the process, so
+// the whole cost of being generous is a megabyte of resident memory in a
+// program that has already advertised `Clipboard` and is holding a GPU context;
+// `app:draw`'s vertex buffer alone is the same order. A megabyte holds roughly
+// 25 000 lines of source, which is past where "select all and copy" is a thing
+// a person does to a text file.
+//
+// **A `@const` and not a parameter**, for two reasons. It cannot be changed
+// after the window opens, so the only honest runtime home for it would be an
+// argument to `graphical.new(w, h, title)` — the one line every graphical
+// program is required to write — which would tax every program in the tree for
+// a knob almost none of them turn. And `@const` is already this collection's
+// established build knob: `-D display.CLIPBOARD_BYTES=65536` on an embedded
+// target is the same shape as `-D sokol_gfx.BACKEND=dummy`, and costs no
+// public surface at all.
+@const i32 CLIPBOARD_BYTES = 1048576
+
+// Whether `clipboard_set` would take `text` whole, the window aside: it is
+// no longer than `clipboard_capacity()`, and it holds no NUL byte. **A NUL is
+// refused for the same reason an oversize string is:** the text reaches sokol
+// as a C string, which ends at the first NUL, so everything after it would be
+// dropped while the call answered that it landed — and an editor cutting a
+// selection trusts that answer before it removes the text. Decided from the
+// string alone, so a program can ask before it tries, and so the rule is
+// checkable with no window.
+bool clipboard_accepts(string8 text):
+    i64 n = #len(text)
+    if n > i64(clipboard_capacity()):
+        return false
+    for i in 0..<n:
+        if u8(text[i]) == 0:
+            return false
+    return true
+
+// Put `text` on the system clipboard. **Answers whether it landed.**
+//
+// `false` means nothing was written and the clipboard still holds whatever it
+// held, for one of three reasons: the string is longer than
+// `clipboard_capacity()`, it holds a NUL byte (see `clipboard_accepts`), or
+// the display is not open yet (sokol's clipboard calls are silent no-ops
+// before `sapp_run` and after it returns).
+bool clipboard_set(string8 text):
+    if !sokol_app.sapp_isvalid():
+        return false
+    if !clipboard_accepts(text):
+        return false
+    ref []char8 tc = strings.clone_to_cstring(text, libc.allocator())
+    defer #delete(tc)
+    sokol_app.sapp_set_clipboard_string(cstring(tc))
+    return true
+
+// Returns a `cstring`, not a `string`, matching core:os.env: a C string cannot
+// become a Dado string without walking and owning it. Measure or print it
+// (strings.measure, println), or `strings.clone_from_cstring` for an owned copy.
+//
+// Bounded by the same buffer: a selection put on the clipboard by another
+// program that is longer than `clipboard_capacity()` arrives truncated, and
+// sokol gives no way to tell that from a selection that was exactly that long.
+// Raising `CLIPBOARD_BYTES` is the only lever there is.
+cstring clipboard_get():
+    return sokol_app.sapp_get_clipboard_string()
+
+// ── Surface: lifecycle & timing ────────────────────────────────────────────
+
+// Ask the window to close; the loop finishes the frame, runs cleanup, `run`
+// returns.
+void request_close():
+    sokol_app.sapp_request_quit()
+
+// Cancel a close that a quit-requested event began.
+void cancel_close():
+    sokol_app.sapp_cancel_quit()
+
+// Close now, without the quit-requested handshake.
+void quit():
+    sokol_app.sapp_quit()
+
+// Whether the display is initialised and the graphics context is valid.
+bool valid():
+    return sokol_app.sapp_isvalid()
+
+// True only inside the render pass (between `begin_pass` and `end_pass`) — so,
+// under `app:graphical`, true for the whole of `app:app`'s `process` hook and
+// false everywhere else. The app:draw primitives check this and panic if called
+// outside the frame.
+bool drawing():
+    return backend.drawing()
+
+u64 frame_count():
+    return sokol_app.sapp_frame_count()
+
+// Seconds the last frame took (smoothed).
+f64 frame_duration():
+    return sokol_app.sapp_frame_duration()

@@ -1,0 +1,479 @@
+// core:mem/gc — a conservative mark-sweep collector behind `mem.Allocator`.
+//
+//     gc.Heap heap
+//     gc.init(&heap)
+//     using gc.allocator(&heap):
+//         run()                                 // every verb allocates here
+//
+// **PROTOTYPE.** It collects, and it is correct for what it scans. What it does
+// not scan is below under *Roots*, and that list is a correctness hole, not a
+// performance note. Do not ship a program on this.
+//
+// Conservative means: any stack word that looks like an address into a live
+// block keeps that block alive. False positives retain garbage; there are no
+// false negatives for anything the root set covers.
+package gc
+
+import "core:mem"
+
+// **The address arithmetic a conservative collector is made of is written in
+// Dado**, in `widen`, `in_span` and `in_range` below. The orderings, `p + n` and
+// the round trip through `#c.uintptr_t` live on `rawptr` — which points at
+// *bytes*, so `+ 1` is unambiguous — and not on `^T`, which points at a type
+// and keeps `==` and `!=` and nothing else. Reaching them costs a written
+// `rawptr(p)` at the place the arithmetic happens, and that friction is the
+// design and not a gap: this is the operation a collector is wrong about when
+// it is wrong, so it is the operation that should be visible.
+//
+// **The hand-written C shim this package used to carry is gone**, and the three
+// functions it held are the three below. Each needed a word spelled on a *C function* rather than a
+// spelling for an address, and each of those three words now exists on this
+// side of the boundary:
+//
+//   * `noinline`, so `stack_top` reports its own frame instead of its
+//     caller's, is `@symbol(noinline)`;
+//   * `no_sanitize_address`, because a conservative scan reads the redzones
+//     ASan puts between locals and is not the underflow ASan calls it, is
+//     `@symbol(no_sanitize_address)`;
+//   * and a `pthread_attr_t` held **by value** — a complete-but-opaque C type,
+//     needing `&attr` and a feature-test macro before `<pthread.h>` — is a
+//     bodiless `foreign type` (complete by default) plus a `define` clause.
+//
+// What the shim cost was a second language, a second build input and a header
+// whose own comment had to explain why three functions were not four. What
+// replacing it costs is that the two attributes are now **registered** rather
+// than arbitrary: `@symbol` takes a word this compiler knows, so a fourth
+// function wanting a fourth attribute is a registration and not a free hand.
+// That is the trade the row was for.
+
+// `#c.size_t` and not `u64`: the same width, and on Darwin not the same type
+// (`uint64_t` is `unsigned long long` there), which the emitter's `_Generic`
+// assertion on this restatement would refuse.
+private foreign "stdlib.h":
+    rawptr malloc(#c.size_t nbytes)
+    void free(rawptr p)
+
+// The two compiler builtins this collector is made of, restated through a
+// `foreign` block exactly as a library function is: gcc and clang declare them
+// and no header does, which is why the block names `<stddef.h>` — a header
+// every hosted target has and whose contents are beside the point.
+//
+// `__builtin_unwind_init` spills callee-saved registers to the stack. Without
+// it a reference living only in a register is invisible to the scan and its
+// block is freed.
+//
+// `__builtin_frame_address(0)` is the current frame's base, which `stack_top`
+// below is the whole of. Its argument has to be a constant, and a literal `0`
+// is what Dado emits for a literal `0`.
+private foreign "stddef.h":
+    void __builtin_unwind_init()
+    rawptr __builtin_frame_address(i32 level)
+
+// What the walk hands back: the heap, and one candidate address.
+type Visit: void(rawptr, rawptr)
+
+// ── the three things that are not about addresses ───────────────────────────
+
+// The high end of this thread's stack.
+//
+// Taking the address of a local in `main` is not a substitute: the compiler may
+// place other locals above it, and a reference in one of those is then outside
+// the scanned range and its block is freed while live. Measured — that is
+// exactly how the first prototype failed.
+//
+// **Two platforms, two calls, and the `when` is the whole of the difference.**
+// glibc answers with a `pthread_attr_t` filled in by `pthread_getattr_np`,
+// which is behind `_GNU_SOURCE` — and `<features.h>` fixes the feature set the
+// first time any header pulls it in, which is why the macro is a `define`
+// clause (emitted above every `#include`) and not a line in this file. Apple
+// answers in one call and needs no macro.
+when #OS == #DARWIN:
+    private foreign "pthread.h":
+        type pthread_t
+        pthread_t pthread_self()
+        rawptr pthread_get_stackaddr_np(pthread_t thread)
+
+    private rawptr stack_base():
+        return pthread_get_stackaddr_np(pthread_self())
+else:
+    // `type pthread_attr_t` with no body is **complete in C and opaque to
+    // Dado**: C spells it and C sizes it, so a local of one is a real object
+    // with a real address and `&attr` is the `pthread_attr_t *` the three
+    // calls below take. That is the property the shim existed for, and CP-5.2
+    // is what made a bodiless `foreign type` mean it.
+    private foreign "pthread.h" define "_GNU_SOURCE=1":
+        type pthread_attr_t
+        type pthread_t
+        pthread_t pthread_self()
+        i32 pthread_getattr_np(pthread_t thread, ^pthread_attr_t attr)
+        i32 pthread_attr_getstack(^pthread_attr_t attr, ^rawptr addr, ^#c.size_t size)
+        i32 pthread_attr_destroy(^pthread_attr_t attr)
+
+    private rawptr stack_base():
+        pthread_attr_t attr
+        rawptr addr = nil
+        #c.size_t size = 0
+        if pthread_getattr_np(pthread_self(), &attr) != 0:
+            return nil
+        if pthread_attr_getstack(&attr, &addr, &size) != 0:
+            _ = pthread_attr_destroy(&attr)
+            return nil
+        _ = pthread_attr_destroy(&attr)
+        // `pthread_attr_getstack` answers with the **low** end and the length;
+        // what a downward-growing stack is scanned to is the high end.
+        return addr + u64(size)
+
+// The low end of the region to scan: this function's own frame base, which sits
+// below every byte of its caller's frame — including the slots
+// `__builtin_unwind_init` spilled the callee-saved registers into.
+//
+// Taking the address of a local in the caller is not a substitute: the compiler
+// may place the spill slots below it, and a reference living only in a register
+// is then outside the range. Measured — that is how the second prototype
+// failed.
+//
+// **`@symbol(noinline)` is load-bearing and not a hint.** Inlined, this reports
+// its caller's frame, the region scanned starts above the words that matter,
+// and the collector frees live blocks — silently, and only under optimisation.
+// Measured at `-O2`, both compilers: without the attribute the function is not
+// emitted at all.
+private @symbol(noinline) rawptr stack_top():
+    return __builtin_frame_address(0)
+
+// One word of the stack, as a pointer.
+//
+// `^rawptr` is `void **`, and reading through it is what makes a *word* out of
+// the bytes at an address. The conversion is written, as every conversion into
+// a pointer type in this file is.
+private type WordPtr: ^rawptr
+
+// Hand every word in `[lo, hi)` to `visit`, skipping any that lies inside
+// `[skip, skip + skip_n)`. `scan_region` is its one caller and names it that;
+// this is the word-by-word half.
+//
+// **`@symbol(no_sanitize_address)` is the reason this was ever C.** A
+// conservative scan reads whole stack frames including the redzones
+// AddressSanitizer puts between locals, so ASan reports it as a
+// stack-buffer-underflow. It is not one, and this is how every collector says
+// so. Without it `./dado test collections/core/mem/gc` fails under `-fsanitize=
+// address` and passes without it, which is the shape of failure that makes a
+// green unsanitized run worth nothing here.
+//
+// The stepping is `rawptr` arithmetic, which is the same byte pointer the
+// deleted C cast to by hand — the same C, written one language earlier.
+private @symbol(no_sanitize_address) void scan_words(rawptr lo, rawptr hi, rawptr skip, u64 skip_n, rawptr ctx, Visit visit):
+    if lo == nil || hi == nil:
+        return
+    rawptr at = lo
+    for at < hi:
+        if skip_n == 0 || at < skip || at >= skip + skip_n:
+            WordPtr w = WordPtr(at)
+            visit(ctx, w^)
+        at = at + #size(rawptr)
+    return
+
+public const i32 MAX_BLOCKS = 4096
+
+type Block: (rawptr at, u64 size, bool marked)
+
+type Heap: (
+    [MAX_BLOCKS]Block blocks,
+    // Marked but not yet scanned. Marking is transitive and this is the
+    // worklist that makes it one pass instead of a fixpoint.
+    [MAX_BLOCKS]i32 pending,
+    i32 pending_count,
+    i32 count,
+    // The lowest and highest byte any live block covers. Every candidate word
+    // is tested against this before anything else, which is the whole reason
+    // the scan is affordable: a stack is overwhelmingly small integers, return
+    // addresses and stack addresses, and each of those is rejected here in two
+    // comparisons instead of a walk over the block table.
+    rawptr lo,
+    rawptr hi,
+    rawptr stack_bottom,
+    i64 collections,
+    i64 freed,
+)
+
+// Everything between the current frame and the top of this thread's stack is
+// scanned. The base comes from the thread rather than from a local in `main`:
+// the compiler may place a local above whichever one you took the address of,
+// and a reference in that one is then outside the range and freed while live.
+// The first prototype did it the other way and collected its own live data.
+public void init(^Heap h):
+    h^.count = 0
+    h^.pending_count = 0
+    h^.lo = nil
+    h^.hi = nil
+    h^.stack_bottom = stack_base()
+    h^.collections = 0
+    h^.freed = 0
+    return
+
+public (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Heap h):
+    return (dispatch, rawptr(h))
+
+// The allocator for a collected heap, as a declaration that takes `mem.Allocator` on:
+// a `HeapAllocator` is accepted wherever an allocator is asked — `#new`, `using`, a
+// parameter written as the two words, an `Allocator` binder — and the
+// compiler calls its `data()` there. It holds only the pointer, so a
+// one-slot declaration: `self` *is* the `^Heap`.
+//
+//     gc.HeapAllocator h = &h
+//     using h:
+//         ...
+public type HeapAllocator using mem.Allocator:
+    ^Heap heap,
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+        return (dispatch, rawptr(self))
+
+public i32 live(^const Heap h):
+    return h.count
+
+public i64 collections(^const Heap h):
+    return h.collections
+
+public i64 freed(^const Heap h):
+    return h.freed
+
+// ── the allocator ───────────────────────────────────────────────────────────
+//
+// `Free` is a no-op: the collector decides, not the caller. That is not a gap —
+// `core:mem`'s interface admits an allocator that never honours `delete`, which
+// is what makes a collector an ordinary member of it. `FreeAll` collects.
+
+private type HeapPtr: ^Heap
+
+private rawptr dispatch(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    HeapPtr h = HeapPtr(data)
+    if rawptr(h) == nil:
+        return nil
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            return take(h, nbytes)
+        case mem.AllocatorMode.Resize:
+            return regrow(h, old, old_size, nbytes)
+        case mem.AllocatorMode.Free:
+            return nil
+        case mem.AllocatorMode.FreeAll:
+            _ = collect(h)
+            return nil
+        else:
+            return nil
+
+private rawptr take(^Heap h, u64 nbytes):
+    if h^.count >= MAX_BLOCKS:
+        _ = collect(h)
+    if h^.count >= MAX_BLOCKS:
+        return nil
+    u64 want = nbytes
+    if want == 0:
+        want = 1
+    rawptr block = malloc(#c.size_t(want))
+    if block == nil:
+        return nil
+    zero(block, want)
+    h^.blocks[h^.count] = (block, want, false)
+    h^.count = h^.count + 1
+    widen(h, block, want)
+    return block
+
+// Grow the heap span to cover a new block.
+//
+// `hi` is one past the last byte of the highest block, so the span it bounds is
+// half-open and `in_span` tests it as one.
+private void widen(^Heap h, rawptr at, u64 nbytes):
+    rawptr end = at + nbytes
+    if h^.lo == nil || at < h^.lo:
+        h^.lo = at
+    if h^.hi == nil || h^.hi < end:
+        h^.hi = end
+    return
+
+// `lo <= p < hi`, the heap-span filter `mark` opens with.
+private bool in_span(rawptr p, rawptr lo, rawptr hi):
+    return p >= lo && p < hi
+
+// Whether `p` points into `[base, base + nbytes)` — interior pointers included,
+// which is the normal case in Dado because every window makes one. The high
+// bound is exclusive: one byte past a block is the first byte of whatever
+// follows it and belongs to that.
+private bool in_range(rawptr p, rawptr base, u64 nbytes):
+    return p >= base && p < base + nbytes
+
+// Allocate, copy, and leave the old block for the collector — a resize under a
+// collector is not a place to free anything, because a reference to the old
+// block may still be on the stack.
+private rawptr regrow(^Heap h, rawptr old, u64 old_size, u64 nbytes):
+    rawptr fresh = take(h, nbytes)
+    if fresh == nil || old == nil:
+        return fresh
+    u64 keep = old_size
+    if nbytes < keep:
+        keep = nbytes
+    mem.Bytes src = mem.Bytes(old)
+    mem.Bytes dst = mem.Bytes(fresh)
+    []u8 from = src[0..<i64(keep)]
+    []u8 into = dst[0..<i64(keep)]
+    for i in i64(0)..<i64(keep):
+        into[i] = from[i]
+    return fresh
+
+private void zero(rawptr p, u64 nbytes):
+    mem.Bytes b = mem.Bytes(p)
+    []u8 span = b[0..<i64(nbytes)]
+    for i in i64(0)..<i64(nbytes):
+        span[i] = 0
+    return
+
+// ── collection ──────────────────────────────────────────────────────────────
+
+// Mark from the roots, free what is unreachable, answer how many blocks went.
+public i64 collect(^Heap h):
+    __builtin_unwind_init()
+    rawptr top = stack_top()
+
+    for i in i64(0)..<i64(h^.count):
+        h^.blocks[i].marked = false
+    h^.pending_count = 0
+
+    scan_region(h, top, h^.stack_bottom)
+    close_over_heap(h)
+
+    i64 gone = sweep(h)
+    h^.collections = h^.collections + 1
+    h^.freed = h^.freed + gone
+    return gone
+
+// Mark every block any word in `[lo, hi)` points into.
+//
+// **The collector's own table is skipped**, and that is not an optimisation.
+// `Heap` holds the address of every live block, so if it sits anywhere inside
+// the scanned region — which it does whenever a caller declares it as a local
+// rather than at package level — every block looks reachable and a collection
+// frees nothing. Measured: the same program collected 50 blocks with a
+// package-level heap and 0 with a stack one.
+private void scan_region(^Heap h, rawptr lo, rawptr hi):
+    scan_words(lo, hi, rawptr(h), #size(Heap), rawptr(h), visit)
+    return
+
+private void visit(rawptr ctx, rawptr candidate):
+    mark(HeapPtr(ctx), candidate)
+    return
+
+// A candidate address marks the block containing it — interior included, since
+// every window in this language makes an interior pointer.
+//
+// **The span test comes first and is the reason this is affordable.** Without
+// it every stack word costs a walk over the whole block table and finds
+// nothing, because almost no stack word is a heap pointer. Measured: adding it
+// alone took collection from 2.14 ms to 0.13 ms on the same workload.
+private void mark(^Heap h, rawptr candidate):
+    if candidate == nil:
+        return
+    if !in_span(candidate, h^.lo, h^.hi):
+        return
+    for i in i64(0)..<i64(h^.count):
+        if !h^.blocks[i].marked:
+            if in_range(candidate, h^.blocks[i].at, h^.blocks[i].size):
+                h^.blocks[i].marked = true
+                h^.pending[h^.pending_count] = i32(i)
+                h^.pending_count = h^.pending_count + 1
+                return
+    return
+
+// Marking is transitive: a marked block's own contents are roots. Draining the
+// worklist scans each block exactly once, where the fixpoint this replaced
+// re-swept the whole table until a pass added nothing — O(blocks) against
+// O(blocks²), and on a chain the old one needed one pass per link.
+private void close_over_heap(^Heap h):
+    for h^.pending_count > 0:
+        h^.pending_count = h^.pending_count - 1
+        scan_block(h, i64(h^.pending[h^.pending_count]))
+    return
+
+private void scan_block(^Heap h, i64 which):
+    rawptr at = h^.blocks[which].at
+    scan_region(h, at, at + h^.blocks[which].size)
+    return
+
+// Free the unmarked and close the gap in the table.
+private i64 sweep(^Heap h):
+    i32 kept = 0
+    i64 gone = 0
+    for i in i64(0)..<i64(h^.count):
+        if h^.blocks[i].marked:
+            h^.blocks[kept] = h^.blocks[i]
+            kept = kept + 1
+        else:
+            free(h^.blocks[i].at)
+            gone = gone + 1
+    h^.count = kept
+    // The span is only as wide as what survived.
+    h^.lo = nil
+    h^.hi = nil
+    for i in i64(0)..<i64(kept):
+        widen(h, h^.blocks[i].at, h^.blocks[i].size)
+    return gone
+
+// ── Roots: what is scanned, and what is not ─────────────────────────────────
+//
+// **Scanned.** The C stack from the current frame to `stack_bottom`, callee-
+// saved registers (via `__builtin_unwind_init`), and the contents of every
+// marked block.
+//
+// **Not scanned, and each is a way to free live memory:**
+//
+//   * **Package-level variables.** Dado emits these as C statics and nothing
+//     here knows where they are. A `ref` parked in one is collected while live.
+//     This is the hole to close first, and Dado can close it better than Boehm
+//     can: the whole program is one translation unit and the compiler knows
+//     every package-level declaration, so an emitted roots table would make
+//     these *precise* rather than conservative. That is a compiler change.
+//   * **Other threads' stacks.** `core:jobs` spawns through `pthread_create`
+//     and those stacks are invisible here. Do not allocate through this
+//     collector from a worker.
+//   * **Memory C owns.** A block handed to a C library that stores the only
+//     reference is unreachable from here.
+//
+// ── Where this sits, measured ───────────────────────────────────────────────
+//
+// Against Boehm 8.2 on the same machine and workload — a chain of `live` nodes
+// kept, 1000 blocks of churn per cycle, `-O2`:
+//
+//     live      this      boehm
+//       50    0.0094 ms   0.023 ms     2.4x faster
+//      500    0.215  ms   0.036 ms     6x slower
+//     2000    4.69   ms   0.054 ms    87x slower
+//
+// Allocation is at parity to 1.5x behind (15-24M/s against 19-36M/s): this is
+// `malloc` plus a table append where Boehm pops a free list.
+//
+// **The shape of that table is the whole remaining story.** Boehm is near-flat
+// in the live set; this is quadratic in it. The span filter in `mark` made
+// *garbage* cheap — a stack word outside the heap is rejected in two
+// comparisons rather than a walk over the block table, which took a collection
+// from 2.14 ms to 0.0094 ms — but a candidate that *is* a heap pointer still
+// costs a linear walk, and every live block's contents produce those. So the
+// cost is O(live x blocks), and the two numbers grow together.
+//
+// One caveat on the 50-live row: this collector is partly faster there because
+// it is doing less work than Boehm rather than less work per unit. It does not
+// scan the data segment at all, which is the correctness hole below, not an
+// optimisation.
+//
+// ── FINISH WORK, in the order the numbers argue for ─────────────────────────
+//
+//   1. **A page table in `mark`.** `page = addr >> 12` to a short list of block
+//      indices, rebuilt on sweep. Turns the linear walk into O(1) and the
+//      collection from O(live x blocks) into O(live). This is the one change
+//      that closes the table above.
+//   2. **A roots table for package-level statics.** The correctness hole under
+//      *Roots*; needs the compiler to emit the manifest.
+//   3. **Collect on a heap-growth watermark**, not only when `MAX_BLOCKS` is
+//      hit or `collect` is called by hand.
+//   4. A growable block table; `MAX_BLOCKS` is a fixed ceiling today.
+//   5. Size-class free lists, so allocation is a pop rather than a `malloc`.
+//      Worth about 1.5x on allocation and nothing on collection.
+//   6. Thread stop-the-world, or a stated single-thread contract.
+//   7. Blacklisting, so a false pointer does not pin a block forever.

@@ -1,0 +1,271 @@
+// core:net — a thin `Reliable`/`Unreliable` wrapper over `vendor:enet`.
+//
+//     import "core:net"
+//
+//     net.init()
+//     defer net.shutdown()
+//
+//     net.Host server = net.host_server(17777, 32)
+//     defer net.host_destroy(server)
+//
+//     net.Host client = net.host_client(1)
+//     defer net.host_destroy(client)
+//     net.Peer peer = net.connect(client, "127.0.0.1", 17777)
+//
+//     net.Event ev = net.poll(server, 10, #default)
+//     if ev.kind == net.Kind.Receive:
+//         // ev.data is the caller's now — #delete(ev.data) when done
+//
+// This is the mechanism half of the networking layer: it knows nothing about
+// the app barrier, `#ROLE`, or an RPC surface — that is `app`'s job, and it
+// is not written yet. What lives here is the class-not-socket surface a
+// caller is promised: `Reliable` and `Unreliable` delivery classes, which
+// hide channel IDs and packet flags and are the whole vocabulary a program
+// needs, over
+// ENet's per-channel reliability (`vendor:enet`). Above the backend line,
+// `app` builds on this package, never on `vendor:enet` directly —
+// mechanism down, opinion up, the same split `core:log`/`app:log` and
+// `core:jobs`/`app` already follow.
+//
+// **The class-to-channel mapping** was an open design point and this
+// package settles it: channel 0 is
+// reliable-ordered (`PacketFlag.Reliable`), channel 1 is
+// unreliable-unsequenced (`PacketFlag.Unsequenced`) — the minimum
+// `channelLimit` a host here needs, and it matches `ENetPacketFlag`'s own
+// `Reliable`/`Unsequenced` split almost directly, exactly the starting
+// point the handoff suggested.
+//
+// **One reusable `ENetEvent` per `Host`, not one per `poll` call** — the
+// same call-reuse `vendor:enet`'s own test demonstrates (`event_create`
+// once, `enet_host_service` fills the same buffer every time), just wrapped
+// so a `Host` owns it instead of the caller.
+//
+// **A `Receive` event's payload is a caller-owned `ref []u8`, copied out of
+// ENet's own packet before the packet is destroyed.** An ENet packet is
+// only valid until it is explicitly destroyed or the next service call
+// reuses its slot; this package copies its bytes into Dado memory and
+// destroys it immediately, so nothing a caller holds ever outlives its
+// owner. `poll` takes an explicit `mem.Allocator` rather than defaulting to
+// `#default` — the same convention `core:cfg`/`core:geom` use and for the
+// same reason: a parameter default must fold at compile time, so
+// the ambient allocator can't be one, and writing it is `ERR0901`); pass
+// `#default` for the ordinary case. Every event kind other than `Receive` carries a
+// nil `data` and nothing to free; `delete` is a no-op on nil regardless.
+//
+// **Single-threaded by design, not by accident.** `enet_host_service` is
+// not documented thread-safe and nothing in `vendor:enet` claims otherwise
+// — so `poll` is meant to be called
+// from one place, the same contract `app:input`'s backend-driven queue
+// already has. `send`/`broadcast` are a thin `enet_peer_send`/
+// `enet_host_broadcast` call with no queue of their own (unlike
+// `app:log`'s per-worker rings and the signals `app:events` became, which
+// exist because *sending* — a log call, an `#emit` — happens from arbitrary
+// job-worker code): the
+// same single-thread caveat that applies to `poll` applies to these too,
+// until/unless a future task (`app`'s own RPC surface, Step 3) adds
+// buffering in front of them.
+package net
+
+import "vendor:enet"
+import "core:mem"
+import "core:strings"
+import "core:mem/libc"
+
+// ── delivery classes — the dev names the class, never the
+// socket" ────────────────────────────────────────────────────────────────
+
+enum i32 Class: (Reliable, Unreliable)
+
+const u8  CHANNEL_RELIABLE   = 0
+const u8  CHANNEL_UNRELIABLE = 1
+const u64 CHANNEL_COUNT      = 2   // channelLimit every Host below is created with
+
+private u8 channel_of(Class cls):
+    if cls == Class.Reliable:
+        return CHANNEL_RELIABLE
+    return CHANNEL_UNRELIABLE
+
+private u32 flags_of(Class cls):
+    if cls == Class.Reliable:
+        return u32(enet.PacketFlag.Reliable)
+    return u32(enet.PacketFlag.Unsequenced)
+
+// ── host & peer ──────────────────────────────────────────────────────────
+
+// A host owns one ENet host and the one `ENetEvent` buffer every `poll`
+// call on it reuses (see package doc comment). Both a server (bound,
+// accepts connections) and a client (unbound, only ever connects out) are
+// this same shape — `host_server`/`host_client` differ only in how they
+// build the underlying `ENetHost`.
+type Host: (^enet.ENetHost h, ^enet.ENetEvent ev)
+
+// The vendor peer handle, re-exported under this package's own name so a
+// caller never has to `import "vendor:enet"` directly. Identity only —
+// compare with `!= nil`, pass it back into this package's own functions,
+// nothing else.
+type Peer: ^enet.ENetPeer
+
+// ── delivery events — the poll surface `app`'s own receive-at-the-barrier
+// loop (Step 3) will drain, mirroring `input.poll`
+// ────────────────────────────────────────────────────────────────────────
+
+enum i32 Kind: (None, Connect, Disconnect, Timeout, Receive)
+
+// `data` is non-nil only for `Kind.Receive` — see package doc comment on
+// ownership.
+type Event: (Kind kind, Peer peer, ref []u8 data)
+
+private Event no_event():
+    Peer nilpeer = nil
+    ref []u8 nildata = nil
+    return (Kind.None, nilpeer, nildata)
+
+// ── lifecycle — process-wide, call once (mirrors `vendor:enet`'s own
+// contract, not per-host) ───────────────────────────────────────────────
+
+// `false` on failure — nothing else in this package will work.
+bool init():
+    return enet.enet_initialize() == 0
+
+void shutdown():
+    enet.enet_deinitialize()
+
+// ── host construction ───────────────────────────────────────────────────
+
+// A server bound to `port` on every local interface, accepting up to
+// `max_peers` connections. `host_valid` is `false` on failure (usually:
+// `port` already bound).
+Host host_server(u16 port, u64 max_peers):
+    ^enet.ENetAddress addr = enet.address_create()
+    enet.address_set_any(addr)
+    enet.address_set_port(addr, port)
+    ^enet.ENetHost h = enet.enet_host_create(addr, #c.size_t(max_peers), #c.size_t(CHANNEL_COUNT), 0, 0)
+    enet.address_destroy(addr)
+    if h == nil:
+        ^enet.ENetEvent nilev = nil
+        return (h, nilev)
+    return (h, enet.event_create())
+
+// A client host with no bound address — it can only `connect` out, never
+// accept. `max_outbound` is ENet's own `peerCount`: how many simultaneous
+// connections this client will ever hold (1 for the common case).
+Host host_client(u64 max_outbound):
+    ^enet.ENetHost h = enet.enet_host_create(nil, #c.size_t(max_outbound), #c.size_t(CHANNEL_COUNT), 0, 0)
+    if h == nil:
+        ^enet.ENetEvent nilev = nil
+        return (h, nilev)
+    return (h, enet.event_create())
+
+bool host_valid(Host host):
+    return host.h != nil
+
+void host_destroy(Host host):
+    if host.ev != nil:
+        enet.event_destroy(host.ev)
+    if host.h != nil:
+        enet.enet_host_destroy(host.h)
+
+u32 host_peer_count(Host host):
+    return enet.enet_host_get_peers_count(host.h)
+
+// Push queued outgoing traffic now rather than waiting for the next
+// `poll` — useful right after a `send`/`broadcast` when nothing else is
+// about to drive the loop (`vendor:enet`'s own test does the same).
+void flush(Host host):
+    enet.enet_host_flush(host.h)
+
+// ── connecting ───────────────────────────────────────────────────────────
+
+// Connect `host` (built with `host_client`) to `address:port`. `address` is
+// a runtime string, so it is copied to a `cstring` on the C heap for the
+// one call that needs it — a literal reaches `cstring` for free,
+// a runtime `string` does not) — the same pattern `app:display.
+// window_set_title` uses. Nil peer on failure: a malformed address, or
+// ENet has no room for another outgoing peer on this host.
+Peer connect(Host host, string8 address, u16 port):
+    ref []char8 caddr = strings.clone_to_cstring(address, libc.allocator())
+    defer #delete(caddr)
+
+    ^enet.ENetAddress addr = enet.address_create()
+    defer enet.address_destroy(addr)
+    bool resolved = enet.address_set_host(addr, cstring(caddr))
+    if !resolved:
+        Peer nilpeer = nil
+        return nilpeer
+
+    enet.address_set_port(addr, port)
+    return enet.enet_host_connect(host.h, addr, #c.size_t(CHANNEL_COUNT), 0)
+
+// A graceful disconnect — queues a disconnect notification the peer will
+// acknowledge; drain `poll` until a `Kind.Disconnect` event names this peer
+// (`vendor:enet`'s own test does the same). Prefer this over `reset` unless
+// the peer is unresponsive.
+void disconnect(Peer peer):
+    enet.enet_peer_disconnect(peer, 0)
+
+// An immediate, unacknowledged drop — no `Kind.Disconnect` event follows.
+// For an unresponsive peer, or test/shutdown teardown that cannot afford to
+// wait out a graceful handshake.
+void reset(Peer peer):
+    enet.enet_peer_reset(peer)
+
+// ── sending ──────────────────────────────────────────────────────────────
+
+// Send `data` to one peer over the given delivery class. `false` if ENet
+// could not queue the packet (e.g. out of memory) — a partial send is not a
+// possible outcome here, only queue-or-don't.
+bool send(Peer peer, Class cls, []u8 data):
+    i64 count = #len(data)
+    rawptr ptr = nil
+    if count > 0:
+        ptr = rawptr(&data[0])
+    ^enet.ENetPacket pkt = enet.enet_packet_create(ptr, #c.size_t(count), flags_of(cls))
+    if pkt == nil:
+        return false
+    i32 rc = enet.enet_peer_send(peer, channel_of(cls), pkt)
+    return rc == 0
+
+// Send `data` to every peer connected to `host` over the given delivery
+// class. A no-op with no error path of its own — ENet's own broadcast
+// silently reaches zero peers if none are connected.
+void broadcast(Host host, Class cls, []u8 data):
+    i64 count = #len(data)
+    rawptr ptr = nil
+    if count > 0:
+        ptr = rawptr(&data[0])
+    ^enet.ENetPacket pkt = enet.enet_packet_create(ptr, #c.size_t(count), flags_of(cls))
+    if pkt != nil:
+        enet.enet_host_broadcast(host.h, channel_of(cls), pkt)
+
+// ── polling — the one place ENet's own event loop is driven ────────────
+
+// One step of `host`'s event loop, waiting up to `timeout_ms` for
+// something to happen. `Kind.None` means nothing did. See the package doc
+// comment for `Kind.Receive`'s `data` ownership.
+Event poll(Host host, u32 timeout_ms, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+    i32 rc = enet.enet_host_service(host.h, host.ev, timeout_ms)
+    if rc <= 0:
+        return no_event()
+
+    u32 kind = enet.event_type(host.ev)
+    Peer p = enet.event_peer(host.ev)
+
+    if kind == u32(enet.EventType.Connect):
+        ref []u8 nildata = nil
+        return (Kind.Connect, p, nildata)
+    if kind == u32(enet.EventType.Disconnect):
+        ref []u8 nildata = nil
+        return (Kind.Disconnect, p, nildata)
+    if kind == u32(enet.EventType.DisconnectTimeout):
+        ref []u8 nildata = nil
+        return (Kind.Timeout, p, nildata)
+    if kind == u32(enet.EventType.Receive):
+        ^enet.ENetPacket pkt = enet.event_packet(host.ev)
+        u32 n = enet.enet_packet_get_length(pkt)
+        ref []u8 d = #make([]u8, u64(n), alloc)
+        if n > 0:
+            enet.packet_copy(pkt, rawptr(&d[0]), u64(n))
+        enet.enet_packet_destroy(pkt)
+        return (Kind.Receive, p, d)
+
+    return no_event()

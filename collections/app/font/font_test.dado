@@ -1,0 +1,1263 @@
+@test
+// What can be claimed about a font atlas **without a font file**, and what has
+// to be claimed with one.
+//
+// This package's hard part is that half of it depends on a `.ttf` that may not
+// exist on the machine running the test. So the tests split in two and say
+// which they are:
+//
+//   * everything about the **fallback** is unconditional. It is compiled into
+//     the package, so it is available on every machine and every target, and
+//     it is where the packer, the metrics arithmetic, the blank-glyph rule and
+//     the lookup are actually pinned.
+//   * everything about a **TrueType** face is guarded by `fs.exists` on
+//     `default_path()` and is *skipped*, not faked, when there is no font. A
+//     test that stubbed a font file would be pinning the stub.
+//
+// **The claims are written at edges.** `advance > 0` for a space is the whole
+// difference between a blank glyph and a missing one, and a rasteriser that
+// returned a zero-size box *and* a zero advance would pass any check that only
+// asked whether the atlas had ink in it.
+package font
+
+import "core:mem/libc"
+import "core:mem"
+import "core:mem/arena"
+import "core:os/fs"
+import "core:strings"
+import "core:fmt"
+
+// The byte offset of texel `(x, y)`. Every index in this file goes through it,
+// because `row * atlas_w + col` is now the *texel* number and the byte offset
+// is four times it — and a file that spells that arithmetic in eleven places is
+// a file where one of them can be left as it was.
+private i64 texel(^Font f, i32 x, i32 y):
+    return (i64(y) * i64(f.atlas_w) + i64(x)) * i64(BPP)
+
+// Any inked pixel in a glyph's box. **The alpha byte is the coverage** — the
+// three colour bytes are 255 whether or not a glyph was drawn there, so a
+// version of this that asked whether any byte was nonzero would answer the
+// whole atlas.
+private i32 ink_in(^Font f, Glyph g):
+    if g.pw <= 0 || g.ph <= 0:
+        return 0
+    i32 n = 0
+    for y in 0..<g.ph:
+        for x in 0..<g.pw:
+            if f.pixels[texel(f, g.px + x, g.py + y) + 3] != 0:
+                n = n + 1
+    return n
+
+// **The property the stock shader depends on, and the one thing nothing else
+// in this file would catch.** `sokol_gp` draws `texture(tex, uv) * color`, so a
+// texel whose rgb is anything but white tints the glyph with it and a texel
+// whose coverage landed in a colour byte instead of alpha draws a solid block.
+// Answers how many texels of the box carry white rgb, how many carry any
+// coverage at all, and the largest coverage in the box.
+//
+// A rasteriser that wrote coverage into `r` and left alpha at zero — which is
+// what writing one byte per pixel into an RGBA buffer *does* — gives
+// `white == 0`, `inked == 0`, `peak == 0`, and every other claim in this file
+// about that glyph still holds.
+private (i32 white, i32 inked, u8 peak) ink_state(^Font f, Glyph g):
+    i32 white = 0
+    i32 inked = 0
+    u8 peak = 0
+    if g.pw <= 0 || g.ph <= 0:
+        return (0, 0, 0)
+    for y in 0..<g.ph:
+        for x in 0..<g.pw:
+            i64 at = texel(f, g.px + x, g.py + y)
+            if f.pixels[at] == 255 && f.pixels[at + 1] == 255 && f.pixels[at + 2] == 255:
+                white = white + 1
+            u8 a = f.pixels[at + 3]
+            if a != 0:
+                inked = inked + 1
+            if a > peak:
+                peak = a
+    return (white, inked, peak)
+
+// Whether any two placed boxes overlap. The property the shelf packer exists
+// to have, and the one nothing else in this file would notice losing.
+//
+// The walk is over `SLOTS`, not `DENSE`, so `.notdef` is held to the same rule
+// as every other box — and the reserved solid block is checked against all of
+// them, because a glyph packed over it would make every rectangle drawn through
+// `solid_src` fringe with somebody's ink.
+private bool boxes_disjoint(^Font f):
+    (i32 sx, i32 sy, i32 sw, i32 sh) = solid_box(f)
+    for i in 0..<SLOTS:
+        Glyph a = f.dense[i64(i)]
+        if a.pw <= 0 || a.ph <= 0:
+            continue
+        if a.px < sx + sw && sx < a.px + a.pw && a.py < sy + sh && sy < a.py + a.ph:
+            return false
+        for j in i + 1..<SLOTS:
+            Glyph b = f.dense[i64(j)]
+            if b.pw <= 0 || b.ph <= 0:
+                continue
+            bool over_x = a.px < b.px + b.pw && b.px < a.px + a.pw
+            bool over_y = a.py < b.py + b.ph && b.py < a.py + a.ph
+            if over_x && over_y:
+                return false
+    return true
+
+private bool boxes_inside(^Font f):
+    for i in 0..<SLOTS:
+        Glyph g = f.dense[i64(i)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        if g.px < 0 || g.py < 0:
+            return false
+        if g.px + g.pw > f.atlas_w || g.py + g.ph > f.atlas_h:
+            return false
+    return true
+
+// **The reserved texel, checked as pixels rather than as a claim.** Every texel
+// of the block is an opaque white `(255, 255, 255, 255)`, and every texel of
+// the one-pixel ring around it has zero coverage — which is the padding that
+// keeps a bilinear sample from finding a neighbour, and the half of the
+// property that a block written with no padding would still pass without.
+//
+// `dark` counts a texel of the block that is not opaque white **for any reason**
+// — a coverage byte short of 255, or a colour byte that is not, which under the
+// stock shader is the difference between a white rule and a coloured one.
+private (i32 lit, i32 dark, i32 fringe) solid_state(^Font f):
+    (i32 sx, i32 sy, i32 sw, i32 sh) = solid_box(f)
+    i32 lit = 0
+    i32 dark = 0
+    for y in 0..<sh:
+        for x in 0..<sw:
+            i64 at = texel(f, sx + x, sy + y)
+            bool rgb = f.pixels[at] == 255 && f.pixels[at + 1] == 255 && f.pixels[at + 2] == 255
+            if rgb && f.pixels[at + 3] == 255:
+                lit = lit + 1
+            else:
+                dark = dark + 1
+    i32 fringe = 0
+    for y in sy - 1..<sy + sh + 1:
+        for x in sx - 1..<sx + sw + 1:
+            if y >= sy && y < sy + sh && x >= sx && x < sx + sw:
+                continue
+            if x < 0 || y < 0 || x >= f.atlas_w || y >= f.atlas_h:
+                continue
+            if f.pixels[texel(f, x, y) + 3] != 0:
+                fringe = fringe + 1
+    return (lit, dark, fringe)
+
+// Where `solid_src` actually lands, as a whole texel, and the texel there. This
+// is the claim `solid_src` makes turned back into a pixel lookup: a point
+// outside the block would pass every arithmetic check above.
+//
+// The source rectangle is already in atlas pixels, so the lookup is a truncation
+// and no longer a multiplication by the atlas size — which is the whole of what
+// leaving uv behind changed here.
+private (u8 r, u8 g, u8 b, u8 a) texel_at_solid_src(^Font f):
+    (f32 sx, f32 sy, f32 sw, f32 sh) = solid_src(f)
+    _ = sw
+    _ = sh
+    i32 x = i32(sx)
+    i32 y = i32(sy)
+    if x < 0 || y < 0 || x >= f.atlas_w || y >= f.atlas_h:
+        return (0, 0, 0, 0)
+    i64 at = texel(f, x, y)
+    return (f.pixels[at], f.pixels[at + 1], f.pixels[at + 2], f.pixels[at + 3])
+
+// The same, as the one number the old `texel_at_solid_uv` answered: an opaque
+// white texel is 255 and anything else is not.
+private u8 solid_texel_value(^Font f):
+    (u8 r, u8 g, u8 b, u8 a) = texel_at_solid_src(f)
+    if r != 255 || g != 255 || b != 255:
+        return 0
+    return a
+
+private bool near(f32 a, f32 b, f32 eps):
+    f32 d = a - b
+    if d < 0.0:
+        d = -d
+    return d <= eps
+
+// The whole image as one number, so "the pack did not change" is a comparison
+// rather than a loop at every call site. A polynomial rolling hash rather than
+// FNV, because `^` is Dado's pointer sigil and not an xor.
+//
+// `upto` is a **byte** count and every caller writes `w * h * BPP`, because
+// what this walks is the run `atlas_pixels` hands out rather than a count of
+// texels.
+private u64 atlas_sum(^Font f, i64 upto):
+    u64 h = u64(1469598103)
+    u64 mul = u64(1000003)
+    u64 one = u64(1)
+    i64 z = 0
+    for i in z..<upto:
+        h = h * mul + u64(f.pixels[i]) + one
+    return h
+
+// Every texel from `from` to `upto` — **texel indices** — is the untouched
+// texel: white, with no coverage.
+//
+// **Not four zeroes, and that is the point of the helper.** A grow that
+// `memset` the new rows to zero would leave a transparent *black* there, and a
+// glyph packed against the boundary would fringe dark where a sample crossed
+// it. The old version of this asked only whether the bytes were zero, which is
+// the answer that is now exactly wrong.
+private bool white_transparent_between(^Font f, i64 from, i64 upto):
+    for i in from..<upto:
+        i64 at = i * i64(BPP)
+        if f.pixels[at] != 255 || f.pixels[at + 1] != 255 || f.pixels[at + 2] != 255:
+            return false
+        if f.pixels[at + 3] != 0:
+            return false
+    return true
+
+// Every packed glyph's source rectangle lies inside the atlas — the dense block
+// and the sparse pair both.
+//
+// This used to be `windows_agree`, which asked whether `u0`/`v0`/`u1`/`v1`
+// still named the box they were divided out of. There is nothing left to ask
+// that of: the rectangle **is** the box, so the arithmetic claim is now an
+// identity and would pass vacuously. What is still worth claiming is the thing
+// a source rectangle has to satisfy to be one — that it names texels the image
+// actually has — and that is asked of the sparse pair too, which
+// `boxes_inside` does not walk.
+private bool rects_inside(^Font f):
+    for i in 0..<SLOTS:
+        Glyph g = f.dense[i64(i)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        if g.px < 0 || g.py < 0:
+            return false
+        if g.px + g.pw > f.atlas_w || g.py + g.ph > f.atlas_h:
+            return false
+    for i in 0..<f.extra_used:
+        Glyph g = f.extra[i64(i)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        if g.px < 0 || g.py < 0:
+            return false
+        if g.px + g.pw > f.atlas_w || g.py + g.ph > f.atlas_h:
+            return false
+    return true
+
+// A copy of every dense glyph's source rectangle, and the comparison against
+// one taken earlier.
+//
+// **This is the assertion that got stronger.** While a `Glyph` carried uv, the
+// most a grow could promise was that `u` survived and `v` halved — a rescaling,
+// checked on one glyph. A pixel rectangle is invariant, so the promise is
+// *identity*, and it is asked of all 96 slots at once: a grow that moved one
+// box by one pixel, or repacked, or recomputed anything at all, fails here.
+private ref []Glyph snap_rects(^Font f):
+    ref []Glyph snap = #make([]Glyph, i64(SLOTS))
+    if snap == nil:
+        return snap
+    for i in 0..<SLOTS:
+        snap[i64(i)] = f.dense[i64(i)]
+    return snap
+
+private bool rects_unmoved(^Font f, ref []Glyph snap):
+    for i in 0..<SLOTS:
+        Glyph a = snap[i64(i)]
+        Glyph b = f.dense[i64(i)]
+        if a.px != b.px || a.py != b.py || a.pw != b.pw || a.ph != b.ph:
+            return false
+    return true
+
+// `boxes_inside` for the sparse pair, which it does not walk.
+private bool extras_inside(^Font f):
+    for i in 0..<f.extra_used:
+        Glyph g = f.extra[i64(i)]
+        if g.pw <= 0 || g.ph <= 0:
+            continue
+        if g.px < 0 || g.py < 0:
+            return false
+        if g.px + g.pw > f.atlas_w || g.py + g.ph > f.atlas_h:
+            return false
+    return true
+
+// ── a model of a drawing surface, and the one line of it that matters ──────
+//
+// `app:font` compiles against no drawing surface, which is the claim the
+// package exists to make, so the property *a grow cannot corrupt a texture* is
+// checked against a model of one. The model is four lines and only one of them
+// is interesting; it is copied from `texture_update` in
+// `collections/app/draw/device.dado`:
+//
+//     if i32(#len(pixels)) < byte_count(g_tex[i].w, g_tex[i].h, ...):
+//         return false
+//
+// **A `<`, not a `!=`.** So an over-long run *passes* the guard, the upload
+// takes the texture's own byte count and no more, and the call answers `true` —
+// on the GPU and on the headless surface alike, because that line sits above
+// `if g_headless: return true`. Measured against the real `app:draw` headless
+// rather than read: `texture_update` of 128*1024 bytes into a 128x256 texture
+// answered `true`, and one byte short answered `false`.
+//
+// That is the failure this package's two counters exist to make unreachable,
+// and `truncated` is the bit that catches it.
+//
+// **The byte count is `w * h * BPP` now**, because every texture `app:draw`
+// holds is RGBA8 and the atlas is handed over as the RGBA8 run it is. The
+// arithmetic is the model's, not this package's: `byte_count(w, h, fmt)` is
+// what `device.dado` calls, and it is four bytes a texel for the one format
+// there is left.
+private type FakeTex: (i32 w, i32 h, i64 held, bool truncated)
+
+private bool fake_texture_update(^FakeTex t, []u8 pixels):
+    i64 want = i64(t.w) * i64(t.h) * i64(BPP)
+    i64 have = #len(pixels)
+    if i32(have) < i32(want):
+        return false
+    if have > want:
+        t.truncated = true
+    t.held = want
+    return true
+
+// What a consumer remembers between frames.
+private type Watcher: (i32 gen, i32 res)
+
+// The consumer every program written against this package already is: it
+// watches `atlas_generation` and updates in place. **It must be unable to see a
+// grow at all** — an update here is the truncating one.
+private void legacy_pass(^Font f, ^FakeTex t, ^Watcher w):
+    if atlas_generation(f) != w.gen:
+        _ = fake_texture_update(t, atlas_pixels(f))
+        w.gen = atlas_generation(f)
+
+// The consumer that grows, exactly as the package comment writes it: the resize
+// is tested first, and it destroys and remakes rather than updating.
+private void growing_pass(^Font f, ^FakeTex t, ^Watcher w):
+    if atlas_resizes(f) != w.res:
+        (i32 aw, i32 ah) = atlas_size(f)
+        t.w = aw
+        t.h = ah
+        t.held = i64(aw) * i64(ah) * i64(BPP)
+        w.res = atlas_resizes(f)
+        w.gen = atlas_generation(f)
+        return
+    if atlas_generation(f) != w.gen:
+        _ = fake_texture_update(t, atlas_pixels(f))
+        w.gen = atlas_generation(f)
+
+i32 test():
+    bool ok = true
+    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = libc.allocator()
+
+    // ── the fallback, which is always there ──────────────────────────────
+
+    Font fb = fallback(16.0) using alloc
+    ok = #expect(fb.source == Source.Fallback, "fallback() did not report Source.Fallback") && ok
+    ok = #expect(fb.pixels != nil, "fallback() produced no atlas") && ok
+    ok = #expect(fb.atlas_w > 0 && fb.atlas_h > 0,
+                 "fallback atlas is ", fb.atlas_w, "x", fb.atlas_h) && ok
+
+    // 16 pixels asked for, 8x8 bitmap, so an integer scale of 2 and a cell
+    // exactly 16 tall. Asking for 20 gets the same font at scale 2, not a
+    // blurred one — the whole reason the scale is an integer.
+    ok = #expect(near(pixel_height(&fb), 16.0, 0.001),
+                 "fallback pixel_height = ", pixel_height(&fb), ", wanted 16") && ok
+    Font fb20 = fallback(20.0) using alloc
+    ok = #expect(near(pixel_height(&fb20), 16.0, 0.001),
+                 "fallback(20) should still be scale 2 -> 16, got ", pixel_height(&fb20)) && ok
+    destroy(&fb20)
+
+    // A size below one cell does not collapse to nothing.
+    Font tiny = fallback(1.0) using alloc
+    ok = #expect(near(pixel_height(&tiny), 8.0, 0.001),
+                 "fallback(1) should clamp to one 8px cell, got ", pixel_height(&tiny)) && ok
+    ok = #expect(glyph(&tiny, 'A').pw > 0, "fallback(1) has no ink for 'A'") && ok
+    destroy(&tiny)
+
+    // Signs. `descent` is negative and `line_height` is the subtraction.
+    ok = #expect(ascent(&fb) > 0.0, "ascent should be positive, got ", ascent(&fb)) && ok
+    ok = #expect(descent(&fb) < 0.0, "descent should be negative, got ", descent(&fb)) && ok
+    ok = #expect(near(line_height(&fb), ascent(&fb) - descent(&fb), 0.001),
+                 "line_height is not ascent - descent + line_gap") && ok
+
+    // The blank-glyph rule, at both edges: an empty box *and* a real advance.
+    Glyph sp = glyph(&fb, ' ')
+    ok = #expect(sp.pw == 0 && sp.ph == 0,
+                 "space has a box: ", sp.pw, "x", sp.ph) && ok
+    ok = #expect(sp.advance > 0.0, "space does not advance: ", sp.advance) && ok
+    ok = #expect(ink_in(&fb, sp) == 0, "space put ink in the atlas") && ok
+
+    // And the other edge: a glyph that is *not* blank.
+    Glyph a = glyph(&fb, 'A')
+    ok = #expect(a.present, "'A' is not present in the fallback") && ok
+    ok = #expect(a.pw > 0 && a.ph > 0, "'A' has no box") && ok
+    ok = #expect(ink_in(&fb, a) > 0, "'A' box has no ink") && ok
+    ok = #expect(ink_in(&fb, a) < a.pw * a.ph,
+                 "'A' box is solid ink, which is a fill and not a glyph") && ok
+    ok = #expect(a.bearing_y < 0.0,
+                 "'A' should rise above the baseline, bearing_y = ", a.bearing_y) && ok
+
+    // **Where the coverage went.** The stock shader is `texel * tint`, so the
+    // three colour bytes must be white or the glyph is tinted by the atlas, and
+    // the coverage must be in alpha or the shader scales nothing. Writing one
+    // byte per pixel into an RGBA buffer puts the coverage in `r` and leaves
+    // alpha at zero — which draws nothing at all, and which every other claim
+    // about 'A' in this file would still pass.
+    (i32 a_white, i32 a_inked, u8 a_peak) = ink_state(&fb, a)
+    ok = #expect(a_white == a.pw * a.ph,
+                 a.pw * a.ph - a_white, " texels of 'A' are not white; the stock shader ",
+                 "multiplies the texel by the tint, so anything but white tints the glyph") && ok
+    ok = #expect(a_inked > 0, "'A' has no coverage in the alpha byte") && ok
+    ok = #expect(a_peak == 255,
+                 "'A' peaks at coverage ", a_peak, " where the bitmap writes 255") && ok
+
+    // The bitmap is monochrome and the atlas is white-with-alpha: every texel is
+    // `(255, 255, 255, a)` with `a` either 0 or 255. An intermediate alpha would
+    // mean something interpolated, and nothing here interpolates; a colour byte
+    // short of 255 would mean something wrote coverage into the wrong lane.
+    bool binary = true
+    bool white = true
+    i64 zero = 0
+    i64 fb_n = i64(fb.atlas_w) * i64(fb.atlas_h)
+    for i in zero..<fb_n:
+        i64 at = i * i64(BPP)
+        if fb.pixels[at] != 255 || fb.pixels[at + 1] != 255 || fb.pixels[at + 2] != 255:
+            white = false
+        u8 v = fb.pixels[at + 3]
+        if v != 0 && v != 255:
+            binary = false
+    ok = #expect(binary, "the fallback atlas holds a coverage that is neither 0 nor 255") && ok
+    ok = #expect(white, "the fallback atlas holds a texel whose rgb is not white") && ok
+
+    // The packer.
+    ok = #expect(boxes_inside(&fb), "a fallback glyph box is outside the atlas") && ok
+    ok = #expect(boxes_disjoint(&fb), "two fallback glyph boxes overlap") && ok
+
+    // Monospace: every advance equal, so a run of narrow letters measures the
+    // same as a run of wide ones.
+    ok = #expect(monospace(&fb), "the fallback is not reported monospace") && ok
+    ok = #expect(near(measure(&fb, "iiii"), measure(&fb, "MMMM"), 0.001),
+                 "fallback iiii = ", measure(&fb, "iiii"),
+                 " but MMMM = ", measure(&fb, "MMMM")) && ok
+    ok = #expect(near(measure(&fb, "AAAA"), 4.0 * glyph(&fb, 'A').advance, 0.001),
+                 "measure is not the sum of the advances") && ok
+    ok = #expect(near(measure(&fb, ""), 0.0, 0.001), "the empty string measures nonzero") && ok
+
+    // A bitmap font has no kerning table, and inventing one would be a lie.
+    ok = #expect(near(kern(&fb, 'A', 'V'), 0.0, 0.001),
+                 "the fallback invented a kerning pair") && ok
+
+    // ── `.notdef`: a missing glyph is a box, and it advances ─────────────
+    //
+    // The whole claim, at both edges. `present` stays honest so a client that
+    // wants to do something smarter can, **and** the box and the advance are
+    // real so a client that just draws what it is handed is correct. A
+    // rasteriser that answered `present == false` with a zero box and a zero
+    // advance — which is what this package used to do — passes any check that
+    // only asks the first half.
+    Glyph out = glyph(&fb, char32(0x00E9))
+    ok = #expect(!out.present, "U+00E9 claims to be present") && ok
+    ok = #expect(out.pw > 0 && out.ph > 0,
+                 "an unpacked codepoint has no .notdef box: ", out.pw, "x", out.ph) && ok
+    ok = #expect(out.advance > 0.0, "an unpacked codepoint does not advance") && ok
+    ok = #expect(ink_in(&fb, out) > 0, "the .notdef box has no ink") && ok
+    ok = #expect(ink_in(&fb, out) < out.pw * out.ph,
+                 ".notdef is solid ink, which is a fill and not a box") && ok
+    Glyph nd = notdef(&fb)
+    ok = #expect(nd.px == out.px && nd.py == out.py,
+                 "an unknown codepoint answers something other than notdef()") && ok
+    ok = #expect(!has(&fb, char32(0x00E9)), "has() disagrees with present") && ok
+    ok = #expect(has(&fb, 'A'), "has('A') is false on the fallback") && ok
+
+    // A run of unknown text measures its width rather than collapsing to zero,
+    // which is the defect the box exists to close: a caret column after a run
+    // that measured zero is silently wrong.
+    ok = #expect(near(measure(&fb, "\x01\x02"), 2.0 * out.advance, 0.001),
+                 "two unknown bytes measured ", measure(&fb, "\x01\x02"),
+                 ", wanted two .notdef advances") && ok
+
+    // ── the reserved solid texel ─────────────────────────────────────────
+
+    (i32 lit, i32 dk, i32 fringe) = solid_state(&fb)
+    ok = #expect(dk == 0, dk, " texels of the reserved block are not opaque") && ok
+    ok = #expect(lit > 0, "the reserved block is empty") && ok
+    ok = #expect(fringe == 0, fringe, " inked pixels ring the reserved block") && ok
+    (u8 sr, u8 sg, u8 sb, u8 sa) = texel_at_solid_src(&fb)
+    ok = #expect(sr == 255 && sg == 255 && sb == 255 && sa == 255,
+                 "solid_src names the texel (", sr, ",", sg, ",", sb, ",", sa,
+                 "), which is not an opaque white") && ok
+    (f32 sx, f32 sy, f32 sw, f32 sh) = solid_src(&fb)
+    // **The degeneracy, asserted as the zero it is.** A source rectangle with
+    // any extent interpolates into the block's transparent padding at a quad's
+    // corners — measured, 644 of 2048 pixels of a 64x32 quad wrong even with the
+    // block six texels square. `solid_box` is that rectangle and this is not it.
+    ok = #expect(sw == 0.0 && sh == 0.0,
+                 "solid_src has extent ", sw, "x", sh, ", which fringes at a quad's corners") && ok
+    (i32 bx0, i32 by0, i32 bw0, i32 bh0) = solid_box(&fb)
+    ok = #expect(sx > f32(bx0) && sx < f32(bx0 + bw0) &&
+                 sy > f32(by0) && sy < f32(by0 + bh0),
+                 "solid_src at ", sx, ",", sy, " is not strictly inside the block ",
+                 bx0, ",", by0, " ", bw0, "x", bh0) && ok
+    ok = #expect(sx < f32(fb.atlas_w) && sy < f32(fb.atlas_h),
+                 "solid_src leaves the atlas") && ok
+
+    // ── the metrics a text view asks for ─────────────────────────────────
+
+    ok = #expect(near(cell_width(&fb), glyph(&fb, ' ').advance, 0.001),
+                 "a monospace face's cell is not its space advance: ",
+                 cell_width(&fb), " vs ", glyph(&fb, ' ').advance) && ok
+    ok = #expect(cap_height(&fb) > 0.0, "cap_height is ", cap_height(&fb)) && ok
+    ok = #expect(x_height(&fb) > 0.0, "x_height is ", x_height(&fb)) && ok
+    ok = #expect(x_height(&fb) < cap_height(&fb),
+                 "x-height ", x_height(&fb), " is not below cap height ", cap_height(&fb)) && ok
+    ok = #expect(cap_height(&fb) <= ascent(&fb),
+                 "cap height rises above the ascent") && ok
+    (f32 ulp, f32 ult, bool ulr) = underline(&fb)
+    ok = #expect(!ulr, "the built-in bitmap claims a post table") && ok
+    ok = #expect(ult >= 1.0, "a derived underline is ", ult, " thick") && ok
+    ok = #expect(ulp > 0.0, "a derived underline sits at ", ulp, ", not below the baseline") && ok
+
+    // ── tab stops, byte offsets and the hit test ─────────────────────────
+    //
+    // On the fallback every cell is `cw` wide, so every number below is exact
+    // and a walk that lost a tab stop or counted a column twice cannot hide in
+    // a rounding tolerance.
+    f32 cw = cell_width(&fb)
+    Tabs t4 = tabs(4.0 * cw, 4)
+    ok = #expect(near(measure_tabbed(&fb, "\tx", t4), 5.0 * cw, 0.001),
+                 "a leading tab plus one character is ", measure_tabbed(&fb, "\tx", t4),
+                 ", wanted ", 5.0 * cw) && ok
+    ok = #expect(near(measure_tabbed(&fb, "ab\tx", t4), 5.0 * cw, 0.001),
+                 "two characters then a tab must still stop at column 4, got ",
+                 measure_tabbed(&fb, "ab\tx", t4)) && ok
+    ok = #expect(near(measure_tabbed(&fb, "abcd\tx", t4), 9.0 * cw, 0.001),
+                 "a tab on a stop advances a whole stop, got ",
+                 measure_tabbed(&fb, "abcd\tx", t4)) && ok
+    ok = #expect(near(advance_to(&fb, "ab\tx", 2, t4), 2.0 * cw, 0.001),
+                 "advance_to(2) is ", advance_to(&fb, "ab\tx", 2, t4)) && ok
+    ok = #expect(near(advance_to(&fb, "ab\tx", 3, t4), 4.0 * cw, 0.001),
+                 "advance_to past the tab is ", advance_to(&fb, "ab\tx", 3, t4)) && ok
+    ok = #expect(column_to(&fb, "ab\tx", 4, t4) == 5,
+                 "column_to over a tab is ", column_to(&fb, "ab\tx", 4, t4), ", wanted 5") && ok
+    ok = #expect(column_to(&fb, "abcd", 4, t4) == 4,
+                 "column_to with no tab is not the character count") && ok
+    // The primitive the three folds are folds over, asked directly — a walk
+    // that agreed with itself but not with `cell_at` would still pass every
+    // claim above.
+    Cell c_a = cell_at(&fb, "ab\tx", 0, 0.0, 0, t4)
+    ok = #expect(c_a.cp == 'a' && c_a.nbytes == 1 && c_a.columns == 1 && !c_a.tab,
+                 "cell_at on 'a' answered cp ", i32(c_a.cp), " nbytes ", c_a.nbytes) && ok
+    ok = #expect(near(c_a.advance, cw, 0.001), "cell_at on 'a' advances ", c_a.advance) && ok
+    Cell c_t = cell_at(&fb, "ab\tx", 2, 2.0 * cw, 2, t4)
+    ok = #expect(c_t.tab && c_t.nbytes == 1 && c_t.columns == 2,
+                 "cell_at on the tab answered ", c_t.columns, " columns, tab = ", c_t.tab) && ok
+    ok = #expect(near(c_t.advance, 2.0 * cw, 0.001),
+                 "the tab at column 2 advances ", c_t.advance, ", wanted ", 2.0 * cw) && ok
+    Cell c_end = cell_at(&fb, "ab", 2, 0.0, 0, t4)
+    ok = #expect(c_end.nbytes == 0, "cell_at past the end took ", c_end.nbytes, " bytes") && ok
+    Cell c_wide = cell_at(&fb, "日", 0, 0.0, 0, no_tabs())
+    ok = #expect(c_wide.nbytes == 3, "cell_at on a three-byte sequence took ",
+                 c_wide.nbytes, " bytes") && ok
+
+    (i64 hit_at, i32 hit_col) = index_at_x(&fb, "ab\tx", 4.2 * cw, t4)
+    ok = #expect(hit_at == 3 && hit_col == 4,
+                 "the click after the tab landed on byte ", hit_at, " column ", hit_col) && ok
+    (i64 h0, i32 c0h) = index_at_x(&fb, "abcd", 0.0 - 5.0, t4)
+    ok = #expect(h0 == 0 && c0h == 0, "a click left of the run is not byte 0") && ok
+    (i64 hn, i32 cn) = index_at_x(&fb, "abcd", 999.0, t4)
+    ok = #expect(hn == 4 && cn == 4, "a click past the run is not the end") && ok
+    // With no tab stops a tab is an ordinary unknown character and gets a box,
+    // which is the behaviour a client that has not asked for tabs must get.
+    ok = #expect(near(measure(&fb, "\t"), out.advance, 0.001),
+                 "a tab with no stops is not one .notdef wide") && ok
+
+    // ── UTF-8: a sequence measures as one character, not as its bytes ────
+    //
+    // This is why a text view could not use `measure`. Two bytes of a
+    // three-byte sequence are not two characters, and a byte walk says they
+    // are — visibly, three boxes wide where one belongs.
+    ok = #expect(near(measure(&fb, "é"), out.advance, 0.001),
+                 "a two-byte sequence measured ", measure(&fb, "é"),
+                 ", wanted one .notdef advance ", out.advance) && ok
+    ok = #expect(near(measure(&fb, "日本"), 2.0 * out.advance, 0.001),
+                 "two three-byte characters measured ", measure(&fb, "日本")) && ok
+    ok = #expect(column_to(&fb, "日本", 6, t4) == 2,
+                 "two characters counted as ", column_to(&fb, "日本", 6, t4), " columns") && ok
+    (i64 mb_at, i32 _) = index_at_x(&fb, "日本", 1.2 * out.advance, t4)
+    ok = #expect(mb_at == 3, "a hit test inside a sequence answered byte ", mb_at) && ok
+
+    // The atlas as a borrow, and the size that describes it.
+    []u8 px = atlas_pixels(&fb)
+    (i32 aw, i32 ah) = atlas_size(&fb)
+    i64 px_n = #len(px)
+    ok = #expect(px_n == i64(aw) * i64(ah) * i64(BPP),
+                 "atlas_pixels is ", px_n, " bytes for a ", aw, "x", ah,
+                 " RGBA8 atlas, which is ", i64(aw) * i64(ah) * i64(BPP)) && ok
+
+    // The packer cursor survives the pack, which is what lets a later
+    // codepoint be added without redesigning the type.
+    ok = #expect(fb.shelf_y > 0, "the shelf cursor was not retained: shelf_y = ", fb.shelf_y) && ok
+    ok = #expect(fb.extra_used == 0, "the sparse table is not empty at load") && ok
+    ok = #expect(atlas_generation(&fb) == 1,
+                 "a packed atlas is at generation ", atlas_generation(&fb)) && ok
+
+    // A bitmap face has 95 glyphs compiled into it and no outlines, so it
+    // cannot learn one — and it says so rather than half-succeeding.
+    ok = #expect(!add_codepoint(&fb, char32(0x00E9)),
+                 "the fallback claimed to rasterise U+00E9") && ok
+    ok = #expect(atlas_generation(&fb) == 1,
+                 "a refused add moved the generation counter") && ok
+    ok = #expect(added(&fb) == 0, "a refused add grew the sparse table") && ok
+    // Asking for something it already has is true and costs nothing.
+    ok = #expect(add_codepoint(&fb, 'A'), "add_codepoint('A') on a face that has it") && ok
+    ok = #expect(atlas_generation(&fb) == 1, "a no-op add moved the generation counter") && ok
+
+    destroy(&fb)
+    ok = #expect(fb.pixels == nil, "destroy left the atlas behind") && ok
+    ok = #expect(fb.atlas_w == 0, "destroy left the atlas size behind") && ok
+    destroy(&fb)   // twice is safe: every field destroy frees, it also nils
+
+    // ── nothing that is not a font ever produces an unusable Font ────────
+
+    []u8 nothing
+    Font empty = load(nothing, 16.0) using alloc
+    ok = #expect(empty.source == Source.Fallback, "load(empty) did not fall back") && ok
+    ok = #expect(measure(&empty, "abc") > 0.0, "load(empty) cannot measure") && ok
+    destroy(&empty)
+
+    ref []u8 junk = #make([]u8, 64, alloc)
+    for i in 0..<64:
+        junk[i] = u8(i)
+    Font bad = load(junk[..<64], 16.0) using alloc
+    ok = #expect(bad.source == Source.Fallback, "load(junk) did not fall back") && ok
+    ok = #expect(bad.pixels != nil, "load(junk) produced no atlas") && ok
+    destroy(&bad)
+    #delete(junk)
+
+    (Font gone, bool gone_ok) = load_file("/no/such/directory/no-such-font.ttf", 16.0) using alloc
+    ok = #expect(!gone_ok, "load_file on a missing path reported success") && ok
+    ok = #expect(gone.source == Source.Fallback, "load_file on a missing path did not fall back") && ok
+    ok = #expect(measure(&gone, "hello") > 0.0, "the fallback from load_file cannot measure") && ok
+    destroy(&gone)
+
+    (Font blank, bool blank_ok) = load_file("", 16.0) using alloc
+    ok = #expect(!blank_ok, "load_file(\"\") reported success") && ok
+    ok = #expect(blank.source == Source.Fallback, "load_file(\"\") did not fall back") && ok
+    destroy(&blank)
+
+    // ── a real face, when this machine has one ───────────────────────────
+
+    string8 path = default_path()
+    ref []char8 cpath = strings.clone_to_cstring(path, alloc)
+    bool have_font = path != "" && fs.exists(cstring(cpath))
+    #delete(cpath)
+
+    if !have_font:
+        fmt.println("app:font: no font at ", path, " — the TrueType claims are skipped, not faked")
+    else:
+        (Font tt, bool tt_ok) = load_file(path, 32.0) using alloc
+        ok = #expect(tt_ok, "load_file could not read ", path) && ok
+        ok = #expect(tt.source == Source.TrueType, "a real font loaded as the fallback") && ok
+        ok = #expect(tt.info != nil, "a TrueType font kept no stbtt_fontinfo") && ok
+        ok = #expect(tt.ttf != nil, "a TrueType font kept no copy of its bytes") && ok
+
+        ok = #expect(ascent(&tt) > 0.0, "TrueType ascent is ", ascent(&tt)) && ok
+        ok = #expect(descent(&tt) < 0.0, "TrueType descent is ", descent(&tt)) && ok
+        ok = #expect(line_height(&tt) > 0.0, "TrueType line_height is ", line_height(&tt)) && ok
+        // `stbtt_ScaleForPixelHeight` scales so ascent - descent is the size
+        // asked for. That is the one arithmetic identity in this package that
+        // comes from stb rather than from here, so it is worth pinning: if it
+        // ever stops holding, the metrics are being scaled twice or not at all.
+        ok = #expect(near(ascent(&tt) - descent(&tt), 32.0, 0.01),
+                     "ascent - descent = ", ascent(&tt) - descent(&tt), ", wanted 32") && ok
+
+        Glyph ta = glyph(&tt, 'A')
+        ok = #expect(ta.present, "'A' is missing from a real face") && ok
+        ok = #expect(ta.pw > 0 && ta.ph > 0, "'A' has no box in a real face") && ok
+        ok = #expect(ink_in(&tt, ta) > 0, "'A' box has no ink in a real face") && ok
+        ok = #expect(ta.bearing_y < 0.0, "'A' does not rise above the baseline") && ok
+        ok = #expect(ta.advance > 0.0, "'A' does not advance") && ok
+
+        Glyph tsp = glyph(&tt, ' ')
+        ok = #expect(tsp.pw == 0 && tsp.ph == 0, "space has a box in a real face") && ok
+        ok = #expect(tsp.advance > 0.0, "space does not advance in a real face") && ok
+
+        ok = #expect(boxes_inside(&tt), "a glyph box is outside a real atlas") && ok
+        ok = #expect(boxes_disjoint(&tt), "two glyph boxes overlap in a real atlas") && ok
+
+        // A rasteriser that wrote past a box would be invisible to every
+        // claim above, so count the ink that is not inside any box.
+        // `covered` is one byte per **texel**; the atlas is four. So the walk
+        // counts texels and reaches the image through `texel`, which is the one
+        // place the two strides are reconciled.
+        i64 tt_n = i64(tt.atlas_w) * i64(tt.atlas_h)
+        ref []u8 covered = #make([]u8, tt_n, alloc)
+        for i in zero..<tt_n:
+            covered[i] = 0
+        for i in 0..<SLOTS:
+            Glyph g = tt.dense[i64(i)]
+            if g.pw <= 0 || g.ph <= 0:
+                continue
+            for y in 0..<g.ph:
+                i64 row = i64(g.py + y) * i64(tt.atlas_w)
+                for x in 0..<g.pw:
+                    covered[row + i64(g.px + x)] = 1
+        (i32 bx, i32 by, i32 bw, i32 bh) = solid_box(&tt)
+        for y in 0..<bh:
+            i64 row = i64(by + y) * i64(tt.atlas_w)
+            for x in 0..<bw:
+                covered[row + i64(bx + x)] = 1
+        i32 stray = 0
+        for i in zero..<tt_n:
+            if tt.pixels[i * i64(BPP) + 3] != 0 && covered[i] == 0:
+                stray = stray + 1
+        ok = #expect(stray == 0, stray, " inked pixels lie outside every glyph box") && ok
+        #delete(covered)
+
+        // **The scratch, asserted at the place it could go wrong.** A glyph is
+        // rasterised into a buffer of its own and expanded from there, so a
+        // stride confused between the scratch's `pw` and the atlas's `atlas_w`
+        // writes a sheared glyph, and one that forgot to clear the scratch
+        // carries the previous glyph's ink. Both put coverage where `covered`
+        // says no box is, and `stray` above is what catches them.
+
+        // The reserved block survives a real pack, at the same edges.
+        (i32 tlit, i32 tdk, i32 tfr) = solid_state(&tt)
+        ok = #expect(tdk == 0 && tlit > 0 && tfr == 0,
+                     "the reserved block on a real face: ", tlit, " opaque, ", tdk,
+                     " not, ", tfr, " ringing it") && ok
+        ok = #expect(solid_texel_value(&tt) == 255,
+                     "solid_src on a real face names ", solid_texel_value(&tt)) && ok
+
+        // The alpha lane and the white rgb, on ink stb wrote rather than ink
+        // this file's blitter wrote. A real face antialiases, so the peak is
+        // asked as "reaches the top" rather than "is 0 or 255".
+        (i32 ta_white, i32 ta_inked, u8 ta_peak) = ink_state(&tt, ta)
+        ok = #expect(ta_white == ta.pw * ta.ph,
+                     ta.pw * ta.ph - ta_white, " texels of a real 'A' are not white") && ok
+        ok = #expect(ta_inked > 0, "a real 'A' put no coverage in the alpha byte") && ok
+        ok = #expect(ta_peak > 128,
+                     "a real 'A' peaks at coverage ", ta_peak,
+                     ", which is not the ink of a rasterised glyph") && ok
+
+        // ── a codepoint added at run time ────────────────────────────────
+        //
+        // The measurement E2 exists for, at both ends: before, the codepoint is
+        // `.notdef` and a run of it measures boxes; after, it is the face's own
+        // glyph with the face's own advance, the atlas has ink where it did
+        // not, and the generation counter has moved so a drawing surface can
+        // find out.
+        char32 eacute = char32(0x00E9)
+        ok = #expect(!has(&tt, eacute), "U+00E9 is already packed") && ok
+        f32 before = measure(&tt, "é")
+        ok = #expect(near(before, notdef(&tt).advance, 0.01),
+                     "an unpacked é measured ", before) && ok
+        i32 gen0 = atlas_generation(&tt)
+
+        bool grew = add_codepoint(&tt, eacute)
+        ok = #expect(grew, "add_codepoint(U+00E9) on a face that has it") && ok
+        if grew:
+            ok = #expect(has(&tt, eacute), "U+00E9 is still not present after adding it") && ok
+            ok = #expect(added(&tt) == 1, "the sparse table holds ", added(&tt)) && ok
+            ok = #expect(atlas_generation(&tt) == gen0 + 1,
+                         "the generation went ", gen0, " -> ", atlas_generation(&tt)) && ok
+            Glyph ea = glyph(&tt, eacute)
+            ok = #expect(ea.present, "the added glyph is not present") && ok
+            ok = #expect(ea.pw > 0 && ea.ph > 0, "the added glyph has no box") && ok
+            ok = #expect(ink_in(&tt, ea) > 0, "the added glyph's box has no ink") && ok
+            ok = #expect(boxes_inside(&tt), "the added box left the atlas") && ok
+            ok = #expect(ea.advance > 0.0, "the added glyph does not advance") && ok
+            // A composed é rises above the cap height; that is what makes it a
+            // different box from the `e` beside it rather than the same one.
+            ok = #expect(0.0 - ea.bearing_y > 0.0 - glyph(&tt, 'e').bearing_y,
+                         "é does not rise above e: ", ea.bearing_y, " vs ",
+                         glyph(&tt, 'e').bearing_y) && ok
+            // And it does not sit on top of anything already packed.
+            bool clear = true
+            for i in 0..<SLOTS:
+                Glyph g = tt.dense[i64(i)]
+                if g.pw <= 0 || g.ph <= 0:
+                    continue
+                bool ox = ea.px < g.px + g.pw && g.px < ea.px + ea.pw
+                bool oy = ea.py < g.py + g.ph && g.py < ea.py + ea.ph
+                if ox && oy:
+                    clear = false
+            ok = #expect(clear, "the added box overlaps a packed glyph") && ok
+            ok = #expect(near(measure(&tt, "é"), ea.advance, 0.01),
+                         "measure of the added character is ", measure(&tt, "é")) && ok
+            // Adding twice is a no-op, not a second box.
+            ok = #expect(add_codepoint(&tt, eacute), "adding twice is refused") && ok
+            ok = #expect(added(&tt) == 1, "adding twice grew the table to ", added(&tt)) && ok
+            ok = #expect(atlas_generation(&tt) == gen0 + 1,
+                         "adding twice moved the generation again") && ok
+
+        // A codepoint the face genuinely does not have is refused rather than
+        // packed as the face's own `.notdef` under a second name.
+        ok = #expect(!add_codepoint(&tt, char32(0x10FFFD)),
+                     "a codepoint outside the face was packed anyway") && ok
+
+        // The metrics off a real face.
+        ok = #expect(cell_width(&tt) > 0.0, "cell_width is ", cell_width(&tt)) && ok
+        ok = #expect(cap_height(&tt) > x_height(&tt),
+                     "cap ", cap_height(&tt), " is not above x-height ", x_height(&tt)) && ok
+        ok = #expect(cap_height(&tt) <= ascent(&tt) + 0.01,
+                     "cap height ", cap_height(&tt), " exceeds the ascent ", ascent(&tt)) && ok
+        (f32 tup, f32 tut, bool tur) = underline(&tt)
+        ok = #expect(tur, "no post table in ", path, " — underline was derived") && ok
+        ok = #expect(tut > 0.0, "underline thickness is ", tut) && ok
+        ok = #expect(tup > 0.0, "underline sits at ", tup, ", not below the baseline") && ok
+        ok = #expect(tup < 0.0 - descent(&tt) + 1.0,
+                     "underline at ", tup, " is below the descender ", 0.0 - descent(&tt)) && ok
+
+        // `.notdef` on a real face is the face's own glyph 0, and it advances.
+        Glyph tnd = notdef(&tt)
+        ok = #expect(!tnd.present, "the face's .notdef claims to be present") && ok
+        ok = #expect(tnd.advance > 0.0, ".notdef does not advance on a real face") && ok
+        ok = #expect(tnd.pw > 0 && tnd.ph > 0, ".notdef has no box on a real face") && ok
+        ok = #expect(ink_in(&tt, tnd) > 0, ".notdef has no ink on a real face") && ok
+
+        // The source rectangle: inside the image it is a rectangle of.
+        //
+        // This was two claims about uv — inside the unit square, and `u0 *
+        // atlas_w == px` — and the second has nothing left to say, because `px`
+        // *is* what a consumer hands over. What survives is the first, restated
+        // in the units the rectangle is now in: a source rect that named a texel
+        // past the right or bottom edge is the same defect that leaving the unit
+        // square was.
+        ok = #expect(ta.px >= 0 && ta.py >= 0 &&
+                     ta.px + ta.pw <= tt.atlas_w && ta.py + ta.ph <= tt.atlas_h,
+                     "'A' source rect ", ta.px, ",", ta.py, " ", ta.pw, "x", ta.ph,
+                     " leaves a ", tt.atlas_w, "x", tt.atlas_h, " atlas") && ok
+        ok = #expect(rects_inside(&tt),
+                     "a source rect leaves the atlas on a real face") && ok
+
+        // Kerning is asked of the face, not invented — and this claim is
+        // written the hard way for a measured reason. Written as
+        // `measure("AV") == advance(A) + advance(V) + kern(A, V)` it passes
+        // even when `measure` ignores kerning entirely, **because the face
+        // this runs against does not kern**: `default_path()` names a
+        // monospace face, monospace faces carry no `kern` table, and
+        // `stbtt_GetKerningTableLength` on DejaVu Sans Mono is 0, so every
+        // term of the correction is zero and the equation holds either way.
+        // Deleting the kerning term from `measure` was tried and the test
+        // stayed green.
+        //
+        // So the pair is **found**, not named: the first ASCII pair this face
+        // actually kerns, whatever it is. On a face with no kerning at all
+        // there is nothing to claim and the claim says so rather than passing
+        // vacuously.
+        char32 ka = char32(0)
+        char32 kb = char32(0)
+        bool kerns = false
+        for i in 0..<DENSE:
+            if kerns:
+                break
+            for j in 0..<DENSE:
+                char32 ca = char32(i32(FIRST) + i)
+                char32 cb = char32(i32(FIRST) + j)
+                if !near(kern(&tt, ca, cb), 0.0, 0.0001):
+                    ka = ca
+                    kb = cb
+                    kerns = true
+                    break
+        if !kerns:
+            fmt.println("app:font: ", path, " has no kerning pair in ASCII — ",
+                    "the claim that `measure` applies kerning is skipped, not faked")
+        else:
+            f32 pair = glyph(&tt, ka).advance + glyph(&tt, kb).advance
+            f32 k = kern(&tt, ka, kb)
+            ref []char8 two = #make([]char8, 2, alloc)
+            two[0] = char8(ka)
+            two[1] = char8(kb)
+            f32 got = measure(&tt, string8(two[..<2]))
+            ok = #expect(near(got, pair + k, 0.01),
+                         "measure of the kerned pair = ", got,
+                         " but advances ", pair, " plus kern ", k,
+                         " = ", pair + k) && ok
+            ok = #expect(!near(got, pair, 0.0001),
+                         "measure ignored a kerning adjustment of ", k) && ok
+            #delete(two)
+
+        // Monospace is measured, not assumed from the file name.
+        if monospace(&tt):
+            ok = #expect(near(measure(&tt, "iiii"), measure(&tt, "MMMM"), 0.01),
+                         "a monospace face measured iiii != MMMM") && ok
+        else:
+            ok = #expect(measure(&tt, "iiii") < measure(&tt, "MMMM"),
+                         "a proportional face measured iiii >= MMMM") && ok
+
+        destroy(&tt)
+        ok = #expect(tt.info == nil, "destroy left the stbtt_fontinfo behind") && ok
+        ok = #expect(tt.ttf == nil, "destroy left the font bytes behind") && ok
+
+    // ── growth: what it moves, and the one thing it must not ─────────────
+    //
+    // On the fallback, so this whole section runs on a machine with no fonts.
+    // Its own `Font`, so nothing above it depends on an atlas that changed size
+    // underneath.
+
+    Font gf = fallback(16.0) using alloc
+    (i32 gw0, i32 gh0) = atlas_size(&gf)
+    i64 gn0 = i64(gw0) * i64(gh0) * i64(BPP)
+    u64 gsum0 = atlas_sum(&gf, gn0)
+    i32 ggen0 = atlas_generation(&gf)
+    Glyph a_before = glyph(&gf, 'A')
+    ref []Glyph rects_before = snap_rects(&gf) using alloc
+    ok = #expect(rects_before != nil, "could not snapshot the dense rectangles") && ok
+    ok = #expect(atlas_resizes(&gf) == 0,
+                 "a Font that never grew reports ", atlas_resizes(&gf), " resizes") && ok
+    ok = #expect(rects_inside(&gf), "a source rect is outside the atlas before any grow") && ok
+
+    bool grew1 = grow_atlas(&gf)
+    ok = #expect(grew1, "grow_atlas on a packed fallback was refused") && ok
+    (i32 gw1, i32 gh1) = atlas_size(&gf)
+    ok = #expect(gw1 == gw0, "grow_atlas moved the width ", gw0, " -> ", gw1) && ok
+    ok = #expect(gh1 == gh0 * 2, "grow_atlas made the height ", gh0, " -> ", gh1) && ok
+    i64 gn1 = i64(gw1) * i64(gh1) * i64(BPP)
+    []u8 gpix = atlas_pixels(&gf)
+    i64 gpix_n = #len(gpix)
+    ok = #expect(gpix_n == gn1,
+                 "atlas_pixels is ", gpix_n, " bytes for a ", gw1, "x", gh1,
+                 " RGBA8 atlas, which is ", gn1) && ok
+
+    // A grow is a copy, not a repack: the packed image is the same bytes, and
+    // the rows underneath it are the untouched texel — **white with no
+    // coverage, not four zeroes.** A transparent black there fringes dark at
+    // every box that sits against the boundary, and it is the one thing about
+    // this format that is invisible until it is on a screen.
+    ok = #expect(atlas_sum(&gf, gn0) == gsum0, "grow_atlas changed the packed image") && ok
+    ok = #expect(white_transparent_between(&gf, i64(gw0) * i64(gh0), i64(gw1) * i64(gh1)),
+                 "grow_atlas filled the new rows with something other than (255,255,255,0)") && ok
+
+    // **The assertion the two counters exist for.** A grow must not look like a
+    // pixel change: a pixel change means `texture_update`, and `texture_update`
+    // takes an over-long run, truncates it and answers `true`.
+    ok = #expect(atlas_generation(&gf) == ggen0,
+                 "grow_atlas moved atlas_generation ", ggen0, " -> ", atlas_generation(&gf),
+                 "; every consumer already written would now update in place with a run ",
+                 "twice the size of its texture, be truncated, and be told it worked") && ok
+    ok = #expect(atlas_resizes(&gf) == 1,
+                 "grow_atlas left atlas_resizes at ", atlas_resizes(&gf)) && ok
+
+    // **No box moved, and now that is the whole claim.** While a `Glyph`
+    // carried uv, the most that could be asserted across a grow was that `u`
+    // survived and `v` *halved* — a rescaling, and one glyph's worth of it. A
+    // pixel rectangle is invariant, so the claim is identity, and it is asked of
+    // every dense slot at once: a grow that moved one box by one pixel fails
+    // here where the old rescaling claim could not have noticed.
+    ok = #expect(boxes_inside(&gf), "a box left the grown atlas") && ok
+    ok = #expect(boxes_disjoint(&gf), "the grown atlas has overlapping boxes") && ok
+    ok = #expect(rects_inside(&gf), "a source rect leaves the grown atlas") && ok
+    ok = #expect(rects_unmoved(&gf, rects_before),
+                 "grow_atlas moved a dense source rectangle; pixel rects are invariant ",
+                 "under a grow and that is the whole reason the uv fields went") && ok
+    Glyph a_after = glyph(&gf, 'A')
+    ok = #expect(a_after.px == a_before.px && a_after.py == a_before.py &&
+                 a_after.pw == a_before.pw && a_after.ph == a_before.ph,
+                 "grow_atlas moved 'A': (", a_before.px, ",", a_before.py, " ",
+                 a_before.pw, "x", a_before.ph, ") -> (", a_after.px, ",", a_after.py,
+                 " ", a_after.pw, "x", a_after.ph, ")") && ok
+    #delete(rects_before)
+
+    // `solid_src` is a pixel position and divides by nothing, so a grow cannot
+    // move it — but the block it names is still ink in an image that was just
+    // `#resize`d, and an opaque texel is what every rule and caret samples.
+    (f32 gsx, f32 gsy, f32 gsw, f32 gsh) = solid_src(&gf)
+    _ = gsw
+    _ = gsh
+    ok = #expect(near(gsx, sx, 0.000001) && near(gsy, sy, 0.000001),
+                 "grow_atlas moved solid_src ", sx, ",", sy, " -> ", gsx, ",", gsy) && ok
+    ok = #expect(solid_texel_value(&gf) == 255,
+                 "solid_src after a grow names ", solid_texel_value(&gf)) && ok
+    (i32 slit, i32 sdark, i32 sfringe) = solid_state(&gf)
+    ok = #expect(sdark == 0 && slit > 0 && sfringe == 0,
+                 "the reserved block after a grow: ", slit, " opaque, ", sdark,
+                 " not, ", sfringe, " ringing it") && ok
+    destroy(&gf)
+
+    // ── the truncating `texture_update`, made unreachable ────────────────
+    //
+    // Two consumers, one atlas, one grow. See the model above the test.
+
+    Font tfx = fallback(16.0) using alloc
+    (i32 tw0, i32 th0) = atlas_size(&tfx)
+    i64 tn0 = i64(tw0) * i64(th0) * i64(BPP)
+
+    FakeTex legacy_tex
+    legacy_tex.w = tw0
+    legacy_tex.h = th0
+    Watcher legacy
+    FakeTex aware_tex
+    aware_tex.w = tw0
+    aware_tex.h = th0
+    Watcher aware
+
+    // Both are up to date before the grow, by the same route a program is.
+    legacy_pass(&tfx, &legacy_tex, &legacy)
+    growing_pass(&tfx, &aware_tex, &aware)
+    ok = #expect(!legacy_tex.truncated && !aware_tex.truncated,
+                 "the first upload already truncated") && ok
+    ok = #expect(legacy_tex.held == tn0 && aware_tex.held == tn0,
+                 "the first upload holds ", legacy_tex.held, "/", aware_tex.held,
+                 " of ", tn0, " bytes") && ok
+
+    bool grew2 = grow_atlas(&tfx)
+    ok = #expect(grew2, "grow_atlas refused a first grow") && ok
+    []u8 tpix = atlas_pixels(&tfx)
+    i64 tn1 = #len(tpix)
+
+    // (a) the consumer that does not know growth exists must not wake up. If it
+    //     does, it calls `texture_update` with `tn1` bytes into a `tn0`-byte
+    //     texture, `app:draw` answers `true`, and half the atlas is garbage.
+    legacy_pass(&tfx, &legacy_tex, &legacy)
+    ok = #expect(!legacy_tex.truncated,
+                 "a grow woke a consumer that watches only atlas_generation: it updated ",
+                 tn1, " bytes in place into a ", legacy_tex.w, "x", legacy_tex.h,
+                 " texture, which app:draw accepts, truncates, and answers true to") && ok
+    ok = #expect(legacy_tex.held == tn0,
+                 "the legacy texture changed size behind its owner: ", legacy_tex.held) && ok
+
+    // (b) the consumer that does know must remake, and hold the whole atlas.
+    growing_pass(&tfx, &aware_tex, &aware)
+    ok = #expect(!aware_tex.truncated, "the grow-aware consumer truncated an upload") && ok
+    ok = #expect(aware_tex.held == tn1,
+                 "the grow-aware consumer holds ", aware_tex.held, " of ", tn1,
+                 " bytes after a grow") && ok
+    ok = #expect(aware_tex.w == tw0 && aware_tex.h == th0 * 2,
+                 "the grow-aware consumer's texture is ", aware_tex.w, "x", aware_tex.h) && ok
+
+    // A second pass with nothing changed uploads nothing at all — the counters
+    // are watermarks, not events.
+    i64 held_before = aware_tex.held
+    growing_pass(&tfx, &aware_tex, &aware)
+    legacy_pass(&tfx, &legacy_tex, &legacy)
+    ok = #expect(aware_tex.held == held_before && !aware_tex.truncated && !legacy_tex.truncated,
+                 "an idle frame uploaded something") && ok
+    destroy(&tfx)
+
+    // ── the ceiling, and what happens at it ──────────────────────────────
+
+    Font cf = fallback(16.0) using alloc
+    (i32 ceil_w0, i32 ceil_h0) = atlas_size(&cf)
+    i32 doublings = 0
+    for doublings < 64:
+        if !grow_atlas(&cf):
+            break
+        doublings = doublings + 1
+    (i32 ceil_w, i32 ceil_h) = atlas_size(&cf)
+    // **The number, written out, not `MAX_ATLAS_H`.** A check that compares the
+    // constant against itself passes whatever the constant becomes — which is
+    // this tree's characteristic defect and was this line, until moving
+    // `MAX_ATLAS_H` to 8192 left the suite green. Moving the ceiling now has to
+    // move this test too, which is the point of having one.
+    ok = #expect(ceil_h == 4096, "growth stopped at height ", ceil_h, ", not 4096") && ok
+    ok = #expect(MAX_ATLAS_H == 4096,
+                 "MAX_ATLAS_H is ", MAX_ATLAS_H, " and the ceiling this test pins is 4096") && ok
+    ok = #expect(ceil_w == ceil_w0, "growth moved the width ", ceil_w0, " -> ", ceil_w) && ok
+    ok = #expect(doublings > 0 && ceil_h == ceil_h0 * (1 << doublings),
+                 doublings, " doublings took ", ceil_h0, " to ", ceil_h) && ok
+    ok = #expect(atlas_resizes(&cf) == doublings,
+                 "atlas_resizes is ", atlas_resizes(&cf), " after ", doublings, " grows") && ok
+
+    // At the ceiling a refused grow changes nothing — not the size, not the
+    // image, not the counters — and the atlas still answers every glyph.
+    i64 ceil_n = i64(ceil_w) * i64(ceil_h) * i64(BPP)
+    u64 csum = atlas_sum(&cf, ceil_n)
+    ok = #expect(!grow_atlas(&cf), "grow_atlas past the ceiling answered true") && ok
+    (i32 ceil_w2, i32 ceil_h2) = atlas_size(&cf)
+    ok = #expect(ceil_w2 == ceil_w && ceil_h2 == ceil_h,
+                 "a refused grow made the atlas ", ceil_w2, "x", ceil_h2) && ok
+    ok = #expect(atlas_resizes(&cf) == doublings, "a refused grow bumped atlas_resizes") && ok
+    ok = #expect(atlas_generation(&cf) == 1, "a refused grow bumped atlas_generation") && ok
+    ok = #expect(atlas_sum(&cf, ceil_n) == csum, "a refused grow changed the image") && ok
+    ok = #expect(glyph(&cf, 'A').present && ink_in(&cf, glyph(&cf, 'A')) > 0,
+                 "the ceiling atlas lost 'A'") && ok
+    ok = #expect(rects_inside(&cf), "a source rect leaves the ceiling atlas") && ok
+    ok = #expect(!has(&cf, char32(0x00E9)),
+                 "a fallback face packed a codepoint it has no outline for") && ok
+    ok = #expect(!glyph(&cf, char32(0x00E9)).present &&
+                 glyph(&cf, char32(0x00E9)).pw == notdef(&cf).pw,
+                 "a codepoint past the ceiling stopped answering .notdef") && ok
+    destroy(&cf)
+
+    // ── growth on a real face: the codepoint the growth bought ───────────
+    //
+    // Its own face, so nothing above depends on an atlas that filled up. Walk
+    // upward until `add_codepoint` refuses for want of room, grow once, and ask
+    // again. The claim is not that the second ask was accepted — it is that the
+    // box it landed in holds the face's own ink, that it is not `.notdef`'s box,
+    // and that the grow itself moved nothing but the shape.
+
+    if have_font:
+        (Font gt, bool gt_ok) = load_file(path, 15.0) using alloc
+        ok = #expect(gt_ok, "load_file could not read ", path, " a second time") && ok
+
+        char32 bought = char32(0)
+        bool grow_kept_image = true
+        bool grow_kept_gen = true
+        i32 gen_before_add = 0
+        for cp in 0xA1..<0x2E00:
+            if bought != char32(0):
+                break
+            if add_codepoint(&gt, char32(cp)):
+                continue
+            // Refused. Was it want of room? Grow once and ask again.
+            (i32 pw, i32 ph) = atlas_size(&gt)
+            i64 pn = i64(pw) * i64(ph)
+            u64 psum = atlas_sum(&gt, pn)
+            i32 pgen = atlas_generation(&gt)
+            Glyph was = glyph(&gt, char32(cp))
+            if !grow_atlas(&gt):
+                break
+            grow_kept_image = atlas_sum(&gt, pn) == psum && grow_kept_image
+            grow_kept_gen = atlas_generation(&gt) == pgen && grow_kept_gen
+            gen_before_add = atlas_generation(&gt)
+            if add_codepoint(&gt, char32(cp)):
+                bought = char32(cp)
+                ok = #expect(!was.present && was.pw == notdef(&gt).pw &&
+                             was.py == notdef(&gt).py,
+                             "the refused codepoint was not answering .notdef before the grow") && ok
+
+        ok = #expect(bought != char32(0),
+                     "no codepoint was ever packed after a grow — the walk never filled ",
+                     "the atlas, so this section proved nothing") && ok
+        ok = #expect(grow_kept_image, "a grow on a real face changed the packed image") && ok
+        ok = #expect(grow_kept_gen, "a grow on a real face moved atlas_generation") && ok
+        if bought != char32(0):
+            Glyph bg = glyph(&gt, bought)
+            ok = #expect(bg.present, "the codepoint bought by a grow is not present") && ok
+            ok = #expect(bg.pw > 0 && bg.ph > 0, "the codepoint bought by a grow has no box") && ok
+            ok = #expect(ink_in(&gt, bg) > 0,
+                         "the codepoint bought by a grow has no ink in its box") && ok
+            ok = #expect(bg.px != notdef(&gt).px || bg.py != notdef(&gt).py,
+                         "the codepoint bought by a grow is still .notdef's own box") && ok
+            ok = #expect(bg.advance > 0.0, "the codepoint bought by a grow does not advance") && ok
+            ok = #expect(atlas_generation(&gt) == gen_before_add + 1,
+                         "the add after a grow moved the generation ", gen_before_add,
+                         " -> ", atlas_generation(&gt)) && ok
+            ok = #expect(boxes_inside(&gt) && extras_inside(&gt),
+                         "a box left the grown atlas on a real face") && ok
+            ok = #expect(rects_inside(&gt),
+                         "a source rect leaves the atlas after a grow on a real face") && ok
+            ok = #expect(solid_texel_value(&gt) == 255,
+                         "solid_src after a grow on a real face names ",
+                         solid_texel_value(&gt)) && ok
+            ok = #expect(added(&gt) > 0, "the sparse table is empty after ", added(&gt)) && ok
+            // ASCII is still ASCII: a grow does not disturb the dense block.
+            ok = #expect(glyph(&gt, 'A').present && ink_in(&gt, glyph(&gt, 'A')) > 0,
+                         "'A' lost its ink across a grow") && ok
+        destroy(&gt)
+
+        // ── the home outlives the call that read it ──────────────────────
+        //
+        // This is the whole justification for `Font.alloc` still existing.
+        // `add_codepoint` mints the sparse `extra_cp`/`extra` pair the first
+        // time anybody asks for a codepoint outside ASCII, which happens at a
+        // draw and not at a load — below, deliberately, with **no `using`
+        // anywhere near it**. The pair has to come out of the arena the face
+        // was loaded in, not out of whatever the caller is standing in; a
+        // `Font.alloc` that were merely decorative would put it in the heap
+        // and this would say so.
+        //
+        // On the real face because `add_codepoint` refuses a fallback — it
+        // has no outlines to rasterise — so this claim is skipped on a machine
+        // with no fonts, exactly like everything else in this branch.
+        arena.Arena face_home = arena.over(alloc)
+        u64 face_empty = arena.used(face_home)
+        (Font hf, bool hf_ok) = load_file(path, 15.0) using arena.allocator(&face_home)
+        ok = #expect(hf_ok, "load_file could not read ", path, " into an arena") && ok
+        u64 face_loaded = arena.used(face_home)
+        ok = #expect(face_loaded > face_empty,
+                     "load_file under an arena put the face somewhere else") && ok
+
+        bool packed_extra = false
+        for cp in 0xA1..<0x180:
+            if add_codepoint(&hf, char32(cp)):
+                packed_extra = true
+                break
+        ok = #expect(packed_extra,
+                     "no codepoint outside ASCII could be packed, so the sparse table ",
+                     "was never minted and where it went proves nothing") && ok
+        ok = #expect(arena.used(face_home) > face_loaded,
+                     "the sparse table `add_codepoint` minted outside the `using` did not ",
+                     "go to the face's own arena — Font.alloc is not carrying the home ",
+                     "the face was loaded under") && ok
+        destroy(&hf)
+        arena.destroy(&face_home)
+
+    // ── `using` is what places a face ────────────────────────────────────
+    //
+    // `fallback` takes no allocator, and the package doc comment claims the
+    // caller still decides where the face lands. Nothing checked that, so this
+    // does — with its own control, because "the arena grew" says nothing
+    // unless a face built *outside* the `using` leaves it exactly where it was.
+
+    arena.Arena home = arena.over(alloc)
+    u64 arena_empty = arena.used(home)
+
+    Font nf = fallback(16.0)
+    ok = #expect(nf.pixels != nil,
+                 "the control face has no atlas, so it allocated nothing and controls nothing") && ok
+    ok = #expect(arena.used(home) == arena_empty,
+                 "a face built with no `using` still spent the arena: ", arena.used(home)) && ok
+    destroy(&nf)
+
+    Font af = fallback(16.0) using arena.allocator(&home)
+    u64 arena_loaded = arena.used(home)
+    ok = #expect(af.pixels != nil,
+                 "the face under the arena has no atlas, so where it went proves nothing") && ok
+    ok = #expect(arena_loaded > arena_empty,
+                 "fallback() under an arena put the face somewhere else — the arena holds ",
+                 arena_loaded) && ok
+    destroy(&af)
+    arena.destroy(&home)
+
+    // ── the nil guards, which every accessor promises ────────────────────
+
+    ^Font none
+    ok = #expect(near(measure(none, "abc"), 0.0, 0.001), "measure(nil) is nonzero") && ok
+    ok = #expect(near(line_height(none), 0.0, 0.001), "line_height(nil) is nonzero") && ok
+    ok = #expect(near(ascent(none), 0.0, 0.001), "ascent(nil) is nonzero") && ok
+    ok = #expect(near(descent(none), 0.0, 0.001), "descent(nil) is nonzero") && ok
+    ok = #expect(near(pixel_height(none), 0.0, 0.001), "pixel_height(nil) is nonzero") && ok
+    ok = #expect(!monospace(none), "monospace(nil) is true") && ok
+    ok = #expect(!glyph(none, 'A').present, "glyph(nil) claims a glyph") && ok
+    ok = #expect(near(kern(none, 'A', 'V'), 0.0, 0.001), "kern(nil) is nonzero") && ok
+    []u8 nil_atlas = atlas_pixels(none)
+    i64 nil_n = #len(nil_atlas)
+    ok = #expect(nil_n == 0, "atlas_pixels(nil) is ", nil_n, " bytes") && ok
+    (i32 nw, i32 nh) = atlas_size(none)
+    ok = #expect(nw == 0 && nh == 0, "atlas_size(nil) is ", nw, "x", nh) && ok
+    ok = #expect(atlas_resizes(none) == 0, "atlas_resizes(nil) is ", atlas_resizes(none)) && ok
+    ok = #expect(!grow_atlas(none), "grow_atlas(nil) answered true") && ok
+    destroy(none)
+
+    // ── a pixel height no integer can hold ─────────────────────────────────
+    //
+    // Every entry point holds the height to `1 ..= 16384` before anything
+    // converts it, NaN reading as 1. `fallback(1e30)` used to reach
+    // `8 * i32(2^31 - 1)`, an overflow and a trap; a NaN passed `< 1.0`.
+    f32 fzero = 0.0
+    f32 nan = fzero / fzero
+    ok = #expect(held_pixel_height(nan) == 1.0, "a NaN height is held to ", held_pixel_height(nan)) && ok
+    ok = #expect(held_pixel_height(1.0e30) == 16384.0,
+                 "a 1e30 height is held to ", held_pixel_height(1.0e30)) && ok
+    ok = #expect(held_pixel_height(0.0 - 3.0) == 1.0, "a negative height is not held to 1") && ok
+    ok = #expect(held_pixel_height(24.5) == 24.5, "an ordinary height moved") && ok
+    Font nan_fb = fallback(nan) using alloc
+    ok = #expect(pixel_height(&nan_fb) == 8.0, "fallback(NaN) is ", pixel_height(&nan_fb), " px") && ok
+    Font huge_fb = fallback(1.0e30) using alloc
+    ok = #expect(pixel_height(&huge_fb) == 16384.0,
+                 "fallback(1e30) is ", pixel_height(&huge_fb), " px") && ok
+    destroy(&huge_fb)
+
+    // The tab stop is a floor, converted only where an `i32` holds it: a pen
+    // left of the origin stops at the origin (a truncation stopped a whole
+    // stop further right), and a pen more than 2^31 stops out gets a stop no
+    // further left than itself — saturating, it answered one 1.3e10 behind it.
+    ok = #expect(floor_f(0.0 - 0.5) == 0.0 - 1.0 && floor_f(2.5) == 2.0 && floor_f(3.0e9) == 3.0e9,
+                 "floor_f is not a floor") && ok
+    Tabs eight = tabs(8.0, 0)
+    Cell left_tab = cell_at(&nan_fb, "\t", 0, 0.0 - 4.0, 0, eight)
+    ok = #expect(left_tab.advance == 4.0, "a tab at pen -4 advanced ", left_tab.advance) && ok
+    Cell far_tab = cell_at(&nan_fb, "\t", 0, 3.0e10, 0, eight)
+    ok = #expect(far_tab.advance >= 0.0, "a tab at pen 3e10 advanced ", far_tab.advance) && ok
+    destroy(&nan_fb)
+
+    if ok:
+        return 0
+    return 1

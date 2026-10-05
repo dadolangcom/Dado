@@ -1,0 +1,475 @@
+// app:ui — the mouse: which node owns a screen cell, and where a mouse event
+// goes.
+//
+// ── Coordinates ────────────────────────────────────────────────────────────
+//
+// **A mouse event's `x`/`y` are framebuffer pixels on every platform, the
+// same unit the grid's cell size is measured in, so a cell is `x / cell_w`
+// with no DPI factor.** Established from sokol_app.h itself, not assumed:
+//
+//   - the `sapp_event` field comment and the "MOUSE LOCK" section of its
+//     header documentation say `mouse_x`/`mouse_y` are "absolute mouse
+//     positions in framebuffer pixels";
+//   - each backend scales the platform's logical position up before storing
+//     it: macOS `_sapp_macos_mouse_update_from_nspoint` multiplies by
+//     `dpi_scale` (and flips y to top-down), Emscripten multiplies `targetX`
+//     by `dpi_scale`, Win32 `_sapp_win32_mouse_update` multiplies by
+//     `dpi.mouse_scale` (1 when the framebuffer is full resolution,
+//     `1 / window_scale` when `high_dpi` is off and the framebuffer is
+//     logical), and X11 `_sapp_x11_mouse_update` passes the window pixel
+//     through, the X11 window being sized in device pixels already;
+//   - `app:input/sokol`'s decode hands `e.mouse_x`/`e.mouse_y` to
+//     `input.push_mouse` unchanged, so `Event.x`/`Event.y` are those numbers;
+//   - `grid.cell_w`/`cell_h` are in framebuffer pixels (the grid comes up at
+//     the display's DPI scale), and `frame.dado` sizes the screen from
+//     `display.window_get_size`, which is `sapp_width`/`sapp_height` — the
+//     framebuffer size, not the logical window size.
+//
+// Before the grid is up the cell size reads 0, and a cell is then taken as one
+// pixel, so a test with no window places the pointer exactly by passing cell
+// coordinates as `x`/`y`.
+//
+// ── The hit map ────────────────────────────────────────────────────────────
+//
+// Which node owns a cell is an array read per layer, not a tree walk: one
+// owner handle per screen cell **per layer group**, written by the paint walk
+// into the map of the layer the node paints into (`set_layer`). `hit` reads
+// the maps from the topmost layer down and answers the first live owner that
+// is in view on its own layer, so a floating subtree owns the cells it covers
+// and, once hidden, removed or moved, the node under it answers again without
+// any repaint below. A map above the base is made at its layer's first claim.
+// The base map answers as it always has: a stale owner there is `NIL`.
+//
+// Within one layer the rule is the one there has always been. Every node the
+// walk repaints —
+// whether or not its kind has a paint hook, because a container's area is
+// where its gaps are — records itself as the owner of every cell of its
+// clipped rectangle, before its children do, so the deepest painter owns a
+// cell. The map is therefore exactly as current as the picture: whatever
+// rule makes a cell's pixels right after a partial repaint (a node repaints
+// its own cells; a parent repaints the cells a removed, hidden or shrunken
+// child left) makes its owner right too, and an idle frame, which paints
+// nothing, writes nothing.
+//
+// Owners are stored as full handles, so an owner removed since the last paint
+// fails the generation check and reads as `NIL` rather than as whatever node
+// has reused its slot.
+//
+// ── Routing ────────────────────────────────────────────────────────────────
+//
+// Keys and text go to the focused node; a mouse event goes to the node under
+// the pointer — or, while one holds it, to the node with the capture — and
+// bubbles to ancestors the same way. A press that some node handles captures
+// the mouse for that node until every button is up again, so a drag that
+// leaves the node's rectangle keeps reporting to it.
+//
+// ── The cursor ─────────────────────────────────────────────────────────────
+//
+// **The system cursor is set when the cursor the frame wants changes, and at
+// no other time** — not once per motion event, and not once per frame. What
+// the frame wants is the *effective* cursor at the pointer's cell: the node
+// holding the capture while one does, else the node under the pointer
+// (`hovered`), asks its kind's `cursor` hook, and each ancestor in turn is
+// asked while the answer is `CURSOR_INHERIT`; nobody answering is
+// `CURSOR_DEFAULT`. So a TextEdit's I-beam survives a drag that leaves it,
+// because the capture keeps asking the TextEdit, and a relayout that slides a
+// different node under a still pointer changes the cursor without a motion.
+// The frame asks (`sync_cursor`) after its layout and paint, on every frame —
+// the answer also moves with no event and no paint, as when a program's
+// `process` calls `capture` or `release` — and hands a changed answer to the
+// sink: `display.set_cursor`, or whatever `set_cursor_sink` installed. Asking
+// is cheap: a capture check or one hit-map read per layer, then a climb
+// through the target's ancestors calling their `cursor` hooks. Before the
+// first mouse event nothing is asked.
+package ui
+
+import "app:display"
+import "app:input"
+import "app:ui/cell"
+import "app:ui/grid"
+
+// One map per layer group, each one owner per cell of `g_screen`, row-major;
+// the base's is made by the first `update` that sees a screen with cells, the
+// others at their first claim. Every live map is `g_owner_n` long.
+private [grid.MAX_LAYERS]ref []Control g_owners
+private i32              g_owner_n
+// How many claims the paint walks have written, ever. Read by the tests to
+// see an unforced repaint skip its claim; nothing else reads it.
+private i32           g_owner_writes
+
+// The capturing node's slot, -1 for none. `g_capture_auto` is whether a press
+// took it (and a buttonless event ends it) rather than `capture`, which lasts
+// until `release`, the node's removal or hiding, or the window losing focus.
+// `g_capture_touched` counts every
+// `capture`/`release`, so a press handler that did either is not overruled by
+// the automatic capture after it returns.
+private i32  g_capture = -1
+private bool g_capture_auto
+private i32  g_capture_touched
+
+// The last cell a mouse event named; `hovered` reads the map there.
+private bool           g_have_pointer
+private cell.CellPoint g_pointer
+
+// ── Coordinates ────────────────────────────────────────────────────────────
+
+// `v / size` rounded toward negative infinity, in cells. A size below one is
+// taken as one. `v` is clamped first so that no float the platform could
+// report — an absurd one or a NaN, which lands on the negative bound —
+// reaches the integer conversion out of range.
+private i32 cell_of(f32 v, i32 size):
+    f64 s = 1.0
+    if size > 1:
+        s = f64(size)
+    f64 q = f64(v) / s
+    if !(q >= -1000000000.0):
+        q = -1000000000.0
+    if q > 1000000000.0:
+        q = 1000000000.0
+    i64 t = i64(q)
+    if f64(t) > q:
+        t = t - 1
+    return i32(t)
+
+// The screen cell under a mouse event's position. See the package comment
+// for the unit; negative positions give negative cells, which `hit` answers
+// `NIL` for. Any event is accepted — a non-mouse one names whatever its
+// `x`/`y` hold, which is `(0, 0)` for a key.
+cell.CellPoint event_cell(input.Event e):
+    cell.CellPoint p = (cell_of(e.x, grid.cell_w()), cell_of(e.y, grid.cell_h()))
+    return p
+
+// ── The hit map ────────────────────────────────────────────────────────────
+
+// Size the map to `screen` and forget every owner. Called by `update` when it
+// sees a new screen, which is also when it makes every node paint-dirty, so
+// the paint walk that follows refills every cell the root covers.
+private void size_owners(cell.CellRect screen):
+    i64 n = 0
+    if screen.cols > 0 && screen.rows > 0:
+        n = i64(screen.cols) * i64(screen.rows)
+    if n > 2147483647:
+        n = 0
+    // Every map above the base is given back; its layer's next claim remakes
+    // it at the new size.
+    for l in 1..<grid.MAX_LAYERS:
+        if g_owners[l] != nil:
+            #delete(g_owners[l])
+            g_owners[l] = nil
+    if n > 0 && (g_owners[0] == nil || #len(g_owners[0]) < n):
+        if g_owners[0] == nil:
+            g_owners[0] = #make([]Control, n, g_alloc)
+        else if !#resize(g_owners[0], n):
+            #delete(g_owners[0])
+            g_owners[0] = nil
+        if g_owners[0] == nil:
+            // No map: `hit` answers `NIL` everywhere rather than reading one
+            // that does not match the screen.
+            g_owner_n = 0
+            return
+    g_owner_n = i32(n)
+    for k in 0..<g_owner_n:
+        g_owners[0][k] = NIL
+
+// Layer `l`'s map, made (all `NIL`) at its first use; nil when it cannot be.
+private ref []Control owner_map(i32 l):
+    if l < 0 || l >= grid.MAX_LAYERS || g_owner_n <= 0:
+        return nil
+    if g_owners[l] == nil:
+        g_owners[l] = #make([]Control, i64(g_owner_n), g_alloc)
+        if g_owners[l] == nil:
+            return nil
+        for k in 0..<g_owner_n:
+            g_owners[l][k] = NIL
+    return g_owners[l]
+
+// Forget every owner of `r` in layer `l`'s map: the cells a floating subtree
+// left, so the layers under it answer there.
+private void disown(i32 l, cell.CellRect r):
+    if l < 0 || l >= grid.MAX_LAYERS || g_owners[l] == nil || g_owner_n <= 0:
+        return
+    cell.CellRect on = cell.intersect(r, g_screen)
+    if cell.is_empty(on):
+        return
+    for row in on.row..<on.row + on.rows:
+        i32 base = (i32(row) - g_screen.row) * g_screen.cols - g_screen.col
+        for col in on.col..<on.col + on.cols:
+            g_owners[l][base + i32(col)] = NIL
+
+// Give back every map; `reset` calls it.
+private void free_owners():
+    for l in 0..<grid.MAX_LAYERS:
+        if g_owners[l] != nil:
+            #delete(g_owners[l])
+            g_owners[l] = nil
+    g_owner_n = 0
+
+// Record slot `i` as the owner of every cell of `clip`. Called by the paint
+// walk for each node it repaints, before its children.
+//
+// Skipped when the paint was not forced, the node has no children and it
+// already claimed exactly this clip, because then nothing can have written
+// over its claim: an ancestor that repainted would have forced this paint, a
+// new screen clears every claim, and a hide or removal clears the claims of
+// the node and its parent. A widget that repaints one damaged line on each
+// keystroke therefore writes no ownership at all. A node with children always
+// writes, since a child that shrank or moved gives cells back to it with its
+// clip unchanged. What the skip gives up: where siblings overlap, a sibling
+// that repaints alone does not take cells from the later sibling that owns
+// them — the map keeps what a full repaint makes, the later sibling on top.
+private void own_cells(i32 i, cell.CellRect clip, bool forced):
+    if g_owner_n <= 0:
+        return
+    if !forced && g_nodes[i].first_child < 0 && g_nodes[i].claimed == clip:
+        return
+    g_nodes[i].claimed = clip
+    g_owner_writes = g_owner_writes + 1
+    ref []Control m = owner_map(g_nodes[i].layer)
+    cell.CellRect r = cell.intersect(clip, g_screen)
+    if m == nil || cell.is_empty(r):
+        return
+    Control c = handle(i)
+    for row in r.row..<r.row + r.rows:
+        i32 base = (i32(row) - g_screen.row) * g_screen.cols - g_screen.col
+        for col in r.col..<r.col + r.cols:
+            m[base + i32(col)] = c
+
+// The node that owns screen cell `(col, row)`: in the topmost layer that has
+// a live owner there, in view and still on that layer, the deepest node whose
+// last paint covered it. `NIL` off the screen, before the first `update`,
+// where nothing has painted, and where the base's owner has been removed or
+// hidden (or an ancestor of it hidden) since — until the repaint that gives
+// the cell to the parent. One array read and one flag per layer map made.
+Control hit(i32 col, i32 row):
+    if g_owner_n <= 0 || !g_have_screen:
+        return NIL
+    if !cell.contains(g_screen, col, row):
+        return NIL
+    i32 k = (row - g_screen.row) * g_screen.cols + (col - g_screen.col)
+    i32 l = grid.MAX_LAYERS - 1
+    for l > 0:
+        if g_owners[l] != nil:
+            Control u = g_owners[l][k]
+            i32 j = index(u)
+            if j >= 0 && g_nodes[j].in_view && g_nodes[j].layer == l:
+                return u
+        l = l - 1
+    if g_owners[0] == nil:
+        return NIL
+    Control c = g_owners[0][k]
+    i32 i = index(c)
+    if i < 0 || !g_nodes[i].in_view:
+        return NIL
+    return c
+
+
+// The node under the last mouse event's position, read from the map now, so
+// it follows a relayout without the pointer moving. `NIL` before any mouse
+// event. No enter/leave events are sent.
+Control hovered():
+    if !g_have_pointer:
+        return NIL
+    return hit(g_pointer.col, g_pointer.row)
+
+// ── Capture ────────────────────────────────────────────────────────────────
+
+// Send every mouse event to `c`, wherever the pointer is, until `release`,
+// until `c` is removed or hidden, or until the window loses focus; a press,
+// a release and a buttonless motion do not end it. The focus loss does,
+// because it is the one moment the program is told the pointer may have gone
+// somewhere it will not hear from — a popup holding the mouse closes then
+// anyway, and a capture that outlived it would take the first click after
+// the window came back. `NIL`, a dead handle and a node out of view release.
+// Replaces any capture held, automatic or not.
+void capture(Control c):
+    g_capture_touched = g_capture_touched + 1
+    g_capture = index(c)
+    if g_capture >= 0 && !g_nodes[g_capture].in_view:
+        g_capture = -1
+    g_capture_auto = false
+
+void release():
+    g_capture_touched = g_capture_touched + 1
+    g_capture = -1
+    g_capture_auto = false
+
+// `NIL` for a node that is not live or not in view; hiding one ends its
+// capture anyway (`set_visible`), so this is belt and braces.
+Control captured():
+    if g_capture < 0 || g_nodes == nil || !g_nodes[g_capture].live || !g_nodes[g_capture].in_view:
+        return NIL
+    return handle(g_capture)
+
+// ── Dispatch ───────────────────────────────────────────────────────────────
+
+private const u32 BUTTONS = 0x700
+
+// Offer `e` to `from`'s input hook and then each ancestor's until one answers
+// true; answers whether one did and which. A hook may remove nodes: the climb
+// goes on to the parent read before the call only while that parent is still
+// live, and a handler that removed itself still counts as handling the event
+// but is answered as `NIL`, so nothing is handed a dead node.
+// The climb ends after slot `stop` has been offered it, when `stop` is not -1.
+private (bool handled, Control by) bubble(Control from, input.Event e, i32 stop):
+    Control at = from
+    for valid(at):
+        i32 i = index(at)
+        Control up = handle(g_nodes[i].parent)
+        InputFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.input
+        if fn != nil:
+            if fn(at, g_nodes[i].state, e):
+                if valid(at):
+                    return (true, at)
+                return (true, NIL)
+        if i == stop:
+            break
+        at = up
+    return (false, NIL)
+
+// Offer `e` to `c`'s own input hook and to nobody else — no bubbling, no
+// focus or capture change — and answer whether it handled it. For a widget
+// that drives another from its own keys, as a line edit drives a list's
+// selection while keeping focus (`line_edit_set_key_target`). False for a
+// dead handle, a kind with no input hook, and while `update` runs.
+bool offer_input(Control c, input.Event e):
+    i32 i = index(c)
+    if i < 0 || g_phase != PHASE_IDLE:
+        return false
+    InputFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.input
+    if fn == nil:
+        return false
+    return fn(c, g_nodes[i].state, e)
+
+// The mouse half of `dispatch`; answers whether a node handled `e`.
+//
+// A press focuses the nearest focusable node from the target up, before the
+// event is offered, so the handler already sees itself focused; a press over
+// nothing focusable leaves focus where it was — clicking empty space is not a
+// request to drop the keyboard.
+//
+// A release or a motion that arrives with no button held ends an automatic
+// capture, after the capturing node has seen it. Any such event, not only the
+// release, because a release can be lost — the button let go outside the
+// window, or while another window had the pointer — and a capture waiting for
+// it would send the next press, anywhere on the screen, to the node that
+// captured last. A wheel notch does not count: its `mods` carry no button
+// bits even mid-drag (see `input.MOUSE_WHEEL`), so it says nothing about the
+// buttons. A press always carries its own button's bit.
+//
+// While a modal is open (modal.dado), a mouse event whose target is not inside
+// it is swallowed — answered as handled and offered to nobody — and a press
+// among them emits `outside_pressed` on the modal, which is how a dialog
+// learns it was clicked away from.
+private bool dispatch_mouse(input.Event e):
+    input.MouseKind k = input.mouse_kind(e)
+    g_pointer = event_cell(e)
+    g_have_pointer = true
+    Control target = captured()
+    if target == NIL:
+        target = hit(g_pointer.col, g_pointer.row)
+    i32 m = modal_index()
+    if m >= 0 && !(valid(target) && in_subtree(index(target), m)):
+        return modal_outside(m, k)
+    if k == input.MouseKind.Press:
+        Control f = target
+        for valid(f) && !is_focusable(f):
+            f = parent(f)
+        if valid(f):
+            set_focus(f)
+    i32 touched = g_capture_touched
+    (bool handled, Control by) = bubble(target, e, -1)
+    if k == input.MouseKind.Press && by != NIL && g_capture < 0 && touched == g_capture_touched:
+        g_capture = index(by)
+        g_capture_auto = true
+    bool buttonless = k == input.MouseKind.Release || k == input.MouseKind.Motion
+    if buttonless && g_capture_auto && (e.mods & BUTTONS) == 0:
+        g_capture = -1
+        g_capture_auto = false
+    return handled
+
+// The window lost focus: whatever the buttons do next, this program may not
+// hear it, so every capture ends — explicit ones too (see `capture`).
+private void focus_lost():
+    g_capture = -1
+    g_capture_auto = false
+
+// ── The cursor ─────────────────────────────────────────────────────────────
+
+// A hook's answer meaning "not mine: ask my parent".
+const i32 CURSOR_INHERIT   = -1
+// The cursors, re-exported from `app:display`, which maps them to sokol's.
+const i32 CURSOR_DEFAULT   = display.CURSOR_DEFAULT
+const i32 CURSOR_IBEAM     = display.CURSOR_IBEAM
+const i32 CURSOR_POINTER   = display.CURSOR_POINTER
+const i32 CURSOR_RESIZE_EW = display.CURSOR_RESIZE_EW
+const i32 CURSOR_RESIZE_NS = display.CURSOR_RESIZE_NS
+
+// Where a changed cursor is sent. Nil is `display.set_cursor`.
+type CursorSink: void(i32)
+
+private CursorSink g_cursor_sink
+// What the sink was last told. sokol starts on its default cursor, so this
+// does too, and a pointer that only ever crosses default-cursor nodes costs no
+// call at all.
+private i32 g_cursor_shown = CURSOR_DEFAULT
+// Calls made to the sink, ever: what the tests count.
+private i32 g_cursor_sets
+
+// Send changed cursors to `sink` from now on; nil sends them to the display
+// again. What the old sink was told is taken as shown.
+void set_cursor_sink(CursorSink sink):
+    g_cursor_sink = sink
+
+// The cursor last handed to the sink, and how many times one has been.
+i32 cursor_shown():
+    return g_cursor_shown
+
+i32 cursor_sets():
+    return g_cursor_sets
+
+// The effective cursor over `c` at cell `p`: the first answer other than
+// `CURSOR_INHERIT` from `c`'s kind's `cursor` hook and then each ancestor's;
+// `CURSOR_DEFAULT` when none answers, and for a dead handle. An answer below
+// `CURSOR_INHERIT` is taken as `CURSOR_INHERIT`.
+i32 cursor_at(Control c, cell.CellPoint p):
+    Control at = c
+    for valid(at):
+        i32 i = index(at)
+        CursorFn fn = g_kinds[i32(g_nodes[i].kind)].hooks.cursor
+        if fn != nil:
+            i32 want = fn(at, g_nodes[i].state, p)
+            if want > CURSOR_INHERIT:
+                return want
+        at = handle(g_nodes[i].parent)
+    return CURSOR_DEFAULT
+
+// The cursor the pointer should show now: the capturing node's while one
+// holds the capture, else the hovered node's, at the last mouse event's cell.
+// `CURSOR_DEFAULT` before any mouse event.
+i32 cursor_wanted():
+    if !g_have_pointer:
+        return CURSOR_DEFAULT
+    Control target = captured()
+    if target == NIL:
+        target = hovered()
+    // Nothing under a modal takes the mouse, so nothing there sets the cursor.
+    i32 m = modal_index()
+    if m >= 0 && !(valid(target) && in_subtree(index(target), m)):
+        return CURSOR_DEFAULT
+    return cursor_at(target, g_pointer)
+
+// Hand the sink the wanted cursor if it is not the one shown. The frame
+// calls this after `update`; a test calls it where the frame would. Does
+// nothing before the first mouse event.
+void sync_cursor():
+    if !g_have_pointer:
+        return
+    i32 want = cursor_wanted()
+    if want == g_cursor_shown:
+        return
+    g_cursor_shown = want
+    g_cursor_sets = g_cursor_sets + 1
+    if g_cursor_sink != nil:
+        g_cursor_sink(want)
+    else:
+        display.set_cursor(want)
