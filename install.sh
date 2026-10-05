@@ -55,7 +55,12 @@ fi
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/dado-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 say "downloading $asset"
-curl -fsSL "$url/$asset" -o "$tmp/$asset" || die "cannot download $url/$asset"
+if ! curl -fsSL "$url/$asset" -o "$tmp/$asset"; then
+    # `latest` names the newest stable release and skips prereleases, so
+    # before the first stable one it answers 404.
+    [ -n "$version" ] || die "cannot download $url/$asset: there may be no stable release yet; pass a version from $base, for example: ... | sh -s -- --version 1.0.0-rc.2"
+    die "cannot download $url/$asset"
+fi
 curl -fsSL "$url/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "cannot download $url/SHA256SUMS"
 want=$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp/SHA256SUMS")
 [ -n "$want" ] || die "SHA256SUMS has no line for $asset"
