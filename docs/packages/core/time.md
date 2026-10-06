@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:time
 
 core:time — measuring how long something took, and waiting.
@@ -53,26 +53,8 @@ any header pulls it in. So the macro is written here and the sidecar is gone.
 
 ## Declarations
 
-56 declarations, 40 public.
+56 declarations, 22 public.
 
-* `i64 dado_rt__web_now_ns()`
-* `i64 dado_rt__web_wall_ns()`
-* `void dado_rt__web_thread_sleep(i64 nanoseconds)`
-* `type LARGE_INTEGER: (#c.llong QuadPart)`
-* `type FILETIME: (#c.ulong dwLowDateTime, #c.ulong dwHighDateTime)`
-* `#c.int QueryPerformanceCounter(^LARGE_INTEGER count)`
-* `#c.int QueryPerformanceFrequency(^LARGE_INTEGER frequency)`
-* `void GetSystemTimePreciseAsFileTime(^FILETIME into)`
-* `void Sleep(#c.ulong milliseconds)`
-* `type TimeSpec`
-* `i32 nanosleep(^sys.TimeSpec request, ^sys.TimeSpec remaining)`
-* `#c.long time(^#c.long into)`
-* `const #c.uint CLOCK_MONOTONIC`
-* `const #c.uint CLOCK_REALTIME`
-* `i32 clock_gettime(#c.uint clock_id, ^sys.TimeSpec into)`
-* `const i32 CLOCK_MONOTONIC`
-* `const i32 CLOCK_REALTIME`
-* `i32 clock_gettime(i32 clock_id, ^sys.TimeSpec into)`
 * `distinct type Duration: i64` — An interval, in nanoseconds. `distinct`, so a `Duration` is not an `i64` a…
 * `Duration nanoseconds(i64 n)`
 * `Duration microseconds(i64 n)`

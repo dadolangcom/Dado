@@ -3,7 +3,9 @@
 # Downloads the release archive, checks it against the release's SHA256SUMS,
 # unpacks it into %LOCALAPPDATA%\dado (or $env:DADO_DIR), and runs the
 # install.bat inside it, which runs `dadoc bootstrap`. $env:DADO_VERSION picks
-# a release other than the latest.
+# a release other than the latest. With none, it takes the latest stable
+# release, and while there is none the newest prerelease, asked of GitHub's
+# releases API ($env:DADO_RELEASE_API overrides where).
 $ErrorActionPreference = 'Stop'
 $base = if ($env:DADO_RELEASE_BASE) { $env:DADO_RELEASE_BASE } else { 'https://github.com/dadolangcom/Dado/releases' }
 $dir = if ($env:DADO_DIR) { $env:DADO_DIR } else { Join-Path $env:LOCALAPPDATA 'dado' }
@@ -19,9 +21,20 @@ try {
     try {
         Invoke-WebRequest -UseBasicParsing -Uri "$url/$asset" -OutFile (Join-Path $tmp $asset)
     } catch {
-        # `latest` skips prereleases, so before the first stable release it answers 404.
-        if (-not $env:DADO_VERSION) { throw "cannot download $url/$asset`: there may be no stable release yet; set `$env:DADO_VERSION to a version from $base and run this again" }
-        throw
+        if ($env:DADO_VERSION) { throw }
+        # `latest` skips prereleases, so before the first stable release it
+        # answers 404: take the newest prerelease. GitHub's API lists a
+        # repository's releases newest first, and drafts only to its owners.
+        $api = $env:DADO_RELEASE_API
+        if (-not $api -and $base -match '^https://github\.com/([^/]+/[^/]+)/releases$') { $api = "https://api.github.com/repos/$($Matches[1])/releases" }
+        $tag = $null
+        if ($api) {
+            try { $tag = @(Invoke-RestMethod -UseBasicParsing -Uri "$($api)?per_page=1" -Headers @{ Accept = 'application/vnd.github+json' })[0].tag_name } catch { }
+        }
+        if (-not $tag) { throw "cannot download $url/$asset, and found no prerelease to fall back to; set `$env:DADO_VERSION to a version from $base and run this again" }
+        $url = "$base/download/$tag"
+        Write-Host "dado install: there is no stable release yet: downloading the newest prerelease, $tag"
+        Invoke-WebRequest -UseBasicParsing -Uri "$url/$asset" -OutFile (Join-Path $tmp $asset)
     }
     Invoke-WebRequest -UseBasicParsing -Uri "$url/SHA256SUMS" -OutFile (Join-Path $tmp 'SHA256SUMS')
     $line = Get-Content (Join-Path $tmp 'SHA256SUMS') | Where-Object { ($_ -split '\s+')[1] -in @($asset, "*$asset") } | Select-Object -First 1

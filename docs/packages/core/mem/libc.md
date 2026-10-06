@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:mem/libc
 
 core:mem/libc — C's heap behind the `Allocator` interface.
@@ -40,14 +40,8 @@ exist.
 
 ## Declarations
 
-12 declarations, 9 public.
+12 declarations, 3 public.
 
-* `rawptr malloc(#c.size_t nbytes)`
-* `rawptr realloc(rawptr ptr, #c.size_t nbytes)`
-* `void free(rawptr ptr)`
-* `rawptr malloc(#c.size_t nbytes)`
-* `rawptr realloc(rawptr ptr, #c.size_t nbytes)`
-* `void free(rawptr ptr)`
 * `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator()` — The allocator. A value, not a singleton: it is two words and copying it…
 * `type Heap using mem.Allocator` — C's heap as a declaration that takes `mem.Allocator` on, for code that…
 * `(rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self)`

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:os
 
 std/os — the process, and the arguments it was started with.
@@ -32,7 +32,7 @@ thread.
 
 ## Declarations
 
-170 declarations, 155 public.
+170 declarations, 56 public.
 
 * `const i32 NOT_FOUND = 1` — Nothing is at the path, or a directory on the way to it is missing.
 * `const i32 EXISTS = 2` — Something is already at the path, and the operation does not replace it.
@@ -56,85 +56,11 @@ thread.
 * `const i32 UNKNOWN = 99` — The system failed with a reason this table does not name.
 * `string8 message(i32 code)` — A sentence for `code`, for a person: what went wrong and, where there is…
 * `i32 last_error()` — The calling thread's most recent system failure, as a code above. Read it…
-* `#c.ulong GetLastError()`
-* `const #c.long ERROR_FILE_NOT_FOUND`
-* `const #c.long ERROR_PATH_NOT_FOUND`
-* `const #c.long ERROR_INVALID_DRIVE`
-* `const #c.long ERROR_BAD_NETPATH`
-* `const #c.long ERROR_BAD_PATHNAME`
-* `const #c.long ERROR_ENVVAR_NOT_FOUND`
-* `const #c.long ERROR_ACCESS_DENIED`
-* `const #c.long ERROR_ALREADY_EXISTS`
-* `const #c.long ERROR_FILE_EXISTS`
-* `const #c.long ERROR_DIRECTORY`
-* `const #c.long ERROR_DIR_NOT_EMPTY`
-* `const #c.long ERROR_INVALID_NAME`
-* `const #c.long ERROR_INVALID_PARAMETER`
-* `const #c.long ERROR_INVALID_HANDLE`
-* `const #c.long ERROR_CRC`
-* `const #c.long ERROR_READ_FAULT`
-* `const #c.long ERROR_WRITE_FAULT`
-* `const #c.long ERROR_DISK_FULL`
-* `const #c.long ERROR_HANDLE_DISK_FULL`
-* `const #c.long ERROR_SHARING_VIOLATION`
-* `const #c.long ERROR_LOCK_VIOLATION`
-* `const #c.long ERROR_NOT_SAME_DEVICE`
-* `const #c.long ERROR_FILENAME_EXCED_RANGE`
-* `const #c.long ERROR_CANT_RESOLVE_FILENAME`
-* `const #c.long ERROR_WRITE_PROTECT`
-* `const #c.long ERROR_NOT_ENOUGH_MEMORY`
-* `const #c.long ERROR_OUTOFMEMORY`
-* `const #c.long ERROR_TOO_MANY_OPEN_FILES`
-* `const #c.long ERROR_PRIVILEGE_NOT_HELD`
-* `const #c.long ERROR_NOT_SUPPORTED`
-* `const #c.long ERROR_CALL_NOT_IMPLEMENTED`
-* `const #c.long ERROR_OPERATION_ABORTED`
 * `i32 from_system(i64 raw)` — A Win32 error number (what `GetLastError` answers) as a code above.
-* `const i32 errno`
-* `const i32 ENOENT`
-* `const i32 EEXIST`
-* `const i32 EACCES`
-* `const i32 EPERM`
-* `const i32 ENOTDIR`
-* `const i32 EISDIR`
-* `const i32 ENOTEMPTY`
-* `const i32 EINVAL`
-* `const i32 EBADF`
-* `const i32 EIO`
-* `const i32 ENOSPC`
-* `const i32 EDQUOT`
-* `const i32 EBUSY`
-* `const i32 ETXTBSY`
-* `const i32 EXDEV`
-* `const i32 ENAMETOOLONG`
-* `const i32 ELOOP`
-* `const i32 EROFS`
-* `const i32 ENOMEM`
-* `const i32 EMFILE`
-* `const i32 ENFILE`
-* `const i32 ENOSYS`
-* `const i32 ENOTSUP`
-* `const i32 EOPNOTSUPP`
-* `const i32 EINTR`
 * `i32 from_system(i64 raw)` — An `errno` value as a code above.
-* `type @incomplete @c("struct HINSTANCE__") ExeModule`
-* `#c.ulong GetModuleFileNameW(^ExeModule module, ^u16 into, #c.ulong size)`
 * `!string8 executable_path()` — The image's path. `GetModuleFileNameW` answers the count it wrote, and a…
-* `#c.int _NSGetExecutablePath(^#c.char into, ^u32 size)`
-* `^#c.char realpath(cstring path, ^#c.char resolved)`
-* `void free(rawptr p)`
-* `#c.size_t strlen(cstring s)`
 * `!string8 executable_path()` — `_NSGetExecutablePath` answers -1 and the size it needs when the buffer…
-* `#c.long readlink(cstring path, ^#c.char into, #c.size_t size)`
 * `!string8 executable_path()` — `readlink` does not terminate what it writes and answers how much it…
-* `i32 abs(i32 n)`
-* `i32 rand()`
-* `void srand(u32 seed)`
-* `void exit(i32 status)`
-* `cstring getenv(cstring name)`
-* `const i32 RAND_MAX`
-* `const i32 EXIT_SUCCESS`
-* `const i32 EXIT_FAILURE`
 * `cstring arg(^rawptr argv, i32 index)` — The argument at `index`, exactly as C handed it over.
 * `[]rawptr all(^rawptr argv, i32 argc)` — The whole argument vector, as a slice, windowed once.
 * `bool has_arg(i32 argc, i32 index)` — Whether `argv` carries an argument at `index` — i.e. whether `index` is…
@@ -148,26 +74,6 @@ thread.
 * `void quit_with(i32 status)`
 * `i32 success()`
 * `i32 failure()`
-* `const #c.uint CP_UTF8`
-* `const #c.ulong STD_INPUT_HANDLE`
-* `const #c.ulong STD_OUTPUT_HANDLE`
-* `const #c.ulong STD_ERROR_HANDLE`
-* `const #c.long ERROR_ENVVAR_NOT_FOUND`
-* `#c.int MultiByteToWideChar(#c.uint code_page, #c.ulong flags, cstring from, #c.int from_count, ^u16 into, #c.int into_count)`
-* `#c.int WideCharToMultiByte(#c.uint code_page, #c.ulong flags, ^const u16 from, #c.int from_count, ^#c.char into, #c.int into_count, cstring default_char, ^#c.int used_default)`
-* `^u16 GetCommandLineW()`
-* `rawptr LocalFree(rawptr block)`
-* `#c.ulong GetEnvironmentVariableW(^const u16 name, ^u16 into, #c.ulong size)`
-* `#c.int SetEnvironmentVariableW(^const u16 name, ^const u16 value)`
-* `#c.ulong GetTempPathW(#c.ulong size, ^u16 into)`
-* `#c.ulong GetCurrentProcessId()`
-* `rawptr GetStdHandle(#c.ulong which)`
-* `#c.int GetConsoleMode(rawptr console, ^#c.ulong mode)`
-* `#c.ulong GetLastError()`
-* `void SetLastError(#c.ulong code)`
-* `^^u16 CommandLineToArgvW(^const u16 line, ^#c.int count)`
-* `#c.int _wputenv_s(^const u16 name, ^const u16 value)`
-* `#c.size_t wcslen(^const u16 s)`
 * `[]string8 args(i32 argc, ^rawptr argv)` — The command line Windows kept, split by `CommandLineToArgvW` — the…
 * `(ref []char8 value, bool found) get_env(string8 name)` — `GetEnvironmentVariableW` answers 0 both for a variable that is not set…
 * `!void set_env(string8 name, string8 value)`
@@ -176,11 +82,6 @@ thread.
 * `!ref []char8 home_dir()` — `USERPROFILE`, which Windows sets for every logged-on user.
 * `ref []char8 temp_dir()` — `GetTempPathW`, which reads `TMP`, `TEMP` and `USERPROFILE` in that…
 * `bool is_terminal(i32 stream)` — A console answers `GetConsoleMode`; a file, a pipe or `NUL` does not.
-* `cstring getenv(cstring name)`
-* `#c.int setenv(cstring name, cstring value, #c.int overwrite)`
-* `#c.int unsetenv(cstring name)`
-* `#c.int getpid()`
-* `#c.int isatty(#c.int fd)`
 * `[]string8 args(i32 argc, ^rawptr argv)` — `argv` as the process received it. The bytes are the process's for its…
 * `(ref []char8 value, bool found) get_env(string8 name)`
 * `!void set_env(string8 name, string8 value)`

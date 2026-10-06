@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:io
 
 core:io — files and the standard streams, through C's `<stdio.h>`.
@@ -32,42 +32,11 @@ reach for a sink to put text on a Windows console.
 
 ## Declarations
 
-93 declarations, 68 public.
+93 declarations, 37 public.
 
-* `i64 dado_rt__web_fd_write(i32 fd, rawptr bytes, i64 count)`
 * `Sink stdout_sink()` — The page's standard output, as a sink.
 * `Sink stderr_sink()` — The page's standard error, as a sink.
 * `type FILE`
-* `const ^FILE stdin`
-* `const ^FILE stdout`
-* `const ^FILE stderr`
-* `#c.size_t fread(rawptr into, #c.size_t size, #c.size_t count, ^FILE stream)`
-* `#c.size_t fwrite(rawptr from, #c.size_t size, #c.size_t count, ^FILE stream)`
-* `^FILE fopen(cstring path, cstring mode)`
-* `i32 fclose(^FILE stream)`
-* `i32 fputs(cstring text, ^FILE stream)`
-* `i32 fgetc(^FILE stream)`
-* `i32 fputc(i32 byte, ^FILE stream)`
-* `i32 fflush(^FILE stream)`
-* `i32 feof(^FILE stream)`
-* `i32 ferror(^FILE stream)`
-* `void clearerr(^FILE stream)`
-* `i32 remove(cstring path)`
-* `i32 rename(cstring from, cstring to)`
-* `const i32 EOF`
-* `const #c.uint CP_UTF8`
-* `const #c.ulong MOVEFILE_REPLACE_EXISTING`
-* `const #c.ulong STD_OUTPUT_HANDLE`
-* `const #c.ulong STD_ERROR_HANDLE`
-* `rawptr GetStdHandle(#c.ulong which)`
-* `#c.int MultiByteToWideChar(#c.uint code_page, #c.ulong flags, cstring from, #c.int from_count, ^u16 into, #c.int into_count)`
-* `#c.int GetConsoleMode(rawptr console, ^#c.ulong mode)`
-* `#c.int WriteConsoleW(rawptr console, const rawptr from, #c.ulong count, ^#c.ulong written, rawptr reserved)`
-* `#c.int MoveFileExW(^const u16 from, ^const u16 to, #c.ulong flags)`
-* `#c.int DeleteFileW(^const u16 path)`
-* `i32 _fileno(^FILE stream)`
-* `^FILE _wfopen(^const u16 path, ^const u16 mode)`
-* `i32 _setmode(i32 fd, i32 mode)`
 * `^FILE stdin()`
 * `^FILE stdout()`
 * `^FILE stderr()`

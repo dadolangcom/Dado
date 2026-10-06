@@ -205,15 +205,15 @@ the thing was acquired, rather than at each of the four exits.
 
 <!--@ flow/defer -->
 
-## Signals: handing a value to another thread
+## Channels: handing a value to another thread
 
 A frame loop, a worker pool, an input backend and a network thread all need the
 same thing — hand a value to another thread without a lock and without losing
-it — and a program that answers it four times answers it four ways. A signal
+it — and a program that answers it four times answers it four ways. A channel
 answers it once, typed, with what may travel checked, and with one layout the
 other side of any boundary can read.
 
-<!--@ flow/signals -->
+<!--@ flow/channels -->
 
 ## Threads on the web
 

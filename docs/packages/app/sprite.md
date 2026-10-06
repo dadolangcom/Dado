@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 2b5ebeeb9435 (dirty) -->
 # app:sprite
 
 `app:sprite` — a sheet cut into frames, a resource holding **named**

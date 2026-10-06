@@ -233,7 +233,7 @@ export class Session {
             seam: (module, name, args) => this.seam(module, name, args),
             // ── inline crossings (a16-inline) ──
             settle: () => this.settle(),
-            signals: () => this.signals(),
+            channels: () => this.channels(),
             fail: (label, code) => this.fail(label, code),
             decode: (bytes) => decodeUtf8(bytes),
         });
@@ -287,11 +287,11 @@ export class Session {
     }
 
     /** The safe point after an inline crossing whose callee can reach
-     * `#emit`, the any-signal bit set: signals delivered to the running VM's
+     * `#send`, the any-channel bit set: channels delivered to the running VM's
      * handlers; a stop a handler met is thrown into the script. */
-    signals() {
+    channels() {
         const c = this.current;
-        if (this.exports.dados_signals(c) !== 0) throw this.take(c);
+        if (this.exports.dados_channels(c) !== 0) throw this.take(c);
     }
 
     /** A failable Dado function's failure at an inline site: the `Error` its

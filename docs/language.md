@@ -718,7 +718,7 @@ A generic body names every slot it has. Embedding splices another
 shape's names into this one, which would give each instantiation a
 different view, so a member written without a name is refused with
 the name to give it; a binder is a whole type and never a count, and a
-signal, being one mailbox named after its declaration, belongs in a
+channel, being one mailbox named after its declaration, belongs in a
 declaration that binds nothing.
 
 ### Methods and traits on a generic `type`
@@ -962,7 +962,7 @@ returned, stored where it outlives the frame, or handed to a function
 that keeps it — as a window over a local array does not; a pair made of an element
 of a `ref` run is stale after `#append`, `#resize`, `#reserve` or
 `#delete` on it; a pair of `#stack` storage stays in its block; and
-no trait value rides in a signal's message or crosses to C through an
+no trait value rides in a channel's message or crosses to C through an
 `export` or a `foreign` signature — C is handed the implementer's own
 type.
 
@@ -1025,7 +1025,7 @@ type; a function of no receiver is a package-level function. `Self`
 names the declaration inside its own body. A slot and a method may not
 share a name, because `v.name` answers exactly one of them, and a
 method is no more visible than its type — an unmarked method is
-exactly as visible. A `union`, `cunion`, `enum`, `foreign` or signal
+exactly as visible. A `union`, `cunion`, `enum`, `foreign` or channel
 declaration holds no methods: declare a `type` over it and write them
 there.
 
@@ -1424,7 +1424,7 @@ wrote yet.
 A slice walks, a string walks as its code units, a map walks as key and
 value, and a value that is not a tuple at all walks once as itself — that
 last one falling out of *a one-slot tuple is its element* rather than
-being a case. A signal walks as its parameters, destructured, through
+being a case. A channel walks as its parameters, destructured, through
 `#peek` or `#drain` — any number of them, and one name binds the whole
 message as its tuple.
 
@@ -1670,37 +1670,37 @@ failure. It stands only in a failable function (`ERR0714`); a plain
 one `int32_t` slot in the function's frame, tested where each exit ends.
 
 
-## Signals: handing a value to another thread
+## Channels: handing a value to another thread
 
 A frame loop, a worker pool, an input backend and a network thread all need the
 same thing — hand a value to another thread without a lock and without losing
-it — and a program that answers it four times answers it four ways. A signal
+it — and a program that answers it four times answers it four ways. A channel
 answers it once, typed, with what may travel checked, and with one layout the
 other side of any boundary can read.
 
-### A signal is a mailbox: many producers, one consumer
+### A channel is a mailbox: many producers, one consumer
 
-`#signal(N) name(params)` declares one, at package level or as a member of
+`#channel(N) name(params)` declares one, at package level or as a member of
 a `type`: a typed, bounded, lock-free mailbox of `N` messages, each one
-the parameters' fields. `#signal(latest)` keeps only the newest message
+the parameters' fields. `#channel(latest)` keeps only the newest message
 instead. Its storage is static or inline in the value that holds it, and
-its zero bytes are the empty signal, so it needs no initializer and
+its zero bytes are the empty channel, so it needs no initializer and
 nothing runs before the program starts — which is also why it works on a
 target with no operating system at all.
 
-`#emit` hands a message to it from any thread and never blocks, its
-arguments checked as a call's are. **A queue's `#emit` fails when the queue
+`#send` hands a message to it from any thread and never blocks, its
+arguments checked as a call's are. **A queue's `#send` fails when the queue
 is full, and the program says what that means**: it is written under
 `try`, failing with a code or handling it in a suite, exactly as a map
-read that finds nothing is. A `latest` signal's `#emit` replaces the value
+read that finds nothing is. A `latest` channel's `#send` replaces the value
 nobody took and cannot fail, so it takes no `try`.
 
 The consumer walks what is queued with `for`: `#peek` looks and consumes
-nothing, `#drain` takes, and `#drain(sig, count)` takes at most that
+nothing, `#drain` takes, and `#drain(ch, count)` takes at most that
 many. A walk is a snapshot — it sees what was queued when it began and
 always ends — and a `#drain` **commits when its loop ends, by any exit**:
 running off the end, `break`, `return`, or a failure passing out of the
-body. An entry whose body began is consumed. `#drain(sig)` alone on a line
+body. An entry whose body began is consumed. `#drain(ch)` alone on a line
 is the discard. `#len` counts, from any thread.
 
 ```dado
@@ -1708,12 +1708,12 @@ package doc_sample
 
 const i32 FULL = 1
 
-#signal(32) pressed(i32 id, bool down)
-#signal(latest) resized(i32 w, i32 h)
+#channel(32) pressed(i32 id, bool down)
+#channel(latest) resized(i32 w, i32 h)
 
 !i32 input(i32 id):
-    try #emit(pressed, id, true) else FULL
-    #emit(resized, 800, 600)
+    try #send(pressed, id, true) else FULL
+    #send(resized, 800, 600)
     return 0
 
 i32 frame():
@@ -1728,22 +1728,22 @@ i32 frame():
 ```
 
 **What a message may hold is what can outlive the sender.** Plain data is
-copied into the slot. A window, a pointer, a string, a map or another signal
+copied into the slot. A window, a pointer, a string, a map or another channel
 is refused, because each is a view of storage the sender keeps. A `ref`
-written as a parameter of its own **moves**: a successful `#emit` writes
+written as a parameter of its own **moves**: a successful `#send` writes
 the sender's place nil and reading it afterwards is refused, while on the
 path where the queue was full it is still the sender's. A `#drain` binds it
-as the owning `ref` and a `#peek` as the view it lends; a `latest` signal,
+as the owning `ref` and a `#peek` as the view it lends; a `latest` channel,
 which overwrites, takes none.
 
-**A value holding a signal is never copied** — it is one mailbox at one
+**A value holding a channel is never copied** — it is one mailbox at one
 address, and a copy would be a second — so it is reached through a
-pointer. And a signal has one consumer: a debug build traps when a second
-thread walks one, naming the signal and both threads, and two thread roots
-that both walk one package-level signal are a warning, an error under
-`--strict`. A consumer that is done hands the signal on with
-`#release(sig)`, a statement of its own: the next thread to walk it
-becomes the consumer, and a signal the program releases is not linted.
+pointer. And a channel has one consumer: a debug build traps when a second
+thread walks one, naming the channel and both threads, and two thread roots
+that both walk one package-level channel are a warning, an error under
+`--strict`. A consumer that is done hands the channel on with
+`#release(ch)`, a statement of its own: the next thread to walk it
+becomes the consumer, and a channel the program releases is not linted.
 
 
 ## Threads on the web
@@ -1891,8 +1891,8 @@ build publishes — **public declarations only**, from both dialects:
   exported class with its constructor, fields and methods, each package
   function, every type as the DadoScript spelling and as what a JavaScript
   caller receives;
-* **the public signals** (`dado.signals`): name, kind, capacity and the
-  index a reader of the signal directory finds it at.
+* **the public channels** (`dado.channels`): name, kind, capacity and the
+  index a reader of the channel directory finds it at.
 
 Every entry carries its `dialect`, its `span` (file, line, column and
 byte range) and its `doc`: the `//` comment lines directly above the
@@ -2331,8 +2331,10 @@ its own (below). A method that throws, called under `try`, fails that
 statement, with its text already on the error sink; one called without
 `try` ends the program with the failure's status after the same text. A
 build that cannot run a script is refused where it makes a VM: a `#NONE`
-target has no C library for the engine, and DadoScript on the web is not built
-yet.
+target has no C library for the engine. On the web a script runs on the
+page's own JavaScript engine, and the few features that engine cannot give a
+wasm module (new code at run time, waiting on an `async` method, a pause
+with no second thread) are refused where they are written.
 
 ### Dado calls a script's function
 
@@ -2400,9 +2402,9 @@ script into its polite phase. `#script_is_running(vm)` answers whether a
 run is in progress on the engine, paused or not, and
 `#script_is_paused(vm)` whether it is paused.
 
-`i64 n = #script_pump(vm)` is the host's frame boundary for signals: it
+`i64 n = #script_pump(vm)` is the host's frame boundary for channels: it
 delivers every message waiting for the VM's handlers — the functions its
-scripts connected to the program's signals — and answers how many. A VM
+scripts bound to the program's channels — and answers how many. A VM
 it cannot enter answers a negative code, `script.THREAD` from another
 thread, `script.STALE` once deleted, `script.STOPPED` once stopped, its
 text on the error sink. Messages are delivered as a call into the script
@@ -2703,18 +2705,18 @@ answers the code. A Dado function the script's function calls sees the
 function fails during a Dado function the script called, the script's own
 error reaches it as that Dado function returns.
 
-### A script connects a handler to a signal
+### A script binds a handler to a channel
 
-`connect(hits, on_hit)` connects a script's function to the signal it
+`receive(hits, on_hit)` binds a script's function to the channel it
 names, one a Dado file of its package declares at package level — a
-signal of an imported package is named through the import, as a Dado
+channel of an imported package is named through the import, as a Dado
 function of one is. From then on the script is
-the signal's one consumer: every message emitted, from any thread, is
+the channel's one consumer: every message sent, from any thread, is
 delivered to the function, one call a message, in the order they were
-emitted, on the thread the script's VM belongs to. The function takes the
+sent, on the thread the script's VM belongs to. The function takes the
 message's fields as a Dado function's answer reaches a script — an integer
 as an `int`, a float as a `float`, a `bool`, a character as a `string` —
-and answers nothing: `#signal(16) hits(i32 n, f64 x)` takes a
+and answers nothing: `#channel(16) hits(i32 n, f64 x)` takes a
 `void(int, float)`, a method of that type or a lambda,
 `void(int n, float x): …`.
 
@@ -2724,13 +2726,13 @@ into the script returning to Dado, and `#script_pump(vm)`, which a Dado
 program writes where its frame ends. A handler runs to completion
 before the next message's begins, and a safe point reached inside a
 handler delivers nothing. A handler that fails has its failure written
-to the error sink, naming the signal, and the next message goes on.
+to the error sink, naming the channel, and the next message goes on.
 
-A signal has one consumer. A second VM connecting to it fails with
-`script.BUSY`, as does connecting to a signal Dado walks with `#peek` or
-`#drain`; connecting again in the same VM replaces the handler. A VM's
-connections end with it. A signal whose message carries a `ref` is never
-connected: a script holds no Dado allocation, so the program drains it in
+A channel has one consumer. A second VM's `receive` of it fails with
+`script.BUSY`, as does a `receive` of a channel Dado walks with `#peek` or
+`#drain`; a `receive` again in the same VM replaces the handler. A VM's
+receivers end with it. A channel whose message carries a `ref` is never
+bound: a script holds no Dado allocation, so the program drains it in
 Dado and hands the script what it needs.
 
 ### Functions are values

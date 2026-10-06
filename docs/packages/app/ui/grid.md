@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # app:ui/grid
 
 app:ui/grid — the cell-grid renderer: a screen of `cell.Cell`s, the glyph
@@ -195,7 +195,7 @@ than sized to the window, and `render` grows it on the first frame.
 
 ## Declarations
 
-292 declarations, 178 public.
+292 declarations, 177 public.
 
 * `@const i32 PAGE_PX = 1024` — The texel budget of a page, as the side of a square: a page is never wider…
 * `@const i32 MIN_SLOTS = 384` — The slots the first page must hold, which picks its width: the 97 slots…
@@ -279,7 +279,6 @@ than sized to the window, and `render` grows it on the first frame.
 * `type ChromeDrawn: (i32 tris, i32 flushes, i32 dropped, bool failed)` — What one layer's chrome pass did: triangles drawn, flushes made, boxes…
 * `ChromeDrawn chrome_draw(^ChromeList l, i32 fb_w, i32 fb_h, i32 frame_left)` — Draw the boxes of `l` with sokol_gp, inside the open pass, into a…
 * `^const sokol_gfx.sg_shader_desc ui_grid_grid_shader_desc(sokol_gfx.sg_backend backend)`
-* `@macro rawptr memmove(rawptr dst, rawptr src, u64 n)`
 * `@const f32 PIXEL_HEIGHT = 16.0` — The requested text height in logical pixels, before the DPI scale.
 * `const i32 BASE = 0` — The base layer, which always exists and always draws, and the most layers…
 * `const i32 MAX_LAYERS = 8`

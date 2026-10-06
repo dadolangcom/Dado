@@ -5,7 +5,7 @@
 app:input — a poll-based input subsystem.
 
 Poll-based, not hook-based — three hooks, everything else is polled: a
-backend emits into the queue, a signal, *outside* the frame barrier (during
+backend sends into the queue, a channel, *outside* the frame barrier (during
 its own input read), the runtime delivers it once a frame before `process`,
 and a program drains it *inside* `process` (the safe region) with
 `input.poll`.

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+f2b6a9e7dc2b.dirty -->
-<!-- commit f2b6a9e7dc2b (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # vendor:tui
 
 vendor:tui — a terminal UI you can throw together in seconds.
@@ -46,7 +46,7 @@ sugar budget spent on nothing. `open` refuses a second one.
 
 ## Declarations
 
-561 declarations, 286 public.
+561 declarations, 193 public.
 
 * `type Rect: (i32 x, i32 y, i32 w, i32 h)` — A rectangle in terminal cells. Zero-based and half-open: a `Rect` at (0,0)
 * `const Rect NOWHERE = (0, 0, 0, 0)`
@@ -197,99 +197,6 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `const Theme MONO = ( DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, DEFAULT, ASCII, false, )` — No colour at all. For a pipe, for CI, for `TERM=dumb`, and for anybody who…
 * `void theme(Theme t)` — Install a theme. Takes effect on the next frame.
 * `Theme now()` — The theme in force, for a widget or a program that wants one of its colours.
-* `type COORD: (#c.short X, #c.short Y)`
-* `type SMALL_RECT: (#c.short Left, #c.short Top, #c.short Right, #c.short Bottom)`
-* `type CONSOLE_SCREEN_BUFFER_INFO`
-* `type INPUT_RECORD`
-* `const rawptr INVALID_HANDLE_VALUE`
-* `const #c.ulong STD_INPUT_HANDLE`
-* `const #c.ulong STD_OUTPUT_HANDLE`
-* `const #c.ulong WAIT_OBJECT_0`
-* `const #c.ulong INFINITE`
-* `const #c.ulong ENABLE_PROCESSED_INPUT`
-* `const #c.ulong ENABLE_LINE_INPUT`
-* `const #c.ulong ENABLE_ECHO_INPUT`
-* `const #c.ulong ENABLE_QUICK_EDIT_MODE`
-* `const #c.ulong ENABLE_EXTENDED_FLAGS`
-* `const #c.ulong ENABLE_VIRTUAL_TERMINAL_INPUT`
-* `const #c.ulong ENABLE_PROCESSED_OUTPUT`
-* `const #c.ulong ENABLE_VIRTUAL_TERMINAL_PROCESSING`
-* `const #c.uint CP_UTF8`
-* `rawptr GetStdHandle(#c.ulong which)`
-* `#c.int GetConsoleMode(rawptr console, ^#c.ulong mode)`
-* `#c.int SetConsoleMode(rawptr console, #c.ulong mode)`
-* `#c.int SetConsoleCtrlHandler(TtyCtrlHandler handler, #c.int add)`
-* `#c.int GetConsoleScreenBufferInfo(rawptr console, ^CONSOLE_SCREEN_BUFFER_INFO info)`
-* `#c.int GetNumberOfConsoleInputEvents(rawptr console, ^#c.ulong count)`
-* `#c.int ReadConsoleInputW(rawptr console, ^INPUT_RECORD records, #c.ulong count, ^#c.ulong read)`
-* `#c.ulong WaitForSingleObject(rawptr handle, #c.ulong milliseconds)`
-* `#c.int WriteConsoleA(rawptr console, const rawptr buffer, #c.ulong count, ^#c.ulong written, rawptr reserved)`
-* `#c.int WideCharToMultiByte(#c.uint code_page, #c.ulong flags, ^const u16 from, #c.int from_count, ^#c.char into, #c.int into_count, cstring default_char, ^#c.int used_default)`
-* `type @c("sig_atomic_t") SigAtomic: #c.int`
-* `const i32 SIGINT`
-* `const i32 SIGTERM`
-* `const i32 SIGHUP`
-* `const i32 SIGTSTP`
-* `const i32 SIGCONT`
-* `const TtyHandler SIG_DFL`
-* `TtyHandler signal(i32 sig, TtyHandler handler)`
-* `i32 raise(i32 sig)`
-* `type @c("sig_atomic_t") SigAtomic: #c.int`
-* `const i32 SIGINT`
-* `const i32 SIGTERM`
-* `const i32 SIGHUP`
-* `const i32 SIGTSTP`
-* `const i32 SIGCONT`
-* `const TtyHandler SIG_DFL`
-* `TtyHandler signal(i32 sig, TtyHandler handler)`
-* `i32 raise(i32 sig)`
-* `const i32 errno`
-* `const i32 EINTR`
-* `const i32 STDIN_FILENO`
-* `const i32 STDOUT_FILENO`
-* `i32 isatty(i32 fd)`
-* `#c.long read(i32 fd, rawptr buf, #c.size_t count)`
-* `#c.long write(i32 fd, const rawptr buf, #c.size_t count)`
-* `const i32 STDIN_FILENO`
-* `const i32 STDOUT_FILENO`
-* `i32 isatty(i32 fd)`
-* `#c.long read(i32 fd, rawptr buf, #c.size_t count)`
-* `#c.long write(i32 fd, const rawptr buf, #c.size_t count)`
-* `type TermiosT`
-* `const #c.ulong ECHO`
-* `const #c.ulong ICANON`
-* `const #c.ulong IXON`
-* `const #c.ulong ICRNL`
-* `const i32 VMIN`
-* `const i32 VTIME`
-* `const i32 TCSAFLUSH`
-* `i32 tcgetattr(i32 fd, ^TermiosT t)`
-* `i32 tcsetattr(i32 fd, i32 actions, ^const TermiosT t)`
-* `type TermiosT`
-* `const u32 ECHO`
-* `const u32 ICANON`
-* `const u32 IXON`
-* `const u32 ICRNL`
-* `const i32 VMIN`
-* `const i32 VTIME`
-* `const i32 TCSAFLUSH`
-* `i32 tcgetattr(i32 fd, ^TermiosT t)`
-* `i32 tcsetattr(i32 fd, i32 actions, ^const TermiosT t)`
-* `type WinSize: (u16 ws_row, u16 ws_col, u16 ws_xpixel, u16 ws_ypixel)`
-* `const #c.ulong TIOCGWINSZ`
-* `i32 ioctl(i32 fd, #c.ulong request, ...)`
-* `type TimeVal: (#c.long tv_sec, #c.int tv_usec)`
-* `type TimeVal: (#c.long tv_sec, #c.long tv_usec)`
-* `type @c("fd_set") FdSet`
-* `@macro void FD_ZERO(^FdSet set)`
-* `@macro void FD_SET(i32 fd, ^FdSet set)`
-* `@macro i32 FD_ISSET(i32 fd, ^FdSet set)`
-* `type @c("fd_set") FdSet`
-* `@macro void FD_ZERO(^FdSet set)`
-* `@macro void FD_SET(i32 fd, ^FdSet set)`
-* `@macro i32 FD_ISSET(i32 fd, ^FdSet set)`
-* `i32 select(i32 nfds, ^FdSet readfds, ^FdSet writefds, ^FdSet exceptfds, ^TimeVal timeout)`
-* `i32 select(i32 nfds, ^FdSet readfds, ^FdSet writefds, ^FdSet exceptfds, ^TimeVal timeout)`
 * `type Frame: void()` — What you hand `run` and `step`. It takes nothing and returns nothing,…
 * `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) mem` — ── storage ────────────────────────────────────────────────────────────────…
 * `bool is_terminal()` — Whether there is a terminal to draw on, asked without changing anything. A…

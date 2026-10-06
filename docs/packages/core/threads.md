@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:threads
 
 core:threads — portable threads, locks, condition variables and atomics.
@@ -41,22 +41,9 @@ test that spawns with `./dado test --sanitize=thread` as well as the default.
 
 ## Declarations
 
-72 declarations, 69 public.
+72 declarations, 31 public.
 
 * `type ThreadFn: rawptr(rawptr)` — A thread entry: takes the argument pointer it was spawned with, returns a…
-* `rawptr dado_rt__web_thread_spawn(ThreadFn entry, rawptr arg)`
-* `bool dado_rt__web_thread_join(rawptr handle)`
-* `i32 dado_rt__web_thread_cores()`
-* `rawptr dado_rt__web_mutex_new()`
-* `void dado_rt__web_mutex_lock(rawptr m)`
-* `void dado_rt__web_mutex_unlock(rawptr m)`
-* `void dado_rt__web_mutex_free(rawptr m)`
-* `rawptr dado_rt__web_cond_new()`
-* `void dado_rt__web_cond_wait(rawptr c, rawptr m)`
-* `bool dado_rt__web_cond_wait_for(rawptr c, rawptr m, i64 ms)`
-* `void dado_rt__web_cond_signal(rawptr c)`
-* `void dado_rt__web_cond_broadcast(rawptr c)`
-* `void dado_rt__web_cond_free(rawptr c)`
 * `rawptr spawn(ThreadFn fn, rawptr arg)`
 * `bool join(rawptr t)`
 * `i32 hardware_concurrency()`
@@ -70,31 +57,6 @@ test that spawns with `./dado test --sanitize=thread` as well as the default.
 * `void cond_signal(rawptr c)`
 * `void cond_broadcast(rawptr c)`
 * `void cond_free(rawptr c)`
-* `type pthread_t`
-* `type pthread_mutex_t`
-* `type pthread_cond_t`
-* `type pthread_attr_t` — The three attribute objects, which this package never builds — every…
-* `type pthread_mutexattr_t`
-* `type pthread_condattr_t`
-* `#c.int pthread_create(^pthread_t thread, ^const pthread_attr_t attr, ThreadFn entry, rawptr arg)`
-* `#c.int pthread_join(pthread_t thread, ^rawptr retval)` — **The one pthreads call that takes its object by value.** It is why…
-* `#c.int pthread_mutex_init(^pthread_mutex_t mutex, ^const pthread_mutexattr_t attr)`
-* `#c.int pthread_mutex_lock(^pthread_mutex_t mutex)`
-* `#c.int pthread_mutex_unlock(^pthread_mutex_t mutex)`
-* `#c.int pthread_mutex_destroy(^pthread_mutex_t mutex)`
-* `#c.int pthread_cond_init(^pthread_cond_t cond, ^const pthread_condattr_t attr)`
-* `#c.int pthread_cond_wait(^pthread_cond_t cond, ^pthread_mutex_t mutex)`
-* `#c.int pthread_cond_timedwait(^pthread_cond_t cond, ^pthread_mutex_t mutex, ^const ThreadsTimespec abstime)`
-* `#c.int pthread_cond_signal(^pthread_cond_t cond)`
-* `#c.int pthread_cond_broadcast(^pthread_cond_t cond)`
-* `#c.int pthread_cond_destroy(^pthread_cond_t cond)`
-* `type ThreadsTimespec`
-* `const #c.int TIME_UTC`
-* `#c.int timespec_get(^ThreadsTimespec ts, #c.int base)`
-* `const #c.int _SC_NPROCESSORS_ONLN`
-* `#c.long sysconf(#c.int name)`
-* `rawptr malloc(#c.size_t nbytes)`
-* `void free(rawptr ptr)`
 * `rawptr spawn(ThreadFn fn, rawptr arg)` — Spawn a thread running `fn(arg)`. Returns an opaque handle, or nil on failure.
 * `bool join(rawptr t)` — Join and free a thread handle. True on success; a nil handle is a failure.
 * `i32 hardware_concurrency()` — The online processor count, at least 1.
@@ -113,12 +75,12 @@ test that spawns with `./dado test --sanitize=thread` as well as the default.
 * `i32 atomic_fetch_add(^i32 p, i32 d)`
 * `bool atomic_cas(^i32 p, i32 expected, i32 desired)`
 
-## signals/back-pressure
+## channels/back-pressure
 
 ### Back-pressure on a full queue
 
 A queue never drops and never blocks, so a full one hands the decision to
-the producer, in the `else` of its `try #emit`. There are three honest
+the producer, in the `else` of its `try #send`. There are three honest
 answers: **drop and count** (input nobody will miss), **keep it and try
 again later** (work that must arrive: hold it in the producer and retry on
 the next tick, as below), and **retry now** (a worker whose consumer is
@@ -127,7 +89,7 @@ another thread that is draining — the fan-in above).
 ```dado
 package pressure
 
-#signal(16) sample(i32 seq, f64 value)
+#channel(16) sample(i32 seq, f64 value)
 
 type Pending: (bool held, i32 seq, f64 value, i32 dropped)
 
@@ -135,11 +97,11 @@ type Pending: (bool held, i32 seq, f64 value, i32 dropped)
 // another; while it cannot go, the new one is dropped and counted.
 void tick(^Pending p, i32 seq, f64 value):
     if p.held:
-        try #emit(sample, p.seq, p.value) else:
+        try #send(sample, p.seq, p.value) else:
             p.dropped += 1
             return
         p.held = false
-    try #emit(sample, seq, value) else:
+    try #send(sample, seq, value) else:
         p.held = true
         p.seq = seq
         p.value = value
@@ -147,18 +109,18 @@ void tick(^Pending p, i32 seq, f64 value):
 
 **Full includes what a walk has taken and not yet committed.** A `#drain`
 commits when its loop ends, so while the walk runs the entries it has
-yielded still count against the capacity. A consumer that emits into the
-queue it is draining, from inside that walk, and retries until the `#emit`
+yielded still count against the capacity. A consumer that sends into the
+queue it is draining, from inside that walk, and retries until the `#send`
 succeeds, spins forever: the room it waits for appears only when its own
-loop ends. Emit into another signal, or keep the message and emit after the
+loop ends. Send into another channel, or keep the message and send after the
 loop.
 
 
-## signals/fan-in
+## channels/fan-in
 
 ### Fan-in from workers
 
-Every worker emits into one queue; one thread drains it. A worker that
+Every worker sends into one queue; one thread drains it. A worker that
 finds the queue full retries — the consumer is behind, and it catches up
 at its next walk — so nothing is lost and no worker blocks on a lock.
 
@@ -169,7 +131,7 @@ import "core:threads"
 
 const i32 WORKERS = 4
 
-#signal(64) done(i32 worker, i64 value)
+#channel(64) done(i32 worker, i64 value)
 
 i32 next_id = 0
 
@@ -178,7 +140,7 @@ rawptr work(rawptr arg):
     for job in 0..<100:
         i64 value = i64(me) * 1000 + i64(job)
         for:
-            try #emit(done, me, value) else:
+            try #send(done, me, value) else:
                 continue
             break
     return nil
@@ -199,17 +161,17 @@ i64 run():
 ```
 
 
-## signals/hand-off
+## channels/hand-off
 
 ### Handing consumption to another thread: `#release`
 
-A signal has one consumer at a time, and a debug build fixes it at the
+A channel has one consumer at a time, and a debug build fixes it at the
 first walk. A program that moves the consuming to another thread — a
 loader that drains until the scene is up and then hands over to the frame
-thread — says so with `#release(sig)` where the first thread is done:
-the next thread to walk the signal becomes its consumer. It is a consumer
+thread — says so with `#release(ch)` where the first thread is done:
+the next thread to walk the channel becomes its consumer. It is a consumer
 statement, written on its own line and never inside a walk of the same
-signal. With assertions it clears the owner word after checking this
+channel. With assertions it clears the owner word after checking this
 thread holds it; with `--no-assert` it compiles to nothing. Nothing makes
 the two threads take turns: the program orders them, as with `threads.join`
 below, and a walk that overlaps another thread's still traps.
@@ -219,7 +181,7 @@ package hand_off
 
 import "core:threads"
 
-#signal(16) scene(i32 part)
+#channel(16) scene(i32 part)
 
 i32 loaded = 0
 
@@ -238,13 +200,13 @@ i32 load():
 ```
 
 
-## signals/jobs
+## channels/jobs
 
 ### Results from `core:jobs`
 
-A job emits what it computed instead of writing into an array the caller
+A job sends what it computed instead of writing into an array the caller
 polls: the result carries its own index, the caller drains after the
-barrier, and a result that arrives is complete — the `#emit` published it.
+barrier, and a result that arrives is complete — the `#send` published it.
 Size the queue for the chunks in flight, or let a job retry.
 
 ```dado
@@ -252,14 +214,14 @@ package job_results
 
 import "core:jobs"
 
-#signal(64) partial(i32 begin, i64 sum)
+#channel(64) partial(i32 begin, i64 sum)
 
 void sum_chunk(^jobs.JobArgs a):
     i64 s = 0
     for i in a.begin..<a.end:
         s += i64(i)
     for:
-        try #emit(partial, a.begin, s) else:
+        try #send(partial, a.begin, s) else:
             continue
         break
 
@@ -276,22 +238,22 @@ queue at once: here 64 chunks of 256, so `n` up to 16384. Past that, drain
 while the batch runs, or use a bigger queue.
 
 
-## signals/latest
+## channels/latest
 
 ### Coalesced state: `latest`
 
 For state where only the newest value matters — a window size, a setting, a
-target position — `#signal(latest)` holds one value. An `#emit` replaces
+target position — `#channel(latest)` holds one value. A `#send` replaces
 what nobody took and cannot fail; the consumer's walk yields the newest
 value once, or nothing when there is nothing new.
 
 ```dado
 package coalesce
 
-#signal(latest) target(f32 x, f32 y)
+#channel(latest) target(f32 x, f32 y)
 
 void track(f32 x, f32 y):
-    #emit(target, x, y)
+    #send(target, x, y)
 
 (f32, f32) follow(f32 at_x, f32 at_y):
     f32 x = at_x
@@ -303,24 +265,24 @@ void track(f32 x, f32 y):
 ```
 
 
-## signals/per-frame
+## channels/per-frame
 
 ### Per-frame input
 
-An input backend emits events as they happen, on its own thread; the frame
+An input backend sends events as they happen, on its own thread; the frame
 drains them at one point, before it updates. A frame that must bound its
-work takes at most a budget with `#drain(sig, n)` and leaves the rest
+work takes at most a budget with `#drain(ch, n)` and leaves the rest
 queued for the next frame, in order.
 
 ```dado
 package per_frame
 
-#signal(256) key(i32 code, bool down)
+#channel(256) key(i32 code, bool down)
 
 i32 dropped = 0
 
 void on_key(i32 code, bool down):
-    try #emit(key, code, down) else:
+    try #send(key, code, down) else:
         dropped += 1
 
 i32 frame(^[512]bool held):
@@ -332,11 +294,11 @@ i32 frame(^[512]bool held):
 ```
 
 
-## signals/request-response
+## channels/request-response
 
-### Request and response: two signals
+### Request and response: two channels
 
-A signal is one-way, so a question and its answer are two: the server
+A channel is one-way, so a question and its answer are two: the server
 consumes requests, the client consumes responses, and each has exactly one
 consumer. The request carries an id the response echoes, because answers
 need not come back in the order questions went out.
@@ -344,20 +306,20 @@ need not come back in the order questions went out.
 ```dado
 package ask
 
-#signal(32) request(i32 id, i32 x)
-#signal(32) response(i32 id, i32 y)
+#channel(32) request(i32 id, i32 x)
+#channel(32) response(i32 id, i32 y)
 
 // The server's thread: answer everything asked so far.
 void serve():
     for id, x in #drain(request):
         for:
-            try #emit(response, id, x * x) else:
+            try #send(response, id, x * x) else:
                 continue
             break
 
 // The client's thread: ask, and later collect what has been answered.
 bool ask(i32 id, i32 x):
-    try #emit(request, id, x) else:
+    try #send(request, id, x) else:
         return false
     return true
 
@@ -369,7 +331,7 @@ i32 collect(^[32]i32 answers):
     return n
 ```
 
-The server's retry is safe because it drains one signal and emits into the
-other. Retrying an `#emit` into the queue a walk is draining, from inside
+The server's retry is safe because it drains one channel and sends into the
+other. Retrying a `#send` into the queue a walk is draining, from inside
 that walk, never succeeds: see back-pressure.
 

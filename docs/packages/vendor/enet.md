@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # vendor:enet
 
 vendor:enet — Dado bindings for the zpl-c/enet single-header fork of ENet
@@ -100,7 +100,7 @@ literal as it is and converts a `u64` with `#c.size_t(n)`.
 
 ## Declarations
 
-65 declarations, 62 public.
+65 declarations, 59 public.
 
 * `type @c("struct in_addr") InAddr` — ── hand-written, above the marker, and it stays across a regeneration ──…
 * `enum @c("ENetPacketFlag") PacketFlag` — bindgen:begin declarations — regenerated; edits between the markers are lost…
@@ -146,9 +146,6 @@ literal as it is and converts a `u64` with `#c.size_t(n)`.
 * `void enet_peer_disconnect(^ENetPeer peer, u32 data)`
 * `void enet_peer_disconnect_now(^ENetPeer peer, u32 data)`
 * `void enet_peer_disconnect_later(^ENetPeer peer, u32 data)`
-* `rawptr calloc(#c.size_t count, #c.size_t size)`
-* `void free(rawptr ptr)`
-* `@macro rawptr memcpy(rawptr dst, const rawptr src, #c.size_t n)`
 * `^ENetAddress address_create()` — Dado cannot stack-allocate a value and hand back a pointer to it that outlives…
 * `void address_destroy(^ENetAddress addr)`
 * `bool address_set_host(^ENetAddress addr, cstring hostname)`

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:os/fs
 
 core:os/fs — what is on the disk.
@@ -47,7 +47,7 @@ written beside `Stat`. On Windows, `<windows.h>` is, through `windows.dado`.
 
 ## Declarations
 
-233 declarations, 183 public.
+239 declarations, 64 public.
 
 * `!ref []char8 read_file(string8 path)` — The whole file. Opened with every sharing mode, so a file another…
 * `!void write_file(string8 path, string8 data)` — Written to a new file beside `path`, flushed to the disk, and moved over…
@@ -59,21 +59,6 @@ written beside `Stat`. On Windows, `<windows.h>` is, through `windows.dado`.
 * `!i64 mtime(string8 path)`
 * `!ref []char8 make_temp_dir(string8 prefix)` — A new directory under `os.temp_dir()`, named `prefix` and sixteen hex…
 * `!void make_symlink(string8 target, string8 path)` — `CreateSymbolicLinkW`, with…
-* `const i32 O_RDONLY`
-* `const i32 O_WRONLY`
-* `const i32 O_CREAT`
-* `const i32 O_EXCL`
-* `const i32 O_TRUNC`
-* `const i32 O_CLOEXEC`
-* `i32 open(cstring path, i32 flags, ...)`
-* `#c.long read(i32 fd, rawptr buf, #c.size_t count)`
-* `#c.long write(i32 fd, const rawptr buf, #c.size_t count)`
-* `#c.int close(i32 fd)`
-* `#c.int fsync(i32 fd)`
-* `#c.int unlink(cstring path)`
-* `#c.int rmdir(cstring path)`
-* `#c.int rename(cstring from, cstring to)`
-* `^#c.char mkdtemp(^#c.char template)`
 * `!ref []char8 read_file(string8 path)` — The whole file. A directory opens for reading on Linux and fails at the…
 * `!void write_file(string8 path, string8 data)` — Written to a new file beside `path` (`O_CREAT | O_EXCL`, so it is never…
 * `!void remove_file(string8 path)`
@@ -104,39 +89,6 @@ written beside `Stat`. On Windows, `<windows.h>` is, through `windows.dado`.
 * `bool set_cwd(cstring path)`
 * `bool make_dir(cstring path)`
 * `bool make_private_dir(cstring path)` — Owner and `SYSTEM` only, through a protected DACL (`windows.dado`), which…
-* `type Stat`
-* `#c.int stat(cstring path, ^Stat buf)`
-* `#c.int lstat(cstring path, ^Stat buf)`
-* `@macro #c.int S_ISDIR(u16 mode)`
-* `@macro #c.int S_ISREG(u16 mode)`
-* `@macro #c.int S_ISLNK(u16 mode)`
-* `type Stat`
-* `#c.int stat(cstring path, ^Stat buf)`
-* `#c.int lstat(cstring path, ^Stat buf)`
-* `@macro #c.int S_ISDIR(u32 mode)`
-* `@macro #c.int S_ISREG(u32 mode)`
-* `@macro #c.int S_ISLNK(u32 mode)`
-* `#c.int mkdir(cstring path, #c.ushort mode)`
-* `#c.int chmod(cstring path, #c.ushort mode)`
-* `#c.int mkdir(cstring path, #c.uint mode)`
-* `#c.int chmod(cstring path, #c.uint mode)`
-* `type DIR`
-* `^DIR opendir(cstring path)`
-* `#c.int closedir(^DIR d)`
-* `type Dirent`
-* `^Dirent readdir(^DIR d)`
-* `type Dirent`
-* `^Dirent readdir(^DIR d)`
-* `^#c.char realpath(cstring path, ^#c.char resolved)` — **`realpath(path, nil)`, not a caller-sized buffer.** POSIX.1-2008 makes…
-* `void free(rawptr p)`
-* `#c.size_t strlen(cstring s)`
-* `@macro rawptr memcpy(rawptr dst, rawptr src, #c.size_t nbytes)`
-* `^#c.char getcwd(^#c.char buf, #c.size_t nbytes)`
-* `#c.int chdir(cstring path)`
-* `#c.int symlink(cstring target, cstring path)`
-* `#c.long readlink(cstring path, ^#c.char buf, #c.size_t nbytes)`
-* `#c.int access(cstring path, i32 mode)` — **`access` and not a mode read**, because *"can this be executed"* is a…
-* `const i32 X_OK`
 * `type Dir: DIR` — The handle, under the name a program writes. A `type` is a view and creates…
 * `^Dir open(cstring path)` — **A `nil` path is answered, not passed on.** Every function here that takes a…
 * `bool opened(^Dir dir)`
@@ -161,74 +113,3 @@ written beside `Stat`. On Windows, `<windows.h>` is, through `windows.dado`.
 * `Listing walk(string8 root, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc)` — Every path under `root`, depth first, **a directory before its contents**.
 * `void release(Listing l)` — Free what a walk allocated. A `Listing` that was never walked is safe to…
 * `bool make_dirs(string8 path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc)` — `mkdir -p`: every directory on `path` that is not there yet.
-* `type FsFindData`
-* `type FsHandleInfo`
-* `type FsSecurity: (#c.ulong nLength, rawptr lpSecurityDescriptor, #c.int bInheritHandle)`
-* `type FsOverlapped`
-* `const #c.uint CP_UTF8`
-* `const #c.ulong GENERIC_READ`
-* `const #c.ulong GENERIC_WRITE`
-* `const #c.ulong FILE_READ_ATTRIBUTES`
-* `const #c.ulong FILE_SHARE_READ`
-* `const #c.ulong FILE_SHARE_WRITE`
-* `const #c.ulong FILE_SHARE_DELETE`
-* `const #c.ulong OPEN_EXISTING`
-* `const #c.ulong CREATE_NEW`
-* `const #c.ulong FILE_ATTRIBUTE_NORMAL`
-* `const #c.ulong FILE_ATTRIBUTE_DIRECTORY`
-* `const #c.ulong FILE_ATTRIBUTE_READONLY`
-* `const #c.ulong FILE_ATTRIBUTE_REPARSE_POINT`
-* `const #c.ulong FILE_FLAG_BACKUP_SEMANTICS`
-* `const #c.ulong FILE_FLAG_OPEN_REPARSE_POINT`
-* `const #c.ulong INVALID_FILE_ATTRIBUTES`
-* `const rawptr INVALID_HANDLE_VALUE`
-* `const #c.ulong MOVEFILE_REPLACE_EXISTING`
-* `const #c.ulong MOVEFILE_WRITE_THROUGH`
-* `const #c.ulong SYMBOLIC_LINK_FLAG_DIRECTORY`
-* `const #c.ulong SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`
-* `const #c.ulong IO_REPARSE_TAG_SYMLINK`
-* `const #c.ulong IO_REPARSE_TAG_MOUNT_POINT`
-* `const #c.ulong VOLUME_NAME_DOS`
-* `const #c.ulong HEAP_ZERO_MEMORY`
-* `const #c.long ERROR_FILE_NOT_FOUND`
-* `const #c.long ERROR_PATH_NOT_FOUND`
-* `const #c.long ERROR_NO_MORE_FILES`
-* `const #c.long ERROR_ACCESS_DENIED`
-* `const #c.long ERROR_INVALID_PARAMETER`
-* `const #c.long ERROR_ALREADY_EXISTS`
-* `const #c.long ERROR_FILE_EXISTS`
-* `#c.int MultiByteToWideChar(#c.uint code_page, #c.ulong flags, cstring from, #c.int from_count, ^u16 into, #c.int into_count)`
-* `#c.int WideCharToMultiByte(#c.uint code_page, #c.ulong flags, ^const u16 from, #c.int from_count, ^#c.char into, #c.int into_count, cstring default_char, ^#c.int used_default)`
-* `#c.ulong GetLastError()`
-* `void SetLastError(#c.ulong code)`
-* `rawptr FindFirstFileW(^const u16 pattern, ^FsFindData found)`
-* `#c.int FindNextFileW(rawptr search, ^FsFindData found)`
-* `#c.int FindClose(rawptr search)`
-* `#c.ulong GetFileAttributesW(^const u16 path)`
-* `#c.int SetFileAttributesW(^const u16 path, #c.ulong attributes)`
-* `rawptr CreateFileW(^const u16 path, #c.ulong access, #c.ulong share, ^FsSecurity security, #c.ulong disposition, #c.ulong flags, rawptr template_file)`
-* `#c.int GetFileInformationByHandle(rawptr file, ^FsHandleInfo info)`
-* `#c.int CloseHandle(rawptr handle)`
-* `#c.int ReadFile(rawptr file, rawptr into, #c.ulong count, ^#c.ulong got, ^FsOverlapped overlapped)`
-* `#c.int WriteFile(rawptr file, const rawptr from, #c.ulong count, ^#c.ulong wrote, ^FsOverlapped overlapped)`
-* `#c.int FlushFileBuffers(rawptr file)`
-* `#c.int DeviceIoControl(rawptr device, #c.ulong code, rawptr in_buffer, #c.ulong in_size, rawptr out_buffer, #c.ulong out_size, ^#c.ulong returned, ^FsOverlapped overlapped)`
-* `#c.ulong GetFullPathNameW(^const u16 path, #c.ulong size, ^u16 into, ^^u16 file_part)`
-* `#c.ulong GetFinalPathNameByHandleW(rawptr file, ^u16 into, #c.ulong size, #c.ulong flags)`
-* `#c.ulong GetCurrentDirectoryW(#c.ulong size, ^u16 into)`
-* `#c.int SetCurrentDirectoryW(^const u16 path)`
-* `#c.int CreateDirectoryW(^const u16 path, ^FsSecurity security)`
-* `#c.int RemoveDirectoryW(^const u16 path)`
-* `#c.int DeleteFileW(^const u16 path)`
-* `#c.int MoveFileExW(^const u16 from, ^const u16 to, #c.ulong flags)`
-* `#c.int CopyFileW(^const u16 from, ^const u16 to, #c.int fail_if_exists)`
-* `#c.uchar CreateSymbolicLinkW(^const u16 link, ^const u16 target, #c.ulong flags)`
-* `rawptr GetProcessHeap()`
-* `rawptr HeapAlloc(rawptr heap, #c.ulong flags, #c.size_t bytes)`
-* `#c.int HeapFree(rawptr heap, #c.ulong flags, rawptr block)`
-* `rawptr LocalFree(rawptr block)`
-* `#c.ullong GetTickCount64()`
-* `#c.ulong GetCurrentProcessId()`
-* `const #c.int SDDL_REVISION_1`
-* `#c.int ConvertStringSecurityDescriptorToSecurityDescriptorW(^const u16 sddl, #c.ulong revision, ^rawptr descriptor, ^#c.ulong size)`
-* `#c.size_t wcslen(^const u16 s)`

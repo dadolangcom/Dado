@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:mem/gc
 
 core:mem/gc — a conservative mark-sweep collector behind `mem.Allocator`.
@@ -19,22 +19,9 @@ false negatives for anything the root set covers.
 
 ## Declarations
 
-44 declarations, 25 public.
+44 declarations, 12 public.
 
-* `rawptr malloc(#c.size_t nbytes)`
-* `void free(rawptr p)`
-* `void __builtin_unwind_init()`
-* `rawptr __builtin_frame_address(i32 level)`
 * `type Visit: void(rawptr, rawptr)` — What the walk hands back: the heap, and one candidate address.
-* `type pthread_t`
-* `pthread_t pthread_self()`
-* `rawptr pthread_get_stackaddr_np(pthread_t thread)`
-* `type pthread_attr_t`
-* `type pthread_t`
-* `pthread_t pthread_self()`
-* `i32 pthread_getattr_np(pthread_t thread, ^pthread_attr_t attr)`
-* `i32 pthread_attr_getstack(^pthread_attr_t attr, ^rawptr addr, ^#c.size_t size)`
-* `i32 pthread_attr_destroy(^pthread_attr_t attr)`
 * `const i32 MAX_BLOCKS = 4096`
 * `type Block: (rawptr at, u64 size, bool marked)`
 * `type Heap`

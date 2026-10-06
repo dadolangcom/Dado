@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 2b5ebeeb9435 (dirty) -->
 # core:jobs
 
 core:jobs — a general task system and the worker pool the runtime parallelises
@@ -10,17 +10,17 @@ runs inline on submit) and a **pooled** one (a central MPMC queue behind a
 mutex+condvar, N worker threads, batch completion via atomic counters). A
 caller writes the same code either way; threads are only how fast it goes.
 
-**A job hands its result back through a signal.** It has no return value and
-no handle to hang one on, so it `#emit`s into a queue signal the caller
+**A job hands its result back through a channel.** It has no return value and
+no handle to hang one on, so it `#send`s into a queue channel the caller
 declared, and the caller drains it — once the batch is joined, or on the
 next frame, whichever it wants:
 
-    #signal(64) tile_done(i32 tile, i64 checksum)
+    #channel(64) tile_done(i32 tile, i64 checksum)
     private i32 g_tiles_lost
 
     void render_tile(^jobs.JobArgs a):
         for t in a.begin..<a.end:
-            try #emit(tile_done, t, checksum_of(t)) else:
+            try #send(tile_done, t, checksum_of(t)) else:
                 _ = #atomic_fetch_add(&g_tiles_lost, 1, #RELAXED)
 
     void frame(^jobs.Scheduler s):
@@ -28,13 +28,13 @@ next frame, whichever it wants:
         for tile, checksum in #drain(tile_done):
             show(tile, checksum)
 
-A value is copied into the signal's slot, so nothing the job wrote has to
-outlive it; a `ref` moves to the thread that drains. **Size the signal for
+A value is copied into the channel's slot, so nothing the job wrote has to
+outlive it; a `ref` moves to the thread that drains. **Size the channel for
 the batch.** The thread that drains is usually the one waiting, and a wait
 helps by running jobs on the waiting thread — so a job that retried on
 `FULL` there would be waiting on itself. Count the refusal instead, as
 above, or keep the value for a later batch. And **drain from one thread** —
-the one that submits is the natural choice — for the signal's whole life.
+the one that submits is the natural choice — for the channel's whole life.
 
 So the scheduler's only answer about a job is *finished or not*: `wait` for a
 handle, or `parallel_for`, which joins before it returns. There is no

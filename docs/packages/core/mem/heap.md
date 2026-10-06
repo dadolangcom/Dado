@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:mem/heap
 
 core:mem/heap — a growable `List`, on the heap, by hand.
@@ -72,11 +72,8 @@ struct of three machine words.
 
 ## Declarations
 
-24 declarations, 22 public.
+24 declarations, 19 public.
 
-* `rawptr malloc(#c.size_t nbytes)`
-* `rawptr realloc(rawptr ptr, #c.size_t nbytes)`
-* `void free(rawptr ptr)`
 * `type T: i32` — ── The element, and the one place it is named ───────────────────────────────…
 * `const i32 CAP_MAX = 65536` — `CAP_MAX` is the ceiling the backing pointer is *typed* over — `^[CAP_MAX]T` —…
 * `type List: (Ptr data, i32 len, i32 cap)` — A `List` is three words: where the block is, how many elements are live, and…

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:http
 
 core:http — a minimal, non-blocking HTTP/1.1 server over TCP.
@@ -47,38 +47,10 @@ back.
 
 ## Declarations
 
-75 declarations, 50 public.
+75 declarations, 22 public.
 
 * `distinct type Server: i32`
 * `distinct type Conn: i32`
-* `const #c.int AF_INET`
-* `const #c.int SOCK_STREAM`
-* `const #c.int SOL_SOCKET`
-* `const #c.int SO_REUSEADDR`
-* `const #c.int SO_RCVTIMEO`
-* `#c.int socket(#c.int domain, #c.int kind, #c.int protocol)`
-* `#c.int setsockopt(#c.int fd, #c.int level, #c.int optname, rawptr optval, #c.uint optlen)`
-* `type @c("struct sockaddr") SockAddr` — `struct sockaddr`, the generic address `bind` and `accept` are declared…
-* `#c.int bind(#c.int fd, ^const sock.SockAddr addr, #c.uint addrlen)`
-* `#c.int listen(#c.int fd, #c.int backlog)`
-* `#c.int accept(#c.int fd, ^sock.SockAddr addr, ^#c.uint addrlen)`
-* `#c.long send(#c.int fd, rawptr from, #c.size_t nbytes, #c.int flags)` — `ssize_t`, which Dado has no name for and which is `long`-shaped on every…
-* `#c.long recv(#c.int fd, rawptr into, #c.size_t nbytes, #c.int flags)`
-* `const u32 INADDR_ANY`
-* `type InAddr: (u32 s_addr)`
-* `type SockAddrIn`
-* `type SockAddrIn: (u16 sin_family, u16 sin_port, InAddr sin_addr, [8]u8 sin_zero)`
-* `const #c.int F_GETFL`
-* `const #c.int F_SETFL`
-* `const #c.int O_NONBLOCK`
-* `#c.int fcntl(#c.int fd, #c.int cmd, ...)` — C's variadic tail, restated as C writes it. `fcntl`'s third argument is…
-* `#c.int close(#c.int fd)`
-* `@macro u16 htons(u16 x)`
-* `@macro u32 htonl(u32 x)`
-* `const #c.int SO_NOSIGPIPE`
-* `type TimeVal: (#c.long tv_sec, #c.int tv_usec)`
-* `const #c.int MSG_NOSIGNAL`
-* `type TimeVal: (#c.long tv_sec, #c.long tv_usec)`
 * `const i32 PATHCAP = 512`
 * `const i32 REQCAP = 16384`
 * `enum i32 Method: (Get, Post, Head, Options, Other)`

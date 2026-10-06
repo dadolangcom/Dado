@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:chars
 
 std/chars — C's `<ctype.h>`, told the truth about.
@@ -56,18 +56,8 @@ tables — ICU, utf8proc — through a `foreign` block.
 
 ## Declarations
 
-45 declarations, 34 public.
+45 declarations, 24 public.
 
-* `@macro i32 isalpha(i32 c)`
-* `@macro i32 isdigit(i32 c)`
-* `@macro i32 isalnum(i32 c)`
-* `@macro i32 isspace(i32 c)`
-* `@macro i32 isupper(i32 c)`
-* `@macro i32 islower(i32 c)`
-* `@macro i32 ispunct(i32 c)`
-* `@macro i32 isprint(i32 c)`
-* `@macro i32 toupper(i32 c)`
-* `@macro i32 tolower(i32 c)`
 * `bool is_alpha(char8 c)`
 * `bool is_digit(char8 c)`
 * `bool is_alnum(char8 c)`

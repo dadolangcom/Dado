@@ -1,21 +1,21 @@
-// signals.mjs — a Dado program's signals, read and written from JavaScript.
+// channels.mjs — a Dado program's channels, read and written from JavaScript.
 //
-// The reference the DadoScript glue starts from: the signal helper family the
-// compiler emits into every program that holds a signal (its runtime's
-// `signal.h`), transliterated helper by helper, over typed-array views of
-// the module's memory at the offsets the program's signal directory records.
+// The reference the DadoScript glue starts from: the channel helper family the
+// compiler emits into every program that holds a channel (its runtime's
+// `channel.h`), transliterated helper by helper, over typed-array views of
+// the module's memory at the offsets the program's channel directory records.
 // **Nothing here calls into wasm after start-up**: the directory's address
-// is asked once, and every emit, walk, look and length after that is loads
+// is asked once, and every send, walk, look and length after that is loads
 // and stores on memory the module shares with its host. That is the property
 // the layout exists for.
 //
-//     import { SignalDirectory } from "./signals.mjs";
-//     const dir = SignalDirectory.read(instance.exports.memory,
-//                                      instance.exports.dado_rt__signal_directory());
-//     const q = dir.signal("main.to_js");
-//     if (dir.signalAny()) for (const i of dir.look()) ...    // the watcher
+//     import { ChannelDirectory } from "./channels.mjs";
+//     const dir = ChannelDirectory.read(instance.exports.memory,
+//                                      instance.exports.dado_rt__channel_directory());
+//     const q = dir.channel("main.to_js");
+//     if (dir.channelAny()) for (const i of dir.look()) ...    // the watcher
 //     dir.drain(q, (m) => ...);                               // #drain(q)
-//     dir.emit(dir.signal("main.from_js"), { id: 1, v: 2n }); // try #emit(...)
+//     dir.send(dir.channel("main.from_js"), { id: 1, v: 2n }); // try #send(...)
 //
 // **Which accesses, and why.** Every access to a word another party writes —
 // `tail`, `head`, `owner`, a slot's `seq`, a `latest`'s `word` and
@@ -37,7 +37,7 @@
 // `p - h >= cap` is true when `h > p` (the subtraction wraps), and here that
 // is written out as `h > p || p - h >= cap`.
 //
-// **What is derived and what is hard-coded.** Every number *about a signal* —
+// **What is derived and what is hard-coded.** Every number *about a channel* —
 // its instance's address, `sizeof`, the offsets of `tail`, `head`, `owner`
 // and the slots, the slot stride, the capacity, each payload field's name,
 // offset, size and kind — is read from the directory, where C wrote it with
@@ -51,9 +51,9 @@
 //
 // **A `ref` field** reads as the address it holds and cannot be written: a
 // `ref` moves ownership of memory the program's allocator holds, and this side
-// can neither give the program one nor free one it takes. Draining a signal
+// can neither give the program one nor free one it takes. Draining a channel
 // whose message holds a `ref` from here leaks each one (the discard included);
-// such a signal is the program's to consume.
+// such a channel is the program's to consume.
 
 /** The directory layout version this reader understands. */
 export const DIRECTORY_VERSION = 1;
@@ -61,9 +61,9 @@ export const DIRECTORY_VERSION = 1;
 /** The directory's own structs on wasm32, where a pointer is 4 bytes and a
  * `uint64_t` is 8-aligned. Not in the directory: these are its shape. */
 export const DIRECTORY_LAYOUT = Object.freeze({
-    // struct dado_rt__signal_directory_t
+    // struct dado_rt__channel_directory_t
     header: { version: 0, count: 4, flags: 8, bits: 12, names: 16, entries: 20 },
-    // struct dado_rt__signal_entry, 96 bytes
+    // struct dado_rt__channel_entry, 96 bytes
     entry: {
         size: 96,
         index: 0,
@@ -81,7 +81,7 @@ export const DIRECTORY_LAYOUT = Object.freeze({
         stride: 80,
         fields: 88,
     },
-    // struct dado_rt__signal_field, 24 bytes
+    // struct dado_rt__channel_field, 24 bytes
     field: { size: 24, name: 0, kind: 4, offset: 8, bytes: 16 },
     // A pointer, and a `const char *` in the name table.
     pointer: 4,
@@ -135,15 +135,15 @@ const READERS = {
 // The helpers' constants.
 const SIG_DIRTY = 1n;
 const SIG_OPEN = 1n;
-const NOT_DIRTY = 0xffff_ffff_ffff_fffen; // ~DADO_RT__SIG_DIRTY as a uint64_t
-const SIGL_MID = 3;
-const SIGL_DIRTY = 16;
-const SIGL_WRITING = 32;
-const SIGNAL_ANY = 1;
+const NOT_DIRTY = 0xffff_ffff_ffff_fffen; // ~DADO_RT__CHAN_DIRTY as a uint64_t
+const CHANL_MID = 3;
+const CHANL_DIRTY = 16;
+const CHANL_WRITING = 32;
+const CHANNEL_ANY = 1;
 const TWO_TO_53 = 1n << 53n;
 
 /**
- * **The consumer id of a DadoScript engine** in a signal's owner word. A native
+ * **The consumer id of a DadoScript engine** in a channel's owner word. A native
  * thread's id is the address of an 8-byte per-thread object, so a multiple of
  * 8, never below 1024 (natively the page at 0 is unmapped; on `#WEB` static
  * data and thread storage begin at the linker's global base, 1024); bit 0 of
@@ -157,7 +157,7 @@ export const ENGINE_ID = 8n;
 export const FIRST_THREAD_ID = 1024n;
 
 /** A walk the one-consumer rule refuses, or a directory this file cannot read. */
-export class SignalError extends Error {}
+export class ChannelError extends Error {}
 
 /** Whether the host stores typed-array elements little-endian, as wasm does. */
 function hostIsLittleEndian() {
@@ -172,23 +172,23 @@ function cString(bytes, at) {
     return new TextDecoder().decode(bytes.subarray(at, end));
 }
 
-/** The program's signals, and the helpers over them. */
-export class SignalDirectory {
+/** The program's channels, and the helpers over them. */
+export class ChannelDirectory {
     /**
      * Read the directory at `address` in `memory` (a `WebAssembly.Memory`)
-     * — the value the module's `dado_rt__signal_directory` export answers,
+     * — the value the module's `dado_rt__channel_directory` export answers,
      * asked once. `engine` is this reader's consumer id.
      */
     static read(memory, address, engine = ENGINE_ID) {
-        return new SignalDirectory(memory, address >>> 0, engine);
+        return new ChannelDirectory(memory, address >>> 0, engine);
     }
 
     constructor(memory, address, engine) {
         if (!hostIsLittleEndian()) {
-            throw new SignalError("this host stores typed arrays big-endian; wasm memory is little-endian");
+            throw new ChannelError("this host stores typed arrays big-endian; wasm memory is little-endian");
         }
         if ((engine & 7n) !== 0n || engine === 0n || engine >= FIRST_THREAD_ID) {
-            throw new SignalError(`an engine id is a nonzero multiple of 8 below ${FIRST_THREAD_ID}, not ${engine}`);
+            throw new ChannelError(`an engine id is a nonzero multiple of 8 below ${FIRST_THREAD_ID}, not ${engine}`);
         }
         this.memory = memory;
         this.engine = engine;
@@ -197,8 +197,8 @@ export class SignalDirectory {
         const dv = this.dv;
         this.version = dv.getUint32(address + L.header.version, true);
         if (this.version !== DIRECTORY_VERSION) {
-            throw new SignalError(
-                `the signal directory is version ${this.version}; this reader reads version ${DIRECTORY_VERSION}`,
+            throw new ChannelError(
+                `the channel directory is version ${this.version}; this reader reads version ${DIRECTORY_VERSION}`,
             );
         }
         this.count = dv.getUint32(address + L.header.count, true);
@@ -207,17 +207,17 @@ export class SignalDirectory {
         const namesAt = dv.getUint32(address + L.header.names, true);
         const entriesAt = dv.getUint32(address + L.header.entries, true);
         if (this.flagsAt % 4 !== 0 || this.bitsAt % 8 !== 0) {
-            throw new SignalError("the flag word or the bitmap is misaligned: not a wasm32 directory");
+            throw new ChannelError("the flag word or the bitmap is misaligned: not a wasm32 directory");
         }
         const name = (i) => cString(this.bytes, dv.getUint32(namesAt + i * L.pointer, true));
         const u64 = (at) => Number(dv.getBigUint64(at, true));
-        this.signals = [];
+        this.channels = [];
         this.byName = new Map();
         for (let i = 0; i < this.count; i++) {
             const e = entriesAt + i * L.entry.size;
             const index = dv.getUint32(e + L.entry.index, true);
             if (index !== i) {
-                throw new SignalError(`directory entry ${i} says it is ${index}: the entry layout is not wasm32's`);
+                throw new ChannelError(`directory entry ${i} says it is ${index}: the entry layout is not wasm32's`);
             }
             const kind = dv.getUint32(e + L.entry.kind, true);
             const fieldCount = dv.getUint32(e + L.entry.fieldCount, true);
@@ -255,11 +255,11 @@ export class SignalDirectory {
             const message = s.kind === "queue" ? L.message : 0;
             for (const f of fields) {
                 if (message + f.offset + f.size > s.stride) {
-                    throw new SignalError(`${s.name}.${f.name} lies outside its slot: the message is not ${message} bytes in`);
+                    throw new ChannelError(`${s.name}.${f.name} lies outside its slot: the message is not ${message} bytes in`);
                 }
             }
             s.message = message;
-            this.signals.push(s);
+            this.channels.push(s);
             this.byName.set(s.name, s);
         }
     }
@@ -278,16 +278,16 @@ export class SignalDirectory {
         this.bytes = new Uint8Array(buffer);
     }
 
-    /** The signal called `name` (its qualified name, `package.signal`). */
-    signal(name) {
+    /** The channel called `name` (its qualified name, `package.channel`). */
+    channel(name) {
         const s = this.byName.get(name);
         if (s === undefined) {
-            throw new SignalError(`the program has no live signal ${name}`);
+            throw new ChannelError(`the program has no live channel ${name}`);
         }
         return s;
     }
 
-    /** A signal declared as a field: its entry, placed at `base` + its offset. */
+    /** A channel declared as a field: its entry, placed at `base` + its offset. */
     instance(s, base) {
         return { ...s, instance: base + s.fieldOffset };
     }
@@ -300,43 +300,43 @@ export class SignalDirectory {
 
     // ---- the program-wide words ------------------------------------------------------
 
-    /** SIGNAL_ANY: some signal changed since the watcher last looked. One load. */
-    signalAny() {
+    /** CHANNEL_ANY: some channel changed since the watcher last looked. One load. */
+    channelAny() {
         this.#views();
-        return (Atomics.load(this.u32, this.flagsAt / 4) & SIGNAL_ANY) !== 0;
+        return (Atomics.load(this.u32, this.flagsAt / 4) & CHANNEL_ANY) !== 0;
     }
 
-    /** Whether signal `s`'s bit is set in the bitmap. */
+    /** Whether channel `s`'s bit is set in the bitmap. */
     bitSet(s) {
         this.#views();
         return (Atomics.load(this.u64, this.bitsAt / 8 + s.bitWord) & s.bit) !== 0n;
     }
 
     /**
-     * The watcher's look: clear SIGNAL_ANY first, then exchange each bitmap
-     * word with 0, and answer the signals whose bits it took. The caller walks
+     * The watcher's look: clear CHANNEL_ANY first, then exchange each bitmap
+     * word with 0, and answer the channels whose bits it took. The caller walks
      * each of them before it looks again — clear, then walk.
      */
     look() {
         this.#views();
-        Atomics.and(this.u32, this.flagsAt / 4, ~SIGNAL_ANY);
+        Atomics.and(this.u32, this.flagsAt / 4, ~CHANNEL_ANY);
         const taken = [];
         const words = (this.count + 63) >> 6;
         for (let w = 0; w < words; w++) {
             const was = Atomics.exchange(this.u64, this.bitsAt / 8 + w, 0n);
             for (let b = 0; b < 64 && w * 64 + b < this.count; b++) {
                 if (was & (1n << BigInt(b))) {
-                    taken.push(this.signals[w * 64 + b]);
+                    taken.push(this.channels[w * 64 + b]);
                 }
             }
         }
         return taken;
     }
 
-    // dado_rt__sig_raise
+    // dado_rt__chan_raise
     #raise(s) {
         Atomics.or(this.u64, this.bitsAt / 8 + s.bitWord, s.bit);
-        Atomics.or(this.u32, this.flagsAt / 4, SIGNAL_ANY);
+        Atomics.or(this.u32, this.flagsAt / 4, CHANNEL_ANY);
     }
 
     // ---- the payload -----------------------------------------------------------------
@@ -355,7 +355,7 @@ export class SignalDirectory {
         for (const f of s.fields) {
             const v = values[f.name];
             if (v === undefined) {
-                throw new SignalError(`${s.name}: no value for ${f.name}`);
+                throw new ChannelError(`${s.name}: no value for ${f.name}`);
             }
             const p = at + f.offset;
             switch (f.kind) {
@@ -400,10 +400,10 @@ export class SignalDirectory {
                     // A `ref` moves ownership of memory the program's allocator
                     // holds; a host cannot hand the consumer one it did not get
                     // from that allocator.
-                    throw new SignalError(`${s.name}.${f.name} is a ref, which JavaScript cannot own`);
+                    throw new ChannelError(`${s.name}.${f.name} is a ref, which JavaScript cannot own`);
                 default:
                     if (!(v instanceof Uint8Array) || v.length !== f.size) {
-                        throw new SignalError(`${s.name}.${f.name} is ${f.size} bytes of composite data`);
+                        throw new ChannelError(`${s.name}.${f.name} is ${f.size} bytes of composite data`);
                     }
                     this.bytes.set(v, p);
             }
@@ -412,7 +412,7 @@ export class SignalDirectory {
 
     // ---- the queue, producer side ------------------------------------------------------
 
-    // dado_rt__sigq_claim: [pos, first], or null when FULL.
+    // dado_rt__chanq_claim: [pos, first], or null when FULL.
     #claim(s) {
         const u64 = this.u64;
         const tail = this.#w64(s, s.tail);
@@ -445,14 +445,14 @@ export class SignalDirectory {
     }
 
     /**
-     * `try #emit(s, …)`: `values` is an object keyed by the parameters' names.
+     * `try #send(s, …)`: `values` is an object keyed by the parameters' names.
      * Answers true, or false when the queue is FULL (nothing claimed; the
      * caller decides — drop, count, or retry later). Never blocks.
      */
-    emit(s, values) {
+    send(s, values) {
         this.#views();
         if (s.kind !== "queue") {
-            return this.emitLatest(s, values);
+            return this.sendLatest(s, values);
         }
         const claimed = this.#claim(s);
         if (claimed === null) {
@@ -461,7 +461,7 @@ export class SignalDirectory {
         const [pos, first] = claimed;
         const slot = s.instance + s.slots + Number(pos % BigInt(s.capacity)) * s.stride;
         this.#write(s, slot + s.message, values);
-        // dado_rt__sigq_publish
+        // dado_rt__chanq_publish
         Atomics.store(this.u64, slot / 8, pos + 1n);
         if (first) {
             this.#raise(s);
@@ -471,7 +471,7 @@ export class SignalDirectory {
 
     // ---- the one-consumer guard ----------------------------------------------------------
 
-    // dado_rt__sig_claim_owner
+    // dado_rt__chan_claim_owner
     #claimOwner(s, mark) {
         const owner = this.#w64(s, s.owner);
         const o = Atomics.compareExchange(this.u64, owner, 0n, this.engine | mark);
@@ -480,26 +480,26 @@ export class SignalDirectory {
         }
         const first = o & ~SIG_OPEN;
         if (first !== this.engine) {
-            throw new SignalError(
-                `signal walked by a second consumer: ${s.name}\n  its consumer is ${describe(first)}, and this is ${describe(this.engine)}`,
+            throw new ChannelError(
+                `channel walked by a second consumer: ${s.name}\n  its consumer is ${describe(first)}, and this is ${describe(this.engine)}`,
             );
         }
         return o;
     }
 
-    // dado_rt__sig_open
+    // dado_rt__chan_open
     #open(s) {
         const o = this.#claimOwner(s, SIG_OPEN);
         if (o === 0n) {
             return;
         }
         if (o & SIG_OPEN) {
-            throw new SignalError(`signal walked inside a walk of itself: ${s.name}`);
+            throw new ChannelError(`channel walked inside a walk of itself: ${s.name}`);
         }
         Atomics.store(this.u64, this.#w64(s, s.owner), o | SIG_OPEN);
     }
 
-    // dado_rt__sig_close
+    // dado_rt__chan_close
     #close(s) {
         Atomics.store(this.u64, this.#w64(s, s.owner), this.engine);
     }
@@ -518,18 +518,18 @@ export class SignalDirectory {
         const head = this.#w64(s, s.head);
         const bits = this.bitsAt / 8 + s.bitWord;
         this.#open(s);
-        // dado_rt__sigq_begin
+        // dado_rt__chanq_begin
         let lim;
         if ((Atomics.load(u64, bits) & s.bit) === 0n) {
             lim = Atomics.and(u64, tail, NOT_DIRTY) >> 1n;
         } else {
             lim = Atomics.load(u64, tail) >> 1n;
         }
-        // dado_rt__sigq_head
+        // dado_rt__chanq_head
         const h = Atomics.load(u64, head);
         let i = h;
         if (!consume && h !== lim) {
-            this.#raise(s); // dado_rt__sigq_peeked
+            this.#raise(s); // dado_rt__chanq_peeked
         }
         // The walk counts `k` from `h` as a Number — at most the capacity —
         // so a message costs no BigInt arithmetic. While every position is
@@ -545,7 +545,7 @@ export class SignalDirectory {
         try {
             while (k < n) {
                 const slot = base + ((start + k) % s.capacity) * s.stride;
-                // dado_rt__sigq_ready
+                // dado_rt__chanq_ready
                 const seq = Atomics.load(u64, slot / 8);
                 if (exact ? Number(seq) !== hn + k + 1 : seq !== h + BigInt(k + 1)) {
                     this.#raise(s);
@@ -559,7 +559,7 @@ export class SignalDirectory {
             }
         } finally {
             if (consume) {
-                // dado_rt__sigq_commit
+                // dado_rt__chanq_commit
                 i = h + BigInt(k);
                 if (Atomics.load(u64, head) !== i) {
                     Atomics.store(u64, head, i);
@@ -599,12 +599,12 @@ export class SignalDirectory {
     len(s) {
         this.#views();
         if (s.kind !== "queue") {
-            // dado_rt__sigl_len
+            // dado_rt__chanl_len
             const w = Atomics.load(this.u32, (s.instance + s.tail) / 4);
             const fs = Atomics.load(this.u32, (s.instance + s.head) / 4);
-            return (w & SIGL_DIRTY) | (fs & 2) ? 1 : 0;
+            return (w & CHANL_DIRTY) | (fs & 2) ? 1 : 0;
         }
-        // dado_rt__sigq_len
+        // dado_rt__chanq_len
         const t = Atomics.load(this.u64, this.#w64(s, s.tail)) >> 1n;
         const h = Atomics.load(this.u64, this.#w64(s, s.head));
         if (h >= t) {
@@ -615,19 +615,19 @@ export class SignalDirectory {
 
     // ---- latest ------------------------------------------------------------------------
 
-    /** `#emit` into a `latest`: never fails; a write that finds another writer
-     * mid-`#emit` is superseded and returns at once (answering false). */
-    emitLatest(s, values) {
+    /** `#send` into a `latest`: never fails; a write that finds another writer
+     * mid-`#send` is superseded and returns at once (answering false). */
+    sendLatest(s, values) {
         this.#views();
         const u32 = this.u32;
         const word = (s.instance + s.tail) / 4;
-        // dado_rt__sigl_claim
+        // dado_rt__chanl_claim
         let w = Atomics.load(u32, word);
         for (;;) {
-            if (w & SIGL_WRITING) {
+            if (w & CHANL_WRITING) {
                 return false;
             }
-            const seen = Atomics.compareExchange(u32, word, w, w | SIGL_WRITING);
+            const seen = Atomics.compareExchange(u32, word, w, w | CHANL_WRITING);
             if (seen === w) {
                 break;
             }
@@ -635,47 +635,47 @@ export class SignalDirectory {
         }
         const back = ((w >> 2) & 3) ^ 2;
         this.#write(s, s.instance + s.slots + back * s.stride, values);
-        // dado_rt__sigl_publish
+        // dado_rt__chanl_publish
         w = Atomics.load(u32, word);
         for (;;) {
-            const mid = w & SIGL_MID;
+            const mid = w & CHANL_MID;
             const b = ((w >> 2) & 3) ^ 2;
-            const n = b | (((mid ^ 2) & 3) << 2) | SIGL_DIRTY;
+            const n = b | (((mid ^ 2) & 3) << 2) | CHANL_DIRTY;
             const seen = Atomics.compareExchange(u32, word, w, n);
             if (seen === w) {
                 break;
             }
             w = seen;
         }
-        if (!(w & SIGL_DIRTY)) {
+        if (!(w & CHANL_DIRTY)) {
             this.#raise(s);
         }
         return true;
     }
 
-    // dado_rt__sigl_take: the buffer to read, or -1.
+    // dado_rt__chanl_take: the buffer to read, or -1.
     #take(s, consume) {
         const u32 = this.u32;
         const word = (s.instance + s.tail) / 4;
         const frontState = (s.instance + s.head) / 4;
         let w = Atomics.load(u32, word);
         let front;
-        if (w & SIGL_DIRTY) {
+        if (w & CHANL_DIRTY) {
             for (;;) {
-                const mid = w & SIGL_MID;
+                const mid = w & CHANL_MID;
                 const back = ((w >> 2) & 3) ^ 2;
                 const f = 3 - mid - back;
-                const n = (w & ~(SIGL_MID | SIGL_DIRTY)) | f; // new mid = old front
+                const n = (w & ~(CHANL_MID | CHANL_DIRTY)) | f; // new mid = old front
                 const seen = Atomics.compareExchange(u32, word, w, n);
                 if (seen === w) {
                     break;
                 }
                 w = seen;
             }
-            front = w & SIGL_MID; // the consumer's front is the old mid
+            front = w & CHANL_MID; // the consumer's front is the old mid
             Atomics.store(u32, frontState, 3);
         } else {
-            front = 3 - (w & SIGL_MID) - (((w >> 2) & 3) ^ 2);
+            front = 3 - (w & CHANL_MID) - (((w >> 2) & 3) ^ 2);
         }
         const fs = Atomics.load(u32, frontState);
         if (!(fs & 2)) {
@@ -689,10 +689,10 @@ export class SignalDirectory {
 
     #latestWalk(s, consume, visit) {
         this.#views();
-        this.#claimOwner(s, 0n); // dado_rt__sig_own
+        this.#claimOwner(s, 0n); // dado_rt__chan_own
         const front = this.#take(s, consume);
         if (!consume && front >= 0) {
-            this.#raise(s); // dado_rt__sigl_peeked
+            this.#raise(s); // dado_rt__chanl_peeked
         }
         if (front < 0) {
             return 0;

@@ -62,8 +62,8 @@ not documented thread-safe and nothing in `vendor:enet` claims otherwise
 from one place, the same contract `app:input`'s backend-driven queue
 already has. `send`/`broadcast` are a thin `enet_peer_send`/
 `enet_host_broadcast` call with no queue of their own (unlike
-`app:log`'s per-worker rings and the signals `app:events` became, which
-exist because *sending* — a log call, an `#emit` — happens from arbitrary
+`app:log`'s per-worker rings and the channels `app:events` became, which
+exist because *sending* — a log call, an `#send` — happens from arbitrary
 job-worker code): the
 same single-thread caveat that applies to `poll` applies to these too,
 until/unless a future task (`app`'s own RPC surface, Step 3) adds

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:math
 
 std/math — the parts of C's `<math.h>` a program reaches for.
@@ -39,28 +39,8 @@ folds and diagnoses like every other `when`.
 
 ## Declarations
 
-48 declarations, 48 public.
+48 declarations, 28 public.
 
-* `f64 sqrt(f64 x)`
-* `f64 pow(f64 base, f64 exponent)`
-* `f64 fabs(f64 x)`
-* `f64 fmod(f64 numerator, f64 denominator)`
-* `f64 floor(f64 x)`
-* `f64 ceil(f64 x)`
-* `f64 trunc(f64 x)`
-* `f64 round(f64 x)`
-* `f64 hypot(f64 x, f64 y)`
-* `f64 fma(f64 x, f64 y, f64 z)`
-* `f64 exp(f64 x)`
-* `f64 log(f64 x)`
-* `f64 log2(f64 x)`
-* `f64 log10(f64 x)`
-* `f64 sin(f64 x)`
-* `f64 cos(f64 x)`
-* `f64 tan(f64 x)`
-* `f64 atan2(f64 y, f64 x)`
-* `@macro bool isnan(f64 x)` — The last two are **macros** in the header rather than functions, and the…
-* `@macro bool isinf(f64 x)`
 * `const f64 PI = 3.14159265358979323846`
 * `const f64 TAU = 6.28318530717958647692`
 * `f64 radians(f64 degrees)` — Degrees to radians and back — the conversion every input handler and every…

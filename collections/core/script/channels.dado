@@ -1,0 +1,312 @@
+// core:script — channels delivered to a script's handlers: what a script's
+// `receive(hits, handler)` lowers to, the watch at every safe point, and
+// `#script_pump(vm)`.
+//
+// **Dado only polls; the runtime watches.** A channel is Dado's mailbox, one
+// layout for both dialects. A script's `receive` binds a handler to a package-level
+// channel of the program, and from then on this package is the channel's one
+// consumer: every `#send`, from any thread, sets the channel's bit in the
+// program's bitmap and the any-channel bit, `CHANNEL_ANY`, in the program's
+// flag word (`dado_rt__flags`) — a word of the program's, never the engine's
+// stop word — and touches nothing else. The engine's thread reads the flag
+// word **only at safe points**: a thunk of a bound Dado function returning
+// into the script, a run — a member call, `#script_run`, `#script_new` —
+// leaving the engine, and `#script_pump(vm)`, the host's frame boundary.
+// When it is set the watch clears it, takes this VM's bits from the bitmap,
+// one word per 64 channels, and walks each channel whose bit it took, calling
+// its handler once a message, in the order they were sent, on the
+// engine's thread. So a handler never runs in the middle of script code:
+// delivery waits for a safe point, and one handler runs to completion before
+// the next begins. A safe point reached inside a handler delivers nothing —
+// the watch is not entered twice.
+//
+// **One consumer.** A `receive` claims the channel's owner word for the VM —
+// `8 × (k + 1)` for engine `k`, a multiple of 8 below 1024 that no thread's
+// id can be — so a second `receive` from another VM answers `BUSY`, as does a
+// `receive` of a channel a Dado thread walks (a debug build's walk records its
+// thread there), and a Dado walk of a channel bound to a script traps in a
+// debug build, naming the engine as its consumer. Calling `receive` again from
+// the same VM replaces the handler. A VM's receivers end with its engine: the
+// owner words are cleared, so another VM may `receive` them then.
+//
+// **Several VMs share the bitmap.** A watch takes only its own VM's bits
+// (`fetch_and` with its mask), and when it sees a bit of a channel bound to
+// another VM still set, it sets `CHANNEL_ANY` again, so that VM's next safe
+// point looks too. A channel bound to no script — one Dado walks — is never
+// touched.
+//
+// **What a message carries.** Scalars: each field crosses as a Dado function's
+// answer does, an integer as an `int`, a float as a `float`, a `bool`, a
+// character as a one-character `string`. A channel carrying a `ref` is
+// refused at the script's `receive` (`ERR1214`): a script holds no Dado
+// allocation, and a copy made and ended for every message would hide a cost
+// the channel exists to avoid; the program drains such a channel in Dado and
+// hands the script what it needs.
+package script
+
+// How many channels of a program scripts may bind handlers to: a VM's receivers
+// are one bit each in a `u64`.
+const i32 MAX_CHANNELS = 64
+
+// How many VMs may hold receivers at once: an engine's id in an owner word
+// is a multiple of 8 below 1024.
+private const i64 MAX_RECEIVING = 127
+
+// One channel a script binds a handler to, as the glue's table lays it out: its
+// qualified name, the generated function that drains it into a handler —
+// answering 0, or `STOPPED` with the stop pending in the engine, and adding
+// how many messages it delivered to its last argument — its owner word, and
+// its index in the program's channel directory, which names its bit.
+type ChannelRow: (cstring name, i32(^JSContext, JSValue, ^i64) deliver, rawptr owner, i64 index)
+
+// The glue's table: the program's flag word and bitmap, and its rows in
+// directory order.
+type ChannelTable: (rawptr flags, rawptr bits, i64 count, rawptr rows)
+
+// A VM's receivers: a handler per row it bound, which rows those are,
+// its id while it has any (0 for none), whether a watch is delivering, and
+// the depth of the run a `#script_pump` is, whose leaving looks no more.
+type Receivers:
+    [MAX_CHANNELS]JSValue handlers,
+    u64 rows,
+    i64 id,
+    bool delivering,
+    i32 pumping,
+
+// The rows any VM has bound, one bit each; read by every watch, written
+// under the handle table's lock.
+private u64 g_received
+// Which ids a receiving VM holds, by `id - 1`.
+private [MAX_RECEIVING]bool g_ids
+
+private ^ChannelTable table_of(Engine e):
+    return ^ChannelTable(rawptr(e^.channels))
+
+private ChannelRow channel_row(^ChannelTable t, i64 i):
+    ^ChannelRow at = ^ChannelRow(rawptr(#c.uintptr_t(t^.rows) + #c.uintptr_t(i) * #c.uintptr_t(#size(ChannelRow))))
+    return at^
+
+private ^u32 flags_of(^ChannelTable t):
+    return ^u32(t^.flags)
+
+private ^u64 bits_word(^ChannelTable t, i64 w):
+    return ^u64(rawptr(#c.uintptr_t(t^.bits) + #c.uintptr_t(w) * #c.uintptr_t(8)))
+
+private u64 row_bit(i64 r):
+    return u64(1) << u64(r)
+
+private u64 channel_bit(i64 index):
+    return u64(1) << u64(index % 64)
+
+// ── `receive` ───────────────────────────────────────────────────────────────
+
+// A script's `receive(ch, handler)`: the glue's thunk for the channel at row
+// `row` calls this with the handler. Claims the channel for this VM and keeps
+// the handler; answers `undefined`, or throws — `BUSY` when another VM, or a
+// thread of Dado's, consumes the channel.
+JSValue receive_channel(^JSContext ctx, JSValue handler, i64 row):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    ^ChannelTable t = table_of(e)
+    ChannelRow r = channel_row(t, row)
+    if !JS_IsFunction(ctx, handler):
+        _ = JS_ThrowTypeError(ctx, "`receive` takes the channel and a function to call with each message, and its second argument is no function")
+        return raised()
+    if row >= i64(MAX_CHANNELS):
+        return raise_code(ctx, NO_MEMORY, "`%s` is past the 64 channels a program's scripts may bind handlers to", r.name)
+    if !receiving_id(e):
+        return raise_code(ctx, BUSY, "`%s` cannot be bound: 127 VMs hold receivers already", r.name)
+    ^u64 owner = ^u64(r.owner)
+    u64 mine = u64(e^.receivers.id) * 8
+    (u64 was, bool claimed) = #atomic_compare_exchange(owner, u64(0), mine, false, #ACQ_REL, #ACQUIRE)
+    if !claimed && was != mine:
+        if was < 1024:
+            return raise_code(ctx, BUSY, "`%s` already has a consumer: another VM's script bound a handler to it — a channel has one consumer, so receive it in one VM, or give each VM a channel of its own", r.name)
+        return raise_code(ctx, BUSY, "`%s` already has a consumer: Dado walks it with `#peek` or `#drain` on a thread of its own — a channel has one consumer, so walk it in Dado or bind a script's handler to it, not both", r.name)
+    if (e^.receivers.rows & row_bit(row)) != 0:
+        JS_FreeValue(ctx, e^.receivers.handlers[row])
+    e^.receivers.handlers[row] = JS_DupValue(ctx, handler)
+    e^.receivers.rows = e^.receivers.rows | row_bit(row)
+    table_lock()
+    g_received = g_received | row_bit(row)
+    table_unlock()
+    // What was sent before the `receive` is delivered at the next safe
+    // point, as what comes after it is.
+    _ = #atomic_fetch_or(flags_of(t), u32(1), #RELEASE)
+    return undefined()
+
+// This VM's id for an owner word, taken the first time it binds a handler; false
+// when every id is held.
+private bool receiving_id(Engine e):
+    if e^.receivers.id != 0:
+        return true
+    table_lock()
+    for i in 0..<MAX_RECEIVING:
+        if !g_ids[i]:
+            g_ids[i] = true
+            e^.receivers.id = i + 1
+            table_unlock()
+            return true
+    table_unlock()
+    return false
+
+// The engine's heap is ending: every handler released and every channel it
+// consumed let go of, so another VM may bind a handler to it.
+private void unbind_all(Engine e):
+    if e^.channels == nil || e^.receivers.id == 0:
+        return
+    ^ChannelTable t = table_of(e)
+    u64 mine = u64(e^.receivers.id) * 8
+    for r in 0..<t^.count:
+        if r >= i64(MAX_CHANNELS):
+            break
+        if (e^.receivers.rows & row_bit(r)) == 0:
+            continue
+        JS_FreeValue(e^.ctx, e^.receivers.handlers[r])
+        e^.receivers.handlers[r] = undefined()
+        ^u64 owner = ^u64(channel_row(t, r).owner)
+        _ = #atomic_compare_exchange(owner, mine, u64(0), false, #ACQ_REL, #ACQUIRE)
+    table_lock()
+    g_received = g_received & ~e^.receivers.rows
+    g_ids[e^.receivers.id - 1] = false
+    table_unlock()
+    e^.receivers.rows = 0
+    e^.receivers.id = 0
+
+// ── The watch ───────────────────────────────────────────────────────────────
+
+// Whether a safe point on `e` has anything to look at: the VM bound a
+// handler and the flag word says a mailbox changed. One load when it has.
+private bool flagged(Engine e):
+    if e^.receivers.rows == 0 || e^.receivers.delivering:
+        return false
+    return (#atomic_load(flags_of(table_of(e)), #RELAXED) & u32(1)) != 0
+
+// A safe point's look: `CHANNEL_ANY` cleared, then this VM's bits taken, a
+// word at a time, and each channel whose bit was taken drained into its
+// handler. Answers 0, or `STOPPED` with the stop pending in the engine — the
+// handler that met it was the last one called; `delivered` counts messages.
+private i32 watch(Engine e, ^i64 delivered):
+    if !flagged(e):
+        return 0
+    ^ChannelTable t = table_of(e)
+    _ = #atomic_fetch_and(flags_of(t), ~u32(1), #ACQ_REL)
+    e^.receivers.delivering = true
+    table_lock()
+    u64 others = g_received & ~e^.receivers.rows
+    table_unlock()
+    bool again = false
+    i32 got = 0
+    i64 count = t^.count
+    if count > i64(MAX_CHANNELS):
+        count = i64(MAX_CHANNELS)
+    i64 r = 0
+    for r < count && got == 0:
+        i64 w = channel_row(t, r).index / 64
+        u64 mask = 0
+        u64 theirs = 0
+        i64 end = r
+        for end < count && channel_row(t, end).index / 64 == w:
+            u64 b = channel_bit(channel_row(t, end).index)
+            if (e^.receivers.rows & row_bit(end)) != 0:
+                mask = mask | b
+            else if (others & row_bit(end)) != 0:
+                theirs = theirs | b
+            end += 1
+        if mask != 0 || theirs != 0:
+            ^u64 word = bits_word(t, w)
+            u64 old = 0
+            if mask != 0:
+                old = #atomic_fetch_and(word, ~mask, #ACQ_REL)
+            else:
+                old = #atomic_load(word, #ACQUIRE)
+            if (old & theirs) != 0:
+                again = true
+            for k in r..<end:
+                if got != 0:
+                    break
+                ChannelRow row = channel_row(t, k)
+                if (e^.receivers.rows & row_bit(k)) != 0 && (old & channel_bit(row.index)) != 0:
+                    i64 n = 0
+                    got = row.deliver(e^.ctx, e^.receivers.handlers[k], &n)
+                    if delivered != nil:
+                        delivered^ += n
+        r = end
+    e^.receivers.delivering = false
+    if again:
+        _ = #atomic_fetch_or(flags_of(t), u32(1), #RELEASE)
+    return got
+
+// One message into a handler, from a channel's generated drain: `argv` its
+// fields, which this takes. Answers 0, or `STOPPED` with the stop pending; a
+// handler's own failure is written to the error sink, naming the channel, and
+// the next message goes on.
+i32 deliver_one(^JSContext ctx, JSValue handler, i32 argc, ^JSValue argv, cstring channel):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    JSValue r = JS_Call(ctx, handler, undefined(), argc, argv)
+    for i in 0..<argc:
+        JS_FreeValue(ctx, nth(argv, i))
+    if !is_exception(r):
+        JS_FreeValue(ctx, r)
+        return 0
+    if stop_pending(e):
+        return STOPPED
+    text_begin(e^.err)
+    err_put(e^.err, "script: the handler bound to `")
+    err_put(e^.err, string8(channel))
+    err_put(e^.err, "` failed:\n")
+    report(e)
+    return 0
+
+// Whether the exception pending is the stop — forced, or the polite one the
+// script did not catch — left pending for whoever goes on.
+private bool stop_pending(Engine e):
+    if forced(e):
+        return true
+    JSValue ex = JS_GetException(e^.ctx)
+    bool stopped = false
+    if (word_of(e) & ASK) != 0 && i32(ex.tag) == JS_TAG_OBJECT:
+        JSValue c = JS_GetPropertyStr(e^.ctx, ex, "code")
+        stopped = i32(c.tag) == JS_TAG_INT && c.u.int32 == STOPPED
+        forget_exception(e, c)
+        JS_FreeValue(e^.ctx, c)
+    _ = JS_Throw(e^.ctx, ex)
+    return stopped
+
+// A run leaving: its safe point. A stop met by a handler is the host's own
+// doing, and there is no script frame left to raise it in, so it is dropped.
+private void watch_leaving(Engine e):
+    if e^.receivers.pumping != 0 && e^.receivers.pumping == e^.stop.running:
+        // A pump's own leaving: it looked already, and what it answers is
+        // what that look delivered.
+        e^.receivers.pumping = 0
+        return
+    if !flagged(e) || e^.stop.ended || forced(e):
+        return
+    if watch(e, nil) != 0:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+
+// `#script_pump(vm)`: the host's frame boundary — the VM entered, and every
+// message waiting for its handlers delivered. Answers how many, or, when the
+// VM could not be entered, the reserved code that says why (`THREAD`,
+// `STALE`, `STOPPED`, `BUSY`), a negative number, its text on the error sink.
+i64 pump_engine(rawptr vm):
+    Slot at
+    if !slot_read(vm, &at):
+        no_script(vm)
+        return i64(STALE)
+    Engine e = at.engine
+    try enter(e) else code:
+        return i64(code)
+    // The frame boundary: the crossing counters begin again.
+    frame_begin(e)
+    i64 n = 0
+    i32 got = watch(e, &n)
+    e^.receivers.pumping = e^.stop.running
+    if got != 0:
+        JSValue lost = JS_GetException(e^.ctx)
+        JS_FreeValue(e^.ctx, lost)
+        leave(e)
+        return i64(STOPPED)
+    leave(e)
+    return n

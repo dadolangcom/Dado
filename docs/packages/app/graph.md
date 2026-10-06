@@ -41,7 +41,7 @@ Nodes live in one growable `ref []Slot` the `Graph` owns. A `ref` can
 move when it grows (`resize`), so a raw `^Slot` a caller held across a
 `create`/`add_child`/`remove` call could dangle — the same class of bug
 `app:events` hit for a `rawptr` held past its pointee's lifetime, before
-it gave way to typed signals.
+it gave way to typed channels.
 A `Node` handle is a slot index (stable across a resize) plus a
 generation (bumped when a slot is freed), so a handle held past `remove`
 reads as invalid at the next call rather than silently reaching whatever

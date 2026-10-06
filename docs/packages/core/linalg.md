@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.2 -->
+<!-- commit 7e1d5137cae1 (dirty) -->
 # core:linalg
 
 std/linalg — vector and matrix maths, written once, over generics.
@@ -55,14 +55,8 @@ function, because a tag is not in the C.
 
 ## Declarations
 
-49 declarations, 49 public.
+49 declarations, 43 public.
 
-* `f64 sqrt(f64 x)`
-* `f64 sin(f64 x)`
-* `f64 cos(f64 x)`
-* `f64 tan(f64 x)`
-* `f64 acos(f64 x)`
-* `f64 atan2(f64 y, f64 x)`
 * `$T dot([$N]T a, [N]T b) where T is scalar` — The dot product: the sum of the products of corresponding slots.
 * `[3]$T cross([3]T a, [3]T b) where T is scalar` — The cross product, which is **three-dimensional and nothing else** — GLSL's…
 * `[N,N]$T outer_product([$N]T a, [N]T b) where T is scalar` — The outer product `a bᵀ` — GLSL's `outerProduct`. An N-vector against an…

@@ -7,6 +7,10 @@
 #
 #   --dir <folder>     install there instead of ~/dado
 #   --version <x.y.z>  that release instead of the latest
+#
+# With no --version it takes the latest stable release, and while there is none
+# (every release so far a prerelease) the newest prerelease, asked of GitHub's
+# releases API.
 #   anything else      passed on to dadoc bootstrap (e.g. --yes, --no-path)
 #
 # With sh reading the script from a pipe, pass options as: ... | sh -s -- --dir ~/tools/dado
@@ -52,14 +56,34 @@ if [ -e "$dir/dadoc" ]; then
     die "$dir already holds a Dado install: run \`dado upgrade\` there, or pass --dir for another folder"
 fi
 
+# The newest release's tag, prereleases included: GitHub's API lists a
+# repository's releases newest first, and drafts only to its owners. Answers
+# nothing when the API cannot be reached or $base is not a GitHub repository.
+newest_tag() {
+    api=${DADO_RELEASE_API:-}
+    if [ -z "$api" ]; then
+        case "$base" in
+            https://github.com/*/*/releases) repo=${base#https://github.com/}; api="https://api.github.com/repos/${repo%/releases}/releases" ;;
+            *) return 0 ;;
+        esac
+    fi
+    curl -fsSL -H 'Accept: application/vnd.github+json' "$api?per_page=1" 2>/dev/null | tr ',' '\n' |
+        sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/dado-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
 say "downloading $asset"
-if ! curl -fsSL "$url/$asset" -o "$tmp/$asset"; then
+if [ -n "$version" ]; then
+    curl -fsSL "$url/$asset" -o "$tmp/$asset" || die "cannot download $url/$asset"
+elif ! curl -fsSL "$url/$asset" -o "$tmp/$asset" 2>/dev/null; then
     # `latest` names the newest stable release and skips prereleases, so
-    # before the first stable one it answers 404.
-    [ -n "$version" ] || die "cannot download $url/$asset: there may be no stable release yet; pass a version from $base, for example: ... | sh -s -- --version 1.0.0-rc.2"
-    die "cannot download $url/$asset"
+    # before the first stable one it answers 404: take the newest prerelease.
+    tag=$(newest_tag)
+    [ -n "$tag" ] || die "cannot download $url/$asset, and found no prerelease to fall back to; pass a version from $base, for example: ... | sh -s -- --version 1.0.0-rc.3"
+    url="$base/download/$tag"
+    say "there is no stable release yet: downloading the newest prerelease, $tag"
+    curl -fsSL "$url/$asset" -o "$tmp/$asset" || die "cannot download $url/$asset"
 fi
 curl -fsSL "$url/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "cannot download $url/SHA256SUMS"
 want=$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp/SHA256SUMS")
