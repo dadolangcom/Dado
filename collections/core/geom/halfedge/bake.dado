@@ -1,0 +1,195 @@
+// The bake: a mesh to triangle buffers.
+package halfedge
+
+import "core:linalg"
+import "core:geom/earcut"
+import "core:geom/polygon"
+
+// A mesh as triangle buffers: parallel per-vertex runs (positions, normals, uvs, and tangents with
+// their handedness in w) and a triangle index run. Made by `bake_geometry`, ended by
+// `baked_destroy`.
+type Baked:
+    ref [][3]f32 positions
+    ref [][3]f32 normals
+    ref [][2]f32 uvs
+    ref [][4]f32 tangents
+    ref []u32 indices
+
+// Frees a bake's runs and leaves it empty.
+#assert_raises
+void baked_destroy(^Baked b):
+    #delete(b.positions)
+    #delete(b.normals)
+    #delete(b.uvs)
+    #delete(b.tangents)
+    #delete(b.indices)
+
+// The bake's working runs, made once per bake and reused for every face.
+private type FaceWork:
+    ref [][3]f64 positions
+    ref []f64 flat       // the loop in its own plane, x then y per corner, as earcut reads it
+    ref [][3]i64 tris    // the answer: triangles of loop positions
+
+private !FaceWork face_work_make():
+    FaceWork w
+    defer fail face_work_destroy(&w)
+    w.positions = #make([][3]f64, 0)
+    w.flat = #make([]f64, 0)
+    w.tris = #make([][3]i64, 0)
+    if w.positions == nil || w.flat == nil || w.tris == nil:
+        fail NO_MEMORY
+    return w
+
+private void face_work_destroy(^FaceWork w):
+    #delete(w.positions)
+    #delete(w.flat)
+    #delete(w.tris)
+
+// The projected quad in `w.flat` as two counter-clockwise triangles: split along the diagonal
+// from corner 1 to 3 when corners 0 and 2 are convex, else along the one from 0 to 2. Most faces
+// of a box or a prism are quads, and this spares them earcut's setup.
+private !void split_quad(^FaceWork w):
+    [2]f64 p0 = [w.flat[0], w.flat[1]]
+    [2]f64 p1 = [w.flat[2], w.flat[3]]
+    [2]f64 p2 = [w.flat[4], w.flat[5]]
+    [2]f64 p3 = [w.flat[6], w.flat[7]]
+    bool ok = true
+    if cross2(p3, p0, p1) > 0.0 && cross2(p1, p2, p3) > 0.0:
+        ok = #append(w.tris, [3, 0, 1]) && #append(w.tris, [1, 2, 3])
+    else:
+        ok = #append(w.tris, [0, 1, 2]) && #append(w.tris, [0, 2, 3])
+    if !ok:
+        fail NO_MEMORY
+
+// The z of (b - a) x (c - b): above zero when a, b, c turn counter-clockwise.
+private f64 cross2([2]f64 a, [2]f64 b, [2]f64 c):
+    return (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+
+// A planar, possibly concave loop triangulated into `w.tris`, triangles of loop positions (not
+// vertex ids), counter-clockwise about the loop's normal: a quad by `split_quad`, a longer loop by
+// `core:geom/earcut`. Earcut leaves zero-area triangles out, so a loop with a corner on a straight
+// edge can answer fewer than n - 2.
+private !void triangulate_loop(^const Mesh m, []i64 loop, ^FaceWork w):
+    #truncate(w.tris, 0)
+    i64 n = #len(loop)
+    if n < 3:
+        return
+    if n == 3:
+        if !#append(w.tris, [0, 1, 2]):
+            fail NO_MEMORY
+        return
+    if !#resize(w.positions, n) || !#resize(w.flat, 2 * n):
+        fail NO_MEMORY
+    for v, i in loop:
+        w.positions[i] = m.vertices[v].position
+    // Projected into the loop's own plane with bit = nrm x tan, the loop stays CCW.
+    [3]f64 nrm = polygon.normal(w.positions[:])
+    ([3]f64 tangent, [3]f64 bit) = plane_axes(nrm)
+    for i in 0..<n:
+        [3]f64 rel = w.positions[i] - w.positions[0]
+        w.flat[2 * i] = linalg.dot(rel, tangent)
+        w.flat[2 * i + 1] = linalg.dot(rel, bit)
+    if n == 4:
+        try split_quad(w)
+        return
+    // With two coordinates per corner and no holes, earcut's only failure is NO_MEMORY.
+    []u32 no_holes
+    try ref []u32 idx = earcut.triangulate(w.flat[:], no_holes) else:
+        fail NO_MEMORY
+    defer #delete(idx)
+    for t in 0..<#len(idx) / 3:
+        if !#append(w.tris, [i64(idx[3 * t]), i64(idx[3 * t + 1]), i64(idx[3 * t + 2])]):
+            fail NO_MEMORY
+
+// Below this |det| a triangle's UVs are degenerate and its tangent is any axis orthogonal to n.
+private const f64 UV_DET_MIN = 0.000000000001
+private const f64 TANGENT_MIN = 0.000000000001
+
+// The triangle's tangent from its UV gradient, orthonormalised against n; w is the handedness.
+private [4]f64 triangle_tangent([3]f64 p0, [3]f64 p1, [3]f64 p2, [2]f64 uv0, [2]f64 uv1, [2]f64 uv2, [3]f64 n):
+    [3]f64 e1 = p1 - p0
+    [3]f64 e2 = p2 - p0
+    [2]f64 du1 = uv1 - uv0
+    [2]f64 du2 = uv2 - uv0
+    f64 det = du1.x * du2.y - du2.x * du1.y
+    if det < UV_DET_MIN && det > -UV_DET_MIN:
+        [3]f64 axis = [1.0, 0.0, 0.0]
+        if n.x > 0.9 || n.x < -0.9:
+            axis = [0.0, 1.0, 0.0]
+        [3]f64 t = linalg.normalize(linalg.cross(axis, n))
+        return [t.x, t.y, t.z, 1.0]
+    f64 r = 1.0 / det
+    [3]f64 t = (e1 * du2.y - e2 * du1.y) * r
+    [3]f64 b = (e2 * du1.x - e1 * du2.x) * r
+    t = t - n * linalg.dot(n, t)
+    if linalg.length(t) > TANGENT_MIN:
+        t = linalg.normalize(t)
+    f64 w = -1.0 if linalg.dot(linalg.cross(n, t), b) < 0.0 else 1.0
+    return [t.x, t.y, t.z, w]
+
+private bool push_vertex(^Baked out, [3]f64 pos, [3]f64 n, [2]f64 uv, [4]f64 tangent):
+    bool ok = #append(out.positions, [f32(pos.x), f32(pos.y), f32(pos.z)])
+    ok = ok && #append(out.normals, [f32(n.x), f32(n.y), f32(n.z)])
+    ok = ok && #append(out.uvs, [f32(uv.x), f32(uv.y)])
+    return ok && #append(out.tangents, [f32(tangent.x), f32(tangent.y), f32(tangent.z), f32(tangent.w)])
+
+// The mesh as indexed triangles: each face triangulated (faces may be concave; past four corners
+// by `core:geom/earcut`), and each corner a triangle uses emitted once per face, so a face keeps
+// its flat normal and its own UVs. A corner on a straight edge of its face may be in no triangle,
+// and is then not emitted. On `#default`; the caller ends it with `baked_destroy`. Fails with
+// NO_MEMORY.
+!Baked bake_geometry(^const Mesh m):
+    Baked out
+    defer fail baked_destroy(&out)
+    out.positions = #make([][3]f32, 0)
+    out.normals = #make([][3]f32, 0)
+    out.uvs = #make([][2]f32, 0)
+    out.tangents = #make([][4]f32, 0)
+    out.indices = #make([]u32, 0)
+    if out.positions == nil || out.normals == nil || out.uvs == nil || out.tangents == nil || out.indices == nil:
+        fail NO_MEMORY
+    try ref []i64 fv = #make([]i64, 0) else NO_MEMORY
+    defer #delete(fv)
+    try ref []i64 fe = #make([]i64, 0) else NO_MEMORY
+    defer #delete(fe)
+    // The baked index of each corner of this face (by loop position), or -1 before it is emitted.
+    try ref []i64 baked_at = #make([]i64, 0) else NO_MEMORY
+    defer #delete(baked_at)
+    try FaceWork w = face_work_make()
+    defer face_work_destroy(&w)
+    for f in 0..<#len(m.faces):
+        #truncate(fv, 0)
+        #truncate(fe, 0)
+        i64 start = m.faces[f].half_edge
+        i64 cur = start
+        for true:
+            if !#append(fv, m.edges[cur].vertex) || !#append(fe, cur):
+                fail NO_MEMORY
+            cur = m.edges[cur].next
+            if cur == start:
+                break
+        if #len(fv) < 3:
+            continue
+        if !#resize(baked_at, #len(fv)):
+            fail NO_MEMORY
+        for k in 0..<#len(baked_at):
+            baked_at[k] = -1
+        try triangulate_loop(m, fv[:], &w)
+        for t in w.tris:
+            [3]i64 tv = [fv[t[0]], fv[t[1]], fv[t[2]]]
+            [3]i64 te = [fe[t[0]], fe[t[1]], fe[t[2]]]
+            [3]f64 p0 = m.vertices[tv[0]].position
+            [3]f64 p1 = m.vertices[tv[1]].position
+            [3]f64 p2 = m.vertices[tv[2]].position
+            [3]f64 n = linalg.normalize(linalg.cross(p1 - p0, p2 - p0))
+            [4]f64 tangent = triangle_tangent(p0, p1, p2, m.edges[te[0]].uv, m.edges[te[1]].uv, m.edges[te[2]].uv, n)
+            for k in 0..<3:
+                i64 found = baked_at[t[k]]
+                if found < 0:
+                    found = #len(out.positions)
+                    if !push_vertex(&out, m.vertices[tv[k]].position, n, m.edges[te[k]].uv, tangent):
+                        fail NO_MEMORY
+                    baked_at[t[k]] = found
+                if !#append(out.indices, u32(found)):
+                    fail NO_MEMORY
+    return out

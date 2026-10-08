@@ -1,0 +1,429 @@
+// The half-edge mesh the sweep works on. Every record comes from the
+// tesselator's arena; a kill unlinks it and the arena takes it back later.
+package tess
+
+import "core:mem/arena"
+
+private type Vertex:
+    ^Vertex next
+    ^Vertex prev
+    ^HalfEdge an_edge
+    [3]f64 coords
+    f64 s
+    f64 t
+    i32 pq_handle
+    i32 n
+    i32 idx
+
+private type Face:
+    ^Face next
+    ^Face prev
+    ^HalfEdge an_edge
+    ^Face trail
+    i32 n
+    i8 marked
+    i8 inside
+
+private type HalfEdge:
+    ^HalfEdge next   // the edge list; a pair's second half links the other way
+    ^HalfEdge sym
+    ^HalfEdge onext
+    ^HalfEdge lnext
+    ^Vertex org
+    ^Face lface
+    ^Region active_region
+    i32 winding
+    i32 mark
+    bool second      // the pair's second half
+
+// The two halves of an edge are made, and freed, as one.
+private type EdgePair:
+    HalfEdge e
+    HalfEdge e_sym
+
+private type Mesh:
+    Vertex v_head
+    Face f_head
+    HalfEdge e_head
+    HalfEdge e_head_sym
+    ^arena.Arena ar
+
+private ^Face rface(^HalfEdge e):
+    return e.sym.lface
+
+private ^Vertex dst(^HalfEdge e):
+    return e.sym.org
+
+private ^HalfEdge oprev(^HalfEdge e):
+    return e.sym.lnext
+
+private ^HalfEdge lprev(^HalfEdge e):
+    return e.onext.sym
+
+private ^HalfEdge rprev(^HalfEdge e):
+    return e.sym.onext
+
+private ^HalfEdge dnext(^HalfEdge e):
+    return rprev(e).sym
+
+private ^HalfEdge first_half(^HalfEdge e):
+    return e.sym if e.second else e
+
+private ^HalfEdge make_edge(^Mesh mesh, ^HalfEdge e_next_in):
+    ^EdgePair pair = #new(EdgePair, arena.allocator(mesh.ar))
+    if pair == nil:
+        return nil
+    ^HalfEdge e = &pair.e
+    ^HalfEdge e_sym = &pair.e_sym
+    e_sym.second = true
+
+    ^HalfEdge e_next = first_half(e_next_in)
+    ^HalfEdge e_prev = e_next.sym.next
+    e_sym.next = e_prev
+    e_prev.sym.next = e
+    e.next = e_next
+    e_next.sym.next = e_sym
+
+    e.sym = e_sym
+    e.onext = e
+    e.lnext = e_sym
+    e_sym.sym = e
+    e_sym.onext = e_sym
+    e_sym.lnext = e
+    return e
+
+private void splice(^HalfEdge a, ^HalfEdge b):
+    ^HalfEdge a_onext = a.onext
+    ^HalfEdge b_onext = b.onext
+    a_onext.sym.lnext = b
+    b_onext.sym.lnext = a
+    a.onext = b_onext
+    b.onext = a_onext
+
+private void make_vertex(^Vertex v_new, ^HalfEdge e_orig, ^Vertex v_next):
+    ^Vertex v_prev = v_next.prev
+    v_new.prev = v_prev
+    v_prev.next = v_new
+    v_new.next = v_next
+    v_next.prev = v_new
+    v_new.an_edge = e_orig
+    ^HalfEdge e = e_orig
+    for true:
+        e.org = v_new
+        e = e.onext
+        if e == e_orig:
+            break
+
+private void make_face(^Face f_new, ^HalfEdge e_orig, ^Face f_next):
+    ^Face f_prev = f_next.prev
+    f_new.prev = f_prev
+    f_prev.next = f_new
+    f_new.next = f_next
+    f_next.prev = f_new
+    f_new.an_edge = e_orig
+    f_new.trail = nil
+    f_new.marked = 0
+    f_new.inside = f_next.inside
+    ^HalfEdge e = e_orig
+    for true:
+        e.lface = f_new
+        e = e.lnext
+        if e == e_orig:
+            break
+
+private void kill_edge(^HalfEdge e_del_in):
+    ^HalfEdge e_del = first_half(e_del_in)
+    ^HalfEdge e_next = e_del.next
+    ^HalfEdge e_prev = e_del.sym.next
+    e_next.sym.next = e_prev
+    e_prev.sym.next = e_next
+
+private void kill_vertex(^Vertex v_del, ^Vertex new_org):
+    ^HalfEdge e_start = v_del.an_edge
+    ^HalfEdge e = e_start
+    for true:
+        e.org = new_org
+        e = e.onext
+        if e == e_start:
+            break
+    ^Vertex v_prev = v_del.prev
+    ^Vertex v_next = v_del.next
+    v_next.prev = v_prev
+    v_prev.next = v_next
+
+private void kill_face(^Face f_del, ^Face new_lface):
+    ^HalfEdge e_start = f_del.an_edge
+    ^HalfEdge e = e_start
+    for true:
+        e.lface = new_lface
+        e = e.lnext
+        if e == e_start:
+            break
+    ^Face f_prev = f_del.prev
+    ^Face f_next = f_del.next
+    f_next.prev = f_prev
+    f_prev.next = f_next
+
+private ^Vertex new_vertex(^Mesh mesh):
+    ^Vertex v = #new(Vertex, arena.allocator(mesh.ar))
+    return v
+
+private ^Face new_face(^Mesh mesh):
+    ^Face f = #new(Face, arena.allocator(mesh.ar))
+    return f
+
+// A loop of one edge: two vertices and one face.
+private ^HalfEdge mesh_make_edge(^Mesh mesh):
+    ^Vertex v1 = new_vertex(mesh)
+    ^Vertex v2 = new_vertex(mesh)
+    ^Face f = new_face(mesh)
+    if v1 == nil || v2 == nil || f == nil:
+        return nil
+    ^HalfEdge e = make_edge(mesh, &mesh.e_head)
+    if e == nil:
+        return nil
+    make_vertex(v1, e, &mesh.v_head)
+    make_vertex(v2, e.sym, &mesh.v_head)
+    make_face(f, e, &mesh.f_head)
+    return e
+
+private bool mesh_splice(^Mesh mesh, ^HalfEdge e_org, ^HalfEdge e_dst):
+    if e_org == e_dst:
+        return true
+    bool joining_vertices = false
+    bool joining_loops = false
+    if e_dst.org != e_org.org:
+        joining_vertices = true
+        kill_vertex(e_dst.org, e_org.org)
+    if e_dst.lface != e_org.lface:
+        joining_loops = true
+        kill_face(e_dst.lface, e_org.lface)
+
+    splice(e_dst, e_org)
+
+    if !joining_vertices:
+        ^Vertex v = new_vertex(mesh)
+        if v == nil:
+            return false
+        make_vertex(v, e_dst, e_org.org)
+        e_org.org.an_edge = e_org
+    if !joining_loops:
+        ^Face f = new_face(mesh)
+        if f == nil:
+            return false
+        make_face(f, e_dst, e_org.lface)
+        e_org.lface.an_edge = e_org
+    return true
+
+private bool mesh_delete(^Mesh mesh, ^HalfEdge e_del):
+    ^HalfEdge e_del_sym = e_del.sym
+    bool joining_loops = false
+
+    if e_del.lface != rface(e_del):
+        joining_loops = true
+        kill_face(e_del.lface, rface(e_del))
+
+    if e_del.onext == e_del:
+        kill_vertex(e_del.org, nil)
+    else:
+        ^Face rf = rface(e_del)   // a local: a write through a call's ^T result is refused (ERR0606)
+        rf.an_edge = oprev(e_del)
+        e_del.org.an_edge = e_del.onext
+        splice(e_del, oprev(e_del))
+        if !joining_loops:
+            ^Face f = new_face(mesh)
+            if f == nil:
+                return false
+            make_face(f, e_del, e_del.lface)
+
+    if e_del_sym.onext == e_del_sym:
+        kill_vertex(e_del_sym.org, nil)
+        kill_face(e_del_sym.lface, nil)
+    else:
+        e_del.lface.an_edge = oprev(e_del_sym)
+        e_del_sym.org.an_edge = e_del_sym.onext
+        splice(e_del_sym, oprev(e_del_sym))
+
+    kill_edge(e_del)
+    return true
+
+private ^HalfEdge mesh_add_edge_vertex(^Mesh mesh, ^HalfEdge e_org):
+    ^HalfEdge e_new = make_edge(mesh, e_org)
+    if e_new == nil:
+        return nil
+    ^HalfEdge e_new_sym = e_new.sym
+    splice(e_new, e_org.lnext)
+    e_new.org = dst(e_org)
+    ^Vertex v = new_vertex(mesh)
+    if v == nil || e_new.org == nil:
+        return nil
+    make_vertex(v, e_new_sym, e_new.org)
+    e_new.lface = e_org.lface
+    e_new_sym.lface = e_org.lface
+    return e_new
+
+private ^HalfEdge mesh_split_edge(^Mesh mesh, ^HalfEdge e_org):
+    ^HalfEdge tmp = mesh_add_edge_vertex(mesh, e_org)
+    if tmp == nil:
+        return nil
+    ^HalfEdge e_new = tmp.sym
+    splice(e_org.sym, oprev(e_org.sym))
+    splice(e_org.sym, e_new)
+    e_org.sym.org = e_new.org
+    e_new.sym.org.an_edge = e_new.sym
+    e_new.sym.lface = rface(e_org)
+    e_new.winding = e_org.winding
+    e_new.sym.winding = e_org.sym.winding
+    return e_new
+
+private ^HalfEdge mesh_connect(^Mesh mesh, ^HalfEdge e_org, ^HalfEdge e_dst):
+    ^HalfEdge e_new = make_edge(mesh, e_org)
+    if e_new == nil:
+        return nil
+    ^HalfEdge e_new_sym = e_new.sym
+    bool joining_loops = false
+    if e_dst.lface != e_org.lface:
+        joining_loops = true
+        kill_face(e_dst.lface, e_org.lface)
+
+    splice(e_new, e_org.lnext)
+    splice(e_new_sym, e_dst)
+
+    e_new.org = dst(e_org)
+    e_new_sym.org = e_dst.org
+    e_new.lface = e_org.lface
+    e_new_sym.lface = e_org.lface
+    e_org.lface.an_edge = e_new_sym
+
+    if !joining_loops:
+        ^Face f = new_face(mesh)
+        if f == nil:
+            return nil
+        make_face(f, e_new, e_org.lface)
+    return e_new
+
+private void mesh_zap_face(^Mesh mesh, ^Face f_zap):
+    ^HalfEdge e_start = f_zap.an_edge
+    ^HalfEdge e_next = e_start.lnext
+    for true:
+        ^HalfEdge e = e_next
+        e_next = e.lnext
+        e.lface = nil
+        if rface(e) == nil:
+            if e.onext == e:
+                kill_vertex(e.org, nil)
+            else:
+                e.org.an_edge = e.onext
+                splice(e, oprev(e))
+            ^HalfEdge e_sym = e.sym
+            if e_sym.onext == e_sym:
+                kill_vertex(e_sym.org, nil)
+            else:
+                e_sym.org.an_edge = e_sym.onext
+                splice(e_sym, oprev(e_sym))
+            kill_edge(e)
+        if e == e_start:
+            break
+    ^Face f_prev = f_zap.prev
+    ^Face f_next = f_zap.next
+    f_next.prev = f_prev
+    f_prev.next = f_next
+
+private ^Mesh mesh_new(^arena.Arena ar):
+    ^Mesh mesh = #new(Mesh, arena.allocator(ar))
+    if mesh == nil:
+        return nil
+    mesh.ar = ar
+    ^Vertex v = &mesh.v_head
+    ^Face f = &mesh.f_head
+    ^HalfEdge e = &mesh.e_head
+    ^HalfEdge e_sym = &mesh.e_head_sym
+    v.next = v
+    v.prev = v
+    f.next = f
+    f.prev = f
+    e.next = e
+    e.sym = e_sym
+    e_sym.next = e_sym
+    e_sym.sym = e
+    e_sym.second = true
+    return mesh
+
+private i32 count_face_verts(^Face f):
+    ^HalfEdge cur = f.an_edge
+    i32 n = 0
+    for true:
+        n += 1
+        cur = cur.lnext
+        if cur == f.an_edge:
+            break
+    return n
+
+private bool mesh_merge_convex_faces(^Mesh mesh, i32 max_verts_per_face):
+    ^HalfEdge e_head = &mesh.e_head
+    ^HalfEdge e = e_head.next
+    for e != e_head:
+        ^HalfEdge e_next = e.next
+        ^HalfEdge e_sym = e.sym
+        if e_sym == nil || e.lface == nil || e.lface.inside == 0 || e_sym.lface == nil || e_sym.lface.inside == 0:
+            e = e_next
+            continue
+        i32 left_nv = count_face_verts(e.lface)
+        i32 right_nv = count_face_verts(e_sym.lface)
+        if left_nv + right_nv - 2 > max_verts_per_face:
+            e = e_next
+            continue
+        ^Vertex va = lprev(e).org
+        ^Vertex vb = e.org
+        ^Vertex vc = dst(e.sym.lnext)
+        ^Vertex vd = lprev(e.sym).org
+        ^Vertex ve = e.sym.org
+        ^Vertex vf = dst(e.lnext)
+        if vert_ccw(va, vb, vc) && vert_ccw(vd, ve, vf):
+            if e == e_next || e == e_next.sym:
+                e_next = e_next.next
+            if !mesh_delete(mesh, e):
+                return false
+        e = e_next
+    return true
+
+private void mesh_flip_edge(^HalfEdge edge):
+    ^HalfEdge a0 = edge
+    ^HalfEdge a1 = a0.lnext
+    ^HalfEdge a2 = a1.lnext
+    ^HalfEdge b0 = edge.sym
+    ^HalfEdge b1 = b0.lnext
+    ^HalfEdge b2 = b1.lnext
+
+    ^Vertex a_org = a0.org
+    ^Vertex a_opp = a2.org
+    ^Vertex b_org = b0.org
+    ^Vertex b_opp = b2.org
+    ^Face fa = a0.lface
+    ^Face fb = b0.lface
+
+    a0.org = b_opp
+    a0.onext = b1.sym
+    b0.org = a_opp
+    b0.onext = a1.sym
+    a2.onext = b0
+    b2.onext = a0
+    b1.onext = a2.sym
+    a1.onext = b2.sym
+
+    a0.lnext = a2
+    a2.lnext = b1
+    b1.lnext = a0
+    b0.lnext = b2
+    b2.lnext = a1
+    a1.lnext = b0
+
+    a1.lface = fb
+    b1.lface = fa
+    fa.an_edge = a0
+    fb.an_edge = b0
+
+    if a_org.an_edge == a0:
+        a_org.an_edge = b1
+    if b_org.an_edge == b0:
+        b_org.an_edge = a1

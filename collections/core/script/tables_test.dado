@@ -1,0 +1,204 @@
+@test
+// The engine's own tables grow on its allocator, with no count fixed in
+// advance:
+//
+// * **Modules.** 200 embedded modules are registered in one engine, and 100
+//   of them are loaded by name into it, each compiled and its namespace held.
+// * **Values held.** Those 100 namespaces and 300 objects are held at once,
+//   400 handles, and each answers its own call.
+// * **Values let go of during a run.** 300 values let go of while a run is
+//   in progress wait, and all of them are released when it leaves.
+// * **Everything goes back.** Once the engine's heap is ended, as a forced
+//   stop ends it, the only block left is the engine's state, every table
+//   freed with the heap; once its state is freed, nothing is left.
+// * **A refusal is `NO_MEMORY`, with its text.** A table that cannot grow
+//   because the allocator refuses fails the call, and says which table.
+//
+// On the web a hand-registered module is never loaded (the page's engine
+// loads the program's scripts by their files), so there the modules are
+// registered but not loaded, and the values held are arrays.
+package script
+
+import "core:fmt"
+import "core:io"
+import "core:mem"
+import "core:mem/libc"
+
+private const cstring BOX_JS = """
+    export class Box {
+        constructor(n) { this.n = n; }
+        get() { return this.n; }
+    }
+    """
+
+private const i64 MODULES = 200
+private const i64 LOADED = 100
+private const i64 OBJECTS = 300
+private const i64 LET_GO = 300
+
+// ── a counting allocator over C's heap, which may be told to refuse ─────────
+
+private i64 g_blocks
+private bool g_refuse
+
+private rawptr counting(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) c = libc.allocator()
+    switch mode:
+        case mem.AllocatorMode.Alloc:
+            if g_refuse:
+                return nil
+            rawptr p = c.proc(c.data, mode, nbytes, align, old, old_size)
+            if p != nil:
+                g_blocks += 1
+            return p
+        case mem.AllocatorMode.Resize:
+            if g_refuse:
+                return nil
+            if old == nil:
+                rawptr p = c.proc(c.data, mode, nbytes, align, old, old_size)
+                if p != nil:
+                    g_blocks += 1
+                return p
+            return c.proc(c.data, mode, nbytes, align, old, old_size)
+        case mem.AllocatorMode.Free:
+            if old != nil:
+                g_blocks -= 1
+            return c.proc(c.data, mode, nbytes, align, old, old_size)
+        case mem.AllocatorMode.FreeAll:
+            return nil
+        else:
+            return nil
+
+when #OS == #WEB:
+    private bool loads_modules():
+        return false
+
+else:
+    private bool loads_modules():
+        return true
+
+// ── the names: "m000" to "m199", each a C string in one block ───────────────
+
+private [1000]char8 g_names
+
+private cstring name_of(i64 i):
+    return cstring(rawptr(&g_names[i * 5]))
+
+private void make_names():
+    for i in 0..<MODULES:
+        g_names[i * 5] = 'm'
+        g_names[i * 5 + 1] = char8(i32('0') + i32(i / 100))
+        g_names[i * 5 + 2] = char8(i32('0') + i32((i / 10) % 10))
+        g_names[i * 5 + 3] = char8(i32('0') + i32(i % 10))
+        g_names[i * 5 + 4] = char8(0)
+
+private [512]char8 err_store
+private fmt.Cursor err_c
+
+private bool said(string8 part):
+    string8 text = fmt.written(err_c)
+    i64 n = #len(part)
+    for i in 0..=(#len(text) - n):
+        if text[i..<i + n] == part:
+            return true
+    return false
+
+i32 test():
+    bool ok = true
+    make_names()
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = (counting, nil)
+    try Engine e = create(alloc) else code:
+        _ = #expect(false, "create failed with ", code)
+        return 1
+    err_c = fmt.over(err_store[:])
+    set_sinks(e, io.stdout_sink(), fmt.to_bytes(&err_c))
+
+    // 200 modules registered.
+    for i in 0..<MODULES:
+        try add_module(e, name_of(i), BOX_JS) else code:
+            _ = #expect(false, "add_module ", i, " failed with ", code, ": ", fmt.written(err_c))
+            destroy(e)
+            return 1
+    ok = #expect(e^.nmodules == i32(MODULES), "registered ", e^.nmodules, " modules, not ", MODULES) && ok
+
+    // 100 of them loaded, then 300 objects made and held beside them.
+    [OBJECTS]Handle objects
+    i64 made = 0
+    if loads_modules():
+        [LOADED]Handle spaces
+        for i in 0..<LOADED:
+            try Handle m = module_of(e, name_of(i)) else code:
+                _ = #expect(false, "loading module ", i, " failed with ", code, ": ", fmt.written(err_c))
+                destroy(e)
+                return 1
+            spaces[i] = m
+        ok = #expect(e^.nloaded == i32(LOADED), "loaded ", e^.nloaded, " modules, not ", LOADED) && ok
+        i64 compiled = 0
+        for i in 0..<e^.nmodules:
+            if compiled_at(e, i)^ != nil:
+                compiled += 1
+        ok = #expect(compiled == LOADED, "compiled ", compiled, " modules, not ", LOADED) && ok
+        for i in 0..<OBJECTS:
+            arg_i64(e, i)
+            try Handle o = construct(e, spaces[i % LOADED], "Box") else code:
+                _ = #expect(false, "construct ", i, " failed with ", code, ": ", fmt.written(err_c))
+                destroy(e)
+                return 1
+            objects[i] = o
+            made += 1
+        for i in 0..<OBJECTS:
+            try call_method(e, objects[i], "get") else code:
+                _ = #expect(false, "get ", i, " failed with ", code, ": ", fmt.written(err_c))
+                destroy(e)
+                return 1
+            try i64 n = result_i64(e) else _:
+                return 1
+            ok = #expect(n == i, "object ", i, " answered ", n) && ok
+    else:
+        for i in 0..<OBJECTS:
+            try Handle o = keep(e, JS_NewArray(e^.ctx)) else code:
+                _ = #expect(false, "keep ", i, " failed with ", code, ": ", fmt.written(err_c))
+                destroy(e)
+                return 1
+            objects[i] = o
+            made += 1
+    ok = #expect(made == OBJECTS, "held ", made, " objects") && ok
+    // Every handle is its own.
+    for i in 1..<OBJECTS:
+        ok = #expect(objects[i] != objects[i - 1], "objects ", i - 1, " and ", i, " share a handle") && ok
+    for i in 0..<OBJECTS:
+        release(e, objects[i])
+
+    // 300 values let go of during a run wait for it to leave.
+    for i in 0..<LET_GO:
+        release_later(e, JS_NewArray(e^.ctx))
+    ok = #expect(e^.stop.nreleases == i32(LET_GO), "waiting: ", e^.stop.nreleases) && ok
+    release_waiting(e)
+    ok = #expect(e^.stop.nreleases == 0, "still waiting: ", e^.stop.nreleases) && ok
+
+    // The heap ended as a forced stop ends it, then the state freed: the
+    // allocator holds nothing.
+    end_engine(e)
+    e^.stop.ended = true
+    ok = #expect(g_blocks == 1, "an ended engine holds ", g_blocks, " block(s), not its state alone") && ok
+    destroy(e)
+    ok = #expect(g_blocks == 0, "blocks left after destroy: ", g_blocks) && ok
+
+    // A table that cannot grow: `NO_MEMORY`, and the text says which.
+    try Engine f = create(alloc) else code:
+        _ = #expect(false, "create failed with ", code)
+        return 1
+    err_c = fmt.over(err_store[:])
+    set_sinks(f, io.stdout_sink(), fmt.to_bytes(&err_c))
+    g_refuse = true
+    i32 got = 0
+    for i in 0..<MODULES:
+        try add_module(f, name_of(i), BOX_JS) else code:
+            got = code
+            break
+    g_refuse = false
+    ok = #expect(got == NO_MEMORY, "a refused table answered ", got) && ok
+    ok = #expect(said("script: no memory for the module table"), "the refusal said: ", fmt.written(err_c)) && ok
+    destroy(f)
+    ok = #expect(g_blocks == 0, "blocks left after the refused engine: ", g_blocks) && ok
+    return 0 if ok else 1

@@ -1,0 +1,588 @@
+// Polygon tessellation with winding rules.
+//
+// A port of libtess2 (SGI Free Software License B; the notice is in this
+// directory's LICENSE). Contours of any winding, overlapping or
+// self-intersecting, go in; the regions a winding rule keeps come out as
+// triangles, convex polygons of up to `poly_size` vertices, or boundary
+// contours (CCW outers, CW holes). `core:geom/clip` builds its set
+// operations on it, and `core:geom/polygon` its outline offset.
+//
+// A `Tess` is made by `init`, fed by `add_contour`, run by `tesselate` and
+// released by `destroy`; it must not be copied once made. Its working mesh
+// lives in an arena on the `#default` that `init` saw; the output arrays are
+// minted on the `#default` that `tesselate` sees, and `destroy` frees both.
+package tess
+
+import "core:mem/arena"
+
+// `add_contour`, `add_points` and `tesselate` fail with MALFORMED for a
+// coordinate beyond MAX_COORD or a partial vertex. `core:geom/earcut` uses the
+// same values for the same causes.
+const i32 MALFORMED = 1
+
+// The code for an allocation that answered nil.
+const i32 NO_MEMORY = 2
+
+// An unused polygon slot, a missing neighbour, or a vertex made by an intersection.
+const i32 UNDEF = -1
+
+// The largest coordinate magnitude the sweep accepts.
+const f64 MAX_COORD = 2251799813685248.0
+
+// Which regions are inside, by winding number: odd, nonzero, positive,
+// negative, or at least two in absolute value.
+enum i32 Winding: (Odd, Nonzero, Positive, Negative, Abs_Geq_Two)
+
+// What `tesselate` outputs. Polygons: `poly_size` vertex indices each, padded
+// with UNDEF. Connected_Polygons: those, then as many neighbour polygon
+// indices (UNDEF on the boundary). Boundary_Contours: (first vertex, vertex
+// count) pairs, one per contour.
+enum i32 Element: (Polygons, Connected_Polygons, Boundary_Contours)
+
+// A tesselator. Set the options before adding contours, and read the output
+// after `tesselate`. The slots after the output are its working state.
+type Tess:
+    // Options, read by `add_contour` and `tesselate`.
+    bool reverse_contours   // add each contour with its winding flipped
+    bool delaunay           // refine triangles to constrained Delaunay
+    [3]f64 normal           // the projection normal; zero computes one
+
+    // Output of the last `tesselate`.
+    ref []f64 vertices         // vertex_size coordinates per vertex
+    ref []i32 vertex_indices   // each output vertex's input index, or UNDEF
+    ref []i32 elements
+    i32 vertex_count
+    i32 element_count
+
+    arena.Arena ar
+    ^Mesh mesh
+    i32 status
+    [3]f64 s_unit
+    [3]f64 t_unit
+    [2]f64 bmin
+    [2]f64 bmax
+    Winding rule
+    DictNode dict
+    PQ pq
+    ^Vertex event
+    i32 vertex_index_counter
+
+// Makes `t` ready, with the default options and no contours. Its working mesh
+// lives in an arena on the `#default` this call sees. `destroy` releases it.
+void init(^Tess t):
+    t.reverse_contours = false
+    t.delaunay = false
+    t.normal = (0.0, 0.0, 0.0)
+    t.vertices = nil
+    t.vertex_indices = nil
+    t.elements = nil
+    t.vertex_count = 0
+    t.element_count = 0
+    t.ar = arena.over(#default)
+    t.mesh = nil
+    t.status = 0
+    t.vertex_index_counter = 0
+
+// Frees `t`'s output arrays and its working mesh.
+void destroy(^Tess t):
+    free_output(t)
+    arena.destroy(&t.ar)
+    t.mesh = nil
+
+private void free_output(^Tess t):
+    #delete(t.vertices)
+    #delete(t.vertex_indices)
+    #delete(t.elements)
+    t.vertex_count = 0
+    t.element_count = 0
+
+private bool valid_coord(f64 c):
+    return c <= MAX_COORD && c >= -MAX_COORD
+
+// Adds one closed contour of `size` (2 or 3) coordinates per vertex. Fails
+// with MALFORMED for a coordinate beyond MAX_COORD or a partial vertex, and
+// NO_MEMORY; a failure is kept, and the next `tesselate` fails with it too.
+!void add_contour(^Tess t, []f64 coords, i32 size = 2):
+    i64 dim = i64(size)
+    if dim < 2:
+        dim = 2
+    if dim > 3:
+        dim = 3
+    if #len(coords) % dim != 0:
+        t.status = MALFORMED
+    try begin_contour(t)
+    ^HalfEdge e = nil
+    for i in 0..<#len(coords) / dim:
+        f64 z = coords[i * dim + 2] if dim > 2 else 0.0
+        try add_vertex(t, &e, coords[i * dim], coords[i * dim + 1], z)
+
+// Adds one closed contour of 2D points, of any float width; the tesselator
+// works in f64. Fails as `add_contour` does, and a failure is kept the same
+// way.
+!void add_points(^Tess t, [][2]$T ring) where T is float:
+    try begin_contour(t)
+    ^HalfEdge e = nil
+    for p in ring:
+        try add_vertex(t, &e, f64(p.x), f64(p.y), 0.0)
+
+private !void begin_contour(^Tess t):
+    if t.status != 0:
+        fail t.status
+    if t.mesh == nil:
+        t.mesh = mesh_new(&t.ar)
+        if t.mesh == nil:
+            t.status = NO_MEMORY
+            fail NO_MEMORY
+
+private !void add_vertex(^Tess t, ^^HalfEdge last, f64 x, f64 y, f64 z):
+    if !valid_coord(x) || !valid_coord(y) || !valid_coord(z):
+        t.status = MALFORMED
+        fail MALFORMED
+    ^HalfEdge e = last^
+    if e == nil:
+        e = mesh_make_edge(t.mesh)
+        if e == nil || !mesh_splice(t.mesh, e, e.sym):
+            t.status = NO_MEMORY
+            fail NO_MEMORY
+    else:
+        if mesh_split_edge(t.mesh, e) == nil:
+            t.status = NO_MEMORY
+            fail NO_MEMORY
+        e = e.lnext
+    e.org.coords = (x, y, z)
+    e.org.idx = t.vertex_index_counter
+    t.vertex_index_counter += 1
+    e.winding = -1 if t.reverse_contours else 1
+    e.sym.winding = 1 if t.reverse_contours else -1
+    last^ = e
+
+// Tessellates every contour added since the last call, replacing the output
+// slots of `t` with new arrays on `#default`, which the next call or `destroy`
+// frees. `kind` says what the elements are (see `Element`); `vertex_size` is 2
+// or 3; `poly_size`, at least 3, is the most vertices per polygon (3 for
+// triangles). With no contour added the output is empty. Fails with a failure
+// an add kept, or NO_MEMORY. A sweep: about
+// (n + k) log n for n vertices and k crossings, more where many crossings
+// fall on one long contour, since each split walks the contour it splits.
+!void tesselate(^Tess t, Winding rule, Element kind, i32 poly_size = 3, i32 vertex_size = 2):
+    #assert(poly_size >= 3, "tesselate: poly_size is at least 3")
+    i32 vsize = vertex_size
+    if vsize < 2:
+        vsize = 2
+    if vsize > 3:
+        vsize = 3
+    free_output(t)
+    t.vertex_index_counter = 0
+    t.rule = rule
+    if t.status != 0:
+        fail t.status
+    if t.mesh == nil:
+        return
+
+    project_polygon(t)
+    bool ok = compute_interior(t)
+    if ok:
+        if kind == Element.Boundary_Contours:
+            ok = mesh_set_winding_number(t.mesh, 1, true)
+        else:
+            ok = mesh_tessellate_interior(t.mesh)
+            if ok && t.delaunay:
+                ok = mesh_refine_delaunay(t.mesh)
+    if ok:
+        if kind == Element.Boundary_Contours:
+            ok = output_contours(t, vsize)
+        else:
+            ok = output_polymesh(t, kind, poly_size, vsize)
+    // Every working record is done with: hand the arena's blocks back.
+    t.mesh = nil
+    arena.reset(&t.ar)
+    if !ok:
+        free_output(t)
+        t.status = NO_MEMORY
+        fail NO_MEMORY
+
+private i32 long_axis([3]f64 v):
+    i32 i = 0
+    if mag(v[1]) > mag(v[0]):
+        i = 1
+    if mag(v[2]) > mag(v[i]):
+        i = 2
+    return i
+
+private i32 short_axis([3]f64 v):
+    i32 i = 0
+    if mag(v[1]) < mag(v[0]):
+        i = 1
+    if mag(v[2]) < mag(v[i]):
+        i = 2
+    return i
+
+private f64 mag(f64 x):
+    return -x if x < 0.0 else x
+
+private f64 dot3([3]f64 u, [3]f64 v):
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+
+private [3]f64 compute_normal(^Tess t):
+    [3]f64 up = (0.0, 0.0, 1.0)
+    ^Vertex v_head = &t.mesh.v_head
+    ^Vertex v = v_head.next
+    if v == v_head:
+        return up
+
+    [3]f64 max_val = v.coords
+    [3]f64 min_val = v.coords
+    [3]^Vertex max_vert = (v, v, v)
+    [3]^Vertex min_vert = (v, v, v)
+    v = v_head.next
+    for v != v_head:
+        for i in 0..<3:
+            f64 c = v.coords[i]
+            if c < min_val[i]:
+                min_val[i] = c
+                min_vert[i] = v
+            if c > max_val[i]:
+                max_val[i] = c
+                max_vert[i] = v
+        v = v.next
+
+    i32 i = 0
+    if max_val[1] - min_val[1] > max_val[0] - min_val[0]:
+        i = 1
+    if max_val[2] - min_val[2] > max_val[i] - min_val[i]:
+        i = 2
+    if min_val[i] >= max_val[i]:
+        return up
+
+    f64 max_len2 = 0.0
+    [3]f64 norm = up
+    ^Vertex v1 = min_vert[i]
+    ^Vertex v2 = max_vert[i]
+    [3]f64 d1 = v1.coords - v2.coords
+    v = v_head.next
+    for v != v_head:
+        [3]f64 d2 = v.coords - v2.coords
+        [3]f64 tn = (d1[1] * d2[2] - d1[2] * d2[1], d1[2] * d2[0] - d1[0] * d2[2], d1[0] * d2[1] - d1[1] * d2[0])
+        f64 tlen2 = tn[0] * tn[0] + tn[1] * tn[1] + tn[2] * tn[2]
+        if tlen2 > max_len2:
+            max_len2 = tlen2
+            norm = tn
+        v = v.next
+
+    if max_len2 <= 0.0:
+        norm = (0.0, 0.0, 0.0)
+        norm[short_axis(d1)] = 1.0
+    return norm
+
+// A computed normal may point either way: flip t so the positive-winding
+// contours have positive area.
+private void check_orientation(^Tess t):
+    ^Face f_head = &t.mesh.f_head
+    ^Vertex v_head = &t.mesh.v_head
+    f64 area = 0.0
+    ^Face f = f_head.next
+    for f != f_head:
+        ^HalfEdge e = f.an_edge
+        if e.winding > 0:
+            for true:
+                area += (e.org.s - dst(e).s) * (e.org.t + dst(e).t)
+                e = e.lnext
+                if e == f.an_edge:
+                    break
+        f = f.next
+    if area < 0.0:
+        ^Vertex v = v_head.next
+        for v != v_head:
+            v.t = -v.t
+            v = v.next
+        t.t_unit = -t.t_unit
+
+private void project_polygon(^Tess t):
+    ^Vertex v_head = &t.mesh.v_head
+    [3]f64 norm = t.normal
+    bool computed = false
+    if norm[0] == 0.0 && norm[1] == 0.0 && norm[2] == 0.0:
+        norm = compute_normal(t)
+        computed = true
+
+    i32 i = long_axis(norm)
+    t.s_unit[i] = 0.0
+    t.s_unit[(i + 1) % 3] = 1.0
+    t.s_unit[(i + 2) % 3] = 0.0
+    t.t_unit[i] = 0.0
+    t.t_unit[(i + 1) % 3] = -0.0 if norm[i] > 0.0 else 0.0
+    t.t_unit[(i + 2) % 3] = 1.0 if norm[i] > 0.0 else -1.0
+
+    ^Vertex v = v_head.next
+    for v != v_head:
+        v.s = dot3(v.coords, t.s_unit)
+        v.t = dot3(v.coords, t.t_unit)
+        v = v.next
+    if computed:
+        check_orientation(t)
+
+    bool first = true
+    v = v_head.next
+    for v != v_head:
+        if first:
+            t.bmin = (v.s, v.t)
+            t.bmax = (v.s, v.t)
+            first = false
+        else:
+            if v.s < t.bmin[0]:
+                t.bmin[0] = v.s
+            if v.s > t.bmax[0]:
+                t.bmax[0] = v.s
+            if v.t < t.bmin[1]:
+                t.bmin[1] = v.t
+            if v.t > t.bmax[1]:
+                t.bmax[1] = v.t
+        v = v.next
+
+// Triangulates one x-monotone face by a fan walk up both chains.
+private bool mesh_tessellate_mono_region(^Mesh mesh, ^Face face):
+    ^HalfEdge up = face.an_edge
+    for vert_leq(dst(up), up.org):
+        up = lprev(up)
+    for vert_leq(up.org, dst(up)):
+        up = up.lnext
+    ^HalfEdge lo = lprev(up)
+
+    for up.lnext != lo:
+        if vert_leq(dst(up), lo.org):
+            for lo.lnext != up && (edge_goes_left(lo.lnext) || edge_sign(lo.org, dst(lo), dst(lo.lnext)) <= 0.0):
+                ^HalfEdge tmp = mesh_connect(mesh, lo.lnext, lo)
+                if tmp == nil:
+                    return false
+                lo = tmp.sym
+            lo = lprev(lo)
+        else:
+            for lo.lnext != up && (edge_goes_right(lprev(up)) || edge_sign(dst(up), up.org, lprev(up).org) >= 0.0):
+                ^HalfEdge tmp = mesh_connect(mesh, up, lprev(up))
+                if tmp == nil:
+                    return false
+                up = tmp.sym
+            up = up.lnext
+
+    for lo.lnext.lnext != up:
+        ^HalfEdge tmp = mesh_connect(mesh, lo.lnext, lo)
+        if tmp == nil:
+            return false
+        lo = tmp.sym
+    return true
+
+private bool mesh_tessellate_interior(^Mesh mesh):
+    ^Face f = mesh.f_head.next
+    for f != &mesh.f_head:
+        ^Face next = f.next
+        if f.inside != 0:
+            if !mesh_tessellate_mono_region(mesh, f):
+                return false
+        f = next
+    return true
+
+private type StackNode:
+    ^HalfEdge edge
+    ^StackNode next
+
+private bool push_edge(^Mesh mesh, ^^StackNode top, ^HalfEdge e):
+    ^StackNode n = #new(StackNode, arena.allocator(mesh.ar))
+    if n == nil:
+        return false
+    n.edge = e
+    n.next = top^
+    top^ = n
+    return true
+
+// Flips internal edges until each is locally Delaunay, or until faces^2 flips.
+private bool mesh_refine_delaunay(^Mesh mesh):
+    ^StackNode top = nil
+    i64 max_faces = 0
+    ^Face f = mesh.f_head.next
+    for f != &mesh.f_head:
+        if f.inside != 0:
+            ^HalfEdge e = f.an_edge
+            for true:
+                e.mark = 1 if edge_is_internal(e) else 0
+                if e.mark != 0 && e.sym.mark == 0:
+                    if !push_edge(mesh, &top, e):
+                        return false
+                e = e.lnext
+                if e == f.an_edge:
+                    break
+            max_faces += 1
+        f = f.next
+
+    i64 max_iter = max_faces * max_faces
+    i64 iter = 0
+    for top != nil && iter < max_iter:
+        ^HalfEdge e = top.edge
+        top = top.next
+        e.mark = 0
+        e.sym.mark = 0
+        if !edge_is_locally_delaunay(e):
+            [4]^HalfEdge edges = (e.lnext, lprev(e), e.sym.lnext, lprev(e.sym))
+            mesh_flip_edge(e)
+            for k in 0..<4:
+                if edges[k].mark == 0 && edge_is_internal(edges[k]):
+                    edges[k].mark = 1
+                    edges[k].sym.mark = 1
+                    if !push_edge(mesh, &top, edges[k]):
+                        return false
+        iter += 1
+    return true
+
+private i32 neighbour_face(^HalfEdge edge):
+    if rface(edge) == nil || rface(edge).inside == 0:
+        return UNDEF
+    return rface(edge).n
+
+private bool output_polymesh(^Tess t, Element kind, i32 poly_size, i32 vsize):
+    ^Mesh mesh = t.mesh
+    if poly_size > 3:
+        if !mesh_merge_convex_faces(mesh, poly_size):
+            return false
+
+    ^Vertex v = mesh.v_head.next
+    for v != &mesh.v_head:
+        v.n = UNDEF
+        v = v.next
+
+    i32 max_vertex_count = 0
+    i32 max_face_count = 0
+    ^Face f = mesh.f_head.next
+    for f != &mesh.f_head:
+        f.n = UNDEF
+        if f.inside != 0:
+            ^HalfEdge edge = f.an_edge
+            for true:
+                ^Vertex w = edge.org
+                if w.n == UNDEF:
+                    w.n = max_vertex_count
+                    max_vertex_count += 1
+                edge = edge.lnext
+                if edge == f.an_edge:
+                    break
+            f.n = max_face_count
+            max_face_count += 1
+        f = f.next
+
+    t.element_count = max_face_count
+    i64 alloc_count = i64(max_face_count)
+    if kind == Element.Connected_Polygons:
+        alloc_count *= 2
+    t.elements = #make([]i32, alloc_count * i64(poly_size))
+    t.vertex_count = max_vertex_count
+    t.vertices = #make([]f64, i64(max_vertex_count) * i64(vsize))
+    t.vertex_indices = #make([]i32, i64(max_vertex_count))
+    if t.elements == nil || t.vertices == nil || t.vertex_indices == nil:
+        return false
+
+    v = mesh.v_head.next
+    for v != &mesh.v_head:
+        if v.n != UNDEF:
+            i64 base = i64(v.n) * i64(vsize)
+            t.vertices[base] = v.coords[0]
+            t.vertices[base + 1] = v.coords[1]
+            if vsize > 2:
+                t.vertices[base + 2] = v.coords[2]
+            t.vertex_indices[v.n] = v.idx
+        v = v.next
+
+    i64 k = 0
+    f = mesh.f_head.next
+    for f != &mesh.f_head:
+        if f.inside != 0:
+            ^HalfEdge edge = f.an_edge
+            i32 face_verts = 0
+            for true:
+                t.elements[k] = edge.org.n
+                k += 1
+                face_verts += 1
+                edge = edge.lnext
+                if edge == f.an_edge:
+                    break
+            for _ in face_verts..<poly_size:
+                t.elements[k] = UNDEF
+                k += 1
+            if kind == Element.Connected_Polygons:
+                edge = f.an_edge
+                face_verts = 0
+                for true:
+                    t.elements[k] = neighbour_face(edge)
+                    k += 1
+                    face_verts += 1
+                    edge = edge.lnext
+                    if edge == f.an_edge:
+                        break
+                for _ in face_verts..<poly_size:
+                    t.elements[k] = UNDEF
+                    k += 1
+        f = f.next
+    return true
+
+private bool output_contours(^Tess t, i32 vsize):
+    ^Mesh mesh = t.mesh
+    i32 vcount = 0
+    i32 ecount = 0
+    ^Face f = mesh.f_head.next
+    for f != &mesh.f_head:
+        if f.inside != 0:
+            ^HalfEdge edge = f.an_edge
+            for true:
+                vcount += 1
+                edge = edge.lnext
+                if edge == f.an_edge:
+                    break
+            ecount += 1
+        f = f.next
+
+    t.element_count = ecount
+    t.vertex_count = vcount
+    t.elements = #make([]i32, i64(ecount) * 2)
+    t.vertices = #make([]f64, i64(vcount) * i64(vsize))
+    t.vertex_indices = #make([]i32, i64(vcount))
+    if t.elements == nil || t.vertices == nil || t.vertex_indices == nil:
+        return false
+
+    i64 vi = 0
+    i64 ei = 0
+    i32 start = 0
+    f = mesh.f_head.next
+    for f != &mesh.f_head:
+        if f.inside != 0:
+            i32 n = 0
+            ^HalfEdge edge = f.an_edge
+            for true:
+                i64 base = vi * i64(vsize)
+                t.vertices[base] = edge.org.coords[0]
+                t.vertices[base + 1] = edge.org.coords[1]
+                if vsize > 2:
+                    t.vertices[base + 2] = edge.org.coords[2]
+                t.vertex_indices[vi] = edge.org.idx
+                vi += 1
+                n += 1
+                edge = edge.lnext
+                if edge == f.an_edge:
+                    break
+            t.elements[ei] = start
+            t.elements[ei + 1] = n
+            ei += 2
+            start += n
+        f = f.next
+    return true
+
+// Keeps only the edges between an inside and an outside face, each wound
+// with the inside on its left.
+private bool mesh_set_winding_number(^Mesh mesh, i32 value, bool keep_only_boundary):
+    ^HalfEdge e = mesh.e_head.next
+    for e != &mesh.e_head:
+        ^HalfEdge e_next = e.next
+        if rface(e).inside != e.lface.inside:
+            e.winding = value if e.lface.inside != 0 else -value
+        else if !keep_only_boundary:
+            e.winding = 0
+        else if !mesh_delete(mesh, e):
+            return false
+        e = e_next
+    return true

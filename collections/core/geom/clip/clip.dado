@@ -1,0 +1,237 @@
+// Polygon set operations, triangulation and cleanup, for any float.
+//
+// Polygons are closed rings, CCW in a y-up frame (positive signed area); a
+// CW ring is a hole. A set of rings is `points` with `starts`: ring k is
+// points[starts[k] ..< starts[k + 1]], the last running to the end, and no
+// starts is one ring.
+//
+//     [8][2]f64 ab = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0), (1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)]
+//     [2]u32 two = [0, 4]
+//     clip.Contours(f64) u
+//     try clip.union_polygon(ab[:], two[:], &u) else:
+//         return 1
+//     defer clip.release(&u)   // one ring of 8 points, area 7
+//
+// The set operations run on `core:geom/tess`, which works in f64: points of
+// another width are widened as they go in, and answers are written at the
+// input's width. They fail with tess's codes.
+package clip
+
+import earcut "../earcut"
+import tess "../tess"
+
+// A set of rings answered by an operation, in the layout of its input: outer
+// boundaries CCW, holes CW. `release` frees it.
+type Contours($T):
+    ref [][2]T points
+    ref []u32 starts
+
+#assert_raises
+// Frees `c`'s points and starts.
+void release(^Contours($T) c):
+    #delete(c.points)
+    #delete(c.starts)
+
+#assert_raises
+// The number of rings in `c`.
+i64 count(^Contours($T) c):
+    return #len(c.starts)
+
+// Ring k of `c`, a view into its points; k is below `count(c)`.
+#assert_raises
+[][2]$T contour(^Contours(T) c, i64 k):
+    #assert(k >= 0 && k < #len(c.starts), "contour: k is below count(c)")
+    i64 lo = i64(c.starts[k])
+    i64 hi = #len(c.points)
+    if k + 1 < #len(c.starts):
+        hi = i64(c.starts[k + 1])
+    return c.points[lo..<hi]
+
+// Which triangulator `triangulate` uses: the tesselator (any input, f64
+// round trip) or earcut (one simple ring, native width).
+enum i32 Mode: (Robust, Fast)
+
+// The area a ring encloses, positive when it winds CCW (y up) and negative
+// when CW.
+#assert_raises
+$T signed_area([][2]T polygon) where T is float:
+    T a = 0.0
+    i64 n = #len(polygon)
+    for i in 0..<n:
+        i64 j = (i + 1) % n
+        a += polygon[i].x * polygon[j].y - polygon[j].x * polygon[i].y
+    return a * 0.5
+
+#assert_raises
+// The area a ring encloses, whatever its winding.
+$T area([][2]T polygon) where T is float:
+    T a = signed_area(polygon)
+    return -a if a < 0.0 else a
+
+// The squared distance from p to the line through a and b (to a when a == b).
+private $T distance2_point_line([$N]T p, [N]T a, [N]T b) where T is float:
+    T denom = 0.0
+    T ww = 0.0
+    for i in 0..<N:
+        T d = b[i] - a[i]
+        T w = p[i] - a[i]
+        denom += d * d
+        ww += w * w
+    if denom < 0.00000000000000000001:
+        return ww
+    // |d x w|^2 as its components, x then y then z in 3D.
+    T cr2 = 0.0
+    i64 i = i64(N) - 2
+    for i >= 0:
+        i64 j = i64(N) - 1
+        for j > i:
+            T c = (b[i] - a[i]) * (p[j] - a[j]) - (b[j] - a[j]) * (p[i] - a[i])
+            cr2 += c * c
+            j -= 1
+        i -= 1
+    return cr2 / denom
+
+// Drops every vertex within `epsilon` of the line through its neighbours,
+// judged against the input's neighbours, for 2D or 3D points. Answers the kept
+// points on `#default`, the caller's to `#delete`; fewer than 3 points come
+// back as they are, and a negative epsilon keeps every point. Fails with
+// tess.NO_MEMORY.
+#assert_raises
+!ref [][$N]$T simplify([][N]T polygon, T epsilon) where T is float:
+    try ref [][N]T out = #make([][N]T, 0) else tess.NO_MEMORY
+    if !append_simplified(&out, polygon, epsilon):
+        #delete(out)
+        fail tess.NO_MEMORY
+    return out
+
+// Appends the points `simplify` keeps to `out`; false when it cannot grow.
+private bool append_simplified(^ref [][$N]$T out, [][N]T polygon, T epsilon) where T is float:
+    i64 n = #len(polygon)
+    if !#reserve(out^, #len(out^) + n):
+        return false
+    for i in 0..<n:
+        if n < 3:
+            _ = #append(out^, polygon[i])
+            continue
+        [N]T prev = polygon[(i - 1 + n) % n]
+        [N]T next = polygon[(i + 1) % n]
+        // Compared squared, so no square root: the same test as distance > epsilon.
+        if epsilon < 0.0 || distance2_point_line(polygon[i], prev, next) > epsilon * epsilon:
+            _ = #append(out^, polygon[i])
+    return true
+
+private enum i32 Op: (Union, Intersect, Xor, Difference)
+
+private !void set_op([][2]$T points, []u32 starts, Op op, ^Contours(T) out) where T is float:
+    // No arm is a lone `try`: `dado fmt` puts a one-statement arm on its
+    // `case` line, and `case X: try f()` followed by `else:` reads back as
+    // `try f() else:`, a different program.
+    tess.Winding rule = tess.Winding.Nonzero
+    switch op:
+        case Op.Union:
+            rule = tess.Winding.Nonzero
+        case Op.Intersect:
+            rule = tess.Winding.Abs_Geq_Two
+        case Op.Xor:
+            rule = tess.Winding.Odd
+        case Op.Difference:
+            try difference_of(points, starts, out)
+            return
+        else:
+            fail tess.MALFORMED
+
+    try boundary_of(points, starts, rule, out)
+
+// The operations below write their answer to `out` rather than return it: a
+// failable function that returns a generic type, `!Contours(T) f(…)`, is
+// refused as not failable (ERR0714).
+
+// Writes to `out` the boundary of the region `rule` keeps over every ring of
+// the set: outer rings CCW, holes CW, the caller's to `release`. Fails with
+// tess.MALFORMED when the starts do not increase within the points or a
+// coordinate is beyond tess.MAX_COORD, and tess.NO_MEMORY.
+!void boundary([][2]$T points, []u32 starts, tess.Winding rule, ^Contours(T) out) where T is float:
+    try boundary_of(points, starts, rule, out)
+
+// Writes to `out` the union of the set, everywhere any ring covers, as
+// `boundary` writes its answer. Fails as `boundary` does.
+!void union_polygon([][2]$T points, []u32 starts, ^Contours(T) out) where T is float:
+    try set_op(points, starts, Op.Union, out)
+
+// Writes to `out` the regions covered at least twice: for two rings, their
+// intersection; for more, not the strict n-way intersection. The answer and
+// failures are as `boundary`'s.
+!void intersect([][2]$T points, []u32 starts, ^Contours(T) out) where T is float:
+    try set_op(points, starts, Op.Intersect, out)
+
+// Writes to `out` the first ring minus every other: exact when the cutters do
+// not overlap each other. The answer and failures are as `boundary`'s.
+!void difference([][2]$T points, []u32 starts, ^Contours(T) out) where T is float:
+    try set_op(points, starts, Op.Difference, out)
+
+// Writes to `out` the regions covered an odd number of times. The answer and
+// failures are as `boundary`'s.
+!void xor([][2]$T points, []u32 starts, ^Contours(T) out) where T is float:
+    try set_op(points, starts, Op.Xor, out)
+
+// v rounded to the nearest multiple of g, halves away from zero.
+private $T snap(T v, T g) where T is float:
+    T half = 0.5 if v >= 0.0 else -0.5
+    return T(i64(v / g + half)) * g
+
+// Writes to `out` the union of the set welded at `fuzz`: every vertex snaps to
+// a fuzz grid first, so edges within fuzz of coincident merge instead of
+// leaving a seam, and each ring of the union is then simplified at fuzz. A gap
+// wider than fuzz stays open, and fuzz <= 0 is a plain union. The answer and
+// failures are as `boundary`'s.
+!void union_fuzzy([][2]$T points, []u32 starts, T fuzz, ^Contours(T) out) where T is float:
+    if fuzz <= 0.0:
+        try union_polygon(points, starts, out)
+        return
+    try ref [][2]T snapped = #make([][2]T, #len(points)) else tess.NO_MEMORY
+    defer #delete(snapped)
+    for p, i in points:
+        snapped[i] = (snap(p.x, fuzz), snap(p.y, fuzz))
+    Contours(T) merged
+    try union_polygon(snapped[:], starts, &merged)   // [:]: a ref does not lend to a generic []$T parameter (ERR0504)
+    defer release(&merged)
+
+    try out.points = #make([][2]T, 0) else tess.NO_MEMORY
+    out.starts = #make([]u32, 0)
+    if out.starts == nil || !#reserve(out.starts, count(&merged)) || !#reserve(out.points, #len(merged.points)):
+        release(out)
+        fail tess.NO_MEMORY
+    for k in 0..<count(&merged):
+        bool grown = #append(out.starts, u32(#len(out.points)))
+        if !grown || !append_simplified(&out.points, contour(&merged, k), fuzz):
+            release(out)
+            fail tess.NO_MEMORY
+
+// The triangles of one ring, on `#default`, the caller's to `#delete`.
+// Mode.Robust runs the tesselator (any ring, odd winding, in f64); Mode.Fast
+// runs earcut (a simple ring, at T's width). Fails with tess.MALFORMED or
+// tess.NO_MEMORY.
+!ref [][3][2]$T triangulate([][2]T polygon, Mode mode = Mode.Robust) where T is float:
+    if mode == Mode.Fast:
+        []u32 no_holes
+        try ref []T flat = #make([]T, 2 * #len(polygon)) else tess.NO_MEMORY
+        defer #delete(flat)
+        for p, i in polygon:
+            flat[2 * i] = p.x
+            flat[2 * i + 1] = p.y
+        try ref []u32 idx = earcut.triangulate(flat[:], no_holes) else code:   // [:]: as above
+            fail tess.MALFORMED if code == earcut.MALFORMED else tess.NO_MEMORY
+        defer #delete(idx)
+        try ref [][3][2]T out = #make([][3][2]T, #len(idx) / 3) else tess.NO_MEMORY
+        for k in 0..<#len(idx) / 3:
+            for j in 0..<3:
+                out[k][j] = polygon[idx[3 * k + i64(j)]]
+        return out
+
+    []u32 one
+    return triangulate_polygons(polygon, one)
+
+// Triangles covering the odd-winding region of a set of rings, on `#default`,
+// the caller's to `#delete`. Fails as `boundary` does.
+!ref [][3][2]$T triangulate_polygons([][2]T points, []u32 starts) where T is float:
+    return triangles_of(points, starts)

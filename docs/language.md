@@ -250,6 +250,22 @@ declaration of one named position over an `i32` *is* `i32`. Keeping the
 wrapper and teaching each consumer to erase it writes one rule into
 dozens of places and gets it wrong in one of them.
 
+**The one name a one-slot declaration gives names the whole element**,
+there being nothing else for it to name. With `type Outer: (Inner r)`,
+`o.r` is the `Outer` seen as its `Inner`: `o.r.a` is the element's
+slot `a`, `o.r = v` stores the whole value, and `o.a` reads the same
+slot, since `Outer` is `Inner`. A slot holding a `ref T` or a `^T`
+names the reference.
+
+```dado
+type Cfg: ([4]f64 thickness)
+
+// thickness is the whole [4]f64, so a computed subscript reaches
+// every element.
+public f64 at(Cfg c, i64 e):
+    return c.thickness[e]
+```
+
 **An array is a tuple whose slots share a type.** `TypeArena::array` is
 `TypeArena::tuple` over N copies of one id and nothing else, so `[N]T`
 is not a second kind of type with rules of its own: `[0]T` is the
@@ -1045,6 +1061,12 @@ members bringing one method name, or a method and a slot, are refused
 at the declaration, as two slots are; a method the embedder writes
 itself collides with a promoted one rather than hiding it.
 
+The member is named whole by the name its slots are qualified with:
+`s.Vec2` is a `Vec2` read from those positions and `s.Vec2 = v`
+stores each of them, but `&s.Vec2` is refused for the same reason.
+
+    Vec2 base(Sprite s): return s.Vec2
+
 A **redeclaration** `type W: V` has `V`'s slots and view and none of
 its methods: `W`'s methods are what `W`'s body writes. `V.len(w)`
 still calls `V`'s, since a parameter takes any value of its shape.
@@ -1283,6 +1305,28 @@ public i32 backwards():
 ```
 
 A splat fills positions, so it cannot be given a name.
+
+### Operands and arguments are evaluated left to right
+
+A call evaluates its arguments left to right, and an operator evaluates
+its operands left to right. A subscript or a window evaluates its base
+before what is inside the brackets. An assignment fixes its place
+before the value on the right runs, so a store into an element whose
+index a call on the right moves lands where the index pointed before
+the call; a compound assignment also reads the place there, so it adds
+to the value from before the call.
+
+The order is guaranteed for every write, and for every read a write
+could change. Where two operands of an operator can each only stop the
+program, as two subscripts out of bounds in `a[i] + a[j]` can, which
+of them is reported is unspecified.
+
+C leaves these orders unspecified and its compilers disagree, so the
+compiler binds an earlier operand to a temporary, or a place's address
+to a pointer, wherever one of the two writes something the other could
+read. Where no operand writes, nothing is bound. `&&`, `||` and a
+conditional value evaluate their right side only when it is needed,
+after the left.
 
 
 A default looks like part of a signature and is not, which is the one thing
@@ -2319,8 +2363,9 @@ arguments and the type of each: a script's `int` parameter takes any
 integer (a `u64` by its bits), its `float` an `f32` or `f64`, its `bool`
 a `bool`, and its `string` a copy of a `string8` or a `ref([]char8)`. A
 script's array, `[]int`, takes a Dado slice, a `ref([]T)` or an array
-whose elements cross, and a tuple takes a Dado tuple of as many slots. It
-answers what the method returns, as Dado holds it: an int as `i64`, a
+whose elements cross, and a tuple takes a Dado tuple of as many slots.
+One call from Dado carries at most 16 arguments, and a call passing more
+is refused (`ERR1221`). It answers what the method returns, as Dado holds it: an int as `i64`, a
 float as `f64`, a bool as `bool`, a string as a `ref([]char8)`, an array
 as a `ref([]T)` of those — each made on the ambient allocator, which the
 program ends with `#delete` — and a tuple as a Dado tuple of those.

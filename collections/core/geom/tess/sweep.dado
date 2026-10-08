@@ -1,0 +1,724 @@
+// The plane sweep: computes each face's winding number and marks the faces
+// the winding rule keeps. The active regions sit in a dictionary ordered
+// bottom to top along the sweep line, bracketed by two sentinels.
+package tess
+
+import "core:mem/arena"
+
+private type DictNode:
+    ^Region key
+    ^DictNode next
+    ^DictNode prev
+
+private type Region:
+    ^HalfEdge e_up
+    ^DictNode node_up
+    i32 winding_number
+    i32 inside
+    i32 sentinel
+    i32 dirty
+    i32 fix_upper_edge   // e_up is a temporary edge to be fixed when a right vertex is found
+
+private ^Region region_below(^Region r):
+    return r.node_up.prev.key
+
+private ^Region region_above(^Region r):
+    return r.node_up.next.key
+
+private ^DictNode dict_insert_before(^Tess tess, ^DictNode node_in, ^Region key):
+    ^DictNode node = node_in
+    for true:
+        node = node.prev
+        if node.key == nil || edge_leq(tess, node.key, key):
+            break
+    ^DictNode n = #new(DictNode, arena.allocator(&tess.ar))
+    if n == nil:
+        return nil
+    n.key = key
+    n.next = node.next
+    node.next.prev = n
+    n.prev = node
+    node.next = n
+    return n
+
+private void dict_delete(^DictNode node):
+    node.next.prev = node.prev
+    node.prev.next = node.next
+
+private ^DictNode dict_search(^Tess tess, ^Region key):
+    ^DictNode node = &tess.dict
+    for true:
+        node = node.next
+        if node.key == nil || edge_leq(tess, key, node.key):
+            break
+    return node
+
+// Whether reg1's upper edge is below reg2's at the current event.
+private bool edge_leq(^Tess tess, ^Region reg1, ^Region reg2):
+    ^Vertex event = tess.event
+    ^HalfEdge e1 = reg1.e_up
+    ^HalfEdge e2 = reg2.e_up
+    if dst(e1) == event:
+        if dst(e2) == event:
+            if vert_leq(e1.org, e2.org):
+                return edge_sign(dst(e2), e1.org, e2.org) <= 0.0
+            return edge_sign(dst(e1), e2.org, e1.org) >= 0.0
+        return edge_sign(dst(e2), event, e2.org) <= 0.0
+    if dst(e2) == event:
+        return edge_sign(dst(e1), event, e1.org) >= 0.0
+    f64 t1 = edge_eval(dst(e1), event, e1.org)
+    f64 t2 = edge_eval(dst(e2), event, e2.org)
+    return t1 >= t2
+
+private void delete_region(^Region reg):
+    reg.e_up.active_region = nil
+    dict_delete(reg.node_up)
+
+private bool fix_upper_edge(^Tess tess, ^Region reg, ^HalfEdge new_edge):
+    if !mesh_delete(tess.mesh, reg.e_up):
+        return false
+    reg.fix_upper_edge = 0
+    reg.e_up = new_edge
+    new_edge.active_region = reg
+    return true
+
+private (^Region reg, bool ok) top_left_region(^Tess tess, ^Region reg_in):
+    ^Region reg = reg_in
+    ^Vertex org = reg.e_up.org
+    for true:
+        reg = region_above(reg)
+        if reg.e_up.org != org:
+            break
+    if reg.fix_upper_edge != 0:
+        ^HalfEdge e = mesh_connect(tess.mesh, region_below(reg).e_up.sym, reg.e_up.lnext)
+        if e == nil:
+            return (nil, false)
+        if !fix_upper_edge(tess, reg, e):
+            return (nil, false)
+        reg = region_above(reg)
+    return (reg, true)
+
+private ^Region top_right_region(^Region reg_in):
+    ^Region reg = reg_in
+    ^Vertex d = dst(reg.e_up)
+    for true:
+        reg = region_above(reg)
+        if dst(reg.e_up) != d:
+            break
+    return reg
+
+private ^Region add_region_below(^Tess tess, ^Region reg_above, ^HalfEdge e_new_up):
+    ^Region reg_new = #new(Region, arena.allocator(&tess.ar))
+    if reg_new == nil:
+        return nil
+    reg_new.e_up = e_new_up
+    reg_new.node_up = dict_insert_before(tess, reg_above.node_up, reg_new)
+    if reg_new.node_up == nil:
+        return nil
+    e_new_up.active_region = reg_new
+    return reg_new
+
+private bool is_winding_inside(^Tess tess, i32 n):
+    switch tess.rule:
+        case Winding.Odd:
+            return (n & 1) != 0
+        case Winding.Nonzero:
+            return n != 0
+        case Winding.Positive:
+            return n > 0
+        case Winding.Negative:
+            return n < 0
+        case Winding.Abs_Geq_Two:
+            return n >= 2 || n <= -2
+        else:
+            return false
+
+private i32 inside_flag(^Tess tess, i32 n):
+    return 1 if is_winding_inside(tess, n) else 0
+
+private void compute_winding(^Tess tess, ^Region reg):
+    reg.winding_number = region_above(reg).winding_number + reg.e_up.winding
+    reg.inside = inside_flag(tess, reg.winding_number)
+
+private void finish_region(^Region reg):
+    ^HalfEdge e = reg.e_up
+    ^Face f = e.lface
+    f.inside = i8(reg.inside)
+    f.an_edge = e
+    delete_region(reg)
+
+private (^HalfEdge e, bool ok) finish_left_regions(^Tess tess, ^Region reg_first, ^Region reg_last):
+    ^Region reg_prev = reg_first
+    ^HalfEdge e_prev = reg_first.e_up
+    for reg_prev != reg_last:
+        reg_prev.fix_upper_edge = 0
+        ^Region reg = region_below(reg_prev)
+        ^HalfEdge e = reg.e_up
+        if e.org != e_prev.org:
+            if reg.fix_upper_edge == 0:
+                finish_region(reg_prev)
+                break
+            ^HalfEdge e2 = mesh_connect(tess.mesh, lprev(e_prev), e.sym)
+            if e2 == nil:
+                return (nil, false)
+            if !fix_upper_edge(tess, reg, e2):
+                return (nil, false)
+        if e_prev.onext != reg.e_up:
+            if !mesh_splice(tess.mesh, oprev(reg.e_up), reg.e_up):
+                return (nil, false)
+            if !mesh_splice(tess.mesh, e_prev, reg.e_up):
+                return (nil, false)
+        finish_region(reg_prev)
+        e_prev = reg.e_up
+        reg_prev = reg
+    return (e_prev, true)
+
+private bool add_right_edges(^Tess tess, ^Region reg_up, ^HalfEdge e_first, ^HalfEdge e_last, ^HalfEdge e_top_left_in, bool clean_up):
+    ^HalfEdge e_top_left = e_top_left_in
+    bool first_time = true
+
+    ^HalfEdge e = e_first
+    for true:
+        if add_region_below(tess, reg_up, e.sym) == nil:
+            return false
+        e = e.onext
+        if e == e_last:
+            break
+
+    if e_top_left == nil:
+        e_top_left = rprev(region_below(reg_up).e_up)
+    ^Region reg_prev = reg_up
+    ^HalfEdge e_prev = e_top_left
+    for true:
+        ^Region reg = region_below(reg_prev)
+        e = reg.e_up.sym
+        if e.org != e_prev.org:
+            break
+        if e.onext != e_prev:
+            if !mesh_splice(tess.mesh, oprev(e), e):
+                return false
+            if !mesh_splice(tess.mesh, oprev(e_prev), e):
+                return false
+        reg.winding_number = reg_prev.winding_number - e.winding
+        reg.inside = inside_flag(tess, reg.winding_number)
+
+        reg_prev.dirty = 1
+        if !first_time:
+            (bool action, bool ok) = check_for_right_splice(tess, reg_prev)
+            if !ok:
+                return false
+            if action:
+                add_winding(e, e_prev)
+                delete_region(reg_prev)
+                if !mesh_delete(tess.mesh, e_prev):
+                    return false
+        first_time = false
+        reg_prev = reg
+        e_prev = e
+    reg_prev.dirty = 1
+
+    if clean_up:
+        return walk_dirty_regions(tess, reg_prev)
+    return true
+
+private void vertex_weights(^Vertex isect, ^Vertex org, ^Vertex d):
+    f64 t1 = vert_l1_dist(org, isect)
+    f64 t2 = vert_l1_dist(d, isect)
+    f64 w0 = 0.5 * t2 / (t1 + t2)
+    f64 w1 = 0.5 * t1 / (t1 + t2)
+    isect.coords[0] += w0 * org.coords[0] + w1 * d.coords[0]
+    isect.coords[1] += w0 * org.coords[1] + w1 * d.coords[1]
+    isect.coords[2] += w0 * org.coords[2] + w1 * d.coords[2]
+
+private void get_intersect_data(^Vertex isect, ^Vertex org_up, ^Vertex dst_up, ^Vertex org_lo, ^Vertex dst_lo):
+    isect.coords[0] = 0.0
+    isect.coords[1] = 0.0
+    isect.coords[2] = 0.0
+    isect.idx = UNDEF
+    vertex_weights(isect, org_up, dst_up)
+    vertex_weights(isect, org_lo, dst_lo)
+
+private (bool action, bool ok) check_for_right_splice(^Tess tess, ^Region reg_up):
+    ^Region reg_lo = region_below(reg_up)
+    ^HalfEdge e_up = reg_up.e_up
+    ^HalfEdge e_lo = reg_lo.e_up
+
+    if vert_leq(e_up.org, e_lo.org):
+        if edge_sign(dst(e_lo), e_up.org, e_lo.org) > 0.0:
+            return (false, true)
+        if !vert_eq(e_up.org, e_lo.org):
+            if mesh_split_edge(tess.mesh, e_lo.sym) == nil:
+                return (false, false)
+            if !mesh_splice(tess.mesh, e_up, oprev(e_lo)):
+                return (false, false)
+            reg_up.dirty = 1
+            reg_lo.dirty = 1
+        else if e_up.org != e_lo.org:
+            pq_delete(&tess.pq, e_up.org.pq_handle)
+            if !mesh_splice(tess.mesh, oprev(e_lo), e_up):
+                return (false, false)
+    else:
+        if edge_sign(dst(e_up), e_lo.org, e_up.org) < 0.0:
+            return (false, true)
+        reg_up.dirty = 1
+        ^Region above = region_above(reg_up)
+        if above != nil:
+            above.dirty = 1
+        if mesh_split_edge(tess.mesh, e_up.sym) == nil:
+            return (false, false)
+        if !mesh_splice(tess.mesh, oprev(e_lo), e_up):
+            return (false, false)
+    return (true, true)
+
+private (bool action, bool ok) check_for_left_splice(^Tess tess, ^Region reg_up):
+    ^Region reg_lo = region_below(reg_up)
+    ^HalfEdge e_up = reg_up.e_up
+    ^HalfEdge e_lo = reg_lo.e_up
+
+    if vert_leq(dst(e_up), dst(e_lo)):
+        if edge_sign(dst(e_up), dst(e_lo), e_up.org) < 0.0:
+            return (false, true)
+        reg_up.dirty = 1
+        ^Region above = region_above(reg_up)
+        if above != nil:
+            above.dirty = 1
+        ^HalfEdge e = mesh_split_edge(tess.mesh, e_up)
+        if e == nil:
+            return (false, false)
+        if !mesh_splice(tess.mesh, e_lo.sym, e):
+            return (false, false)
+        e.lface.inside = i8(reg_up.inside)
+    else:
+        if edge_sign(dst(e_lo), dst(e_up), e_lo.org) > 0.0:
+            return (false, true)
+        reg_up.dirty = 1
+        reg_lo.dirty = 1
+        ^HalfEdge e = mesh_split_edge(tess.mesh, e_lo)
+        if e == nil:
+            return (false, false)
+        if !mesh_splice(tess.mesh, e_up.lnext, e_lo.sym):
+            return (false, false)
+        ^Face rf = rface(e)   // a local: a write through a call's ^T result is refused (ERR0606)
+        rf.inside = i8(reg_up.inside)
+    return (true, true)
+
+private (bool action, bool ok) check_for_intersect(^Tess tess, ^Region reg_up_in):
+    ^Region reg_up = reg_up_in
+    ^Region reg_lo = region_below(reg_up)
+    ^HalfEdge e_up = reg_up.e_up
+    ^HalfEdge e_lo = reg_lo.e_up
+    ^Vertex org_up = e_up.org
+    ^Vertex org_lo = e_lo.org
+    ^Vertex dst_up = dst(e_up)
+    ^Vertex dst_lo = dst(e_lo)
+
+    if org_up == org_lo:
+        return (false, true)
+
+    f64 t_min_up = org_up.t if org_up.t < dst_up.t else dst_up.t
+    f64 t_max_lo = org_lo.t if org_lo.t > dst_lo.t else dst_lo.t
+    if t_min_up > t_max_lo:
+        return (false, true)
+
+    if vert_leq(org_up, org_lo):
+        if edge_sign(dst_lo, org_up, org_lo) > 0.0:
+            return (false, true)
+    else:
+        if edge_sign(dst_up, org_lo, org_up) < 0.0:
+            return (false, true)
+
+    Vertex isect
+    edge_intersect(dst_up, org_up, dst_lo, org_lo, &isect)
+
+    if vert_leq(&isect, tess.event):
+        isect.s = tess.event.s
+        isect.t = tess.event.t
+    ^Vertex org_min = org_up if vert_leq(org_up, org_lo) else org_lo
+    if vert_leq(org_min, &isect):
+        isect.s = org_min.s
+        isect.t = org_min.t
+
+    if vert_eq(&isect, org_up) || vert_eq(&isect, org_lo):
+        (bool _, bool cok) = check_for_right_splice(tess, reg_up)
+        return (false, cok)
+
+    if (!vert_eq(dst_up, tess.event) && edge_sign(dst_up, tess.event, &isect) >= 0.0) || (!vert_eq(dst_lo, tess.event) && edge_sign(dst_lo, tess.event, &isect) <= 0.0):
+        if dst_lo == tess.event:
+            if mesh_split_edge(tess.mesh, e_up.sym) == nil:
+                return (false, false)
+            if !mesh_splice(tess.mesh, e_lo.sym, e_up):
+                return (false, false)
+            (^Region reg_up2, bool rok) = top_left_region(tess, reg_up)
+            if !rok:
+                return (false, false)
+            reg_up = reg_up2
+            e_up = region_below(reg_up).e_up
+            (^HalfEdge _, bool fok) = finish_left_regions(tess, region_below(reg_up), reg_lo)
+            if !fok:
+                return (false, false)
+            if !add_right_edges(tess, reg_up, oprev(e_up), e_up, e_up, true):
+                return (false, false)
+            return (true, true)
+        if dst_up == tess.event:
+            if mesh_split_edge(tess.mesh, e_lo.sym) == nil:
+                return (false, false)
+            if !mesh_splice(tess.mesh, e_up.lnext, oprev(e_lo)):
+                return (false, false)
+            reg_lo = reg_up
+            reg_up = top_right_region(reg_up)
+            ^HalfEdge e = rprev(region_below(reg_up).e_up)
+            reg_lo.e_up = oprev(e_lo)
+            (^HalfEdge e_lo2, bool fok2) = finish_left_regions(tess, reg_lo, nil)
+            if !fok2:
+                return (false, false)
+            if !add_right_edges(tess, reg_up, e_lo2.onext, rprev(e_up), e, true):
+                return (false, false)
+            return (true, true)
+        if edge_sign(dst_up, tess.event, &isect) >= 0.0:
+            ^Region above = region_above(reg_up)   // a local: a write through a call's ^T result is refused (ERR0606)
+            above.dirty = 1
+            reg_up.dirty = 1
+            if mesh_split_edge(tess.mesh, e_up.sym) == nil:
+                return (false, false)
+            e_up.org.s = tess.event.s
+            e_up.org.t = tess.event.t
+        if edge_sign(dst_lo, tess.event, &isect) <= 0.0:
+            reg_up.dirty = 1
+            reg_lo.dirty = 1
+            if mesh_split_edge(tess.mesh, e_lo.sym) == nil:
+                return (false, false)
+            e_lo.org.s = tess.event.s
+            e_lo.org.t = tess.event.t
+        return (false, true)
+
+    // The general case: split both edges at the intersection, a new event.
+    if mesh_split_edge(tess.mesh, e_up.sym) == nil:
+        return (false, false)
+    if mesh_split_edge(tess.mesh, e_lo.sym) == nil:
+        return (false, false)
+    if !mesh_splice(tess.mesh, oprev(e_lo), e_up):
+        return (false, false)
+    e_up.org.s = isect.s
+    e_up.org.t = isect.t
+    e_up.org.pq_handle = pq_insert(&tess.pq, e_up.org)
+    if e_up.org.pq_handle == INV_HANDLE:
+        return (false, false)
+    get_intersect_data(e_up.org, org_up, dst_up, org_lo, dst_lo)
+    ^Region above = region_above(reg_up)   // a local: a write through a call's ^T result is refused (ERR0606)
+    above.dirty = 1
+    reg_up.dirty = 1
+    reg_lo.dirty = 1
+    return (false, true)
+
+private bool walk_dirty_regions(^Tess tess, ^Region reg_up_in):
+    ^Region reg_up = reg_up_in
+    ^Region reg_lo = region_below(reg_up)
+    for true:
+        for reg_lo.dirty != 0:
+            reg_up = reg_lo
+            reg_lo = region_below(reg_lo)
+        if reg_up.dirty == 0:
+            reg_lo = reg_up
+            reg_up = region_above(reg_up)
+            if reg_up == nil || reg_up.dirty == 0:
+                return true
+        reg_up.dirty = 0
+        ^HalfEdge e_up = reg_up.e_up
+        ^HalfEdge e_lo = reg_lo.e_up
+
+        if dst(e_up) != dst(e_lo):
+            (bool action, bool ok) = check_for_left_splice(tess, reg_up)
+            if !ok:
+                return false
+            if action:
+                if reg_lo.fix_upper_edge != 0:
+                    delete_region(reg_lo)
+                    if !mesh_delete(tess.mesh, e_lo):
+                        return false
+                    reg_lo = region_below(reg_up)
+                    e_lo = reg_lo.e_up
+                else if reg_up.fix_upper_edge != 0:
+                    delete_region(reg_up)
+                    if !mesh_delete(tess.mesh, e_up):
+                        return false
+                    reg_up = region_above(reg_lo)
+                    e_up = reg_up.e_up
+        if e_up.org != e_lo.org:
+            if dst(e_up) != dst(e_lo) && reg_up.fix_upper_edge == 0 && reg_lo.fix_upper_edge == 0 && (dst(e_up) == tess.event || dst(e_lo) == tess.event):
+                (bool hit, bool iok) = check_for_intersect(tess, reg_up)
+                if !iok:
+                    return false
+                if hit:
+                    return true
+            else:
+                (bool _, bool rok) = check_for_right_splice(tess, reg_up)
+                if !rok:
+                    return false
+        if e_up.org == e_lo.org && dst(e_up) == dst(e_lo):
+            add_winding(e_lo, e_up)
+            delete_region(reg_up)
+            if !mesh_delete(tess.mesh, e_up):
+                return false
+            reg_up = region_above(reg_lo)
+    return true
+
+private bool connect_right_vertex(^Tess tess, ^Region reg_up_in, ^HalfEdge e_bottom_left_in):
+    ^Region reg_up = reg_up_in
+    ^HalfEdge e_bottom_left = e_bottom_left_in
+    ^HalfEdge e_top_left = e_bottom_left.onext
+    ^Region reg_lo = region_below(reg_up)
+    ^HalfEdge e_up = reg_up.e_up
+    ^HalfEdge e_lo = reg_lo.e_up
+    bool degenerate = false
+
+    if dst(e_up) != dst(e_lo):
+        (bool _, bool ok) = check_for_intersect(tess, reg_up)
+        if !ok:
+            return false
+
+    if vert_eq(e_up.org, tess.event):
+        if !mesh_splice(tess.mesh, oprev(e_top_left), e_up):
+            return false
+        (^Region r, bool rok) = top_left_region(tess, reg_up)
+        if !rok:
+            return false
+        reg_up = r
+        e_top_left = region_below(reg_up).e_up
+        (^HalfEdge _, bool fok) = finish_left_regions(tess, region_below(reg_up), reg_lo)
+        if !fok:
+            return false
+        degenerate = true
+    if vert_eq(e_lo.org, tess.event):
+        if !mesh_splice(tess.mesh, e_bottom_left, oprev(e_lo)):
+            return false
+        (^HalfEdge ebl, bool fok2) = finish_left_regions(tess, reg_lo, nil)
+        if !fok2:
+            return false
+        e_bottom_left = ebl
+        degenerate = true
+    if degenerate:
+        return add_right_edges(tess, reg_up, e_bottom_left.onext, e_top_left, e_top_left, true)
+
+    ^HalfEdge e_new = oprev(e_lo) if vert_leq(e_lo.org, e_up.org) else e_up
+    e_new = mesh_connect(tess.mesh, lprev(e_bottom_left), e_new)
+    if e_new == nil:
+        return false
+    if !add_right_edges(tess, reg_up, e_new, e_new.onext, e_new.onext, false):
+        return false
+    e_new.sym.active_region.fix_upper_edge = 1
+    return walk_dirty_regions(tess, reg_up)
+
+private bool connect_left_degenerate(^Tess tess, ^Region reg_up_in, ^Vertex v_event):
+    ^Region reg_up = reg_up_in
+    ^HalfEdge e = reg_up.e_up
+    if vert_eq(e.org, v_event):
+        return mesh_splice(tess.mesh, e, v_event.an_edge)
+
+    if !vert_eq(dst(e), v_event):
+        if mesh_split_edge(tess.mesh, e.sym) == nil:
+            return false
+        if reg_up.fix_upper_edge != 0:
+            if !mesh_delete(tess.mesh, e.onext):
+                return false
+            reg_up.fix_upper_edge = 0
+        if !mesh_splice(tess.mesh, v_event.an_edge, e):
+            return false
+        return sweep_event(tess, v_event)
+
+    // v_event coincides with e's destination.
+    reg_up = top_right_region(reg_up)
+    ^Region reg = region_below(reg_up)
+    ^HalfEdge e_top_right = reg.e_up.sym
+    ^HalfEdge e_top_left = e_top_right.onext
+    ^HalfEdge e_last = e_top_left
+    if reg.fix_upper_edge != 0:
+        delete_region(reg)
+        if !mesh_delete(tess.mesh, e_top_right):
+            return false
+        e_top_right = oprev(e_top_left)
+    if !mesh_splice(tess.mesh, v_event.an_edge, e_top_right):
+        return false
+    if !edge_goes_left(e_top_left):
+        e_top_left = nil
+    return add_right_edges(tess, reg_up, e_top_right.onext, e_last, e_top_left, true)
+
+private bool connect_left_vertex(^Tess tess, ^Vertex v_event):
+    Region tmp
+    tmp.e_up = v_event.an_edge.sym
+    ^Region reg_up = dict_search(tess, &tmp).key
+    ^Region reg_lo = region_below(reg_up)
+    if reg_lo == nil:
+        return true
+    ^HalfEdge e_up = reg_up.e_up
+    ^HalfEdge e_lo = reg_lo.e_up
+
+    if edge_sign(dst(e_up), v_event, e_up.org) == 0.0:
+        return connect_left_degenerate(tess, reg_up, v_event)
+
+    ^Region reg = reg_up if vert_leq(dst(e_lo), dst(e_up)) else reg_lo
+
+    if reg_up.inside != 0 || reg.fix_upper_edge != 0:
+        ^HalfEdge e_new = nil
+        if reg == reg_up:
+            e_new = mesh_connect(tess.mesh, v_event.an_edge.sym, e_up.lnext)
+            if e_new == nil:
+                return false
+        else:
+            ^HalfEdge t = mesh_connect(tess.mesh, dnext(e_lo), v_event.an_edge)
+            if t == nil:
+                return false
+            e_new = t.sym
+        if reg.fix_upper_edge != 0:
+            if !fix_upper_edge(tess, reg, e_new):
+                return false
+        else:
+            ^Region r = add_region_below(tess, reg_up, e_new)
+            if r == nil:
+                return false
+            compute_winding(tess, r)
+        return sweep_event(tess, v_event)
+
+    return add_right_edges(tess, reg_up, v_event.an_edge, v_event.an_edge, nil, true)
+
+private bool sweep_event(^Tess tess, ^Vertex v_event):
+    tess.event = v_event
+    ^HalfEdge e = v_event.an_edge
+    for e.active_region == nil:
+        e = e.onext
+        if e == v_event.an_edge:
+            return connect_left_vertex(tess, v_event)
+
+    (^Region reg_up, bool ok) = top_left_region(tess, e.active_region)
+    if !ok:
+        return false
+    ^Region reg = region_below(reg_up)
+    ^HalfEdge e_top_left = reg.e_up
+    (^HalfEdge e_bottom_left, bool fok) = finish_left_regions(tess, reg, nil)
+    if !fok:
+        return false
+    if e_bottom_left.onext == e_top_left:
+        return connect_right_vertex(tess, reg_up, e_bottom_left)
+    return add_right_edges(tess, reg_up, e_bottom_left.onext, e_top_left, e_top_left, true)
+
+private bool add_sentinel(^Tess tess, f64 smin, f64 smax, f64 t):
+    ^Region reg = #new(Region, arena.allocator(&tess.ar))
+    if reg == nil:
+        return false
+    ^HalfEdge e = mesh_make_edge(tess.mesh)
+    if e == nil:
+        return false
+    e.org.s = smax
+    e.org.t = t
+    ^Vertex d = dst(e)   // a local: a write through a call's ^T result is refused (ERR0606)
+    d.s = smin
+    d.t = t
+    tess.event = d
+    reg.e_up = e
+    reg.sentinel = 1
+    reg.node_up = dict_insert_before(tess, &tess.dict, reg)
+    return reg.node_up != nil
+
+private bool init_edge_dict(^Tess tess):
+    tess.dict.key = nil
+    tess.dict.next = &tess.dict
+    tess.dict.prev = &tess.dict
+    f64 w = (tess.bmax[0] - tess.bmin[0]) + 0.01
+    f64 h = (tess.bmax[1] - tess.bmin[1]) + 0.01
+    f64 smin = tess.bmin[0] - w
+    f64 smax = tess.bmax[0] + w
+    f64 tmin = tess.bmin[1] - h
+    f64 tmax = tess.bmax[1] + h
+    if !add_sentinel(tess, smin, smax, tmin):
+        return false
+    return add_sentinel(tess, smin, smax, tmax)
+
+private void done_edge_dict(^Tess tess):
+    for true:
+        ^Region reg = tess.dict.next.key
+        if reg == nil:
+            break
+        delete_region(reg)
+
+private bool remove_degenerate_edges(^Tess tess):
+    ^HalfEdge e_head = &tess.mesh.e_head
+    ^HalfEdge e = e_head.next
+    for e != e_head:
+        ^HalfEdge e_next = e.next
+        ^HalfEdge e_lnext = e.lnext
+        if vert_eq(e.org, dst(e)) && e.lnext.lnext != e:
+            if !mesh_splice(tess.mesh, e_lnext, e):
+                return false
+            if !mesh_delete(tess.mesh, e):
+                return false
+            e = e_lnext
+            e_lnext = e.lnext
+        if e_lnext.lnext == e:
+            if e_lnext != e:
+                if e_lnext == e_next || e_lnext == e_next.sym:
+                    e_next = e_next.next
+                if !mesh_delete(tess.mesh, e_lnext):
+                    return false
+            if e == e_next || e == e_next.sym:
+                e_next = e_next.next
+            if !mesh_delete(tess.mesh, e):
+                return false
+        e = e_next
+    return true
+
+private bool init_priority_q(^Tess tess):
+    ^Vertex v_head = &tess.mesh.v_head
+    i32 count = 0
+    ^Vertex v = v_head.next
+    for v != v_head:
+        count += 1
+        v = v.next
+    count += 8
+    if !pq_new(&tess.pq, count, &tess.ar):
+        return false
+    v = v_head.next
+    for v != v_head:
+        v.pq_handle = pq_insert(&tess.pq, v)
+        if v.pq_handle == INV_HANDLE:
+            return false
+        v = v.next
+    return pq_init(&tess.pq, &tess.ar)
+
+private bool remove_degenerate_faces(^Tess tess):
+    ^Face f = tess.mesh.f_head.next
+    for f != &tess.mesh.f_head:
+        ^Face f_next = f.next
+        ^HalfEdge e = f.an_edge
+        if e.lnext.lnext == e:
+            add_winding(e.onext, e)
+            if !mesh_delete(tess.mesh, e):
+                return false
+        f = f_next
+    return true
+
+// Sweeps every vertex, merging coincident ones, and leaves each face's
+// `inside` set by the winding rule.
+private bool compute_interior(^Tess tess):
+    if !remove_degenerate_edges(tess):
+        return false
+    if !init_priority_q(tess):
+        return false
+    if !init_edge_dict(tess):
+        return false
+
+    for true:
+        ^Vertex v = pq_extract_min(&tess.pq)
+        if v == nil:
+            break
+        for true:
+            ^Vertex v_next = pq_minimum(&tess.pq)
+            if v_next == nil || !vert_eq(v_next, v):
+                break
+            v_next = pq_extract_min(&tess.pq)
+            if !mesh_splice(tess.mesh, v.an_edge, v_next.an_edge):
+                return false
+        if !sweep_event(tess, v):
+            return false
+
+    tess.event = tess.dict.next.key.e_up.org
+    done_edge_dict(tess)
+    return remove_degenerate_faces(tess)

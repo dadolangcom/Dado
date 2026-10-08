@@ -234,16 +234,22 @@ type State:
     SinkStack sinks,
     // The embedded modules, by name: registered by `add_module`, read by the
     // loader. Neither string is copied — both are the program's constants.
-    [MAX_MODULES]Module modules,
+    // Every table of rows below is a block of the engine's allocator, grown
+    // as rows come (`grow`), which says how many rows it has room for; the
+    // count beside it is the rows in use. Ending the heap frees each
+    // (`free_tables`).
+    Rows modules,
     i32 nmodules,
     // Each embedded module's definition once the engine has compiled it —
     // loaded by `#script_new` or imported by a module that was — by the
     // index of its row in `modules`; nil before. What a reload finds a
     // class's namespace by.
-    [MAX_MODULES]^JSModuleDef compiled,
+    Rows compiled,
     // Values a caller holds by number: a loaded module's namespace, a
     // constructed object. Slot 0 is never used, so a `Handle` of 0 is none.
-    [MAX_HANDLES]JSValue handles,
+    // Slots below `handles_low` are all taken: where `keep` looks first.
+    Rows handles,
+    i32 handles_low,
     // The arguments of the next call, in order, and whether one was pushed
     // past the table's end — which fails the call rather than making it with
     // an argument missing.
@@ -263,7 +269,7 @@ type State:
     // by its name — a constant of the program's — and its namespace, which
     // every `#script_new` of a class it exports constructs from; empty for an
     // engine `create` made until something loads one.
-    [MAX_MODULES]Loaded loaded,
+    Rows loaded,
     i32 nloaded,
     // The code of the last failure reported: a DadoScript `Error`'s, or 70 for a
     // throw that carries none.
@@ -273,7 +279,7 @@ type State:
     // `create` made — and the native modules made of it so far, by the
     // definition the engine links them through.
     const rawptr bound,
-    [MAX_MODULES]Native natives,
+    Rows natives,
     i32 nnatives,
     // The engine word, and what stopping and pausing it share with its runs
     // (`stop.dado`).
@@ -339,9 +345,18 @@ type Bound: (cstring module, cstring name, JSValue(^JSContext, JSValue, i32, ^JS
 // once the loader returns; −1 for a module with no export.
 type Native: (^JSModuleDef def, i64 first)
 
-const i32 MAX_MODULES = 64
-const i32 MAX_HANDLES = 256
+// The most arguments one call into a script takes: the pushes of one call
+// wait in a table of this many, which the compiler refuses a call to exceed
+// (`ERR1221`).
 const i32 MAX_ARGS = 16
+
+// The rows a table of the engine's has room for the first time it is made;
+// each growth doubles it.
+private const i64 FIRST_ROWS = 16
+
+// The most rows a table of the engine's counts: its count is an `i32`, and
+// so is a `Handle`, the index of a row of `handles`.
+private const i64 MOST_ROWS = 2147483647
 
 // A new engine on `alloc`, which everything it allocates comes from — the
 // runtime, every object a script creates, and the engine's own state. Its
@@ -414,13 +429,14 @@ private void end_engine(Engine e):
     slots_release(e)
     release_waiting(e)
     // An empty slot is zero or `undefined`, and freeing either does nothing.
-    for i in 1..<MAX_HANDLES:
-        JS_FreeValue(e^.ctx, e^.handles[i])
-        e^.handles[i] = undefined()
+    for i in 1..<e^.handles.rows:
+        JS_FreeValue(e^.ctx, handle_at(e, i)^)
     JS_FreeContext(e^.ctx)
     JS_FreeRuntime(e^.rt)
     e^.ctx = nil
     e^.rt = nil
+    // The tables go with the heap: an ended engine loads and holds nothing.
+    free_tables(e)
 
 // Where `print` and `println` write, and where a failure's text goes.
 void set_sinks(Engine e, Sink out, Sink err):
@@ -439,10 +455,15 @@ void set_sinks(Engine e, Sink out, Sink err):
 // module's `import`. Nothing is compiled until something imports it. Both
 // strings are borrowed for the engine's life.
 !void add_module(Engine e, cstring name, cstring source):
-    if e^.nmodules >= MAX_MODULES:
-        say(e, "script: more than 64 embedded modules")
+    i64 n = i64(e^.nmodules)
+    if n >= MOST_ROWS:
+        say(e, "script: more than 2147483647 embedded modules")
         fail NO_MEMORY
-    e^.modules[e^.nmodules] = (name, source)
+    if !grow(e^.alloc, &e^.modules, n, #size(Module)) || !grow(e^.alloc, &e^.compiled, n, #size(^JSModuleDef)):
+        say(e, "script: no memory for the module table")
+        fail NO_MEMORY
+    module_at(e, n)^ = (name, source)
+    compiled_at(e, n)^ = nil
     e^.nmodules += 1
 
 // Import the module `name` and evaluate it (and everything it imports) under
@@ -527,11 +548,11 @@ void arg_string(Engine e, string8 s):
 
 // Call `object`'s method `method` with the pushed arguments.
 !void call_method(Engine e, Handle object, cstring method):
-    if object <= 0 || object >= MAX_HANDLES:
+    if object <= 0 || i64(object) >= e^.handles.rows:
         clear_args(e)
         say(e, "script: no such value")
         fail NO_SUCH
-    try call_on(e, e^.handles[object], method)
+    try call_on(e, handle_at(e, object)^, method)
 
 // Call the method `method` of the object `obj` with the pushed arguments.
 private !void call_on(Engine e, JSValue obj, cstring method):
@@ -570,10 +591,10 @@ private !void put_on(Engine e, JSValue obj, cstring field):
 
 // Let go of a value the engine holds for the caller.
 void release(Engine e, Handle h):
-    if h <= 0 || h >= MAX_HANDLES:
+    if h <= 0 || i64(h) >= e^.handles.rows:
         return
-    JS_FreeValue(e^.ctx, e^.handles[h])
-    e^.handles[h] = undefined()
+    JS_FreeValue(e^.ctx, handle_at(e, h)^)
+    unhold(e, h)
 
 // ── Answers ─────────────────────────────────────────────────────────────────
 
@@ -711,14 +732,14 @@ private const i32 PUT = 2
 // that fails to evaluate fails with its code, its text on the error sink.
 private !Handle module_of(Engine e, cstring name):
     for i in 0..<e^.nloaded:
-        if string8(e^.loaded[i].name) == string8(name):
-            return e^.loaded[i].ns
-    if e^.nloaded >= MAX_MODULES:
-        say(e, "script: more than 64 modules loaded into one VM")
+        if string8(loaded_at(e, i)^.name) == string8(name):
+            return loaded_at(e, i)^.ns
+    if !grow(e^.alloc, &e^.loaded, i64(e^.nloaded), #size(Loaded)):
+        say(e, "script: no memory for the table of the modules a VM has loaded")
         fail NO_MEMORY
     try Handle m = load(e, name) else code:
         fail script_code(e, code)
-    e^.loaded[e^.nloaded] = (name, m)
+    loaded_at(e, e^.nloaded)^ = (name, m)
     e^.nloaded += 1
     return m
 
@@ -2042,19 +2063,27 @@ private !rawptr result_instance(Engine e, cstring class):
 
 // A value `#delete` let go of while a run was in the engine, released when
 // the outermost run leaves (`leave`) or the heap ends.
+//
+// The list is on `#heap`, not the engine's allocator: a `#delete` from
+// another thread lands here, under the engine's lock, while the run in
+// progress allocates on the engine's allocator, which need not be safe to
+// call from two threads; C's heap is. `release_state` frees it.
 private void release_later(Engine e, JSValue v):
-    if e^.stop.nreleases < MAX_HANDLES:
-        e^.stop.releases[e^.stop.nreleases] = v
+    i64 n = i64(e^.stop.nreleases)
+    if n < MOST_ROWS && grow(#heap, &e^.stop.releases, n, #size(JSValue)):
+        release_at(e, n)^ = v
         e^.stop.nreleases += 1
         return
-    // A full list: the engine keeps it, and its heap's end releases it.
-    try _ = keep(e, v) else _:
-        return
+    // C's heap refused more: a free slot of `handles` keeps it, and the heap's
+    // end releases it. Never a new one: growing `handles` may move it under
+    // the run in progress.
+    if hold_free(e, v) == 0:
+        JS_FreeValue(e^.ctx, v)
 
 private void release_waiting(Engine e):
     for i in 0..<e^.stop.nreleases:
-        JS_FreeValue(e^.ctx, e^.stop.releases[i])
-        e^.stop.releases[i] = undefined()
+        JS_FreeValue(e^.ctx, release_at(e, i)^)
+        release_at(e, i)^ = undefined()
     e^.stop.nreleases = 0
 
 // Row `i` of a module table: a C array of `{const char *name, const char
@@ -2163,8 +2192,8 @@ private bool is_native(string8 name):
 // links the module; an ES import binding cannot be reassigned by the module
 // that imports it, so what a script calls is the thunk and nothing else.
 private ^JSModuleDef native_module(Engine e, ^JSContext ctx, cstring name):
-    if e^.nnatives >= MAX_MODULES:
-        _ = JS_ThrowReferenceError(ctx, "more than 64 native modules: '%s'", name)
+    if !grow(e^.alloc, &e^.natives, i64(e^.nnatives), #size(Native)):
+        _ = JS_ThrowOutOfMemory(ctx)
         return nil
     ^JSModuleDef m = JS_NewCModule(ctx, name, init_native)
     if m == nil:
@@ -2182,7 +2211,7 @@ private ^JSModuleDef native_module(Engine e, ^JSContext ctx, cstring name):
             if first < 0:
                 first = at
         at += 1
-    e^.natives[e^.nnatives] = (m, first)
+    native_at(e, e^.nnatives)^ = (m, first)
     e^.nnatives += 1
     return m
 
@@ -2190,8 +2219,8 @@ private i32 init_native(^JSContext ctx, ^JSModuleDef m):
     Engine e = Engine(JS_GetContextOpaque(ctx))
     i64 first = 0 - 2
     for i in 0..<e^.nnatives:
-        if e^.natives[i].def == m:
-            first = e^.natives[i].first
+        if native_at(e, i)^.def == m:
+            first = native_at(e, i)^.first
     if first == 0 - 2:
         return 0 - 1
     if first < 0:
@@ -2248,25 +2277,56 @@ private void clear_result(Engine e):
     e^.result = undefined()
 
 // Hold `v` in the first free slot. Takes ownership whether it succeeds or not.
+// The table grows when every slot is taken.
 private !Handle keep(Engine e, JSValue v):
-    for i in 1..<MAX_HANDLES:
+    Handle h = hold_free(e, v)
+    if h != 0:
+        return h
+    i64 at = e^.handles.rows
+    if at < 1:
+        at = 1
+    if at >= MOST_ROWS:
+        JS_FreeValue(e^.ctx, v)
+        say(e, "script: more than 2147483646 values held at once")
+        fail NO_MEMORY
+    if !grow(e^.alloc, &e^.handles, at, #size(JSValue)):
+        JS_FreeValue(e^.ctx, v)
+        say(e, "script: no memory for the table of values held")
+        fail NO_MEMORY
+    handle_at(e, at)^ = v
+    e^.handles_low = i32(at + 1)
+    return Handle(at)
+
+// `v` held in the first free slot `handles` has, the table as it is: the
+// slot, or 0 when every one is taken and `v` is still the caller's.
+private Handle hold_free(Engine e, JSValue v):
+    i64 from = i64(e^.handles_low)
+    if from < 1:
+        from = 1
+    for i in from..<e^.handles.rows:
         // Free is never-used (all zero) or released (`undefined`); a slot this
         // package fills always holds an object or a namespace.
-        JSValue slot = e^.handles[i]
+        JSValue slot = handle_at(e, i)^
         if (slot.tag == 0 && slot.u.ptr == nil) || i32(slot.tag) == JS_TAG_UNDEFINED:
-            e^.handles[i] = v
+            handle_at(e, i)^ = v
+            e^.handles_low = i32(i + 1)
             return Handle(i)
-    JS_FreeValue(e^.ctx, v)
-    say(e, "script: more than 255 values held at once")
-    fail NO_MEMORY
+    e^.handles_low = i32(e^.handles.rows)
+    return 0
+
+// Slot `h` let go of: free, and where `keep` looks first if it is the lowest.
+private void unhold(Engine e, Handle h):
+    handle_at(e, h)^ = undefined()
+    if h < e^.handles_low:
+        e^.handles_low = h
 
 // `holder.name`, which must be a function; `what` names it in the refusal.
 private !JSValue member(Engine e, Handle holder, cstring name, cstring what):
-    if holder <= 0 || holder >= MAX_HANDLES:
+    if holder <= 0 || i64(holder) >= e^.handles.rows:
         clear_args(e)
         say(e, "script: no such value")
         fail NO_SUCH
-    try JSValue f = member_of(e, e^.handles[holder], name, what)
+    try JSValue f = member_of(e, handle_at(e, holder)^, name, what)
     return f
 
 // `holder.name` of the object `holder`, which must be a function.
@@ -2453,9 +2513,93 @@ private i64 io_write(Sink out, string8 s):
         return 0
     return out.proc(out.data, rawptr(s), #len(s))
 
+// The engine's state, and every table it grew: the last of what the engine
+// allocated, so nothing of it is left once this returns.
 private void release_state(Engine e):
+    free_tables(e)
     (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
     _ = a.proc(a.data, mem.AllocatorMode.Free, 0, 0, rawptr(e), #size(State))
+
+// Every table the engine grew, freed and emptied.
+private void free_tables(Engine e):
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = e^.alloc
+    free_rows(a, &e^.modules, #size(Module))
+    free_rows(a, &e^.compiled, #size(^JSModuleDef))
+    free_rows(a, &e^.handles, #size(JSValue))
+    free_rows(a, &e^.loaded, #size(Loaded))
+    free_rows(a, &e^.natives, #size(Native))
+    free_rows(#heap, &e^.stop.releases, #size(JSValue))
+    e^.nmodules = 0
+    e^.handles_low = 0
+    e^.nloaded = 0
+    e^.nnatives = 0
+    e^.stop.nreleases = 0
+
+// ── The engine's tables ─────────────────────────────────────────────────────
+//
+// A table is a block of rows, zero before its first row, and how many rows
+// the block has room for. It grows by `Resize`, which may move it, so
+// nothing keeps the address of a row across a call that may grow its table:
+// a row is reached by its index each time (`module_at` and the others), and
+// an index stays good as the table grows.
+
+private type Rows: (rawptr block, i64 rows)
+
+// Row `i`'s address. Dado has no pointer arithmetic; the address crosses to
+// an integer and back.
+private rawptr row_in(Rows t, i64 i, u64 size):
+    return rawptr(#c.uintptr_t(t.block) + #c.uintptr_t(i) * #c.uintptr_t(size))
+
+// Room for row `need` in `t`, made on `a` when there is none: the rows kept,
+// the new ones zero, and the room doubled, so `n` rows cost `log n`
+// growths. False when `a` refuses, `t` then as it was.
+private bool grow((rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, ^Rows t, i64 need, u64 size):
+    if need < t^.rows:
+        return true
+    i64 want = FIRST_ROWS
+    if t^.rows >= FIRST_ROWS:
+        want = t^.rows * 2
+    for want <= need:
+        want *= 2
+    if want > MOST_ROWS:
+        want = MOST_ROWS
+    rawptr p = nil
+    if t^.block == nil:
+        p = a.proc(a.data, mem.AllocatorMode.Alloc, u64(want) * size, mem.MAX_ALIGN, nil, 0)
+    else:
+        p = a.proc(a.data, mem.AllocatorMode.Resize, u64(want) * size, mem.MAX_ALIGN, t^.block, u64(t^.rows) * size)
+    if p == nil:
+        return false
+    t^.block = p
+    t^.rows = want
+    return true
+
+private void free_rows((rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a, ^Rows t, u64 size):
+    if t^.block != nil:
+        _ = a.proc(a.data, mem.AllocatorMode.Free, 0, 0, t^.block, u64(t^.rows) * size)
+    t^.block = nil
+    t^.rows = 0
+
+private ^Module module_at(Engine e, i64 i):
+    return ^Module(row_in(e^.modules, i, #size(Module)))
+
+// A row of `compiled`: a pointer to a module's definition.
+private type DefAt: ^^JSModuleDef
+
+private DefAt compiled_at(Engine e, i64 i):
+    return DefAt(row_in(e^.compiled, i, #size(^JSModuleDef)))
+
+private ^JSValue handle_at(Engine e, i64 i):
+    return ^JSValue(row_in(e^.handles, i, #size(JSValue)))
+
+private ^Loaded loaded_at(Engine e, i64 i):
+    return ^Loaded(row_in(e^.loaded, i, #size(Loaded)))
+
+private ^Native native_at(Engine e, i64 i):
+    return ^Native(row_in(e^.natives, i, #size(Native)))
+
+private ^JSValue release_at(Engine e, i64 i):
+    return ^JSValue(row_in(e^.stop.releases, i, #size(JSValue)))
 
 // ── print and println ───────────────────────────────────────────────────────
 //
@@ -2499,7 +2643,7 @@ private ^JSModuleDef load_embedded(^JSContext ctx, cstring name, rawptr opaque):
     if wanted == HOST_MODULE:
         return host_module(ctx, name)
     for i in 0..<e^.nmodules:
-        Module m = e^.modules[i]
+        Module m = module_at(e, i)^
         if string8(m.name) == wanted:
             string8 src = string8(m.source)
             i32 flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_DADOS
@@ -2508,7 +2652,7 @@ private ^JSModuleDef load_embedded(^JSContext ctx, cstring name, rawptr opaque):
                 return nil
             ^JSModuleDef def = ^JSModuleDef(v.u.ptr)
             JS_FreeValue(ctx, v)
-            e^.compiled[i] = def
+            compiled_at(e, i)^ = def
             return def
     _ = JS_ThrowReferenceError(ctx, "no embedded module named '%s'", name)
     return nil

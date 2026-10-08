@@ -1,0 +1,343 @@
+// The writer: CBOR appended to a run it owns.
+package cbor
+
+import "core:slices"
+
+// CBOR appended to `out`, a run the writer owns until `finish` hands it over.
+// Make one with `writer`. The caller counts containers: `array(n)` is
+// followed by `n` items, `map(n)` by `n` key and value pairs.
+//
+// A write that fails is kept, every later write does nothing, and `finish`
+// fails with the first code.
+public type Writer:
+    ref []u8 out
+    i32 failed
+
+    // Appends the unsigned integer `v`. A failure is kept for `finish`.
+    void uint(^self, u64 v):
+        self.head(MAJOR_UNSIGNED, v)
+
+    // Appends `v`: unsigned when it is zero or more, negative otherwise. A
+    // failure is kept for `finish`.
+    void int(^self, i64 v):
+        if v >= 0:
+            self.head(MAJOR_UNSIGNED, u64(v))
+        else:
+            self.head(MAJOR_NEGATIVE, u64(-(v + 1)))
+
+    // Appends the negative integer `-1 - n`, which reaches -2^64. A failure
+    // is kept for `finish`.
+    void negative(^self, u64 n):
+        self.head(MAJOR_NEGATIVE, n)
+
+    // Appends `b` as a byte string. A failure is kept for `finish`.
+    void bytes(^self, []u8 b):
+        self.head(MAJOR_BYTES, u64(#len(b)))
+        self.put(b)
+
+    // Appends `s` as a text string, its bytes as given: they are not checked
+    // to be UTF-8. A failure is kept for `finish`.
+    void text(^self, string8 s):
+        self.head(MAJOR_TEXT, u64(#len(s)))
+        if self.failed != 0 || !#reserve(self.out, #len(self.out) + #len(s)):
+            self.fail_with(NO_MEMORY)
+            return
+        for c in s:
+            _ = #append(self.out, u8(c))
+
+    // Appends the head of an array of `count` items, which the next `count`
+    // items fill. A failure is kept for `finish`.
+    void array(^self, u64 count):
+        self.head(MAJOR_ARRAY, count)
+
+    // Appends the head of a map of `count` pairs, which the next `2 * count`
+    // items fill, each key before its value. A failure is kept for `finish`.
+    void map(^self, u64 count):
+        self.head(MAJOR_MAP, count)
+
+    // Appends the head of tag `number`; the next item is its content. A
+    // failure is kept for `finish`.
+    void tag(^self, u64 number):
+        self.head(MAJOR_TAG, number)
+
+    // Appends tag 55799 (`SELF_DESCRIBE`), which marks the bytes as CBOR.
+    // Write it first, then the one item it describes. A failure is kept for
+    // `finish`.
+    void self_describe(^self):
+        self.head(MAJOR_TAG, SELF_DESCRIBE)
+
+    // Appends `true` or `false`. A failure is kept for `finish`.
+    void boolean(^self, bool v):
+        self.byte(0xF5 if v else 0xF4)
+
+    // Appends `null`. A failure is kept for `finish`.
+    void null(^self):
+        self.byte(0xF6)
+
+    // Appends `undefined`. A failure is kept for `finish`.
+    void undefined(^self):
+        self.byte(0xF7)
+
+    // Appends simple value `v`. 24 to 31 have no encoding and fail with
+    // `BAD_SIMPLE`. A failure is kept for `finish`.
+    void simple(^self, u8 v):
+        if v >= 24 && v < 32:
+            self.fail_with(BAD_SIMPLE)
+            return
+        self.head(MAJOR_SIMPLE, u64(v))
+
+    // Appends `v` in the narrowest of half, single and double precision that
+    // holds it exactly. A NaN keeps its sign and as much of its payload as
+    // fits. A failure is kept for `finish`.
+    void float(^self, f64 v):
+        Bits64 b = Bits64(v)
+        (u32 bits, i32 width) = shortest_float(b.u)
+        if width == 2:
+            self.byte(0xF9)
+            self.be(u64(bits), 2)
+        else if width == 4:
+            self.byte(0xFA)
+            self.be(u64(bits), 4)
+        else:
+            self.byte(0xFB)
+            self.be(b.u, 8)
+
+    // Appends `v` in single precision, whatever its value. A failure is kept
+    // for `finish`.
+    void float32(^self, f32 v):
+        Bits32 b = Bits32(v)
+        self.byte(0xFA)
+        self.be(u64(b.u), 4)
+
+    // Appends `v` in double precision, whatever its value. A failure is kept
+    // for `finish`.
+    void float64(^self, f64 v):
+        Bits64 b = Bits64(v)
+        self.byte(0xFB)
+        self.be(b.u, 8)
+
+    // Appends `encoded`, bytes that are already CBOR, without checking them.
+    // A failure is kept for `finish`.
+    void raw(^self, []u8 encoded):
+        self.put(encoded)
+
+    // Where the next item will start: the `at` that `sort_map` takes.
+    i64 mark(self):
+        return #len(self.out)
+
+    // Reorders the definite map whose head starts at `at` so its keys are in
+    // the bytewise order of their encodings, RFC 8949's deterministic order.
+    // Take `at` with `mark` before writing the map, and sort before writing
+    // anything after it:
+    //
+    //     i64 at = w.mark()
+    //     w.map(2)
+    //     w.text("b")
+    //     w.uint(2)
+    //     w.text("a")
+    //     w.uint(1)
+    //     w.sort_map(at)            // {"a": 1, "b": 2}
+    //
+    // Fails with `DUPLICATE_KEY` when two keys are equal, `WRONG_TYPE` when
+    // `at` is not a definite map, `TRUNCATED` when `at` is not inside what
+    // was written, and `TRAILING` when bytes follow the map; a failure is
+    // kept for `finish`. Sorting n keys takes O(n log n) comparisons and
+    // copies the map's bytes once. Its scratch comes from `#default` and is
+    // freed before it returns.
+    void sort_map(^self, i64 at):
+        if self.failed != 0:
+            return
+        try sort_entries(self.out[:], at) else code:
+            self.fail_with(code)
+
+    // The bytes written so far, as a view into the writer's run. The next
+    // write may move the run, so take the view again after it.
+    []u8 data(self):
+        return self.out[:]
+
+    // The first code a write failed with, or 0 while every write has
+    // succeeded.
+    i32 code(self):
+        return self.failed
+
+    // Hands over the bytes: the caller owns the run and deletes it, and the
+    // writer is left empty. Fails with the first code a write failed with,
+    // and then frees the bytes itself.
+    !ref([]u8) finish(^self):
+        if self.failed != 0:
+            #delete(self.out)
+            fail self.failed
+        defer self.out = nil
+        return self.out
+
+    // Frees the bytes without handing them over. After `finish` there is
+    // nothing left, and it does nothing.
+    void destroy(^self):
+        #delete(self.out)
+
+    // Keeps `code` as the writer's failure, unless it already has one.
+    private void fail_with(^self, i32 code):
+        if self.failed == 0:
+            self.failed = code
+
+    // Appends `b`, or keeps `NO_MEMORY`. Does nothing once the writer has
+    // failed.
+    private void byte(^self, u8 b):
+        if self.failed != 0:
+            return
+        if !#append(self.out, b):
+            self.fail_with(NO_MEMORY)
+
+    // Appends the bytes of `b`, or keeps `NO_MEMORY`. Does nothing once
+    // the writer has failed.
+    private void put(^self, []u8 b):
+        if self.failed != 0:
+            return
+        if !#reserve(self.out, #len(self.out) + #len(b)):
+            self.fail_with(NO_MEMORY)
+            return
+        for x in b:
+            _ = #append(self.out, x)
+
+    // `v`'s low `n` bytes, most significant first.
+    private void be(^self, u64 v, i32 n):
+        for i in 0..<n:
+            self.byte(u8((v >> u64(8 * (n - 1 - i))) & 0xFF))
+
+    // Appends the head of major type `major` with argument `arg`, in the
+    // shortest form that holds `arg`.
+    private void head(^self, u8 major, u64 arg):
+        u8 m = major << 5
+        if arg < 24:
+            self.byte(m | u8(arg))
+        else if arg <= 0xFF:
+            self.byte(m | 24)
+            self.be(arg, 1)
+        else if arg <= 0xFFFF:
+            self.byte(m | 25)
+            self.be(arg, 2)
+        else if arg <= 0xFFFFFFFF:
+            self.byte(m | 26)
+            self.be(arg, 4)
+        else:
+            self.byte(m | 27)
+            self.be(arg, 8)
+
+// An empty writer. Its run comes from `#default` with room for `room` bytes,
+// and grows there as needed:
+//
+//     cbor.Writer w = cbor.writer() using arena.allocator(&a)
+//
+// A failed allocation is kept, and `finish` fails with `NO_MEMORY`.
+#assert_raises
+public Writer writer(i64 room = 64):
+    Writer w
+    w.out = #make([]u8, 0)
+    if w.out == nil || !#reserve(w.out, room):
+        w.failed = NO_MEMORY
+    return w
+
+// ── preferred serialization of floats ─────────────────────────────────────
+
+// The narrowest encoding of the double with bits `d`: `(half bits, 2)`,
+// `(single bits, 4)` or `(0, 8)`.
+private (u32 bits, i32 width) shortest_float(u64 d):
+    u64 sign = d >> 63
+    i64 e = i64((d >> 52) & 0x7FF)
+    u64 m = d & 0xFFFFFFFFFFFFF
+    if e == 0x7FF:
+        // Infinity or NaN: the payload's top bits, if the rest are zero.
+        if m & 0x3FFFFFFFFFF == 0:
+            return (u32((sign << 15) | 0x7C00 | (m >> 42)), 2)
+        if m & 0x1FFFFFFF == 0:
+            return (u32((sign << 31) | 0x7F800000 | (m >> 29)), 4)
+        return (0, 8)
+    if e == 0 && m == 0:
+        return (u32(sign << 15), 2)
+    if e == 0:
+        return (0, 8)
+    i64 x = e - 1023
+    u64 sig = m | 0x10000000000000
+    // Half: normal for 2^-14 <= |v| < 2^16, subnormal down to 2^-24.
+    if x >= -14 && x <= 15 && m & 0x3FFFFFFFFFF == 0:
+        return (u32((sign << 15) | (u64(x + 15) << 10) | (m >> 42)), 2)
+    if x >= -24 && x < -14:
+        u64 shift = u64(28 - x)
+        if sig & ((u64(1) << shift) - 1) == 0:
+            return (u32((sign << 15) | (sig >> shift)), 2)
+    // Single: normal for 2^-126 <= |v| < 2^128, subnormal down to 2^-149.
+    if x >= -126 && x <= 127 && m & 0x1FFFFFFF == 0:
+        return (u32((sign << 31) | (u64(x + 127) << 23) | (m >> 29)), 4)
+    if x >= -149 && x < -126:
+        u64 shift = u64(-x - 97)
+        if sig & ((u64(1) << shift) - 1) == 0:
+            return (u32((sign << 31) | (sig >> shift)), 4)
+    return (0, 8)
+
+// ── deterministic map order ───────────────────────────────────────────────
+
+// One pair of a map being sorted: the key's encoding and the whole pair's.
+private type Entry:
+    []u8 key
+    []u8 pair
+
+// Whether `a`'s key encoding sorts before `b`'s: bytewise, and a prefix
+// first.
+private bool key_less(Entry a, Entry b):
+    i64 n = #len(a.key)
+    i64 m = #len(b.key)
+    i64 k = n if n < m else m
+    for i in 0..<k:
+        if a.key[i] != b.key[i]:
+            return a.key[i] < b.key[i]
+    return n < m
+
+// Whether `a` and `b` have the same key encoding.
+private bool same_key(Entry a, Entry b):
+    return !key_less(a, b) && !key_less(b, a)
+
+// Sorts, in place, the pairs of the definite map whose head is at `out[at]`
+// and which ends where `out` ends. Fails with `TRUNCATED` when `at` is not
+// inside `out`, `WRONG_TYPE`, `TRAILING`, `DUPLICATE_KEY`, `NO_MEMORY` or
+// the code of a malformed item, leaving `out` as it was.
+private !void sort_entries([]u8 out, i64 at):
+    i64 n = #len(out)
+    try Head h = read_head(out, at)
+    if h.major != MAJOR_MAP || h.info == INDEFINITE:
+        fail WRONG_TYPE
+    u64 count = h.arg
+    if count < 2:
+        try i64 end = skip_items(out, h.next, count * 2)
+        if end != n:
+            fail TRAILING
+        return
+    ref []Entry es = #make([]Entry, 0)
+    if es == nil:
+        fail NO_MEMORY
+    defer #delete(es)
+    if !#reserve(es, i64(count)):
+        fail NO_MEMORY
+    i64 p = h.next
+    for _i in 0..<count:
+        try i64 k = skip_items(out, p, 1)
+        try i64 v = skip_items(out, k, 1)
+        Entry e = (out[p..<k], out[p..<v])
+        _ = #append(es, e)
+        p = v
+    if p != n:
+        fail TRAILING
+    slices.sort(es[:], key_less)
+    for i in 1..<#len(es):
+        if same_key(es[i - 1], es[i]):
+            fail DUPLICATE_KEY
+    ref []u8 sorted = #make([]u8, 0)
+    if sorted == nil:
+        fail NO_MEMORY
+    defer #delete(sorted)
+    if !#reserve(sorted, n - h.next):
+        fail NO_MEMORY
+    for e in es:
+        for b in e.pair:
+            _ = #append(sorted, b)
+    for i in 0..<#len(sorted):
+        out[h.next + i] = sorted[i]

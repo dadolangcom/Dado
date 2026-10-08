@@ -125,7 +125,7 @@ checked by the type system rather than by a runtime scan of a string.
 
 ## Declarations
 
-90 declarations, 39 public.
+96 declarations, 42 public.
 
 * `i64 put_bytes([]char8 bytes, Sink out)` — Hand `bytes` to `out`, and answer how many it took.
 * `i64 put_string(string8 s, Sink out)` — The bytes of a `string`, written whole — embedded `\0` included, because a…
@@ -141,6 +141,8 @@ checked by the type system rather than by a runtime scan of a string.
 * `i64 put_base(u64 value, u32 base, bool upper, Sink out)` — An unsigned value in `base`, with the digits above 9 written in the case…
 * `i64 put_signed($T value, Sink out) where T is int && T in (i8, i16, i32, i64)` — A signed integer of any width, in decimal.
 * `i64 put_unsigned($T value, Sink out) where T is int && T in (u8, u16, u32, u64)` — An unsigned integer of any width, in decimal.
+* `i32 render_signed($T value, []char8 into) where T is int && T in (i8, i16, i32, i64)` — `value` in decimal, as `put_signed` writes it, at the start of `into`.
+* `i32 render_unsigned($T value, []char8 into) where T is int && T in (u8, u16, u32, u64)` — `value` in decimal, as `put_unsigned` writes it, at the start of `into`.
 * `i64 put_hex($T value, i32 digits, bool upper, bool prefix, Sink out) where T is int && T in (u8, u16, u32, u64)` — Hexadecimal, with an optional `0x` and an optional minimum digit count that…
 * `i64 put_binary($T value, i32 digits, bool prefix, Sink out) where T is int && T in (u8, u16, u32, u64)` — Binary, with an optional `0b` and the same floor rule as `put_hex`.
 * `i64 put_string_pad(string8 s, Pad p, Sink out)` — A `string` in a field.
@@ -153,6 +155,7 @@ checked by the type system rather than by a runtime scan of a string.
 * `bool is_infinite($T x) where T is float` — Whether `x` is an infinity, asked without `<math.h>`.
 * `i64 put_float($T value, i32 decimals, Sink out) where T is float` — `value` with exactly `decimals` places after the point, rounded half away from…
 * `i64 put_float_shortest($T value, Sink out) where T is float` — ── the shortest float that reads back ──────────────────────────────────────…
+* `i32 render_float_shortest($T value, []char8 into) where T is float` — `value` as `put_float_shortest` writes it, at the start of `into`. Answers…
 * `type Cursor` — Where a `to_bytes` sink is up to. `into` is the caller's storage, `used` is…
 * `Cursor over([]char8 into)` — A cursor over storage the caller owns.
 * `Sink to_bytes(^Cursor c)` — A sink that fills a cursor and drops what will not fit.

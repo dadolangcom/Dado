@@ -1,7 +1,25 @@
+// One closed ring: its offset, and the normal of a 3D ring.
+//
+// `offset` moves each vertex to where its two edges, each moved by the same
+// distance, meet: the ring keeps its vertices, and a large or inward
+// distance can make it cross itself. `offset_outline` answers the region
+// such an offset bounds, as a set of rings:
+//
+//     [4][2]f64 square = [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+//     clip.Contours(f64) grown
+//     try polygon.offset_outline(square[:], 1.0, polygon.Join.Miter, &grown) else:
+//         return 1
+//     defer clip.release(&grown)   // one ring, (-1, -1) to (3, 3)
+//
+// The outline is by winding numbers (Chen and McMains): each edge is pushed
+// out by its own distance, every corner gets a join or a V through the
+// original vertex, and `core:geom/tess` keeps the region the winding rule
+// says is inside. The result may split, merge or drop rings, so it is a set.
 package polygon
 
-import "core:mem"
 import "core:math"
+import clip "../clip"
+import tess "../tess"
 
 // `core:math` exposes only `root`/`magnitude` publicly, and both take `f64`.
 // These functions are generic over `float` (f32 or f64), so a scalar square
@@ -12,25 +30,21 @@ private $T rootf(T x) where T is float:
 private $T absf(T x) where T is float:
     return T(math.magnitude(f64(x)))
 
+// Moves each vertex of a closed ring, in place, to where its two edges meet
+// once each is moved `dt` along its normal: outward for a positive `dt` on a
+// CCW ring. The ring keeps its vertex count; it is not cleaned, so a large or
+// inward `dt` on a concave ring can leave it crossing itself
+// (`offset_outline` answers the region instead). Edges are taken as parallel
+// when their cross product is below 0.00001, in the ring's own units. Uses a
+// scratch run of n points on `#default`, freed before it returns. Fewer than
+// 3 points, or a `dt` of 0, change nothing.
 void offset(ref [][2]$T polygon, T dt) where T is float:
     i64 n = #len(polygon)
     if n < 3 || dt == 0.0:
         return
 
-    // Allocate temporary space for the new vertex coordinates. `#default` is
-    // an ordinary allocator, so `make` takes it directly and the run is
-    // released at scope exit — the earlier `arena.begin(context.temp)` misread
-    // an allocator as an `^Arena`, and that record is kept because the misread
-    // is about what an `Allocator` *is*, which the respelling did not change.
-    //
-    // **`#default` and not `runtime.temp()`, deliberately.** `context.temp` is
-    // retired and `core:runtime`'s scratch is what replaced it, but
-    // this is a **library** function: naming the process scratch here would
-    // make `offset` silently allocate nothing for any caller that had not run
-    // `runtime.init_scratch`, and would couple a geometry routine to a global.
-    // The ambient allocator is the caller's to choose, and a caller who wants
-    // the scratch writes `using runtime.temp():` around the call — which is the
-    // whole of what replaced the second context slot.
+    // New positions go to a scratch run, so every vertex reads its neighbours'
+    // old positions. On `#default`, so the caller chooses where it lands.
     auto temp = #make([][2]T, n, #default)
     defer #delete(temp)
 
@@ -79,12 +93,359 @@ void offset(ref [][2]$T polygon, T dt) where T is float:
     for i in 0..<n:
         polygon[i] = temp[i]
 
-// A default of `#default` is not allowed — a parameter default must fold at
-// compile time, and the ambient allocator is a runtime value, so
-// writing one is `ERR0901`. The allocator is taken explicitly, as the rest of
-// `core` does (e.g. `strings.clone_to_cstring`); pass `#default` at the call
-// site for the ambient one.
+// A copy of `polygon` on `alloc`, the caller's to `#delete`, moved as `offset`
+// moves it. Pass `#default` for the ambient allocator: a parameter default
+// must fold at compile time (ERR0901), and the ambient allocator does not.
 ref [][2]$T offset_by([][2]T polygon, T dt, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc) where T is float:
     auto r = #copy(polygon, alloc)
     offset(r, dt)
     return r
+
+// How the offset edges meet at a corner they turn away from.
+enum i32 Join: (Miter, Bevel, Round)
+
+// The outline of a closed ring whose edges are each offset by their own
+// distance, written to `out` (outer rings CCW, holes CW), the caller's to `clip.release`.
+// deltas[k] moves the edge leaving vertex k, positive to the right of travel
+// (outward on a CCW ring, inward on a CW one). A short `deltas` repeats its
+// last entry, a long one is truncated, an empty one offsets nothing. Corners
+// the edges turn away from get `join`; `arc_resolution` is a Round join's
+// chord deviation, and a Miter join longer than `miter_limit` times the
+// distance is cut square (0 or less is no limit). Rings may split, merge or
+// vanish. Fails with tess.MALFORMED for a coordinate beyond tess.MAX_COORD,
+// and tess.NO_MEMORY. Two tesselator passes (`core:geom/tess`); differing distances add
+// a pass quadratic in the ring's size, to carry each onto the cleaned ring.
+// A distance wider than the gaps between edges makes many crossings, which
+// costs more than linear time.
+!void offset_outline_edges([][2]$T polygon, []T deltas, Join join, ^clip.Contours(T) out, T arc_resolution = 0.1, T miter_limit = 0.0) where T is float:
+    try ref []f64 fd = #make([]f64, #len(deltas)) else tess.NO_MEMORY
+    defer #delete(fd)
+    for d, i in deltas:
+        fd[i] = f64(d)
+    try offset_in_f64(polygon, fd[:], join, out, f64(arc_resolution), f64(miter_limit))
+
+// The outline of a closed ring offset by `delta` on every edge, written the result to
+// `out` (outer rings CCW, holes CW), the caller's to `clip.release`. A
+// positive delta moves each edge to the right of travel: outward on a CCW
+// ring, inward on a CW one. Corners the edges turn away from get `join`;
+// `arc_resolution` is a Round join's chord deviation, and a Miter join longer
+// than `miter_limit` times the distance is cut square (0 or less is no limit).
+// Rings may split, merge or vanish. Fails as `offset_outline_edges` does, at
+// its cost.
+!void offset_outline([][2]$T polygon, T delta, Join join, ^clip.Contours(T) out, T arc_resolution = 0.1, T miter_limit = 0.0) where T is float:
+    // One delta: a short `deltas` repeats its last entry.
+    try ref []f64 fd = #make([]f64, 1) else tess.NO_MEMORY
+    defer #delete(fd)
+    fd[0] = f64(delta)
+    try offset_in_f64(polygon, fd[:], join, out, f64(arc_resolution), f64(miter_limit))
+
+// Runs the f64 offset on `polygon` and writes the answer to `out` as T.
+private !void offset_in_f64([][2]$T polygon, []f64 deltas, Join join, ^clip.Contours(T) out, f64 arc_resolution, f64 miter_limit) where T is float:
+    try ref [][2]f64 f = #make([][2]f64, #len(polygon)) else tess.NO_MEMORY
+    defer #delete(f)
+    for p, i in polygon:
+        f[i] = (f64(p.x), f64(p.y))
+    clip.Contours(f64) r
+    try offset_engine(f[:], deltas, join, arc_resolution, miter_limit, &r)
+    defer clip.release(&r)
+    try copy_out(&r, out)
+
+// The unit normal of a 3D ring by Newell's method, on the side from which the
+// ring winds CCW; zero when it encloses nothing.
+[3]$T normal([][3]T profile) where T is float:
+    [3]T n = (0.0, 0.0, 0.0)
+    i64 count = #len(profile)
+    if count < 3:
+        return n
+    for i in 0..<count:
+        [3]T a = profile[i]
+        [3]T b = profile[(i + 1) % count]
+        n.x += (a.y - b.y) * (a.z + b.z)
+        n.y += (a.z - b.z) * (a.x + b.x)
+        n.z += (a.x - b.x) * (a.y + b.y)
+    T len2 = n.x * n.x + n.y * n.y + n.z * n.z
+    if len2 < 0.00000000000000000001:
+        [3]T zero = (0.0, 0.0, 0.0)
+        return zero
+    T len = T(math.root(f64(len2)))
+    return (n.x / len, n.y / len, n.z / len)
+
+// Writes `c` into `out`, converted to T.
+private !void copy_out(^clip.Contours(f64) c, ^clip.Contours($T) out) where T is float:
+    try out.points = #make([][2]T, #len(c.points)) else tess.NO_MEMORY
+    out.starts = #make([]u32, #len(c.starts))
+    if out.starts == nil:
+        #delete(out.points)
+        fail tess.NO_MEMORY
+    for p, i in c.points:
+        out.points[i] = (T(p.x), T(p.y))
+    for s, k in c.starts:
+        out.starts[k] = s
+
+// The engine below runs at f64 only. Each `ref` it passes to a generic
+// function is windowed, `r[:]`: a ref does not lend to a generic `[]$T`
+// parameter (ERR0504).
+
+private [2]$T normalize0([2]T v) where T is float:
+    T len = math.root(v.x * v.x + v.y * v.y)
+    if len == 0.0:
+        return v
+    return (v.x / len, v.y / len)
+
+// The left normal of a direction.
+private [2]$T orthogonal([2]T v) where T is float:
+    return (-v.y, v.x)
+
+private $T cross2([2]T a, [2]T b) where T is float:
+    return a.x * b.y - a.y * b.x
+
+private $T dot2([2]T a, [2]T b) where T is float:
+    return a.x * b.x + a.y * b.y
+
+private (bool hit, [2]$T point) line_intersect([2]T a0, [2]T a1, [2]T b0, [2]T b1) where T is float:
+    [2]T ad = a1 - a0
+    [2]T bd = b1 - b0
+    T denom = ad.x * bd.y - ad.y * bd.x
+    if math.magnitude(denom) < 0.0000000001:
+        [2]T zero = (0.0, 0.0)
+        return (false, zero)
+    [2]T diff = b0 - a0
+    T t = (diff.x * bd.y - diff.y * bd.x) / denom
+    return (true, a0 + ad * t)
+
+// A left turn at p, marching prev -> p -> next: convex for a CCW outer and a
+// CW hole alike.
+private bool is_convex([2]$T p, [2]T prev, [2]T next) where T is float:
+    return cross2(p - prev, next - p) > 0.0
+
+// core:math has no inverse cosine, so acos is taken through atan2.
+private $T acos(T x) where T is float:
+    return math.angle(math.root(1.0 - x * x), x)
+
+private i64 arc_sample_count($T radius, T total_angle, T chord_deviation) where T is float:
+    if radius < 0.0000000001:
+        return 0
+    T half_step = acos(math.clamp(1.0 - chord_deviation / radius, -1.0, 1.0))
+    i64 n = i64(math.up(math.magnitude(total_angle) / (2.0 * half_step)))
+    return n if n > 1 else 1
+
+// The offset curve before cleaning: each edge moved by its delta (the last
+// delta repeats for the edges past it), corners joined by `join`, and a V
+// through the original vertex wherever the offset edges cross.
+// `arc_resolution` is the chord deviation of a Round join; `miter_limit` <= 0
+// is no limit. Answers the points on `#default`.
+private !ref [][2]$T make_raw_offset_curve([][2]T polygon, []T deltas, Join join, T arc_resolution, T miter_limit) where T is float:
+    i64 c = #len(polygon)
+    i64 dc = #len(deltas) - 1
+    ref [][2]T buf = nil
+    if join == Join.Round:
+        T max_delta = deltas[0]
+        for d in deltas:
+            max_delta = math.max(max_delta, math.magnitude(d))
+        i64 max_arc = arc_sample_count(max_delta, math.PI, arc_resolution)
+        try buf = #make([][2]T, c * (max_arc + 2)) else tess.NO_MEMORY
+    else:
+        try buf = #make([][2]T, c * 3) else tess.NO_MEMORY
+
+    i64 count = 0
+    for i in 0..<c:
+        i64 h = (i - 1 + c) % c
+        i64 j = (i + 1) % c
+        [2]T n_in = orthogonal(normalize0(polygon[i] - polygon[h]))
+        [2]T n_out = orthogonal(normalize0(polygon[j] - polygon[i]))
+        T delta_in = deltas[math.min(h, dc)]
+        T delta_out = deltas[math.min(i, dc)]
+        [2]T p_end = polygon[i] - n_in * delta_in
+        [2]T p_start = polygon[i] - n_out * delta_out
+
+        bool convex = is_convex(polygon[i], polygon[h], polygon[j])
+        bool inner = deltas[math.min(i, dc)] < 0.0
+        // A convex corner offset inward, or a concave one outward, makes a
+        // loop the winding rule discards: route it through the vertex.
+        if (convex && inner) || (!convex && !inner):
+            buf[count] = p_end
+            buf[count + 1] = polygon[i]
+            buf[count + 2] = p_start
+            count += 3
+            continue
+
+        if join == Join.Miter:
+            (bool hit, [2]T x) = line_intersect(polygon[h] - n_in * delta_in, p_end, p_start, polygon[j] - n_out * delta_out)
+            T d = math.max(math.magnitude(delta_in), math.magnitude(delta_out))
+            [2]T off = x - polygon[i]
+            bool within = miter_limit <= 0.0 || math.root(dot2(off, off)) <= miter_limit * d
+            if hit && within:
+                buf[count] = x
+                count += 1
+            else:
+                buf[count] = p_end
+                buf[count + 1] = p_start
+                count += 2
+            continue
+
+        T radius = delta_in if math.magnitude(delta_in) < math.magnitude(delta_out) else delta_out
+        T angle_in = math.angle(n_in.y, n_in.x)
+        T angle_out = math.angle(n_out.y, n_out.x)
+        [2]T origin = polygon[i]
+        if math.magnitude(delta_in - delta_out) > 0.000000001:
+            [2]T edge_in = normalize0(polygon[i] - polygon[h])
+            [2]T edge_out = normalize0(polygon[j] - polygon[i])
+            (bool hit, [2]T x) = line_intersect(p_end, p_end + edge_in, p_start, p_start + edge_out)
+            if hit:
+                origin = x + n_in * radius + n_out * radius
+            [2]T u_in = (math.cosine(angle_in), math.sine(angle_in))
+            [2]T u_out = (math.cosine(angle_out), math.sine(angle_out))
+            p_end = origin - u_in * radius
+            p_start = origin - u_out * radius
+
+        if join == Join.Bevel:
+            buf[count] = p_end
+            buf[count + 1] = p_start
+            count += 2
+            continue
+
+        T diff = math.remainder(angle_out - angle_in + math.TAU, math.TAU)
+        if diff > math.PI:
+            diff -= math.TAU
+        i64 steps = arc_sample_count(math.magnitude(radius), math.magnitude(diff), arc_resolution)
+        buf[count] = p_end
+        count += 1
+        for k in 1..<steps:
+            T a = angle_in + T(k) * diff / T(steps)
+            [2]T u = (math.cosine(a), math.sine(a))
+            buf[count] = origin - u * radius
+            count += 1
+        buf[count] = p_start
+        count += 1
+
+    #truncate(buf, count)
+    return buf
+
+// `deltas` fitted to n edges: the last entry repeats, surplus is dropped,
+// and none offsets nothing.
+private !ref []$T normalize_edge_deltas([]T deltas, i64 n) where T is float:
+    try ref []T out = #make([]T, n) else tess.NO_MEMORY
+    if #len(deltas) == 0:
+        return out
+    i64 last = #len(deltas) - 1
+    for i in 0..<n:
+        out[i] = deltas[math.min(i, last)]
+    return out
+
+// Re-attributes per-edge deltas from `source`'s edges to `target`'s. The
+// tesselator emits a cleaned ring in its own vertex order, so each target
+// edge takes the delta of the source edge nearest its midpoint; direction
+// only breaks ties between source edges on one line.
+private !ref []$T remap_edge_deltas([][2]T source, [][2]T target, []T edge_deltas) where T is float:
+    i64 nt = #len(target)
+    i64 ns = #len(source)
+    try ref []T out = #make([]T, nt) else tess.NO_MEMORY
+    if ns == 0 || nt == 0:
+        return out
+
+    [2]T lo = source[0]
+    [2]T hi = source[0]
+    for p in source:
+        lo = (math.min(lo.x, p.x), math.min(lo.y, p.y))
+        hi = (math.max(hi.x, p.x), math.max(hi.y, p.y))
+    [2]T span = hi - lo
+    // Matches sit at ~0 distance; the window only separates a match from a miss.
+    T tie = math.max(1.0e-24, 1.0e-14 * dot2(span, span))
+
+    for i in 0..<nt:
+        [2]T a = target[i]
+        [2]T b = target[(i + 1) % nt]
+        [2]T mid = (a + b) * 0.5
+        [2]T td = normalize0(b - a)
+        T best_d2 = 1.0e308
+        i64 best = 0
+        T best_dot = -2.0
+        for k in 0..<ns:
+            [2]T p = source[k]
+            [2]T q = source[(k + 1) % ns]
+            [2]T sd = q - p
+            T l2 = dot2(sd, sd)
+            if l2 <= 1.0e-24:
+                continue
+            T t = math.clamp(dot2(mid - p, sd) / l2, 0.0, 1.0)
+            [2]T diff = mid - (p + sd * t)
+            T d2 = dot2(diff, diff)
+            T dt = dot2(td, sd / math.root(l2))
+            if d2 < best_d2 - tie || (d2 <= best_d2 + tie && dt > best_dot):
+                best = k
+                best_d2 = math.min(d2, best_d2)
+                best_dot = dt
+        out[i] = edge_deltas[best]
+    return out
+
+// Offsets each edge of a closed ring by its own distance: deltas[k] moves
+// the edge polygon[k] -> polygon[k + 1] (the last covers the closing edge),
+// positive to the right of travel, so outward on a CCW ring and inward on a
+// CW one. A short `deltas` repeats its last entry, a long one is truncated,
+// an empty one offsets nothing. Answers the cleaned boundary as a set.
+private !void offset_engine([][2]$T polygon, []T deltas, Join join, T arc_resolution, T miter_limit, ^clip.Contours(T) out) where T is float:
+    i64 n = #len(polygon)
+    if n < 3:
+        return
+    try ref []T input_deltas = normalize_edge_deltas(deltas, n)
+    defer #delete(input_deltas)
+
+    // The cleaning pass keeps positive regions, so a CW ring is reversed and
+    // its deltas carried with it: edge k becomes edge n - 2 - k, sign flipped.
+    try ref [][2]T work = #make([][2]T, n) else tess.NO_MEMORY
+    defer #delete(work)
+    if clip.signed_area(polygon) < 0.0:
+        for i in 0..<n:
+            work[i] = polygon[n - 1 - i]
+        try ref []T flipped = #make([]T, n) else tess.NO_MEMORY
+        for k in 0..<n:
+            flipped[(n - 2 - k + n) % n] = -input_deltas[k]
+        #delete(input_deltas)
+        input_deltas = flipped
+    else:
+        for i in 0..<n:
+            work[i] = polygon[i]
+
+    // With one distance for every edge, each cleaned edge takes it, and the
+    // per-edge remap (quadratic in the ring's size) is skipped.
+    bool uniform = true
+    for d in input_deltas:
+        uniform = uniform && d == input_deltas[0]
+
+    []u32 one
+    clip.Contours(T) cleaned
+    try clip.boundary(work[:], one, tess.Winding.Positive, &cleaned)
+    defer clip.release(&cleaned)
+
+    try ref [][2]T raw = #make([][2]T, 0) else tess.NO_MEMORY
+    defer #delete(raw)
+    try ref []u32 raw_starts = #make([]u32, 0) else tess.NO_MEMORY
+    defer #delete(raw_starts)
+    T cw_area = 0.0
+    T ccw_area = 0.0
+    for k in 0..<clip.count(&cleaned):
+        [][2]T ring = clip.contour(&cleaned, k)
+        ref []T cd = nil
+        defer #delete(cd)
+        if uniform:
+            try cd = #make([]T, 1) else tess.NO_MEMORY
+            cd[0] = input_deltas[0]
+        else:
+            try cd = remap_edge_deltas(work[:], ring, input_deltas[:])
+        try ref [][2]T curve = make_raw_offset_curve(ring, cd[:], join, arc_resolution, miter_limit)
+        defer #delete(curve)
+        T sa = clip.signed_area(curve[:])
+        if sa < 0.0:
+            cw_area -= sa
+        else:
+            ccw_area += sa
+        if !#append(raw_starts, u32(#len(raw))):
+            fail tess.NO_MEMORY
+        for p in curve:
+            if !#append(raw, p):
+                fail tess.NO_MEMORY
+
+    // A large offset can leave the reversed loops dominant; the negative
+    // rule then extracts the right side of them.
+    tess.Winding rule = tess.Winding.Negative if cw_area > ccw_area else tess.Winding.Positive
+    try clip.boundary(raw[:], raw_starts[:], rule, out)

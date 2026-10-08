@@ -1,0 +1,363 @@
+@test
+// Writer to reader and back: floats at every width boundary keep their bits,
+// deterministic map order (the example keys of RFC 8949 section 4.2.1), and a
+// fixed-seed randomised pass: random items are written, transcoded through
+// the reader into a second writer byte for byte, and then mangled, which
+// must only ever fail with a code.
+package cbor
+
+// xorshift64*, fixed seed: the same items every run.
+private u64 state = 0x9E3779B97F4A7C15
+
+private u64 next():
+    state = state ~ (state >> 12)
+    state = state ~ (state << 25)
+    state = state ~ (state >> 27)
+    return state * 0x2545F4914F6CDD1D
+
+private u64 below(u64 n):
+    return next() % n
+
+private u64 bits(f64 v):
+    Bits64 b = Bits64(v)
+    return b.u
+
+private f64 from_bits(u64 u):
+    Bits64 b = Bits64(u)
+    return b.f
+
+// `v` written by `float` takes `width` bytes after the head and reads back
+// with the same bits.
+private bool float_ok(f64 v, i64 width):
+    Writer w = writer()
+    w.float(v)
+    try ref []u8 b = w.finish() else:
+        return #expect(false, "float ", v, ": the writer failed")
+    defer #delete(b)
+    Reader r = reader(b[:])
+    f64 back = 0.0
+    try back = r.float() else:
+        return #expect(false, "float ", v, ": unreadable")
+    bool ok = #expect(#len(b) == width + 1, "float ", v, " took ", #len(b) - 1, " bytes, not ", width)
+    return #expect(bits(back) == bits(v), "float ", v, " read back as ", back) && ok
+
+// ── a transcoder through the typed reads ─────────────────────────────────
+
+private !void copy(^Reader r, ^Writer w):
+    try Kind k = r.kind()
+    if k == Kind.Unsigned:
+        try u64 v = r.uint()
+        w.uint(v)
+    else if k == Kind.Negative:
+        try u64 n = r.negative()
+        w.negative(n)
+    else if k == Kind.Bytes:
+        try []u8 b = r.bytes()
+        w.bytes(b)
+    else if k == Kind.Text:
+        try string8 s = r.text()
+        w.text(s)
+    else if k == Kind.Array:
+        try Container c = r.array()
+        w.array(c.left)
+        for r.more(&c):
+            try copy(r, w)
+    else if k == Kind.Map:
+        try Container c = r.map()
+        w.map(c.left)
+        for r.more(&c):
+            try copy(r, w)
+            try copy(r, w)
+    else if k == Kind.Tag:
+        try u64 t = r.tag()
+        w.tag(t)
+        try copy(r, w)
+    else if k == Kind.Float:
+        try f64 f = r.float()
+        w.float(f)
+    else:
+        try u8 s = r.simple()
+        w.simple(s)
+
+// ── random items ─────────────────────────────────────────────────────────
+
+private [64]u8 junk
+
+// Thirteen bytes; a random prefix may end inside a character.
+private const string8 SAMPLE = "ab\"\\ü水𐅑"
+
+private f64 random_float():
+    u64 pick = below(6)
+    if pick == 0:
+        // Exact in half precision.
+        return f64(i64(below(2048)) - 1024) / f64(u64(1) << below(25))
+    if pick == 1:
+        // Exact in single precision.
+        Bits32 s = Bits32(u32(next() >> 32) & 0xFF7FFFFF)
+        return f64(s.f)
+    if pick == 2:
+        return 0.0
+    // Any double that is not a NaN.
+    u64 b = next()
+    if (b >> 52) & 0x7FF == 0x7FF:
+        b = b & 0xBFFFFFFFFFFFFFFF
+    return from_bits(b)
+
+private void random_item(^Writer w, i32 depth):
+    u64 pick = below(12) if depth < 5 else below(8)
+    if pick == 0:
+        w.uint(next() >> below(64))
+    else if pick == 1:
+        w.negative(next() >> below(64))
+    else if pick == 2:
+        i64 n = i64(below(40))
+        for i in 0..<n:
+            junk[i] = u8(next() & 0xFF)
+        w.bytes(junk[0..<n])
+    else if pick == 3:
+        string8 sample = SAMPLE
+        w.text(sample[0..<i64(below(14))])
+    else if pick == 4:
+        w.float(random_float())
+    else if pick == 5:
+        w.boolean(below(2) == 0)
+    else if pick == 6:
+        w.null()
+    else if pick == 7:
+        u64 s = below(256)
+        if s >= 24 && s < 32:
+            s = 32
+        w.simple(u8(s))
+    else if pick == 8 || pick == 9:
+        u64 n = below(6)
+        w.array(n)
+        for _i in 0..<n:
+            random_item(w, depth + 1)
+    else if pick == 10:
+        u64 n = below(5)
+        w.map(n)
+        for _i in 0..<(n * 2):
+            random_item(w, depth + 1)
+    else:
+        w.tag(next() >> below(64))
+        random_item(w, depth + 1)
+
+private i32 well_formed_code([]u8 b):
+    try well_formed(b) else code:
+        return code
+    return 0
+
+private bool one_round(i64 round):
+    Writer w = writer()
+    random_item(&w, 0)
+    try ref []u8 b = w.finish() else:
+        return #expect(false, "round ", round, ": the writer failed")
+    defer #delete(b)
+    bool ok = #expect(well_formed_code(b[:]) == 0, "round ", round, ": not well-formed")
+    Reader r = reader(b[:])
+    Writer w2 = writer()
+    try copy(&r, &w2) else code:
+        w2.destroy()
+        return #expect(false, "round ", round, ": transcoding failed: ", message(code))
+    try ref []u8 b2 = w2.finish() else:
+        return #expect(false, "round ", round, ": the second writer failed")
+    defer #delete(b2)
+    bool same = #len(b) == #len(b2)
+    for i in 0..<#len(b):
+        same = same && b[i] == b2[i]
+    ok = #expect(same && r.done(), "round ", round, ": transcoding changed the bytes") && ok
+    // Mangle: flip a byte, cut the tail. Any answer is fine except a crash;
+    // skip agrees with well_formed on every one.
+    ref []u8 m = #make([]u8, #len(b))
+    defer #delete(m)
+    for i in 0..<#len(b):
+        m[i] = b[i]
+    for _t in 0..<8:
+        i64 at = i64(below(u64(#len(m))))
+        u8 was = m[at]
+        m[at] = u8(next() & 0xFF)
+        i64 cut = #len(m) - i64(below(3))
+        if cut < 0:
+            cut = 0
+        i32 code = well_formed_code(m[0..<cut])
+        Reader mr = reader(m[0..<cut])
+        i32 skipped = 0
+        try mr.skip() else c:
+            skipped = c
+        if code != TRAILING:
+            ok = #expect(skipped == code, "round ", round, ": skip said ", skipped, ", well_formed ", code) && ok
+        if code == 0:
+            try ref []char8 text = diagnose(m[0..<cut]) else:
+                ok = #expect(false, "round ", round, ": a well-formed item did not render") && ok
+                continue
+            #delete(text)
+        m[at] = was
+    return ok
+
+i32 test():
+    bool ok = true
+
+    // ── floats at the width boundaries ────────────────────────────────────
+    ok = float_ok(1.0, 2) && ok
+    ok = float_ok(65504.0, 2) && ok
+    ok = float_ok(65505.0, 4) && ok
+    ok = float_ok(65536.0, 4) && ok
+    ok = float_ok(0.000000059604644775390625, 2) && ok             // 2^-24
+    ok = float_ok(0.0000000298023223876953125, 4) && ok            // 2^-25
+    ok = float_ok(0.00006103515625, 2) && ok                       // 2^-14
+    ok = float_ok(0.000030517578125, 2) && ok                      // 2^-15, subnormal
+    ok = float_ok(0.000030517578125 * 1.5, 2) && ok
+    ok = float_ok(0.000030517578125 * (1.0 + 1.0 / 1024.0), 4) && ok
+    ok = float_ok(from_bits(0x36A0000000000000), 4) && ok          // 2^-149
+    ok = float_ok(from_bits(0x3690000000000000), 8) && ok          // 2^-150
+    ok = float_ok(from_bits(0x3810000000000000), 4) && ok          // 2^-126
+    ok = float_ok(from_bits(0x3800000000000000), 4) && ok          // 2^-127
+    ok = float_ok(from_bits(0x47EFFFFFE0000000), 4) && ok          // the largest single
+    ok = float_ok(from_bits(0x47EFFFFFF0000000), 8) && ok
+    ok = float_ok(from_bits(0x47F0000000000000), 8) && ok          // 2^128
+    ok = float_ok(from_bits(0x0000000000000001), 8) && ok          // the smallest double
+    ok = float_ok(from_bits(0x8000000000000000), 2) && ok          // -0
+    ok = float_ok(0.1, 8) && ok
+    ok = float_ok(from_bits(0x7FF0000000000000), 2) && ok          // infinity
+    ok = float_ok(from_bits(0x7FF8000000000000), 2) && ok          // the quiet NaN
+    ok = float_ok(from_bits(0xFFFC000000000000), 2) && ok          // a payload half keeps
+    ok = float_ok(from_bits(0x7FF8000020000000), 4) && ok          // ... single keeps
+    ok = float_ok(from_bits(0x7FF8000000000001), 8) && ok          // ... only double keeps
+
+    // ── deterministic map order ───────────────────────────────────────────
+    // Keys 10, 100, -1, "z", "aa", [100], [-1], false, given backwards.
+    Writer w = writer()
+    i64 at = w.mark()
+    w.map(8)
+    w.boolean(false)
+    w.uint(7)
+    w.array(1)
+    w.int(-1)
+    w.uint(6)
+    w.array(1)
+    w.uint(100)
+    w.uint(5)
+    w.text("aa")
+    w.uint(4)
+    w.text("z")
+    w.uint(3)
+    w.int(-1)
+    w.uint(2)
+    w.uint(100)
+    w.uint(1)
+    w.uint(10)
+    w.uint(0)
+    w.sort_map(at)
+    ref []u8 sorted
+    try sorted = w.finish() else code:
+        sorted = nil
+        ok = #expect(false, "sort_map failed: ", message(code)) && ok
+    if sorted != nil:
+        [23]u8 want = [0xA8, 0x0A, 0x00, 0x18, 0x64, 0x01, 0x20, 0x02, 0x61, 0x7A, 0x03, 0x62, 0x61, 0x61, 0x04,
+                       0x81, 0x18, 0x64, 0x05, 0x81, 0x20, 0x06, 0xF4]
+        bool same = #len(sorted) == 24
+        for i in 0..<23:
+            same = same && sorted[i] == want[i]
+        ok = #expect(same && sorted[23] == 0x07, "the sorted map is not in deterministic order") && ok
+    #delete(sorted)
+
+    // A nested map sorted first, then its parent, with the parent's
+    // first-written key last.
+    w = writer()
+    at = w.mark()
+    w.map(2)
+    w.text("b")
+    i64 inner = w.mark()
+    w.map(2)
+    w.uint(2)
+    w.null()
+    w.uint(1)
+    w.null()
+    w.sort_map(inner)
+    w.text("a")
+    w.boolean(true)
+    w.sort_map(at)
+    ref []u8 nest
+    try nest = w.finish() else:
+        nest = nil
+    if nest != nil:
+        ref []char8 d
+        try d = diagnose(nest[:]) else:
+            d = nil
+        ok = #expect(d != nil && string8(d[:]) == "{\"a\": true, \"b\": {1: null, 2: null}}", "nested sort") && ok
+        #delete(d)
+    ok = #expect(nest != nil, "nested sort failed") && ok
+    #delete(nest)
+
+    // Equal keys, and a mark that is not a map.
+    w = writer()
+    at = w.mark()
+    w.map(2)
+    w.text("k")
+    w.uint(1)
+    w.text("k")
+    w.uint(2)
+    w.sort_map(at)
+    ok = #expect(w.code() == DUPLICATE_KEY, "duplicate keys gave ", w.code()) && ok
+    ref []u8 dup
+    try dup = w.finish() else:
+        dup = nil
+    ok = #expect(dup == nil, "finish succeeded after a failure") && ok
+    w = writer()
+    at = w.mark()
+    w.array(0)
+    w.sort_map(at)
+    ok = #expect(w.code() == WRONG_TYPE, "sorting an array gave ", w.code()) && ok
+    w.destroy()
+    // A mark with nothing written after it, marks outside what was written,
+    // and a map that is not the last thing written.
+    w = writer()
+    w.sort_map(w.mark())
+    ok = #expect(w.code() == TRUNCATED, "sorting at the end gave ", w.code()) && ok
+    w.destroy()
+    w = writer()
+    w.map(0)
+    w.sort_map(-1)
+    ok = #expect(w.code() == TRUNCATED, "sorting at -1 gave ", w.code()) && ok
+    w.destroy()
+    w = writer()
+    w.map(0)
+    w.sort_map(100)
+    ok = #expect(w.code() == TRUNCATED, "sorting past the end gave ", w.code()) && ok
+    w.destroy()
+    w = writer()
+    at = w.mark()
+    w.map(1)
+    w.uint(1)
+    w.uint(2)
+    w.uint(3)
+    w.sort_map(at)
+    ok = #expect(w.code() == TRAILING, "sorting a map with an item after it gave ", w.code()) && ok
+    w.destroy()
+    w = writer()
+    at = w.mark()
+    w.map(2)
+    w.uint(2)
+    w.uint(0)
+    w.uint(1)
+    w.uint(0)
+    w.uint(3)
+    w.sort_map(at)
+    ok = #expect(w.code() == TRAILING, "sorting two pairs with an item after them gave ", w.code()) && ok
+    w.destroy()
+
+    // A failure is kept: later writes do nothing and finish fails.
+    w = writer()
+    w.simple(24)
+    w.uint(1)
+    []u8 kept = w.data()
+    ok = #expect(w.code() == BAD_SIMPLE && #len(kept) == 0, "a bad simple value was not kept") && ok
+    i32 finished = 0
+    try dup = w.finish() else code:
+        finished = code
+    ok = #expect(finished == BAD_SIMPLE, "finish failed with ", finished) && ok
+
+    // ── randomised ────────────────────────────────────────────────────────
+    for round in 0..<3000:
+        ok = one_round(round) && ok
+    return 0 if ok else 1

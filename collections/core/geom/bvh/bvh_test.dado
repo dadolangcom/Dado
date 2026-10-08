@@ -1,0 +1,306 @@
+@test
+package bvh
+
+import "core:slices"
+import "core:mem/bump"
+import "core:geom/hit"
+
+private u64 rng_state = 0x2545F4914F6CDD1D
+
+// xorshift64*, fixed seed: deterministic across targets.
+private f32 rnd():
+    rng_state = rng_state ~ (rng_state >> 12)
+    rng_state = rng_state ~ (rng_state << 25)
+    rng_state = rng_state ~ (rng_state >> 27)
+    u64 r = rng_state * 0x2545F4914F6CDD1D
+    return f32(f64(r >> 11) / 9007199254740992.0)
+
+private [3]f32 rnd3(f32 scale):
+    return (rnd() * scale, rnd() * scale, rnd() * scale)
+
+// Three corners per triangle.
+private type Scene: ([][3]f32 corners)
+private type ScenePtr: ^Scene
+
+private RayHit tri_test([3]f32 origin, [3]f32 dir, i32 item, f32 t_max, rawptr data):
+    ScenePtr s = ScenePtr(data)
+    i32 k = item * 3
+    (f32 t, _, _, bool h) = hit.ray_triangle(origin, dir, s.corners[k], s.corners[k + 1], s.corners[k + 2], true)
+    return (t, h && t < t_max)
+
+private bool skip_even(i32 item, rawptr data):
+    return item % 2 == 0
+
+// The nearest hit by testing every triangle in order.
+private (i32, f32) brute([][3]f32 corners, [3]f32 origin, [3]f32 dir, bool even_skipped):
+    i32 best = -1
+    f32 best_t = 1000000.0
+    i64 n = #len(corners) / 3
+    for i in 0..<n:
+        if even_skipped && i % 2 == 0:
+            continue
+        (f32 t, _, _, bool h) = hit.ray_triangle(origin, dir, corners[3 * i], corners[3 * i + 1], corners[3 * i + 2], true)
+        if h && t < best_t:
+            best = i32(i)
+            best_t = t
+    return (best, best_t)
+
+private void boxes_of([][3]f32 corners, []Box boxes):
+    for i in 0..<#len(boxes):
+        boxes[i] = triangle_box(corners[3 * i], corners[3 * i + 1], corners[3 * i + 2])
+
+// Every item sits in exactly one leaf, and every box holds its children.
+private bool well_formed(^const Bvh b, []Box boxes):
+    i64 n = #len(boxes)
+    ref []i32 seen = #make([]i32, n)
+    defer #delete(seen)
+    bool ok = true
+    for node, i in b.nodes:
+        if node.count > 0:
+            for k in node.first..<node.first + node.count:
+                i32 it = b.items[k]
+                seen[it] += 1
+                ok = ok && hit.aabb_aabb(node.lo, node.hi, boxes[it].lo, boxes[it].hi)
+                ok = ok && contains(node.lo, node.hi, boxes[it].lo, boxes[it].hi)
+        else:
+            ok = ok && node.first > i32(i)
+            ok = ok && contains(node.lo, node.hi, b.nodes[node.first].lo, b.nodes[node.first].hi)
+            ok = ok && contains(node.lo, node.hi, b.nodes[node.first + 1].lo, b.nodes[node.first + 1].hi)
+    for c in seen:
+        ok = ok && c == 1
+    return ok
+
+private bool contains([3]f32 lo, [3]f32 hi, [3]f32 ilo, [3]f32 ihi):
+    for a in 0..<3:
+        if ilo[a] < lo[a] || ihi[a] > hi[a]:
+            return false
+    return true
+
+// Rays from around the scene at random targets in it, against brute force.
+private bool rays_agree(^const Bvh b, [][3]f32 corners, i32 rays, string8 what):
+    bool ok = true
+    Scene s = (corners)
+    RayTest test = (tri_test, rawptr(&s))
+    Skip none = (nil, nil)
+    Skip evens = (skip_even, nil)
+    i32 hits = 0
+    for r in 0..<rays:
+        [3]f32 origin = rnd3(14.0) - (2.0, 2.0, 2.0)
+        [3]f32 dir = rnd3(10.0) - origin
+        (i32 item, f32 t, bool h) = raycast(b, origin, dir, 1000000.0, test, none)
+        (i32 want, f32 want_t) = brute(corners, origin, dir, false)
+        ok = #expect(item == want && (!h || t == want_t), what, " ray ", r, ": bvh ", item, " at ", t, ", brute ", want, " at ", want_t) && ok
+        if h:
+            hits += 1
+
+        (item, t, h) = raycast(b, origin, dir, 1000000.0, test, evens)
+        (want, want_t) = brute(corners, origin, dir, true)
+        ok = #expect(item == want && (!h || t == want_t), what, " ray ", r, " skipping evens: bvh ", item, ", brute ", want) && ok
+    ok = #expect(hits > rays / 10, what, ": only ", hits, " of ", rays, " rays hit") && ok
+    return ok
+
+// Box queries against brute force, as sorted item sets.
+private bool boxes_agree(^const Bvh b, []Box boxes, i32 queries, string8 what):
+    bool ok = true
+    for q in 0..<queries:
+        [3]f32 lo = rnd3(10.0)
+        [3]f32 hi = lo + rnd3(3.0)
+        ref []i32 got = #make([]i32, 0)
+        defer #delete(got)
+        try i32 n = overlapping(b, boxes, lo, hi, &got) else:
+            return #expect(false, what, ": overlapping failed")
+        ref []i32 want = #make([]i32, 0)
+        defer #delete(want)
+        for box, i in boxes:
+            if hit.aabb_aabb(box.lo, box.hi, lo, hi):
+                _ = #append(want, i32(i))
+        slices.sort_ascending(got[:])
+        bool same = n == i32(#len(got)) && #len(got) == #len(want)
+        if same:
+            for w, i in want:
+                same = same && got[i] == w
+        ok = #expect(same, what, " box ", q, ": ", #len(got), " found, ", #len(want), " expected") && ok
+    return ok
+
+private bool test_random():
+    bool ok = true
+    i32 n = 400
+    ref [][3]f32 corners = #make([][3]f32, 3 * n)
+    defer #delete(corners)
+    for i in 0..<n:
+        [3]f32 at = rnd3(10.0)
+        corners[3 * i] = at
+        corners[3 * i + 1] = at + rnd3(1.0) - (0.5, 0.5, 0.5)
+        corners[3 * i + 2] = at + rnd3(1.0) - (0.5, 0.5, 0.5)
+    ref []Box boxes = #make([]Box, n)
+    defer #delete(boxes)
+    boxes_of(corners, boxes)
+
+    try Bvh b = build(boxes) else:
+        return #expect(false, "build failed")
+    defer destroy(&b)
+    ok = #expect(well_formed(&b, boxes), "random: malformed tree") && ok
+    ok = #expect(b.depth > 3 && b.depth < 40, "random: depth ", b.depth) && ok
+    ok = rays_agree(&b, corners, 500, "random") && ok
+    ok = boxes_agree(&b, boxes, 200, "random") && ok
+
+    // Move every triangle, refit, and agree again.
+    for i in 0..<3 * n:
+        corners[i] = corners[i] + rnd3(2.0) - (1.0, 1.0, 1.0)
+    boxes_of(corners, boxes)
+    refit(&b, boxes)
+    ok = #expect(well_formed(&b, boxes), "refit: malformed tree") && ok
+    ok = rays_agree(&b, corners, 500, "refit") && ok
+    ok = boxes_agree(&b, boxes, 200, "refit") && ok
+    return ok
+
+private bool test_degenerate():
+    bool ok = true
+    Skip none = (nil, nil)
+
+    // Empty.
+    []Box nothing
+    try Bvh e = build(nothing) else:
+        return #expect(false, "empty build failed")
+    defer destroy(&e)
+    Scene es
+    (_, _, bool eh) = raycast(&e, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 10.0, (tri_test, rawptr(&es)), none)
+    ref []i32 out = #make([]i32, 0)
+    defer #delete(out)
+    try i32 en = overlapping(&e, nothing, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &out) else:
+        return 1 == 0
+    ok = #expect(!eh && en == 0, "empty tree answered") && ok
+
+    // One triangle.
+    ref [][3]f32 one = #make([][3]f32, 3)
+    defer #delete(one)
+    one[0] = (0.0, 0.0, 0.0)
+    one[1] = (1.0, 0.0, 0.0)
+    one[2] = (0.0, 1.0, 0.0)
+    ref []Box one_box = #make([]Box, 1)
+    defer #delete(one_box)
+    boxes_of(one, one_box)
+    try Bvh o = build(one_box) else:
+        return #expect(false, "one build failed")
+    defer destroy(&o)
+    Scene os = (one)
+    (i32 oi, f32 ot, bool oh) = raycast(&o, (0.25, 0.25, 5.0), (0.0, 0.0, -1.0), 10.0, (tri_test, rawptr(&os)), none)
+    ok = #expect(oh && oi == 0 && ot == 5.0 && #len(o.nodes) == 1, "one item: ", oi, " ", ot) && ok
+    (_, _, oh) = raycast(&o, (0.25, 0.25, 5.0), (0.0, 0.0, -1.0), 4.0, (tri_test, rawptr(&os)), none)
+    ok = #expect(!oh, "one item: hit past t_max") && ok
+
+    // Many identical triangles: splits by halves, every one is found.
+    i32 n = 300
+    ref [][3]f32 same = #make([][3]f32, 3 * n)
+    defer #delete(same)
+    for i in 0..<n:
+        same[3 * i] = (1.0, 1.0, 1.0)
+        same[3 * i + 1] = (2.0, 1.0, 1.0)
+        same[3 * i + 2] = (1.0, 2.0, 1.0)
+    ref []Box same_boxes = #make([]Box, n)
+    defer #delete(same_boxes)
+    boxes_of(same, same_boxes)
+    try Bvh s = build(same_boxes) else:
+        return #expect(false, "identical build failed")
+    defer destroy(&s)
+    ok = #expect(well_formed(&s, same_boxes) && s.depth < 12, "identical: depth ", s.depth) && ok
+    Scene ss = (same)
+    (i32 si, _, bool sh) = raycast(&s, (1.2, 1.2, 4.0), (0.0, 0.0, -1.0), 10.0, (tri_test, rawptr(&ss)), none)
+    ok = #expect(sh && si >= 0, "identical: no hit") && ok
+    #truncate(out, 0)
+    try i32 sn = overlapping(&s, same_boxes, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &out) else:
+        return 1 == 0
+    ok = #expect(sn == n, "identical: ", sn, " overlap") && ok
+
+    // Exponentially spaced: lopsided for SAH.
+    i32 m = 300
+    ref [][3]f32 chain = #make([][3]f32, 3 * m)
+    defer #delete(chain)
+    f32 x = 1.0
+    for i in 0..<m:
+        chain[3 * i] = (x, 0.0, 0.0)
+        chain[3 * i + 1] = (x, 1.0, 0.0)
+        chain[3 * i + 2] = (x, 0.0, 1.0)
+        x = x * 1.3
+    ref []Box chain_boxes = #make([]Box, m)
+    defer #delete(chain_boxes)
+    boxes_of(chain, chain_boxes)
+    try Bvh c = build(chain_boxes) else:
+        return #expect(false, "chain build failed")
+    defer destroy(&c)
+    ok = #expect(well_formed(&c, chain_boxes) && c.depth < 48, "chain: depth ", c.depth) && ok
+    Scene cs = (chain)
+    // Along +x through the corner edge: the nearest is the first plane.
+    (i32 ci, _, bool ch) = raycast(&c, (0.0, 0.1, 0.1), (1.0, 0.0, 0.0), 1.0e30, (tri_test, rawptr(&cs)), none)
+    ok = #expect(ch && ci == 0, "chain: nearest ", ci) && ok
+    Skip evens = (skip_even, nil)
+    (ci, _, ch) = raycast(&c, (0.0, 0.1, 0.1), (1.0, 0.0, 0.0), 1.0e30, (tri_test, rawptr(&cs)), evens)
+    ok = #expect(ch && ci == 1, "chain: nearest odd ", ci) && ok
+    return ok
+
+// The quickselect behind median splits: a partition about the middle slot.
+private bool test_median():
+    bool ok = true
+    for round in 0..<20:
+        i32 n = 5 + round * 7
+        ref [][3]f32 cs = #make([][3]f32, n)
+        defer #delete(cs)
+        ref []i32 items = #make([]i32, n)
+        defer #delete(items)
+        for i in 0..<n:
+            // Few distinct values, so ties are common.
+            cs[i] = (f32(i32(rnd() * 6.0)), rnd(), 0.0)
+            items[i] = i
+        [3]f32 lo = (0.0, 0.0, 0.0)
+        [3]f32 hi = (6.0, 1.0, 0.0)
+        i32 mid = median_split(cs, items, 0, n, lo, hi)
+        f32 pivot = cs[items[mid]].x
+        bool parted = mid == n / 2
+        for k in 0..<n:
+            f32 v = cs[items[k]].x
+            parted = parted && (v <= pivot if k < mid else v >= pivot)
+        slices.sort_ascending(items[:])
+        for k in 0..<n:
+            parted = parted && items[k] == k
+        ok = #expect(parted, "median split, n = ", n) && ok
+    return ok
+
+// Every allocation refused: build and overlapping fail with NO_MEMORY and leak nothing.
+private bool test_no_memory():
+    bool ok = true
+    ref []Box boxes = #make([]Box, 50)
+    defer #delete(boxes)
+    for i in 0..<50:
+        [3]f32 at = rnd3(10.0)
+        boxes[i] = (at, at + (1.0, 1.0, 1.0))
+    [64]u8 storage
+    bump.Arena tiny = bump.over(rawptr(&storage), 64)
+    using bump.allocator(&tiny):
+        try Bvh b = build(boxes) else code:
+            ok = #expect(code == NO_MEMORY, "build failed with ", code) && ok
+            return ok
+        destroy(&b)
+    return #expect(false, "build succeeded in 64 bytes")
+
+private bool test_overlapping_no_memory():
+    ref []Box boxes = #make([]Box, 50)
+    defer #delete(boxes)
+    for i in 0..<50:
+        boxes[i] = ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    try Bvh b = build(boxes) else:
+        return #expect(false, "build failed")
+    defer destroy(&b)
+    [64]u8 storage
+    bump.Arena tiny = bump.over(rawptr(&storage), 64)
+    ref []i32 out = #make([]i32, 0, bump.allocator(&tiny))
+    try i32 _ = overlapping(&b, boxes, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), &out) else code:
+        return #expect(code == NO_MEMORY, "overlapping failed with ", code)
+    return #expect(false, "50 items fit in 64 bytes")
+
+i32 test():
+    bool ok = test_random()
+    ok = test_no_memory() && ok
+    ok = test_overlapping_no_memory() && ok
+    ok = test_median() && ok
+    ok = test_degenerate() && ok
+    return 0 if ok else 1

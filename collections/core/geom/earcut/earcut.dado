@@ -1,0 +1,837 @@
+// Polygon triangulation by ear clipping, holes included.
+//
+// A port of mapbox/earcut 3.2.4 (ISC licence, Copyright (c) 2026 Mapbox; the
+// notice is in this directory's LICENSE). It answers the reference's indices
+// for f64 input:
+//
+//     [8]f64 quad = [10.0, 0.0, 0.0, 50.0, 60.0, 60.0, 70.0, 10.0]
+//     []u32 no_holes
+//     try ref []u32 tris = earcut.triangulate(quad[:], no_holes) else:
+//         return 1
+//     defer #delete(tris)   // [1, 0, 3, 1, 3, 2]
+//
+// Self-intersecting input still answers triangles; `deviation` measures how
+// far they are from the polygon's area.
+package earcut
+
+// `triangulate` fails with MALFORMED when `dim` is below 2, the data ends
+// partway through a vertex, or the hole starts do not increase strictly
+// inside the vertices.
+const i32 MALFORMED = 1
+
+// `triangulate` fails with NO_MEMORY when an allocation answers nil.
+const i32 NO_MEMORY = 2
+
+private const i32 NIL = -1
+private const i32 K = 16          // edges per block of the hole-bridge index
+private const i32 HASH_MIN = 80   // more coordinates than this many vertices' worth: z-order hashing
+private const i32 SMALL_SORT = 32 // insertion sort up to this many nodes, radix above
+
+private type Node:
+    i32 i        // vertex index
+    f64 x
+    f64 y
+    i32 prev
+    i32 next
+    i32 z        // z-order value; the owning block while holes are bridged
+    i32 prev_z   // NIL at the ends
+    i32 next_z
+    bool steiner // a one-vertex hole, kept through filtering
+
+// Everything is reserved before the first node is made, so nothing below
+// allocates and node indices stay valid.
+private type Ctx:
+    ref []Node nodes
+    i32 count
+    ref []u32 tris
+    bool filtered_out
+    bool index_active
+    ref []f64 bbox      // [min_x, min_y, max_x, max_y] per block
+    ref []i32 block_head
+    ref []i32 block_stop
+    i32 num_blocks
+    ref []i32 sort_arr
+    ref []i32 sort_buf
+    ref []u32 z_arr
+    ref []u32 z_buf
+
+private void release(^Ctx c):
+    #delete(c.nodes)
+    #delete(c.tris)
+    #delete(c.bbox)
+    #delete(c.block_head)
+    #delete(c.block_stop)
+    #delete(c.sort_arr)
+    #delete(c.sort_buf)
+    #delete(c.z_arr)
+    #delete(c.z_buf)
+
+// |x|, min and max in Dado rather than through core:math, whose C (fabs, and
+// math.h at all) a script cannot run and a #NONE target cannot link.
+private f64 abs(f64 x):
+    return -x if x < 0.0 else x
+
+private f64 min(f64 a, f64 b):
+    return b if b < a else a
+
+private f64 max(f64 a, f64 b):
+    return b if b > a else a
+
+private f64 infinity():
+    f64 big = 1.0e308
+    return big * 10.0
+
+// Triangulates a polygon given as flat coordinates, `dim` per vertex, of
+// which only the first two are read. The outer ring starts at vertex 0 and
+// each hole at the vertex index in `holes`, which must increase. A ring needs
+// no closing point and may wind either way. Answers vertex-index triples on
+// `#default`, the caller's to `#delete`; a degenerate polygon answers none.
+// Fails with MALFORMED or NO_MEMORY. About n log n for n vertices on ordinary
+// input (a z-order hash above 80 vertices), n^2 at worst.
+#assert_raises
+!ref []u32 triangulate([]$T data, []u32 holes, i32 dim = 2) where T is float:
+    i64 len = #len(data)
+    if dim < 2 || len % i64(dim) != 0:
+        fail MALFORMED
+    i64 nverts = len / i64(dim)
+    i64 last = 0
+    for h in holes:
+        if i64(h) <= last || i64(h) >= nverts:
+            fail MALFORMED
+        last = i64(h)
+
+    i64 nholes = #len(holes)
+    i64 outer_len = len
+    if nholes > 0:
+        outer_len = i64(holes[0]) * i64(dim)
+
+    // Ring nodes, plus two per hole bridge; each split adds two more and there
+    // are fewer splits than that many nodes.
+    i64 n_max = nverts + 2 * nholes
+    i64 node_cap = 3 * n_max + 8
+    bool hashed = len > i64(HASH_MIN) * i64(dim)
+
+    Ctx c
+    defer release(&c)
+    try c.nodes = #make([]Node, node_cap) else NO_MEMORY
+    try c.tris = #make([]u32, 0) else NO_MEMORY
+    if !#reserve(c.tris, 3 * n_max):
+        fail NO_MEMORY
+    if nholes > 0:
+        i64 max_blocks = (nverts + 2 * nholes + i64(K) - 1) / i64(K) + nholes + 2
+        try c.bbox = #make([]f64, 4 * max_blocks) else NO_MEMORY
+        try c.block_head = #make([]i32, max_blocks) else NO_MEMORY
+        try c.block_stop = #make([]i32, max_blocks) else NO_MEMORY
+    if hashed:
+        try c.sort_arr = #make([]i32, node_cap) else NO_MEMORY
+        try c.sort_buf = #make([]i32, node_cap) else NO_MEMORY
+        try c.z_arr = #make([]u32, node_cap) else NO_MEMORY
+        try c.z_buf = #make([]u32, node_cap) else NO_MEMORY
+
+    i32 outer = linked_list(&c, data, 0, outer_len, dim, true)
+    if outer == NIL || c.nodes[outer].next == c.nodes[outer].prev:
+        return take_tris(&c)
+
+    f64 min_x = 0.0
+    f64 min_y = 0.0
+    f64 inv_size = 0.0
+
+    if nholes > 0:
+        ref []i32 queue = #make([]i32, nholes)
+        defer #delete(queue)
+        if queue == nil:
+            fail NO_MEMORY
+        outer = eliminate_holes(&c, data, holes, outer, dim, queue)
+
+    if hashed:
+        min_x = f64(data[0])
+        min_y = f64(data[1])
+        f64 max_x = min_x
+        f64 max_y = min_y
+        i64 i = i64(dim)
+        for i < outer_len:
+            f64 x = f64(data[i])
+            f64 y = f64(data[i + 1])
+            if x < min_x: min_x = x
+            if y < min_y: min_y = y
+            if x > max_x: max_x = x
+            if y > max_y: max_y = y
+            i += i64(dim)
+        inv_size = max(max_x - min_x, max_y - min_y)
+        inv_size = 32767.0 / inv_size if inv_size != 0.0 else 0.0
+
+    earcut_linked(&c, outer, min_x, min_y, inv_size)
+    return take_tris(&c)
+
+private ref []u32 take_tris(^Ctx c):
+    ref []u32 out = c.tris
+    c.tris = nil
+    return out
+
+// How far `triangles` is from covering the polygon: the difference between
+// the polygon's area and the triangles' total area, relative to the polygon's.
+// Near 0 for a correct triangulation, and 0 for a degenerate polygon with no
+// triangles. `data`, `holes` and `dim` are what `triangulate` was given, and
+// `triangles` is what it answered.
+#assert_raises
+f64 deviation([]$T data, []u32 holes, i32 dim, []u32 triangles) where T is float:
+    i64 len = #len(data)
+    i64 nholes = #len(holes)
+    i64 outer_len = len
+    if nholes > 0:
+        outer_len = i64(holes[0]) * i64(dim)
+
+    f64 polygon_area = abs(signed_area(data, 0, outer_len, dim))
+    for h, k in holes:
+        i64 start = i64(h) * i64(dim)
+        i64 end = len
+        if k < nholes - 1:
+            end = i64(holes[k + 1]) * i64(dim)
+        polygon_area -= abs(signed_area(data, start, end, dim))
+
+    f64 triangles_area = 0.0
+    i64 i = 0
+    for i + 2 < #len(triangles):
+        i64 a = i64(triangles[i]) * i64(dim)
+        i64 b = i64(triangles[i + 1]) * i64(dim)
+        i64 d = i64(triangles[i + 2]) * i64(dim)
+        triangles_area += abs(
+            (f64(data[a]) - f64(data[d])) * (f64(data[b + 1]) - f64(data[a + 1])) -
+            (f64(data[a]) - f64(data[b])) * (f64(data[d + 1]) - f64(data[a + 1])))
+        i += 3
+
+    // No triangles: an area within shoelace roundoff of zero means degenerate input.
+    if triangles_area == 0.0:
+        f64 largest = 0.0
+        i64 j = 0
+        for j + 1 < len:
+            largest = max(largest, max(abs(f64(data[j])), abs(f64(data[j + 1]))))
+            j += i64(dim)
+        f64 eps = 2.220446049250313e-16
+        return 0.0 if abs(polygon_area) <= f64(len) * largest * largest * eps else 1.0
+    return abs((triangles_area - polygon_area) / polygon_area)
+
+private f64 signed_area([]$T data, i64 start, i64 end, i32 dim) where T is float:
+    f64 sum = 0.0
+    i64 i = start
+    i64 j = end - i64(dim)
+    for i < end:
+        sum += (f64(data[j]) - f64(data[i])) * (f64(data[i + 1]) + f64(data[j + 1]))
+        j = i
+        i += i64(dim)
+    return sum
+
+// A circular doubly linked ring of the vertices in [start, end), in the asked winding.
+private i32 linked_list(^Ctx c, []$T data, i64 start, i64 end, i32 dim, bool clockwise) where T is float:
+    i32 last = NIL
+    i64 d = i64(dim)
+    if clockwise == (signed_area(data, start, end, dim) > 0.0):
+        i64 i = start
+        for i < end:
+            last = insert_node(c, i32(i / d), f64(data[i]), f64(data[i + 1]), last)
+            i += d
+    else:
+        i64 i = end - d
+        for i >= start:
+            last = insert_node(c, i32(i / d), f64(data[i]), f64(data[i + 1]), last)
+            i -= d
+
+    if last != NIL && equals(c, last, c.nodes[last].next):
+        remove_node(c, last)
+        last = c.nodes[last].next
+    return last
+
+// Removes collinear and coincident points. With end == start the whole ring is
+// swept to a fixpoint; otherwise only the window up to `end`. Answers the new end.
+private i32 filter_points(^Ctx c, i32 start, i32 end_at):
+    bool full = end_at == start
+    i32 end = end_at
+    i32 p = start
+    for true:
+        bool again = false
+        ^Node n = &c.nodes[p]
+        if p != n.next && !n.steiner && (equals(c, p, n.next) || area(c, n.prev, p, n.next) == 0.0):
+            if full || p == end:
+                end = n.prev
+            c.filtered_out = true
+            remove_node(c, p)
+            p = n.prev
+            again = true
+        else if full || p != end:
+            p = n.next
+            again = !full
+        if !again && p == end:
+            break
+    return end
+
+private void push_tri(^Ctx c, i32 a, i32 b, i32 d):
+    _ = #append(c.tris, u32(c.nodes[a].i))
+    _ = #append(c.tris, u32(c.nodes[b].i))
+    _ = #append(c.tris, u32(c.nodes[d].i))
+
+private void earcut_linked(^Ctx c, i32 start, f64 min_x, f64 min_y, f64 inv_size):
+    i32 ear = start
+    if inv_size != 0.0:
+        index_curve(c, ear, min_x, min_y, inv_size)
+
+    i32 stop = ear
+    bool cured = false
+    for c.nodes[ear].prev != c.nodes[ear].next:
+        i32 prev = c.nodes[ear].prev
+        i32 next = c.nodes[ear].next
+
+        if area(c, prev, ear, next) < 0.0 && (is_ear_hashed(c, ear, min_x, min_y, inv_size) if inv_size != 0.0 else is_ear(c, ear)):
+            push_tri(c, prev, ear, next)
+            remove_node(c, ear)
+            ear = next
+            stop = next
+            continue
+
+        ear = next
+        if ear == stop:
+            // Filter while filtering removes nodes; then cure once; then split.
+            c.filtered_out = false
+            ear = filter_points(c, ear, ear)
+            if c.filtered_out:
+                stop = ear
+                continue
+            if !cured:
+                ear = cure_local_intersections(c, ear)
+                stop = ear
+                cured = true
+                continue
+            split_earcut(c, ear, min_x, min_y, inv_size)
+            break
+
+private bool is_ear(^Ctx c, i32 ear):
+    ^Node a = &c.nodes[c.nodes[ear].prev]
+    ^Node b = &c.nodes[ear]
+    i32 cn = c.nodes[ear].next
+    ^Node d = &c.nodes[cn]
+    f64 x0 = min(min(a.x, b.x), d.x)
+    f64 y0 = min(min(a.y, b.y), d.y)
+    f64 x1 = max(max(a.x, b.x), d.x)
+    f64 y1 = max(max(a.y, b.y), d.y)
+
+    i32 p = d.next
+    i32 stop = b.prev
+    for p != stop:
+        ^Node n = &c.nodes[p]
+        if (n.x >= x0 && n.x <= x1 && n.y >= y0 && n.y <= y1 && !(a.x == n.x && a.y == n.y) &&
+                point_in_triangle(a.x, a.y, b.x, b.y, d.x, d.y, n.x, n.y) && area(c, n.prev, p, n.next) >= 0.0):
+            return false
+        p = n.next
+    return true
+
+private bool is_ear_hashed(^Ctx c, i32 ear, f64 min_x, f64 min_y, f64 inv_size):
+    ^Node a = &c.nodes[c.nodes[ear].prev]
+    ^Node b = &c.nodes[ear]
+    i32 cn = c.nodes[ear].next
+    ^Node d = &c.nodes[cn]
+    f64 x0 = min(min(a.x, b.x), d.x)
+    f64 y0 = min(min(a.y, b.y), d.y)
+    f64 x1 = max(max(a.x, b.x), d.x)
+    f64 y1 = max(max(a.y, b.y), d.y)
+    i32 min_z = z_order(x0, y0, min_x, min_y, inv_size)
+    i32 max_z = z_order(x1, y1, min_x, min_y, inv_size)
+
+    i32 p = b.prev_z
+    for p != NIL && c.nodes[p].z >= min_z:
+        ^Node n = &c.nodes[p]
+        if (n.x >= x0 && n.x <= x1 && n.y >= y0 && n.y <= y1 && p != cn && !(a.x == n.x && a.y == n.y) &&
+                point_in_triangle(a.x, a.y, b.x, b.y, d.x, d.y, n.x, n.y) && area(c, n.prev, p, n.next) >= 0.0):
+            return false
+        p = n.prev_z
+    p = b.next_z
+    for p != NIL && c.nodes[p].z <= max_z:
+        ^Node n = &c.nodes[p]
+        if (n.x >= x0 && n.x <= x1 && n.y >= y0 && n.y <= y1 && p != cn && !(a.x == n.x && a.y == n.y) &&
+                point_in_triangle(a.x, a.y, b.x, b.y, d.x, d.y, n.x, n.y) && area(c, n.prev, p, n.next) >= 0.0):
+            return false
+        p = n.next_z
+    return true
+
+private i32 cure_local_intersections(^Ctx c, i32 from):
+    i32 start = from
+    i32 p = start
+    bool cured = false
+    for true:
+        i32 a = c.nodes[p].prev
+        i32 pn = c.nodes[p].next
+        i32 b = c.nodes[pn].next
+        if intersects(c, a, p, pn, b, false) && locally_inside(c, a, b) && locally_inside(c, b, a):
+            push_tri(c, a, p, b)
+            remove_node(c, p)
+            remove_node(c, pn)
+            p = b
+            start = b
+            cured = true
+        p = c.nodes[p].next
+        if p == start:
+            break
+    return filter_points(c, p, p) if cured else p
+
+// Splits the ring along the first valid diagonal and triangulates both halves.
+private void split_earcut(^Ctx c, i32 start, f64 min_x, f64 min_y, f64 inv_size):
+    i32 a = start
+    for true:
+        i32 b = c.nodes[c.nodes[a].next].next
+        for b != c.nodes[a].prev:
+            if c.nodes[a].i != c.nodes[b].i && is_valid_diagonal(c, a, b):
+                i32 d = split_polygon(c, a, b)
+                a = filter_points(c, a, c.nodes[a].next)
+                d = filter_points(c, d, c.nodes[d].next)
+                earcut_linked(c, a, min_x, min_y, inv_size)
+                earcut_linked(c, d, min_x, min_y, inv_size)
+                return
+            b = c.nodes[b].next
+        a = c.nodes[a].next
+        if a == start:
+            break
+
+// Links every hole into the outer ring, leftmost hole first.
+private i32 eliminate_holes(^Ctx c, []$T data, []u32 holes, i32 outer_in, i32 dim, []i32 queue) where T is float:
+    i64 nholes = #len(holes)
+    i64 len = #len(data)
+    for h, k in holes:
+        i64 start = i64(h) * i64(dim)
+        i64 end = len
+        if k < nholes - 1:
+            end = i64(holes[k + 1]) * i64(dim)
+        i32 list = linked_list(c, data, start, end, dim, false)
+        if list == c.nodes[list].next:
+            c.nodes[list].steiner = true
+        queue[k] = get_leftmost(c, list)
+
+    sort_holes(c, queue)
+
+    c.num_blocks = 0
+    i32 outer = outer_in
+    index_segment(c, outer, outer)
+
+    c.index_active = true
+    for q in queue:
+        outer = eliminate_hole(c, q, outer)
+    c.index_active = false
+
+    return filter_points(c, outer, outer)
+
+// A stable binary insertion sort: the order V8's sort gives `compareXYSlope`.
+private void sort_holes(^Ctx c, []i32 queue):
+    i64 n = #len(queue)
+    for i in 1..<n:
+        i32 pivot = queue[i]
+        i64 lo = 0
+        i64 hi = i
+        for lo < hi:
+            i64 mid = lo + ((hi - lo) >> 1)
+            if compare_xy_slope(c, pivot, queue[mid]) < 0.0:
+                hi = mid
+            else:
+                lo = mid + 1
+        i64 j = i
+        for j > lo:
+            queue[j] = queue[j - 1]
+            j -= 1
+        queue[lo] = pivot
+
+// Holes whose leftmost points meet are ordered counter-clockwise, so the bridge
+// lands on the shared point. A zero or NaN difference falls through, as `||` does.
+private f64 compare_xy_slope(^Ctx c, i32 ia, i32 ib):
+    ^Node a = &c.nodes[ia]
+    ^Node b = &c.nodes[ib]
+    f64 d = a.x - b.x
+    if d != 0.0 && d == d:
+        return d
+    d = a.y - b.y
+    if d != 0.0 && d == d:
+        return d
+    ^Node an = &c.nodes[a.next]
+    ^Node bn = &c.nodes[b.next]
+    return (an.y - a.y) / (an.x - a.x) - (bn.y - b.y) / (bn.x - b.x)
+
+private i32 eliminate_hole(^Ctx c, i32 hole, i32 outer):
+    i32 bridge = find_hole_bridge(c, hole, outer)
+    if bridge == NIL:
+        return outer
+
+    i32 bridge_reverse = split_polygon(c, bridge, hole)
+
+    // Index the spliced run bridge .. bridge2.next before filtering; filtering
+    // only drops points, so the boxes stay conservative.
+    i32 bridge2 = c.nodes[bridge_reverse].next
+    index_segment(c, bridge, c.nodes[bridge2].next)
+
+    _ = filter_points(c, bridge_reverse, c.nodes[bridge_reverse].next)
+    return filter_points(c, bridge, c.nodes[bridge].next)
+
+// Indexes the run head .. stop (exclusive; head == stop is the whole ring) as
+// blocks of K edges, each box bounding both ends of its edges.
+private void index_segment(^Ctx c, i32 head, i32 stop):
+    i32 p = head
+    for true:
+        i32 b = c.num_blocks
+        c.num_blocks += 1
+        c.block_head[b] = p
+        f64 min_x = c.nodes[p].x
+        f64 min_y = c.nodes[p].y
+        f64 max_x = min_x
+        f64 max_y = min_y
+        i32 k = 0
+        for true:
+            i32 cn = c.nodes[p].next
+            c.nodes[p].z = b
+            f64 x = c.nodes[cn].x
+            f64 y = c.nodes[cn].y
+            if x < min_x: min_x = x
+            if x > max_x: max_x = x
+            if y < min_y: min_y = y
+            if y > max_y: max_y = y
+            p = cn
+            k += 1
+            if k >= K || p == stop:
+                break
+        c.block_stop[b] = p
+        i32 g = b * 4
+        c.bbox[g] = min_x
+        c.bbox[g + 1] = min_y
+        c.bbox[g + 2] = max_x
+        c.bbox[g + 3] = max_y
+        if p == stop:
+            break
+
+// Filtering heals head -> tail; grow head's block so the scan cannot skip it.
+private void grow_block(^Ctx c, i32 head, i32 tail):
+    i32 g = c.nodes[head].z * 4
+    f64 x = c.nodes[tail].x
+    f64 y = c.nodes[tail].y
+    if x < c.bbox[g]: c.bbox[g] = x
+    if y < c.bbox[g + 1]: c.bbox[g + 1] = y
+    if x > c.bbox[g + 2]: c.bbox[g + 2] = x
+    if y > c.bbox[g + 3]: c.bbox[g + 3] = y
+
+private bool is_live(^Ctx c, i32 p):
+    return c.nodes[c.nodes[p].prev].next == p
+
+private i32 live_block_stop(^Ctx c, i32 b):
+    i32 stop = c.block_stop[b]
+    for !is_live(c, stop):
+        stop = c.nodes[stop].next
+    c.block_stop[b] = stop
+    return stop
+
+private i32 live_block_head(^Ctx c, i32 b):
+    i32 head = c.block_head[b]
+    for !is_live(c, head):
+        head = c.nodes[head].next
+    c.block_head[b] = head
+    return head
+
+// David Eberly's bridge from a hole's leftmost point to the outer ring.
+private i32 find_hole_bridge(^Ctx c, i32 hole, i32 outer):
+    f64 hx = c.nodes[hole].x
+    f64 hy = c.nodes[hole].y
+    f64 qx = 0.0 - infinity()
+    i32 m = NIL
+
+    if equals(c, hole, outer):
+        return outer
+
+    // A leftward ray from the hole: the nearest crossing's left endpoint, or
+    // the vertex it passes through.
+    for b in 0..<c.num_blocks:
+        i32 g = b * 4
+        if hy < c.bbox[g + 1] || hy > c.bbox[g + 3] || c.bbox[g] > hx || c.bbox[g + 2] <= qx:
+            continue
+        i32 stop = live_block_stop(c, b)
+        i32 p = live_block_head(c, b)
+        for true:
+            if is_live(c, p):
+                i32 pn = c.nodes[p].next
+                ^Node n = &c.nodes[p]
+                ^Node nn = &c.nodes[pn]
+                if equals(c, hole, pn):
+                    return pn
+                else if hy <= n.y && hy >= nn.y && nn.y != n.y:
+                    f64 x = n.x + (hy - n.y) * (nn.x - n.x) / (nn.y - n.y)
+                    if x <= hx && x > qx:
+                        qx = x
+                        m = p if n.x < nn.x else pn
+                        if x == hx:
+                            return m
+            p = c.nodes[p].next
+            if p == stop:
+                break
+
+    if m == NIL:
+        return NIL
+
+    // A vertex inside the triangle (hole, crossing, m) blocks the bridge: take
+    // the one at the least angle to the ray instead.
+    f64 mx = c.nodes[m].x
+    f64 my = c.nodes[m].y
+    f64 tmin_y = min(hy, my)
+    f64 tmax_y = max(hy, my)
+    f64 tan_min = infinity()
+
+    for b in 0..<c.num_blocks:
+        i32 g = b * 4
+        if c.bbox[g + 2] < mx || c.bbox[g] > hx || c.bbox[g + 3] < tmin_y || c.bbox[g + 1] > tmax_y:
+            continue
+        i32 stop = live_block_stop(c, b)
+        i32 p = live_block_head(c, b)
+        for true:
+            ^Node n = &c.nodes[p]
+            if (is_live(c, p) && hx >= n.x && n.x >= mx && hx != n.x &&
+                    point_in_triangle(hx if hy < my else qx, hy, mx, my, qx if hy < my else hx, hy, n.x, n.y)):
+                f64 tan = abs(hy - n.y) / (hx - n.x)
+                ^Node nn = &c.nodes[n.next]
+                // A hole point on p's horizontal edge: the bridge runs along it.
+                if ((locally_inside(c, p, hole) || (n.y == hy && nn.y == hy && nn.x > hx)) &&
+                        (tan < tan_min || (tan == tan_min && (n.x > c.nodes[m].x || (n.x == c.nodes[m].x && sector_contains_sector(c, m, p)))))):
+                    m = p
+                    tan_min = tan
+            p = n.next
+            if p == stop:
+                break
+
+    return m
+
+private bool sector_contains_sector(^Ctx c, i32 m, i32 p):
+    return area(c, c.nodes[m].prev, m, c.nodes[p].prev) < 0.0 && area(c, c.nodes[p].next, m, c.nodes[m].next) < 0.0
+
+// Links the ring's nodes in z-order through prev_z/next_z.
+private void index_curve(^Ctx c, i32 start, f64 min_x, f64 min_y, f64 inv_size):
+    i32 p = start
+    i32 n = 0
+    for true:
+        c.nodes[p].z = z_order(c.nodes[p].x, c.nodes[p].y, min_x, min_y, inv_size)
+        c.sort_arr[n] = p
+        n += 1
+        p = c.nodes[p].next
+        if p == start:
+            break
+
+    sort_nodes(c, n)
+
+    i32 prev = NIL
+    for i in 0..<n:
+        i32 node = c.sort_arr[i]
+        c.nodes[node].prev_z = prev
+        if prev != NIL:
+            c.nodes[prev].next_z = node
+        prev = node
+    c.nodes[prev].next_z = NIL
+
+// Insertion sort by signed z when small; otherwise an LSD radix sort on z as
+// u32, four 8-bit passes, ending back in sort_arr.
+private void sort_nodes(^Ctx c, i32 n):
+    if n <= SMALL_SORT:
+        for i in 1..<n:
+            i32 node = c.sort_arr[i]
+            i32 z = c.nodes[node].z
+            i32 j = i - 1
+            for j >= 0 && c.nodes[c.sort_arr[j]].z > z:
+                c.sort_arr[j + 1] = c.sort_arr[j]
+                j -= 1
+            c.sort_arr[j + 1] = node
+        return
+
+    for i in 0..<n:
+        c.z_arr[i] = u32(c.nodes[c.sort_arr[i]].z)
+    radix_pass(n, c.sort_arr, c.z_arr, c.sort_buf, c.z_buf, 0)
+    radix_pass(n, c.sort_buf, c.z_buf, c.sort_arr, c.z_arr, 8)
+    radix_pass(n, c.sort_arr, c.z_arr, c.sort_buf, c.z_buf, 16)
+    radix_pass(n, c.sort_buf, c.z_buf, c.sort_arr, c.z_arr, 24)
+
+// One stable scatter of n nodes from src to dst by the z byte at `shift`.
+private void radix_pass(i32 n, []i32 src, []u32 src_z, []i32 dst, []u32 dst_z, i32 shift):
+    [256]u32 counts
+    for i in 0..<n:
+        counts[(src_z[i] >> shift) & 0xff] += 1
+    u32 sum = 0
+    for b in 0..<256:
+        u32 k = counts[b]
+        counts[b] = sum
+        sum += k
+    for i in 0..<n:
+        u32 z = src_z[i]
+        u32 at = counts[(z >> shift) & 0xff]
+        counts[(z >> shift) & 0xff] += 1
+        dst[at] = src[i]
+        dst_z[at] = z
+
+// The z-order of a point, from coordinates scaled into 15 bits. i32 throughout,
+// so out-of-box points wrap as JavaScript's `| 0` does.
+private i32 z_order(f64 px, f64 py, f64 min_x, f64 min_y, f64 inv_size):
+    i32 x = i32((px - min_x) * inv_size)
+    i32 y = i32((py - min_y) * inv_size)
+
+    x = (x | (x << 8)) & 0x00FF00FF
+    x = (x | (x << 4)) & 0x0F0F0F0F
+    x = (x | (x << 2)) & 0x33333333
+    x = (x | (x << 1)) & 0x55555555
+
+    y = (y | (y << 8)) & 0x00FF00FF
+    y = (y | (y << 4)) & 0x0F0F0F0F
+    y = (y | (y << 2)) & 0x33333333
+    y = (y | (y << 1)) & 0x55555555
+
+    return x | (y << 1)
+
+private i32 get_leftmost(^Ctx c, i32 start):
+    i32 p = start
+    i32 leftmost = start
+    for true:
+        ^Node n = &c.nodes[p]
+        ^Node l = &c.nodes[leftmost]
+        if n.x < l.x || (n.x == l.x && n.y < l.y):
+            leftmost = p
+        p = n.next
+        if p == start:
+            break
+    return leftmost
+
+private bool point_in_triangle(f64 ax, f64 ay, f64 bx, f64 by, f64 cx, f64 cy, f64 px, f64 py):
+    return ((cx - px) * (ay - py) >= (ax - px) * (cy - py) &&
+            (ax - px) * (by - py) >= (bx - px) * (ay - py) &&
+            (bx - px) * (cy - py) >= (cx - px) * (by - py))
+
+// A diagonal is valid when it lies inside the polygon and crosses no edge.
+private bool is_valid_diagonal(^Ctx c, i32 a, i32 b):
+    ^Node na = &c.nodes[a]
+    ^Node nb = &c.nodes[b]
+    bool zero_length = equals(c, a, b) && area(c, na.prev, a, na.next) > 0.0 && area(c, nb.prev, b, nb.next) > 0.0
+    return (c.nodes[na.next].i != nb.i &&
+        (zero_length || (locally_inside(c, a, b) && locally_inside(c, b, a) &&
+            (area(c, na.prev, a, nb.prev) != 0.0 || area(c, a, nb.prev, b) != 0.0))) &&
+        !intersects_polygon(c, a, b) && (zero_length || middle_inside(c, a, b)))
+
+// Twice the signed area of the triangle; negative is counter-clockwise in y-down.
+private f64 area(^Ctx c, i32 p, i32 q, i32 r):
+    ^Node a = &c.nodes[p]
+    ^Node b = &c.nodes[q]
+    ^Node d = &c.nodes[r]
+    return (b.y - a.y) * (d.x - b.x) - (b.x - a.x) * (d.y - b.y)
+
+private bool equals(^Ctx c, i32 p, i32 q):
+    return c.nodes[p].x == c.nodes[q].x && c.nodes[p].y == c.nodes[q].y
+
+// Whether p1q1 and p2q2 cross; collinear touches count when include_boundary.
+private bool intersects(^Ctx c, i32 p1, i32 q1, i32 p2, i32 q2, bool include_boundary):
+    f64 o1 = area(c, p1, q1, p2)
+    f64 o2 = area(c, p1, q1, q2)
+    f64 o3 = area(c, p2, q2, p1)
+    f64 o4 = area(c, p2, q2, q1)
+
+    if ((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0)) && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0)):
+        return true
+    if !include_boundary:
+        return false
+    if o1 == 0.0 && on_segment(c, p1, p2, q1): return true
+    if o2 == 0.0 && on_segment(c, p1, q2, q1): return true
+    if o3 == 0.0 && on_segment(c, p2, p1, q2): return true
+    if o4 == 0.0 && on_segment(c, p2, q1, q2): return true
+    return false
+
+// For collinear p, q, r: whether q lies on pr.
+private bool on_segment(^Ctx c, i32 ip, i32 iq, i32 ir):
+    ^Node p = &c.nodes[ip]
+    ^Node q = &c.nodes[iq]
+    ^Node r = &c.nodes[ir]
+    return q.x <= max(p.x, r.x) && q.x >= min(p.x, r.x) && q.y <= max(p.y, r.y) && q.y >= min(p.y, r.y)
+
+private bool intersects_polygon(^Ctx c, i32 a, i32 b):
+    ^Node na = &c.nodes[a]
+    ^Node nb = &c.nodes[b]
+    f64 min_x = min(na.x, nb.x)
+    f64 max_x = max(na.x, nb.x)
+    f64 min_y = min(na.y, nb.y)
+    f64 max_y = max(na.y, nb.y)
+
+    i32 p = a
+    for true:
+        ^Node np = &c.nodes[p]
+        i32 n = np.next
+        ^Node nn = &c.nodes[n]
+        bool outside = ((np.x > max_x && nn.x > max_x) || (np.x < min_x && nn.x < min_x) ||
+            (np.y > max_y && nn.y > max_y) || (np.y < min_y && nn.y < min_y))
+        if !outside && np.i != na.i && nn.i != na.i && np.i != nb.i && nn.i != nb.i && intersects(c, p, n, a, b, true):
+            return true
+        p = n
+        if p == a:
+            break
+    return false
+
+private bool locally_inside(^Ctx c, i32 a, i32 b):
+    ^Node na = &c.nodes[a]
+    if area(c, na.prev, a, na.next) < 0.0:
+        return area(c, a, b, na.next) >= 0.0 && area(c, a, na.prev, b) >= 0.0
+    return area(c, a, b, na.prev) < 0.0 || area(c, a, na.next, b) < 0.0
+
+private bool middle_inside(^Ctx c, i32 a, i32 b):
+    i32 p = a
+    bool inside = false
+    f64 px = (c.nodes[a].x + c.nodes[b].x) / 2.0
+    f64 py = (c.nodes[a].y + c.nodes[b].y) / 2.0
+    for true:
+        ^Node np = &c.nodes[p]
+        ^Node nn = &c.nodes[np.next]
+        if ((np.y > py) != (nn.y > py)) && (px < (nn.x - np.x) * (py - np.y) / (nn.y - np.y) + np.x):
+            inside = !inside
+        p = np.next
+        if p == a:
+            break
+    return inside
+
+// Links a and b by a bridge: splits one ring in two, or merges a hole into
+// the outer ring. Answers b's copy.
+private i32 split_polygon(^Ctx c, i32 a, i32 b):
+    i32 a2 = create_node(c, c.nodes[a].i, c.nodes[a].x, c.nodes[a].y)
+    i32 b2 = create_node(c, c.nodes[b].i, c.nodes[b].x, c.nodes[b].y)
+    i32 an = c.nodes[a].next
+    i32 bp = c.nodes[b].prev
+
+    c.nodes[a].next = b
+    c.nodes[b].prev = a
+
+    c.nodes[a2].next = an
+    c.nodes[an].prev = a2
+
+    c.nodes[b2].next = a2
+    c.nodes[a2].prev = b2
+
+    c.nodes[bp].next = b2
+    c.nodes[b2].prev = bp
+
+    return b2
+
+private i32 insert_node(^Ctx c, i32 i, f64 x, f64 y, i32 last):
+    i32 p = create_node(c, i, x, y)
+    if last == NIL:
+        c.nodes[p].prev = p
+        c.nodes[p].next = p
+    else:
+        i32 ln = c.nodes[last].next
+        c.nodes[p].next = ln
+        c.nodes[p].prev = last
+        c.nodes[ln].prev = p
+        c.nodes[last].next = p
+    return p
+
+private void remove_node(^Ctx c, i32 p):
+    ^Node n = &c.nodes[p]
+    c.nodes[n.next].prev = n.prev
+    c.nodes[n.prev].next = n.next
+    if n.prev_z != NIL:
+        c.nodes[n.prev_z].next_z = n.next_z
+    if n.next_z != NIL:
+        c.nodes[n.next_z].prev_z = n.prev_z
+    if c.index_active:
+        grow_block(c, n.prev, n.next)
+
+private i32 create_node(^Ctx c, i32 i, f64 x, f64 y):
+    i32 p = c.count
+    c.count += 1
+    c.nodes[p] = (i, x, y, NIL, NIL, 0, NIL, NIL, false)
+    return p

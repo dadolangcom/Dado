@@ -1,0 +1,421 @@
+// a JSON writer (RFC 8259): values appended to text it owns.
+//
+//     json.Writer w = json.writer(indent: 2)
+//     w.object()
+//     w.key("name")
+//     w.text("oak")
+//     w.key("sizes")
+//     w.array()
+//     w.int(600)
+//     w.float(18.5)
+//     w.end_array()
+//     w.end_object()
+//     try ref []char8 text = w.finish() else code:
+//         fmt.println(json.message(code))
+//         return
+//     defer #delete(text)
+//
+// `text` is then:
+//
+//     {
+//       "name": "oak",
+//       "sizes": [
+//         600,
+//         18.5
+//       ]
+//     }
+//
+// The text grows on the allocator that was `#default` when `writer` was
+// called, so `json.writer() using a` puts it in `a`. Every call costs time in
+// proportion to what it writes.
+//
+// Strings escape `"`, `\`, the control characters, DEL, U+0080 to U+009F,
+// U+2028 and U+2029, and pass other valid UTF-8 through. A byte that is not
+// valid UTF-8 becomes U+FFFD. Floats are the shortest text that reads back as
+// the same value. Keys are written in the order given, and nothing checks that
+// a key is not repeated.
+//
+// A call that cannot write what it was asked fails the writer with a code:
+// the code is kept, later calls write nothing, and `finish` fails with it.
+// `message(code)` answers a sentence for each code.
+//
+// It has no `foreign` block and no package state. It builds for every target,
+// `#NONE` and the web included, and every function raises into a script.
+package json
+
+import "core:fmt"
+
+// A failure code: a value written inside an object with no key before it.
+public const i32 EXPECTED_KEY = 1
+
+// A failure code: a key outside an object, or a second key before the first
+// one's value.
+public const i32 UNEXPECTED_KEY = 2
+
+// A failure code: an end that closes nothing or the wrong kind of container,
+// an end after a key with no value, a second top-level value, or `finish`
+// with nothing written or something still open.
+public const i32 UNBALANCED = 3
+
+// A failure code: `float` or `float32` was given a NaN or an infinity, which
+// JSON cannot spell.
+public const i32 NOT_FINITE = 4
+
+// A failure code: objects and arrays nested deeper than `MAX_DEPTH`.
+public const i32 TOO_DEEP = 5
+
+// A failure code: the text could not grow.
+public const i32 NO_MEMORY = 6
+
+// How many objects and arrays may be open at once.
+public const i32 MAX_DEPTH = 128
+
+// A sentence describing `code`, one of this package's failure codes; any
+// other code answers "not a code of core:json".
+//
+//     string8 why = json.message(json.TOO_DEEP)
+//     // why is "objects and arrays nest deeper than MAX_DEPTH"
+#assert_raises
+public string8 message(i32 code):
+    if code == EXPECTED_KEY:
+        return "a value inside an object needs a key first"
+    if code == UNEXPECTED_KEY:
+        return "a key outside an object, or two keys in a row"
+    if code == UNBALANCED:
+        return "the objects and arrays do not balance, or there is not exactly one top-level value"
+    if code == NOT_FINITE:
+        return "JSON has no NaN or infinity"
+    if code == TOO_DEEP:
+        return "objects and arrays nest deeper than MAX_DEPTH"
+    if code == NO_MEMORY:
+        return "an allocation failed"
+    return "not a code of core:json"
+
+// What an open container is, one per level of `Writer.open`.
+private enum u8 Container:
+    Object
+    Array
+
+// One JSON text being written: make one with `writer`, write exactly one
+// top-level value, then take the text with `finish` or free it with
+// `destroy`. Its slots are its state; read the failure with `code` and write
+// no slot. A copy shares the text, so pass a writer by pointer.
+public type Writer:
+    ref []char8 out
+    i32 failed
+    i32 indent
+    i32 depth
+    [MAX_DEPTH]Container open
+    bool empty
+    bool keyed
+    bool done
+
+    // Opens an object: `{`. Inside it, write `key` before each value, then
+    // `end_object`. Fails with `EXPECTED_KEY` where a key is due, `UNBALANCED`
+    // after the top-level value, and `TOO_DEEP` past `MAX_DEPTH`.
+    void object(^self):
+        self.begin(Container.Object, '{')
+
+    // Closes the innermost open object: `}`. Fails with `UNBALANCED` when it
+    // is not an object or its last key has no value.
+    void end_object(^self):
+        self.end(Container.Object, '}')
+
+    // Opens an array: `[`. Values written next are its elements, up to
+    // `end_array`. Fails with `EXPECTED_KEY` where a key is due, `UNBALANCED`
+    // after the top-level value, and `TOO_DEEP` past `MAX_DEPTH`.
+    void array(^self):
+        self.begin(Container.Array, '[')
+
+    // Closes the innermost open array: `]`. Fails with `UNBALANCED` when it is
+    // not an array.
+    void end_array(^self):
+        self.end(Container.Array, ']')
+
+    // Writes `name` as the next member's name, a JSON string escaped the way
+    // `text` escapes a value; its value is the next thing written. Fails with
+    // `UNEXPECTED_KEY` outside an object or straight after another key.
+    void key(^self, string8 name):
+        if self.failed != 0:
+            return
+        if self.depth == 0 || self.open[self.depth - 1] != Container.Object || self.keyed:
+            self.fail_with(UNEXPECTED_KEY)
+            return
+        self.separate()
+        self.quoted(name)
+        self.put(": " if self.indent > 0 else ":")
+        self.keyed = true
+
+    // Writes `s` as a JSON string. `"`, `\`, the control characters, DEL,
+    // U+0080 to U+009F, U+2028 and U+2029 are escaped, other valid UTF-8 is
+    // written as it is, and each byte that is not valid UTF-8 becomes U+FFFD.
+    // Fails with `EXPECTED_KEY` in an object with no key
+    // before it, and `UNBALANCED` after the top-level value.
+    void text(^self, string8 s):
+        if self.before_value():
+            self.quoted(s)
+            self.after_value()
+
+    // Writes `v` in decimal: `-42`. Fails with `EXPECTED_KEY` in an object with
+    // no key before it, and `UNBALANCED` after the top-level value.
+    void int(^self, i64 v):
+        if self.before_value():
+            [20]char8 buf
+            i32 n = fmt.render_signed(v, buf[:])
+            self.put(string8(buf[0..<i64(n)]))
+            self.after_value()
+
+    // Writes `v` in decimal: `18446744073709551615`. Fails with `EXPECTED_KEY`
+    // in an object with no key before it, and `UNBALANCED` after the top-level
+    // value.
+    void uint(^self, u64 v):
+        if self.before_value():
+            [20]char8 buf
+            i32 n = fmt.render_unsigned(v, buf[:])
+            self.put(string8(buf[0..<i64(n)]))
+            self.after_value()
+
+    // Writes the shortest decimal that reads back as `v`: `0.1`, `1.0`,
+    // `1e+21`. Fails with `NOT_FINITE` for a NaN or an infinity,
+    // `EXPECTED_KEY` in an object with no key before it, and `UNBALANCED`
+    // after the top-level value.
+    void float(^self, f64 v):
+        put_float(self, v)
+
+    // Writes the shortest decimal that reads back as `v` in single
+    // precision: `f32(0.1)` is `0.1`. Fails with `NOT_FINITE` for a NaN or an
+    // infinity, `EXPECTED_KEY` in an object with no key before it, and
+    // `UNBALANCED` after the top-level value.
+    void float32(^self, f32 v):
+        put_float(self, v)
+
+    // Writes `true` or `false`. Fails with `EXPECTED_KEY` in an object with no
+    // key before it, and `UNBALANCED` after the top-level value.
+    void boolean(^self, bool v):
+        if self.before_value():
+            self.put("true" if v else "false")
+            self.after_value()
+
+    // Writes `null`. Fails with `EXPECTED_KEY` in an object with no key
+    // before it, and `UNBALANCED` after the top-level value.
+    void null(^self):
+        if self.before_value():
+            self.put("null")
+            self.after_value()
+
+    // The code the writer failed with, or 0 while it has not failed.
+    i32 code(self):
+        return self.failed
+
+    // Hands over the text, which the caller then owns and `#delete`s. Fails
+    // with the code the writer failed with, or with `UNBALANCED` unless
+    // exactly one whole value was written; on failure the text is freed.
+    !ref([]char8) finish(^self):
+        if self.failed == 0 && !self.done:
+            self.failed = UNBALANCED
+        if self.failed != 0:
+            #delete(self.out)
+            fail self.failed
+        defer self.out = nil
+        return self.out
+
+    // Frees the text without finishing. Does nothing after `finish`.
+    void destroy(^self):
+        #delete(self.out)
+
+    private void fail_with(^self, i32 code):
+        if self.failed == 0:
+            self.failed = code
+
+    private void put(^self, string8 s):
+        if self.failed != 0:
+            return
+        if !#reserve(self.out, #len(self.out) + #len(s)):
+            self.fail_with(NO_MEMORY)
+            return
+        for c in s:
+            _ = #append(self.out, c)
+
+    private void put_char(^self, char8 c):
+        if self.failed != 0:
+            return
+        if !#append(self.out, c):
+            self.fail_with(NO_MEMORY)
+
+    // Between members or elements: the comma, then the line and indent.
+    private void separate(^self):
+        if !self.empty:
+            self.put_char(',')
+        self.empty = false
+        self.newline(self.depth)
+
+    private void newline(^self, i32 depth):
+        if self.indent <= 0:
+            return
+        self.put_char('\n')
+        for _i in 0..<(depth * self.indent):
+            self.put_char(' ')
+
+    // Whether a value may go here, writing what comes before it.
+    private bool before_value(^self):
+        if self.failed != 0:
+            return false
+        if self.depth == 0:
+            if self.done:
+                self.fail_with(UNBALANCED)
+                return false
+            return true
+        if self.open[self.depth - 1] == Container.Object:
+            if !self.keyed:
+                self.fail_with(EXPECTED_KEY)
+                return false
+            self.keyed = false
+            return true
+        self.separate()
+        return self.failed == 0
+
+    private void after_value(^self):
+        if self.depth == 0:
+            self.done = true
+
+    private void begin(^self, Container kind, char8 brace):
+        if !self.before_value():
+            return
+        if self.depth == MAX_DEPTH:
+            self.fail_with(TOO_DEEP)
+            return
+        self.put_char(brace)
+        self.open[self.depth] = kind
+        self.depth += 1
+        self.empty = true
+
+    private void end(^self, Container kind, char8 brace):
+        if self.failed != 0:
+            return
+        if self.depth == 0 || self.open[self.depth - 1] != kind || self.keyed:
+            self.fail_with(UNBALANCED)
+            return
+        self.depth -= 1
+        if !self.empty:
+            self.newline(self.depth)
+        self.put_char(brace)
+        self.empty = false
+        self.after_value()
+
+    // `s` between quotes. Bytes that need no escape are written a run at a
+    // time, so plain text costs one `put` per run rather than one per
+    // character.
+    private void quoted(^self, string8 s):
+        self.put_char('"')
+        i64 n = #len(s)
+        i64 run = 0
+        i64 i = 0
+        for i < n:
+            u32 b = u32(s[i])
+            if b >= 0x20 && b < 0x7F && b != u32('"') && b != u32('\\'):
+                i += 1
+                continue
+            i64 size = 1
+            u32 cp = b
+            if b >= 0x80:
+                (cp, size) = utf8_at(s, i)
+                bool plain = cp >= 0xA0 && cp != 0x2028 && cp != 0x2029 && !(cp == REPLACEMENT && size == 1)
+                if plain:
+                    i += size
+                    continue
+            self.put(s[run..<i])
+            self.escape(cp)
+            i += size
+            run = i
+        self.put(s[run..<n])
+        self.put_char('"')
+
+    // The escape for one code point `quoted` does not pass through.
+    private void escape(^self, u32 cp):
+        if cp == u32('"'):
+            self.put("\\\"")
+        else if cp == u32('\\'):
+            self.put("\\\\")
+        else if cp == u32('\n'):
+            self.put("\\n")
+        else if cp == u32('\r'):
+            self.put("\\r")
+        else if cp == u32('\t'):
+            self.put("\\t")
+        else if cp == 0x08:
+            self.put("\\b")
+        else if cp == 0x0C:
+            self.put("\\f")
+        else if cp == REPLACEMENT:
+            self.put("\xEF\xBF\xBD")
+        else:
+            self.put("\\u")
+            for k in 0..<4:
+                self.put_char(HEX[i64((cp >> u32(12 - 4 * k)) & 15)])
+
+// `v` as `float` and `float32` write it: NaN and the infinities fail with
+// `NOT_FINITE`, and anything else is the shortest text that reads back as `v`
+// at its own precision.
+private void put_float(^Writer w, $T v) where T is float:
+    if fmt.is_nan(v) || fmt.is_infinite(v):
+        w.fail_with(NOT_FINITE)
+        return
+    if w.before_value():
+        [24]char8 buf
+        i32 n = fmt.render_float_shortest(v, buf[:])
+        w.put(string8(buf[0..<i64(n)]))
+        w.after_value()
+
+// An empty writer. With `indent` 0 or less the text is compact; above 0, each
+// member and element goes on its own line, indented `indent` spaces a level.
+// The text is allocated on `#default`, with `room` bytes reserved up front; a
+// failed allocation shows as `NO_MEMORY` from `finish`.
+//
+//     json.Writer w = json.writer() using arena    // the text lives in `arena`
+#assert_raises
+public Writer writer(i32 indent = 0, i64 room = 64):
+    Writer w
+    w.indent = indent
+    w.out = #make([]char8, 0)
+    if w.out == nil || !#reserve(w.out, room):
+        w.failed = NO_MEMORY
+    return w
+
+private const u32 REPLACEMENT = 0xFFFD
+private const string8 HEX = "0123456789abcdef"
+
+// The code point at `s[at]` and its length; U+FFFD and 1 for a byte that
+// does not start a well-formed sequence. It answers what core:chars `decode`
+// does, but takes an `i64` index, and core:chars does not build for the web
+// (its `foreign "ctype.h"` block is ERR1032 there).
+private (u32 cp, i64 size) utf8_at(string8 s, i64 at):
+    u32 b0 = u32(s[at])
+    if b0 < 0x80:
+        return (b0, 1)
+    i64 need = 0
+    u32 cp = 0
+    u32 min = 0
+    if b0 >= 0xC2 && b0 < 0xE0:
+        need = 1
+        cp = b0 & 0x1F
+        min = 0x80
+    else if b0 >= 0xE0 && b0 < 0xF0:
+        need = 2
+        cp = b0 & 0x0F
+        min = 0x800
+    else if b0 >= 0xF0 && b0 < 0xF5:
+        need = 3
+        cp = b0 & 0x07
+        min = 0x10000
+    else:
+        return (REPLACEMENT, 1)
+    if at + need >= #len(s):
+        return (REPLACEMENT, 1)
+    for k in 1..=need:
+        u32 b = u32(s[at + k])
+        if b & 0xC0 != 0x80:
+            return (REPLACEMENT, 1)
+        cp = (cp << 6) | (b & 0x3F)
+    if cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp < 0xE000):
+        return (REPLACEMENT, 1)
+    return (cp, need + 1)

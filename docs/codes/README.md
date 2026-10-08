@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 7e1d5137cae1 (dirty) -->
+<!-- dadoc 1.0.0-rc.3 -->
+<!-- commit eaa5ea1b6195 (dirty) -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -239,6 +239,8 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR1218](ERR1218.md) | error | a member of a script's instance named through its handle that the class does not have, or used as no field or method is |
 | [ERR1219](ERR1219.md) | error | a script's field or answer whose DadoScript type has no Dado side, or an instance crossing beside a container |
 | [ERR1220](ERR1220.md) | error | a Dado function a script passes a function to that keeps its bare function-reference parameter past the call |
+| [ERR1221](ERR1221.md) | error | a call from Dado into a script with more than 16 arguments |
+| [ERR1222](ERR1222.md) | error | a program whose scripts bind handlers to more than 64 channels |
 | [ERR1223](ERR1223.md) | error | a `#script_reload` in a release build that does not enable reload |
 | [ERR1224](ERR1224.md) | error | a reload's new code for a class the build does not carry, calling a Dado function the build does not bind or binds with another signature, dropping or changing a method the build's Dado runs or a field it reaches through a handle, or changing a kept field's type |
 | [ERR1225](ERR1225.md) | error | a DadoScript feature a web build cannot run — `#script_reload`, `Script.load`, a call from Dado of an `async` method, or `#script_pause` single-threaded |

@@ -1,0 +1,479 @@
+// A half-edge polygon mesh: a box and a prism (a planar contour extruded along its own normal),
+// traversal queries, moving a vertex, an edge or a face, and a bake to triangle buffers.
+//
+//     [4][3]f64 square = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 2.0, 0.0], [0.0, 2.0, 0.0]]
+//     try halfedge.Mesh m = halfedge.from_polygon3(square[:], 1.0)
+//     defer halfedge.destroy(&m)
+//     try halfedge.Baked b = halfedge.bake_geometry(&m)
+//     defer halfedge.baked_destroy(&b)
+//     // 8 vertices and 6 faces; the bake has 24 corners and 36 indices
+//
+// Faces are counter-clockwise seen from outside. Vertices, half-edges, faces and surfaces are
+// addressed by their i64 index in the mesh's runs, and every run only grows, so an index stays
+// valid. A mesh's runs are on the allocator that was `#default` when it was made.
+package halfedge
+
+import "core:linalg"
+// Bound as `polygons`: `from_polygon3` names its parameter `polygon`.
+import polygons "core:geom/polygon"
+
+#static_assert(#OS != #NONE, "core:geom/halfedge needs core:linalg, which takes its square root from the C library, and a #NONE target has none")
+
+// The code every failable function here fails with: an allocation failed.
+const i32 NO_MEMORY = 1
+
+// A mesh vertex. UVs are per corner, on the half-edge (`HalfEdge.uv`), so a vertex shared by
+// faces with different UVs needs no copy.
+type Vertex:
+    [3]f64 position
+    [3]f64 normal    // area-weighted, unit; set by `calculate_normals`
+
+// A plane (nx, ny, nz, d) with dot(n, p) == d, and the faces it covers.
+type Surface:
+    [4]f64 plane
+    i64 first_face
+    i64 face_count
+
+// A face: its surface, and one of its half-edges; the rest of its loop follows by `next`.
+type Face:
+    i64 surface
+    i64 half_edge
+
+// One side of an edge, inside one face, pointing to a vertex.
+type HalfEdge:
+    i64 vertex      // the vertex it points to
+    i64 face
+    i64 twin        // -1 on an open boundary
+    i64 next        // CCW
+    i64 prev
+    [2]f64 uv       // at this corner (vertex `vertex` within `face`)
+
+// A mesh's four runs, made by `from_box` or `from_polygon3` and ended by `destroy`.
+type Mesh:
+    ref []Vertex vertices
+    ref []HalfEdge edges
+    ref []Face faces
+    ref []Surface surfaces
+
+// Frees the mesh's runs and leaves it empty.
+#assert_raises
+void destroy(^Mesh m):
+    #delete(m.vertices)
+    #delete(m.edges)
+    #delete(m.faces)
+    #delete(m.surfaces)
+
+// Two unit axes spanning the plane with unit normal `n`, with bitangent = n x tangent, so a
+// loop counter-clockwise about +n stays counter-clockwise in (tangent, bitangent). The reference
+// axis is +Z, or +Y when `n` is within about 2.6 degrees of ±Z, where the cross with Z is short.
+private ([3]f64 tangent, [3]f64 bitangent) plane_axes([3]f64 n):
+    [3]f64 up = [0.0, 0.0, 1.0]
+    if n.z >= 0.999 || n.z <= -0.999:
+        up = [0.0, 1.0, 0.0]
+    [3]f64 tangent = linalg.normalize(linalg.cross(up, n))
+    return (tangent, linalg.cross(n, tangent))
+
+private [4]f64 plane_from_points([3]f64 a, [3]f64 b, [3]f64 c):
+    [3]f64 n = linalg.normalize(linalg.cross(b - a, c - a))
+    return [n.x, n.y, n.z, linalg.dot(n, a)]
+
+// Makes the four runs, with room for the counts given. On failure the mesh is left for the
+// caller's `destroy`.
+private !void reserve_all(^Mesh m, i64 nv, i64 ne, i64 nf):
+    m.vertices = #make([]Vertex, 0)
+    m.edges = #make([]HalfEdge, 0)
+    m.faces = #make([]Face, 0)
+    m.surfaces = #make([]Surface, 0)
+    bool ok = m.vertices != nil && m.edges != nil && m.faces != nil && m.surfaces != nil
+    ok = ok && #reserve(m.vertices, nv) && #reserve(m.edges, ne) && #reserve(m.faces, nf) && #reserve(m.surfaces, nf)
+    if !ok:
+        fail NO_MEMORY
+
+private !void add_vertex(^Mesh m, [3]f64 p):
+    Vertex v
+    v.position = p
+    if !#append(m.vertices, v):
+        fail NO_MEMORY
+
+// A face with its own surface from a CCW vertex loop; `uvs` empty or parallel to `loop`. Twins
+// are left for `rebuild_twins`.
+private !i64 add_face_loop(^Mesh m, []i64 loop, [][2]f64 uvs):
+    i64 fi = #len(m.faces)
+    i64 si = #len(m.surfaces)
+    i64 base = #len(m.edges)
+    i64 n = #len(loop)
+    Surface s
+    s.first_face = fi
+    s.face_count = 1
+    if !#append(m.surfaces, s) || !#append(m.faces, (si, base)):
+        fail NO_MEMORY
+    for i in 0..<n:
+        [2]f64 uv = [0.0, 0.0]
+        if #len(uvs) == n:
+            uv = uvs[i]
+        if !#append(m.edges, (loop[i], fi, -1, base + (i + 1) % n, base + (i + n - 1) % n, uv)):
+            fail NO_MEMORY
+    return fi
+
+// Every twin matched from scratch: the half-edge running the opposite way, else -1.
+private void rebuild_twins(^Mesh m):
+    i64 nv = #len(m.vertices) + 1
+    {i64: i64} dir = {}
+    defer #delete(dir)
+    for i in 0..<#len(m.edges):
+        i64 s = m.edges[m.edges[i].prev].vertex
+        i64 e = m.edges[i].vertex
+        dir[s * nv + e] = i
+    for i in 0..<#len(m.edges):
+        i64 s = m.edges[m.edges[i].prev].vertex
+        i64 e = m.edges[i].vertex
+        (i64 t, bool found) = dir[e * nv + s]
+        m.edges[i].twin = t if found else -1
+
+// The six faces of a `from_box` mesh, in build order.
+enum i64 BoxFace: (Front, Right, Back, Left, Top, Bottom)
+
+// The face index of `f` in a `from_box` mesh.
+#assert_raises
+i64 box_face(BoxFace f):
+    return i64(f)
+
+// A box of `size` centred on the origin: 8 vertices, 6 quad faces each on its own surface, 24
+// half-edges, and area-weighted vertex normals. Its UVs are zero until `calculate_uvs`. On
+// `#default`; the caller ends it with `destroy`. Fails with NO_MEMORY.
+!Mesh from_box([3]f64 size):
+    Mesh m
+    defer fail destroy(&m)
+    [3]f64 h = size * 0.5
+    try reserve_all(&m, 8, 24, 6)
+    [8][3]f64 corners = [[0.0 - h.x, 0.0 - h.y, h.z], [h.x, 0.0 - h.y, h.z], [h.x, h.y, h.z], [0.0 - h.x, h.y, h.z],
+        [0.0 - h.x, 0.0 - h.y, 0.0 - h.z], [h.x, 0.0 - h.y, 0.0 - h.z], [h.x, h.y, 0.0 - h.z], [0.0 - h.x, h.y, 0.0 - h.z]]
+    for p in corners:
+        try add_vertex(&m, p)
+    [6][4]i64 loops = [[0, 1, 2, 3], [1, 5, 6, 2], [5, 4, 7, 6], [4, 0, 3, 7], [3, 2, 6, 7], [4, 5, 1, 0]]
+    [][2]f64 no_uvs
+    for loop in loops:
+        try i64 fi = add_face_loop(&m, loop[:], no_uvs)
+        m.surfaces[fi].plane = plane_from_points(m.vertices[loop[0]].position, m.vertices[loop[1]].position, m.vertices[loop[2]].position)
+    rebuild_twins(&m)
+    calculate_normals(&m)
+    return m
+
+// The face index, in a `from_polygon3` prism, of the wall over contour edge `edge_index`.
+#assert_raises
+i64 prism_wall(i64 edge_index):
+    return edge_index
+
+// The face index of the top cap of a `from_polygon3` prism over an `n`-point contour.
+#assert_raises
+i64 prism_top(i64 n):
+    return n
+
+// The face index of the bottom cap of a `from_polygon3` prism over an `n`-point contour.
+#assert_raises
+i64 prism_bottom(i64 n):
+    return n + 1
+
+private [2]f64 cap_uv([3]f64 p, [3]f64 origin, [3]f64 tan, [3]f64 bit):
+    [3]f64 rel = p - origin
+    return [linalg.dot(rel, tan), linalg.dot(rel, bit)]
+
+// The planar contour `polygon` extruded `length` along its own Newell normal into a closed prism.
+// Vertices 0..n-1 are the contour (the bottom cap) and n..2n-1 its offset copy (the top); faces
+// are the n walls, then the top, then the bottom (`prism_wall`, `prism_top`, `prism_bottom`). UVs
+// are exact: the caps project onto the contour plane, and the walls unroll into one strip (U arc
+// length, V height). Fewer than 3 points answers an empty mesh; collinear points have no normal
+// and give a prism of zero height. On `#default`; the caller ends it with `destroy`. Fails with
+// NO_MEMORY.
+!Mesh from_polygon3([][3]f64 polygon, f64 length):
+    Mesh m
+    i64 n = #len(polygon)
+    if n < 3:
+        return m
+    [3]f64 pn = polygons.normal(polygon)
+    [3]f64 offset = pn * length
+    defer fail destroy(&m)
+    try reserve_all(&m, 2 * n, 6 * n, n + 2)
+    for p in polygon:
+        try add_vertex(&m, p)
+    for p in polygon:
+        try add_vertex(&m, p + offset)
+    ([3]f64 tan, [3]f64 bit) = plane_axes(pn)
+    [3]f64 origin = polygon[0]
+    f64 height = linalg.length(offset)
+    f64 u = 0.0
+    for k in 0..<n:
+        i64 kn = (k + 1) % n
+        f64 u_next = u + linalg.length(polygon[kn] - polygon[k])
+        [4]i64 quad = [k, kn, n + kn, n + k]
+        [4][2]f64 quad_uv = [[u, 0.0], [u_next, 0.0], [u_next, height], [u, height]]
+        try i64 _ = add_face_loop(&m, quad[:], quad_uv[:])
+        u = u_next
+    ref []i64 cap = #make([]i64, n)
+    ref [][2]f64 cap_uvs = #make([][2]f64, n)
+    defer #delete(cap)
+    defer #delete(cap_uvs)
+    if cap == nil || cap_uvs == nil:
+        fail NO_MEMORY
+    for k in 0..<n:
+        cap[k] = n + k
+        cap_uvs[k] = cap_uv(polygon[k] + offset, origin, tan, bit)
+    try i64 _ = add_face_loop(&m, cap[:], cap_uvs[:])
+    // The bottom faces -pn: the contour reversed.
+    for k in 0..<n:
+        cap[k] = n - 1 - k
+        cap_uvs[k] = cap_uv(polygon[n - 1 - k], origin, tan, bit)
+    try i64 _ = add_face_loop(&m, cap[:], cap_uvs[:])
+    rebuild_twins(&m)
+    calculate_normals(&m)
+    return m
+
+// Sets each vertex normal to the unit sum of its corners' cross products, so larger faces weigh
+// more. A vertex no face reaches keeps a zero normal.
+void calculate_normals(^Mesh m):
+    for i in 0..<#len(m.vertices):
+        m.vertices[i].normal = [0.0, 0.0, 0.0]
+    for e in m.edges:
+        [3]f64 pc = m.vertices[e.vertex].position
+        [3]f64 pn = m.vertices[m.edges[e.next].vertex].position
+        [3]f64 pp = m.vertices[m.edges[e.prev].vertex].position
+        m.vertices[e.vertex].normal = m.vertices[e.vertex].normal + linalg.cross(pn - pc, pp - pc)
+    for i in 0..<#len(m.vertices):
+        [3]f64 n = m.vertices[i].normal
+        if linalg.length(n) > NORMAL_MIN:
+            m.vertices[i].normal = linalg.normalize(n)
+
+// Below this a vertex normal is left unnormalised (no faces around it).
+private const f64 NORMAL_MIN = 0.00001
+
+// Sets each corner's UV by projecting its face onto the face's own plane, measured from the face's
+// first corner: one UV island per face.
+void calculate_uvs(^Mesh m):
+    for fi in 0..<#len(m.faces):
+        [4]f64 pl = face_plane(m, fi)
+        [3]f64 nrm = [pl[0], pl[1], pl[2]]
+        ([3]f64 tan, [3]f64 bit) = plane_axes(nrm)
+        i64 start = m.faces[fi].half_edge
+        [3]f64 origin = m.vertices[m.edges[start].vertex].position
+        i64 e = start
+        for true:
+            [3]f64 rel = m.vertices[m.edges[e].vertex].position - origin
+            m.edges[e].uv = [linalg.dot(rel, tan), linalg.dot(rel, bit)]
+            e = m.edges[e].next
+            if e == start:
+                break
+
+// A face's half-edges in counter-clockwise order from its first, as a new run on `#default`: the
+// caller `#delete`s it. Fails with NO_MEMORY.
+#assert_raises
+!ref []i64 face_loop_edges(^const Mesh m, i64 face):
+    try ref []i64 out = #make([]i64, 0) else NO_MEMORY
+    defer fail #delete(out)
+    i64 start = m.faces[face].half_edge
+    i64 e = start
+    for true:
+        if !#append(out, e):
+            fail NO_MEMORY
+        e = m.edges[e].next
+        if e == start:
+            break
+    return out
+
+// A face's vertices in counter-clockwise order (vertex k is the one half-edge k points to), as a
+// new run on `#default`: the caller `#delete`s it. Fails with NO_MEMORY.
+#assert_raises
+!ref []i64 face_vertices(^const Mesh m, i64 face):
+    try ref []i64 out = #make([]i64, 0) else NO_MEMORY
+    defer fail #delete(out)
+    i64 start = m.faces[face].half_edge
+    i64 e = start
+    for true:
+        if !#append(out, m.edges[e].vertex):
+            fail NO_MEMORY
+        e = m.edges[e].next
+        if e == start:
+            break
+    return out
+
+// The mean of a face's corner positions.
+#assert_raises
+[3]f64 face_centroid(^const Mesh m, i64 face):
+    [3]f64 c = [0.0, 0.0, 0.0]
+    i64 n = 0
+    i64 start = m.faces[face].half_edge
+    i64 e = start
+    for true:
+        c += m.vertices[m.edges[e].vertex].position
+        n += 1
+        e = m.edges[e].next
+        if e == start:
+            break
+    return c / f64(n)
+
+// A face's plane as (nx, ny, nz, d): its unit Newell normal, and d through the mean of its
+// corners. (0, 1, 0, 0) for a face of fewer than 3 corners.
+[4]f64 face_plane(^const Mesh m, i64 face):
+    [3]f64 nrm = [0.0, 0.0, 0.0]
+    [3]f64 c = [0.0, 0.0, 0.0]
+    i64 n = 0
+    i64 start = m.faces[face].half_edge
+    i64 e = start
+    for true:
+        [3]f64 cur = m.vertices[m.edges[e].vertex].position
+        [3]f64 nxt = m.vertices[m.edges[m.edges[e].next].vertex].position
+        nrm.x += (cur.y - nxt.y) * (cur.z + nxt.z)
+        nrm.y += (cur.z - nxt.z) * (cur.x + nxt.x)
+        nrm.z += (cur.x - nxt.x) * (cur.y + nxt.y)
+        c += cur
+        n += 1
+        e = m.edges[e].next
+        if e == start:
+            break
+    if n < 3:
+        return [0.0, 1.0, 0.0, 0.0]
+    if linalg.length(nrm) > PLANE_MIN:
+        nrm = linalg.normalize(nrm)
+    c = c / f64(n)
+    return [nrm.x, nrm.y, nrm.z, linalg.dot(nrm, c)]
+
+private const f64 PLANE_MIN = 0.000000000001
+
+// A face's unit Newell normal: the first three of `face_plane`.
+[3]f64 face_normal(^const Mesh m, i64 face):
+    [4]f64 p = face_plane(m, face)
+    return [p[0], p[1], p[2]]
+
+// The vertices half-edge `edge` runs from and to.
+#assert_raises
+(i64 from, i64 to) edge_endpoints(^const Mesh m, i64 edge):
+    return (m.edges[m.edges[edge].prev].vertex, m.edges[edge].vertex)
+
+// Whether half-edge `edge` has no twin: it lies on an open boundary.
+#assert_raises
+bool is_boundary_edge(^const Mesh m, i64 edge):
+    return m.edges[edge].twin < 0
+
+// Some half-edge pointing to `vertex`, or -1 when none does. A linear scan of the half-edges.
+#assert_raises
+i64 vertex_incoming_edge(^const Mesh m, i64 vertex):
+    for i in 0..<#len(m.edges):
+        if m.edges[i].vertex == vertex:
+            return i
+    return -1
+
+// The half-edges pointing to `vertex`, one per face around it, found by turning next then twin
+// from `vertex_incoming_edge`'s. An open boundary stops the turn, so around a boundary vertex the
+// faces past the boundary from the start are missed. A new run on `#default`: the caller
+// `#delete`s it. Fails with NO_MEMORY.
+#assert_raises
+!ref []i64 vertex_incoming_edges(^const Mesh m, i64 vertex):
+    try ref []i64 out = #make([]i64, 0) else NO_MEMORY
+    defer fail #delete(out)
+    i64 start = vertex_incoming_edge(m, vertex)
+    if start < 0:
+        return out
+    i64 h = start
+    for true:
+        if !#append(out, h):
+            fail NO_MEMORY
+        i64 t = m.edges[m.edges[h].next].twin
+        if t < 0:
+            break
+        h = t
+        if h == start:
+            break
+    return out
+
+// The faces around `vertex`, in `vertex_incoming_edges` order, as a new run on `#default`: the
+// caller `#delete`s it. Fails with NO_MEMORY.
+#assert_raises
+!ref []i64 vertex_faces(^const Mesh m, i64 vertex):
+    try ref []i64 ring = vertex_incoming_edges(m, vertex)
+    for i in 0..<#len(ring):
+        ring[i] = m.edges[ring[i]].face
+    return ring
+
+// The vertices one edge from `vertex`, in `vertex_incoming_edges` order, as a new run on
+// `#default`: the caller `#delete`s it. Fails with NO_MEMORY.
+#assert_raises
+!ref []i64 vertex_neighbors(^const Mesh m, i64 vertex):
+    try ref []i64 ring = vertex_incoming_edges(m, vertex)
+    for i in 0..<#len(ring):
+        (i64 from, _) = edge_endpoints(m, ring[i])
+        ring[i] = from
+    return ring
+
+// The faces across each edge of `face`, open edges skipped, as a new run on `#default`: the
+// caller `#delete`s it. Fails with NO_MEMORY.
+#assert_raises
+!ref []i64 face_neighbors(^const Mesh m, i64 face):
+    try ref []i64 out = #make([]i64, 0) else NO_MEMORY
+    defer fail #delete(out)
+    i64 start = m.faces[face].half_edge
+    i64 e = start
+    for true:
+        i64 t = m.edges[e].twin
+        if t >= 0 && !#append(out, m.edges[t].face):
+            fail NO_MEMORY
+        e = m.edges[e].next
+        if e == start:
+            break
+    return out
+
+// One fan triangle of a face: its corners' positions, and the face it came from.
+type Triangle:
+    [3]f64 v0
+    [3]f64 v1
+    [3]f64 v2
+    i64 face
+
+// Every face as a fan of triangles from its first corner, as a new run on `#default`: the caller
+// `#delete`s it. Exact for convex faces; a concave face's fan can leave the face, and
+// `bake_geometry` triangulates such a face inside its outline instead. Fails with NO_MEMORY.
+#assert_raises
+!ref []Triangle get_triangles(^const Mesh m):
+    try ref []Triangle out = #make([]Triangle, 0) else NO_MEMORY
+    defer fail #delete(out)
+    for fi in 0..<#len(m.faces):
+        i64 first = m.faces[fi].half_edge
+        [3]f64 p0 = m.vertices[m.edges[first].vertex].position
+        i64 e = m.edges[first].next
+        // Fan triangles (first, e, next(e)) until next(e) closes the loop.
+        for m.edges[e].next != first:
+            i64 f = m.edges[e].next
+            if !#append(out, (p0, m.vertices[m.edges[e].vertex].position, m.vertices[m.edges[f].vertex].position, fi)):
+                fail NO_MEMORY
+            e = f
+    return out
+
+// Recomputes each surface's plane from its first face, then every vertex normal. Call it after
+// moving vertex positions directly.
+void refresh(^Mesh m):
+    for si in 0..<#len(m.surfaces):
+        i64 f = m.surfaces[si].first_face
+        if f >= 0 && f < #len(m.faces):
+            m.surfaces[si].plane = face_plane(m, f)
+    calculate_normals(m)
+
+// Moves `vertex` by `by`, then `refresh`es the mesh.
+void translate_vertex(^Mesh m, i64 vertex, [3]f64 by):
+    m.vertices[vertex].position += by
+    refresh(m)
+
+// Moves both ends of half-edge `edge` by `by`, then `refresh`es the mesh.
+void translate_edge(^Mesh m, i64 edge, [3]f64 by):
+    (i64 a, i64 b) = edge_endpoints(m, edge)
+    m.vertices[a].position += by
+    m.vertices[b].position += by
+    refresh(m)
+
+// Moves every corner of `face` by `by`, then `refresh`es the mesh.
+void translate_face(^Mesh m, i64 face, [3]f64 by):
+    i64 start = m.faces[face].half_edge
+    i64 e = start
+    for true:
+        m.vertices[m.edges[e].vertex].position += by
+        e = m.edges[e].next
+        if e == start:
+            break
+    refresh(m)

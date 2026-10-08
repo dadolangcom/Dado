@@ -1,0 +1,531 @@
+// The reader: a cursor over encoded bytes, pulled one item at a time.
+package cbor
+
+// What an item is, as `Reader.kind` answers it. `Break` is the byte that ends
+// an indefinite-length item.
+public enum i32 Kind: (Unsigned, Negative, Bytes, Text, Array, Map, Tag, Bool, Null, Undefined, Simple, Float, Break)
+
+// An array, map or string being walked: `array`, `map` and `chunks` answer
+// one, and `more` steps it. `left` counts the items (an array), pairs (a map)
+// or pieces (a string) still to come of a definite one; `indefinite` says it
+// ends at a break instead; `chunk` is the major type a string's pieces must
+// have, and 0 for an array or a map.
+public type Container:
+    u64 left
+    bool indefinite
+    u8 chunk
+
+// A cursor over `data`: `at` is the offset of the next item. Make one with
+// `reader`. Each read takes one item, or the head of one; a read that fails
+// leaves `at` where it was.
+public type Reader:
+    []u8 data
+    i64 at
+
+    // What the next item is, without reading it. Fails with the code of
+    // malformed input, or `TRUNCATED` at the end.
+    !Kind kind(self):
+        try Head h = read_head(self.data, self.at)
+        return kind_of(h)
+
+    // Whether every byte has been read.
+    bool done(self):
+        return self.at >= #len(self.data)
+
+    // The next item, an unsigned integer. Fails with `WRONG_TYPE` for any
+    // other item, or with the code of malformed input; a failure leaves the
+    // reader where it was.
+    !u64 uint(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_UNSIGNED:
+            fail WRONG_TYPE
+        self.at = h.next
+        return h.arg
+
+    // The next item, an unsigned or negative integer. Fails with `OVERFLOW`
+    // outside the range of `i64`, `WRONG_TYPE` for any other item, or the
+    // code of malformed input; a failure leaves the reader where it was.
+    !i64 int(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_UNSIGNED && h.major != MAJOR_NEGATIVE:
+            fail WRONG_TYPE
+        if h.arg > 0x7FFFFFFFFFFFFFFF:
+            fail OVERFLOW
+        self.at = h.next
+        if h.major == MAJOR_NEGATIVE:
+            return -1 - i64(h.arg)
+        return i64(h.arg)
+
+    // The next item, a negative integer, as `n` where its value is `-1 - n`;
+    // this reaches -2^64, which `int` cannot. Fails with `WRONG_TYPE` for any
+    // other item, or with the code of malformed input; a failure leaves the
+    // reader where it was.
+    !u64 negative(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_NEGATIVE:
+            fail WRONG_TYPE
+        self.at = h.next
+        return h.arg
+
+    // The next item, a definite-length byte string, as a view into `data`.
+    // Fails with `CHUNKED` for an indefinite-length one (read it with
+    // `chunks` or `bytes_copy`), `WRONG_TYPE` for any other item, or the code
+    // of malformed input; a failure leaves the reader where it was.
+    ![]u8 bytes(^self):
+        try []u8 b = self.string_of(MAJOR_BYTES)
+        return b
+
+    // The next item, a definite-length text string, as a view into `data`.
+    // Its UTF-8 is not checked. Fails with `CHUNKED` for an indefinite-length
+    // one (read it with `chunks` or `text_copy`), `WRONG_TYPE` for any other
+    // item, or the code of malformed input; a failure leaves the reader where
+    // it was.
+    !string8 text(^self):
+        try []u8 b = self.string_of(MAJOR_TEXT)
+        return as_text(b)
+
+    // The next item, a byte string of either length form, its pieces joined
+    // in a new run on `#default`, which the caller deletes. Linear in the
+    // string's length. Fails with `WRONG_TYPE` for any other item,
+    // `NO_MEMORY` when the run cannot be made, or the code of malformed
+    // input; a failure leaves the reader where it was.
+    !ref([]u8) bytes_copy(^self):
+        ref []u8 out
+        try self.at = join_pieces(self^, MAJOR_BYTES, &out)
+        return out
+
+    // The next item, a text string of either length form, its pieces joined
+    // in a new run on `#default`, which the caller deletes. Its UTF-8 is not
+    // checked. Linear in the string's length. Fails with `WRONG_TYPE` for any
+    // other item, `NO_MEMORY` when the run cannot be made, or the code of
+    // malformed input; a failure leaves the reader where it was.
+    !ref([]char8) text_copy(^self):
+        ref []char8 out
+        try self.at = join_pieces(self^, MAJOR_TEXT, &out)
+        return out
+
+    // Opens the next item, a byte or text string of either length form, to be
+    // read piece by piece. A definite-length string is one piece:
+    //
+    //     try cbor.Container c = r.chunks()
+    //     for r.more(&c):
+    //         try []u8 piece = r.chunk(&c)
+    //
+    // Fails with `WRONG_TYPE` for any other item, or with the code of
+    // malformed input; a failure leaves the reader where it was.
+    !Container chunks(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_BYTES && h.major != MAJOR_TEXT:
+            fail WRONG_TYPE
+        if h.info != INDEFINITE:
+            return (1, false, h.major)
+        self.at = h.next
+        return (0, true, h.major)
+
+    // The next piece of the string `c` was opened on, as a view into `data`.
+    // Fails with `BAD_CHUNK` when the next item is not a definite-length
+    // string of the same major type, or with the code of malformed input; a
+    // failure leaves the reader where it was.
+    ![]u8 chunk(^self, ^Container c):
+        try Head h = item_head(self.data, self.at)
+        if h.major != c^.chunk || h.info == INDEFINITE:
+            fail BAD_CHUNK
+        self.at = h.next + i64(h.arg)
+        return self.data[h.next..<self.at]
+
+    // Opens the next item, an array; `more` then answers true once per item:
+    //
+    //     try cbor.Container a = r.array()
+    //     for r.more(&a):
+    //         try u64 v = r.uint()
+    //
+    // Fails with `WRONG_TYPE` for any other item, or with the code of
+    // malformed input; a failure leaves the reader where it was.
+    !Container array(^self):
+        try Container c = self.open(MAJOR_ARRAY)
+        return c
+
+    // Opens the next item, a map; `more` then answers true once per pair, and
+    // the turn reads the key and then the value. Fails with `WRONG_TYPE` for
+    // any other item, or with the code of malformed input; a failure leaves
+    // the reader where it was.
+    !Container map(^self):
+        try Container c = self.open(MAJOR_MAP)
+        return c
+
+    // Whether `c` has another item, pair or piece, counting it off. The break
+    // that ends an indefinite-length one is read here. At the end of the
+    // input it answers true, so the read that follows fails with `TRUNCATED`.
+    bool more(^self, ^Container c):
+        if !c^.indefinite:
+            if c^.left == 0:
+                return false
+            c^.left -= 1
+            return true
+        if self.at < #len(self.data) && self.data[self.at] == BREAK:
+            self.at += 1
+            return false
+        return true
+
+    // The next item's tag number; the item after it is the tag's content.
+    // Fails with `WRONG_TYPE` for any other item, or with the code of
+    // malformed input; a failure leaves the reader where it was.
+    !u64 tag(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_TAG:
+            fail WRONG_TYPE
+        self.at = h.next
+        return h.arg
+
+    // Whether the next item is the self-describe tag (`SELF_DESCRIBE`),
+    // reading it if it is. Malformed input answers false and reads nothing.
+    bool self_described(^self):
+        try Head h = read_head(self.data, self.at) else:
+            return false
+        if h.major != MAJOR_TAG || h.arg != SELF_DESCRIBE:
+            return false
+        self.at = h.next
+        return true
+
+    // The next item, `true` or `false`. Fails with `WRONG_TYPE` for any other
+    // item, or with the code of malformed input; a failure leaves the reader
+    // where it was.
+    !bool boolean(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_SIMPLE || (h.info != 20 && h.info != 21):
+            fail WRONG_TYPE
+        self.at = h.next
+        return h.info == 21
+
+    // Reads the next item, `null`. Fails with `WRONG_TYPE` for any other
+    // item, or with the code of malformed input; a failure leaves the reader
+    // where it was.
+    !void null(^self):
+        try self.simple_is(22)
+
+    // Reads the next item, `undefined`. Fails with `WRONG_TYPE` for any other
+    // item, or with the code of malformed input; a failure leaves the reader
+    // where it was.
+    !void undefined(^self):
+        try self.simple_is(23)
+
+    // The next item, a simple value: `false`, `true`, `null` and `undefined`
+    // among them, as 20 to 23. Fails with `WRONG_TYPE` for any other item, or
+    // with the code of malformed input; a failure leaves the reader where it
+    // was.
+    !u8 simple(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_SIMPLE || (h.info >= 25 && h.info <= 27):
+            fail WRONG_TYPE
+        self.at = h.next
+        return u8(h.arg)
+
+    // The next item, a float of any width, as an `f64`. Fails with
+    // `WRONG_TYPE` for any other item, or with the code of malformed input; a
+    // failure leaves the reader where it was.
+    !f64 float(^self):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_SIMPLE || h.info < 25 || h.info > 27:
+            fail WRONG_TYPE
+        self.at = h.next
+        return float_of(h)
+
+    // Steps over the next item, whatever it holds. Fails with the code of the
+    // first malformed byte, or `TOO_DEEP` past `MAX_DEPTH`; a failure leaves
+    // the reader where it was. Linear in the item's length, and nesting costs
+    // no stack.
+    !void skip(^self):
+        try i64 end = skip_items(self.data, self.at, 1)
+        self.at = end
+
+    // The next item in diagnostic notation, as a new run on `#default` which
+    // the caller deletes, and steps over it. Fails as `skip` does, or with
+    // `NO_MEMORY`; a failure leaves the reader where it was. Linear in
+    // the item's length.
+    !ref([]char8) diagnose(^self):
+        try i64 end = skip_items(self.data, self.at, 1)
+        try ref []char8 out = render(self.data[self.at..<end])
+        self.at = end
+        return out
+
+    // The next item, a definite-length string of major type `major`, as a
+    // view into `data`. Fails with `WRONG_TYPE`, `CHUNKED` or the code of
+    // malformed input, and then does not move.
+    private ![]u8 string_of(^self, u8 major):
+        try Head h = item_head(self.data, self.at)
+        if h.major != major:
+            fail WRONG_TYPE
+        if h.info == INDEFINITE:
+            fail CHUNKED
+        self.at = h.next + i64(h.arg)
+        return self.data[h.next..<self.at]
+
+    // Opens the next item, an array or map of major type `major`, and answers
+    // its count. Fails with `WRONG_TYPE` or the code of malformed input, and
+    // then does not move.
+    private !Container open(^self, u8 major):
+        try Head h = item_head(self.data, self.at)
+        if h.major != major:
+            fail WRONG_TYPE
+        self.at = h.next
+        if h.info == INDEFINITE:
+            return (0, true, 0)
+        return (h.arg, false, 0)
+
+    // Reads the next item, the simple value whose additional information is
+    // `info`. Fails with `WRONG_TYPE` or the code of malformed input, and
+    // then does not move.
+    private !void simple_is(^self, u8 info):
+        try Head h = item_head(self.data, self.at)
+        if h.major != MAJOR_SIMPLE || h.info != info:
+            fail WRONG_TYPE
+        self.at = h.next
+
+// The string at `r.at`, of either length form, its pieces joined in `out^`:
+// one new run on `#default`, sized by a first walk over the pieces, so the
+// bytes are copied once. Answers where the string ends. `r` is a copy, so a
+// failure moves no caller's reader, and `out^` is left as it was.
+private !i64 join_pieces(Reader r, u8 major, ^ref []$T out) where T in (u8, char8):
+    try Head h = item_head(r.data, r.at)
+    if h.major != major:
+        fail WRONG_TYPE
+    Reader sizing = r
+    try Container counted = sizing.chunks()
+    i64 n = 0
+    for sizing.more(&counted):
+        try []u8 piece = sizing.chunk(&counted)
+        n += #len(piece)
+    ref []T run = #make([]T, n)
+    if run == nil:
+        fail NO_MEMORY
+    try Container c = r.chunks() else code:
+        #delete(run)
+        fail code
+    i64 i = 0
+    for r.more(&c):
+        try []u8 piece = r.chunk(&c) else code:
+            #delete(run)
+            fail code
+        for b in piece:
+            run[i] = T(b)
+            i += 1
+    out^ = run
+    return r.at
+
+// A reader at the start of `data`. It reads `data` in place and allocates
+// nothing.
+#assert_raises
+public Reader reader([]u8 data):
+    return (data, 0)
+
+// Succeeds when `data` is exactly one well-formed item. Fails with the code
+// of the first malformed byte, `TOO_DEEP` past `MAX_DEPTH`, or `TRAILING`
+// when bytes follow the item. Linear in `#len(data)`, and nesting costs no
+// stack.
+#assert_raises
+public !void well_formed([]u8 data):
+    try i64 end = skip_items(data, 0, 1)
+    if end != #len(data):
+        fail TRAILING
+
+// The item `data` holds, in RFC 8949's diagnostic notation, as a new run on
+// `#default` which the caller deletes:
+//
+//     try ref []char8 d = cbor.diagnose(bytes[:])   // {"a": [1, 2.5]}
+//
+// Fails as `well_formed` does, or with `NO_MEMORY`. Linear in
+// `#len(data)`.
+#assert_raises
+public !ref([]char8) diagnose([]u8 data):
+    try well_formed(data)
+    try ref []char8 out = render(data)
+    return out
+
+// ── heads ─────────────────────────────────────────────────────────────────
+
+// An item's first byte split, its argument, and where what follows starts.
+// `arg` is 0 for an indefinite length and the raw bits for a float.
+private type Head:
+    u8 major
+    u8 info
+    u64 arg
+    i64 next
+
+// The head of the item at `d[at]`. Fails with `TRUNCATED` when it runs past
+// the end of `d`, or when a string, array or map counts more items or bytes
+// than `d` has left, and with `RESERVED` for additional information 28 to 30,
+// a 31 where no indefinite length exists, or a two-byte simple value below
+// 32. A break is answered, not refused.
+private !Head read_head([]u8 d, i64 at):
+    i64 n = #len(d)
+    if at < 0 || at >= n:
+        fail TRUNCATED
+    u8 b = d[at]
+    u8 major = b >> 5
+    u8 info = b & 31
+    i64 p = at + 1
+    u64 arg = 0
+    if info < 24:
+        arg = u64(info)
+    else if info <= 27:
+        i64 w = i64(1) << i64(info - 24)
+        if n - p < w:
+            fail TRUNCATED
+        for i in 0..<w:
+            arg = (arg << 8) | u64(d[p + i])
+        p += w
+    else if info < INDEFINITE:
+        fail RESERVED
+    else if major == MAJOR_UNSIGNED || major == MAJOR_NEGATIVE || major == MAJOR_TAG:
+        fail RESERVED
+    if major == MAJOR_SIMPLE && info == 24 && arg < 32:
+        fail RESERVED
+    if info != INDEFINITE:
+        // Every item takes at least a byte, so no count may outrun the input.
+        u64 rest = u64(n - p)
+        if major >= MAJOR_BYTES && major <= MAJOR_MAP && arg > rest:
+            fail TRUNCATED
+    return (major, info, arg, p)
+
+// A head where an item must start: a break there is out of place.
+private !Head item_head([]u8 d, i64 at):
+    try Head h = read_head(d, at)
+    if h.major == MAJOR_SIMPLE && h.info == INDEFINITE:
+        fail BAD_BREAK
+    return h
+
+// What the item `h` heads is.
+private Kind kind_of(Head h):
+    if h.major == MAJOR_UNSIGNED:
+        return Kind.Unsigned
+    if h.major == MAJOR_NEGATIVE:
+        return Kind.Negative
+    if h.major == MAJOR_BYTES:
+        return Kind.Bytes
+    if h.major == MAJOR_TEXT:
+        return Kind.Text
+    if h.major == MAJOR_ARRAY:
+        return Kind.Array
+    if h.major == MAJOR_MAP:
+        return Kind.Map
+    if h.major == MAJOR_TAG:
+        return Kind.Tag
+    if h.info == 20 || h.info == 21:
+        return Kind.Bool
+    if h.info == 22:
+        return Kind.Null
+    if h.info == 23:
+        return Kind.Undefined
+    if h.info >= 25 && h.info <= 27:
+        return Kind.Float
+    if h.info == INDEFINITE:
+        return Kind.Break
+    return Kind.Simple
+
+// ── floats ────────────────────────────────────────────────────────────────
+
+// The value of the float `h` heads, whose width its additional information
+// gives (25 half, 26 single, 27 double).
+private f64 float_of(Head h):
+    if h.info == 25:
+        return half_to_f64(u32(h.arg))
+    if h.info == 26:
+        Bits32 s = Bits32(u32(h.arg))
+        return f64(s.f)
+    Bits64 d = Bits64(h.arg)
+    return d.f
+
+// 2^-24, the smallest half-precision subnormal.
+private const f64 HALF_TINY = 0.000000059604644775390625
+
+// The half-precision float with bits `h`, exactly, as an `f64`.
+private f64 half_to_f64(u32 h):
+    u64 sign = u64(h >> 15) << 63
+    u32 e = (h >> 10) & 0x1F
+    u64 m = u64(h & 0x3FF)
+    if e == 0:
+        Bits64 v = Bits64(f64(m) * HALF_TINY)
+        Bits64 signed = Bits64(v.u | sign)
+        return signed.f
+    u64 bits = 0
+    if e == 31:
+        bits = sign | (u64(0x7FF) << 52) | (m << 42)
+    else:
+        bits = sign | (u64(e + 1008) << 52) | (m << 42)
+    Bits64 d = Bits64(bits)
+    return d.f
+
+// ── walking whole items ───────────────────────────────────────────────────
+
+// One open container in `skip_items`.
+private type Frame:
+    u64 left
+    u64 seen
+    bool indefinite
+    u8 major
+
+// Where `count` whole items starting at `at` end. Iterative, so nesting
+// costs a frame of `MAX_DEPTH`, not stack.
+private !i64 skip_items([]u8 d, i64 at, u64 count):
+    [MAX_DEPTH]Frame stack
+    i32 depth = 0
+    i64 p = at
+    u64 todo = count
+    if todo == 0:
+        return p
+    for:
+        try Head h = read_head(d, p)
+        p = h.next
+        bool done = false
+        if h.major == MAJOR_SIMPLE && h.info == INDEFINITE:
+            if depth == 0 || !stack[depth - 1].indefinite:
+                fail BAD_BREAK
+            if stack[depth - 1].major == MAJOR_MAP && stack[depth - 1].seen % 2 != 0:
+                fail BAD_BREAK
+            depth -= 1
+            done = true
+        else:
+            if depth > 0:
+                u8 chunk = stack[depth - 1].major
+                if (chunk == MAJOR_BYTES || chunk == MAJOR_TEXT) && (h.major != chunk || h.info == INDEFINITE):
+                    fail BAD_CHUNK
+            bool opens = false
+            Frame f = (0, 0, h.info == INDEFINITE, h.major)
+            if h.major == MAJOR_BYTES || h.major == MAJOR_TEXT:
+                if f.indefinite:
+                    opens = true
+                else:
+                    p += i64(h.arg)
+            else if h.major == MAJOR_ARRAY:
+                f.left = h.arg
+                opens = f.indefinite || h.arg > 0
+            else if h.major == MAJOR_MAP:
+                f.left = h.arg * 2
+                opens = f.indefinite || h.arg > 0
+            else if h.major == MAJOR_TAG:
+                f.left = 1
+                opens = true
+            if opens:
+                if depth == MAX_DEPTH:
+                    fail TOO_DEEP
+                stack[depth] = f
+                depth += 1
+            else:
+                done = true
+        // A finished item counts against its container, which may finish too.
+        for done:
+            if depth == 0:
+                todo -= 1
+                if todo == 0:
+                    return p
+                done = false
+            else if stack[depth - 1].indefinite:
+                stack[depth - 1].seen += 1
+                done = false
+            else:
+                stack[depth - 1].left -= 1
+                if stack[depth - 1].left == 0:
+                    depth -= 1
+                else:
+                    done = false
+    return p

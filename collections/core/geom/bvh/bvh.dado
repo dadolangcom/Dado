@@ -1,0 +1,372 @@
+// A static bounding volume hierarchy over 3D boxes: built once, queried for the nearest ray hit and
+// for every box overlapping a query box, and refitted in place when the boxes move.
+//
+//     try bvh.Bvh tree = bvh.build(boxes[:])
+//     defer bvh.destroy(&tree)
+//     (i32 item, f32 t, bool hit) = bvh.raycast(&tree, origin, dir, 1000.0, (leaf_test, rawptr(&scene)), (nil, nil))
+//
+// An item is the index of its box in the slice `build` was given; what it stands for (a triangle,
+// a widget) is the caller's, and the caller's leaf test decides whether a ray hits it. The tree is
+// built by binned SAH, and by median splits past depth 64, which bounds its depth. It is f32
+// throughout, the precision of the vertex data such a tree indexes.
+package bvh
+
+import "core:linalg"
+import "core:geom/hit"
+
+#static_assert(#OS != #NONE, "core:geom/bvh needs core:linalg, which takes its square root from the C library, and a #NONE target has none")
+
+// The code `build` and `overlapping` fail with: an allocation failed.
+const i32 NO_MEMORY = 1
+
+private const i32 MAX_LEAF = 4
+private const i32 BINS = 12
+private const i32 MEDIAN_DEPTH = 64  // from this depth on, splits are by median, which bounds the depth
+private const i32 STACK = 128        // the traversal stacks' length
+
+// A traversal holds at most one entry per level plus one, and from MEDIAN_DEPTH on each split
+// halves the items, so MAX_ITEMS (2^30) items need MEDIAN_DEPTH + 31 levels at most.
+#static_assert(STACK >= MEDIAN_DEPTH + 32, "bvh's traversal stack is shorter than the deepest tree build can make")
+
+// The most boxes `build` takes: node and item indices are i32, and a tree has 2n - 1 nodes.
+const i64 MAX_ITEMS = 1 << 30
+
+// An axis-aligned box: its lowest and its highest corner.
+type Box: ([3]f32 lo, [3]f32 hi)
+
+// One node of the flat tree, with the box around everything under it.
+type Node:
+    [3]f32 lo
+    [3]f32 hi
+    i32 first   // a leaf's first slot in `items`; an internal node's left child, the right is first + 1
+    i32 count   // a leaf's item count; 0 for an internal node
+
+// A tree made by `build` and ended by `destroy`. `nodes[0]` is the root, and a child's index is
+// always greater than its parent's.
+type Bvh:
+    ref []Node nodes
+    ref []i32 items    // item indices, in leaf order
+    i32 depth          // the deepest level, the root's being 0
+
+// What a leaf test answers: whether the ray hits the item before t_max, and at what t.
+type RayHit: (f32 t, bool hit)
+
+// A leaf test, called as fn(origin, dir, item, t_max, data) for each item a ray reaches. Named
+// through RayHit because a function type cannot spell a tuple return inline yet:
+// `(f32, bool)(i32, rawptr)` is a parse error.
+type RayFn: RayHit([3]f32, [3]f32, i32, f32, rawptr)
+
+// A leaf test and the data `raycast` hands back to it unchanged. A function and its data stand
+// where a trait belongs: a function here taking a trait-typed parameter is refused when it is
+// called from another package (ERR0920, "names no type here").
+type RayTest: (RayFn fn, rawptr data)
+
+// An exclusion filter, called as fn(item, data): true leaves the item out.
+type SkipFn: bool(i32, rawptr)
+
+// An exclusion filter and its data. A nil `fn` leaves nothing out.
+type Skip: (SkipFn fn, rawptr data)
+
+// The box around triangle a, b, c.
+#assert_raises
+Box triangle_box([3]f32 a, [3]f32 b, [3]f32 c):
+    return (linalg.min(linalg.min(a, b), c), linalg.max(linalg.max(a, b), c))
+
+private f32 half_area([3]f32 lo, [3]f32 hi):
+    [3]f32 d = hi - lo
+    return d.x * d.y + d.y * d.z + d.z * d.x
+
+// Builds a tree over `boxes` on `#default`; the caller ends it with `destroy`. Item i is
+// boxes[i]. No boxes answers an empty tree. Takes at most MAX_ITEMS boxes (asserted). Fails with
+// NO_MEMORY. O(n log n) for boxes spread through space.
+#assert_raises
+!Bvh build([]Box boxes):
+    i64 n = #len(boxes)
+    #assert(n <= MAX_ITEMS, "bvh.build takes at most MAX_ITEMS boxes")
+    Bvh b
+    if n == 0:
+        return b
+    defer fail destroy(&b)
+    try b.nodes = #make([]Node, 2 * n - 1) else NO_MEMORY
+    try b.items = #make([]i32, n) else NO_MEMORY
+    try ref [][3]f32 centroids = #make([][3]f32, n) else NO_MEMORY
+    defer #delete(centroids)
+
+    for box, i in boxes:
+        b.items[i] = i32(i)
+        centroids[i] = (box.lo + box.hi) * 0.5
+
+    // An explicit work stack: a node waiting to be split, its range, its depth.
+    [STACK]i32 todo_node
+    [STACK]i32 todo_depth
+    i32 sp = 1
+    todo_node[0] = 0
+    todo_depth[0] = 0
+    b.nodes[0].first = 0
+    b.nodes[0].count = i32(n)
+    i32 used = 1
+
+    for sp > 0:
+        sp -= 1
+        i32 at = todo_node[sp]
+        i32 depth = todo_depth[sp]
+        if depth > b.depth:
+            b.depth = depth
+        i32 start = b.nodes[at].first
+        i32 count = b.nodes[at].count
+
+        Box nb = boxes[b.items[start]]
+        [3]f32 clo = centroids[b.items[start]]
+        [3]f32 chi = clo
+        for k in start + 1..<start + count:
+            i32 it = b.items[k]
+            nb = (linalg.min(nb.lo, boxes[it].lo), linalg.max(nb.hi, boxes[it].hi))
+            clo = linalg.min(clo, centroids[it])
+            chi = linalg.max(chi, centroids[it])
+        b.nodes[at].lo = nb.lo
+        b.nodes[at].hi = nb.hi
+        if count <= MAX_LEAF:
+            continue
+
+        i32 mid = 0
+        if depth < MEDIAN_DEPTH:
+            mid = sah_split(boxes, centroids, b.items, start, count, clo, chi)
+        if mid <= start || mid >= start + count:
+            mid = median_split(centroids, b.items, start, count, clo, chi)
+
+        i32 left = used
+        used += 2
+        b.nodes[left].first = start
+        b.nodes[left].count = mid - start
+        b.nodes[left + 1].first = mid
+        b.nodes[left + 1].count = start + count - mid
+        b.nodes[at].first = left
+        b.nodes[at].count = 0
+        todo_node[sp] = left + 1
+        todo_depth[sp] = depth + 1
+        todo_node[sp + 1] = left
+        todo_depth[sp + 1] = depth + 1
+        sp += 2
+    #truncate(b.nodes, used)
+    return b
+
+// Frees the tree's runs and leaves it empty.
+#assert_raises
+void destroy(^Bvh b):
+    #delete(b.nodes)
+    #delete(b.items)
+    b.depth = 0
+
+// Binned SAH over all three axes. Partitions items[start ..< start+count]
+// and answers the first slot of the right side, or `start` when no axis spreads.
+private i32 sah_split([]Box boxes, [][3]f32 centroids, []i32 items, i32 start, i32 count, [3]f32 clo, [3]f32 chi):
+    i32 best_axis = -1
+    i32 best_bin = 0
+    f32 best_cost = 0.0
+    for axis in 0..<3:
+        f32 extent = chi[axis] - clo[axis]
+        if extent <= 0.0:
+            continue
+        f32 scale = f32(BINS) / extent
+        [BINS]i32 bin_count
+        [BINS]Box bin_box
+        for k in start..<start + count:
+            i32 it = items[k]
+            i32 bi = bin_of(centroids[it][axis], clo[axis], scale)
+            if bin_count[bi] == 0:
+                bin_box[bi] = boxes[it]
+            else:
+                bin_box[bi] = (linalg.min(bin_box[bi].lo, boxes[it].lo), linalg.max(bin_box[bi].hi, boxes[it].hi))
+            bin_count[bi] += 1
+
+        // Right-hand sweep: the cost of everything right of each plane.
+        [BINS]f32 right_cost
+        i32 rn = 0
+        Box rb = bin_box[BINS - 1]
+        i32 r = BINS - 1
+        for r > 0:
+            if bin_count[r] > 0:
+                rb = bin_box[r] if rn == 0 else (linalg.min(rb.lo, bin_box[r].lo), linalg.max(rb.hi, bin_box[r].hi))
+                rn += bin_count[r]
+            right_cost[r] = f32(rn) * half_area(rb.lo, rb.hi) if rn > 0 else -1.0
+            r -= 1
+
+        i32 ln = 0
+        Box lb = bin_box[0]
+        for i in 0..<BINS - 1:
+            if bin_count[i] > 0:
+                lb = bin_box[i] if ln == 0 else (linalg.min(lb.lo, bin_box[i].lo), linalg.max(lb.hi, bin_box[i].hi))
+                ln += bin_count[i]
+            if ln == 0 || right_cost[i + 1] < 0.0:
+                continue
+            f32 cost = f32(ln) * half_area(lb.lo, lb.hi) + right_cost[i + 1]
+            if best_axis < 0 || cost < best_cost:
+                best_axis = axis
+                best_bin = i
+                best_cost = cost
+
+    if best_axis < 0:
+        return start
+    f32 scale = f32(BINS) / (chi[best_axis] - clo[best_axis])
+    i32 lo = start
+    i32 hi = start + count - 1
+    for lo <= hi:
+        if bin_of(centroids[items[lo]][best_axis], clo[best_axis], scale) <= best_bin:
+            lo += 1
+        else:
+            i32 s = items[lo]
+            items[lo] = items[hi]
+            items[hi] = s
+            hi -= 1
+    return lo
+
+private i32 bin_of(f32 c, f32 lo, f32 scale):
+    i32 bi = i32((c - lo) * scale)
+    if bi < 0:
+        return 0
+    if bi >= BINS:
+        return BINS - 1
+    return bi
+
+// Splits at the median centroid on the widest axis (quickselect); identical
+// centroids split in half.
+private i32 median_split([][3]f32 centroids, []i32 items, i32 start, i32 count, [3]f32 clo, [3]f32 chi):
+    [3]f32 ext = chi - clo
+    i32 axis = 0
+    if ext.y > ext[axis]: axis = 1
+    if ext.z > ext[axis]: axis = 2
+    i32 mid = start + count / 2
+    i32 lo = start
+    i32 hi = start + count - 1
+    for lo < hi:
+        f32 pivot = centroids[items[(lo + hi) / 2]][axis]
+        i32 i = lo
+        i32 j = hi
+        for i <= j:
+            for centroids[items[i]][axis] < pivot:
+                i += 1
+            for centroids[items[j]][axis] > pivot:
+                j -= 1
+            if i <= j:
+                i32 s = items[i]
+                items[i] = items[j]
+                items[j] = s
+                i += 1
+                j -= 1
+        if mid <= j:
+            hi = j
+        else if mid >= i:
+            lo = i
+        else:
+            break
+    return mid
+
+// The nearest item the ray origin + t * dir hits with t < t_max, as `test` decides, leaving out
+// what `skip` leaves out: its index, its t, and hit. A miss answers (-1, t_max, false). Near
+// children are visited first, and a subtree whose box starts past the best hit so far is not
+// entered.
+(i32 item, f32 t, bool hit) raycast(^const Bvh b, [3]f32 origin, [3]f32 dir, f32 t_max, RayTest test, Skip skip):
+    i32 best = -1
+    f32 best_t = t_max
+    if #len(b.nodes) == 0:
+        return (best, best_t, false)
+    [3]f32 inv = hit.inverse_dir(dir)
+
+    (f32 t_root, _, bool in_root) = hit.ray_aabb(origin, inv, b.nodes[0].lo, b.nodes[0].hi, best_t)
+    if !in_root:
+        return (best, best_t, false)
+
+    [STACK]i32 stack
+    [STACK]f32 entry
+    i32 sp = 1
+    stack[0] = 0
+    entry[0] = t_root
+    for sp > 0:
+        sp -= 1
+        if entry[sp] > best_t:
+            continue
+        i32 at = stack[sp]
+        Node n = b.nodes[at]
+        if n.count > 0:
+            for k in n.first..<n.first + n.count:
+                i32 it = b.items[k]
+                if skip.fn != nil && skip.fn(it, skip.data):
+                    continue
+                (f32 t, bool h) = test.fn(origin, dir, it, best_t, test.data)
+                if h && t < best_t:
+                    best = it
+                    best_t = t
+            continue
+
+        ^const Node l = &b.nodes[n.first]
+        ^const Node r = &b.nodes[n.first + 1]
+        (f32 tl, _, bool hl) = hit.ray_aabb(origin, inv, l.lo, l.hi, best_t)
+        (f32 tr, _, bool hr) = hit.ray_aabb(origin, inv, r.lo, r.hi, best_t)
+        // Push the far child first so the near one is popped next.
+        if hl && hr:
+            bool left_near = tl <= tr
+            stack[sp] = n.first + 1 if left_near else n.first
+            entry[sp] = tr if left_near else tl
+            stack[sp + 1] = n.first if left_near else n.first + 1
+            entry[sp + 1] = tl if left_near else tr
+            sp += 2
+        else if hl:
+            stack[sp] = n.first
+            entry[sp] = tl
+            sp += 1
+        else if hr:
+            stack[sp] = n.first + 1
+            entry[sp] = tr
+            sp += 1
+    return (best, best_t, best >= 0)
+
+// Appends to `out` every item whose box in `boxes` (the slice the tree was built or last refitted
+// from) overlaps [lo, hi], touching included, and answers how many it appended. `out` grows on its
+// own allocator. Fails with NO_MEMORY when `out` cannot grow; what was appended stays.
+#assert_raises
+!i32 overlapping(^const Bvh b, []Box boxes, [3]f32 lo, [3]f32 hi, ^ref []i32 out):
+    if #len(b.nodes) == 0:
+        return 0
+    i32 found = 0
+    [STACK]i32 stack
+    i32 sp = 1
+    stack[0] = 0
+    for sp > 0:
+        sp -= 1
+        ^const Node n = &b.nodes[stack[sp]]
+        if !hit.aabb_aabb(n.lo, n.hi, lo, hi):
+            continue
+        if n.count == 0:
+            stack[sp] = n.first
+            stack[sp + 1] = n.first + 1
+            sp += 2
+            continue
+        for k in n.first..<n.first + n.count:
+            i32 it = b.items[k]
+            if !hit.aabb_aabb(boxes[it].lo, boxes[it].hi, lo, hi):
+                continue
+            if !#append(out^, it):
+                fail NO_MEMORY
+            found += 1
+    return found
+
+// Recomputes every node's box from `boxes`, the same items moved, children before parents. The
+// tree's shape does not change, so queries stay exact but slow down as items move far. O(n).
+#assert_raises
+void refit(^Bvh b, []Box boxes):
+    i64 i = #len(b.nodes) - 1
+    for i >= 0:
+        ^Node n = &b.nodes[i]
+        if n.count > 0:
+            Box nb = boxes[b.items[n.first]]
+            for k in n.first + 1..<n.first + n.count:
+                Box ib = boxes[b.items[k]]
+                nb = (linalg.min(nb.lo, ib.lo), linalg.max(nb.hi, ib.hi))
+            n.lo = nb.lo
+            n.hi = nb.hi
+        else:
+            ^Node l = &b.nodes[n.first]
+            ^Node r = &b.nodes[n.first + 1]
+            n.lo = linalg.min(l.lo, r.lo)
+            n.hi = linalg.max(l.hi, r.hi)
+        i -= 1
