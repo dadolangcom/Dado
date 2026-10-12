@@ -1,8 +1,8 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 7e1d5137cae1 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit fa29e0260488 -->
 # core:linalg
 
-std/linalg — vector and matrix maths, written once, over generics.
+core:linalg — vector and matrix maths, written once, over generics.
 
 Every function here is a **template**: `[$N]T` binds the arity from the
 argument and `T` binds the element type, `where T is scalar`, so `dot` is one page of source
@@ -31,7 +31,9 @@ row `r` of column `c`, each `[ … ]` in a matrix literal is a *column*, and the
 literals read transposed from the way a textbook writes the rows. `cross`
 obeys the right-hand rule (`x cross y == z`); `look_at` builds a view looking
 down **−z**; `perspective`/`orthographic` map to OpenGL/GLSL clip space, with
-`z` in **[−1, 1]** (glm's `_NO` / negative-one-to-one convention). Composition
+`z` in **[−1, 1]** (glm's `_NO` / negative-one-to-one convention), and
+`perspective_zero_to_one`/`orthographic_zero_to_one` to the [0, 1] depth of
+Metal, Direct3D, Vulkan and WebGPU (glm's `_ZO`). Composition
 is right-to-left as usual: `rot_y(h) * rot_x(p)` pitches first, then yaws.
 
 **`#transpose(m)` is a language builtin** — `[R,C]T` to `[C,R]T` —
@@ -39,12 +41,20 @@ so it is not restated here; call it directly. `*` on a matrix is the matrix
 product, `m * v` is matrix-times-column-vector, and `m * s` broadcasts a
 scalar, all builtin. What this file adds is everything those operators do not.
 
+**Tier N W H.** Every function builds and runs freestanding (`#NONE`), on
+the web (`#WEB`) and hosted (Linux, macOS, Windows and the BSDs). The
+arithmetic is Dado's own; the square root and the trigonometry are
+`core:math`'s, which takes them from the C library where there is one and
+computes them in Dado on `#NONE`, so this package has no `foreign` block of
+its own and nothing to link.
+
 **It generalizes over `scalar` wherever a square root is not in the way.**
 `dot`, `cross`, the componentwise `min`/`max`/`clamp`/`abs`/`sign`, the matrix
 `determinant`s and `trace`s are one body over `int` and `float` alike — an
 integer `dot` is exact and means what it says. Only the functions that reach
-libm (`length`, `normalize`, the trig, every `inverse`) narrow to `float`,
-because a square root or a reciprocal has no integer answer.
+a square root, the trigonometry or a reciprocal (`length`, `normalize`, the
+rotations, the quaternions, every `inverse`) narrow to `float`, because
+none of those has an integer answer.
 
 **It works against a `foreign` type with nothing written at the call.**
 A transparent foreign type is interchangeable with the shape it
@@ -55,7 +65,7 @@ function, because a tag is not in the C.
 
 ## Declarations
 
-49 declarations, 43 public.
+58 declarations, 58 public.
 
 * `$T dot([$N]T a, [N]T b) where T is scalar` — The dot product: the sum of the products of corresponding slots.
 * `[3]$T cross([3]T a, [3]T b) where T is scalar` — The cross product, which is **three-dimensional and nothing else** — GLSL's…
@@ -87,16 +97,31 @@ function, because a tag is not in the C.
 * `[N,N]$T diagonal([$N]T v) where T is scalar` — The diagonal matrix whose diagonal is `v` — and so the pure scaling matrix…
 * `$T trace([$N,N]T m) where T is scalar` — The trace — the sum of the diagonal — at any square size.
 * `$T determinant2([2,2]T m) where T is scalar` — The determinant at each square size. Column-major, so `m[c][r]` is row `r` of…
-* `$T determinant3([3,3]T m) where T is scalar`
-* `$T determinant4([4,4]T m) where T is scalar`
-* `[2,2]$T inverse2([2,2]T m) where T is float`
-* `[3,3]$T inverse3([3,3]T m) where T is float`
-* `[4,4]$T inverse4([4,4]T m) where T is float`
-* `[3,3]$T rot_x(T radians) where T is float`
-* `[3,3]$T rot_y(T radians) where T is float`
-* `[3,3]$T rot_z(T radians) where T is float`
+* `$T determinant3([3,3]T m) where T is scalar` — The determinant of a 3×3 matrix, by cofactor expansion along the first…
+* `$T determinant4([4,4]T m) where T is scalar` — The determinant of a 4×4 matrix, by Laplace expansion in complementary…
+* `[2,2]$T inverse2([2,2]T m) where T is float` — The inverse of a 2×2 matrix: its adjugate (the diagonal swapped, the…
+* `[3,3]$T inverse3([3,3]T m) where T is float` — The inverse of a 3×3 matrix: the transposed cofactors over the…
+* `[4,4]$T inverse4([4,4]T m) where T is float` — The inverse of a 4×4 matrix, by the closed-form adjugate. A singular `m`
+* `[3,3]$T rot_x(T radians) where T is float` — The rotation by `radians` about +x: +y turns toward +z.
+* `[3,3]$T rot_y(T radians) where T is float` — The rotation by `radians` about +y: +z turns toward +x.
+* `[3,3]$T rot_z(T radians) where T is float` — The rotation by `radians` about +z: +x turns toward +y.
+* `[3,3]$T rot_axis([3]T axis, T radians) where T is float` — The rotation by `radians` about `axis`, right-handed: counter-clockwise…
+* `[3,3]$T from_euler(T yaw, T pitch, T roll) where T is float` — The rotation matrix for `yaw`, `pitch` and `roll` in radians, as above.
+* `[3]$T to_euler([3,3]T m) where T is float` — The yaw, pitch and roll of a rotation matrix, in that order, the inverse…
 * `[4,4]$T translation([3]T t) where T is float` — The translation matrix for offset `t` — glm's `translate` of the identity.
 * `[4,4]$T scaling([3]T s) where T is float` — The 4×4 scaling matrix for per-axis factors `s` — glm's `scale`. The…
 * `[4,4]$T look_at([3]T eye, [3]T center, [3]T up) where T is float` — The right-handed view matrix for a camera at `eye` looking at `center`, with…
 * `[4,4]$T perspective(T fovy, T aspect, T near, T far) where T is float` — The right-handed perspective projection — glm's `perspective`, OpenGL clip…
 * `[4,4]$T orthographic(T left, T right, T bottom, T top, T near, T far) where T is float` — The right-handed orthographic projection — glm's `ortho`, OpenGL clip space…
+* `[4,4]$T perspective_zero_to_one(T fovy, T aspect, T near, T far) where T is float` — The right-handed perspective projection into clip space with `z` in…
+* `[4,4]$T orthographic_zero_to_one(T left, T right, T bottom, T top, T near, T far) where T is float` — The right-handed orthographic projection into clip space with `z` in…
+* `[4]$T quat_mul([4]T a, [4]T b) where T is float` — The Hamilton product `a b`: the rotation by `b` followed by the rotation…
+* `[4]$T quat_conjugate([4]T q) where T is float` — The conjugate, `(−x, −y, −z, w)`: for a unit quaternion, its inverse — the…
+* `[4]$T quat_from_axis_angle([3]T axis, T radians) where T is float` — The unit quaternion of the rotation by `radians` about `axis`,…
+* `[3]$T quat_rotate([4]T q, [3]T v) where T is float` — `v` rotated by the unit quaternion `q`, without building a matrix:
+* `[3,3]$T quat_to_matrix3([4]T q) where T is float` — The rotation matrix of the unit quaternion `q`. A quaternion that is not…
+* `[4,4]$T quat_to_matrix4([4]T q) where T is float` — The 4×4 homogeneous form of `quat_to_matrix3`, for a model matrix.
+* `[4]$T quat_from_matrix3([3,3]T m) where T is float` — The unit quaternion of a rotation matrix, the inverse of…
+* `[4]$T quat_slerp([4]T a, [4]T b, T t) where T is float` — The spherical linear interpolation from the unit quaternion `a` to `b` at…
+* `[4,4]$T compose([3]T t, [4]T q, [3]T s) where T is float` — The model matrix `translation(t) * quat_to_matrix4(q) * scaling(s)`:
+* `([3]$T translation, [4]T rotation, [3]T scale) decompose([4,4]T m) where T is float` — An affine matrix taken apart into the translation, rotation and scale…

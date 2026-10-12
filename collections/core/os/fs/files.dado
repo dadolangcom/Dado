@@ -1,42 +1,50 @@
-// Whole files, and changing the tree — the failable half of `core:os/fs`, over
-// `string8` paths on every system.
+// Whole files, what a path is, and changing the tree, over `string8` paths on
+// every system.
 //
-//     try fs.write_file("settings.ini", text) else code:
-//         println("cannot save: ", os.message(code))
-//     try ref []char8 back = fs.read_file("settings.ini") else code:
+//     try fs.write_file("settings.ini", text) else why:
+//         println("cannot save: ", os.message(why))
+//     try ref []char8 back = fs.read_file("settings.ini") else why:
 //         ...
 //     defer #delete(back)
 //
-// **Every function here fails with a code from `core:os`** (`os.NOT_FOUND`,
-// `os.PERMISSION`, …), whichever system it runs on, and `os.message(code)` is
-// the sentence. The predicates in `fs.dado` keep their `bool`s, because *"is
-// this a directory"* has no failure that is not also *no*.
+//     try fs.FileInfo i = fs.info("settings.ini") else why:
+//         ...
+//     println(i.size, " bytes, written at ", i.mtime)
 //
-// **Paths are `string8`**, UTF-8 on every system: POSIX passes the bytes on,
-// with a `\0` added for the call; Windows converts them to UTF-16
-// (`windows.dado`).
+// **Every function here fails `os.Error`** (`os.Error.NOT_FOUND`,
+// `os.Error.PERMISSION`, …), whichever system it runs on, and
+// `os.message(why)` is the sentence. The predicates in `fs.dado` answer
+// `bool`s, because *"is this a directory"* has no failure that is not also
+// *no*; `info` is the question that says why it could not answer.
+//
+// **Text and bytes.** `read_file` and `write_file` move text (`char8`);
+// `read_bytes` and `write_bytes` move the same bytes as `u8`, for a binary
+// file, with no copy between the two.
 //
 // **What is allocated is the caller's**, from the ambient allocator (`using`):
-// `read_file`'s bytes and `make_temp_dir`'s path are `ref []char8`s to
-// `#delete`. The scratch the functions make for themselves is freed before
-// they return, on every path out.
+// `read_file`'s and `read_bytes`' runs, `make_temp_dir`'s, `current_dir`'s,
+// `canonical`'s and `link_target`'s paths are to `#delete`, and `read_dir`'s
+// and `glob`'s `Listing`s end with `destroy`. The scratch the functions make
+// for themselves is freed before they return, on every path out; a scratch
+// allocation that fails is `NO_MEMORY`.
+//
+// **On `#WEB`** every function here fails with `os.Error.UNSUPPORTED`: a page
+// has no file system, and node's is not imported yet. Each web function is
+// one line, so a host import that answers it replaces that line.
+//
+// Not promised to raise: every function reaches the system through a
+// `foreign` call. `FileInfo`'s methods and `Kind` are plain Dado, promised
+// through `raises_test.dado`.
 //
 // Thread-safety: every function is safe from any thread; two threads changing
 // one tree at once get whatever order the system gives them.
 package fs
 
 import "core:os"
+import "core:path"
 import "core:strings"
 
 // ── what every system shares ────────────────────────────────────────────────
-
-// `s` with a `\0` after it, for a C call; the caller deletes it.
-private ref []char8 c_path(string8 s):
-    ref []char8 out = #make([]char8, #len(s) + 1)
-    for i in 0..<#len(s):
-        out[i] = s[i]
-    out[#len(s)] = '\0'
-    return out
 
 // The name `write_file` writes first, beside `path` so the rename that
 // publishes it stays on one filesystem: the path, the process and a counter,
@@ -53,131 +61,413 @@ private bool plain_name(string8 prefix):
         if c == '/' || c == '\\' || c == '\0': return false
     return true
 
+// How much a whole-file read asks the system for at a time, at least: the run
+// grows by doubling from here, and the system's answer is written straight
+// into it.
+private const i64 READ_STEP = 65536
+
+// Bytes at an address, to be windowed by a count the caller knows.
+private type Bytes: ^u8
+
+// ── what a path is ──────────────────────────────────────────────────────────
+
+// What `FileInfo.kind` says a path is.
+enum i32 Kind:
+    // A regular file.
+    File = 1,
+    // A directory.
+    Dir = 2,
+    // A symbolic link, asked about with `link_info`.
+    Link = 3,
+    // A device, a pipe, a socket.
+    Other = 4,
+
+// What `info` and `link_info` answer about a path, read at once.
+//
+// `mode` is the permission bits, `0o7777`'s worth, as POSIX keeps them (read
+// them in hex: `0x1ED` is `0755`). Windows has no such bits and answers
+// `0666` or `0444` for a file and `0777` or `0555` for a directory, by its
+// read-only attribute. `size` is in bytes, and 0 for a directory on Windows.
+// `mtime` is the last write, in nanoseconds since the Unix epoch, as `mtime`
+// answers it.
+type FileInfo:
+    Kind kind
+    u32 mode
+    i64 size
+    i64 mtime
+
+    // Whether this is a regular file.
+    bool is_file(self): return self.kind == Kind.File
+
+    // Whether this is a directory.
+    bool is_dir(self): return self.kind == Kind.Dir
+
+    // Whether this is a symbolic link (only `link_info` answers one).
+    bool is_link(self): return self.kind == Kind.Link
+
+// ── whole files ─────────────────────────────────────────────────────────────
+
+// The whole file at `path` as text, owned by the caller. Fails with `IS_DIR`
+// for a directory, `NO_MEMORY` when the run cannot grow, and the system's
+// reason otherwise.
+os.Error!ref []char8 read_file(string8 path):
+    ref []char8 out = #make([]char8, 0)
+    if out == nil: fail os.Error.NO_MEMORY
+    try read_whole(path, &out) else why:
+        #delete(out)
+        fail why
+    return out
+
+// The whole file at `path` as bytes, owned by the caller: `read_file` for a
+// binary file. Fails as `read_file` does.
+os.Error!ref []u8 read_bytes(string8 path):
+    ref []u8 out = #make([]u8, 0)
+    if out == nil: fail os.Error.NO_MEMORY
+    try read_whole(path, &out) else why:
+        #delete(out)
+        fail why
+    return out
+
+// Replace the file at `path` with the text `data`, atomically: a reader sees
+// the old bytes or the new ones and never a part, and a failure leaves `path`
+// as it was. The new file has the default permissions, not the old one's.
+os.Error!void write_file(string8 path, string8 data):
+    []char8 bytes = strings.bytes(data)
+    rawptr from = nil
+    if #len(bytes) > 0: from = rawptr(&bytes[0])
+    try replace_with(path, from, #len(bytes))
+    return
+
+// Replace the file at `path` with the bytes `data`, atomically, as
+// `write_file` does.
+os.Error!void write_bytes(string8 path, []u8 data):
+    rawptr from = nil
+    if #len(data) > 0: from = rawptr(&data[0])
+    try replace_with(path, from, #len(data))
+    return
+
+// ── listing ─────────────────────────────────────────────────────────────────
+
+// Every entry of the directory `dir`, in the system's order, `.` and `..`
+// left out and dotfiles kept. Each `Entry`'s `path` is the entry's **name**,
+// not joined to `dir`, and `is_dir` follows links. Fails with the system's
+// reason when `dir` cannot be opened (`NOT_FOUND`, `NOT_DIR`, `PERMISSION`),
+// and `UNSUPPORTED` on `#WEB`. End it with `destroy`.
+os.Error!Listing read_dir(string8 dir):
+    ^Dir d = open(dir)
+    if d == nil: try failed()
+    ref []char8 bytes = #make([]char8, 0)
+    ref []Span spans = #make([]Span, 0)
+    for:
+        (string8 nm, bool more) = next(d)
+        if !more: break
+        if nm == "." || nm == "..": continue
+        ref []char8 full = #format(dir, "/", nm)
+        bool d_here = is_dir(full)
+        #delete(full)
+        i64 start = #len(bytes)
+        for c in nm:
+            _ = #append(bytes, c)
+        _ = #append(spans, (start, #len(nm), d_here))
+    close(d)
+    return listing_of(bytes, spans)
+
+// The `Listing` over `bytes`, given each entry's span: the views are taken
+// once the bytes have stopped moving, as `walk` does.
+private Listing listing_of(ref []char8 bytes, ref []Span spans):
+    ref []Entry entries = #make([]Entry, 0)
+    string8 all = bytes
+    for s in spans:
+        _ = #append(entries, (strings.substring(all, s.start, s.len), s.is_dir))
+    #delete(spans)
+    return (bytes, entries)
+
+// Every path that matches `pattern`, in byte order. Each component may hold
+// `core:path`'s wildcards — `*`, `?`, `[a-z]`, and on POSIX `\c` — and is
+// matched against one directory's names; a name starting with `.` is matched
+// only by a component that starts with `.` too, as a shell does. No match is
+// an empty `Listing`, not a failure. A malformed pattern fails `INVALID` (the
+// argument is not one the operation can take: `path.match` says why, with
+// `path.Error.BAD_PATTERN`), and `#WEB` `UNSUPPORTED`. `**` is not special:
+// `walk` is the whole tree. End it with `destroy`.
+os.Error!Listing glob(string8 pattern):
+    when #OS == #WEB:
+        fail os.Error.UNSUPPORTED
+    else:
+        // The root the pattern names, or nothing for a relative one, and the
+        // rest of the pattern after it.
+        string8 vol = path.volume(pattern)
+        i64 i = #len(vol)
+        if i < #len(pattern) && path.is_separator(pattern[i]):
+            i += 1
+        string8 root = strings.substring(pattern, 0, i)
+        ref []char8 found = #make([]char8, 0)
+        try glob_walk(root, strings.rest(pattern, i), &found) else why:
+            #delete(found)
+            fail why
+        // Each match ended by a `\0`; what is listed is what is there.
+        ref []char8 bytes = #make([]char8, 0)
+        ref []Span spans = #make([]Span, 0)
+        string8 all = found
+        i64 from = 0
+        for k in 0..<#len(all):
+            if all[k] != '\0': continue
+            string8 p = strings.substring(all, from, k - from)
+            from = k + 1
+            bool d_here = is_dir(p)
+            i64 at = #len(bytes)
+            for c in p:
+                _ = #append(bytes, c)
+            _ = #append(spans, (at, #len(p), d_here))
+        #delete(found)
+        sort_spans(bytes, spans)
+        return listing_of(bytes, spans)
+
+// Whether `part` holds a wildcard `core:path`'s `match` reads.
+private bool wild(string8 part):
+    for c in part:
+        if c == '*' || c == '?' || c == '[': return true
+        when #OS != #WINDOWS:
+            if c == '\\': return true
+    return false
+
+// `base` joined to `name`: `base` as it is when it ends in a separator (a
+// root), and with `/` between otherwise; `name` alone when `base` is empty.
+private ref []char8 child(string8 base, string8 name):
+    if #len(base) == 0: return #format(name)
+    if path.is_separator(base[#len(base) - 1]) || base[#len(base) - 1] == ':': return #format(base, name)
+    return #format(base, "/", name)
+
+// `p`, ended by a `\0`, onto `out`.
+private void add_found(^ref []char8 out, string8 p):
+    for c in p:
+        _ = #append(out^, c)
+    _ = #append(out^, '\0')
+
+// Every match of `rest` under `base`, onto `out`: the first component of
+// `rest` is joined on as it is when it holds no wildcard and matched against
+// what `base` holds when it does, and the rest of `rest` is matched under
+// each directory that leads on. A path is added only when something is there
+// (a dangling link included). **A pattern `path.match` refuses is `INVALID`
+// here**: `path`'s codes are its own, and are never passed on as `os`'s.
+private os.Error!void glob_walk(string8 base, string8 rest, ^ref []char8 out):
+    i64 i = 0
+    i64 n = #len(rest)
+    for i < n && path.is_separator(rest[i]):
+        i += 1
+    if i >= n:
+        if #len(base) > 0: add_found(out, base)
+        return
+    i64 start = i
+    for i < n && !path.is_separator(rest[i]):
+        i += 1
+    string8 part = strings.substring(rest, start, i - start)
+    string8 tail = strings.rest(rest, i)
+    bool last = true
+    for c in tail:
+        if !path.is_separator(c): last = false
+    if !wild(part):
+        ref []char8 p = child(base, part)
+        string8 ps = p
+        try glob_next(ps, tail, last, out) else why:
+            #delete(p)
+            fail why
+        #delete(p)
+        return
+    // A malformed part is refused before any directory is read, so the
+    // answer does not depend on what the directory holds.
+    try _ = path.match(part, "") else:
+        fail os.Error.INVALID
+    string8 dir = base
+    if #len(dir) == 0: dir = "."
+    ^Dir d = open(dir)
+    if d == nil: return
+    defer close(d)
+    for:
+        (string8 nm, bool more) = next(d)
+        if !more: break
+        if nm == "." || nm == "..": continue
+        if nm[0] == '.' && part[0] != '.': continue
+        try bool m = path.match(part, nm) else:
+            fail os.Error.INVALID
+        if !m: continue
+        ref []char8 p = child(base, nm)
+        string8 ps = p
+        try glob_next(ps, tail, last, out) else why:
+            #delete(p)
+            fail why
+        #delete(p)
+    return
+
+// One candidate `p`: a match when it is the last component and something is
+// there, and the place to go on from when it is a directory.
+private os.Error!void glob_next(string8 p, string8 tail, bool last, ^ref []char8 out):
+    bool there = exists(p) || is_link(p)
+    if last:
+        if there: add_found(out, p)
+        return
+    if is_dir(p):
+        try glob_walk(p, tail, out)
+    return
+
+// `spans` sorted by the bytes each names, an insertion sort: a glob's matches
+// are few.
+private void sort_spans(ref []char8 bytes, ref []Span spans):
+    string8 all = bytes
+    for i in 1..<#len(spans):
+        Span s = spans[i]
+        i64 j = i
+        for j > 0 && before(all, s, spans[j - 1]):
+            spans[j] = spans[j - 1]
+            j -= 1
+        spans[j] = s
+
+// Whether the bytes `a` names sort before the bytes `b` names.
+private bool before(string8 all, Span a, Span b):
+    i64 n = a.len
+    if b.len < n: n = b.len
+    for k in 0..<n:
+        char8 x = all[a.start + k]
+        char8 y = all[b.start + k]
+        if x != y: return u8(x) < u8(y)
+    return a.len < b.len
+
 // ── Windows ─────────────────────────────────────────────────────────────────
 when #OS == #WINDOWS:
-    // The whole file. Opened with every sharing mode, so a file another
+    // The whole file at `path`, appended to `out`, which grows by doubling and
+    // is read into in place.
+    //
+    // On Windows it is opened with every sharing mode, so a file another
     // program has open can still be read, as on POSIX.
-    !ref []char8 read_file(string8 path):
+    private os.Error!void read_whole(string8 path, ^ref []$T out):
         ref []u16 w = wide_path(path)
         defer #delete(w)
-        if #len(w) == 0: fail os.INVALID
+        if #len(w) == 0: fail os.Error.INVALID
         // `CreateFileW` refuses a directory opened without
         // `FILE_FLAG_BACKUP_SEMANTICS` as `ERROR_ACCESS_DENIED`, which would
         // read as a permission problem; asked first, it is `IS_DIR`, as POSIX
         // answers it.
         (u32 a, bool got) = attributes_of(path)
-        if got && (a & u32(FILE_ATTRIBUTE_DIRECTORY)) != 0: fail os.IS_DIR
+        if got && (a & u32(FILE_ATTRIBUTE_DIRECTORY)) != 0: fail os.Error.IS_DIR
         rawptr h = CreateFileW(&w[0], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
-        if h == INVALID_HANDLE_VALUE: fail failure()
+        if h == INVALID_HANDLE_VALUE: try failed()
         defer _ = CloseHandle(h)
         FsHandleInfo info
-        if GetFileInformationByHandle(h, &info) == 0: fail failure()
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0: fail os.IS_DIR
-        ref []char8 out = #make([]char8, 0)
-        [65536]char8 chunk
+        if GetFileInformationByHandle(h, &info) == 0: try failed()
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0: fail os.Error.IS_DIR
+        i64 have = #len(out^)
         for:
-            #c.ulong got = 0
-            if ReadFile(h, rawptr(&chunk[0]), 65536, &got, nil) == 0:
-                i32 code = failure()
-                #delete(out)
-                fail code
-            if got == 0: break
-            for i in 0..<i64(got):
-                _ = #append(out, chunk[i])
-        return out
+            if have == #len(out^):
+                i64 grow = #len(out^) * 2
+                if grow < READ_STEP: grow = READ_STEP
+                if !#resize(out^, grow): fail os.Error.NO_MEMORY
+            i64 want = #len(out^) - have
+            if want > 1073741824: want = 1073741824
+            #c.ulong got_bytes = 0
+            if ReadFile(h, rawptr(&out^[have]), #c.ulong(want), &got_bytes, nil) == 0:
+                try failed()
+            if got_bytes == 0: break
+            have += i64(got_bytes)
+        if !#resize(out^, have): fail os.Error.NO_MEMORY
+        return
 
-    private !void write_all(rawptr h, string8 data):
-        []char8 bytes = strings.bytes(data)
+    private os.Error!void write_all(rawptr h, rawptr bytes, i64 n):
+        if n <= 0: return
+        []u8 all = Bytes(bytes)[0..<n]
         i64 done = 0
-        i64 n = #len(bytes)
         for done < n:
             i64 step = n - done
             if step > 1048576: step = 1048576
             #c.ulong wrote = 0
-            if WriteFile(h, rawptr(&bytes[done]), #c.ulong(step), &wrote, nil) == 0:
-                fail failure()
-            if wrote == 0: fail os.IO
+            if WriteFile(h, rawptr(&all[done]), #c.ulong(step), &wrote, nil) == 0:
+                try failed()
+            if wrote == 0: fail os.Error.IO
             done += i64(wrote)
         return
 
-    // Written to a new file beside `path`, flushed to the disk, and moved over
-    // `path` by `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
-    // `MOVEFILE_WRITE_THROUGH`. A reader sees the old bytes or the new ones and
-    // never a part; a failure removes the new file and leaves `path` as it was.
-    !void write_file(string8 path, string8 data):
+    // On Windows `path` is written to a new file beside it, flushed to the
+    // disk, and moved over `path` by `MoveFileExW` with
+    // `MOVEFILE_REPLACE_EXISTING` and `MOVEFILE_WRITE_THROUGH`. A failure
+    // removes the new file and leaves `path` as it was.
+    private os.Error!void replace_with(string8 path, rawptr bytes, i64 n):
         ref []char8 tmp = temp_beside(path)
         defer #delete(tmp)
         ref []u16 wtmp = wide_path(tmp)
         defer #delete(wtmp)
         ref []u16 w = wide_path(path)
         defer #delete(w)
-        if #len(wtmp) == 0 || #len(w) == 0: fail os.INVALID
+        if #len(wtmp) == 0 || #len(w) == 0: fail os.Error.INVALID
         rawptr h = CreateFileW(&wtmp[0], GENERIC_WRITE, 0, nil, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nil)
-        if h == INVALID_HANDLE_VALUE: fail failure()
-        try write_all(h, data) else code:
+        if h == INVALID_HANDLE_VALUE: try failed()
+        try write_all(h, bytes, n) else why:
             _ = CloseHandle(h)
             _ = DeleteFileW(&wtmp[0])
-            fail code
+            fail why
         if FlushFileBuffers(h) == 0:
-            i32 code = failure()
+            os.Error code = failure()
             _ = CloseHandle(h)
             _ = DeleteFileW(&wtmp[0])
-            fail code
+            try os.fail_with(code)
         _ = CloseHandle(h)
         if MoveFileExW(&wtmp[0], &w[0], MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0:
-            i32 code = failure()
+            os.Error code = failure()
             _ = DeleteFileW(&wtmp[0])
-            fail code
+            try os.fail_with(code)
         return
 
+    // Remove the file (or the link) at `path`. Fails with `IS_DIR` for a
+    // directory, which `remove_dir` removes.
+    //
     // A read-only file refuses `DeleteFileW`, which POSIX's `unlink` never
     // does for that reason, so the attribute is cleared and the delete asked
     // again.
-    !void remove_file(string8 path):
+    os.Error!void remove_file(string8 path):
         ref []u16 w = wide_path(path)
         defer #delete(w)
-        if #len(w) == 0: fail os.INVALID
+        if #len(w) == 0: fail os.Error.INVALID
         if DeleteFileW(&w[0]) != 0: return
-        i32 code = failure()
+        os.Error code = failure()
         (u32 a, bool got) = attributes_of(path)
         if got && (a & u32(FILE_ATTRIBUTE_DIRECTORY)) != 0 && (a & u32(FILE_ATTRIBUTE_REPARSE_POINT)) == 0:
-            fail os.IS_DIR
+            fail os.Error.IS_DIR
         if got && (a & u32(FILE_ATTRIBUTE_READONLY)) != 0:
             if SetFileAttributesW(&w[0], FILE_ATTRIBUTE_NORMAL) != 0 && DeleteFileW(&w[0]) != 0:
                 return
             code = failure()
-        fail code
+        try os.fail_with(code)
 
-    !void remove_dir(string8 path):
+    // Remove the directory at `path`, which must be empty (`NOT_EMPTY`
+    // otherwise); `remove_all` removes one with what is in it.
+    os.Error!void remove_dir(string8 path):
         ref []u16 w = wide_path(path)
         defer #delete(w)
-        if #len(w) == 0: fail os.INVALID
-        if RemoveDirectoryW(&w[0]) == 0: fail failure()
+        if #len(w) == 0: fail os.Error.INVALID
+        if RemoveDirectoryW(&w[0]) == 0: try failed()
         return
 
-    // A link — symbolic, or a junction — is removed as itself, never entered:
+    // Remove `path` and, for a directory, everything in it. A link is removed
+    // as itself and never entered. Nothing at `path` is success.
+    //
+    // On Windows a link — symbolic, or a junction — is removed as itself, never entered:
     // `RemoveDirectoryW` for one to a directory and `remove_file` for one to a
     // file. A directory's names are read whole before any is removed, so the
     // search never runs over entries that are going.
-    !void remove_all(string8 path):
+    os.Error!void remove_all(string8 path):
         (u32 a, bool got) = attributes_of(path)
         if !got:
-            i32 code = failure()
-            if code == os.NOT_FOUND: return
-            fail code
+            os.Error code = failure()
+            if code == os.Error.NOT_FOUND: return
+            try os.fail_with(code)
         bool dir = (a & u32(FILE_ATTRIBUTE_DIRECTORY)) != 0
         bool link = (a & u32(FILE_ATTRIBUTE_REPARSE_POINT)) != 0
         if dir && !link:
-            ref []char8 cp = c_path(path)
-            ^Dir d = open(cstring(cp))
-            #delete(cp)
-            if !opened(d): fail failure()
+            ^Dir d = open(path)
+            if d == nil: try failed()
             ref []char8 names = #make([]char8, 0)
             defer #delete(names)
             for:
-                (cstring name, bool more) = next(d)
+                (string8 nm, bool more) = next(d)
                 if !more: break
-                string8 nm = string8(name)
                 if nm == "." || nm == "..": continue
                 for c in nm:
                     _ = #append(names, c)
@@ -189,9 +479,9 @@ when #OS == #WINDOWS:
                 if all[i] == '\0':
                     ref []char8 child = #format(path, "\\", strings.substring(all, start, i - start))
                     string8 c = child
-                    try remove_all(c) else code:
+                    try remove_all(c) else why:
                         #delete(child)
-                        fail code
+                        fail why
                     #delete(child)
                     start = i + 1
             try remove_dir(path)
@@ -202,50 +492,63 @@ when #OS == #WINDOWS:
         try remove_file(path)
         return
 
-    // `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`: an existing `to` is
+    // Move `from` to `to`, replacing what is at `to`. Across filesystems it
+    // fails with `CROSS_DEVICE` and moves nothing.
+    //
+    // On Windows, `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`: an existing `to` is
     // replaced, as POSIX's `rename` does; a move to another volume fails with
     // `CROSS_DEVICE` and moves nothing.
-    !void rename(string8 from, string8 to):
+    os.Error!void rename(string8 from, string8 to):
         ref []u16 wf = wide_path(from)
         defer #delete(wf)
         ref []u16 wt = wide_path(to)
         defer #delete(wt)
-        if #len(wf) == 0 || #len(wt) == 0: fail os.INVALID
-        if MoveFileExW(&wf[0], &wt[0], MOVEFILE_REPLACE_EXISTING) == 0: fail failure()
+        if #len(wf) == 0 || #len(wt) == 0: fail os.Error.INVALID
+        if MoveFileExW(&wf[0], &wt[0], MOVEFILE_REPLACE_EXISTING) == 0: try failed()
         return
 
-    // `CopyFileW`, replacing `to`; it copies the attributes too.
-    !void copy_file(string8 from, string8 to):
+    // Copy the file `from` to `to`, replacing `to`, with `from`'s
+    // permissions.
+    //
+    // On Windows, `CopyFileW`, replacing `to`; it copies the attributes too.
+    os.Error!void copy_file(string8 from, string8 to):
         ref []u16 wf = wide_path(from)
         defer #delete(wf)
         ref []u16 wt = wide_path(to)
         defer #delete(wt)
-        if #len(wf) == 0 || #len(wt) == 0: fail os.INVALID
-        if CopyFileW(&wf[0], &wt[0], 0) == 0: fail failure()
+        if #len(wf) == 0 || #len(wt) == 0: fail os.Error.INVALID
+        if CopyFileW(&wf[0], &wt[0], 0) == 0: try failed()
         return
 
-    !i64 mtime(string8 path):
+    // When the file at `path` (links followed) was last written, in
+    // nanoseconds since the Unix epoch.
+    os.Error!i64 mtime(string8 path):
         (FsHandleInfo info, bool got) = info_follow(path)
-        if !got: fail failure()
+        if !got: try failed()
         return unix_nanos_of(info.ftLastWriteTime.dwLowDateTime, info.ftLastWriteTime.dwHighDateTime)
 
-    // A new directory under `os.temp_dir()`, named `prefix` and sixteen hex
+    // Make a new directory under `os.temp_dir()` that only its owner can
+    // open, named `prefix` and some characters nobody else picked, and answer
+    // its path, owned by the caller. `prefix` may not hold a separator
+    // (`INVALID`).
+    //
+    // On Windows it is named `prefix` and sixteen hex
     // digits, that only its owner can open. A name already taken is tried
     // again with new digits.
-    !ref []char8 make_temp_dir(string8 prefix):
-        if !plain_name(prefix): fail os.INVALID
+    os.Error!ref []char8 make_temp_dir(string8 prefix):
+        if !plain_name(prefix): fail os.Error.INVALID
         ref []char8 base = os.temp_dir()
         defer #delete(base)
         string8 b = base
         for _ in 0..<100:
             ref []char8 path = #format(b, "\\", prefix, hex16(temp_noise()))
             string8 p = path
-            try create_private(p) else code:
+            try create_private(p) else why:
                 #delete(path)
-                if code == os.EXISTS: continue
-                fail code
+                if why == os.Error.EXISTS: continue
+                fail why
             return path
-        fail os.EXISTS
+        fail os.Error.EXISTS
 
     private ref []char8 hex16(u64 x):
         ref []char8 out = #make([]char8, 16)
@@ -259,15 +562,20 @@ when #OS == #WINDOWS:
             v = v >> 4
         return out
 
-    // `CreateSymbolicLinkW`, with
+    // Make `path` a symbolic link to `target`, stored as written (a relative
+    // target is read from the link's own directory). Fails with `EXISTS` when
+    // something is at `path`, and on Windows with `PRIVILEGE` without
+    // Developer Mode or administrator rights.
+    //
+    // On Windows, `CreateSymbolicLinkW`, with
     // `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` so Developer Mode is
     // enough; without it, or administrator rights, Windows refuses with
     // `PRIVILEGE`, whose message says so. A link to a directory has to be
     // made as one, so `target` is looked at from the link's own directory,
     // which is where a relative target is read from. Separators in `target`
     // are written as `\`, the only one a link's text is read with.
-    !void make_symlink(string8 target, string8 path):
-        if #len(target) == 0 || #len(path) == 0: fail os.INVALID
+    os.Error!void make_symlink(string8 target, string8 path):
+        if #len(target) == 0 || #len(path) == 0: fail os.Error.INVALID
         ref []char8 t = #format(target)
         defer #delete(t)
         for i in 0..<#len(t):
@@ -279,27 +587,25 @@ when #OS == #WINDOWS:
             #delete(seen)
             seen = #format(parent_of(path), ts)
         string8 s = seen
-        ref []char8 sc = c_path(s)
-        if is_dir(cstring(sc)): flags = flags | SYMBOLIC_LINK_FLAG_DIRECTORY
-        #delete(sc)
+        if is_dir(s): flags = flags | SYMBOLIC_LINK_FLAG_DIRECTORY
         #delete(seen)
         ref []u16 wl = wide_path(path)
         defer #delete(wl)
         ref []u16 wt = widen(ts)
         defer #delete(wt)
-        if #len(wl) == 0 || #len(wt) == 0: fail os.INVALID
+        if #len(wl) == 0 || #len(wt) == 0: fail os.Error.INVALID
         if CreateSymbolicLinkW(&wl[0], &wt[0], flags) == 0:
             // An old Windows refuses the flag it does not know; asked again
             // without it, the answer is the privilege question.
             if i64(GetLastError()) == i64(ERROR_INVALID_PARAMETER):
                 if CreateSymbolicLinkW(&wl[0], &wt[0], flags ~ SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0:
                     return
-            fail failure()
+            try failed()
         // A system that answers success and makes nothing is not one that
         // makes links: Wine's `CreateSymbolicLinkW` is such a stub. Asked
         // afterwards, so the caller hears `UNSUPPORTED` rather than finding
         // nothing there.
-        if !link_at(path): fail os.UNSUPPORTED
+        if !link_at(path): fail os.Error.UNSUPPORTED
         return
 
     // Everything of `path` up to and including its last separator; empty when
@@ -312,7 +618,126 @@ when #OS == #WINDOWS:
             i -= 1
         return ""
 
-// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+    // What is at `path`, links followed: its kind, permissions, size and last
+    // write together. Fails with `NOT_FOUND` when nothing is there (a dangling
+    // link included).
+    os.Error!FileInfo info(string8 path):
+        (FsHandleInfo got_info, bool got) = info_follow(path)
+        if !got: try failed()
+        return info_from(got_info, false)
+
+    // What is at `path` itself, a link not followed: a link answers
+    // `Kind.Link`, and its own size and time.
+    os.Error!FileInfo link_info(string8 path):
+        (FsHandleInfo got_info, bool got) = info_nofollow(path)
+        if !got: try failed()
+        return info_from(got_info, link_at(path))
+
+    // Set the permission bits of `path` to `mode` (`0x1ED` is `0755`). On
+    // Windows only the owner's write bit (`0x80`) means anything: without it
+    // the file is made read-only, with it writable.
+    os.Error!void chmod(string8 path, u32 mode):
+        (u32 a, bool got) = attributes_of(path)
+        if !got: try failed()
+        u32 want = a & ~u32(FILE_ATTRIBUTE_READONLY)
+        if (mode & 0x80) == 0: want = want | u32(FILE_ATTRIBUTE_READONLY)
+        if want == 0: want = u32(FILE_ATTRIBUTE_NORMAL)
+        ref []u16 w = wide_path(path)
+        defer #delete(w)
+        if #len(w) == 0: fail os.Error.INVALID
+        if SetFileAttributesW(&w[0], #c.ulong(want)) == 0: try failed()
+        return
+
+    // The working directory, owned by the caller, of any length.
+    os.Error!ref []char8 current_dir():
+        #c.ulong need = GetCurrentDirectoryW(0, nil)
+        if need == 0: try failed()
+        ref []u16 buf = #make([]u16, i64(need) + 1)
+        defer #delete(buf)
+        if #len(buf) != i64(need) + 1: fail os.Error.NO_MEMORY
+        #c.ulong got = GetCurrentDirectoryW(#c.ulong(#len(buf)), &buf[0])
+        if got == 0 || i64(got) >= #len(buf): try failed()
+        return narrow(&buf[0], i64(got))
+
+    // Make `path` the working directory.
+    os.Error!void change_dir(string8 path):
+        ref []u16 w = widen(path)
+        defer #delete(w)
+        if #len(w) == 0: fail os.Error.INVALID
+        if SetCurrentDirectoryW(&w[0]) == 0: try failed()
+        return
+
+    // Make one directory at `path`, not its parents (`make_dirs` makes those).
+    // Fails with `EXISTS` when something is already there.
+    os.Error!void create_dir(string8 path):
+        ref []u16 w = wide_path(path)
+        defer #delete(w)
+        if #len(w) == 0: fail os.Error.INVALID
+        if CreateDirectoryW(&w[0], nil) == 0: try failed()
+        return
+
+// ── the web ─────────────────────────────────────────────────────────────────
+//
+// No file system: every function fails with `UNSUPPORTED`, one line each.
+else when #OS == #WEB:
+    private os.Error!void failed():
+        fail os.Error.UNSUPPORTED
+
+    private os.Error!void read_whole(string8 path, ^ref []$T out):
+        fail os.Error.UNSUPPORTED
+
+    private os.Error!void replace_with(string8 path, rawptr bytes, i64 n):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void remove_file(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void remove_dir(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void remove_all(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void rename(string8 from, string8 to):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void copy_file(string8 from, string8 to):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!i64 mtime(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!ref []char8 make_temp_dir(string8 prefix):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void make_symlink(string8 target, string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!FileInfo info(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!FileInfo link_info(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void chmod(string8 path, u32 mode):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!ref []char8 current_dir():
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void change_dir(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!void create_dir(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!ref []char8 canonical(string8 path):
+        fail os.Error.UNSUPPORTED
+
+    os.Error!ref []char8 link_target(string8 path):
+        fail os.Error.UNSUPPORTED
+
+// ── POSIX: Linux, macOS and the BSDs ────────────────────────────────────────
 //
 // `open`'s and `mkdtemp`'s declarations need the POSIX surface asked for, and
 // `rename` is C's own. Bound as `px` because this package declares `open`,
@@ -341,55 +766,67 @@ else:
     private foreign px "stdlib.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
         ^#c.char mkdtemp(^#c.char template)
 
+    private foreign px "unistd.h":
+        ^#c.char getcwd(^#c.char buf, #c.size_t nbytes)
+        #c.int chdir(cstring path)
+
     // `0666` and `0777`, in the hex this language writes; the process's umask
     // takes from them what the user asked it to.
     private const i32 FILE_MODE = 0x1B6
 
-    private i32 failure():
+    // The last error, as `os`'s code, to hold while cleaning up.
+    private os.Error failure():
         return os.last_error()
 
-    // The whole file. A directory opens for reading on Linux and fails at the
+    // Fail with the last error. It always fails.
+    private os.Error!void failed():
+        try os.fail_last()
+
+    // The whole file, appended to `out`, which grows by doubling and is read
+    // into in place. A directory opens for reading on Linux and fails at the
     // first `read` with `EISDIR`, which is the code it fails with here.
-    !ref []char8 read_file(string8 path):
+    private os.Error!void read_whole(string8 path, ^ref []$T out):
         ref []char8 cp = c_path(path)
+        if cp == nil: fail os.Error.NO_MEMORY
         i32 fd = px.open(cstring(cp), px.O_RDONLY | px.O_CLOEXEC)
         #delete(cp)
-        if fd < 0: fail failure()
+        if fd < 0: try failed()
         defer _ = px.close(fd)
-        ref []char8 out = #make([]char8, 0)
-        [65536]char8 chunk
+        i64 have = #len(out^)
         for:
-            i64 got = i64(px.read(fd, rawptr(&chunk[0]), 65536))
+            if have == #len(out^):
+                i64 grow = #len(out^) * 2
+                if grow < READ_STEP: grow = READ_STEP
+                if !#resize(out^, grow): fail os.Error.NO_MEMORY
+            i64 got = i64(px.read(fd, rawptr(&out^[have]), #c.size_t(#len(out^) - have)))
             if got < 0:
-                i32 code = failure()
-                if code == os.INTERRUPTED: continue
-                #delete(out)
-                fail code
+                os.Error code = failure()
+                if code == os.Error.INTERRUPTED: continue
+                try os.fail_with(code)
             if got == 0: break
-            for i in 0..<got:
-                _ = #append(out, chunk[i])
-        return out
+            have += got
+        if !#resize(out^, have): fail os.Error.NO_MEMORY
+        return
 
-    private !void write_all(i32 fd, string8 data):
-        []char8 bytes = strings.bytes(data)
+    private os.Error!void write_all(i32 fd, rawptr bytes, i64 n):
+        if n <= 0: return
+        []u8 all = Bytes(bytes)[0..<n]
         i64 done = 0
-        i64 n = #len(bytes)
         for done < n:
-            i64 wrote = i64(px.write(fd, rawptr(&bytes[done]), #c.size_t(n - done)))
+            i64 wrote = i64(px.write(fd, rawptr(&all[done]), #c.size_t(n - done)))
             if wrote < 0:
-                i32 code = failure()
-                if code == os.INTERRUPTED: continue
-                fail code
-            if wrote == 0: fail os.IO
+                os.Error code = failure()
+                if code == os.Error.INTERRUPTED: continue
+                try os.fail_with(code)
+            if wrote == 0: fail os.Error.IO
             done += wrote
         return
 
     // Written to a new file beside `path` (`O_CREAT | O_EXCL`, so it is never
     // someone else's), `fsync`ed, and `rename`d over `path`, which POSIX makes
-    // atomic: a reader sees the old bytes or the new ones and never a part. A
-    // failure removes the new file and leaves `path` as it was. The new file
-    // has the default mode (`0666` less the umask), not the old one's.
-    !void write_file(string8 path, string8 data):
+    // atomic. A failure removes the new file and leaves `path` as it was. The
+    // new file has the default mode (`0666` less the umask), not the old one's.
+    private os.Error!void replace_with(string8 path, rawptr bytes, i64 n):
         ref []char8 tmp = temp_beside(path)
         defer #delete(tmp)
         string8 t = tmp
@@ -397,37 +834,40 @@ else:
         defer #delete(ctmp)
         ref []char8 cp = c_path(path)
         defer #delete(cp)
+        if ctmp == nil || cp == nil: fail os.Error.NO_MEMORY
         i32 fd = px.open(cstring(ctmp), px.O_WRONLY | px.O_CREAT | px.O_EXCL | px.O_CLOEXEC, FILE_MODE)
-        if fd < 0: fail failure()
-        try write_all(fd, data) else code:
+        if fd < 0: try failed()
+        try write_all(fd, bytes, n) else why:
             _ = px.close(fd)
             _ = px.unlink(cstring(ctmp))
-            fail code
+            fail why
         if px.fsync(fd) != 0:
-            i32 code = failure()
+            os.Error code = failure()
             _ = px.close(fd)
             _ = px.unlink(cstring(ctmp))
-            fail code
+            try os.fail_with(code)
         if px.close(fd) != 0:
-            i32 code = failure()
+            os.Error code = failure()
             _ = px.unlink(cstring(ctmp))
-            fail code
+            try os.fail_with(code)
         if px.rename(cstring(ctmp), cstring(cp)) != 0:
-            i32 code = failure()
+            os.Error code = failure()
             _ = px.unlink(cstring(ctmp))
-            fail code
+            try os.fail_with(code)
         return
 
-    !void remove_file(string8 path):
+    os.Error!void remove_file(string8 path):
         ref []char8 cp = c_path(path)
         defer #delete(cp)
-        if px.unlink(cstring(cp)) != 0: fail failure()
+        if cp == nil: fail os.Error.NO_MEMORY
+        if px.unlink(cstring(cp)) != 0: try failed()
         return
 
-    !void remove_dir(string8 path):
+    os.Error!void remove_dir(string8 path):
         ref []char8 cp = c_path(path)
         defer #delete(cp)
-        if px.rmdir(cstring(cp)) != 0: fail failure()
+        if cp == nil: fail os.Error.NO_MEMORY
+        if px.rmdir(cstring(cp)) != 0: try failed()
         return
 
     // `lstat` decides, so a symbolic link is `unlink`ed as itself and never
@@ -436,25 +876,25 @@ else:
     // Something that swaps a directory for a link between the `lstat` and the
     // `opendir` can still steer one level of the walk; a tree nobody else is
     // changing is removed exactly.
-    !void remove_all(string8 path):
+    os.Error!void remove_all(string8 path):
         ref []char8 cp = c_path(path)
         defer #delete(cp)
+        if cp == nil: fail os.Error.NO_MEMORY
         (bool there, bool dir) = lstat_kind(cstring(cp))
         if !there:
-            i32 code = failure()
-            if code == os.NOT_FOUND: return
-            fail code
+            os.Error code = failure()
+            if code == os.Error.NOT_FOUND: return
+            try os.fail_with(code)
         if !dir:
             try remove_file(path)
             return
-        ^Dir d = open(cstring(cp))
-        if !opened(d): fail failure()
+        ^Dir d = open(path)
+        if d == nil: try failed()
         ref []char8 names = #make([]char8, 0)
         defer #delete(names)
         for:
-            (cstring name, bool more) = next(d)
+            (string8 nm, bool more) = next(d)
             if !more: break
-            string8 nm = string8(name)
             if nm == "." || nm == "..": continue
             for c in nm:
                 _ = #append(names, c)
@@ -466,9 +906,9 @@ else:
             if all[i] == '\0':
                 ref []char8 child = #format(path, "/", strings.substring(all, start, i - start))
                 string8 c = child
-                try remove_all(c) else code:
+                try remove_all(c) else why:
                     #delete(child)
-                    fail code
+                    fail why
                 #delete(child)
                 start = i + 1
         try remove_dir(path)
@@ -476,64 +916,67 @@ else:
 
     // `rename(2)`: an existing `to` is replaced atomically; across
     // filesystems it fails with `CROSS_DEVICE` and moves nothing.
-    !void rename(string8 from, string8 to):
+    os.Error!void rename(string8 from, string8 to):
         ref []char8 cf = c_path(from)
         defer #delete(cf)
         ref []char8 ct = c_path(to)
         defer #delete(ct)
-        if px.rename(cstring(cf), cstring(ct)) != 0: fail failure()
+        if cf == nil || ct == nil: fail os.Error.NO_MEMORY
+        if px.rename(cstring(cf), cstring(ct)) != 0: try failed()
         return
 
     // The bytes, into `to` created or truncated, with `from`'s permission
     // bits.
-    !void copy_file(string8 from, string8 to):
+    os.Error!void copy_file(string8 from, string8 to):
         ref []char8 cf = c_path(from)
         defer #delete(cf)
         ref []char8 ct = c_path(to)
         defer #delete(ct)
+        if cf == nil || ct == nil: fail os.Error.NO_MEMORY
         (u32 mode, bool got) = mode_bits(cstring(cf))
-        if !got: fail failure()
-        if is_dir(cstring(cf)): fail os.IS_DIR
+        if !got: try failed()
+        if is_dir(from): fail os.Error.IS_DIR
         i32 src = px.open(cstring(cf), px.O_RDONLY | px.O_CLOEXEC)
-        if src < 0: fail failure()
+        if src < 0: try failed()
         defer _ = px.close(src)
         i32 dst = px.open(cstring(ct), px.O_WRONLY | px.O_CREAT | px.O_TRUNC | px.O_CLOEXEC, i32(mode & 0x1FF))
-        if dst < 0: fail failure()
+        if dst < 0: try failed()
         [65536]char8 chunk
         for:
             i64 got_bytes = i64(px.read(src, rawptr(&chunk[0]), 65536))
             if got_bytes < 0:
-                i32 code = failure()
-                if code == os.INTERRUPTED: continue
+                os.Error code = failure()
+                if code == os.Error.INTERRUPTED: continue
                 _ = px.close(dst)
-                fail code
+                try os.fail_with(code)
             if got_bytes == 0: break
-            string8 piece = string8(chunk[0..<got_bytes])
-            try write_all(dst, piece) else code:
+            try write_all(dst, rawptr(&chunk[0]), got_bytes) else why:
                 _ = px.close(dst)
-                fail code
-        if px.close(dst) != 0: fail failure()
+                fail why
+        if px.close(dst) != 0: try failed()
         return
 
-    !i64 mtime(string8 path):
+    os.Error!i64 mtime(string8 path):
         ref []char8 cp = c_path(path)
         defer #delete(cp)
+        if cp == nil: fail os.Error.NO_MEMORY
         (i64 ns, bool got) = mtime_of(cstring(cp))
-        if !got: fail failure()
+        if !got: try failed()
         return ns
 
     // `mkdtemp`, which makes the directory `0700` and never over anything
     // already there.
-    !ref []char8 make_temp_dir(string8 prefix):
-        if !plain_name(prefix): fail os.INVALID
+    os.Error!ref []char8 make_temp_dir(string8 prefix):
+        if !plain_name(prefix): fail os.Error.INVALID
         ref []char8 base = os.temp_dir()
         defer #delete(base)
         string8 b = base
         ref []char8 template = #format(b, "/", prefix, "XXXXXX", "\0")
+        if template == nil: fail os.Error.NO_MEMORY
         if px.mkdtemp(CharBuf(rawptr(&template[0]))) == nil:
-            i32 code = failure()
+            os.Error code = failure()
             #delete(template)
-            fail code
+            try os.fail_with(code)
         string8 whole = template
         string8 made = strings.substring(whole, 0, #len(whole) - 1)
         ref []char8 out = #format(made)
@@ -541,11 +984,89 @@ else:
         return out
 
     // `symlink(2)`, which needs no privilege on POSIX.
-    !void make_symlink(string8 target, string8 path):
+    os.Error!void make_symlink(string8 target, string8 path):
+        if #len(target) == 0 || #len(path) == 0: fail os.Error.INVALID
         ref []char8 ct = c_path(target)
         defer #delete(ct)
         ref []char8 cp = c_path(path)
         defer #delete(cp)
-        if #len(target) == 0 || #len(path) == 0: fail os.INVALID
-        if !symlink(cstring(ct), cstring(cp)): fail failure()
+        if ct == nil || cp == nil: fail os.Error.NO_MEMORY
+        if !symlink_to(cstring(ct), cstring(cp)): try failed()
         return
+
+    os.Error!FileInfo info(string8 path):
+        (StatOut st, bool got) = stat_of(path, true)
+        if !got: try failed()
+        return info_of(st)
+
+    os.Error!FileInfo link_info(string8 path):
+        (StatOut st, bool got) = stat_of(path, false)
+        if !got: try failed()
+        return info_of(st)
+
+    private FileInfo info_of(StatOut st):
+        return (Kind(i32(st[0])), u32(st[1]), st[2], st[3] * 1000000000 + st[4])
+
+    os.Error!void chmod(string8 path, u32 mode):
+        ref []char8 cp = c_path(path)
+        defer #delete(cp)
+        if cp == nil: fail os.Error.NO_MEMORY
+        if !chmod_to(cstring(cp), mode & 0xFFF): try failed()
+        return
+
+    // `getcwd` into a buffer that doubles until the path fits (`ERANGE`).
+    os.Error!ref []char8 current_dir():
+        i64 cap = 1024
+        for cap <= 1048576:
+            ref []char8 buf = #make([]char8, cap)
+            if buf == nil: fail os.Error.NO_MEMORY
+            if px.getcwd(CharBuf(rawptr(&buf[0])), #c.size_t(cap)) != nil:
+                string8 got = string8(cstring(rawptr(&buf[0])))
+                ref []char8 out = #format(got)
+                #delete(buf)
+                return out
+            os.Error code = failure()
+            #delete(buf)
+            if code != os.Error.INVALID && code != os.Error.UNKNOWN: try os.fail_with(code)
+            cap = cap * 2
+        fail os.Error.TOO_LONG
+
+    os.Error!void change_dir(string8 path):
+        ref []char8 cp = c_path(path)
+        defer #delete(cp)
+        if cp == nil: fail os.Error.NO_MEMORY
+        if px.chdir(cstring(cp)) != 0: try failed()
+        return
+
+    os.Error!void create_dir(string8 path):
+        ref []char8 cp = c_path(path)
+        defer #delete(cp)
+        if cp == nil: fail os.Error.NO_MEMORY
+        if !mkdir_to(cstring(cp), 0x1FF): try failed()
+        return
+
+// ── what both hosted families answer the same way ───────────────────────────
+
+when #OS != #WEB:
+    // `path` resolved against the disk — every `.`, `..` and link followed —
+    // as an absolute path owned by the caller. Fails with `NOT_FOUND` when
+    // something on the way is not there.
+    os.Error!ref []char8 canonical(string8 path):
+        ref []char8 buf = #make([]char8, 32768)
+        defer #delete(buf)
+        if buf == nil: fail os.Error.NO_MEMORY
+        i64 n = real_path(path, buf[:])
+        if n < 0: try failed()
+        return #format(string8(buf[0..<n]))
+
+    // The text the link at `path` holds — one hop, not resolved — owned by
+    // the caller. Fails with `INVALID` when `path` is not a link.
+    os.Error!ref []char8 link_target(string8 path):
+        ref []char8 buf = #make([]char8, 32768)
+        defer #delete(buf)
+        if buf == nil: fail os.Error.NO_MEMORY
+        i64 n = read_link(path, buf[:])
+        if n < 0:
+            if !is_link(path): fail os.Error.INVALID
+            try failed()
+        return #format(string8(buf[0..<n]))

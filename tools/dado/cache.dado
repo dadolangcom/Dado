@@ -27,8 +27,10 @@
 package driver
 
 import "core:hash"
+import "core:io"
 import "core:os"
 import "core:os/fs"
+import "core:os/proc"
 import "core:strings"
 import "core:time"
 
@@ -94,21 +96,16 @@ void put_unsaid(^Digest d, string8 text, string8 unsaid):
 // `*.c` file's name — `dadoc` reads those names and never those bodies.
 void put_dir(^Digest d, string8 dir):
     put_text(d, txt(#format("%", dir)))
-    ref []char8 dc = strings.clone_to_cstring(dir, #default)
-    ^fs.Dir h = fs.open(cstring(dc))
-    if !fs.opened(h):
+    try fs.Listing l = fs.read_dir(dir) else:
         d.ok = false
         return
     ref []string8 names = #make([]string8, 0)
-    for:
-        (cstring name, bool more) = fs.next(h)
-        if !more: break
-        string8 n = string8(name)
-        if n == "." || n == "..": continue
+    for e in l.entries:
+        string8 n = e.path
         if is_source(n) || strings.ends_with(n, ".c"):
             ref []char8 own = #format(n)
             _ = #append(names, txt(own))
-    fs.close(h)
+    l.destroy()
     sort_bytes(names[:])
     for n in names:
         put_text(d, n)
@@ -121,7 +118,7 @@ private bool is_source(string8 name):
 string8 finish_digest(^Digest d):
     hash.Sha256Digest out = d.h.finish()
     if !d.ok: return ""
-    return txt(hash.sha256_hex(out))
+    return txt(hash.hex(out))
 
 // ── emit/ ───────────────────────────────────────────────────────────────────
 
@@ -196,14 +193,11 @@ bool emit_fresh(string8 slot, string8 dadoc_id, []string8 args):
 bool sources_moved(string8 manifest, i64 mark):
     for dir in included_dirs(manifest):
         if !is_dir(dir): continue
-        ref []char8 dc = strings.clone_to_cstring(dir, #default)
-        ^fs.Dir h = fs.open(cstring(dc))
-        if !fs.opened(h): return true
+        try fs.Listing l = fs.read_dir(dir) else:
+            return true
         bool moved = false
-        for:
-            (cstring name, bool more) = fs.next(h)
-            if !more: break
-            string8 n = string8(name)
+        for e in l.entries:
+            string8 n = e.path
             if !is_source(n): continue
             try i64 t = fs.mtime(join2(dir, n)) else:
                 moved = true
@@ -211,7 +205,7 @@ bool sources_moved(string8 manifest, i64 mark):
             if t > mark:
                 moved = true
                 break
-        fs.close(h)
+        l.destroy()
         if moved: return true
     return false
 
@@ -298,13 +292,17 @@ type ObjectJob:
         return (own, true, true)
 
     string8 dir = join2(j.cache, j.sub)
-    _ = fs.make_dirs(dir, #default)
+    try fs.make_dirs(dir) else: pass
     string8 obj = join2(dir, txt(#format(key, ".o")))
     string8 lock = txt(#format(obj, ".lock"))
-    ref []char8 lockc = strings.clone_to_cstring(lock, #default)
     i64 waited = 0
     for !is_file(obj):
-        if fs.make_dir(cstring(lockc)):
+        // The lock is a directory: making one is atomic, and fails for the
+        // second process that tries.
+        bool locked = true
+        try fs.create_dir(lock) else:
+            locked = false
+        if locked:
             write_quietly(join2(lock, "pid"), txt(#format(os.pid(), "\n")))
             string8 tmp = txt(#format(obj, ".", os.pid()))
             if run(compile_to(j, tmp)) == 0:
@@ -326,7 +324,7 @@ type ObjectJob:
         if waited > 3000:
             remove_tree_quietly(lock)
             continue
-        time.nap(100)
+        time.sleep(time.milliseconds(100))
     return (obj, true, false)
 
 // `text` written to `p`, or nothing when it cannot be.
@@ -355,3 +353,174 @@ else:
 
     private bool holder_alive(i64 pid):
         return lk.kill(i32(pid), 0) == 0
+
+// ── units/ ──────────────────────────────────────────────────────────────────
+
+// A dev build's objects (CP-13 step 4): the many-file form
+// `dadoc --split-out` writes, units of a package or so and a runtime file,
+// each compiled at most once for what it holds, several at a time.
+//
+// **The key is the unit preprocessed**, as `cached_object`'s is: `cc -E`
+// with the exact flags, so every header byte the object is made of, in
+// whatever directory and under whatever name, and which file each
+// `#include` found, are in it; plus the compiler's identity, every flag and
+// `DADO_CFLAGS`. The preprocessing runs as the compiles do, several at a
+// time: measured on the 2-core VM at about 50 ms a unit, 0.3 s for
+// `tools/dado`'s eleven. An edited nested header, a header of any
+// extension, a changed `-I` order: each is a different key.
+//
+// The objects are `units/<key>.o`. Two builds sharing the directory each
+// compile into a file of their own pid and rename it into place, so the
+// worst a race costs is a compile. Every build that uses an object writes
+// its `<key>.o.used` beside it (`core:os/fs` sets no file times), and an
+// object whose last use is a week old is swept by the next build
+// (`sweep_units`), never one this build uses; should one go between the
+// check and the link anyway, the build compiles it again (`unit_objects`
+// is asked twice by its caller).
+type UnitsJob:
+    string8 cache                  // `<build>/.dado-cache`
+    string8 cc_id
+    Command flags                  // the compiler and every flag before the `-I`s
+    ref []string8 includes         // the `-I` list, `DADO_CFLAGS` on its tail
+    i32 jobs                       // at most this many compiles at once
+
+// The part of every unit's key that is the same for the whole build.
+string8 units_key(^UnitsJob j):
+    Digest d = digest()
+    put_text(&d, j.cc_id)
+    for w in j.flags.words:
+        put_text(&d, w)
+    for w in j.includes:
+        put_text(&d, w)
+    (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+    put_text(&d, user_cflags)
+    return finish_digest(&d)
+
+// `commands`, at most `jobs` at a time; each one's status, in order (127
+// for one that did not start).
+ref []i32 run_all([]Command commands, i32 jobs):
+    ref []i32 status = #make([]i32, 0)
+    ref []proc.Child running = #make([]proc.Child, 0)
+    ref []i64 slot = #make([]i64, 0)
+    i64 waited = 0
+    for i in 0..<#len(commands):
+        _ = #append(status, 127)
+        if i64(#len(running)) - waited >= i64(jobs):
+            status[slot[waited]] = wait_status(running[waited])
+            waited += 1
+        Command c = commands[i]
+        if verbose(): note(txt(#format("  $ ", shown(c))))
+        _ = io.flush(io.stdout())
+        _ = io.flush(io.stderr())
+        try proc.Child child = proc.spawn(c.words[:]) else:
+            continue
+        _ = #append(running, child)
+        _ = #append(slot, i64(i))
+    for k in waited..<i64(#len(running)):
+        status[slot[k]] = wait_status(running[k])
+    return status
+
+private i32 wait_status(proc.Child c):
+    try proc.Ended e = proc.wait(c) else:
+        return 127
+    if proc.ok(e): return 0
+    return 1
+
+// The object of each of `units`, in order; `ok` false when one did not
+// compile (its compiler has said why on standard error). A unit whose
+// object is already in the cache compiles nothing.
+(ref []string8 objects, bool ok) unit_objects(^UnitsJob j, []string8 units):
+    ref []string8 objects = #make([]string8, 0)
+    string8 dir = join2(j.cache, "units")
+    try fs.make_dirs(dir) else: pass
+    string8 base = units_key(j)
+
+    // Each unit preprocessed, beside it, several at a time.
+    ref []Command pre = #make([]Command, 0)
+    for u in units:
+        Command e = command_of(j.flags.words[:])
+        add_all(&e, j.includes[:])
+        add(&e, "-E")
+        add(&e, u)
+        add(&e, "-o")
+        add(&e, txt(#format(u, ".i")))
+        _ = #append(pre, e)
+    ref []i32 pre_status = run_all(pre[:], j.jobs)
+
+    ref []Command compiles = #make([]Command, 0)
+    ref []string8 tmps = #make([]string8, 0)
+    ref []string8 dests = #make([]string8, 0)
+    for i in 0..<#len(units):
+        string8 u = units[i]
+        string8 i_file = txt(#format(u, ".i"))
+        string8 key = ""
+        if #len(base) > 0 && pre_status[i] == 0:
+            Digest d = digest()
+            put_text(&d, base)
+            put_file(&d, i_file)
+            key = finish_digest(&d)
+        remove_quietly(i_file)
+        // No key: compiled for this build alone, under the unit's name.
+        string8 obj = txt(#format(u, ".o"))
+        if #len(key) > 0:
+            obj = join2(dir, txt(#format(key, ".o")))
+            write_quietly(txt(#format(obj, ".used")), "")
+        _ = #append(objects, obj)
+        if #len(key) > 0 && is_file(obj): continue
+        string8 tmp = txt(#format(obj, ".", os.pid(), ".tmp"))
+        Command c = command_of(j.flags.words[:])
+        add_all(&c, j.includes[:])
+        add(&c, "-c")
+        add(&c, u)
+        add(&c, "-o")
+        add(&c, tmp)
+        _ = #append(compiles, c)
+        _ = #append(tmps, tmp)
+        _ = #append(dests, obj)
+    ref []i32 status = run_all(compiles[:], j.jobs)
+    bool ok = true
+    for i in 0..<#len(compiles):
+        if status[i] != 0:
+            remove_quietly(tmps[i])
+            ok = false
+            continue
+        try fs.rename(tmps[i], dests[i]) else:
+            remove_quietly(tmps[i])
+            ok = false
+    return (objects, ok)
+
+// Whether every one of `objects` is still there: a concurrent build's sweep
+// can, in a narrow window, take one this build checked.
+bool all_there([]string8 objects):
+    for o in objects:
+        if !is_file(o): return false
+    return true
+
+// Remove the objects under `<cache>/units` whose last use (their `.used`,
+// else the object itself) is more than a week old, never one of `used`;
+// and a compile's `.tmp` a crashed build left as old. Quiet: a sweep that
+// cannot read or remove something leaves it for the next.
+void sweep_units(string8 cache, []string8 used):
+    string8 dir = join2(cache, "units")
+    try fs.Listing l = fs.read_dir(dir) else:
+        return
+    i64 week = i64(7) * 24 * 3600 * 1000000000
+    i64 now = time.unix_nanos()
+    for e in l.entries:
+        string8 p = join2(dir, e.path)
+        if strings.ends_with(p, ".used"): continue
+        bool in_use = false
+        for u in used:
+            if u == p:
+                in_use = true
+                break
+        if in_use: continue
+        string8 stamp = txt(#format(p, ".used"))
+        string8 aged = p
+        if is_file(stamp): aged = stamp
+        try i64 t = fs.mtime(aged) else:
+            continue
+        if now - t > week:
+            remove_quietly(p)
+            remove_quietly(stamp)
+    l.destroy()

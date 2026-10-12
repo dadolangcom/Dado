@@ -59,21 +59,38 @@
 // across workers; **a map or any other structure a job shares with another
 // thread is not synchronised** and needs a `core:threads` mutex.
 //
+// **Tier W H.** The pooled engine runs wherever `core:threads` does: Linux,
+// macOS, the BSDs, Windows, and a web module built with `--web-threads`. A
+// single-threaded web module has no thread to start, so there `start` runs
+// the serial engine whatever `nthreads` asks for, and answers true;
+// `Scheduler.nworkers` says which engine runs. A `#NONE` build is refused by
+// the static assertion below: the pool is `core:threads`', and a freestanding
+// target has no second thread to run it on.
+//
+// **The scratch arenas grow on the allocator `start` was called under**
+// (`#default`: C's heap, unless a `using` around `start` says otherwise), and
+// keep it until `stop`. That is the one allocator this package captures, and
+// it is captured on purpose: the arenas outlive the `using` they were made in
+// and are reset and grown from every worker thread, whose own ambient is the
+// root.
+//
+// **What raises into a script.** Nothing here. A job is a function reference
+// and a `rawptr` to its data, the scheduler's handles are `core:threads`'
+// thread and lock handles, and its counters are atomic accesses, so every
+// function reaches something a script cannot hold. A script that wants work done in parallel
+// asks Dado code that owns a scheduler.
+//
 // This is a `core:` library and owes tests: it is a concurrency engine and
 // wraps core:threads.
 //
 // ## The atomics are the language's, and the ordering is written at each call
 //
 // Every atomic access below is a `#atomic_*` intrinsic over an ordinary `i32`
-// the scheduler already owns, and not a call to `core:threads`' wrappers. Those
-// are one verb each at `#SEQ_CST`, because a function cannot take an ordering
-// as a parameter: the ordering has to be a constant at the machine
-// instruction, which is exactly why `#atomic_*` takes a `#` member the checker
-// folds and refuses. A wrapper fixes one ordering for every caller, and this
-// package wants four.
-//
-// So the orderings below are written per access rather than paid for uniformly,
-// and each is chosen rather than defaulted:
+// the scheduler already owns, with its ordering written at the access. The
+// verb takes the ordering as a constant, so the C compiler emits exactly that
+// instruction; `core:threads`' `atomic_*` functions take an `Order` argument
+// and pick the verb with a `switch`, which costs nothing once inlined but
+// says less at the call than the verb does. Each ordering here is chosen:
 //
 //   * **the batch counter's decrement is `#ACQ_REL`** — release, so that a
 //     thread which sees the count reach zero sees everything the job wrote
@@ -89,29 +106,41 @@
 //     claimed by a compare-exchange that carries its own ordering. A stronger
 //     ordering here would buy nothing and cost a fence per submission.
 //
-// `core:threads` keeps its atomic wrappers and its tests: they are what a
-// program that holds a cell and not an ordering needs, and `jobs` not calling
-// them is not a reason to delete them.
+// Each `Scheduler` keeps its own workers' identities, so any number of them
+// may run at once, each with its own pool.
 package jobs
 
 import "core:threads"
+import "core:mem"
 import "core:mem/arena"
-import "core:mem/libc"
 
+#static_assert(#OS != #NONE, "core:jobs needs core:threads for its pool, and a #NONE target has no second thread")
+
+// The most participants one scheduler has: the calling thread and up to 63
+// worker threads. `start` clamps `nthreads` to `MAX_WORKERS - 1`.
 const i32 MAX_WORKERS = 64
-const i32 QCAP = 8192 // job ring capacity; a fuller push runs inline
-const i32 HCAP = 8192 // batch-counter ring capacity
+
+// The job ring's capacity. A submission into a full ring runs on the
+// submitting thread instead.
+const i32 QCAP = 8192
+
+// The batch-counter ring's capacity: how many batches can be unfinished at
+// once before a submission runs inline.
+const i32 HCAP = 8192
 
 // What a job sees. `scratch` is this worker's private arena — `using
 // ja.scratch:` or an explicit argument (see the contract above). `begin`/`end` are the sub-range for a
 // `parallel_for` chunk; a plain `submit` gets [0, 0).
 type JobArgs:
     i32       worker,
-    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) scratch,
+    (mem.Proc proc, rawptr data) scratch,
     i32       begin,
     i32       end,
     rawptr    data,
 
+// A job: called with its `JobArgs`, once per `submit` and once per chunk of a
+// `parallel_for`. It answers nothing; a result goes out through a channel
+// (see the header).
 type JobFn: void(^JobArgs)
 
 // A completion token. Serial handles are always done; a pooled handle names a
@@ -137,18 +166,24 @@ private type Job:
     i32    end,
     i32    batch,
 
-// A worker's identity, handed to its thread. `sched` is a real `^Scheduler`
-// — a self-reference bounded by the pointer — so its fields keep their
-// names — unlike a rawptr-converted pointer.
+// A worker's identity, handed to its thread. The scheduler is held as a
+// `rawptr` so that `Scheduler` can keep these inline: a `^Scheduler` here
+// would make `Scheduler` contain an array of a type that points back at it,
+// which C cannot lay out. The worker turns it back with `SchedPtr`.
 private type WCtx:
-    ^Scheduler sched,
-    i32        index,
+    rawptr sched,
+    i32    index,
 
-// The scheduler. One instance, owned by the caller (a package global — the inline
-// rings make it too big for the stack). Functions take `^Scheduler`.
+private type WCtxPtr: ^WCtx
+
+private type SchedPtr: ^Scheduler
+
+// The scheduler, owned by the caller: a package variable, since the inline
+// rings make it too big for the stack. Functions take `^Scheduler`. Its zero
+// value is stopped; `start` starts it.
 type Scheduler:
-    rawptr mtx,
-    rawptr cv,
+    threads.Mutex mtx,
+    threads.Cond  cv,
     i32    nworkers, // worker THREADS (0 = serial engine)
     i32    running,  // atomic flag: 1 running, 0 = draining to shutdown
     // job ring, guarded by mtx
@@ -160,24 +195,22 @@ type Scheduler:
     [HCAP]i32 counters,
     i32       hnext,
     // workers 0..nworkers (0 is the main thread, which helps during wait)
-    [MAX_WORKERS]rawptr      wthreads,
+    [MAX_WORKERS]threads.Thread wthreads,
     [MAX_WORKERS]arena.Arena warenas,
     bool                     started,
-
-// The worker contexts live here, not inside `Scheduler`: a `WCtx` holds a
-// `^Scheduler`, and an inline `[MAX_WORKERS]WCtx` field inside `Scheduler` makes a
-// struct that embeds an array of a type that points back at it — which the C
-// emitter cannot lay out (incomplete element type). Hoisting the array out breaks
-// the cycle. The cost: **v1 supports one active pooled scheduler** — which is
-// exactly what `app:app` owns. (A later engine can pass per-worker storage in.)
-private [MAX_WORKERS]WCtx g_wctx
+    // each worker's identity, which its thread reads from here
+    [MAX_WORKERS]WCtx        wctx,
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
 
-// Start the scheduler with `nthreads` worker threads (0 → the serial engine, all
-// inline). Worker indices run 1..nthreads; index 0 is the main thread, which
-// participates while it waits. Per-participant scratch arenas 0..nthreads are
-// created here. Returns false if a thread or primitive could not be created.
+// Starts the scheduler with `nthreads` worker threads (0 is the serial
+// engine, every job inline). Worker indices run 1..nthreads; index 0 is the
+// main thread, which runs jobs while it waits. Per-participant scratch arenas
+// 0..nthreads are created here, on `#default` (see the header). Answers false
+// if a thread or primitive could not be created, having stopped whatever it
+// did start. A single-threaded web module starts no thread, so there it
+// starts the serial engine and answers true; so does any web build that
+// cannot start the first worker.
 bool start(^Scheduler s, i32 nthreads):
     i32 nt = nthreads
 
@@ -196,7 +229,7 @@ bool start(^Scheduler s, i32 nthreads):
 
     // arenas for participants 0..nt
     for i in 0..=nt:
-        s.warenas[i] = arena.over(libc.allocator())
+        s.warenas[i] = arena.over(#default)
 
     if nt == 0:
         s.started = true
@@ -206,20 +239,49 @@ bool start(^Scheduler s, i32 nthreads):
     s.cv = threads.cond_new()
 
     if s.mtx == nil || s.cv == nil:
+        threads.mutex_free(s.mtx)
+        threads.cond_free(s.cv)
+        for i in 0..=nt:
+            arena.destroy(&s.warenas[i])
         return false
 
+    // `try_spawn`, not `spawn`: a single-threaded web module answers nil here
+    // at run time, and the scheduler falls back to the serial engine, where a
+    // `spawn` would refuse the whole build (ERR1033).
     for i in 1..=nt:
-        g_wctx[i] = (s, i)
-        s.wthreads[i] = threads.spawn(worker_main, rawptr(&g_wctx[i]))
+        s.wctx[i] = (rawptr(s), i)
+        s.wthreads[i] = threads.try_spawn(worker_main, rawptr(&s.wctx[i]))
 
         if s.wthreads[i] == nil:
+            for k in i..=nt:
+                arena.destroy(&s.warenas[k])
+            s.nworkers = i - 1
+            s.started = true
+
+            if i > 1:
+                stop(s)
+                return false
+
+            // No worker started, so there is no pool to stop: the serial
+            // engine is what is left, which the web takes and a native build
+            // reports.
+            threads.mutex_free(s.mtx)
+            threads.cond_free(s.cv)
+            s.mtx = nil
+            s.cv = nil
+
+            if #OS == #WEB:
+                return true
+
+            stop(s)
             return false
 
     s.started = true
     return true
 
-// Stop the pool: signal drain, wake all workers, join them, free primitives and
-// arenas. Safe to call once after `start`.
+// Stops the pool: lets the workers drain the queue, wakes and joins them,
+// and frees the primitives and arenas. Calling it on a stopped scheduler does
+// nothing.
 void stop(^Scheduler s):
     if !s.started:
         return
@@ -242,14 +304,17 @@ void stop(^Scheduler s):
 
     s.started = false
 
-// Reset the per-participant scratch arenas — the app calls this once a frame.
+// Resets every participant's scratch arena, taking back everything jobs
+// allocated there; `app:app` calls it once a frame. Call it only while no job
+// runs.
 void reset_scratch(^Scheduler s):
     for i in 0..=s.nworkers:
         arena.reset(&s.warenas[i])
 
 // ── the surface ──────────────────────────────────────────────────────────────
 
-// Submit one job. Serial: runs inline now. Pooled: enqueued; `wait` the handle.
+// Submits one job. The serial engine runs it now, on this thread; the pooled
+// one queues it, and `wait` on the handle returns once it has run.
 Handle submit(^Scheduler s, JobFn fn, rawptr data):
     if s.nworkers == 0:
         run_inline(s, fn, data, 0, 0)
@@ -268,14 +333,16 @@ Handle submit(^Scheduler s, JobFn fn, rawptr data):
     push(s, (fn, data, 0, 0, batch))
     return Handle(batch)
 
-// Submit `fn` to run after `dep` completes. v1: since callers wait on `dep`
-// before depending on its result, this simply waits then submits.
+// Submits `fn` to run after `dep` has finished. It waits for `dep` on this
+// thread (running other jobs meanwhile) and then submits.
 Handle submit_after(^Scheduler s, JobFn fn, rawptr data, Handle dep):
     wait(s, dep)
     return submit(s, fn, data)
 
-// Fork-join over [0, n) in `grain`-sized chunks, then join before returning.
-// This is the common case and carries its own barrier, so it needs no handle.
+// Runs `fn` over [0, n) in chunks of `grain` indices (1 when `grain` is
+// below 1), each chunk a job with its range in `JobArgs.begin` and `end`, and
+// returns once every chunk has run. It needs no handle: the return is the
+// barrier.
 void parallel_for(^Scheduler s, i32 n, i32 grain, JobFn fn, rawptr data):
     if n <= 0:
         return
@@ -311,8 +378,8 @@ void parallel_for(^Scheduler s, i32 n, i32 grain, JobFn fn, rawptr data):
 
     join_batch(s, batch)
 
-// Cooperatively wait for a handle: the waiting thread runs other ready jobs while
-// the batch is unfinished, so the main thread at the barrier stays useful.
+// Waits for a handle's job to finish, running other queued jobs on this
+// thread meanwhile, so a thread at the barrier stays useful.
 void wait(^Scheduler s, Handle h):
     if s.nworkers == 0 || i32(h) == SERIAL_DONE:
         return
@@ -417,34 +484,35 @@ private void push(^Scheduler s, Job job):
     threads.cond_signal(s.cv)
     threads.unlock(s.mtx)
 
-// Pop one job under the lock. Returns false (via the flag) when the ring is empty.
-private (Job, bool) try_pop(^Scheduler s):
+// Pop one job under the lock. Fails when the ring is empty.
+private !Job try_pop(^Scheduler s):
     threads.lock(s.mtx)
 
     if s.qcount == 0:
         threads.unlock(s.mtx)
-        Job empty
-        return (empty, false)
+        fail 1
 
     Job j = s.q[s.qhead]
     s.qhead = (s.qhead + 1) % QCAP
     s.qcount = s.qcount - 1
     threads.unlock(s.mtx)
-    return (j, true)
+    return j
 
-// Help until this batch is drained: run any ready job, else spin (the last chunk
-// is finishing on another worker). This is the cooperative barrier.
+// Help until this batch is drained: run any ready job, else yield (the last
+// chunk is finishing on another worker), so the waiting thread gives its time
+// slice to the one it waits on rather than spinning on the lock. This is the
+// cooperative barrier.
 private void join_batch(^Scheduler s, i32 batch):
     for #atomic_load(&s.counters[batch], #ACQUIRE) > 0:
-        (Job j, bool got) = try_pop(s)
-
-        if got:
-            run_job(s, j, 0)
+        try Job j = try_pop(s) else:
+            threads.yield()
+            continue
+        run_job(s, j, 0)
 
 // A worker thread: block for work, run it, repeat until drained and shut down.
 private rawptr worker_main(rawptr arg):
-    WCtx me = wctx_of(arg)
-    ^Scheduler s = me.sched
+    WCtxPtr me = WCtxPtr(arg)
+    ^Scheduler s = SchedPtr(me.sched)
     i32 idx = me.index
 
     for:
@@ -464,12 +532,3 @@ private rawptr worker_main(rawptr arg):
         run_job(s, j, idx)
 
     return nil // unreachable: the loop only exits via the return above
-
-// Recover a WCtx from the rawptr thread argument. Converting rawptr -> a typed
-// pointer drops the pointee's name view, so copy the pointee into a typed local.
-private WCtx wctx_of(rawptr arg):
-    WCtxPtr p = WCtxPtr(arg)
-    WCtx w = p^
-    return w
-
-private type WCtxPtr: ^WCtx

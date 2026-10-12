@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.3 -->
-<!-- commit 8e62c891753a -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit cc341d1a7513 -->
 # core:geom/hit
 
 Ray and box tests for picking and collision, in 3D.
@@ -14,6 +14,14 @@ The ray tests are generic over f32 and f64. A ray is an origin and a direction t
 unit length, and every t answered is in units of that direction. Each test is exact at its
 boundary, with no tolerance, and a boundary point counts as a hit. The 2D segment and point
 tests are in core:geom/line and core:geom/point.
+
+**Tier N W H.** Pure Dado over `core:linalg` and `core:math`: it builds and runs freestanding
+(`#NONE`), on the web, and hosted (Linux, macOS and Windows) alike.
+
+**What raises into a script.** `ray_aabb`, `inverse_dir`, `ray_triangle`, `ray_plane` and
+`aabb_aabb`, each promised by the `#assert_raises` on the line above it. `ray_sphere` is not:
+it takes a square root, which `core:math` answers from the C library's `sqrt` wherever there
+is one.
 
 ## Declarations
 

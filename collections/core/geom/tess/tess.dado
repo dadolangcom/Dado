@@ -7,21 +7,54 @@
 // contours (CCW outers, CW holes). `core:geom/clip` builds its set
 // operations on it, and `core:geom/polygon` its outline offset.
 //
-// A `Tess` is made by `init`, fed by `add_contour`, run by `tesselate` and
-// released by `destroy`; it must not be copied once made. Its working mesh
+// A `Tess` is made by `init`, fed by `add_contour`, run by `tessellate` and
+// ended by `destroy`; it must not be copied once made. Its working mesh
 // lives in an arena on the `#default` that `init` saw; the output arrays are
-// minted on the `#default` that `tesselate` sees, and `destroy` frees both.
+// made on the `#default` that `tessellate` sees, and `destroy` frees both.
+//
+// **Allocation.** `init` captures the `#default` it sees for the tesselator's
+// whole life, rather than each call taking the `#default` of its moment: the
+// working mesh is one arena that every add and every run carves from, and a
+// `using` between `init` and `destroy` must not split it across allocators.
+//
+// **Errors.** `add_contour`, `add_points` and `tessellate` fail with a member
+// of `Error` (codes 1800 to 1899), and `message(why)` is a sentence for one.
+// `core:geom/clip` and `core:geom/polygon` fail with the same codes.
+//
+// **Tier N W H.** Pure Dado over `core:math` and `core:mem/arena`: it builds and runs
+// freestanding (`#NONE`), on the web, and hosted (Linux, macOS and Windows) alike.
+//
+// **What raises into a script.** `message` alone, promised by the `#assert_raises` on the line
+// above it. Every other public function reaches the arena that holds the working mesh (`init`
+// makes it, `destroy` frees it, the others allocate from it or reset it), and an arena's
+// allocator is a procedure and a `rawptr`, an address a script has no value for. Making the
+// tesselator raise means allocating its mesh some other way (an index pool, after 1.0: the
+// working state is one private slot, `work`, so that rewrite changes no public name).
 package tess
 
+import "core:math"
 import "core:mem/arena"
 
-// `add_contour`, `add_points` and `tesselate` fail with MALFORMED for a
-// coordinate beyond MAX_COORD or a partial vertex. `core:geom/earcut` uses the
-// same values for the same causes.
-const i32 MALFORMED = 1
+// Why an add or a run failed. The numbers are this package's, 1800 to 1899,
+// apart from every other package's, so a code read anywhere never means two
+// things.
+distinct enum i32 Error:
+    // A coordinate beyond MAX_COORD (or not a number), a contour whose
+    // coordinates end partway through a vertex, a `poly_size` below 3 on
+    // `#NONE`, or (from `core:geom/clip`) ring starts that do not increase
+    // within the points.
+    MALFORMED = 1800,
+    // An allocation answered nil.
+    NO_MEMORY,
 
-// The code for an allocation that answered nil.
-const i32 NO_MEMORY = 2
+// A sentence for each of this package's codes, and one for any other value.
+#assert_raises
+string8 message(Error why):
+    if why == Error.MALFORMED:
+        return "malformed input: a coordinate out of range, a partial vertex, or ring starts out of order"
+    if why == Error.NO_MEMORY:
+        return "out of memory: the tesselator could not allocate"
+    return "not a code of core:geom/tess"
 
 // An unused polygon slot, a missing neighbour, or a vertex made by an intersection.
 const i32 UNDEF = -1
@@ -31,32 +64,38 @@ const f64 MAX_COORD = 2251799813685248.0
 
 // Which regions are inside, by winding number: odd, nonzero, positive,
 // negative, or at least two in absolute value.
-enum i32 Winding: (Odd, Nonzero, Positive, Negative, Abs_Geq_Two)
+enum i32 Winding: (Odd, Nonzero, Positive, Negative, AbsGeqTwo)
 
-// What `tesselate` outputs. Polygons: `poly_size` vertex indices each, padded
-// with UNDEF. Connected_Polygons: those, then as many neighbour polygon
-// indices (UNDEF on the boundary). Boundary_Contours: (first vertex, vertex
+// What `tessellate` outputs. Polygons: `poly_size` vertex indices each, padded
+// with UNDEF. ConnectedPolygons: those, then as many neighbour polygon
+// indices (UNDEF on the boundary). BoundaryContours: (first vertex, vertex
 // count) pairs, one per contour.
-enum i32 Element: (Polygons, Connected_Polygons, Boundary_Contours)
+enum i32 Element: (Polygons, ConnectedPolygons, BoundaryContours)
 
 // A tesselator. Set the options before adding contours, and read the output
-// after `tesselate`. The slots after the output are its working state.
+// after `tessellate`. `work` is its working state, private to this package.
 type Tess:
-    // Options, read by `add_contour` and `tesselate`.
+    // Options, read by `add_contour` and `tessellate`.
     bool reverse_contours   // add each contour with its winding flipped
     bool delaunay           // refine triangles to constrained Delaunay
     [3]f64 normal           // the projection normal; zero computes one
 
-    // Output of the last `tesselate`.
+    // Output of the last `tessellate`.
     ref []f64 vertices         // vertex_size coordinates per vertex
     ref []i32 vertex_indices   // each output vertex's input index, or UNDEF
     ref []i32 elements
     i32 vertex_count
     i32 element_count
 
+    Work work
+
+// The tesselator's working state: the mesh's arena, the mesh, a kept failure,
+// the projection and the sweep's dictionary, queue and event.
+private type Work:
     arena.Arena ar
     ^Mesh mesh
-    i32 status
+    bool failed        // an add failed: the next add or run fails with `status`
+    Error status
     [3]f64 s_unit
     [3]f64 t_unit
     [2]f64 bmin
@@ -78,16 +117,16 @@ void init(^Tess t):
     t.elements = nil
     t.vertex_count = 0
     t.element_count = 0
-    t.ar = arena.over(#default)
-    t.mesh = nil
-    t.status = 0
-    t.vertex_index_counter = 0
+    t.work.ar = arena.over(#default)
+    t.work.mesh = nil
+    t.work.failed = false
+    t.work.vertex_index_counter = 0
 
 // Frees `t`'s output arrays and its working mesh.
 void destroy(^Tess t):
     free_output(t)
-    arena.destroy(&t.ar)
-    t.mesh = nil
+    arena.destroy(&t.work.ar)
+    t.work.mesh = nil
 
 private void free_output(^Tess t):
     #delete(t.vertices)
@@ -101,15 +140,15 @@ private bool valid_coord(f64 c):
 
 // Adds one closed contour of `size` (2 or 3) coordinates per vertex. Fails
 // with MALFORMED for a coordinate beyond MAX_COORD or a partial vertex, and
-// NO_MEMORY; a failure is kept, and the next `tesselate` fails with it too.
-!void add_contour(^Tess t, []f64 coords, i32 size = 2):
+// NO_MEMORY; a failure is kept, and the next `tessellate` fails with it too.
+Error!void add_contour(^Tess t, []f64 coords, i32 size = 2):
     i64 dim = i64(size)
     if dim < 2:
         dim = 2
     if dim > 3:
         dim = 3
     if #len(coords) % dim != 0:
-        t.status = MALFORMED
+        keep(t, Error.MALFORMED)
     try begin_contour(t)
     ^HalfEdge e = nil
     for i in 0..<#len(coords) / dim:
@@ -119,39 +158,51 @@ private bool valid_coord(f64 c):
 // Adds one closed contour of 2D points, of any float width; the tesselator
 // works in f64. Fails as `add_contour` does, and a failure is kept the same
 // way.
-!void add_points(^Tess t, [][2]$T ring) where T is float:
+Error!void add_points(^Tess t, [][2]$T ring) where T is float:
     try begin_contour(t)
     ^HalfEdge e = nil
     for p in ring:
         try add_vertex(t, &e, f64(p.x), f64(p.y), 0.0)
 
-private !void begin_contour(^Tess t):
-    if t.status != 0:
-        fail t.status
-    if t.mesh == nil:
-        t.mesh = mesh_new(&t.ar)
-        if t.mesh == nil:
-            t.status = NO_MEMORY
-            fail NO_MEMORY
+// Keeps `why` as the failure the next add or run answers.
+private void keep(^Tess t, Error why):
+    t.work.failed = true
+    t.work.status = why
 
-private !void add_vertex(^Tess t, ^^HalfEdge last, f64 x, f64 y, f64 z):
+// Fails with the failure an add kept, if one did.
+private Error!void refail(^Tess t):
+    if !t.work.failed:
+        return
+    if t.work.status == Error.MALFORMED:
+        fail Error.MALFORMED
+    fail Error.NO_MEMORY
+
+private Error!void begin_contour(^Tess t):
+    try refail(t)
+    if t.work.mesh == nil:
+        t.work.mesh = mesh_new(&t.work.ar)
+        if t.work.mesh == nil:
+            keep(t, Error.NO_MEMORY)
+            fail Error.NO_MEMORY
+
+private Error!void add_vertex(^Tess t, ^^HalfEdge last, f64 x, f64 y, f64 z):
     if !valid_coord(x) || !valid_coord(y) || !valid_coord(z):
-        t.status = MALFORMED
-        fail MALFORMED
+        keep(t, Error.MALFORMED)
+        fail Error.MALFORMED
     ^HalfEdge e = last^
     if e == nil:
-        e = mesh_make_edge(t.mesh)
-        if e == nil || !mesh_splice(t.mesh, e, e.sym):
-            t.status = NO_MEMORY
-            fail NO_MEMORY
+        e = mesh_make_edge(t.work.mesh)
+        if e == nil || !mesh_splice(t.work.mesh, e, e.sym):
+            keep(t, Error.NO_MEMORY)
+            fail Error.NO_MEMORY
     else:
-        if mesh_split_edge(t.mesh, e) == nil:
-            t.status = NO_MEMORY
-            fail NO_MEMORY
+        if mesh_split_edge(t.work.mesh, e) == nil:
+            keep(t, Error.NO_MEMORY)
+            fail Error.NO_MEMORY
         e = e.lnext
     e.org.coords = (x, y, z)
-    e.org.idx = t.vertex_index_counter
-    t.vertex_index_counter += 1
+    e.org.idx = t.work.vertex_index_counter
+    t.work.vertex_index_counter += 1
     e.winding = -1 if t.reverse_contours else 1
     e.sym.winding = 1 if t.reverse_contours else -1
     last^ = e
@@ -159,73 +210,75 @@ private !void add_vertex(^Tess t, ^^HalfEdge last, f64 x, f64 y, f64 z):
 // Tessellates every contour added since the last call, replacing the output
 // slots of `t` with new arrays on `#default`, which the next call or `destroy`
 // frees. `kind` says what the elements are (see `Element`); `vertex_size` is 2
-// or 3; `poly_size`, at least 3, is the most vertices per polygon (3 for
-// triangles). With no contour added the output is empty. Fails with a failure
+// or 3; `poly_size`, at least 3 (asserted; on `#NONE`, which has no stream to
+// assert to, a smaller one fails MALFORMED), is the most vertices per polygon (3
+// for triangles). With no contour added the output is empty. Fails with a failure
 // an add kept, or NO_MEMORY. A sweep: about
 // (n + k) log n for n vertices and k crossings, more where many crossings
 // fall on one long contour, since each split walks the contour it splits.
-!void tesselate(^Tess t, Winding rule, Element kind, i32 poly_size = 3, i32 vertex_size = 2):
-    #assert(poly_size >= 3, "tesselate: poly_size is at least 3")
+Error!void tessellate(^Tess t, Winding rule, Element kind, i32 poly_size = 3, i32 vertex_size = 2):
+    // `#NONE` has no stream for an assert to report to: there, a smaller one fails MALFORMED.
+    when #OS == #NONE:
+        if poly_size < 3:
+            fail Error.MALFORMED
+    else:
+        #assert(poly_size >= 3, "tessellate: poly_size is at least 3")
     i32 vsize = vertex_size
     if vsize < 2:
         vsize = 2
     if vsize > 3:
         vsize = 3
     free_output(t)
-    t.vertex_index_counter = 0
-    t.rule = rule
-    if t.status != 0:
-        fail t.status
-    if t.mesh == nil:
+    t.work.vertex_index_counter = 0
+    t.work.rule = rule
+    try refail(t)
+    if t.work.mesh == nil:
         return
 
     project_polygon(t)
-    bool ok = compute_interior(t)
+    bool ok = compute_interior(&t.work)
     if ok:
-        if kind == Element.Boundary_Contours:
-            ok = mesh_set_winding_number(t.mesh, 1, true)
+        if kind == Element.BoundaryContours:
+            ok = mesh_set_winding_number(t.work.mesh, 1, true)
         else:
-            ok = mesh_tessellate_interior(t.mesh)
+            ok = mesh_tessellate_interior(t.work.mesh)
             if ok && t.delaunay:
-                ok = mesh_refine_delaunay(t.mesh)
+                ok = mesh_refine_delaunay(t.work.mesh)
     if ok:
-        if kind == Element.Boundary_Contours:
+        if kind == Element.BoundaryContours:
             ok = output_contours(t, vsize)
         else:
             ok = output_polymesh(t, kind, poly_size, vsize)
     // Every working record is done with: hand the arena's blocks back.
-    t.mesh = nil
-    arena.reset(&t.ar)
+    t.work.mesh = nil
+    arena.reset(&t.work.ar)
     if !ok:
         free_output(t)
-        t.status = NO_MEMORY
-        fail NO_MEMORY
+        keep(t, Error.NO_MEMORY)
+        fail Error.NO_MEMORY
 
 private i32 long_axis([3]f64 v):
     i32 i = 0
-    if mag(v[1]) > mag(v[0]):
+    if math.abs(v[1]) > math.abs(v[0]):
         i = 1
-    if mag(v[2]) > mag(v[i]):
+    if math.abs(v[2]) > math.abs(v[i]):
         i = 2
     return i
 
 private i32 short_axis([3]f64 v):
     i32 i = 0
-    if mag(v[1]) < mag(v[0]):
+    if math.abs(v[1]) < math.abs(v[0]):
         i = 1
-    if mag(v[2]) < mag(v[i]):
+    if math.abs(v[2]) < math.abs(v[i]):
         i = 2
     return i
-
-private f64 mag(f64 x):
-    return -x if x < 0.0 else x
 
 private f64 dot3([3]f64 u, [3]f64 v):
     return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
 
 private [3]f64 compute_normal(^Tess t):
     [3]f64 up = (0.0, 0.0, 1.0)
-    ^Vertex v_head = &t.mesh.v_head
+    ^Vertex v_head = &t.work.mesh.v_head
     ^Vertex v = v_head.next
     if v == v_head:
         return up
@@ -277,8 +330,8 @@ private [3]f64 compute_normal(^Tess t):
 // A computed normal may point either way: flip t so the positive-winding
 // contours have positive area.
 private void check_orientation(^Tess t):
-    ^Face f_head = &t.mesh.f_head
-    ^Vertex v_head = &t.mesh.v_head
+    ^Face f_head = &t.work.mesh.f_head
+    ^Vertex v_head = &t.work.mesh.v_head
     f64 area = 0.0
     ^Face f = f_head.next
     for f != f_head:
@@ -295,10 +348,10 @@ private void check_orientation(^Tess t):
         for v != v_head:
             v.t = -v.t
             v = v.next
-        t.t_unit = -t.t_unit
+        t.work.t_unit = -t.work.t_unit
 
 private void project_polygon(^Tess t):
-    ^Vertex v_head = &t.mesh.v_head
+    ^Vertex v_head = &t.work.mesh.v_head
     [3]f64 norm = t.normal
     bool computed = false
     if norm[0] == 0.0 && norm[1] == 0.0 && norm[2] == 0.0:
@@ -306,17 +359,17 @@ private void project_polygon(^Tess t):
         computed = true
 
     i32 i = long_axis(norm)
-    t.s_unit[i] = 0.0
-    t.s_unit[(i + 1) % 3] = 1.0
-    t.s_unit[(i + 2) % 3] = 0.0
-    t.t_unit[i] = 0.0
-    t.t_unit[(i + 1) % 3] = -0.0 if norm[i] > 0.0 else 0.0
-    t.t_unit[(i + 2) % 3] = 1.0 if norm[i] > 0.0 else -1.0
+    t.work.s_unit[i] = 0.0
+    t.work.s_unit[(i + 1) % 3] = 1.0
+    t.work.s_unit[(i + 2) % 3] = 0.0
+    t.work.t_unit[i] = 0.0
+    t.work.t_unit[(i + 1) % 3] = -0.0 if norm[i] > 0.0 else 0.0
+    t.work.t_unit[(i + 2) % 3] = 1.0 if norm[i] > 0.0 else -1.0
 
     ^Vertex v = v_head.next
     for v != v_head:
-        v.s = dot3(v.coords, t.s_unit)
-        v.t = dot3(v.coords, t.t_unit)
+        v.s = dot3(v.coords, t.work.s_unit)
+        v.t = dot3(v.coords, t.work.t_unit)
         v = v.next
     if computed:
         check_orientation(t)
@@ -325,18 +378,18 @@ private void project_polygon(^Tess t):
     v = v_head.next
     for v != v_head:
         if first:
-            t.bmin = (v.s, v.t)
-            t.bmax = (v.s, v.t)
+            t.work.bmin = (v.s, v.t)
+            t.work.bmax = (v.s, v.t)
             first = false
         else:
-            if v.s < t.bmin[0]:
-                t.bmin[0] = v.s
-            if v.s > t.bmax[0]:
-                t.bmax[0] = v.s
-            if v.t < t.bmin[1]:
-                t.bmin[1] = v.t
-            if v.t > t.bmax[1]:
-                t.bmax[1] = v.t
+            if v.s < t.work.bmin[0]:
+                t.work.bmin[0] = v.s
+            if v.s > t.work.bmax[0]:
+                t.work.bmax[0] = v.s
+            if v.t < t.work.bmin[1]:
+                t.work.bmin[1] = v.t
+            if v.t > t.work.bmax[1]:
+                t.work.bmax[1] = v.t
         v = v.next
 
 // Triangulates one x-monotone face by a fan walk up both chains.
@@ -438,7 +491,7 @@ private i32 neighbour_face(^HalfEdge edge):
     return rface(edge).n
 
 private bool output_polymesh(^Tess t, Element kind, i32 poly_size, i32 vsize):
-    ^Mesh mesh = t.mesh
+    ^Mesh mesh = t.work.mesh
     if poly_size > 3:
         if !mesh_merge_convex_faces(mesh, poly_size):
             return false
@@ -469,7 +522,7 @@ private bool output_polymesh(^Tess t, Element kind, i32 poly_size, i32 vsize):
 
     t.element_count = max_face_count
     i64 alloc_count = i64(max_face_count)
-    if kind == Element.Connected_Polygons:
+    if kind == Element.ConnectedPolygons:
         alloc_count *= 2
     t.elements = #make([]i32, alloc_count * i64(poly_size))
     t.vertex_count = max_vertex_count
@@ -505,7 +558,7 @@ private bool output_polymesh(^Tess t, Element kind, i32 poly_size, i32 vsize):
             for _ in face_verts..<poly_size:
                 t.elements[k] = UNDEF
                 k += 1
-            if kind == Element.Connected_Polygons:
+            if kind == Element.ConnectedPolygons:
                 edge = f.an_edge
                 face_verts = 0
                 for true:
@@ -522,7 +575,7 @@ private bool output_polymesh(^Tess t, Element kind, i32 poly_size, i32 vsize):
     return true
 
 private bool output_contours(^Tess t, i32 vsize):
-    ^Mesh mesh = t.mesh
+    ^Mesh mesh = t.work.mesh
     i32 vcount = 0
     i32 ecount = 0
     ^Face f = mesh.f_head.next

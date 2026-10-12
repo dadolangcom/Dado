@@ -1,4 +1,4 @@
-// a JSON writer (RFC 8259): values appended to text it owns.
+// JSON (RFC 8259): a writer, a pull reader, and a tree.
 //
 //     json.Writer w = json.writer(indent: 2)
 //     w.object()
@@ -25,25 +25,72 @@
 //       ]
 //     }
 //
-// The text grows on the allocator that was `#default` when `writer` was
-// called, so `json.writer() using a` puts it in `a`. Every call costs time in
-// proportion to what it writes.
+// and it reads back a value at a time, allocating nothing:
 //
-// Strings escape `"`, `\`, the control characters, DEL, U+0080 to U+009F,
-// U+2028 and U+2029, and pass other valid UTF-8 through. A byte that is not
-// valid UTF-8 becomes U+FFFD. Floats are the shortest text that reads back as
-// the same value. Keys are written in the order given, and nothing checks that
-// a key is not repeated.
+//     json.Reader r = json.reader_text(text)
+//     ref []char8 scratch
+//     defer #delete(scratch)
+//     try r.object()
+//     for r.more():
+//         try string8 name = r.key(&scratch)
+//         if name == "sizes":
+//             try r.array()
+//             for r.more():
+//                 try f64 size = r.float()
+//     try r.finish()
 //
+// or whole, as a tree:
+//
+//     try json.Document doc = json.parse_text(text)
+//     defer doc.destroy()
+//     try json.Value sizes = doc.root().get("sizes")
+//     try json.Value first = sizes.at(0)
+//     try i64 n = first.int()                     // 600
+//
+// **The writer.** The text grows on the allocator that was `#default` when
+// `writer` was called, so `json.writer() using a` puts it in `a`. Every call
+// costs time in proportion to what it writes. Strings escape `"`, `\`, the
+// control characters, DEL, U+0080 to U+009F, U+2028 and U+2029, and pass
+// other valid UTF-8 through. A byte that is not valid UTF-8 becomes U+FFFD.
+// Floats are the shortest text that reads back as the same value. Keys are
+// written in the order given, and nothing checks that a key is not repeated.
 // A call that cannot write what it was asked fails the writer with a code:
 // the code is kept, later calls write nothing, and `finish` fails with it.
-// `message(code)` answers a sentence for each code.
 //
-// It has no `foreign` block and no package state. It builds for every target,
-// `#NONE` and the web included, and every function raises into a script.
+// **The reader** (`reader` over bytes, `reader_text` over text) is strict
+// RFC 8259: no comments, trailing commas, leading zeros, `NaN`, single quotes
+// or byte-order mark, and strings of well-formed UTF-8 whose `\u` escapes
+// pair their surrogates. A string or number read from text with no escape
+// is a view into it; otherwise a read decodes into a scratch run the caller
+// gives it. Integers read exactly as `i64` or `u64` and fail with `OVERFLOW`
+// when they do not fit; any number reads as the nearest `f64`, correctly
+// rounded by core:strings/parse. Objects and arrays nest at most `MAX_DEPTH`
+// deep, and walking or skipping them costs no stack. Malformed input fails
+// the reader for good with a code and the byte offset it was found at.
+//
+// **The tree** (`parse`, `parse_text`, `Reader.document`) holds a value in
+// three runs on `#default`: a node per value, every container's children,
+// and every string's text. `Value` is a handle into it whose lookups by
+// index cost the same at any size; `get` by key is linear in the members.
+// `Writer.value` writes a tree back.
+//
+// Failures are this package's codes, and `message(code)` answers a sentence
+// for each.
+//
+// **Tier N W H. Script class S.** No `foreign` block and no package state:
+// it builds for every target, `#NONE` and `#WEB` included, and any thread
+// may use it, one thread to a writer, reader or document.
+//
+// **What raises into a script.** Every package-level function, each
+// promised by the `#assert_raises` on the line above it. The methods of
+// `Writer`, `Reader`, `Document` and `Value` cannot carry the promise
+// themselves, so `raises_test.dado` makes it for them through private
+// functions that call each one. Nothing is left out.
 package json
 
+import "core:chars"
 import "core:fmt"
+import "core:math"
 
 // A failure code: a value written inside an object with no key before it.
 public const i32 EXPECTED_KEY = 1
@@ -61,13 +108,15 @@ public const i32 UNBALANCED = 3
 // JSON cannot spell.
 public const i32 NOT_FINITE = 4
 
-// A failure code: objects and arrays nested deeper than `MAX_DEPTH`.
+// A failure code: objects and arrays nested deeper than `MAX_DEPTH`, or than
+// a reader's lower limit.
 public const i32 TOO_DEEP = 5
 
 // A failure code: the text could not grow.
 public const i32 NO_MEMORY = 6
 
-// How many objects and arrays may be open at once.
+// How many objects and arrays may be open at once, in a writer and in a
+// reader.
 public const i32 MAX_DEPTH = 128
 
 // A sentence describing `code`, one of this package's failure codes; any
@@ -89,6 +138,30 @@ public string8 message(i32 code):
         return "objects and arrays nest deeper than MAX_DEPTH"
     if code == NO_MEMORY:
         return "an allocation failed"
+    if code == TRUNCATED:
+        return "the input ends inside a value, or where one is due"
+    if code == UNEXPECTED:
+        return "a byte that cannot stand where it does"
+    if code == BAD_NUMBER:
+        return "a number not in JSON's form"
+    if code == BAD_ESCAPE:
+        return "a backslash escape JSON does not have"
+    if code == LONE_SURROGATE:
+        return "a \\u escape of half a surrogate pair"
+    if code == CONTROL_CHARACTER:
+        return "a control character in a string, not escaped"
+    if code == BAD_UTF8:
+        return "a string holds bytes that are not UTF-8"
+    if code == TRAILING:
+        return "more follows the value"
+    if code == WRONG_TYPE:
+        return "the value is not of the type asked for"
+    if code == OVERFLOW:
+        return "the integer does not fit"
+    if code == OUT_OF_TURN:
+        return "no value or key of that kind is due here"
+    if code == NOT_FOUND:
+        return "no such member or element"
     return "not a code of core:json"
 
 // What an open container is, one per level of `Writer.open`.
@@ -202,6 +275,50 @@ public type Writer:
         if self.before_value():
             self.put("null")
             self.after_value()
+
+    // Writes `v` and everything inside it, as `parse` read it: each kind by
+    // the call above that writes it, an `Int` with `int`, a `Uint` with
+    // `uint`, and a `Float` or a `Big` with `float`, so a `Big` comes out as
+    // its nearest `f64` and one past the largest fails with `NOT_FINITE`.
+    // Fails as those calls do. Nesting costs a call each level, and the
+    // reader's depth limit, like the writer's, is `MAX_DEPTH`.
+    void value(^self, Value v):
+        Kind k = v.kind()
+        if k == Kind.Null:
+            self.null()
+        else if k == Kind.Bool:
+            try bool b = v.boolean() else:
+                return
+            self.boolean(b)
+        else if k == Kind.Number:
+            Node n = v.doc^.nodes[v.node]
+            if n.form == Form.Int:
+                self.int(n.i)
+            else if n.form == Form.Uint:
+                self.uint(n.u)
+            else:
+                self.float(n.f)
+        else if k == Kind.String:
+            try string8 s = v.text() else:
+                return
+            self.text(s)
+        else if k == Kind.Array:
+            self.array()
+            for i in 0..<v.len():
+                try Value e = v.at(i) else:
+                    return
+                self.value(e)
+            self.end_array()
+        else:
+            self.object()
+            for i in 0..<v.len():
+                try string8 name = v.key(i) else:
+                    return
+                try Value e = v.at(i) else:
+                    return
+                self.key(name)
+                self.value(e)
+            self.end_object()
 
     // The code the writer failed with, or 0 while it has not failed.
     i32 code(self):
@@ -318,7 +435,9 @@ public type Writer:
             i64 size = 1
             u32 cp = b
             if b >= 0x80:
-                (cp, size) = utf8_at(s, i)
+                (char32 c, i64 k) = chars.decode(s[i..<(i + 4 if i + 4 < n else n)], 0)
+                cp = u32(c)
+                size = k
                 bool plain = cp >= 0xA0 && cp != 0x2028 && cp != 0x2029 && !(cp == REPLACEMENT && size == 1)
                 if plain:
                     i += size
@@ -357,7 +476,7 @@ public type Writer:
 // `NOT_FINITE`, and anything else is the shortest text that reads back as `v`
 // at its own precision.
 private void put_float(^Writer w, $T v) where T is float:
-    if fmt.is_nan(v) || fmt.is_infinite(v):
+    if math.is_nan(f64(v)) || math.is_infinite(f64(v)):
         w.fail_with(NOT_FINITE)
         return
     if w.before_value():
@@ -383,39 +502,3 @@ public Writer writer(i32 indent = 0, i64 room = 64):
 
 private const u32 REPLACEMENT = 0xFFFD
 private const string8 HEX = "0123456789abcdef"
-
-// The code point at `s[at]` and its length; U+FFFD and 1 for a byte that
-// does not start a well-formed sequence. It answers what core:chars `decode`
-// does, but takes an `i64` index, and core:chars does not build for the web
-// (its `foreign "ctype.h"` block is ERR1032 there).
-private (u32 cp, i64 size) utf8_at(string8 s, i64 at):
-    u32 b0 = u32(s[at])
-    if b0 < 0x80:
-        return (b0, 1)
-    i64 need = 0
-    u32 cp = 0
-    u32 min = 0
-    if b0 >= 0xC2 && b0 < 0xE0:
-        need = 1
-        cp = b0 & 0x1F
-        min = 0x80
-    else if b0 >= 0xE0 && b0 < 0xF0:
-        need = 2
-        cp = b0 & 0x0F
-        min = 0x800
-    else if b0 >= 0xF0 && b0 < 0xF5:
-        need = 3
-        cp = b0 & 0x07
-        min = 0x10000
-    else:
-        return (REPLACEMENT, 1)
-    if at + need >= #len(s):
-        return (REPLACEMENT, 1)
-    for k in 1..=need:
-        u32 b = u32(s[at + k])
-        if b & 0xC0 != 0x80:
-            return (REPLACEMENT, 1)
-        cp = (cp << 6) | (b & 0x3F)
-    if cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp < 0xE000):
-        return (REPLACEMENT, 1)
-    return (cp, need + 1)

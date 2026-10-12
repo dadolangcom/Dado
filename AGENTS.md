@@ -144,7 +144,7 @@ lists a package's signatures; `dado doc <package>` prints its page.
   `hash` (SHA-256), `io` (files and standard streams), `os` (arguments, environment, errors),
   `os/fs` (files and directories), `os/proc` (run a program, read its output), `path`,
   `flags` (command lines), `time`, `log`, `cfg` (INI), `threads`, `jobs`, `mem` (the allocator
-  interface) with `mem/arena`, `mem/bump`, `mem/slab`, `mem/heap`, `mem/libc`, `mem/gc`,
+  interface) with `mem/arena`, `mem/bump`, `mem/slab`, `mem/libc`, `mem/gc`,
   `runtime`, `net`, `http`, `http/server`, `geom/*`, `script` (DadoScript's runtime), `shader`.
 * app (games and tools with a window): `app` and `graphical`/`headless` (the runtime),
   `display`, `draw`, `text`, `font`, `sprite`, `graph` (scene graph), `body2d`, `input`,

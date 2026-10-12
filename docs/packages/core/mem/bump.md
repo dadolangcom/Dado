@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f5f6761926d6 (dirty) -->
 # core:mem/bump
 
 core:mem/bump — a cursor over a block, behind the allocator interface.
@@ -8,8 +8,9 @@ core:mem/bump — a cursor over a block, behind the allocator interface.
     import "core:mem/bump"
 
     [4096]u8 storage
-    bump.Arena arena = bump.over(&storage, 4096)
-    mem.Allocator a = bump.allocator(&arena)
+    bump.Arena arena = bump.over(storage[:])
+    using bump.allocator(&arena):
+        ref []i32 xs = #make([]i32, 8)
 
 **The foundation every other allocator is described in terms of**, and the
 one whose `FreeAll` is the reason to reach for it: releasing every
@@ -28,7 +29,8 @@ code here.)
 
 ## What it does with each mode
 
-    Alloc     align the cursor, hand back the block, advance
+    Alloc     align the cursor, hand back the block, advance; a zero size
+              advances one byte, so its block is distinct (`core:mem`'s rule)
     Resize    **in place** when the block is the last allocation, which is
               O(1) and invisible from outside; `mem.resize_by_copy`
               otherwise
@@ -40,15 +42,26 @@ code here.)
 contains an allocator that does not honour `delete`, which is what makes a
 collector an ordinary member of the interface rather than a new idea.
 
+## Where it runs, and what a script sees
+
+**Every target**: freestanding (`#NONE`), the web, and hosted (Linux, macOS
+and Windows) alike. It asks nothing of a C library.
+
+**What raises into a script: nothing.** An `Arena` is a block's address and
+a cursor into it, and every function here takes one.
+
+**Thread-safety.** An `Arena` belongs to one thread at a time; two threads
+allocating from one race on its cursor.
+
 ## Declarations
 
-15 declarations, 8 public.
+13 declarations, 8 public.
 
 * `type Arena` — The arena's state: where the block is, how large it is, and how much of it…
-* `Arena over(rawptr block, u64 cap)` — An arena over storage that already exists — a `[N]u8` on the stack, a…
-* `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Arena arena)` — The allocator for `arena`. The arena is the allocator's `data`, so it is…
+* `Arena over([]u8 storage)` — An arena over storage that already exists — a `[N]u8` on the stack, a…
+* `(mem.Proc proc, rawptr data) allocator(^Arena arena)` — The allocator for `arena`. The arena is the allocator's `data`, so it is…
 * `type BumpAllocator using mem.Allocator` — The allocator for a bump arena, as a declaration that takes `mem.Allocator` on:
-* `(rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self)`
-* `u64 used(Arena a)` — How many bytes are in use, and how many are left. A test asserting an…
-* `u64 available(Arena a)`
+* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.arena)` answers.
+* `u64 used(Arena a)` — How many bytes are in use, alignment padding included. A test asserting an…
+* `u64 available(Arena a)` — How many bytes are left: the capacity `over` kept, less `used`. A request…
 * `void reset(^Arena a)` — Release every allocation in one store. **Lifetime-ending**: every…

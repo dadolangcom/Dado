@@ -3,24 +3,25 @@
 //
 //     import "core:os/proc"
 //
-//     [2]cstring argv
-//     argv[0] = "toy-lsp"
-//     argv[1] = "--stdio"
-//     proc.Duplex lsp = proc.duplex(argv[:], proc.ERRORS_DISCARD)
-//     if !proc.started(lsp): complain(lsp.failure)       // an errno; 2 is ENOENT
+//     [2]string8 argv = ["toy-lsp", "--stdio"]
+//     try proc.Duplex lsp = proc.duplex(argv[:], proc.Errors.Discard) else why:
+//         complain(os.message(why))                     // NOT_FOUND: no such program
 //
-//     (i64 sent, i32 stopped) = proc.send_all(&lsp, request[:], 50)
+//     try proc.send_all(&lsp, request[:], 50) else why:
+//         ...                                           // Pipe.WAITED or Pipe.BROKE
 //     [4096]char8 chunk
-//     i32 n = proc.receive(&lsp, chunk[:], 0)            // bytes, or DRAINED / WAITED / BROKE
+//     try i64 n = proc.receive(&lsp, chunk[:], 0) else why:
+//         ...                                           // nothing yet, or the child is gone
 //     ...
-//     (bool exited, i32 status) = proc.stop(&lsp, 500)   // EOF, grace, SIGKILL, reap, close
+//     try proc.Ended e = proc.stop(&lsp, 500) else why: // EOF, grace, SIGKILL, reap, close
+//         ...
 //
 // `exec.dado`'s `spawn` gives one direction; this is both, for a program that
 // holds a conversation with its child — a language server speaking JSON-RPC on
 // stdio is the case it was written for. Everything here is `pipe` and
 // `posix_spawnp`, with the argv rules `exec.dado` states (`runnable`,
-// `ARG_CAP`, `PATH` lookup), and the answers are `drain`'s: a byte count, or
-// `DRAINED` / `WAITED` / `BROKE`.
+// `ARG_CAP`, `PATH` lookup), and the answers are `drain`'s: a byte count, 0 at
+// the end of the output, or `Pipe.WAITED` / `Pipe.BROKE`.
 //
 // ── THE FIVE DECISIONS ─────────────────────────────────────────────────────
 //
@@ -44,7 +45,7 @@
 // are pipes and that flag is Linux-only anyway. So the first `duplex` installs
 // `SIG_IGN` if the disposition was `SIG_DFL`, and puts back whatever was there
 // otherwise — a program with its own handler keeps it, and gets its handler
-// called before the `write` answers `BROKE`.
+// called before the `write` fails `BROKE`.
 //   *The cost*, which is process-wide and is the reason this is written down:
 //   after the first `duplex`, a `write` to *any* broken pipe in this process
 //   answers `EPIPE` instead of killing it — so a filter run as `prog | head`
@@ -90,17 +91,18 @@
 // child's `exec`, against 0.35–0.39 ms for `posix_spawnp`.
 //
 // **5. A failed `exec` is reported, not guessed.** `posix_spawnp` answers the
-// `errno` of an `execvp` that failed, so `failure` is `ENOENT` for a program
-// that is not there, rather than a child that ran and exited 127 — the thing
-// `exec` cannot tell apart. That answer is synchronous on both platforms: on
-// glibc because the `CLONE_VFORK` child writes it where the parent reads it
+// `errno` of an `execvp` that failed, so `duplex` fails `NOT_FOUND` for a
+// program that is not there, rather than answering a child that ran and
+// exited 127 — the thing `exec` cannot tell apart. That answer is
+// synchronous on both platforms: on glibc because the `CLONE_VFORK` child
+// writes it where the parent reads it
 // before `posix_spawnp` returns, on Darwin because the system call does the
 // `exec`. **What that costs**: `duplex` returns only once the child has
 // exec'd, so it waits for the kernel to load the program — the figure above,
 // hundreds of microseconds and not milliseconds, and the reason no
 // asynchronous form is offered. An implementation that reported the failure
 // as a child exiting 127 instead (POSIX allows it; glibc before 2.24 did)
-// would make `started` true and `finished` say `(true, true, 127)`; one that
+// would make `duplex` succeed and `finished` answer `Exited(127)`; one that
 // answers an error with a pid is reaped here before the error is answered.
 
 // ── MACOS ──────────────────────────────────────────────────────────────────
@@ -126,17 +128,23 @@
 // and glibc as functions. **Not run on a Mac**, the Darwin arms included.
 package proc
 
+import "core:os"
 import "core:time"
 
 // ── the handle ─────────────────────────────────────────────────────────────
 
 // What `duplex` does with the child's standard error.
-const i32 ERRORS_INHERIT = 0    // the parent's own stderr, untouched
-const i32 ERRORS_PIPE = 1       // a third pipe, read with `receive_errors`
-const i32 ERRORS_MERGE = 2      // into the stdout pipe, as `2>&1`
-const i32 ERRORS_DISCARD = 3    // `/dev/null`
+enum i32 Errors:
+    // The parent's own stderr, untouched.
+    Inherit = 0,
+    // A third pipe, read with `receive_errors`.
+    Pipe = 1,
+    // Into the stdout pipe, as `2>&1`.
+    Merge = 2,
+    // `/dev/null` (`NUL` on Windows).
+    Discard = 3,
 
-// **`ERRORS_PIPE` is a promise to read it.** A child whose stderr pipe fills
+// **`Errors.Pipe` is a promise to read it.** A child whose stderr pipe fills
 // (64 KiB on Linux) blocks in its next `write` to stderr, and a parent that is
 // only reading stdout waits for output that is never coming. Discard or merge
 // unless you will drain both.
@@ -145,24 +153,22 @@ const i32 ERRORS_DISCARD = 3    // `/dev/null`
 // only through the verbs below.
 //
 // `input`, `output` and `errors` are the parent's descriptors, -1 when closed
-// or never opened. `failure` is the `errno` of whatever stopped `duplex` —
-// `ENOENT` for a missing program, as `posix_spawnp` answered it — or -1 for an argv or
-// `errors` mode refused before anything ran, and 0 for a child that started.
-// `reaped`, `exited` and `status` are the wait's answer once there is one, in
-// `proc.close`'s encoding.
+// or never opened. Once `reaped`, `ended` is how the child ended — unless
+// `lost`, when the wait itself could not happen (someone else reaped the
+// child) and there is no ending to tell. A `Duplex` nobody started is all
+// zero, and `started` says so.
 type Duplex:
-    bool open,
-    i32  pid,
-    i32  input,
-    i32  output,
-    i32  errors,
-    i32  failure,
-    bool reaped,
-    bool exited,
-    i32  status,
+    bool  open,
+    i32   pid,
+    i32   input,
+    i32   output,
+    i32   errors,
+    bool  reaped,
+    bool  lost,
+    Ended ended,
 
 // Where each end sits in `duplex`'s one array of six: read end, then write
-// end, for stdin, stdout and stderr, in that order. Under `ERRORS_DISCARD`
+// end, for stdin, stdout and stderr, in that order. Under `Errors.Discard`
 // the stderr write end is `/dev/null`, opened by the parent.
 private const i32 IN_R = 0
 private const i32 IN_W = 1
@@ -182,8 +188,9 @@ private bool g_sigpipe_ours
 
 // ── the verbs written once, over each arm's ─────────────────────────────────
 
-// Whether `duplex` started a child. A `Duplex` that did not holds no
-// descriptor and no pid, and every verb below answers it `BROKE` or `false`.
+// Whether this `Duplex` is a started child: false for one nobody started (a
+// zero value, such as a field not yet assigned), and true from a `duplex`
+// that succeeded until the program ends.
 bool started(Duplex d): return d.open
 
 // Whether the first `duplex` in this process set `SIGPIPE` to ignored — false
@@ -191,56 +198,106 @@ bool started(Duplex d): return d.open
 // disposition of its own.
 bool ignoring_sigpipe(): return g_sigpipe_ours
 
+// Write as much of `bytes` as the pipe will take, waiting at most
+// `timeout_ms` for room (0 waits not at all, negative waits indefinitely).
+//
+// Answers the count written — possibly fewer than `#len(bytes)`, and the rest
+// is the caller's to send again; empty `bytes` answers 0. Fails `Pipe.WAITED`
+// when there was no room in time, and `Pipe.BROKE` when the child's stdin is
+// closed (it exited, or `close_input` ran) or `d` is not a started child.
+Pipe!i64 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+    try i64 n = piped(i64(send_raw(d, bytes, timeout_ms)))
+    return n
+
+// Whatever the child has written to stdout, waiting at most `timeout_ms`:
+// the byte count, 0 once it has closed its stdout (every later call answers
+// 0 again), or `Pipe.WAITED` / `Pipe.BROKE`, exactly as `drain`.
+Pipe!i64 receive(^Duplex d, []char8 into, i32 timeout_ms = 0):
+    try i64 n = piped(i64(receive_raw(d, into, timeout_ms)))
+    return n
+
+// `receive` for the stderr pipe, which exists only under `Errors.Pipe`;
+// `Pipe.BROKE` otherwise.
+Pipe!i64 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0):
+    try i64 n = piped(i64(receive_errors_raw(d, into, timeout_ms)))
+    return n
+
 // `send` until all of `bytes` is gone, or nothing moved for `timeout_ms`.
 //
-// `sent` is how much was written and `stopped` why it stopped short: 0 when
-// all of it went, else `WAITED` or `BROKE` as from `send`. The timeout is a
-// *stall* bound, per wait, and not a bound on the whole call — a child reading
-// one byte a millisecond keeps it going, and each byte is progress. **Only
-// for a message that fits the pipe, or a child that reads without writing
+// The timeout is a *stall* bound, per wait, and not a bound on the whole call
+// — a child reading one byte a millisecond keeps it going, and each byte is
+// progress. Fails as `send` does, with what was already sent sent. **Only for
+// a message that fits the pipe, or a child that reads without writing
 // back:** a child that answers as it reads, with nobody reading its answers,
-// fills its stdout and stops reading, and this then stops with `WAITED`. The
+// fills its stdout and stops reading, and this then fails `WAITED`. The
 // deadlock-free shape for a large exchange is `send` and `receive` in turn.
-(i64 sent, i32 stopped) send_all(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
-    if !has_input(d): return (0, BROKE)
+Pipe!void send_all(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+    if !has_input(d): fail Pipe.BROKE
     i64 total = #len(bytes)
     i64 done = 0
     for done < total:
-        i32 n = send(d, bytes[done..<total], timeout_ms)
-        if n == BROKE || n == WAITED: return (done, n)
-        done += i64(n)
-    return (done, 0)
+        try i64 n = send(d, bytes[done..<total], timeout_ms)
+        done += n
+    return
 
-// The whole ending in one call: close every pipe, give the child `grace_ms` to
-// exit, `SIGKILL` it if it has not, reap it. Answers `proc.close`'s pair, and
-// `(false, -1)` for a `Duplex` never started.
+// How the child ended, without waiting: fails `Pipe.WAITED` while it is
+// still running, and `Pipe.BROKE` for a `Duplex` never started or a wait that
+// could not happen (the child was reaped by someone else). Once it has
+// ended, every later call answers the same from the record without asking
+// the system.
+Pipe!Ended finished(^Duplex d):
+    try Ended e = finish(d, 0)
+    return e
+
+// `finished`, waiting up to `timeout_ms` for it (negative waits
+// indefinitely).
+Pipe!Ended finish(^Duplex d, i32 timeout_ms):
+    if d == nil || !d.open: fail Pipe.BROKE
+    if !finish_raw(d, timeout_ms): fail Pipe.WAITED
+    if d.lost: fail Pipe.BROKE
+    return d.ended
+
+// The whole ending in one call: close every pipe, give the child `grace_ms`
+// to exit, end it if it has not (`SIGKILL`; the job on Windows), reap it, and
+// answer how it ended. Fails `Pipe.BROKE` for a `Duplex` never started.
 //
 // **Unread output is thrown away**, on purpose: the read ends are closed
 // first, so a child still writing gets `EPIPE` (or its default `SIGPIPE`)
-// instead of blocking on a full pipe until the grace runs out. Read to
-// `DRAINED` first if the tail matters.
-(bool exited, i32 status) stop(^Duplex d, i32 grace_ms):
-    if d == nil || !d.open: return (false, 0 - 1)
-    release(d)
-    (bool done, bool exited, i32 status) = finish(d, grace_ms)
-    if done: return (exited, status)
-    _ = kill(d)
-    (_, bool exited2, i32 status2) = finish(d, 0 - 1)
-    return (exited2, status2)
+// instead of blocking on a full pipe until the grace runs out. Read to the
+// end of the output first if the tail matters.
+Pipe!Ended stop(^Duplex d, i32 grace_ms):
+    if d == nil || !d.open: fail Pipe.BROKE
+    close_pipes(d)
+    if !finish_raw(d, grace_ms):
+        _ = kill(d)
+        _ = finish_raw(d, 0 - 1)
+    if !d.reaped || d.lost: fail Pipe.BROKE
+    return d.ended
 
-private Duplex unstarted(i32 why):
+// A `Duplex` for a child that started: `pid`, and the parent's three ends.
+private Duplex running(i32 pid, i32 input, i32 output, i32 errors):
     Duplex d
-    d.open = false
-    d.pid = 0 - 1
-    d.input = 0 - 1
-    d.output = 0 - 1
-    d.errors = 0 - 1
-    d.failure = why
-    d.status = 0 - 1
+    d.open = true
+    d.pid = pid
+    d.input = input
+    d.output = output
+    d.errors = errors
     return d
+
+// Record the wait's answer — an exit code, or a negated signal number with
+// `exited` false, `(false, -1)` for a wait that never happened — once.
+private void record(^Duplex d, bool exited, i32 status):
+    d.reaped = true
+    (Ended e, bool known) = ending(exited, status)
+    d.ended = e
+    d.lost = !known
 
 private bool has_input(^Duplex d):
     return d != nil && d.open && d.input >= 0
+
+// Whether `errors` is a member, which a value of an enum need not be.
+private bool known_errors(Errors errors):
+    return errors == Errors.Inherit || errors == Errors.Pipe || errors == Errors.Merge || errors == Errors.Discard
 
 // ── WINDOWS ────────────────────────────────────────────────────────────────
 //
@@ -256,28 +313,26 @@ private bool has_input(^Duplex d):
 // `send_staged`). Reads are `drain`'s, `PeekNamedPipe` then one `ReadFile` of
 // what is there.
 // **2. There is no `SIGPIPE`.** A write to a pipe whose reader has gone fails
-// with `ERROR_NO_DATA` or `ERROR_BROKEN_PIPE`, and `send` answers `BROKE`;
+// with `ERROR_NO_DATA` or `ERROR_BROKEN_PIPE`, and `send` fails `BROKE`;
 // `ignoring_sigpipe` is false, because nothing was changed.
 // **3. Only the child's three ends are inherited**, by the handle list
 // `windows.dado` describes, so a second child never holds the first one's
 // stdin open. A parent with no standard handle passes the child none.
 // **4. `CreateProcessW` is the only way there is**, and costs the parent
 // nothing in proportion to its size.
-// **5. A failed start is reported, not guessed**: `failure` is the
-// `GetLastError` code, `ERROR_FILE_NOT_FOUND` (2, as `ENOENT` is) for a
-// program that is not there.
+// **5. A failed start is reported, not guessed**: `duplex` fails with the
+// `GetLastError` code as `os.Error`, `NOT_FOUND` for a program that is not
+// there.
 //
 // **`terminate` and `kill` are one thing**, because Windows has no request a
 // process must be asked by: both end the child and every process it started,
-// through its job, and the answer is `(false, -9)`, `SIGKILL`'s. `finish`
+// through its job, and the answer is `Signaled(9)`, `SIGKILL`'s. `finish`
 // waits on the process handle with the timeout, so it does not poll.
 // `input`, `output` and `errors` are C-runtime descriptors over the pipe
 // handles, so a closed one is -1 as on POSIX.
 when #OS == #WINDOWS:
-    Duplex duplex([]cstring argv, i32 errors = ERRORS_INHERIT):
-        Duplex d = unstarted(0 - 1)
-        if !runnable(argv): return d
-        if errors < ERRORS_INHERIT || errors > ERRORS_DISCARD: return d
+    os.Error!Duplex duplex([]string8 argv, Errors errors = Errors.Inherit):
+        if !runnable(argv) || !known_errors(errors): fail os.Error.INVALID
 
         (rawptr in_parent, rawptr in_child, i32 why) = outbound_pipe()
         rawptr out_parent = nil
@@ -286,15 +341,15 @@ when #OS == #WINDOWS:
         rawptr err_parent = nil
         rawptr err_child = nil
         bool err_ours = false
-        if why == 0 && errors == ERRORS_PIPE:
+        if why == 0 && errors == Errors.Pipe:
             (err_parent, err_child, why) = anonymous_pipe()
             err_ours = true
-        if why == 0 && errors == ERRORS_DISCARD:
+        if why == 0 && errors == Errors.Discard:
             err_child = open_null()
             err_ours = true
             if err_child == nil: why = i32(ERROR_FILE_NOT_FOUND)
-        if errors == ERRORS_INHERIT: err_child = std_handle(STD_ERROR_HANDLE)
-        if errors == ERRORS_MERGE: err_child = out_child
+        if errors == Errors.Inherit: err_child = std_handle(STD_ERROR_HANDLE)
+        if errors == Errors.Merge: err_child = out_child
 
         i32 pid = 0 - 1
         if why == 0: (pid, why) = launch_argv(argv, in_child, out_child, err_child)
@@ -307,37 +362,34 @@ when #OS == #WINDOWS:
             close_handle(in_parent)
             close_handle(out_parent)
             close_handle(err_parent)
-            d.failure = why
-            return d
+            try os.fail_with(os.from_system(i64(why)))
 
-        d.input = descriptor(in_parent, CRT_WRITE)
-        d.output = descriptor(out_parent, CRT_READ)
-        if err_parent != nil: d.errors = descriptor(err_parent, CRT_READ)
-        if d.input < 0 || d.output < 0 || (err_parent != nil && d.errors < 0):
-            close_fd(d.input)
-            close_fd(d.output)
-            close_fd(d.errors)
+        i32 input = descriptor(in_parent, CRT_WRITE)
+        i32 output = descriptor(out_parent, CRT_READ)
+        i32 errs = 0 - 1
+        if err_parent != nil: errs = descriptor(err_parent, CRT_READ)
+        if input < 0 || output < 0 || (err_parent != nil && errs < 0):
+            close_fd(input)
+            close_fd(output)
+            close_fd(errs)
             _ = end_tree(pid)
             _ = reap_pid(pid, 0 - 1)
-            return unstarted(i32(ERROR_TOO_MANY_OPEN_FILES))
-        d.open = true
-        d.pid = pid
-        d.failure = 0
-        return d
+            fail os.Error.TOO_MANY_OPEN
+        return running(pid, input, output, errs)
 
-    i32 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+    private i32 send_raw(^Duplex d, []char8 bytes, i32 timeout_ms):
         if !has_input(d): return BROKE
         i64 n = #len(bytes)
         if n <= 0: return 0
         if n > WRITE_CAP: n = WRITE_CAP
         return send_staged(d.pid, d.input, bytes, n, timeout_ms)
 
-    i32 receive(^Duplex d, []char8 into, i32 timeout_ms = 0):
+    private i32 receive_raw(^Duplex d, []char8 into, i32 timeout_ms):
         if d == nil || !d.open: return BROKE
         if !d.reaped: service_pid(d.pid)
         return drain_handle(handle_of(d.output), into, timeout_ms)
 
-    i32 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0):
+    private i32 receive_errors_raw(^Duplex d, []char8 into, i32 timeout_ms):
         if d == nil || !d.open: return BROKE
         return drain_handle(handle_of(d.errors), into, timeout_ms)
 
@@ -352,20 +404,17 @@ when #OS == #WINDOWS:
 
     bool kill(^Duplex d): return end_child(d)
 
-    (bool done, bool exited, i32 status) finished(^Duplex d):
-        return finish(d, 0)
-
-    (bool done, bool exited, i32 status) finish(^Duplex d, i32 timeout_ms):
-        if d == nil || !d.open: return (false, false, 0 - 1)
-        if d.reaped: return (true, d.exited, d.status)
+    // Whether the child has ended, waiting up to `timeout_ms` (negative:
+    // without limit), the answer recorded in `d` once.
+    private bool finish_raw(^Duplex d, i32 timeout_ms):
+        if d == nil || !d.open: return false
+        if d.reaped: return true
         (bool done, bool exited, i32 status) = reap_pid(d.pid, timeout_ms)
-        if !done: return (false, false, 0 - 1)
-        d.reaped = true
-        d.exited = exited
-        d.status = status
-        return (true, exited, status)
+        if !done: return false
+        record(d, exited, status)
+        return true
 
-    void release(^Duplex d):
+    void close_pipes(^Duplex d):
         if d == nil || !d.open: return
         _ = close_input(d)
         close_fd(d.output)
@@ -482,29 +531,32 @@ else:
     // ── starting ───────────────────────────────────────────────────────────────
 
     // Start `argv` with its stdin and stdout on pipes to this process, and its
-    // stderr as `errors` says. Blocks only until the child has exec'd (the file's
-    // head has the cost), and never aborts: `started` answers whether it worked
-    // and `failure` says why not.
-    Duplex duplex([]cstring argv, i32 errors = ERRORS_INHERIT):
-        Duplex d = unstarted(0 - 1)
-        if !runnable(argv): return d
-        if errors < ERRORS_INHERIT || errors > ERRORS_DISCARD: return d
+    // stderr as `errors` says. Blocks only until the child has exec'd (the
+    // file's head has the cost). Fails `INVALID` for an argv this package will
+    // not run, `NOT_FOUND` for a program that is not there, and the system's
+    // reason for a pipe or a start that failed.
+    os.Error!Duplex duplex([]string8 argv, Errors errors = Errors.Inherit):
+        if !runnable(argv) || !known_errors(errors): fail os.Error.INVALID
+        ref []char8 block = argv_block(argv)
+        defer #delete(block)
+        if block == nil: fail os.Error.NO_MEMORY
+        CArgv c_argv = c_argv_of(&block, #len(argv))
         ignore_sigpipe_once()
 
         [ENDS]i32 fds
         for i in 0..<ENDS:
             fds[i] = 0 - 1
         bool piped = open_pipe(fds[:], IN_R) && open_pipe(fds[:], OUT_R)
-        if piped && errors == ERRORS_PIPE: piped = open_pipe(fds[:], ERR_R)
-        if piped && errors == ERRORS_DISCARD:
+        if piped && errors == Errors.Pipe: piped = open_pipe(fds[:], ERR_R)
+        if piped && errors == Errors.Discard:
             fds[ERR_W] = above_stdio(sys.open("/dev/null", sys.O_WRONLY | sys.O_CLOEXEC))
             piped = fds[ERR_W] >= 0
         if !piped:
-            d.failure = errno
+            os.Error failed = os.last_error()
             close_ends(fds[:])
-            return d
+            try os.fail_with(failed)
 
-        (i32 pid, i32 why) = spawn_child(argv, fds[:], errors)
+        (i32 pid, i32 why) = spawn_child(&c_argv, fds[:], errors)
 
         // The child's ends are the child's copies now, or nobody's: the parent's
         // are closed either way, so its stdout read end sees end-of-file when the
@@ -514,8 +566,7 @@ else:
         close_end(fds[:], ERR_W)
         if why != 0:
             close_ends(fds[:])
-            d.failure = why
-            return d
+            try os.fail_with(os.from_system(i64(why)))
 
         // Non-blocking on the one end the parent writes. The read ends stay
         // blocking: `drain_fd` reads only after `poll` says there is something, and
@@ -523,24 +574,12 @@ else:
         i32 flags = sys.fcntl(fds[IN_W], sys.F_GETFL)
         if flags >= 0: _ = sys.fcntl(fds[IN_W], sys.F_SETFL, flags | sys.O_NONBLOCK)
 
-        d.open = true
-        d.pid = pid
-        d.input = fds[IN_W]
-        d.output = fds[OUT_R]
-        d.errors = fds[ERR_R]
-        d.failure = 0
-        return d
+        return running(pid, fds[IN_W], fds[OUT_R], fds[ERR_R])
 
     // ── talking ────────────────────────────────────────────────────────────────
 
-    // Write as much of `bytes` as the pipe will take, waiting at most `timeout_ms`
-    // for room (0 waits not at all, negative waits indefinitely).
-    //
-    // Answers the count written — possibly fewer than `#len(bytes)`, and the rest
-    // is the caller's to send again — or `WAITED` when there was no room in time,
-    // or `BROKE` when the child's stdin is closed (it exited, or `close_input`
-    // ran) or `d` is not a started child. Empty `bytes` answers 0.
-    i32 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0):
+    // `send`'s answer: the count, or `WAITED` / `BROKE`.
+    private i32 send_raw(^Duplex d, []char8 bytes, i32 timeout_ms):
         if !has_input(d): return BROKE
         i64 n = #len(bytes)
         if n <= 0: return 0
@@ -558,16 +597,12 @@ else:
             if e == EAGAIN || e == EINTR: return WAITED
         return BROKE
 
-    // Whatever the child has written to stdout, waiting at most `timeout_ms`:
-    // the byte count, or `DRAINED` (it closed its stdout — every later call says
-    // so again), `WAITED` or `BROKE`, exactly as `drain`.
-    i32 receive(^Duplex d, []char8 into, i32 timeout_ms = 0):
+    // `receive`'s answer, as `drain_fd` gives it.
+    private i32 receive_raw(^Duplex d, []char8 into, i32 timeout_ms):
         if d == nil || !d.open: return BROKE
         return drain_fd(d.output, into, timeout_ms)
 
-    // `receive` for the stderr pipe, which exists only under `ERRORS_PIPE`;
-    // `BROKE` otherwise.
-    i32 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0):
+    private i32 receive_errors_raw(^Duplex d, []char8 into, i32 timeout_ms):
         if d == nil || !d.open: return BROKE
         return drain_fd(d.errors, into, timeout_ms)
 
@@ -588,52 +623,52 @@ else:
     // Stop the child whether it agrees or not (`SIGKILL`). Same refusals.
     bool kill(^Duplex d): return signal_child(d, sig.SIGKILL)
 
-    // Whether the child has ended, without waiting. `done` false is "still
-    // running" and the other two are then meaningless; once `done`, every later
-    // call answers the same triple from the record without asking the kernel.
-    // `(exited, status)` is `proc.close`'s encoding: an exit code, or a negated
-    // signal number with `exited` false.
-    (bool done, bool exited, i32 status) finished(^Duplex d):
-        if d == nil || !d.open: return (false, false, 0 - 1)
-        if d.reaped: return (true, d.exited, d.status)
+    // Whether the child has ended, without waiting, the answer recorded in
+    // `d` once; every later call answers from the record without asking the
+    // kernel.
+    private bool finished_raw(^Duplex d):
+        if d == nil || !d.open: return false
+        if d.reaped: return true
         i32 raw = 0
         i32 got = wait_for.waitpid(d.pid, &raw, wait_for.WNOHANG)
-        if got == 0: return (false, false, 0 - 1)
-        return settle(d, got, raw)
+        if got == 0: return false
+        settle(d, got, raw)
+        return true
 
-    // `finished`, waiting up to `timeout_ms` for it (negative waits indefinitely).
+    // `finished_raw`, waiting up to `timeout_ms` for it (negative waits
+    // indefinitely).
     //
     // The bounded wait polls: `waitpid` has no timeout, so this asks with `WNOHANG`
     // and naps 1, 2, 4, 8 and then 16 ms between asks. The cost is up to 16 ms of
     // latency after a slow child exits, bought instead of a `SIGCHLD` handler,
     // which would be process-wide state this package does not want to own.
-    (bool done, bool exited, i32 status) finish(^Duplex d, i32 timeout_ms):
-        if d == nil || !d.open: return (false, false, 0 - 1)
-        if d.reaped: return (true, d.exited, d.status)
+    private bool finish_raw(^Duplex d, i32 timeout_ms):
+        if d == nil || !d.open: return false
+        if d.reaped: return true
         if timeout_ms < 0:
             i32 raw = 0
             i32 got = 0 - 1
             for:
                 got = wait_for.waitpid(d.pid, &raw, 0)
                 if got >= 0 || errno != EINTR: break
-            return settle(d, got, raw)
+            settle(d, got, raw)
+            return true
 
-        f64 began = time.now()
+        time.Instant began = time.instant()
         i32 step = 1
         for:
-            (bool done, bool exited, i32 status) = finished(d)
-            if done: return (true, exited, status)
-            i64 left = i64(timeout_ms) - time.ms_since(began)
+            if finished_raw(d): return true
+            i64 left = i64(timeout_ms) - time.as_milliseconds(time.elapsed(began))
             if left <= 0: break
             if i64(step) > left: step = i32(left)
-            time.nap(step)
+            time.sleep(time.milliseconds(step))
             if step < 16: step = step * 2
-        return (false, false, 0 - 1)
+        return false
 
     // Close every descriptor the parent still holds, without waiting. The child
     // is not reaped — `finished` and `finish` still work after this — and a second
     // call does nothing.
-    void release(^Duplex d):
+    void close_pipes(^Duplex d):
         if d == nil || !d.open: return
         _ = close_input(d)
         if d.output >= 0: _ = sys.close(d.output)
@@ -647,20 +682,16 @@ else:
         if d == nil || !d.open || d.reaped || d.pid <= 0: return false
         return sig.kill(d.pid, signum) == 0
 
-    // Record a `waitpid` answer. -1 is `ECHILD` in practice — the child was reaped
-    // by someone else, or `SIGCHLD` is ignored and the kernel reaped it — and is
-    // recorded as done with `(false, -1)`, the wait-that-never-happened pair,
-    // because asking again would answer the same.
-    private (bool done, bool exited, i32 status) settle(^Duplex d, i32 got, i32 raw):
-        d.reaped = true
+    // Record a `waitpid` answer. -1 is `ECHILD` in practice — the child was
+    // reaped by someone else, or `SIGCHLD` is ignored and the kernel reaped it
+    // — and is recorded as done and `lost`, because asking again would answer
+    // the same.
+    private void settle(^Duplex d, i32 got, i32 raw):
         if got < 0:
-            d.exited = false
-            d.status = 0 - 1
-        else:
-            (bool exited, i32 status) = decode(raw)
-            d.exited = exited
-            d.status = status
-        return (true, d.exited, d.status)
+            record(d, false, 0 - 1)
+            return
+        (bool exited, i32 status) = decode(raw)
+        record(d, exited, status)
 
     // `pipe` into `fds[at]` and `fds[at + 1]`, both close-on-exec at once and
     // both numbered 3 or above (`above_stdio`) — the child's ends too, since
@@ -719,13 +750,7 @@ else:
     // set-up, or of the `execvp` that failed. A pid answered beside an error (an
     // implementation that forked before it failed) is reaped here: that child is
     // exiting 127, so the wait is bounded by its exit.
-    private (i32 pid, i32 why) spawn_child([]cstring argv, []i32 fds, i32 errors):
-        [ARGV_SLOTS]cstring c_argv
-        i32 n = i32(#len(argv))
-        for i in 0..<n:
-            c_argv[i] = argv[i]
-        c_argv[n] = nil
-
+    private (i32 pid, i32 why) spawn_child(^CArgv c_argv, []i32 fds, Errors errors):
         posix_spawn_file_actions_t fa
         posix_spawnattr_t attr
         i32 why = posix_spawn_file_actions_init(&fa)
@@ -737,9 +762,9 @@ else:
 
         why = posix_spawn_file_actions_adddup2(&fa, fds[IN_R], 0)
         if why == 0: why = posix_spawn_file_actions_adddup2(&fa, fds[OUT_W], 1)
-        if why == 0 && (errors == ERRORS_PIPE || errors == ERRORS_DISCARD):
+        if why == 0 && (errors == Errors.Pipe || errors == Errors.Discard):
             why = posix_spawn_file_actions_adddup2(&fa, fds[ERR_W], 2)
-        if why == 0 && errors == ERRORS_MERGE:
+        if why == 0 && errors == Errors.Merge:
             why = posix_spawn_file_actions_adddup2(&fa, 1, 2)
         if why == 0 && g_sigpipe_ours:
             SigSet dfl
@@ -750,7 +775,7 @@ else:
 
         i32 pid = 0 - 1
         if why == 0:
-            why = posix_spawnp(&pid, c_argv[0], &fa, &attr, Argv(rawptr(&c_argv[0])), Argv(environment()))
+            why = posix_spawnp(&pid, c_argv^[0], &fa, &attr, Argv(rawptr(&c_argv^[0])), Argv(environment()))
         _ = posix_spawnattr_destroy(&attr)
         _ = posix_spawn_file_actions_destroy(&fa)
         if why != 0 && pid > 0:

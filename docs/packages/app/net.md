@@ -1,8 +1,8 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit 549ca2ce6a97 -->
 # app:net
 
-app:net — the RPC-and-packets escape hatch on top of `core:net`: framed
+app:net — the RPC-and-packets escape hatch on top of `core:net/enet`: framed
 remote calls, and peers named by a small integer.
 
     import "app:net"    // binds `net` — the last path segment
@@ -29,20 +29,20 @@ readability — a program that polls both this package and `app:input` in one
 call site — and that is now the *whole* of the reason.
 
 It was not the original reason, and the correction is worth keeping. This
-package first chose these names to escape a refusal: with `core:net`'s own
+package first chose these names to escape a refusal: with `core:net/enet`'s own
 `Event` and a local `Event` both visible, every field access on either was
 `ERR0518`, and the comment here explained it as view resolution keying
 "off the plain name, not full structural identity." That was a
 compiler defect, not a rule — what is refused is *two visible spellings of
 **one shape***, and these were two shapes. It is fixed;
-`example/net`'s client now imports `core:net` and `app:input` into one file,
+`example/net`'s client now imports `core:net/enet` and `app:input` into one file,
 which is the case that could not be written. **Reverting the names is a
 live option and deliberately not taken here**: it is an API change to a
 landed package with a test and an example against it, and the names earn
 their keep on their own merits now. Whoever weighs it should know it is a
 preference and no longer a constraint.
 
-**The mechanism.** `core:net` is the `Reliable`/
+**The mechanism.** `core:net/enet` is the `Reliable`/
 `Unreliable` wrapper over `vendor:enet` — a `Host`, a `Peer`, `send`/
 `broadcast`, and a `poll` that drains ENet's event loop. This is the
 opinion on top, the same split `core:log`/`app:log` already follows:
@@ -60,12 +60,12 @@ A server cannot also `dial` out in this baseline — a program that needs
 both roles in one process is out of scope here (the target shape is a
 headless server *and* a separate TUI client, two processes).
 
-**Peer ids, not pointers.** `core:net.Peer` is a raw `^ENetPeer`; this
+**Peer ids, not pointers.** `core:net/enet.Peer` is a raw `^ENetPeer`; this
 package keeps a fixed `MAX_PEERS`-slot table and hands back a small `i32`
 instead — the surface names a `peer_id`, not a pointer, and a
 small int is what a program can put in an array index or send back over
-the wire itself. A server's peers are registered as `core:net`'s own
-`Kind.Connect` events arrive (their id is not known before then); a client's one peer is
+the wire itself. A server's peers are registered as `core:net/enet`'s own
+`Connected` events arrive (their id is not known before then); a client's one peer is
 registered synchronously by `dial`, at `connect`'s return, before the
 handshake even completes — the same event fires again once it does, and
 `poll` recognises the peer by pointer identity rather than re-registering
@@ -74,7 +74,7 @@ it under a second id.
 **`poll` is drained at the barrier, exactly like `input.poll`** —
 three hooks, and everything else is polled: call it from `process`, not
 anywhere else. Unlike `input`, there is no separate backend-driven fill
-step — `core:net.poll`'s own `timeout_ms = 0` call is non-blocking and
+step — `core:net/enet.poll`'s own `timeout_ms = 0` call is non-blocking and
 ENet already buffers internally, so calling it directly, in a loop, from
 inside `process` *is* the drain; no intermediate ring is needed. That was
 the open question this package settles — a ring turned out to be
@@ -91,21 +91,34 @@ automatically at the next one — the lifetime every scratch-backed value in
 this framework gets, and the reason a `poll` result must be read or copied
 within the frame that produced it.
 
-**The wire format `rpc` adds over a raw `core:net` packet is one `i32`,
+**The wire format `rpc` adds over a raw `core:net/enet` packet is one `i32`,
 little-endian, prefixed to the payload** — `id`, so `poll` can hand it
 back without the program inventing its own header. This is the one piece
 of framing `app:net` owns; the *payload* bytes are still "the program
-serialises itself." **`core:net`'s own `send`/`broadcast`
+serialises itself." **`core:net/enet`'s own `send`/`broadcast`
 are not re-exposed here** — the "raw packets, one level lower" surface
 (`app.send`/`app.receive`, unframed) is deliberately deferred: sharing one
 `Host`/channel pair between framed `rpc` traffic and unframed raw traffic
 needs its own disambiguation design (`poll` consumes exactly one
-`core:net.poll` event per call and cannot peek its bytes before deciding
+`core:net/enet.poll` event per call and cannot peek its bytes before deciding
 how to decode them), and the Definition of done here is "exchange RPCs,"
 not both surfaces at once. A future task can add it once a real caller
 needs it.
 
 ## Declarations
 
-0 declarations, 0 public.
+26 declarations, 13 public.
 
+* `const i32 MAX_PEERS = 64`
+* `bool listen(u16 port, u64 max_peers)` — Become a server, bound to `port`, accepting up to `max_peers`. `false` on…
+* `i32 dial(string8 address, u16 port)` — Become a client (on first call) and connect to `address:port`. Returns the…
+* `bool disconnect_peer(i32 peer_id)` — Ask a peer to disconnect gracefully — drain `poll` for the matching…
+* `void flush()` — Push queued outgoing traffic now rather than waiting for the next `poll`.
+* `void close()` — Tear down the host (and, if this was the last one, the ENet library…
+* `bool is_open()`
+* `bool is_server()`
+* `u32 peer_count()` — How many peers are currently connected. `0` with no host open.
+* `bool rpc(i32 peer_id, i32 id, []u8 bytes, corenet.Class cls)` — Send `bytes` tagged with `id` to one peer (`peer_id`) or every connected…
+* `enum i32 NetEventKind: (Connect, Disconnect, Timeout, Rpc)`
+* `type NetEvent: (NetEventKind kind, i32 peer, i32 id, []u8 data)` — `id`/`data` are meaningful only for `NetEventKind.Rpc` — every other kind carries…
+* `i32 poll([]NetEvent out)` — Drain up to `#len(out)` pending events, returning how many were written. A…

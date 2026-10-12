@@ -1,17 +1,15 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f5f6761926d6 (dirty) -->
 # core:mem/arena
 
 core:mem/arena — a bump arena that **grows**, behind the allocator interface.
 
-    import "core:mem"
-    import "core:mem/libc"
     import "core:mem/arena"
 
-    arena.Arena scratch = arena.over(libc.allocator())
+    arena.Arena scratch = arena.over(#default)   // blocks from the caller's allocator
     defer arena.destroy(&scratch)
     using arena.allocator(&scratch):
-        ...                                  // `#default` is the arena here
+        ref []i32 xs = #make([]i32, 100)          // `#default` is the arena here
 
 `core:mem/bump` is a cursor over **one** block and answers `nil` when that
 block is full. This is the same cursor over a **list** of them: when the head
@@ -26,7 +24,9 @@ have a size the caller has to have guessed right.
 
 ## What it does with each mode
 
-    Alloc     carve from the head block; request another when it will not fit
+    Alloc     carve from the head block; request another when it will not fit.
+              A zero size takes one byte, so its block is distinct
+              (`core:mem`'s zero-size rule)
     Resize    **in place** when the block is the head's last allocation, which
               is O(1) and invisible from outside; `mem.resize_by_copy`
               otherwise
@@ -37,13 +37,14 @@ have a size the caller has to have guessed right.
               being permanent. Every reference into the arena is stale from
               that moment, and nothing detects it
 
-## Why this needed a window over a bare pointer
+## Trusted: the backing allocator's zeroing
 
-Every byte address below is `region[at..<at + n]` over a `[]u8` taken across
-the block. There used to be no such form: reaching byte `at` meant
-over-typing it as a `^[65536]u8`, which capped every allocator written in
-Dado at a 64 KiB heap — and a *growing* arena whose blocks
-cannot exceed 64 KiB is not one.
+Allocation always zeroes, and a block from the backing allocator is an
+allocation, so a carve from a block's never-used tail is handed out without
+a second pass: each block keeps a `clean` mark, and only bytes below it — ones
+an allocation a release gave back may have written — are zeroed again. A
+backing that does not zero its blocks breaks `core:mem`'s contract, and this
+arena then hands out blocks that are not zero.
 
 ## Scoped release is `defer`, and is not automatic
 
@@ -57,20 +58,31 @@ used for is a helper that builds a temporary and **returns it**, which an
 automatic release at block or function exit would break. Mark/release is the
 correct primitive and where the marks go is the programmer's call.
 
+## Where it runs, and what a script sees
+
+**Every target**: freestanding (`#NONE`), the web, and hosted (Linux, macOS
+and Windows) alike. It is Dado over the backing allocator it is handed, so
+it runs wherever that one does.
+
+**What raises into a script: nothing.** An `Arena` holds its backing
+allocator and its blocks as addresses, and every function here takes one.
+
+**Thread-safety.** An `Arena` belongs to one thread at a time; two threads
+allocating from one race on its cursor.
+
 ## Declarations
 
-29 declarations, 17 public.
+29 declarations, 16 public.
 
-* `type Block` — One block: the storage, the cursor into it, and the block allocated *before*
 * `type Arena` — The arena: where new blocks come from, the head of the list, how large the…
 * `type Mark` — A cursor position to rewind to. It carries the arena, so `end` takes one…
 * `const u64 BLOCK = 65536` — The first block's size, and the one every doubling starts from. 64 KiB…
-* `Arena over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing)` — An arena that requests blocks from `backing`. **It does not allocate**: the…
-* `Arena sized((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, u64 first)` — The same, with the first block's size written. Later blocks double from it,…
+* `Arena over((mem.Proc proc, rawptr data) backing)` — An arena that requests blocks from `backing`. **It does not allocate**: the…
+* `Arena sized((mem.Proc proc, rawptr data) backing, u64 first)` — The same, with the first block's size written. Later blocks double from it,…
 * `bool prime(^Arena a)` — Request the first block **now** rather than on the first allocation, and say…
-* `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Arena a)` — The allocator for `a`. The arena is the allocator's `data`, so it is borrowed…
+* `(mem.Proc proc, rawptr data) allocator(^Arena a)` — The allocator for `a`. The arena is the allocator's `data`, so it is borrowed…
 * `type ArenaAllocator using mem.Allocator` — The allocator for an arena, as a declaration that takes `mem.Allocator` on:
-* `(rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self)`
+* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.arena)` answers.
 * `void reset(^Arena a)` — Release every allocation, **keeping the oldest block**. One store per block…
 * `void destroy(^Arena a)` — Hand every block back, including the oldest. The arena is reusable…
 * `Mark begin(^Arena a)` — Where the arena is now. `bump.used` is already this for a single block; a…

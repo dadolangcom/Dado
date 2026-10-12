@@ -1,0 +1,354 @@
+@test
+// core:threads: what each primitive promises, with threads where the build
+// has them. Every thread here starts with `try_spawn`, so a single-threaded
+// web module builds this test too: there `try_spawn` answers nil, and the
+// test checks the one-thread half of each promise (a lock taken and given
+// back, a wait that runs out, a count that reaches 0) and skips the rest.
+package threads
+
+import "core:time"
+
+const i32 WORKERS = 4
+
+// ── join_result ──
+
+rawptr echo(rawptr arg):
+    return arg
+
+// ── try_lock: a thread holds `g_held` until the main thread says so ──
+
+Mutex g_held = nil
+AtomicBool g_holding
+AtomicBool g_may_release
+
+rawptr holder(rawptr arg):
+    lock(g_held)
+    g_holding.store(true)
+    for !g_may_release.load():
+        yield()
+    unlock(g_held)
+    return nil
+
+// ── a timed wait that a signal ends ──
+
+Mutex g_wake_m = nil
+Cond g_wake_c = nil
+bool g_woken = false
+
+rawptr waker(rawptr arg):
+    lock(g_wake_m)
+    g_woken = true
+    cond_signal(g_wake_c)
+    unlock(g_wake_m)
+    return nil
+
+// ── Once ──
+
+Once g_once
+i32 g_once_runs = 0
+
+void once_body(rawptr data):
+    _ = atomic_fetch_add(&g_once_runs, 1)
+
+rawptr once_caller(rawptr arg):
+    g_once.call(once_body, nil)
+    return nil
+
+// ── Semaphore: at most two inside at once ──
+
+Semaphore g_sem
+i32 g_inside = 0
+i32 g_most_inside = 0
+
+rawptr sem_worker(rawptr arg):
+    for _ in 0..<200:
+        g_sem.acquire()
+        i32 now = atomic_fetch_add(&g_inside, 1) + 1
+        i32 seen = atomic_load(&g_most_inside)
+        for now > seen && !atomic_cas(&g_most_inside, seen, now):
+            seen = atomic_load(&g_most_inside)
+        _ = atomic_fetch_sub(&g_inside, 1)
+        g_sem.release()
+    return nil
+
+// ── WaitGroup ──
+
+WaitGroup g_wg
+i64 g_wg_sum = 0
+
+rawptr wg_worker(rawptr arg):
+    _ = atomic_fetch_add(&g_wg_sum, i64(1000000000000), Order.Relaxed)
+    g_wg.done()
+    return nil
+
+// ── Barrier: every round, exactly one thread is told it arrived last ──
+
+const i32 ROUNDS = 50
+Barrier g_barrier
+i32 g_last = 0
+i32 g_round_ticks = 0
+
+rawptr barrier_worker(rawptr arg):
+    for _ in 0..<ROUNDS:
+        _ = atomic_fetch_add(&g_round_ticks, 1)
+        if g_barrier.wait():
+            _ = atomic_fetch_add(&g_last, 1)
+        // A second wait, so no thread starts the next round's count before
+        // every thread has finished this one's.
+        _ = g_barrier.wait()
+    return nil
+
+// ── reader/writer lock: readers share it, a writer is alone ──
+
+RwLock g_rw = nil
+i64 g_rw_value = 0
+i32 g_rw_bad = 0
+
+rawptr rw_worker(rawptr arg):
+    for i in 0..<500:
+        if i % 10 == 0:
+            write_lock(g_rw)
+            g_rw_value += 2
+            write_unlock(g_rw)
+        else:
+            read_lock(g_rw)
+            if g_rw_value % 2 != 0:
+                _ = atomic_fetch_add(&g_rw_bad, 1)
+            read_unlock(g_rw)
+    return nil
+
+// ── current_id ──
+
+u64 g_ids_seen = 0
+
+rawptr id_worker(rawptr arg):
+    u64 me = current_id()
+    if me < 64:
+        _ = atomic_fetch_or(&g_ids_seen, u64(1) << me)
+    return nil
+
+// Joins every non-nil handle in `ts`, answering whether each join worked.
+bool join_all(^[WORKERS]Thread ts):
+    bool ok = true
+    for i in 0..<WORKERS:
+        if ts[i] != nil:
+            ok = join(ts[i]) && ok
+    return ok
+
+i32 test():
+    bool ok = true
+
+    // Whether this build has threads: nil only in a single-threaded web module.
+    i32 marker = 7
+    Thread probe = try_spawn(echo, rawptr(&marker))
+    bool threaded = probe != nil
+    if !threaded:
+        ok = #expect(#OS == #WEB, "try_spawn answered nil outside a single-threaded web module") && ok
+    else:
+        try rawptr got = join_result(probe) else why:
+            ok = #expect(false, "join_result failed: ", message(why)) && ok
+            return 1
+        ok = #expect(got == rawptr(&marker), "join_result hands back the thread's answer") && ok
+    try _ = join_result(nil) else why:
+        ok = #expect(why == Error.NO_THREAD, "join_result of nil failed ", message(why)) && ok
+    ok = #expect(!join(nil), "join of nil") && ok
+
+    // ── the codes ──
+    ok = #expect(i32(Error.NO_THREAD) == 2500 && i32(Error.NO_MEMORY) == 2503, "the codes left 2500 to 2599") && ok
+    ok = #expect(message(Error.CANNOT_WAIT) != message(Error.JOIN_FAILED), "two codes share a sentence") && ok
+    ok = #expect(message(Error(1)) == "not a core:threads error code", "a foreign code was not refused") && ok
+    yield()
+
+    // ── atomics at each width and ordering ──
+    i64 wide = 1
+    ok = #expect(atomic_fetch_add(&wide, i64(1) << 40, Order.AcqRel) == 1, "i64 fetch_add answers the old value") && ok
+    ok = #expect(atomic_load(&wide, Order.Acquire) == (i64(1) << 40) + 1, "i64 load") && ok
+    atomic_store(&wide, -5, Order.Release)
+    ok = #expect(atomic_exchange(&wide, 9, Order.Relaxed) == -5, "i64 exchange") && ok
+    (i64 seen_wide, bool swapped_wide) = atomic_compare_exchange(&wide, 1, 2, Order.SeqCst)
+    ok = #expect(!swapped_wide && seen_wide == 9, "i64 compare_exchange reports what it found") && ok
+    u64 bits = 0xF0
+    ok = #expect(atomic_fetch_and(&bits, u64(0x3C), Order.Acquire) == 0xF0, "u64 fetch_and") && ok
+    ok = #expect(atomic_fetch_or(&bits, u64(1), Order.Release) == 0x30, "u64 fetch_or") && ok
+    ok = #expect(atomic_fetch_xor(&bits, u64(0x31), Order.Relaxed) == 0x31, "u64 fetch_xor") && ok
+    ok = #expect(atomic_load(&bits) == 0, "u64 cell is 0") && ok
+    u32 small = 3
+    ok = #expect(atomic_fetch_sub(&small, u32(1), Order.SeqCst) == 3, "u32 fetch_sub") && ok
+    ok = #expect(atomic_cas(&small, u32(2), u32(8), Order.AcqRel), "u32 cas") && ok
+    rawptr slot = nil
+    ok = #expect(atomic_cas(&slot, nil, rawptr(&marker), Order.Release), "rawptr cas") && ok
+    ok = #expect(atomic_load(&slot, Order.Acquire) == rawptr(&marker), "rawptr load") && ok
+    atomic_fence(Order.Relaxed)
+    atomic_fence(Order.Acquire)
+    atomic_fence(Order.Release)
+    atomic_fence(Order.AcqRel)
+    atomic_fence()
+    AtomicBool flag
+    ok = #expect(!flag.load(), "an AtomicBool starts false") && ok
+    ok = #expect(!flag.exchange(true), "exchange answers the old false") && ok
+    ok = #expect(flag.compare_exchange(true, false, Order.AcqRel), "compare_exchange true -> false") && ok
+    ok = #expect(!flag.compare_exchange(true, false), "compare_exchange on false fails") && ok
+    flag.store(true, Order.Relaxed)
+    ok = #expect(flag.load(Order.Relaxed), "store then load") && ok
+
+    // ── current_id: stable on one thread, distinct across threads ──
+    u64 main_id = current_id()
+    ok = #expect(main_id >= 1 && current_id() == main_id, "current_id is stable") && ok
+    if threaded:
+        [WORKERS]Thread ts
+        for i in 0..<WORKERS:
+            ts[i] = try_spawn(id_worker, nil)
+        ok = #expect(join_all(&ts), "id workers joined") && ok
+        u64 seen_ids = atomic_load(&g_ids_seen)
+        i32 ids = 0
+        for b in 0..<64:
+            if (seen_ids >> u64(b)) & 1 == 1:
+                ids += 1
+        ok = #expect(ids == WORKERS, "each thread had its own id: ", ids) && ok
+        ok = #expect((seen_ids >> main_id) & 1 == 0, "no worker had the main thread's id") && ok
+
+    // ── try_lock ──
+    g_held = mutex_new()
+    ok = #expect(try_lock(g_held), "try_lock on a free mutex") && ok
+    unlock(g_held)
+    ok = #expect(!try_lock(nil), "try_lock of nil") && ok
+    if threaded:
+        Thread h = try_spawn(holder, nil)
+        for !g_holding.load():
+            yield()
+        ok = #expect(!try_lock(g_held), "try_lock while another thread holds it") && ok
+        g_may_release.store(true)
+        ok = #expect(join(h), "holder joined") && ok
+        ok = #expect(try_lock(g_held), "try_lock once it is released") && ok
+        unlock(g_held)
+    mutex_free(g_held)
+
+    // ── a timed wait: runs out with nobody to signal, ends early when signalled ──
+    g_wake_m = mutex_new()
+    g_wake_c = cond_new()
+    lock(g_wake_m)
+    ok = #expect(!cond_wait_for(g_wake_c, g_wake_m, time.milliseconds(5)), "a 5 ms wait nothing signals ran out") && ok
+    ok = #expect(!cond_wait_for(g_wake_c, g_wake_m, time.nanoseconds(0)), "a 0 ms wait answered woken") && ok
+    ok = #expect(!cond_wait_for(g_wake_c, g_wake_m, time.milliseconds(-5)), "a negative wait answered woken") && ok
+    // A wait shorter than a millisecond still waits on Windows and the web,
+    // which round it up, and runs out with nobody to signal.
+    ok = #expect(!cond_wait_for(g_wake_c, g_wake_m, time.microseconds(300)), "a 300 us wait nothing signals ran out") && ok
+    if threaded:
+        // The waker needs the mutex this thread holds, so its signal comes
+        // only once this thread is waiting.
+        Thread w = try_spawn(waker, nil)
+        bool any_woken = false
+        i32 tries = 0
+        for !g_woken && tries < 100:
+            any_woken = cond_wait_for(g_wake_c, g_wake_m, time.seconds(5)) || any_woken
+            tries += 1
+        ok = #expect(g_woken && any_woken, "a signal ended a timed wait") && ok
+        unlock(g_wake_m)
+        ok = #expect(join(w), "waker joined") && ok
+    else:
+        unlock(g_wake_m)
+    cond_free(g_wake_c)
+    mutex_free(g_wake_m)
+
+    // ── Once ──
+    if threaded:
+        [WORKERS]Thread ts
+        for i in 0..<WORKERS:
+            ts[i] = try_spawn(once_caller, nil)
+        g_once.call(once_body, nil)
+        ok = #expect(join_all(&ts), "once callers joined") && ok
+    else:
+        g_once.call(once_body, nil)
+        g_once.call(once_body, nil)
+    ok = #expect(g_once.done(), "the Once has run") && ok
+    ok = #expect(atomic_load(&g_once_runs) == 1, "the Once ran ", atomic_load(&g_once_runs), " times") && ok
+
+    // ── Semaphore ──
+    try g_sem = semaphore(2) else why:
+        ok = #expect(false, "semaphore failed: ", message(why)) && ok
+        return 1
+    ok = #expect(g_sem.try_acquire() && g_sem.try_acquire(), "two units") && ok
+    ok = #expect(!g_sem.try_acquire(), "no third unit") && ok
+    ok = #expect(!g_sem.acquire_for(time.milliseconds(5)), "acquire_for runs out with no unit free") && ok
+    g_sem.release(2)
+    ok = #expect(g_sem.available() == 2, "release(2) gave back two") && ok
+    ok = #expect(g_sem.acquire_for(time.milliseconds(5)), "acquire_for takes a free unit") && ok
+    g_sem.release()
+    if threaded:
+        [WORKERS]Thread ts
+        for i in 0..<WORKERS:
+            ts[i] = try_spawn(sem_worker, nil)
+        ok = #expect(join_all(&ts), "semaphore workers joined") && ok
+        ok = #expect(atomic_load(&g_most_inside) <= 2, "at most two inside: ", atomic_load(&g_most_inside)) && ok
+        ok = #expect(g_sem.available() == 2, "every unit came back") && ok
+    g_sem.destroy()
+    ok = #expect(g_sem.mtx == nil && g_sem.cv == nil, "destroy") && ok
+    try Semaphore none = semaphore(-3) else why:
+        ok = #expect(false, "semaphore failed: ", message(why)) && ok
+        return 1
+    ok = #expect(none.available() == 0, "a negative start is 0") && ok
+    none.destroy()
+
+    // ── WaitGroup ──
+    try g_wg = wait_group() else why:
+        ok = #expect(false, "wait_group failed: ", message(why)) && ok
+        return 1
+    ok = #expect(g_wg.wait_for(time.milliseconds(1)), "a wait group at 0 is done") && ok
+    g_wg.add(1)
+    ok = #expect(!g_wg.wait_for(time.milliseconds(5)), "wait_for runs out while the count is 1") && ok
+    g_wg.done()
+    g_wg.wait()
+    if threaded:
+        g_wg.add(i64(WORKERS))
+        [WORKERS]Thread ts
+        for i in 0..<WORKERS:
+            ts[i] = try_spawn(wg_worker, nil)
+        g_wg.wait()
+        ok = #expect(atomic_load(&g_wg_sum) == i64(WORKERS) * 1000000000000, "every worker counted before wait returned") && ok
+        ok = #expect(join_all(&ts), "wait group workers joined") && ok
+    g_wg.done()
+    ok = #expect(g_wg.wait_for(time.milliseconds(1)), "done below 0 stays at 0") && ok
+    g_wg.destroy()
+
+    // ── Barrier ──
+    try Barrier one = barrier(0) else why:
+        ok = #expect(false, "barrier failed: ", message(why)) && ok
+        return 1
+    ok = #expect(one.wait() && one.wait(), "a barrier of one lets its one thread through") && ok
+    one.destroy()
+    if threaded:
+        try g_barrier = barrier(WORKERS) else why:
+            ok = #expect(false, "barrier failed: ", message(why)) && ok
+            return 1
+        [WORKERS]Thread ts
+        for i in 0..<WORKERS:
+            ts[i] = try_spawn(barrier_worker, nil)
+        ok = #expect(join_all(&ts), "barrier workers joined") && ok
+        ok = #expect(atomic_load(&g_last) == ROUNDS, "one last arrival per round: ", atomic_load(&g_last)) && ok
+        ok = #expect(atomic_load(&g_round_ticks) == WORKERS * ROUNDS, "every thread ran every round") && ok
+        g_barrier.destroy()
+
+    // ── reader/writer lock ──
+    g_rw = rwlock_new()
+    ok = #expect(g_rw != nil, "rwlock_new") && ok
+    ok = #expect(try_read_lock(g_rw) && try_read_lock(g_rw), "two readers at once") && ok
+    ok = #expect(!try_write_lock(g_rw), "no writer while reading") && ok
+    read_unlock(g_rw)
+    read_unlock(g_rw)
+    ok = #expect(try_write_lock(g_rw), "a writer once the readers left") && ok
+    ok = #expect(!try_read_lock(g_rw), "no reader while writing") && ok
+    ok = #expect(!try_write_lock(g_rw), "no second writer") && ok
+    write_unlock(g_rw)
+    ok = #expect(!try_read_lock(nil) && !try_write_lock(nil), "nil rwlock") && ok
+    if threaded:
+        [WORKERS]Thread ts
+        for i in 0..<WORKERS:
+            ts[i] = try_spawn(rw_worker, nil)
+        ok = #expect(join_all(&ts), "rwlock workers joined") && ok
+        ok = #expect(g_rw_bad == 0, "a reader saw a half-written value") && ok
+        ok = #expect(g_rw_value == i64(WORKERS) * 100, "every write landed: ", g_rw_value) && ok
+    rwlock_free(g_rw)
+
+    if ok:
+        return 0
+    return 1

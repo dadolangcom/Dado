@@ -1,7 +1,7 @@
 # `vendor:enet`
 
 Dado bindings for [ENet](http://enet.bespin.org/) — the reliable-UDP library
-`core:net`/P2-NET wraps behind its `Reliable`/`Unreliable` delivery-class
+`core:net/enet` wraps behind its `Reliable`/`Unreliable` delivery-class
 surface. Vendored from the
 [zpl-c/enet](https://github.com/zpl-c/enet) single-header fork (MIT; see
 LICENSE), not the original two-file `lsalzman/enet` distribution — one file
@@ -25,10 +25,10 @@ defer enet.enet_host_destroy(server)
 ^enet.ENetEvent ev = enet.event_create()
 defer enet.event_destroy(ev)
 i32 rc = enet.enet_host_service(server, ev, 0)
-if rc > 0 && enet.event_type(ev) == u32(enet.EventType.Receive):
+if rc > 0 && enet.event_type(ev) == enet.EventType.Receive:
     ^enet.ENetPacket pkt = enet.event_packet(ev)
-    [256]char8 buf
-    u64 n = enet.packet_copy(pkt, rawptr(&buf[0]), 256)
+    [256]u8 buf
+    u64 n = enet.packet_copy(pkt, buf[:])
     enet.enet_packet_destroy(pkt)
 ```
 
@@ -38,10 +38,12 @@ if rc > 0 && enet.event_type(ev) == u32(enet.EventType.Receive):
 vendor/enet/
   LICENSE               upstream MIT text + vendoring note
   enet.h                the vendored single header, unmodified except for
-                         enet-c99-pedantic.patch's four sites and
-                         enet-timeout-shift-ub.patch's one (see below)
+                         enet-c99-pedantic.patch's four sites,
+                         enet-timeout-shift-ub.patch's one and
+                         enet-windows.patch's one (see below)
   enet.c                implementation TU: #define ENET_IMPLEMENTATION,
-                         #include "enet.h" — the sokol_time.c pattern
+                         #include "enet.h", the sokol_time.c pattern; empty
+                         on wasm32 and freestanding builds
   enet.dado              the binding: a hand-curated pass over a
                          binding-generator draft, not the raw output
                          — and, since 2026-09-13, the whole of the Dado side.
@@ -54,6 +56,8 @@ vendor/enet/
   enet-timeout-shift-ub.patch  the one-site correctness patch, likewise
                          already applied — an unbounded left shift in
                          enet_protocol_check_timeouts (see below)
+  enet-windows.patch    the one-site patch the Windows build needed,
+                         likewise already applied
   link                  no link flags on Linux/macOS
 ```
 
@@ -90,7 +94,7 @@ Dado's binding generator ran against the vendored `enet.h` first and got
 plus five opaque handles; it drops ENet's internal protocol/command/list
 machinery bindgen dutifully translated (dead surface no caller outside
 `enet.c`'s own translation unit can reach) and the raw socket primitives
-(`core:net` drives ENet through `ENetHost`, never the BSD socket
+(`core:net/enet` drives ENet through `ENetHost`, never the BSD socket
 underneath). `enet.dado`'s own doc comment has the full accounting of what
 bindgen skipped and why each skip was the *right* answer here rather than a
 `dadoc` bug to chase — see it before touching this package.
@@ -228,9 +232,27 @@ at once is an amplification at exactly the wrong moment.
 before-and-after table above and by the UBSan abort. The *end-to-end* path — a
 real peer going silent under a live reliable send until the counter passes 32 —
 is **not** automated: it needs two processes, a killed one, and several seconds
-of wall clock, which is not a `@test`. `enet_test.dado`, `core:net`'s and
+of wall clock, which is not a `@test`. `enet_test.dado`, `core:net/enet`'s and
 `app:net`'s suites all pass unchanged, sanitized and not, which is a
 no-regression result and not a witness for the fix.
+
+## Windows, the web and `#NONE`
+
+Windows builds the same C over Winsock and links `ws2_32` and `winmm`
+(`enet_time_get` reads `timeGetTime`). Two things stood in the way, and both
+are fixed: `struct in_addr` is a union under Winsock, whose `s_addr` is a macro
+for `S_un.S_addr`, so `enet.dado` restates `InAddr` once per C library; and
+`enet.h`'s Windows clock helper was declared without a prototype, which the
+`-Werror` build refuses (`enet-windows.patch`). `scripts/wintest.sh
+collections/vendor/enet` cross-compiles and links the test for
+`x86_64-windows-gnu`; it has not been run on Windows.
+
+A web build has no C library and no UDP socket, and a `#NONE` build has no
+network stack. On both, `enet.c` compiles to an empty translation unit and
+`enet.dado` declares the same names as Dado stubs: `enet_initialize` fails,
+every constructor answers nil, and the rest answers what ENet answers for a
+call it cannot carry out. A program that imports this package, or
+`core:net/enet`, still builds for those targets, and finds out at run time.
 
 ## Verification
 

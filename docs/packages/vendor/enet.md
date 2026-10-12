@@ -1,9 +1,9 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 7e1d5137cae1 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit ad4cc5b13c3d (dirty) -->
 # vendor:enet
 
 vendor:enet — Dado bindings for the zpl-c/enet single-header fork of ENet
-(MIT; see LICENSE), the reliable-UDP library `core:net` wraps.
+(MIT; see LICENSE), the reliable-UDP library `core:net/enet` wraps.
 
     import "vendor:enet"
 
@@ -48,7 +48,7 @@ ENet's *internal* protocol/command/list machinery (`ENetProtocol*`,
 reachable from outside `enet.c`'s own translation unit, so a binding for
 it is dead surface a caller could misuse. The raw low-level socket
 primitives (`enet_socket_*`, `ENetSocketSet`/`fd_set`) are dropped for the
-same reason from the other direction — `core:net` drives ENet through
+same reason from the other direction — `core:net/enet` drives ENet through
 `ENetHost`, never the BSD socket underneath it.
 
 **Why bindgen skipped what it skipped, and why hand-authoring (not fixing
@@ -91,6 +91,11 @@ because neither could be restated; both are restated now, so the accessors
 are Dado one-liners over a member read. The accounting is in the block below
 the generated region.
 
+**What raises into a script: nothing.** Every declaration here is ENet's C,
+or a wrapper that passes a pointer to it, and the web's Dado stubs take and
+answer the same `rawptr`s, `cstring`s and `#c.*` values, so no function
+carries `#assert_raises`.
+
 **`size_t` parameters** (`enet_packet_create`'s `dataLength`,
 `enet_host_create`'s `peerCount`/`channelLimit`, …) are `#c.size_t`, C's own
 type, and not `u64`: the width is the same on every target Dado supports and
@@ -100,9 +105,12 @@ literal as it is and converts a `u64` with `#c.size_t(n)`.
 
 ## Declarations
 
-65 declarations, 59 public.
+126 declarations, 120 public.
 
+* `type @c("struct in_addr") InAddr`
+* `void address_set_any(^ENetAddress addr)` — "Bind to every interface." `enet.h` spells this `ENET_HOST_ANY`, which under…
 * `type @c("struct in_addr") InAddr` — ── hand-written, above the marker, and it stays across a regeneration ──…
+* `void address_set_any(^ENetAddress addr)` — "Bind to every interface." `enet.h` spells this `ENET_HOST_ANY`, which under…
 * `enum @c("ENetPacketFlag") PacketFlag` — bindgen:begin declarations — regenerated; edits between the markers are lost…
 * `enum @c("ENetPeerState") PeerState`
 * `enum @c("ENetEventType") EventType`
@@ -146,18 +154,76 @@ literal as it is and converts a `u64` with `#c.size_t(n)`.
 * `void enet_peer_disconnect(^ENetPeer peer, u32 data)`
 * `void enet_peer_disconnect_now(^ENetPeer peer, u32 data)`
 * `void enet_peer_disconnect_later(^ENetPeer peer, u32 data)`
-* `^ENetAddress address_create()` — Dado cannot stack-allocate a value and hand back a pointer to it that outlives…
+* `^ENetAddress address_create()` — A zeroed `ENetAddress` from C's heap, for the calls that take one by…
+* `void address_destroy(^ENetAddress addr)` — Give back an address `address_create` made.
+* `bool address_set_host(^ENetAddress addr, cstring hostname)` — Set `addr`'s host to `hostname`, an IPv4 literal or a name ENet resolves…
+* `void address_set_port(^ENetAddress addr, u16 port)` — Set `addr`'s port.
+* `u16 address_get_port(^ENetAddress addr)` — `addr`'s port.
+* `bool address_get_host(^ENetAddress addr, []char8 out)` — Write `addr`'s host into `out` as NUL-terminated text: its name when a…
+* `^ENetEvent event_create()` — A zeroed `ENetEvent` from C's heap, for `enet_host_service` to fill; end…
+* `void event_destroy(^ENetEvent ev)` — Give back an event `event_create` made.
+* `EventType event_type(^ENetEvent ev)` — What the event `ev` reports.
+* `^ENetPeer event_peer(^ENetEvent ev)` — The peer the event `ev` happened to.
+* `u8 event_channel_id(^ENetEvent ev)` — The channel a `Receive` event's packet arrived on.
+* `u32 event_data(^ENetEvent ev)` — The data a `Connect` or `Disconnect` event carries (the peer's `data`
+* `^ENetPacket event_packet(^ENetEvent ev)` — A `Receive` event's packet, which the caller destroys…
+* `u64 packet_copy(^ENetPacket packet, []u8 out)` — Copy a received packet's bytes into `out`, as many as fit, and answer how…
+* `enum i32 PacketFlag` — `#WEB` and `#NONE`: the same names, in Dado, and nothing to drive. A page…
+* `enum i32 PeerState`
+* `enum i32 EventType`
+* `type ENetPacket` — The handles are never built here, so their bodies are a placeholder…
+* `type ENetPeer`
+* `type ENetHost`
+* `type InAddr`
+* `type ENetAddress`
+* `type ENetEvent`
+* `^ENetPacket enet_packet_create(const rawptr data, #c.size_t dataLength, u32 flags)`
+* `void enet_packet_destroy(^ENetPacket packet)`
+* `i32 enet_initialize()`
+* `void enet_deinitialize()`
+* `u32 enet_linked_version()`
+* `u32 enet_time_get()`
+* `i32 enet_address_set_host_new(^ENetAddress address, cstring hostName)`
+* `i32 enet_address_get_host_new(^const ENetAddress address, ^#c.char hostName, #c.size_t nameLength)`
+* `u32 enet_host_get_peers_count(^ENetHost host)`
+* `u32 enet_host_get_packets_sent(^ENetHost host)`
+* `u32 enet_host_get_packets_received(^ENetHost host)`
+* `u32 enet_host_get_bytes_sent(^ENetHost host)`
+* `u32 enet_host_get_bytes_received(^ENetHost host)`
+* `u32 enet_peer_get_rtt(^ENetPeer peer)`
+* `PeerState enet_peer_get_state(^ENetPeer peer)`
+* `rawptr enet_peer_get_data(^ENetPeer peer)`
+* `void enet_peer_set_data(^ENetPeer peer, const rawptr data)`
+* `rawptr enet_packet_get_data(^ENetPacket packet)`
+* `u32 enet_packet_get_length(^ENetPacket packet)`
+* `^ENetHost enet_host_create(^const ENetAddress address, #c.size_t peerCount, #c.size_t channelLimit, u32 incomingBandwidth, u32 outgoingBandwidth)`
+* `void enet_host_destroy(^ENetHost host)`
+* `^ENetPeer enet_host_connect(^ENetHost host, ^const ENetAddress address, #c.size_t channelCount, u32 data)`
+* `i32 enet_host_check_events(^ENetHost host, ^ENetEvent event)`
+* `i32 enet_host_service(^ENetHost host, ^ENetEvent event, u32 timeout)`
+* `void enet_host_flush(^ENetHost host)`
+* `void enet_host_broadcast(^ENetHost host, u8 channelID, ^ENetPacket packet)`
+* `void enet_host_channel_limit(^ENetHost host, #c.size_t channelLimit)`
+* `void enet_host_bandwidth_limit(^ENetHost host, u32 incomingBandwidth, u32 outgoingBandwidth)`
+* `i32 enet_peer_send(^ENetPeer peer, u8 channelID, ^ENetPacket packet)`
+* `^ENetPacket enet_peer_receive(^ENetPeer peer, ^u8 channelID)`
+* `void enet_peer_ping(^ENetPeer peer)`
+* `void enet_peer_reset(^ENetPeer peer)`
+* `void enet_peer_disconnect(^ENetPeer peer, u32 data)`
+* `void enet_peer_disconnect_now(^ENetPeer peer, u32 data)`
+* `void enet_peer_disconnect_later(^ENetPeer peer, u32 data)`
+* `^ENetAddress address_create()` — The wrappers above the stubs, with nothing to allocate or copy.
 * `void address_destroy(^ENetAddress addr)`
 * `bool address_set_host(^ENetAddress addr, cstring hostname)`
-* `void address_set_any(^ENetAddress addr)` — "Bind to every interface." `enet.h` spells this `ENET_HOST_ANY`, which under…
+* `void address_set_any(^ENetAddress addr)`
 * `void address_set_port(^ENetAddress addr, u16 port)`
 * `u16 address_get_port(^ENetAddress addr)`
-* `bool address_get_host(^ENetAddress addr, rawptr out, u64 outLen)`
+* `bool address_get_host(^ENetAddress addr, []char8 out)`
 * `^ENetEvent event_create()`
 * `void event_destroy(^ENetEvent ev)`
-* `u32 event_type(^ENetEvent ev)` — `u32` and not `EventType`, because every caller in this tree compares it…
+* `EventType event_type(^ENetEvent ev)`
 * `^ENetPeer event_peer(^ENetEvent ev)`
 * `u8 event_channel_id(^ENetEvent ev)`
 * `u32 event_data(^ENetEvent ev)`
 * `^ENetPacket event_packet(^ENetEvent ev)`
-* `u64 packet_copy(^ENetPacket packet, rawptr out, u64 outCap)` — Copy a received packet's bytes into `out` (up to `outCap` bytes); returns…
+* `u64 packet_copy(^ENetPacket packet, []u8 out)`

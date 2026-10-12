@@ -22,6 +22,8 @@
 // under the header's name must not collide with this one. A `FILETIME` member
 // is a member list for the same reason: `core:time` declares `FILETIME`.
 //
+// Not promised to raise: everything here is the Win32 boundary.
+//
 // `DWORD` is `unsigned long` (32 bits on Windows), `BOOL` is `int`, `BOOLEAN`
 // is `unsigned char`, a `HANDLE` is a `void *`, and a `WCHAR` is a 16-bit
 // `wchar_t`, which is `unsigned short` in C and `u16` here.
@@ -116,6 +118,26 @@ when #OS == #WINDOWS:
         rawptr LocalFree(rawptr block)
         #c.ullong GetTickCount64()
         #c.ulong GetCurrentProcessId()
+
+        // What an open `File` (`handle.dado`) is read, moved, cut and locked
+        // through. `SetFilePointer` and not `SetFilePointerEx`, whose
+        // `LARGE_INTEGER` is a union passed by value: the old form splits the
+        // offset into two `LONG`s, and the high half is a pointer it answers
+        // through. `LockFileEx` takes an `OVERLAPPED` whose zero is "from
+        // offset 0", which is the range every lock here starts at.
+        const #c.ulong CREATE_ALWAYS
+        const #c.ulong OPEN_ALWAYS
+        const #c.ulong TRUNCATE_EXISTING
+        const #c.ulong FILE_APPEND_DATA
+        const #c.ulong INVALID_SET_FILE_POINTER
+        const #c.ulong LOCKFILE_EXCLUSIVE_LOCK
+        const #c.ulong LOCKFILE_FAIL_IMMEDIATELY
+        const #c.long ERROR_LOCK_VIOLATION
+        const #c.long NO_ERROR
+        #c.ulong SetFilePointer(rawptr file, #c.long low, ^#c.long high, #c.ulong method)
+        #c.int SetEndOfFile(rawptr file)
+        #c.int LockFileEx(rawptr file, #c.ulong flags, #c.ulong reserved, #c.ulong low, #c.ulong high, ^FsOverlapped overlapped)
+        #c.int UnlockFileEx(rawptr file, #c.ulong reserved, #c.ulong low, #c.ulong high, ^FsOverlapped overlapped)
 
     // `ConvertStringSecurityDescriptorToSecurityDescriptorW` is `<sddl.h>`'s and
     // lives in `advapi32`. `SDDL_REVISION_1` is 1.
@@ -225,12 +247,6 @@ when #OS == #WINDOWS:
         #delete(full)
         return prefixed
 
-    // A `cstring` path as a `string8`, or the empty string for `nil`, which
-    // every caller has already refused.
-    private string8 text_of(cstring path):
-        if path == nil: return ""
-        return string8(path)
-
     // ── asking what a path is ───────────────────────────────────────────────
 
     // What `path` resolves to, following links: a handle opened for nothing
@@ -247,6 +263,36 @@ when #OS == #WINDOWS:
         bool got = GetFileInformationByHandle(h, &info) != 0
         _ = CloseHandle(h)
         return (info, got)
+
+    // What `path` itself is, a link not followed: the handle is opened with
+    // `FILE_FLAG_OPEN_REPARSE_POINT`, so a link answers its own attributes.
+    private (FsHandleInfo info, bool ok) info_nofollow(string8 path):
+        FsHandleInfo info
+        ref []u16 w = wide_path(path)
+        defer #delete(w)
+        if #len(w) == 0: return (info, false)
+        rawptr h = CreateFileW(&w[0], FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nil, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nil)
+        if h == INVALID_HANDLE_VALUE: return (info, false)
+        bool got = GetFileInformationByHandle(h, &info) != 0
+        _ = CloseHandle(h)
+        return (info, got)
+
+    // A `FileInfo` from what Windows answered. Windows has no permission bits:
+    // the read-only attribute is the one thing they can say, so a file is
+    // `0666` or `0444` and a directory `0777` or `0555`. `link` says the path
+    // was asked about without following, and is itself a link.
+    private FileInfo info_from(FsHandleInfo info, bool link):
+        u32 a = u32(info.dwFileAttributes)
+        bool dir = (a & u32(FILE_ATTRIBUTE_DIRECTORY)) != 0
+        Kind kind = Kind.File
+        if link: kind = Kind.Link
+        else if dir: kind = Kind.Dir
+        u32 mode = 0x1B6
+        if dir: mode = 0x1FF
+        if (a & u32(FILE_ATTRIBUTE_READONLY)) != 0: mode = mode & 0x16D
+        i64 size = i64(info.nFileSizeHigh) * 4294967296 + i64(info.nFileSizeLow)
+        if dir: size = 0
+        return (kind, mode, size, unix_nanos_of(info.ftLastWriteTime.dwLowDateTime, info.ftLastWriteTime.dwHighDateTime))
 
     // The attributes of `path` itself — a link's own, not its target's.
     private (u32 attributes, bool ok) attributes_of(string8 path):
@@ -278,9 +324,13 @@ when #OS == #WINDOWS:
         i64 intervals = i64(high) * 4294967296 + i64(low)
         return (intervals - 116444736000000000) * 100
 
-    // The last error, as `os`'s code.
-    private i32 failure():
+    // The last error, as `os`'s code, to hold while cleaning up.
+    private os.Error failure():
         return os.last_error()
+
+    // Fail with the last error. It always fails.
+    private os.Error!void failed():
+        try os.fail_last()
 
     // ── private directories ─────────────────────────────────────────────────
 
@@ -288,21 +338,21 @@ when #OS == #WINDOWS:
     // (`P`, so nothing is inherited from the parent) with full access for the
     // owner (`OW`) and for `SYSTEM` (`SY`), on the directory and everything
     // later made in it (`OICI`). The descriptor is the system's, and freed.
-    private !void create_private(string8 path):
+    private os.Error!void create_private(string8 path):
         ref []u16 w = wide_path(path)
         defer #delete(w)
-        if #len(w) == 0: fail os.INVALID
+        if #len(w) == 0: fail os.Error.INVALID
         ref []u16 sddl = widen("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)")
         defer #delete(sddl)
         rawptr descriptor = nil
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl[0], #c.ulong(SDDL_REVISION_1), &descriptor, nil) == 0:
-            fail failure()
+            try failed()
         FsSecurity sa = (#c.ulong(#size(FsSecurity)), descriptor, 0)
         bool made = CreateDirectoryW(&w[0], &sa) != 0
-        i32 code = 0
+        os.Error code = os.Error.UNKNOWN
         if !made: code = failure()
         _ = LocalFree(descriptor)
-        if !made: fail code
+        if !made: try os.fail_with(code)
         return
 
     // A name nobody else is likely to pick: the process, a tick count and a
@@ -382,10 +432,12 @@ when #OS == #WINDOWS:
     // Whether `path` ends in one of the extensions in `PATHEXT`
     // (`.COM;.EXE;.BAT;.CMD` when it is unset), ignoring ASCII case.
     private bool runnable_name(string8 path):
-        (ref []char8 env, bool found) = os.get_env("PATHEXT")
+        ref []char8 env = nil
+        try env = os.get_env("PATHEXT") else:
+            env = nil
         defer #delete(env)
         string8 list = ".COM;.EXE;.BAT;.CMD"
-        if found && #len(env) > 0:
+        if #len(env) > 0:
             list = env
         i64 start = 0
         for i in 0..<#len(list) + 1:

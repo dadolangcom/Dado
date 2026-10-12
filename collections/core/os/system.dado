@@ -5,7 +5,9 @@
 //     i32 main(i32 argc, ^rawptr argv):
 //         for a in os.args(argc, argv):
 //             println(a)
-//         (ref []char8 home, bool found) = os.get_env("HOME")
+//         try ref []char8 home = os.get_env("HOME") else why:
+//             println("HOME: ", os.message(why))
+//             return 1
 //         defer #delete(home)
 //
 // **Names and values are UTF-8 on every system.** Linux and macOS hand a
@@ -17,7 +19,19 @@
 //
 // **Allocation is the caller's ambient allocator** (`using`), except for
 // `args`, whose answer lives for the whole process and is made once on the
-// heap. A `ref []char8` answer is the caller's to `#delete`.
+// heap, deliberately: the arguments outlive any `using` a caller could be in.
+// A `ref []char8` answer is the caller's to `#delete`.
+//
+// **On `#WEB`** a module is handed no arguments (`main` gets an `argc` of 0)
+// and no environment this package can reach yet, so `args` is empty, `get_env`
+// fails `NOT_FOUND`, `set_env`, `unset_env` and `home_dir` fail with
+// `UNSUPPORTED`, `temp_dir` is empty, `pid` is 0 and `is_terminal` false. The
+// web arm keeps the host's questions in one place each, so a host import that
+// answers one is a few lines there.
+//
+// **What raises into a script.** Nothing here is promised: every function
+// reaches the system through a `foreign` call (or, on `#WEB`, answers for a
+// host that has not been asked), and `args` reads `argv`, a `rawptr`.
 //
 // Thread-safety: `args` must be called first from one thread (normally
 // `main`); after that it only reads. The environment is one table per process
@@ -36,17 +50,21 @@ private bool env_name_ok(string8 name):
         if c == '=' || c == '\0': return false
     return true
 
-// `s` with a `\0` after it, for a C call; the caller deletes it.
+// `s` with a `\0` after it, for a C call; the caller deletes it. Shorter than
+// `#len(s) + 1` (empty) only when the allocation failed.
 private ref []char8 terminated(string8 s):
     ref []char8 out = #make([]char8, #len(s) + 1)
+    if #len(out) != #len(s) + 1: return out
     for i in 0..<#len(s):
         out[i] = s[i]
     out[#len(s)] = '\0'
     return out
 
-// An owned copy of `s`; the caller deletes it.
+// An owned copy of `s`; the caller deletes it. Shorter than `s` only when the
+// allocation failed.
 private ref []char8 owned(string8 s):
     ref []char8 out = #make([]char8, #len(s))
+    if #len(out) != #len(s): return out
     for i in 0..<#len(s):
         out[i] = s[i]
     return out
@@ -99,24 +117,32 @@ when #OS == #WINDOWS:
     // A byte buffer handed to C as the `char *` the header declares.
     private type CharBuf: ^#c.char
 
-    // `text` as UTF-16 with its terminator. Empty when the conversion failed,
-    // which every caller treats as the call failing.
-    private ref []u16 widen(string8 text):
+    // `text` as UTF-16 with its terminator. Fails `NO_MEMORY` when a copy
+    // cannot be made, and `INVALID` when the conversion fails, so a caller
+    // never reads a refused allocation as a malformed name.
+    private Error!ref []u16 widen(string8 text):
         i64 n = #len(text)
         if n == 0:
             ref []u16 nothing = #make([]u16, 1)
+            if #len(nothing) != 1:
+                #delete(nothing)
+                fail Error.NO_MEMORY
             nothing[0] = 0
             return nothing
         // A string's bytes have no address to hand out, so C reads a copy.
         ref []char8 bytes = terminated(text)
         defer #delete(bytes)
+        if #len(bytes) != n + 1: fail Error.NO_MEMORY
         #c.int units = wsys.MultiByteToWideChar(wsys.CP_UTF8, 0, cstring(bytes), #c.int(n), nil, 0)
-        if units <= 0: return #make([]u16, 0)
+        if units <= 0: fail Error.INVALID
         ref []u16 wide = #make([]u16, i64(units) + 1)
+        if #len(wide) != i64(units) + 1:
+            #delete(wide)
+            fail Error.NO_MEMORY
         #c.int wrote = wsys.MultiByteToWideChar(wsys.CP_UTF8, 0, cstring(bytes), #c.int(n), &wide[0], units)
         if wrote != units:
             #delete(wide)
-            return #make([]u16, 0)
+            fail Error.INVALID
         wide[i64(units)] = 0
         return wide
 
@@ -129,7 +155,11 @@ when #OS == #WINDOWS:
         _ = wsys.WideCharToMultiByte(wsys.CP_UTF8, 0, wide, #c.int(count), CharBuf(rawptr(&out[0])), bytes, nil, nil)
         return out
 
-    // The command line Windows kept, split by `CommandLineToArgvW` — the
+    // The process's arguments as UTF-8, the program first: made once, on the
+    // heap, and good for the whole process. Call it first from `main` with the
+    // entry point's own `argc` and `argv`.
+    //
+    // On Windows, the command line Windows kept, split by `CommandLineToArgvW` — the
     // parser every Windows program's C runtime follows for quotes and
     // backslashes — and converted from UTF-16. `argv` is not read: on Windows
     // it is the same line converted to the ANSI code page, which loses every
@@ -150,71 +180,91 @@ when #OS == #WINDOWS:
         g_args_made = true
         return g_args[:]
 
-    // `GetEnvironmentVariableW` answers 0 both for a variable that is not set
+    // The value of the environment variable `name`, owned by the caller: a
+    // variable set to the empty string is an empty value. Fails `NOT_FOUND`
+    // when it is not set (always, on `#WEB`), `INVALID` for a name no
+    // environment can hold (empty, or with `=` or `\0` in it), and
+    // `NO_MEMORY` when the value cannot be copied.
+    //
+    // On Windows, `GetEnvironmentVariableW` answers 0 both for a variable that is not set
     // and for a failure, and tells them apart by the last error, which is
     // cleared first. A variable set to nothing measures 1 (its terminator).
-    (ref []char8 value, bool found) get_env(string8 name):
-        if !env_name_ok(name): return (#make([]char8, 0), false)
-        ref []u16 wname = widen(name)
+    Error!ref []char8 get_env(string8 name):
+        if !env_name_ok(name): fail Error.INVALID
+        try ref []u16 wname = widen(name)
         defer #delete(wname)
-        if #len(wname) == 0: return (#make([]char8, 0), false)
         // A value can change between the measure and the read; asking again
         // is the answer, and three tries is more than any real race needs.
         for _ in 0..<3:
             wsys.SetLastError(0)
             #c.ulong need = wsys.GetEnvironmentVariableW(&wname[0], nil, 0)
-            if need == 0:
-                return (#make([]char8, 0), false)
+            if need == 0: fail Error.NOT_FOUND
             ref []u16 buf = #make([]u16, i64(need))
+            if #len(buf) != i64(need):
+                #delete(buf)
+                fail Error.NO_MEMORY
             #c.ulong got = wsys.GetEnvironmentVariableW(&wname[0], &buf[0], need)
             if got < need:
                 ref []char8 out = narrow(&buf[0], i64(got))
                 #delete(buf)
-                return (out, true)
+                // A value of one unit or more converts to one byte or more,
+                // so an empty answer for one is a copy that was refused.
+                if got > 0 && #len(out) == 0:
+                    #delete(out)
+                    fail Error.NO_MEMORY
+                return out
             #delete(buf)
-        return (#make([]char8, 0), false)
+        fail Error.NOT_FOUND
 
-    !void set_env(string8 name, string8 value):
-        if !env_name_ok(name): fail INVALID
-        ref []u16 wname = widen(name)
+    // Set the environment variable `name` to `value`, replacing what was
+    // there, for this process and the children it starts afterwards. Fails
+    // with `INVALID` for a name no environment can hold or a value with a
+    // `\0` in it, `NO_MEMORY` when the name or value cannot be copied for the
+    // system, and `UNSUPPORTED` on `#WEB`. Call it before threads start.
+    Error!void set_env(string8 name, string8 value):
+        if !env_name_ok(name): fail Error.INVALID
+        for c in value:
+            if c == '\0': fail Error.INVALID
+        try ref []u16 wname = widen(name)
         defer #delete(wname)
-        ref []u16 wvalue = widen(value)
+        try ref []u16 wvalue = widen(value)
         defer #delete(wvalue)
-        if #len(wname) == 0 || #len(wvalue) == 0: fail INVALID
         // The runtime's copy first: it cannot hold an empty value (an empty
         // one removes the variable there, and from the system too), so the
         // system's table is written last and is the one `get_env` reads.
         _ = wcrt._wputenv_s(&wname[0], &wvalue[0])
         if wsys.SetEnvironmentVariableW(&wname[0], &wvalue[0]) == 0:
-            fail last_error()
+            try fail_last()
         return
 
-    // A null value deletes the variable. Deleting one that is not set is
-    // success, as POSIX's `unsetenv` makes it.
-    !void unset_env(string8 name):
-        if !env_name_ok(name): fail INVALID
-        ref []u16 wname = widen(name)
+    // Remove the environment variable `name`. Removing one that is not set
+    // succeeds, as POSIX's `unsetenv` makes it; a name no environment can hold
+    // fails with `INVALID`, a name that cannot be copied for the system with
+    // `NO_MEMORY`, and `#WEB` with `UNSUPPORTED`. Call it before threads
+    // start.
+    //
+    // On Windows, a null value deletes the variable.
+    Error!void unset_env(string8 name):
+        if !env_name_ok(name): fail Error.INVALID
+        try ref []u16 wname = widen(name)
         defer #delete(wname)
-        if #len(wname) == 0: fail INVALID
         u16 empty = 0
         _ = wcrt._wputenv_s(&wname[0], &empty)
         if wsys.SetEnvironmentVariableW(&wname[0], nil) == 0:
             if i64(wsys.GetLastError()) == i64(wsys.ERROR_ENVVAR_NOT_FOUND): return
-            fail last_error()
+            try fail_last()
         return
 
+    // This process's id, as the system numbers it; 0 on `#WEB`, where there
+    // is no process.
     i64 pid():
         return i64(wsys.GetCurrentProcessId())
 
-    // `USERPROFILE`, which Windows sets for every logged-on user.
-    !ref []char8 home_dir():
-        (ref []char8 home, bool found) = get_env("USERPROFILE")
-        if !found || #len(home) == 0:
-            #delete(home)
-            fail NOT_FOUND
-        return home
-
-    // `GetTempPathW`, which reads `TMP`, `TEMP` and `USERPROFILE` in that
+    // The directory for temporary files, owned by the caller, with no
+    // trailing separator. Never fails on a hosted system, which always has
+    // one; empty on `#WEB`, which has none.
+    //
+    // On Windows, `GetTempPathW`, which reads `TMP`, `TEMP` and `USERPROFILE` in that
     // order and falls back to the Windows directory. Its trailing `\` is taken
     // off, so the answer joins like every other directory here; a drive's root
     // (`C:\`) keeps it, because `C:` alone means that drive's current
@@ -231,8 +281,11 @@ when #OS == #WINDOWS:
             return trimmed
         return out
 
-    // A console answers `GetConsoleMode`; a file, a pipe or `NUL` does not.
-    // `stream` is 0, 1 or 2, the standard input, output and error.
+    // Whether standard stream `stream` — 0, 1 or 2, the standard input, output
+    // and error — is a terminal a person is at, rather than a file or a pipe.
+    // False for any other number, and always false on `#WEB`.
+    //
+    // On Windows, a console answers `GetConsoleMode`; a file, a pipe or `NUL` does not.
     bool is_terminal(i32 stream):
         #c.ulong which = wsys.STD_INPUT_HANDLE
         if stream == 1: which = wsys.STD_OUTPUT_HANDLE
@@ -243,12 +296,58 @@ when #OS == #WINDOWS:
         #c.ulong mode = 0
         return wsys.GetConsoleMode(handle, &mode) != 0
 
-// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+// ── the web ─────────────────────────────────────────────────────────────────
+//
+// A module has no environment block, no process and no terminal of its own.
+// Each question the host could one day answer is one private function here
+// (`web_get_env`, `web_set_env`, `web_unset_env`), so a host import that
+// answers it changes that function and nothing else.
+else when #OS == #WEB:
+    // Nothing is set until the host offers an environment to read.
+    private Error!ref []char8 web_get_env(string8 name):
+        fail Error.NOT_FOUND
+
+    private Error!void web_set_env(string8 name, string8 value):
+        fail Error.UNSUPPORTED
+
+    private Error!void web_unset_env(string8 name):
+        fail Error.UNSUPPORTED
+
+    Error!ref []char8 get_env(string8 name):
+        if !env_name_ok(name): fail Error.INVALID
+        try ref []char8 value = web_get_env(name)
+        return value
+
+    Error!void set_env(string8 name, string8 value):
+        if !env_name_ok(name): fail Error.INVALID
+        for c in value:
+            if c == '\0': fail Error.INVALID
+        try web_set_env(name, value)
+        return
+
+    Error!void unset_env(string8 name):
+        if !env_name_ok(name): fail Error.INVALID
+        try web_unset_env(name)
+        return
+
+    i64 pid():
+        return 0
+
+    Error!ref []char8 home_dir():
+        fail Error.UNSUPPORTED
+
+    ref []char8 temp_dir():
+        return #make([]char8, 0)
+
+    bool is_terminal(i32 stream):
+        return false
+
+// ── POSIX: Linux, macOS and the BSDs ────────────────────────────────────────
 //
 // `setenv` and `unsetenv` are POSIX.1-2001 and not C, so `<stdlib.h>` declares
 // them only when asked for the POSIX surface — the `define` below, the same
 // one `core:time` writes. `getpid` and `isatty` are `<unistd.h>`'s.
-else:
+else when #OS != #NONE:
     private foreign penv "stdlib.h" define "_POSIX_C_SOURCE=200809L":
         cstring getenv(cstring name)
         #c.int setenv(cstring name, cstring value, #c.int overwrite)
@@ -258,63 +357,53 @@ else:
         #c.int getpid()
         #c.int isatty(#c.int fd)
 
-    // `argv` as the process received it. The bytes are the process's for its
-    // whole life, so each argument is a view of them and nothing is copied.
-    []string8 args(i32 argc, ^rawptr argv):
-        if g_args_made: return g_args[:]
-        using #heap:
-            g_args = #make([]string8, 0)
-            if argc > 0 && argv != nil:
-                for slot in argv[0..<i64(argc)]:
-                    if slot == nil: break
-                    _ = #append(g_args, string8(cstring(slot)))
-        g_args_made = true
-        return g_args[:]
-
-    (ref []char8 value, bool found) get_env(string8 name):
-        if !env_name_ok(name): return (#make([]char8, 0), false)
+    Error!ref []char8 get_env(string8 name):
+        if !env_name_ok(name): fail Error.INVALID
         ref []char8 cname = terminated(name)
+        if #len(cname) != #len(name) + 1:
+            #delete(cname)
+            fail Error.NO_MEMORY
         cstring got = penv.getenv(cstring(cname))
         #delete(cname)
-        if got == nil: return (#make([]char8, 0), false)
-        return (owned(string8(got)), true)
+        if got == nil: fail Error.NOT_FOUND
+        string8 value = string8(got)
+        ref []char8 out = owned(value)
+        if #len(out) != #len(value):
+            #delete(out)
+            fail Error.NO_MEMORY
+        return out
 
-    !void set_env(string8 name, string8 value):
-        if !env_name_ok(name): fail INVALID
+    Error!void set_env(string8 name, string8 value):
+        if !env_name_ok(name): fail Error.INVALID
         for c in value:
-            if c == '\0': fail INVALID
+            if c == '\0': fail Error.INVALID
         ref []char8 cname = terminated(name)
         defer #delete(cname)
         ref []char8 cvalue = terminated(value)
         defer #delete(cvalue)
+        if #len(cname) != #len(name) + 1 || #len(cvalue) != #len(value) + 1: fail Error.NO_MEMORY
         if penv.setenv(cstring(cname), cstring(cvalue), 1) != 0:
-            fail last_error()
+            try fail_last()
         return
 
-    !void unset_env(string8 name):
-        if !env_name_ok(name): fail INVALID
+    Error!void unset_env(string8 name):
+        if !env_name_ok(name): fail Error.INVALID
         ref []char8 cname = terminated(name)
         defer #delete(cname)
+        if #len(cname) != #len(name) + 1: fail Error.NO_MEMORY
         if penv.unsetenv(cstring(cname)) != 0:
-            fail last_error()
+            try fail_last()
         return
 
     i64 pid():
         return i64(punistd.getpid())
 
-    // `HOME`, which POSIX requires the login to set.
-    !ref []char8 home_dir():
-        (ref []char8 home, bool found) = get_env("HOME")
-        if !found || #len(home) == 0:
-            #delete(home)
-            fail NOT_FOUND
-        return home
-
     // `TMPDIR` when it is set and not empty, otherwise `/tmp`. A trailing `/`
     // is taken off (macOS's `TMPDIR` has one), except from `/` itself.
     ref []char8 temp_dir():
-        (ref []char8 dir, bool found) = get_env("TMPDIR")
-        if !found || #len(dir) == 0:
+        try ref []char8 dir = get_env("TMPDIR") else:
+            return owned("/tmp")
+        if #len(dir) == 0:
             #delete(dir)
             return owned("/tmp")
         i64 n = #len(dir)
@@ -329,3 +418,45 @@ else:
     bool is_terminal(i32 stream):
         if stream < 0: return false
         return punistd.isatty(#c.int(stream)) != 0
+
+// ── what the arms share ─────────────────────────────────────────────────────
+
+when #OS != #WINDOWS && #OS != #NONE:
+    // The process's arguments, the program first: made once, on the heap, and
+    // good for the whole process. Call it first from `main` with the entry
+    // point's own `argc` and `argv`. On `#WEB` the loader hands `main`
+    // `(0, nil)`, so this is empty.
+    //
+    // On POSIX, `argv` as the process received it: the bytes are the
+    // process's for its whole life, so each argument is a view of them and
+    // nothing is copied.
+    []string8 args(i32 argc, ^rawptr argv):
+        if g_args_made: return g_args[:]
+        using #heap:
+            g_args = #make([]string8, 0)
+            if argc > 0 && argv != nil:
+                for slot in argv[0..<i64(argc)]:
+                    if slot == nil: break
+                    _ = #append(g_args, string8(cstring(slot)))
+        g_args_made = true
+        return g_args[:]
+
+// The variable the user's home is in: `USERPROFILE`, which Windows sets for
+// every logged-on user, and `HOME`, which POSIX requires the login to set.
+when #OS == #WINDOWS:
+    private const string8 HOME_VARIABLE = "USERPROFILE"
+else:
+    private const string8 HOME_VARIABLE = "HOME"
+
+when #OS != #WEB && #OS != #NONE:
+    // The user's home directory, owned by the caller. Fails with `NOT_FOUND`
+    // when the system does not say, `NO_MEMORY` when it cannot be copied, and
+    // `UNSUPPORTED` on `#WEB`.
+    Error!ref []char8 home_dir():
+        try ref []char8 home = get_env(HOME_VARIABLE) else why:
+            if why == Error.NO_MEMORY: fail Error.NO_MEMORY
+            fail Error.NOT_FOUND
+        if #len(home) == 0:
+            #delete(home)
+            fail Error.NOT_FOUND
+        return home

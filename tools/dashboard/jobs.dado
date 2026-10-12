@@ -28,28 +28,25 @@ private const i32 STOP_GRACE_MS = 1500
 
 private const i32 MAX_ARGS = 64
 
-// Each argument twice: as the C string the child is handed, and as text for
-// showing.
-private [MAX_ARGS]ref []char8 g_argbuf
+// Each argument owned, and the list of views over them the child is handed.
 private [MAX_ARGS]ref []char8 g_argtext
-private [MAX_ARGS]cstring g_argv
+private [MAX_ARGS]string8 g_argv
 private i32 g_argc
+
+// Why the last `spawn` did not start its child.
+private os.Error g_spawn_why
 
 private void args_reset():
     for i in 0..<g_argc:
-        #delete(g_argbuf[i])
-        g_argbuf[i] = nil
         #delete(g_argtext[i])
         g_argtext[i] = nil
+        g_argv[i] = ""
     g_argc = 0
 
 private void arg(string8 s):
     if g_argc >= MAX_ARGS: return
-    ref []char8 c = strings.clone_to_cstring(s, #heap)
-    if c == nil: return
-    g_argbuf[g_argc] = c
     g_argtext[g_argc] = own(nil, s)
-    g_argv[g_argc] = cstring(c)
+    g_argv[g_argc] = txt(g_argtext[g_argc])
     g_argc = g_argc + 1
 
 // The argument list as the command line a person would type, for the
@@ -83,7 +80,9 @@ private proc.Duplex spawn(string8 env_a, string8 val_a, string8 env_b, string8 v
         try os.set_env(env_a, val_a) else: pass
     if #len(env_b) > 0:
         try os.set_env(env_b, val_b) else: pass
-    proc.Duplex d = proc.duplex(g_argv[0..<g_argc], proc.ERRORS_MERGE)
+    proc.Duplex d
+    try d = proc.duplex(g_argv[0..<g_argc], proc.Errors.Merge) else why:
+        g_spawn_why = why
     if #len(env_a) > 0:
         try os.unset_env(env_a) else: pass
     if #len(env_b) > 0:
@@ -91,15 +90,30 @@ private proc.Duplex spawn(string8 env_a, string8 val_a, string8 env_b, string8 v
     // The child reads nothing from us: closing its input at once turns a
     // program that asks a question into one that hears end-of-file and takes
     // its default, instead of one that waits for an answer nobody can type.
-    _ = proc.close_input(&d)
+    if proc.started(d): _ = proc.close_input(&d)
     return d
 
+// Stop `d` (see `proc.stop`), and answer whether it ended with status 0.
+private bool stopped_ok(^proc.Duplex d, i32 grace_ms):
+    try proc.Ended e = proc.stop(d, grace_ms) else:
+        return false
+    return proc.ok(e)
+
+// What `receive` read from `d` within `timeout_ms`: the count, 0 at the end
+// of its output, and -1 when nothing was ready in time.
+private i64 received(^proc.Duplex d, []char8 into, i32 timeout_ms):
+    i64 n = 0
+    try n = proc.receive(d, into, timeout_ms) else why:
+        if why == proc.Pipe.WAITED: return 0 - 1
+        return 0
+    return n
+
 // Why a child did not start, and what to do about it.
-private string8 start_failure(i32 why):
-    if why == 2:
+private string8 start_failure(os.Error why):
+    if why == os.Error.NOT_FOUND:
         string8 a = #format("could not start ", args_shown(true), ": no such program. Run the dashboard as `dado dashboard`, so it can find dado beside itself, or put dado on your PATH.", tui.mem)
         return a
-    string8 b = #format("could not start ", args_shown(true), " (error ", why, "). Check the program is executable, and that the system has processes to spare.", tui.mem)
+    string8 b = #format("could not start ", args_shown(true), " (", os.message(why), "). Check the program is executable, and that the system has processes to spare.", tui.mem)
     return b
 
 // ── the run ────────────────────────────────────────────────────────────────
@@ -146,7 +160,7 @@ private bool start_run(i32 kind, string8 label, string8 pkg, string8 env_a, stri
     if !proc.started(g_run):
         g_result = RESULT_NOT_STARTED
         g_run_took = 0.0
-        tui.log_say(&g_out, start_failure(g_run.failure))
+        tui.log_say(&g_out, start_failure(g_spawn_why))
         tui.toast(#format(label, " did not start", tui.mem), tui.now().err)
         args_reset()
         return false
@@ -163,7 +177,7 @@ private void cancel_run():
     if !g_running: return
     stop_tree(g_run.pid)
     _ = proc.terminate(&g_run)
-    _ = proc.stop(&g_run, STOP_GRACE_MS)
+    _ = stopped_ok(&g_run, STOP_GRACE_MS)
     g_running = false
     g_result = RESULT_CANCELLED
     g_run_took = tui.clock() - g_run_started
@@ -177,15 +191,15 @@ private void pump_run():
     if !g_running: return
     [16384]char8 chunk
     for:
-        i32 n = proc.receive(&g_run, chunk[:], 0)
-        if n == proc.WAITED: return
-        if n == proc.DRAINED || n == proc.BROKE: break
+        i64 n = received(&g_run, chunk[:], 0)
+        if n < 0: return
+        if n == 0: break
         tui.log_feed(&g_out, chunk[0..<n])
         tui.wake()
-    (bool exited, i32 status) = proc.stop(&g_run, STOP_GRACE_MS)
+    bool ok = stopped_ok(&g_run, STOP_GRACE_MS)
     g_running = false
     g_run_took = tui.clock() - g_run_started
-    g_result = RESULT_OK if proc.ok(exited, status) else RESULT_FAILED
+    g_result = RESULT_OK if ok else RESULT_FAILED
     note_built()
     finish_run()
     tui.wake()
@@ -350,7 +364,7 @@ private void begin_query(i32 kind, string8 about):
     g_q_out = own(g_q_out, "")
     g_q_started = tui.clock()
     if !proc.started(g_q):
-        string8 why = start_failure(g_q.failure)
+        string8 why = start_failure(g_spawn_why)
         args_reset()
         query_failed(kind, about, why)
         return
@@ -360,7 +374,7 @@ private void begin_query(i32 kind, string8 about):
 private void cancel_query():
     if !g_q_live: return
     _ = proc.terminate(&g_q)
-    _ = proc.stop(&g_q, STOP_GRACE_MS)
+    _ = stopped_ok(&g_q, STOP_GRACE_MS)
     g_q_live = false
     query_failed(g_q_kind, txt(g_q_for), "cancelled. Ctrl-R asks again.")
     tui.wake()
@@ -371,14 +385,13 @@ private void pump_query():
         return
     [16384]char8 chunk
     for:
-        i32 n = proc.receive(&g_q, chunk[:], 0)
-        if n == proc.WAITED: return
-        if n == proc.DRAINED || n == proc.BROKE: break
+        i64 n = received(&g_q, chunk[:], 0)
+        if n < 0: return
+        if n == 0: break
         for i in 0..<n:
             if !#append(g_q_out, chunk[i]): break
-    (bool exited, i32 status) = proc.stop(&g_q, STOP_GRACE_MS)
+    bool ok = stopped_ok(&g_q, STOP_GRACE_MS)
     g_q_live = false
-    bool ok = proc.ok(exited, status)
     query_answered(g_q_kind, txt(g_q_for), txt(g_q_out), ok)
     tui.wake()
     next_query()
@@ -491,12 +504,12 @@ private string8 read_all(i32 limit_ms):
     [4096]char8 chunk
     f64 began = tui.clock()
     for (tui.clock() - began) * 1000.0 < f64(limit_ms):
-        i32 n = proc.receive(&d, chunk[:], 50)
-        if n == proc.WAITED: continue
-        if n <= 0: break
+        i64 n = received(&d, chunk[:], 50)
+        if n < 0: continue
+        if n == 0: break
         for i in 0..<n:
             _ = #append(got, chunk[i])
-    _ = proc.stop(&d, 200)
+    _ = stopped_ok(&d, 200)
     string8 s = got
     return s
 
@@ -505,9 +518,9 @@ private void stop_everything():
     if g_running:
         stop_tree(g_run.pid)
         _ = proc.terminate(&g_run)
-        _ = proc.stop(&g_run, STOP_GRACE_MS)
+        _ = stopped_ok(&g_run, STOP_GRACE_MS)
         g_running = false
     if g_q_live:
         _ = proc.terminate(&g_q)
-        _ = proc.stop(&g_q, STOP_GRACE_MS)
+        _ = stopped_ok(&g_q, STOP_GRACE_MS)
         g_q_live = false

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.3 -->
-<!-- commit eaa5ea1b6195 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f12a11494f94 -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -226,7 +226,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR1205](ERR1205.md) | error | a `#script_*` verb in a build that can run no script — a `#NONE` target, or no DadoScript runtime in the compilation |
 | [ERR1206](ERR1206.md) | error | a script's call of a Dado function whose signature cannot cross |
 | [WRN1207](WRN1207.md) | warning | a script's argument narrowed into a Dado parameter, under `--strict`, where it is not a constant that fits |
-| [ERR1208](ERR1208.md) | error | a Dado declaration named in a script whose type does not cross, a construction of one that is no shape, or a write to a slot of one a script holds as a tuple |
+| [ERR1208](ERR1208.md) | error | a Dado declaration named in a script whose type does not cross, a construction of one that is no shape, a write to a slot of one a script holds as a tuple, or a Dado constant a script reads that cannot be written into it |
 | [ERR1209](ERR1209.md) | error | a `#script_new`, `#script_stop`, `#script_pause`, `#script_resume`, `#script_is_running`, `#script_is_paused` or `#script_reload` given something other than a VM, or a `#script_vm` written with `using` |
 | [ERR1210](ERR1210.md) | error | a retired script verb: `#script_load`, or `#script_run` given an entry name |
 | [ERR1211](ERR1211.md) | error | a `using out:` or `using err:` after a call that runs no script |

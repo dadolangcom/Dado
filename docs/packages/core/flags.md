@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit a397e1c892b1 (dirty) -->
 # core:flags
 
 core:flags — command lines: flags, positionals, subcommands, and the help
@@ -23,16 +23,22 @@ text they imply, declared once and read back typed.
             fmt.println("hello, ", p.value(who), "!" if p.on(loud) else ".")
         return 0
 
-**Tier W H. Script class S.** Pure Dado, and it never reads the process's
-arguments itself: `parse` takes a `[]string8` the caller supplies, so the
-same declarations parse a test's words, a script's, or `main`'s, on every
-target alike.
+**Tier N W H. Script class S.** Pure Dado, and it never reads the process's
+arguments or environment itself: `parse` takes a `[]string8` the caller
+supplies, and `env_var` the variables the caller read, so the same
+declarations parse a test's words, a script's, or `main`'s, on every target
+alike — freestanding, the web and hosted (Linux, macOS, Windows).
+
+**What raises into a script**: everything. `message` and `parser` carry
+`#assert_raises` on the line above them, and every method of `Parser` is
+promised through the private function of `raises_test.dado`, since a
+method cannot carry the promise itself yet.
 
 **The shape, and why.** A `Parser` holds a table of declarations. Each
 declaring method answers a small typed handle (`BoolFlag`, `TextFlag`,
-`IntFlag`, `ListFlag`, each a `distinct` index into the table), and after
-`parse` the reading methods take the handle back: `on`, `value`,
-`number`, `values`. The program writes no loop and the handle's type
+`IntFlag`, `FloatFlag`, `ListFlag`, each a `distinct` index into the
+table), and after `parse` the reading methods take the handle back: `on`,
+`value`, `number`, `amount`, `values`. The program writes no loop and the handle's type
 decides what may be read from it, so reading a switch as a number is a
 compile error (ERR0504) rather than a zero. A handle is an index and not a
 `^T` into the table, so declaring more flags (which grows the table) never
@@ -86,6 +92,26 @@ command has a `tail`, a word after `--` goes nowhere else. Without one,
 `--` only ends the flags: what follows is positional however it is
 spelled. A positional word with nowhere to go is refused.
 
+**The environment, as a fallback.** `env("--cc", "DADO_CC")` says that
+the flag spelled `--cc` takes its value from the variable `DADO_CC` when
+the command line does not give one; `env_var(name, value)` hands the parser
+one variable the program read. The parser reads no environment of its own —
+on the web and freestanding there is none to read — so a program that
+supplies no variables simply finds none, and every flag keeps its default:
+
+    os.Environment e = os.environment()
+    defer e.destroy()
+    for v in e.vars:
+        p.env_var(v.name, v.value)
+
+A value given on the command line always wins. A variable set to the empty
+string counts as unset. A variable's value is checked as the flag's value
+would be, and a bad one fails `parse` with that code and a sentence naming
+the variable. A switch reads `true`, `yes`, `on` and `1` as on and their
+opposites as off (`core:strings/parse`'s `to_bool`), a list takes the whole
+value as one item, and a variable is never a positional. The help shows the
+variable beside the flag: `(env: DADO_CC)`.
+
 **Help.** Every parser declares `-h --help` itself. `parse` stops at it
 and answers success, `wants_help` says so, and `help` writes the text for
 the command chosen (or for the program): a usage line, the summary, the
@@ -101,16 +127,18 @@ windows into the `args` passed to `parse` (`-DNAME=1`'s value is the word
 from its third byte), so `args` must outlive the reads. Nothing is
 copied.
 
-**Error codes.** `parse` is failable. `message(code)` answers a sentence
-for the code; `error()` answers the full sentence for the failure just
-returned, which names the word, the flag and the repair:
+**Error codes: `Error`, 1400 to 1499**, a range no other package's codes
+share. `parse` is `Error!string8`; `message(why)` answers a sentence for
+the code, and `error()` the full sentence for the failure just returned,
+which names the word, the flag and the repair:
 
 * `UNKNOWN_FLAG` — no such flag here; the nearest spelling (edit distance)
   is suggested, or the commands it belongs to are named.
 * `MISSING_VALUE` — a flag that takes a value has none (or an empty one);
   its form is shown.
 * `BAD_VALUE` — the value is not what the flag accepts: not a whole
-  number, not one of its choices, or a value given to a switch.
+  number, not a number, not one of its choices, or a value given to a
+  switch.
 * `UNKNOWN_COMMAND` — the first word is not a command; the nearest is
   suggested.
 * `EXTRA_POSITIONAL` — a positional word with no place to go.
@@ -118,14 +146,19 @@ returned, which names the word, the flag and the repair:
 * `BAD_SPEC` — the declarations themselves are wrong: a spelling that is
   neither `-c` nor `--word`, one spelling twice where both reach, a scope
   naming no command, a value form missing, a default that is not a choice,
-  a number whose value is optional.
+  a number whose value is optional, an `env` naming no flag.
   This is the program's mistake, not the user's, reported at `parse`.
+* `NO_MEMORY` — the allocator refused a declaration, or a list's value.
 
 **Allocation.** Ambient: the table, the lists and the failure sentence are
 on `#default`, and `help` answers a `ref []char8` the caller owns. Under a
 `using` arena nothing needs freeing; outside one, `destroy` frees what the
 parser holds and the caller `#delete`s the help text. Lengths and indices
-are `i64`.
+are `i64`. When the allocator refuses, nothing traps: a declaration it
+refused makes the next `parse` fail with `NO_MEMORY` and its handle read
+as the zero value; a list's value it refused fails that `parse` with
+`NO_MEMORY`; a failure sentence it refused leaves `error()` answering
+`message` of the code; and `help` answers `nil`.
 
 **Thread-safety.** No package state. A `Parser` is a plain value that one
 thread at a time may declare into, parse with and read; separate parsers
@@ -133,38 +166,37 @@ are independent.
 
 ## Declarations
 
-98 declarations, 35 public.
+100 declarations, 34 public.
 
-* `const i32 UNKNOWN_FLAG = 1` — `parse`'s code: a flag no declaration in reach spells.
-* `const i32 MISSING_VALUE = 2` — `parse`'s code: a flag that takes a value was given none, or an empty one.
-* `const i32 BAD_VALUE = 3` — `parse`'s code: a flag's value is not one it accepts.
-* `const i32 UNKNOWN_COMMAND = 4` — `parse`'s code: the first word is not a declared command.
-* `const i32 EXTRA_POSITIONAL = 5` — `parse`'s code: a positional word has no positional left to fill.
-* `const i32 MISSING_POSITIONAL = 6` — `parse`'s code: a required positional was not given.
-* `const i32 BAD_SPEC = 7` — `parse`'s code: the declarations are malformed or contradict each other.
-* `string8 message(i32 code)` — A sentence for each of this package's codes, and one for any other.
+* `distinct enum i32 Error` — Why `parse` failed. The numbers are this package's, 1400 to 1499, apart…
+* `string8 message(Error why)` — A sentence for each of this package's codes, and one for any other value.
 * `distinct type BoolFlag: i64` — A switch: on when given.
 * `distinct type TextFlag: i64` — One text: a flag's value, a `choice`, or a positional.
 * `distinct type IntFlag: i64` — A whole number.
+* `distinct type FloatFlag: i64` — A number with a fraction: what `core:strings/parse`'s `to_f64` reads.
 * `distinct type ListFlag: i64` — A list: a repeatable flag's values, or the words a `rest` or `tail`
 * `type Parser` — A program's command line: what it declares, and what the last `parse`
 * `void command(^self, string8 name, string8 summary)` — A command word, with the one line the help shows beside it (`""`
 * `BoolFlag boolean(^self, string8 names, string8 summary, string8 scope = "")` — A switch, off unless given. A value written to it (`--release=yes`)
 * `TextFlag text(^self, string8 names, string8 form, string8 summary, string8 default = "", string8 scope = "")` — A flag with one text value; the last one given wins. `default` is what…
 * `IntFlag integer(^self, string8 names, string8 form, string8 summary, i64 default = 0, string8 scope = "")` — A flag whose value must be a whole number (decimal, an optional sign).
+* `FloatFlag real(^self, string8 names, string8 form, string8 summary, f64 default = 0.0, string8 scope = "")` — A flag whose value must be a number: decimal digits with an optional…
+* `void env(^self, string8 spelling, string8 variable)` — The flag spelled `spelling` (any one of its spellings) takes its value…
+* `void env_var(^self, string8 name, string8 value)` — One variable of the environment the program read, for the flags `env`
 * `ListFlag list(^self, string8 names, string8 form, string8 summary, string8 scope = "")` — A repeatable flag: every value given, in order (`-D A=1 -D B=2`).
 * `TextFlag choice(^self, string8 names, string8 form, string8 summary, string8 default = "", string8 scope = "")` — A flag whose value must be one of the choices its form lists between…
 * `TextFlag positional(^self, string8 name, string8 summary, bool required = false, string8 scope = "")` — One positional word, filled in declaration order. A `required` one…
 * `ListFlag rest(^self, string8 name, string8 summary, string8 scope = "")` — Every positional word left over once the `positional`s are filled.
 * `ListFlag tail(^self, string8 name, string8 summary, string8 scope = "")` — The words after `--`, exactly as written, flags or not.
-* `!string8 parse(^self, []string8 args)` — Read `args` (the words after the program's name) against the…
+* `Error!string8 parse(^self, []string8 args)` — Read `args` (the words after the program's name) against the…
 * `bool wants_help(self)` — Whether the last `parse` stopped at `-h` or `--help`.
-* `string8 error(self)` — The full sentence for the last failure of `parse`; empty after a…
+* `string8 error(self)` — The full sentence for the last failure of `parse`, or `message` of its…
 * `string8 command_name(self)` — The command word the last `parse` chose, or `""`.
 * `bool on(self, BoolFlag f)` — Whether the switch was given.
 * `string8 value(self, TextFlag f)` — The text given, or the default when it was not.
 * `bool given(self, TextFlag f)` — Whether the text was given at all, which tells a form-`[=PATH]` flag…
 * `i64 number(self, IntFlag f)` — The number given, or the default when it was not.
+* `f64 amount(self, FloatFlag f)` — The number given, or the default when it was not.
 * `[]string8 values(self, ListFlag f)` — Every value given, in order; empty when none was.
 * `ref []char8 help(self)` — The help for the command the last `parse` chose, or for the program…
 * `ref []char8 help_for(self, string8 command)` — The help for `command`, or for the program when `command` is `""`

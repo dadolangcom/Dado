@@ -1,9 +1,20 @@
 // core:mem/gc — a conservative mark-sweep collector behind `mem.Allocator`.
 //
-//     gc.Heap heap
-//     gc.init(&heap)
-//     using gc.allocator(&heap):
-//         run()                                 // every verb allocates here
+//     import "core:mem/gc"
+//
+//     gc.Heap heap                              // about 115 KB: not a local
+//
+//     i32 main():
+//         gc.init(&heap)
+//         using gc.allocator(&heap):
+//             ref []i32 xs = #make([]i32, 100)  // every verb allocates here
+//             xs[0] = 1
+//         _ = gc.collect(&heap)
+//         return 0
+//
+// **Outside the 1.0 promise.** This package is a prototype and is versioned
+// with nothing: its API may change or the package go in any release, and the
+// standard library's version promise does not cover it.
 //
 // **PROTOTYPE.** It collects, and it is correct for what it scans. What it does
 // not scan is below under *Roots*, and that list is a correctness hole, not a
@@ -12,6 +23,17 @@
 // Conservative means: any stack word that looks like an address into a live
 // block keeps that block alive. False positives retain garbage; there are no
 // false negatives for anything the root set covers.
+//
+// **Hosted only: Linux, macOS and Windows**, each answering where its thread's
+// stack ends in its own call (`stack_base` below). Not `#NONE`, which has no
+// `malloc`, and not the web, where a WebAssembly module cannot read its own
+// stack: the `#static_assert` below refuses both, naming the reason.
+//
+// **What raises into a script: nothing.** A collector is made of addresses,
+// and every function here takes a `^Heap` or a `rawptr` or reaches `malloc`.
+//
+// **Thread-safety.** One `Heap` belongs to one thread, and only that thread's
+// stack is scanned (see *Roots* below).
 package gc
 
 import "core:mem"
@@ -46,12 +68,27 @@ import "core:mem"
 // function wanting a fourth attribute is a registration and not a free hand.
 // That is the trade the row was for.
 
+#static_assert(#OS != #WEB && #OS != #NONE, "core:mem/gc scans the C stack and allocates from C's heap: a #WEB module cannot read its own stack and a #NONE target has no heap")
+
 // `#c.size_t` and not `u64`: the same width, and on Darwin not the same type
 // (`uint64_t` is `unsigned long long` there), which the emitter's `_Generic`
 // assertion on this restatement would refuse.
-private foreign "stdlib.h":
-    rawptr malloc(#c.size_t nbytes)
-    void free(rawptr p)
+//
+// On `#WEB` and `#NONE` everything C is a Dado stub, never built because the
+// assertion above refuses the build first, so its reason is the only error.
+when #OS == #WEB || #OS == #NONE:
+    private rawptr malloc(#c.size_t nbytes):
+        return nil
+    private void free(rawptr p):
+        return
+    private void __builtin_unwind_init():
+        return
+    private rawptr __builtin_frame_address(i32 level):
+        return nil
+else:
+    private foreign "stdlib.h":
+        rawptr malloc(#c.size_t nbytes)
+        void free(rawptr p)
 
 // The two compiler builtins this collector is made of, restated through a
 // `foreign` block exactly as a library function is: gcc and clang declare them
@@ -65,9 +102,10 @@ private foreign "stdlib.h":
 // `__builtin_frame_address(0)` is the current frame's base, which `stack_top`
 // below is the whole of. Its argument has to be a constant, and a literal `0`
 // is what Dado emits for a literal `0`.
-private foreign "stddef.h":
-    void __builtin_unwind_init()
-    rawptr __builtin_frame_address(i32 level)
+when #OS != #WEB && #OS != #NONE:
+    private foreign "stddef.h":
+        void __builtin_unwind_init()
+        rawptr __builtin_frame_address(i32 level)
 
 // What the walk hands back: the heap, and one candidate address.
 type Visit: void(rawptr, rawptr)
@@ -81,13 +119,16 @@ type Visit: void(rawptr, rawptr)
 // the scanned range and its block is freed while live. Measured — that is
 // exactly how the first prototype failed.
 //
-// **Two platforms, two calls, and the `when` is the whole of the difference.**
+// **Three platforms, three calls, and the `when` is the whole of the difference.**
 // glibc answers with a `pthread_attr_t` filled in by `pthread_getattr_np`,
 // which is behind `_GNU_SOURCE` — and `<features.h>` fixes the feature set the
 // first time any header pulls it in, which is why the macro is a `define`
 // clause (emitted above every `#include`) and not a line in this file. Apple
-// answers in one call and needs no macro.
-when #OS == #DARWIN:
+// answers in one call and needs no macro, and so does Windows.
+when #OS == #WEB || #OS == #NONE:
+    private rawptr stack_base():
+        return nil
+else when #OS == #DARWIN:
     private foreign "pthread.h":
         type pthread_t
         pthread_t pthread_self()
@@ -95,6 +136,22 @@ when #OS == #DARWIN:
 
     private rawptr stack_base():
         return pthread_get_stackaddr_np(pthread_self())
+else when #OS == #WINDOWS:
+    // Windows answers both ends of the calling thread's stack in one call, as
+    // integers (`ULONG_PTR`, which is `uintptr_t` on every 64-bit Windows).
+    // The high end is what a downward-growing stack is scanned to, and it is
+    // made an address the way every address here is: from `rawptr` by `+`.
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        void GetCurrentThreadStackLimits(^#c.uintptr_t low, ^#c.uintptr_t high)
+
+    private rawptr stack_base():
+        #c.uintptr_t low = 0
+        #c.uintptr_t high = 0
+        GetCurrentThreadStackLimits(&low, &high)
+        if high == 0:
+            return nil
+        rawptr none = nil
+        return none + u64(high)
 else:
     // `type pthread_attr_t` with no body is **complete in C and opaque to
     // Dado**: C spells it and C sizes it, so a local of one is a real object
@@ -172,10 +229,17 @@ private @symbol(no_sanitize_address) void scan_words(rawptr lo, rawptr hi, rawpt
         at = at + #size(rawptr)
     return
 
-public const i32 MAX_BLOCKS = 4096
+// How many blocks one `Heap` holds at once. A full table collects, and an
+// allocation that still finds it full answers `nil`.
+const i32 MAX_BLOCKS = 4096
 
+// One block the collector handed out: where, how large, and whether the
+// current collection has reached it.
 type Block: (rawptr at, u64 size, bool marked)
 
+// A collected heap: the block table, the marking worklist, the span every
+// live block lies in, and the counters. About 115 KB, so a program keeps one
+// in package-level storage rather than on the stack.
 type Heap: (
     [MAX_BLOCKS]Block blocks,
     // Marked but not yet scanned. Marking is transitive and this is the
@@ -200,7 +264,7 @@ type Heap: (
 // the compiler may place a local above whichever one you took the address of,
 // and a reference in that one is then outside the range and freed while live.
 // The first prototype did it the other way and collected its own live data.
-public void init(^Heap h):
+void init(^Heap h):
     h^.count = 0
     h^.pending_count = 0
     h^.lo = nil
@@ -210,7 +274,8 @@ public void init(^Heap h):
     h^.freed = 0
     return
 
-public (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Heap h):
+// `h` as an allocator: the two words `using` and the verbs take.
+(mem.Proc proc, rawptr data) allocator(^Heap h):
     return (dispatch, rawptr(h))
 
 // The allocator for a collected heap, as a declaration that takes `mem.Allocator` on:
@@ -219,21 +284,25 @@ public (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) 
 // compiler calls its `data()` there. It holds only the pointer, so a
 // one-slot declaration: `self` *is* the `^Heap`.
 //
-//     gc.HeapAllocator h = &h
-//     using h:
-//         ...
-public type HeapAllocator using mem.Allocator:
+//     gc.HeapAllocator ha = &heap
+//     using ha:
+//         ref []i32 xs = #make([]i32, 100)
+type HeapAllocator using mem.Allocator:
     ^Heap heap,
-    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self):
+    // The two words `allocator(self.heap)` answers.
+    (mem.Proc proc, rawptr data) data(self):
         return (dispatch, rawptr(self))
 
-public i32 live(^const Heap h):
+// How many blocks `h` holds now, reachable or not yet collected.
+i32 live(^const Heap h):
     return h.count
 
-public i64 collections(^const Heap h):
+// How many collections `h` has run, by hand or when its table filled.
+i64 collections(^const Heap h):
     return h.collections
 
-public i64 freed(^const Heap h):
+// How many blocks `h`'s collections have freed, in all.
+i64 freed(^const Heap h):
     return h.freed
 
 // ── the allocator ───────────────────────────────────────────────────────────
@@ -272,7 +341,7 @@ private rawptr take(^Heap h, u64 nbytes):
     rawptr block = malloc(#c.size_t(want))
     if block == nil:
         return nil
-    zero(block, want)
+    mem.zero(block, want)
     h^.blocks[h^.count] = (block, want, false)
     h^.count = h^.count + 1
     widen(h, block, want)
@@ -311,25 +380,13 @@ private rawptr regrow(^Heap h, rawptr old, u64 old_size, u64 nbytes):
     u64 keep = old_size
     if nbytes < keep:
         keep = nbytes
-    mem.Bytes src = mem.Bytes(old)
-    mem.Bytes dst = mem.Bytes(fresh)
-    []u8 from = src[0..<i64(keep)]
-    []u8 into = dst[0..<i64(keep)]
-    for i in i64(0)..<i64(keep):
-        into[i] = from[i]
+    mem.copy(fresh, old, keep)
     return fresh
-
-private void zero(rawptr p, u64 nbytes):
-    mem.Bytes b = mem.Bytes(p)
-    []u8 span = b[0..<i64(nbytes)]
-    for i in i64(0)..<i64(nbytes):
-        span[i] = 0
-    return
 
 // ── collection ──────────────────────────────────────────────────────────────
 
 // Mark from the roots, free what is unreachable, answer how many blocks went.
-public i64 collect(^Heap h):
+i64 collect(^Heap h):
     __builtin_unwind_init()
     rawptr top = stack_top()
 

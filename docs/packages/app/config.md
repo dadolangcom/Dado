@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit d5b92d013902 -->
 # app:config
 
 app:config — self-provisioning settings, over core:cfg.
@@ -26,25 +26,23 @@ and nothing backend-specific, so a server reads config the same way a
 terminal or graphical program does.
 
 **Opinion over mechanism.** Everything here forwards to `core:cfg`, fixing
-one allocator (`app.allocator()`) so a program never plumbs one through —
-that is the entire value add. A program that wants its own allocator, or
-the untyped `Config` value's own shape, reaches for `core:cfg` directly;
-nothing here is otherwise reachable only through this package.
+one allocator (`app.allocator()`) for `load`, `save` and the setters — that
+is the entire value add. A program that wants the untyped `Config` value's
+own shape reaches for `core:cfg` directly; nothing here is otherwise
+reachable only through this package.
 
-**Where a `Config` lands, and how a caller says so.** `core:cfg` takes an
-allocator in every signature, which is the convention this collection does
-not use: an allocator is not threaded through parameter lists here, it is
-the ambient one and `using` is how it is changed. So the two forms this
-package offers are the ambient and the opinion, and neither is a parameter:
+**Where a `Config` lands, and how a caller says so.** `core:cfg` allocates
+on the ambient allocator, as this collection does: an allocator is not
+threaded through parameter lists, and `using` is how it is changed. So the
+two forms this package offers are the ambient and the opinion, and neither
+is a parameter:
 
     config.load(path, seed)                              // app.allocator()
     config.load_with(path, seed)                         // the caller's own default
     config.load_with(path, seed) using arena.allocator(&a)   // in `a`
 
-`load` is now literally `load_with` under a `using`, which is the whole of
-what "fixing one allocator" means and is one line rather than an argument
-threaded down. `load_with` writes `#default` where `core:cfg` insists on a
-value, and `#default` *is* the ambient — so the caller's `using` reaches the
+`load` is literally `load_with` under a `using`, which is the whole of what
+"fixing one allocator" means, and the caller's `using` reaches the
 `core:cfg` call underneath without this file naming a place.
 
 **Who ends a `Config`.** The caller that loaded it, with `destroy(&c)` —
@@ -68,9 +66,9 @@ allocator parameter on it was a value with exactly one correct argument.
 
 * `type Config: cfg.Config` — section -> key -> value: **`core:cfg`'s `Config` itself**, by a qualified…
 * `type DefaultsFn: void(^Config)` — Called once, only when `load` finds nothing at the path, to seed a fresh…
-* `(Config c, bool created, bool ok, i32 bad_lines) load(cstring path, DefaultsFn defaults)` — Load `path` with `app.allocator()`. See `load_with` for the form that takes…
-* `(Config c, bool created, bool ok, i32 bad_lines) load_with(cstring path, DefaultsFn defaults)` — Load `path`, or self-provision it. If `path` exists, this is exactly…
-* `bool save(Config c, cstring path)` — Write `c` back to `path` — after a program has changed a value at…
+* `(Config c, bool created, bool ok, i32 bad_lines) load(string8 path, DefaultsFn defaults)` — Load `path` with `app.allocator()`. See `load_with` for the form that takes…
+* `(Config c, bool created, bool ok, i32 bad_lines) load_with(string8 path, DefaultsFn defaults)` — Load `path`, or self-provision it. If `path` exists, this is exactly…
+* `bool save(Config c, string8 path)` — Write `c` back to `path` — after a program has changed a value at…
 * `void destroy(^Config c)` — End `c`: every value, every section's map, and the map. See the package…
 * `string8 get_string(Config c, string8 section, string8 key, string8 fallback)`
 * `i32 get_i32(Config c, string8 section, string8 key, i32 fallback)`

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit a09527b116bd -->
 # core:fmt
 
 core:fmt — where rendered bytes go, and what shape they arrive in.
@@ -12,7 +12,7 @@ core:fmt — where rendered bytes go, and what shape they arrive in.
 
     _ = fmt.put_string("n = ", out)
     _ = fmt.put_signed(42, out)
-    string line = fmt.written(c)       // the bytes, as a string
+    string8 line = fmt.written(c)      // the bytes, as a view
 
 **The compiler owns what a value looks like; this package owns where it goes
 and how it is shaped.** `#render(v, sink)` renders one value in the one form
@@ -21,21 +21,22 @@ renderer driven by a type cannot take an opinion from a call. Every one of
 those opinions lives here, and each is an ordinary function a program can
 read.
 
-## The four that write a message
+## The six that write a message
 
-    public void print(..#any args)
-    public void println(..#any args)
-    public void write(Sink out, ..#any args)
-    public void writeln(Sink out, ..#any args)
+    void print(..#any args)
+    void println(..#any args)
+    void eprint(..#any args)
+    void eprintln(..#any args)
+    void write(Sink out, ..#any args)
+    void writeln(Sink out, ..#any args)
 
 These are the compiler's retired `print` and `println`, and they are this
 package's because the destination is a library's business and the *rendering*
-is not: `#render(v, sink)` is the compiler's, per-type, and these four are a
-`..#any` pack unrolled over it. They exist only inside a `when #OS != #NONE:`
-— on a freestanding target the names do not exist and a call is refused
-rather than silently doing nothing. `print` and `println` reach the terminal
-through `core:io`'s `stdout_sink()`; `write` and `writeln` take the sink the
-caller names. None of them fails, so no call site writes `try`.
+is not: `#render(v, sink)` is the compiler's, per-type, and these six are a
+`..#any` pack unrolled over it. `print` and `println` reach the terminal
+through `core:io`'s `stdout_sink()`, `eprint` and `eprintln` through its
+`stderr_sink()`; `write` and `writeln` take the sink the caller names. None
+of them fails, so no call site writes `try`.
 
 They are the one place the sink is written **first**, and the rule below says
 why that is the grammar's doing rather than a choice.
@@ -63,28 +64,44 @@ count, and a caller that cares compares it against what it asked for. It is
 A nil `proc` takes nothing and answers 0, so an unset `Sink` is inert rather
 than a fault.
 
-## This package includes nothing, and imports one thing
+## Tier N W H, and what a freestanding target gives up
 
-No `foreign` block — so this file emits no `#include` of its own, and a
-program on a target whose OS is `#NONE` may use every line of it that exists
-there. That is not an accident of what happened to be needed: it is the
-reason the stream sinks are **not here**. `stdout` is `<stdio.h>`, a
-`foreign` block's `#include` reaches every importer of the package holding
-it, and a `fmt` that dragged `<stdio.h>` behind it would be a formatting
-library no freestanding program could call. `core:io` owns `^FILE` already
-and is where a sink over one belongs.
+**Tier N W H.** No `foreign` block, so this file emits no `#include` of its
+own, and every line of it builds hosted (Linux, macOS, Windows), on the web
+and freestanding, with two differences on `#NONE`, both the target's:
 
-The one `import` is `core:io`, and it is what the four printing functions at
-the foot of this file reach standard output through. It costs an importer
-nothing it does not ask for, because the emitter follows **liveness** and not
-imports: those four are templates over a pack, so a program that calls none
-of them instantiates none of them and emits no `<stdio.h>`. The argument for
-the rule above is therefore unchanged — what it forbids is a header this
-package *cannot* avoid emitting, and an import is not one.
+* `print`, `println`, `eprint` and `eprintln` do not exist there: a
+  freestanding target has no standard output or error to reach, and a call
+  is refused (*package `fmt` declares no function `println`*) rather than
+  silently doing nothing. `write` and `writeln` stay, because the caller
+  names the sink.
+* `#render` of a float is refused there (ERR1004: its conversion is the C
+  library's), so `put`, `write` and `writeln` given a float, or a tuple
+  holding one, are refused at that call. This package's own float putters
+  and renderers are written in Dado and work everywhere: on `#NONE` a
+  float is written with `put_float`, `put_float_shortest`, `put_float_exp`
+  or `put_float_pad`.
+
+That is the reason the stream sinks are **not here**: `stdout` is
+`<stdio.h>`, and `core:io` owns it. `core:io` is imported for the four
+printing functions at the foot of this file; it costs an importer nothing
+it does not ask for, because the emitter follows **liveness** and not
+imports: they are templates over a pack, so a program that calls none of
+them instantiates none and emits no `<stdio.h>`.
 
 The same rule keeps `core:math` out: `<math.h>` and `-lm` would ride along
-with it — unconditionally, because the float path below is concrete and calls
-it — so that path does its own arithmetic.
+with it on a hosted target, so the float path below does its own
+arithmetic, and the NaN and infinity tests it needs are private here.
+
+## What raises into a script
+
+Every function here that neither takes nor makes a `Sink`, each promised by
+the `#assert_raises` on the line above it: the `render_*` family (text into
+the caller's `[]char8`, the script-safe face of each putter), `right`,
+`left`, `zeros`, and the `Cursor` verbs `over`, `written` and `rewind`. Everything that takes or makes a `Sink` is not
+promised, for one reason: a `Sink` is C's `(procedure, rawptr data)` pair,
+and a script has no addresses. A script that wants text calls a renderer;
+one that wants output calls its own `print`.
 
 ## What an importer pays, measured
 
@@ -125,19 +142,19 @@ checked by the type system rather than by a runtime scan of a string.
 
 ## Declarations
 
-96 declarations, 42 public.
+105 declarations, 46 public.
 
 * `i64 put_bytes([]char8 bytes, Sink out)` — Hand `bytes` to `out`, and answer how many it took.
-* `i64 put_string(string8 s, Sink out)` — The bytes of a `string`, written whole — embedded `\0` included, because a…
+* `i64 put_string(string8 s, Sink out)` — The bytes of a `string8`, written whole — embedded `\0` included, because a…
 * `i64 put_cstring(cstring c, Sink out)` — The bytes at `c`, up to its `\0`. One walk to find the length C threw away —…
 * `i64 put_char(char8 b, Sink out)` — One byte.
-* `i64 put_repeat(char8 b, i32 n, Sink out)` — `b`, `n` times. `n <= 0` writes nothing. This is what every alignment in the…
+* `i64 put_repeat(char8 b, i64 n, Sink out)` — `b`, `n` times. `n <= 0` writes nothing. This is what every alignment in the…
 * `enum i32 Align` — Which side the padding goes on. A plain `i32`-backed enum, so it orders and…
-* `type Pad` — How a field is padded: how wide it is at least, which side the slack goes on,…
+* `type Pad` — How a field is padded: how wide it is at least, in bytes, which side the…
 * `const Pad PLAIN = (0, Align.Left, ' ')` — No padding. The value an argument takes when a caller does not care.
-* `Pad right(i32 width)` — Right-aligned in `width` columns, space-filled — a number in a column.
-* `Pad left(i32 width)` — Left-aligned in `width` columns, space-filled — a name in a column.
-* `Pad zeros(i32 width)` — Right-aligned in `width` columns, zero-filled — a fixed-width number.
+* `Pad right(i32 width)` — Right-aligned in `width` bytes, space-filled — a number in a column.
+* `Pad left(i32 width)` — Left-aligned in `width` bytes, space-filled — a name in a column.
+* `Pad zeros(i32 width)` — Right-aligned in `width` bytes, zero-filled — a fixed-width number.
 * `i64 put_base(u64 value, u32 base, bool upper, Sink out)` — An unsigned value in `base`, with the digits above 9 written in the case…
 * `i64 put_signed($T value, Sink out) where T is int && T in (i8, i16, i32, i64)` — A signed integer of any width, in decimal.
 * `i64 put_unsigned($T value, Sink out) where T is int && T in (u8, u16, u32, u64)` — An unsigned integer of any width, in decimal.
@@ -145,15 +162,17 @@ checked by the type system rather than by a runtime scan of a string.
 * `i32 render_unsigned($T value, []char8 into) where T is int && T in (u8, u16, u32, u64)` — `value` in decimal, as `put_unsigned` writes it, at the start of `into`.
 * `i64 put_hex($T value, i32 digits, bool upper, bool prefix, Sink out) where T is int && T in (u8, u16, u32, u64)` — Hexadecimal, with an optional `0x` and an optional minimum digit count that…
 * `i64 put_binary($T value, i32 digits, bool prefix, Sink out) where T is int && T in (u8, u16, u32, u64)` — Binary, with an optional `0b` and the same floor rule as `put_hex`.
-* `i64 put_string_pad(string8 s, Pad p, Sink out)` — A `string` in a field.
+* `i64 put_string_pad(string8 s, Pad p, Sink out)` — A `string8` in a field, measured in bytes: ASCII aligns by column, and…
 * `i64 put_signed_pad($T value, Pad p, Sink out) where T is int && T in (i8, i16, i32, i64)` — A signed decimal in a field.
 * `i64 put_unsigned_pad($T value, Pad p, Sink out) where T is int && T in (u8, u16, u32, u64)` — An unsigned decimal in a field.
 * `i64 put_bool(bool v, Sink out)` — `true` or `false`, which is what the compiler's own renderer writes.
 * `i64 put_bool_as(bool v, string8 when_true, string8 when_false, Sink out)` — `v` as one of two words the caller chose — `yes`/`no`, `on`/`off`, `1`/`0`.
 * `i64 put_quoted(string8 s, Sink out)` — `s` between double quotes, with the eight escapes the language's own literals…
-* `bool is_nan($T x) where T is float` — Whether `x` is a NaN, asked without `<math.h>`: a NaN is the one value that is…
-* `bool is_infinite($T x) where T is float` — Whether `x` is an infinity, asked without `<math.h>`.
-* `i64 put_float($T value, i32 decimals, Sink out) where T is float` — `value` with exactly `decimals` places after the point, rounded half away from…
+* `i64 put_float($T value, i32 places, Sink out) where T is float` — `value` with exactly `places` places after the point, rounded half away from…
+* `i64 put_float_pad($T value, i32 places, Pad p, Sink out) where T is float` — `value` as `put_float` writes it, in a field: the padding goes around the…
+* `i32 render_float($T value, i32 places, []char8 into) where T is float` — `value` as `put_float` writes it, at the start of `into`. Answers how many…
+* `i64 put_float_exp($T value, i32 places, Sink out) where T is float` — `value` in exponent notation, `d.ddde+NN`: one digit before the point,…
+* `i32 render_float_exp($T value, i32 places, []char8 into) where T is float` — `value` as `put_float_exp` writes it, at the start of `into`. Answers how…
 * `i64 put_float_shortest($T value, Sink out) where T is float` — ── the shortest float that reads back ──────────────────────────────────────…
 * `i32 render_float_shortest($T value, []char8 into) where T is float` — `value` as `put_float_shortest` writes it, at the start of `into`. Answers…
 * `type Cursor` — Where a `to_bytes` sink is up to. `into` is the caller's storage, `used` is…
@@ -169,3 +188,5 @@ checked by the type system rather than by a runtime scan of a string.
 * `void writeln(Sink out, ..#any args)` — `args`, and then a newline.
 * `void print(..#any args)` — `args`, on standard output.
 * `void println(..#any args)` — `args`, on standard output, and then a newline.
+* `void eprint(..#any args)` — `args`, on standard error: a diagnostic, kept apart from a program's…
+* `void eprintln(..#any args)` — `args`, on standard error, and then a newline.

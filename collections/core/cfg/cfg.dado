@@ -1,13 +1,30 @@
-// core:cfg — a native INI reader/writer over core:io and core:os/fs.
+// core:cfg — INI text to a queryable `Config` and back, and the same to and
+// from a file.
 //
 //     import "core:cfg"
-//     import "core:mem"
 //
-//     (cfg.Config c, bool ok, i32 bad) = cfg.load("settings.ini", alloc)
+//     (cfg.Config c, bool ok, i32 bad) = cfg.load("settings.ini")
 //     defer cfg.destroy(&c)
-//     i32 width = cfg.get_i32(c, "window", "width", 1280, alloc)
-//     cfg.set_i32(&c, "window", "width", width, alloc)
-//     cfg.save(c, "settings.ini", alloc)
+//     i32 width = cfg.get_i32(c, "window", "width", 1280)
+//     cfg.set_i32(&c, "window", "width", width)
+//     _ = cfg.save(c, "settings.ini")
+//
+//     try string8 title = cfg.get(c, "window", "title") else why:
+//         println(cfg.message(why))       // "no such key in that section"
+//         return 1
+//
+// **Tier N W H, the file layer W H. Script class H.** The text half —
+// `parse`, `render`, `render_over`, the getters, setters and removers — is
+// Dado over `core:strings`, `core:strings/parse` and `core:slices`, and
+// builds and runs freestanding, on the web and hosted. The file half
+// (`load`, `save`, `exists`, in `file.dado`) is a thin layer over `core:io`
+// on top of it: it is not declared on `#NONE`, which has no files, and on the
+// web it answers what `core:io` does there — no file opens yet, so `load`
+// answers an empty `Config` and `save` answers false.
+//
+// **What raises into a script.** Every function of the text half, each
+// promised by the `#assert_raises` above it. The file layer is not: it
+// reaches C's streams through `core:io`.
 //
 // The format is INI, and a vendored C parser was ruled out in favour of
 // this one — zero dependency, and the result is a queryable
@@ -15,101 +32,109 @@
 // `"section:key"` strings.
 //
 // **The format.** `[section]` headers, `key = value` lines, `;` and `#`
-// comments, blank lines — the common subset every INI reader agrees on.
-// Whitespace around `=` and around a section name is trimmed; nothing else
-// is. Lines before the first header land in the `""` section, so a caller
+// comments on lines of their own, blank lines — the common subset every INI
+// reader agrees on. Whitespace around `=` and around a section name is
+// trimmed; nothing else is, and a `;` or `#` after a value is part of the
+// value. Lines before the first header land in the `""` section, so a caller
 // that never writes `[section]` still has a flat key=value file.
+//
+// **Quoted values.** A value that starts with `"` is quoted: it ends at the
+// matching `"`, which must end the line, and `\"`, `\\`, `\n`, `\r` and `\t`
+// inside it are escapes. That is how a value keeps leading or trailing
+// spaces, a line break or a leading quote. `render` quotes exactly the values
+// that need it, so every value round-trips; a value that merely contains a
+// `"` or a `\` after its first byte is written bare.
 //
 // **Forgiving on read, exact on write.** A hand-edited config is not a wire
 // protocol: a stray line that isn't a comment, a header or a `key = value`
-// pair is skipped rather than failing the whole load, the same stance
-// `numbers.to_i32` (`core:strings/parse`) takes on unparsable text.
-// `bad_lines` says how many were dropped and `ok` is `bad_lines == 0`, so a
-// caller that cares can still tell the difference between "booted clean" and
-// "booted anyway".
+// pair — or a quoted value that does not close — is skipped rather than
+// failing the whole parse. `bad_lines` says how many were dropped, so a
+// caller that cares can still tell "booted clean" (0) from "booted anyway".
+//
+// **Comments survive a round trip.** `render(c)` writes a `Config` out fresh,
+// in a fixed order: the `""` section's keys, then each section, both sorted
+// by name. `render_over(c, original)` writes it over the text it was parsed
+// from instead: every comment, blank line and unparsed line of a section
+// that still exists stays where it was, every key whose value did not change
+// keeps its line byte for byte, a changed value is rewritten in place, a
+// removed key or section is dropped, and new keys go after the last line of
+// their section, new sections at the end. `save` renders over the file
+// already at the path, so a hand-written file keeps its comments and its
+// order through a load, a set and a save.
 //
 // **Every value a `Config` holds is its own allocation, and `destroy` ends
 // them.** Section and key names become map keys, and a map already copies
 // those on a fresh insert and frees them at `#delete`; the *value* half of
 // every entry is a `ref []char8` the map neither copies nor frees, so
-// `parse`/`set_*` clone it in and `destroy(&c)` frees every value, every
-// section's map and the outer map. A `set_*` over a key that already has a
-// value frees the old one first, so a reload or an overwrite does not leak.
-// The result is a `Config` that does not borrow from the text it was parsed
-// from — `load` frees its read buffer the moment `parse` returns — and one
-// that can be ended: **the caller that made it calls `destroy`**, or made it
-// under a `using` arena whose end is the free. `get`/`get_string` answer a
-// `string8` **window** into the stored value, good until that key is set
-// again or the `Config` is destroyed.
+// `parse` and the setters copy it in and `destroy(&c)` frees every value,
+// every section's map and the outer map. A setter over a key that already
+// has a value frees the old one first, so a reload or an overwrite does not
+// leak. The result is a `Config` that does not borrow from the text it was
+// parsed from, and one that can be ended: **the caller that made it calls
+// `destroy`**, or made it under a `using` arena whose end is the free.
+// `get` and `get_string` answer a `string8` **window** into the stored
+// value, good until that key is set again or removed, or the `Config` is
+// destroyed.
 //
-// **Why the value type is `ref []char8` and not `string8`**:
-// a `string8` is a window, `#delete` of a window is ERR0504, and so a value
-// stored as one could be freed by nobody — `clone` minted a `ref`, returned a
-// window over it, and the `ref`, the only thing with authority to free, died
-// at the end of `clone`. LeakSanitizer measured it: every value of every
-// `Config` ever parsed, and a program reloading its config leaked the whole
-// config each time. Storing the `ref` keeps the authority where `destroy` can
-// reach it; the getters still answer `string8`, so no reader changed.
+// **Why the value type is `ref []char8` and not `string8`**: a `string8` is
+// a window, `#delete` of a window is ERR0504, and so a value stored as one
+// could be freed by nobody. Storing the `ref` keeps the authority where
+// `destroy` can reach it; the getters still answer `string8`.
+//
+// **Allocation is ambient.** Everything this package allocates comes from
+// `#default`, so `cfg.parse(text) using arena.allocator(&a)` puts the whole
+// `Config` in `a`; a value set later is copied onto whatever the setter is
+// called under.
+//
+// **A failed allocation drops what it was for, and nothing else.** A setter
+// whose copy cannot be made leaves the key as it was (the old value, or
+// absent); `parse` counts a line whose value or section cannot be stored in
+// `bad_lines`; `render` and `render_over` answer `nil`.
+//
+// **Thread-safety.** No package state. A `Config` is a map: one thread at a
+// time may change one, and any number may read one nobody is changing.
+//
+// **Error codes: `Error`, 1300 to 1399**, a range no other package's codes
+// share, and only `get` fails. A malformed line is counted, a typed getter
+// answers the caller's fallback for a missing key, and the file layer
+// answers `bool`s.
 package cfg
 
+import "core:slices"
 import "core:strings"
-// `STR-FREESTANDING` (2026-09-02): `to_i32`/`to_f64` left `core:strings` for a
-// package of their own, then a `foreign "stdlib.h"` block and now plain Dado.
-// This package parses, so it imports the parsers by name.
-//
-// **Bound `numbers` rather than taking the default `parse`**, which would
-// collide with this file's own `parse` function; an import's optional binding
-// is what that is for.
+// Bound as `numbers` rather than the default `parse`, which would collide
+// with this package's own `parse` function.
 import numbers "core:strings/parse"
-import "core:io"
-import "core:os/fs"
-import "core:mem"
 
 // section -> key -> value. `""` is the implicit default section. Each value
-// is an owned run; read one with `get`/`get_string`, end them all with
+// is an owned run; read one with `get` or a typed getter, end them all with
 // `destroy`.
 type Config: {string8: {string8: ref []char8}}
 
-// `string ⇄ []char8` is free, but `[]T` is not a callable
-// spelling — the conversion is only reachable through a named alias. This is
-// that alias, used wherever a `string` needs to reach `write_bytes`.
-type Bytes: []char8
+// Why `get` failed. The numbers are this package's, 1300 to 1399, apart from
+// every other package's, so a code read anywhere never means two things.
+distinct enum i32 Error:
+    // The section has no such key, or there is no such section.
+    NOT_FOUND = 1300,
 
-// A fresh, empty config. The allocator is explicit, not `#default`
-// — the same reason `polygon.offset_by` takes one: a parameter default has
-// to fold at compile time and the ambient allocator is a runtime value.
-Config fresh((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    return #make(Config, 8, alloc)
+// A sentence for each of this package's codes, and one for any other value.
+#assert_raises
+string8 message(Error why):
+    if why == Error.NOT_FOUND:
+        return "no such key in that section"
+    return "not a code of core:cfg"
 
-// A value's own copy, independent of whatever `s` was a window into. Every
-// value stored in a `Config` goes through this — see the package doc comment
-// on why keys don't need the same treatment. **It returns the `ref`**, which
-// is what makes the copy freeable; it used to return `string8(out[:])` and
-// drop the `ref` on the floor.
-ref []char8 clone(string8 s, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    i64 n = #len(s)
-    ref []char8 out = #make([]char8, n, alloc)
-    for i in 0..<n:
-        out[i] = s[i]
-    return out
-
-// Store `val` under `section`/`key`, freeing the value it replaces. The one
-// place a value enters a `Config`: `parse` (where a key repeated in a file
-// overwrites) and every `set_*` come through here, so an overwrite never
-// strands the old run.
-private void put(^Config cfg, string8 section, string8 key, ref []char8 val):
-    ({string8: ref []char8} sec, bool has_sec) = cfg^[section]
-    if has_sec:
-        (ref []char8 old, bool had) = sec[key]
-        if had:
-            #delete(old)
-    cfg^[section][key] = val
+// An empty `Config`, its table on `#default`. `destroy` ends it.
+#assert_raises
+Config empty():
+    return fresh()
 
 // End a `Config`: every value, every section's map, and the outer map. `cfg`
 // is the zero `Config` afterwards, so a second `destroy` does nothing and a
-// `Config` that was never filled (`fresh`, or a missing file's `load`) is
-// safe to destroy. Not needed — and harmless — for a `Config` made under a
-// `using` arena, whose end frees all of it at once.
+// `Config` that was never filled is safe to destroy. Not needed — and
+// harmless — for a `Config` made under a `using` arena, whose end frees all
+// of it at once.
+#assert_raises
 void destroy(^Config cfg):
     for _, sec in cfg^:
         for _, val in sec:
@@ -117,187 +142,240 @@ void destroy(^Config cfg):
         #delete(sec)
     #delete(cfg^)
 
-// `[name]`, trimmed and unwrapped. False on anything that isn't a `[...]`
-// line or whose name is empty once trimmed — `[]` and `[  ]` are both bad.
-(string8 name, bool ok) parse_section(string8 ln):
-    i64 n = #len(ln)
-    if n < 2 || ln[n - 1] != ']':
-        return ("", false)
-    string8 inner = strings.trim(ln[1..<(n - 1)])
-    if strings.is_empty(inner):
-        return ("", false)
-    return (inner, true)
-
-// `key = value`, split on the first `=`. False when there is no `=` at all
-// or the key side is empty once trimmed — `= value` names nothing.
-(string8 key, string8 val, bool ok) parse_kv(string8 ln):
-    (string8 head, string8 tail, bool found) = strings.split_first(ln, "=")
-    if !found:
-        return ("", "", false)
-    string8 key = strings.trim(head)
-    if strings.is_empty(key):
-        return ("", "", false)
-    return (key, strings.trim(tail), true)
-
-// Parse INI text into a `Config`. See the package doc comment for the format
-// and the forgiving-on-read stance; `bad_lines` counts the lines this
-// skipped and `ok` is `bad_lines == 0`.
-// (`section` and `key` used to trip LNT0412, "declared and never read", under
-// `--strict`: the lint does not count a variable used only as a chained map
-// index in write position, `cfg[section][key] = …`, as read. The write moved
-// into `put` when values became freeable, so both are arguments now and the
-// lint is quiet here. The gap itself has since been closed: a map's key in a
-// place position is a read.)
-(Config cfg, bool ok, i32 bad_lines) parse(string8 text, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    Config cfg = #make(Config, 8, alloc)
+// Parse INI text into a new `Config` on `#default`. See the package comment
+// for the format and the forgiving-on-read stance; `bad_lines` counts the
+// lines this skipped, so 0 is a clean parse. A line whose value or section
+// cannot be allocated is skipped and counted too. A key repeated in the text
+// keeps its last value. The caller ends the `Config` with `destroy`.
+#assert_raises
+(Config cfg, i32 bad_lines) parse(string8 text):
+    Config cfg = fresh()
     string8 section = ""
     i32 bad = 0
-    string8 rest = text
-    bool more = true
-    for more:
-        (string8 raw, string8 tail, bool found) = strings.line(rest)
-        rest = tail
-        more = found
-        string8 ln = strings.trim(raw)
-        if strings.is_empty(ln):
-            continue
-        if ln[0] == ';' || ln[0] == '#':
-            continue
-        if ln[0] == '[':
-            (string8 name, bool sok) = parse_section(ln)
-            if !sok:
+    i64 at = 0
+    for at < #len(text):
+        (string8 raw, i64 next) = next_line(text, at)
+        at = next
+        Line ln = classify(raw)
+        if ln.kind == LineKind.Section:
+            section = ln.name
+            // A header makes its section, keys or none, so `render_over`
+            // keeps an empty section's header and its comments.
+            ({string8: ref []char8} _, bool known) = cfg[section]
+            if !known:
+                cfg[section] = #make(Section, 4)
+                // An insert whose table cannot grow is dropped, and the
+                // header with it.
+                if !(section in cfg):
+                    bad = bad + 1
+        else if ln.kind == LineKind.Pair:
+            (ref []char8 val, bool vok) = decode_value(ln.value)
+            if !vok || !put(&cfg, section, ln.name, val):
                 bad = bad + 1
-                continue
-            section = name
-            continue
-        (string8 key, string8 val, bool kok) = parse_kv(ln)
-        if !kok:
+        else if ln.kind == LineKind.Bad:
             bad = bad + 1
-            continue
-        put(&cfg, section, key, clone(val, alloc))
-    return (cfg, bad == 0, bad)
+    return (cfg, bad)
 
-// Whether `path` names a file `load` would actually read (as opposed to
-// nothing there yet, or a directory of that name).
-bool exists(cstring path):
-    return fs.exists(path) && fs.is_file(path)
+// `cfg` as INI text, in a new run on `#default` the caller `#delete`s: the
+// `""` section's keys with no header, then every other section under its
+// `[name]` after a blank line, sections and keys each sorted by name, so the
+// same `Config` always renders the same bytes. `nil` when an allocation fails. `parse` of the text
+// answers an equal `Config`.
+#assert_raises
+ref []char8 render(Config cfg):
+    return render_over(cfg, "")
 
-// Read `path` and parse it. A missing file is not an error — it returns a
-// fresh empty `Config` with `ok` true and `bad_lines` 0, which is what lets
-// `app:config`'s "no file yet, write defaults" path share this call with
-// the ordinary "read it back" path. Use `exists` first if the distinction
-// matters to the caller.
-(Config cfg, bool ok, i32 bad_lines) load(cstring path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    if !exists(path):
-        return (fresh(alloc), true, 0)
-    i64 nbytes = fs.bytes(path)
-    if nbytes <= 0:
-        return (fresh(alloc), true, 0)
-    auto f = io.open_read(path)
-    if !io.opened(f):
-        return (fresh(alloc), false, 0)
-    ref []char8 buf = #make([]char8, nbytes, alloc)
-    i64 n = io.read_bytes(f, buf[:])
-    io.close(f)
-    string8 text = string8(buf[0..<i32(n)])
-    (Config cfg, bool ok, i32 bad) = parse(text, alloc)
-    #delete(buf)
-    return (cfg, ok, bad)
+// `cfg` written over `original`, the text it was parsed from, in a new run
+// on `#default` the caller `#delete`s, keeping what a person wrote: see
+// "Comments survive a round trip" in the package comment. Over empty text it
+// is `render`. `nil` when an allocation fails.
+#assert_raises
+ref []char8 render_over(Config cfg, string8 original):
+    Text out = #make([]char8, 0)
+    if out == nil || !#reserve(out, #len(original) + 64):
+        #delete(out)
+        return nil
+    bool fine = true
+    // Pass 1: where each section's last header or pair is, so new keys can
+    // follow it, and where the first header is, which bounds `""`.
+    {string8: i64} last = #make({string8: i64}, 8)
+    i64 first_header = 0 - 1
+    i64 count = 0
+    string8 section = ""
+    i64 at = 0
+    for at < #len(original):
+        (string8 raw, i64 next) = next_line(original, at)
+        at = next
+        Line ln = classify(raw)
+        if ln.kind == LineKind.Section:
+            section = ln.name
+            if first_header < 0:
+                first_header = count
+            last[section] = count
+            fine = section in last && fine
+        else if ln.kind == LineKind.Pair:
+            last[section] = count
+            fine = section in last && fine
+        count = count + 1
+    // Pass 2: the lines, kept, rewritten or dropped.
+    {string8: {string8: bool}} written = #make({string8: {string8: bool}}, 8)
+    bool default_done = false
+    bool skipping = false
+    section = ""
+    at = 0
+    i64 index = 0
+    for at < #len(original):
+        (string8 raw, i64 next) = next_line(original, at)
+        at = next
+        Line ln = classify(raw)
+        if index == first_header && !default_done:
+            fine = new_pairs(&out, cfg, "", &written, true) && fine
+            default_done = true
+        if ln.kind == LineKind.Section:
+            section = ln.name
+            ({string8: ref []char8} _, bool kept) = cfg[section]
+            skipping = !kept
+            if !skipping:
+                fine = line_out(&out, raw) && fine
+        else if ln.kind == LineKind.Pair:
+            if !skipping:
+                (string8 now, bool has) = lookup(cfg, section, ln.name)
+                ({string8: bool} done, bool any_done) = written[section]
+                bool again = false
+                if any_done:
+                    (bool _, bool seen) = done[ln.name]
+                    again = seen
+                if has && !again:
+                    fine = mark(&written, section, ln.name) && fine
+                    if value_equals(ln.value, now):
+                        fine = line_out(&out, raw) && fine
+                    else:
+                        fine = pair_out(&out, ln.name, now) && fine
+        else if !skipping:
+            fine = line_out(&out, raw) && fine
+        (i64 end, bool has_end) = last[section]
+        if !skipping && has_end && end == index && (section != "" || !default_done):
+            fine = new_pairs(&out, cfg, section, &written, false) && fine
+            if section == "":
+                default_done = true
+        index = index + 1
+    if !default_done:
+        fine = new_pairs(&out, cfg, "", &written, false) && fine
+    // Sections the original never named, sorted.
+    ref []string8 names = #make([]string8, 0)
+    for name, _ in cfg:
+        (i64 _, bool named) = last[name]
+        if name != "" && !named:
+            fine = #append(names, name) && fine
+    slices.sort(names[:], strings.before)
+    for name in names:
+        i64 n = #len(out)
+        if n > 0 && !(n >= 2 && out[n - 1] == '\n' && out[n - 2] == '\n'):
+            fine = text_out(&out, "\n") && fine
+        fine = text_out(&out, "[") && fine
+        fine = text_out(&out, name) && fine
+        fine = text_out(&out, "]\n") && fine
+        fine = new_pairs(&out, cfg, name, &written, false) && fine
+    #delete(names)
+    for _, done in written:
+        #delete(done)
+    #delete(written)
+    #delete(last)
+    if !fine:
+        #delete(out)
+        return nil
+    return out
 
-// Write every key of one section (no header) — the shared body `save` uses
-// for both the default section and each named one.
-void write_pairs(^io.FILE f, {string8: ref []char8} pairs):
-    for key, val in pairs:
-        io.write_bytes(f, Bytes(key))
-        io.write(f, " = ")
-        io.write_bytes(f, val[:])
-        io.write(f, "\n")
-
-// Write `cfg` to `path` as INI text: the default section's keys first with
-// no header, then every other section under its own `[name]`. Overwrites
-// whatever was at `path`. False only if the file could not be opened for
-// writing.
-bool save(Config cfg, cstring path, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    auto f = io.open_write(path)
-    if !io.opened(f):
-        return false
-    ({string8: ref []char8} def_sec, bool has_def) = cfg[""]
-    if has_def:
-        write_pairs(f, def_sec)
-    for section, inner in cfg:
-        if strings.is_empty(section):
-            continue
-        io.write(f, "[")
-        io.write_bytes(f, Bytes(section))
-        io.write_line(f, "]")
-        write_pairs(f, inner)
-    io.close(f)
-    return true
-
-// ── typed reads ──────────────────────────────────────────────────────────
+// ── reading values ───────────────────────────────────────────────────────
 //
 // Deliberately getters with a caller-supplied fallback, not automatic struct
-// deserialization — this is a queryable Dado API, and the same
-// shape as the `iniparser_getstring(d, "sec:key", def)` named as
-// precedent. A missing key and a value that doesn't parse are the same
-// "couldn't answer" case here: `get_f64` answers `fallback` when strict
-// `numbers.to_f64` fails, and `get_i32` inherits `numbers.to_i32`'s 0.
+// deserialization — a queryable Dado API, the same shape as
+// `iniparser_getstring(d, "sec:key", def)`. A missing key and a value that
+// does not parse are the same "couldn't answer" case: every typed getter
+// answers `fallback` for both, and every one is strict, so `"12 apples"` is a
+// fallback and not 12.
 
-// The stored value as a window into the `Config`'s own run: good until the
-// key is set again or the `Config` is destroyed. Copy it (`#format(v)`) to
-// keep it longer.
-(string8 val, bool found) get(Config cfg, string8 section, string8 key):
-    ({string8: ref []char8} sec, bool sfound) = cfg[section]
-    if !sfound:
-        return ("", false)
-    (ref []char8 v, bool found) = sec[key]
+// The stored value, as a window into the `Config`'s own run: good until the
+// key is set again or removed, or the `Config` is destroyed. Copy it
+// (`strings.clone(v)`) to keep it longer. Fails with `NOT_FOUND` when the
+// section has no such key, or there is no such section.
+#assert_raises
+Error!string8 get(Config cfg, string8 section, string8 key):
+    (string8 v, bool found) = lookup(cfg, section, key)
     if !found:
-        return ("", false)
-    return (string8(v[:]), true)
+        fail Error.NOT_FOUND
+    return v
 
+// The stored value, or `fallback` for a missing key: `get` with the answer
+// folded in.
+#assert_raises
 string8 get_string(Config cfg, string8 section, string8 key, string8 fallback):
-    (string8 v, bool found) = get(cfg, section, key)
+    (string8 v, bool found) = lookup(cfg, section, key)
     if found:
         return v
     return fallback
 
-i32 get_i32(Config cfg, string8 section, string8 key, i32 fallback, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    (string8 v, bool found) = get(cfg, section, key)
+// The stored value as an `i32` when it is exactly a decimal integer in range
+// (`core:strings/parse`'s `to_i32`), and `fallback` otherwise.
+#assert_raises
+i32 get_i32(Config cfg, string8 section, string8 key, i32 fallback):
+    (string8 v, bool found) = lookup(cfg, section, key)
     if !found:
         return fallback
-    ref []char8 c = strings.clone_to_cstring(v, alloc)
-    i32 n = numbers.to_i32(cstring(c))
-    #delete(c)
+    try i32 n = numbers.to_i32(v) else:
+        return fallback
     return n
 
-// `fallback` too when the value is not exactly a number: `to_f64` is strict,
-// so `"2.5 # note"` and `"fast"` are both a fallback rather than 2.5 and 0.
-// `alloc` is no longer used — `to_f64` reads the value in place — and stays in
-// the signature so that `get_f64` and `get_i32` keep one shape.
-f64 get_f64(Config cfg, string8 section, string8 key, f64 fallback, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    _ = alloc
-    (string8 v, bool found) = get(cfg, section, key)
+// The stored value as an `i64` when it is exactly a decimal integer in range,
+// and `fallback` otherwise.
+#assert_raises
+i64 get_i64(Config cfg, string8 section, string8 key, i64 fallback):
+    (string8 v, bool found) = lookup(cfg, section, key)
+    if !found:
+        return fallback
+    try i64 n = numbers.to_i64(v) else:
+        return fallback
+    return n
+
+// The stored value as a `u64` when it is exactly a decimal integer from 0 to
+// 2^64-1, and `fallback` otherwise.
+#assert_raises
+u64 get_u64(Config cfg, string8 section, string8 key, u64 fallback):
+    (string8 v, bool found) = lookup(cfg, section, key)
+    if !found:
+        return fallback
+    try u64 n = numbers.to_u64(v) else:
+        return fallback
+    return n
+
+// The stored value as an `f64` when it is exactly a number
+// (`core:strings/parse`'s `to_f64`), and `fallback` otherwise: `"2.5 # note"`
+// and `"fast"` are both a fallback.
+#assert_raises
+f64 get_f64(Config cfg, string8 section, string8 key, f64 fallback):
+    (string8 v, bool found) = lookup(cfg, section, key)
     if !found:
         return fallback
     try f64 n = numbers.to_f64(v) else:
         return fallback
     return n
 
-// Accepts true/1/yes/on and false/0/no/off (case-sensitive — a hand-written
-// file is expected to use one style consistently); anything else, like a
-// missing key, answers `fallback`.
+// `true` for true/1/yes/on and `false` for false/0/no/off (case-sensitive —
+// a hand-written file is expected to use one style consistently); anything
+// else, like a missing key, answers `fallback`.
+#assert_raises
 bool get_bool(Config cfg, string8 section, string8 key, bool fallback):
-    (string8 v, bool found) = get(cfg, section, key)
+    (string8 v, bool found) = lookup(cfg, section, key)
     if !found:
         return fallback
-    if strings.compare(v, "true") == 0 || strings.compare(v, "1") == 0 || strings.compare(v, "yes") == 0 || strings.compare(v, "on") == 0:
+    if v == "true" || v == "1" || v == "yes" || v == "on":
         return true
-    if strings.compare(v, "false") == 0 || strings.compare(v, "0") == 0 || strings.compare(v, "no") == 0 || strings.compare(v, "off") == 0:
+    if v == "false" || v == "0" || v == "no" || v == "off":
         return false
     return fallback
 
-// ── typed writes ─────────────────────────────────────────────────────────
-
+// ── writing values ───────────────────────────────────────────────────────
+//
 // **The map is taken by pointer, and it has to be.** A `Config` is a map, a
 // map value is a table pointer and the allocator that made it, and both are
 // passed by value — so a setter that took `Config` would be inserting into
@@ -307,18 +385,342 @@ bool get_bool(Config cfg, string8 section, string8 key, bool fallback):
 // is the rule, and `^Config` with `cfg^` at each use is what it asks for.
 //
 // **An overwrite frees the value it replaces**, so setting one key a thousand
-// times holds one value, not a thousand.
-void set_string(^Config cfg, string8 section, string8 key, string8 val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    put(cfg, section, key, clone(val, alloc))
+// times holds one value, not a thousand. Each value is copied onto `#default`,
+// and when the copy or the insert cannot be allocated the key is left as it
+// was: its old value, or absent.
 
-void set_i32(^Config cfg, string8 section, string8 key, i32 val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    put(cfg, section, key, #format(val, alloc))
+// Store `val` under `section` and `key`, creating either as needed.
+#assert_raises
+void set_string(^Config cfg, string8 section, string8 key, string8 val):
+    _ = put(cfg, section, key, clone(val))
 
-void set_f64(^Config cfg, string8 section, string8 key, f64 val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
-    put(cfg, section, key, #format(val, alloc))
+// Store `val` in decimal.
+#assert_raises
+void set_i32(^Config cfg, string8 section, string8 key, i32 val):
+    _ = put(cfg, section, key, #format(val))
 
-void set_bool(^Config cfg, string8 section, string8 key, bool val, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc):
+// Store `val` in decimal; `get_i64` reads it back exactly.
+#assert_raises
+void set_i64(^Config cfg, string8 section, string8 key, i64 val):
+    _ = put(cfg, section, key, #format(val))
+
+// Store `val` in decimal; `get_u64` reads it back exactly.
+#assert_raises
+void set_u64(^Config cfg, string8 section, string8 key, u64 val):
+    _ = put(cfg, section, key, #format(val))
+
+// Store `val` in the shortest decimal that reads back as the same `f64`.
+#assert_raises
+void set_f64(^Config cfg, string8 section, string8 key, f64 val):
+    _ = put(cfg, section, key, #format(val))
+
+// Store `true` or `false`.
+#assert_raises
+void set_bool(^Config cfg, string8 section, string8 key, bool val):
     if val:
-        set_string(cfg, section, key, "true", alloc)
+        set_string(cfg, section, key, "true")
     else:
-        set_string(cfg, section, key, "false", alloc)
+        set_string(cfg, section, key, "false")
+
+// Remove `key` from `section`, freeing its value, and answer whether it was
+// there. The section stays, empty or not: `remove_section` removes it.
+#assert_raises
+bool remove_key(^Config cfg, string8 section, string8 key):
+    ({string8: ref []char8} sec, bool has_sec) = cfg^[section]
+    if !has_sec:
+        return false
+    (ref []char8 old, bool had) = sec[key]
+    if !had:
+        return false
+    #delete(old)
+    // `sec` is a copy of the section's handle, and the handle points at the
+    // one table, so removing through it removes from the `Config`.
+    #delete(sec, key)
+    return true
+
+// Remove `section` and every key in it, freeing their values, and answer
+// whether it was there. `render_over` drops its header and every line under
+// it.
+#assert_raises
+bool remove_section(^Config cfg, string8 section):
+    ({string8: ref []char8} sec, bool has_sec) = cfg^[section]
+    if !has_sec:
+        return false
+    for _, val in sec:
+        #delete(val)
+    #delete(sec)
+    #delete(cfg^, section)
+    return true
+
+// ── inside ────────────────────────────────────────────────────────────────
+
+// A fresh, empty config on `#default`.
+private Config fresh():
+    return #make(Config, 8)
+
+// A value's own copy on `#default`, `nil` when it cannot be made, independent of whatever `s` was a window
+// into. It returns the `ref`, which is what makes the copy freeable.
+private ref []char8 clone(string8 s):
+    i64 n = #len(s)
+    ref []char8 out = #make([]char8, n)
+    if out == nil:
+        return out
+    for i in 0..<n:
+        out[i] = s[i]
+    return out
+
+// The stored value as a window, and whether there was one: `get` before its
+// answer is made a failure, for the getters that fold a miss into a fallback.
+private (string8 val, bool found) lookup(Config cfg, string8 section, string8 key):
+    ({string8: ref []char8} sec, bool sfound) = cfg[section]
+    if !sfound:
+        return ("", false)
+    (ref []char8 v, bool found) = sec[key]
+    if !found:
+        return ("", false)
+    return (string8(v[:]), true)
+
+// Store `val` under `section`/`key`, freeing the value it replaces, and
+// answer whether it was stored. The one place a value enters a `Config`:
+// `parse` (where a key repeated in a file overwrites) and every setter come
+// through here, so an overwrite never strands the old run.
+//
+// **A failed allocation drops the write and nothing else.** `val` is `nil`
+// when its copy could not be made. A map insert whose table cannot grow is
+// dropped by the map, which hands back a sink slot holding `nil`; a stored
+// value is never `nil`, so the slot says which happened. Whatever was not
+// stored is freed, the old value stays, and a section made only for this key
+// is removed again.
+private bool put(^Config cfg, string8 section, string8 key, ref []char8 val):
+    if val == nil:
+        return false
+    ({string8: ref []char8} sec, bool has_sec) = cfg^[section]
+    ref []char8 old = nil
+    bool had = false
+    if has_sec:
+        (old, had) = sec[key]
+    ^ref []char8 slot = &cfg^[section][key]
+    ({string8: ref []char8} now, bool sec_now) = cfg^[section]
+    bool landed = false
+    if sec_now:
+        landed = slot^ != nil if had else key in now
+    if !landed:
+        #delete(val)
+        if !has_sec && sec_now && #len(now) == 0:
+            #delete(now)
+            #delete(cfg^, section)
+        return false
+    slot^ = val
+    if had:
+        #delete(old)
+    return true
+
+// Mark `key` of `section` written, and answer whether the mark was stored.
+private bool mark(^{string8: {string8: bool}} written, string8 section, string8 key):
+    written^[section][key] = true
+    ({string8: bool} done, bool any) = written^[section]
+    return any && key in done
+
+// One section's keys and values: `Config`'s inner map, named so it can be
+// made.
+private type Section: {string8: ref []char8}
+
+// What one line of INI text is.
+private enum i32 LineKind: (Blank, Comment, Section, Pair, Bad)
+
+// A line, classified: a section's `name`, or a pair's key as `name` and its
+// value as written (trimmed, quotes and escapes still in it) as `value`.
+private type Line:
+    LineKind kind
+    string8 name
+    string8 value
+
+// The line starting at `at`, without its `\n` (a `\r` before it stays, and
+// `classify` trims it), and where the next one starts.
+private (string8 line, i64 next) next_line(string8 text, i64 at):
+    i64 end = at
+    i64 n = #len(text)
+    for end < n && text[end] != '\n':
+        end = end + 1
+    if end < n:
+        return (text[at..<end], end + 1)
+    return (text[at..<end], end)
+
+private Line classify(string8 raw):
+    string8 ln = strings.trim(raw)
+    i64 n = #len(ln)
+    if n == 0:
+        return (LineKind.Blank, "", "")
+    if ln[0] == ';' || ln[0] == '#':
+        return (LineKind.Comment, "", "")
+    if ln[0] == '[':
+        // `[name]`, trimmed and unwrapped; `[]` and `[  ]` name nothing.
+        if n < 2 || ln[n - 1] != ']':
+            return (LineKind.Bad, "", "")
+        string8 inner = strings.trim(ln[1..<(n - 1)])
+        if strings.is_empty(inner):
+            return (LineKind.Bad, "", "")
+        return (LineKind.Section, inner, "")
+    // `key = value`, split on the first `=`; `= value` names nothing.
+    (string8 head, string8 tail, bool found) = strings.split_first(ln, "=")
+    if !found:
+        return (LineKind.Bad, "", "")
+    string8 key = strings.trim(head)
+    if strings.is_empty(key):
+        return (LineKind.Bad, "", "")
+    return (LineKind.Pair, key, strings.trim(tail))
+
+// The value `raw` stands for, copied onto `#default` (`nil` when it cannot
+// be): `raw` itself when it is
+// bare, and its contents with the escapes read when it is quoted. `false`
+// for a quoted value that does not close at the end of the line or holds an
+// escape this format does not have.
+private (ref []char8 value, bool ok) decode_value(string8 raw):
+    i64 n = #len(raw)
+    if n == 0 || raw[0] != '"':
+        return (clone(raw), true)
+    if !quoted_ok(raw):
+        return (nil, false)
+    ref []char8 out = #make([]char8, 0)
+    if !#reserve(out, n):
+        #delete(out)
+        return (nil, true)
+    i64 i = 1
+    for i < n - 1:
+        char8 c = raw[i]
+        if c == '\\':
+            i = i + 1
+            c = unescape(raw[i])
+        _ = #append(out, c)
+        i = i + 1
+    return (out, true)
+
+// Whether `raw`, which starts with `"`, is one well-formed quoted value: a
+// closing `"` as its last byte and nowhere before, and only known escapes.
+private bool quoted_ok(string8 raw):
+    i64 n = #len(raw)
+    if n < 2 || raw[n - 1] != '"':
+        return false
+    i64 i = 1
+    for i < n - 1:
+        char8 c = raw[i]
+        if c == '"':
+            return false
+        if c == '\\':
+            if i + 1 >= n - 1 || unescape(raw[i + 1]) == 0:
+                return false
+            i = i + 1
+        i = i + 1
+    return true
+
+// The byte the escape `\c` stands for, or 0 for no escape this format has.
+private char8 unescape(char8 c):
+    if c == 'n':
+        return '\n'
+    if c == 'r':
+        return '\r'
+    if c == 't':
+        return '\t'
+    if c == '"' || c == '\\':
+        return c
+    return 0
+
+// Whether the written value `raw` stands for `stored`, with no allocation:
+// the test that keeps an unchanged pair's line as it was.
+private bool value_equals(string8 raw, string8 stored):
+    i64 n = #len(raw)
+    if n == 0 || raw[0] != '"':
+        return raw == stored
+    if !quoted_ok(raw):
+        return false
+    i64 i = 1
+    i64 j = 0
+    for i < n - 1:
+        char8 c = raw[i]
+        if c == '\\':
+            i = i + 1
+            c = unescape(raw[i])
+        if j >= #len(stored) || stored[j] != c:
+            return false
+        i = i + 1
+        j = j + 1
+    return j == #len(stored)
+
+// Whether `v` has to be quoted to read back as itself: empty is fine bare,
+// and so is anything that neither starts nor ends with a space, starts with
+// a `"`, nor holds a line break or another control byte but a tab.
+private bool needs_quotes(string8 v):
+    i64 n = #len(v)
+    if n == 0:
+        return false
+    if v[0] == '"' || is_blank(v[0]) || is_blank(v[n - 1]):
+        return true
+    for c in v:
+        if c < ' ' && c != '\t':
+            return true
+    return false
+
+private bool is_blank(char8 c):
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == char8(11) || c == char8(12)
+
+// What `render_over` writes into.
+private type Text: ref []char8
+
+private bool text_out(^Text out, string8 s):
+    if !#reserve(out^, #len(out^) + #len(s)):
+        return false
+    for c in s:
+        _ = #append(out^, c)
+    return true
+
+// A line kept as it was written, and its `\n`.
+private bool line_out(^Text out, string8 raw):
+    return text_out(out, raw) && text_out(out, "\n")
+
+// `key = value`, the value quoted and escaped when it has to be.
+private bool pair_out(^Text out, string8 key, string8 val):
+    bool fine = text_out(out, key) && text_out(out, " = ")
+    if !needs_quotes(val):
+        return fine && text_out(out, val) && text_out(out, "\n")
+    fine = text_out(out, "\"") && fine
+    for c in val:
+        if c == '\n':
+            fine = text_out(out, "\\n") && fine
+        else if c == '\r':
+            fine = text_out(out, "\\r") && fine
+        else if c == '\t':
+            fine = text_out(out, "\\t") && fine
+        else if c == '"':
+            fine = text_out(out, "\\\"") && fine
+        else if c == '\\':
+            fine = text_out(out, "\\\\") && fine
+        else:
+            fine = #append(out^, c) && fine
+    return text_out(out, "\"\n") && fine
+
+// Every key of `section` not yet in `written`, sorted, as pairs, each then
+// marked written. With `gap`, a blank line follows when any was written —
+// the `""` section's keys going in before the first header.
+private bool new_pairs(^Text out, Config cfg, string8 section, ^{string8: {string8: bool}} written, bool gap):
+    ({string8: ref []char8} sec, bool has) = cfg[section]
+    if !has:
+        return true
+    ({string8: bool} done, bool any_done) = written^[section]
+    ref []string8 keys = #make([]string8, 0)
+    bool fine = true
+    for key, _ in sec:
+        bool seen = false
+        if any_done:
+            (bool _, bool was) = done[key]
+            seen = was
+        if !seen:
+            fine = #append(keys, key) && fine
+    slices.sort(keys[:], strings.before)
+    for key in keys:
+        (ref []char8 v, bool _) = sec[key]
+        fine = pair_out(out, key, string8(v[:])) && fine
+        fine = mark(written, section, key) && fine
+    if gap && #len(keys) > 0:
+        fine = text_out(out, "\n") && fine
+    #delete(keys)
+    return fine

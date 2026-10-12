@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f5f6761926d6 -->
 # vendor:raylib
 
 vendor:raylib — a restatement of the parts of raylib 6.x a game reaches for.
@@ -21,7 +21,7 @@ names, so `DrawPixel(i32 posY, i32 posX, …)` is the header's own type.
 The nine places the header says `const char *` say `cstring` here, which is
 the type and not a spelling: a literal already is one, so the line above
 needs nothing, and a `string` a program built — a score, a filename — reaches
-them through `strings.clone_to_cstring(s, alloc)` and `cstring(that)`. There
+them through `strings.clone_to_cstring(s)` and `cstring(that)`. There
 is no conversion, and that allocation is what C's terminator costs.
 
 A `foreign` member that is not `private` is an ordinary declaration of this

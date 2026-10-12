@@ -1,0 +1,367 @@
+// core:net/enet: game sessions over ENet's reliable UDP, as two delivery
+// classes, `Reliable` and `Unreliable`, over `vendor:enet`.
+//
+//     import "core:net/enet"
+//
+//     try enet.init() else why:
+//         fmt.println(enet.message(why))
+//         return 1
+//     defer enet.shutdown()
+//
+//     try enet.Host server = enet.host_server(17777, 32) else why:
+//         fmt.println(enet.message(why))
+//         return 1
+//     defer enet.host_destroy(server)
+//
+//     try enet.Event ev = enet.poll(server, 10) else why:
+//         fmt.println(enet.message(why))
+//         return 1
+//     switch ev:
+//         case enet.Received r:
+//             // r.data is the caller's: #delete it when done
+//             #delete(r.data)
+//         case enet.Connected _: fmt.println("a peer came")
+//         case enet.Disconnected _: fmt.println("a peer left")
+//         case enet.TimedOut _: fmt.println("a peer timed out")
+//         case enet.Idle _: fmt.println("nothing yet")
+//
+// This package is the session half of networking. Sockets, addresses and DNS
+// are `core:net`; this one is what a game wants on top of UDP: peers that
+// connect and time out, and two delivery classes that hide ENet's channel
+// numbers and packet flags. `app:net` builds its RPC layer on it, and a
+// program never needs `vendor:enet` directly.
+//
+// **Tier W H, sessions H only.** Linux, macOS, the BSDs and Windows run ENet
+// (Windows links `ws2_32` and `winmm`). On `#WEB` and `#NONE` the package
+// builds and `init` fails `Error.UNSUPPORTED`: a page has no UDP socket to
+// give ENet, and `vendor:enet` compiles its C only where there is a C
+// library. No host can be made there, so nothing else is reached.
+//
+// **Errors.** `init`, the host constructors, `connect`, `send` and `poll`
+// fail with a member of `Error` (codes 2000 to 2099), and `message(why)` is
+// a sentence for each.
+//
+// **The class-to-channel mapping.** Channel 0 is reliable and ordered
+// (`PacketFlag.Reliable`) and channel 1 is unreliable and unsequenced
+// (`PacketFlag.Unsequenced`). Two is the smallest `channelLimit` a host here
+// is created with, and the split follows `ENetPacketFlag`'s own.
+//
+// **One reusable `ENetEvent` per `Host`, not one per `poll` call.** ENet's
+// service call fills the same buffer every time, and a `Host` owns that
+// buffer instead of the caller.
+//
+// **What `poll` answers is an `Event`**, a union with one member for each
+// thing that can happen, so a `switch` over it names them all and needs no
+// `else`. `Idle` is "nothing happened in the time allowed", which is no
+// failure; a failure is ENet's service call itself failing. **A `Received`
+// event's `data` is a caller-owned `ref []u8`** on `#default`, copied out of
+// ENet's packet before the packet is destroyed (an ENet packet lives only
+// until the next service call); the caller `#delete`s it, or polls inside a
+// `using` of an arena that reclaims it.
+//
+// **Single-threaded.** ENet's service call is not documented as thread-safe,
+// so `poll`, `send`, `broadcast` and `flush` are meant to be called from one
+// thread, the same contract `app:input`'s queue has. There is no send queue
+// here; one belongs above this package if a caller needs to send from
+// several threads.
+//
+// The package is named `netenet` and imported as `enet` (the qualifier is the
+// directory's name): `vendor:enet` is already a package named `enet`, and
+// `dadoc query inspect`, which `dado doc` and `dado api` read, lists no
+// declarations for a second package of the same name.
+//
+// **What raises into a script.** `message`, and the private mapping from a
+// class to its channel, each promised by the `#assert_raises`
+// above it. Everything else calls ENet through a `foreign` declaration or
+// holds an ENet pointer, which is the C boundary a script does not cross.
+package netenet
+
+import venet "vendor:enet"
+import "core:strings"
+
+// ── errors ───────────────────────────────────────────────────────────────
+
+// Why a call failed.
+distinct enum i32 Error:
+    // This target runs no ENet: `#WEB` or `#NONE`.
+    UNSUPPORTED = 2000,
+    // ENet would not start.
+    START_FAILED,
+    // The host could not be made: for a server, usually because the port is
+    // taken; else the system refused a socket.
+    HOST_FAILED,
+    // The host was never made: a `Host` no constructor answered.
+    NO_HOST,
+    // The address did not resolve to an IPv4 address.
+    NOT_RESOLVED,
+    // The host has no room for another outgoing peer.
+    NO_PEER_SLOT,
+    // ENet would not queue the packet: the peer is not connected, or the
+    // packet is larger than a host may send.
+    NOT_QUEUED,
+    // ENet's service call failed: the host's socket reported an error.
+    SERVICE_FAILED,
+    // An allocation failed.
+    NO_MEMORY,
+
+// A sentence for `why`, for a person reading a tool's output.
+#assert_raises
+string8 message(Error why):
+    if why == Error.UNSUPPORTED: return "this target runs no ENet (a web page or bare metal has no UDP socket)"
+    if why == Error.START_FAILED: return "ENet would not start"
+    if why == Error.HOST_FAILED: return "the host could not be made: the port is in use, or the system refused a socket"
+    if why == Error.NO_HOST: return "the host was never made"
+    if why == Error.NOT_RESOLVED: return "the address did not resolve to an IPv4 address"
+    if why == Error.NO_PEER_SLOT: return "the host has no room for another peer"
+    if why == Error.NOT_QUEUED: return "the packet was not queued: the peer is not connected, or the packet is too large"
+    if why == Error.SERVICE_FAILED: return "ENet's service call failed on the host's socket"
+    if why == Error.NO_MEMORY: return "out of memory"
+    return "not a core:net/enet error"
+
+// ── delivery classes: a caller names the class, never the channel ───────
+
+// How a packet is delivered: `Reliable` is resent until acknowledged and
+// arrives in order; `Unreliable` is sent once, unsequenced, and may be lost.
+enum i32 Class:
+    Reliable,
+    Unreliable,
+
+// The ENet channel `Class.Reliable` packets travel on.
+const u8  CHANNEL_RELIABLE   = 0
+// The ENet channel `Class.Unreliable` packets travel on.
+const u8  CHANNEL_UNRELIABLE = 1
+// How many channels every `Host` here is created with: one per class.
+const u64 CHANNEL_COUNT      = 2
+
+// The channel a class travels on.
+#assert_raises
+private u8 channel_of(Class cls):
+    if cls == Class.Reliable:
+        return CHANNEL_RELIABLE
+    return CHANNEL_UNRELIABLE
+
+// The ENet packet flags a class is sent with. Not promised: `PacketFlag` is
+// `enet.h`'s C enum.
+private u32 flags_of(Class cls):
+    if cls == Class.Reliable:
+        return u32(venet.PacketFlag.Reliable)
+    return u32(venet.PacketFlag.Unsequenced)
+
+// ── host & peer ──────────────────────────────────────────────────────────
+
+// One ENet host and the `ENetEvent` buffer every `poll` on it reuses. A
+// server (bound, accepting connections) and a client (unbound, connecting
+// out) have this same shape; `host_server` and `host_client` differ only in
+// how they build the `ENetHost`. End it with `host_destroy`.
+type Host: (^venet.ENetHost h, ^venet.ENetEvent ev)
+
+// A connected peer: ENet's handle, under this package's name so a caller
+// never imports `vendor:enet`. Compare it with `nil` and with other peers,
+// and pass it back to this package; nothing else.
+type Peer: ^venet.ENetPeer
+
+// ── what `poll` answers ──────────────────────────────────────────────────
+
+// Nothing happened within `timeout_ms`, the wait `poll` was given.
+distinct type Idle: (u32 timeout_ms)
+// `peer` finished connecting: on a server, a new peer; on a client, the
+// server it dialed.
+distinct type Connected: (Peer peer)
+// `peer` disconnected cleanly.
+distinct type Disconnected: (Peer peer)
+// `peer` stopped answering and was dropped.
+distinct type TimedOut: (Peer peer)
+// A packet from `peer` arrived: its bytes, on `#default`, which the caller
+// owns and `#delete`s.
+type Received: (Peer peer, ref []u8 data)
+
+// One `poll` result: nothing, or one of the four things that happen to a
+// peer. A `switch` over it names every member and needs no `else`.
+union Event: (Idle, Connected, Disconnected, TimedOut, Received)
+
+// ── lifecycle: process-wide, called once, as `vendor:enet` asks ─────────
+
+// Start ENet for this process; nothing else in this package works until it
+// has. Fails `Error.UNSUPPORTED` on `#WEB` and `#NONE`, and
+// `Error.START_FAILED` when ENet will not start.
+Error!void init():
+    when #OS == #WEB || #OS == #NONE:
+        fail Error.UNSUPPORTED
+    else:
+        if venet.enet_initialize() != 0:
+            fail Error.START_FAILED
+
+// Stop ENet for this process, after every host is destroyed. Pairs with a
+// successful `init`.
+void shutdown():
+    venet.enet_deinitialize()
+
+// ── host construction ───────────────────────────────────────────────────
+
+// A host for `h`, with its event buffer; destroys `h` and fails
+// `Error.NO_MEMORY` when the buffer cannot be made.
+private Error!Host with_event(^venet.ENetHost h):
+    ^venet.ENetEvent ev = venet.event_create()
+    if ev == nil:
+        venet.enet_host_destroy(h)
+        fail Error.NO_MEMORY
+    return (h, ev)
+
+// A server bound to `port` on every local interface, accepting up to
+// `max_peers` connections. Fails `Error.HOST_FAILED` when ENet cannot make
+// it (usually: `port` is already bound), and `Error.NO_MEMORY`.
+Error!Host host_server(u16 port, u64 max_peers):
+    ^venet.ENetAddress addr = venet.address_create()
+    if addr == nil:
+        fail Error.NO_MEMORY
+    venet.address_set_any(addr)
+    venet.address_set_port(addr, port)
+    ^venet.ENetHost h = venet.enet_host_create(addr, #c.size_t(max_peers), #c.size_t(CHANNEL_COUNT), 0, 0)
+    venet.address_destroy(addr)
+    if h == nil:
+        fail Error.HOST_FAILED
+    return with_event(h)
+
+// A client host with no bound address: it can only `connect` out, never
+// accept. `max_outbound` is ENet's own `peerCount`: how many simultaneous
+// connections this client will ever hold (1 for the common case). Fails as
+// `host_server` does.
+Error!Host host_client(u64 max_outbound):
+    ^venet.ENetHost h = venet.enet_host_create(nil, #c.size_t(max_outbound), #c.size_t(CHANNEL_COUNT), 0, 0)
+    if h == nil:
+        fail Error.HOST_FAILED
+    return with_event(h)
+
+// Destroy a host and its event buffer, dropping every peer it holds without
+// a disconnect handshake. Does nothing to a `Host` no constructor made.
+void host_destroy(Host host):
+    if host.ev != nil:
+        venet.event_destroy(host.ev)
+    if host.h != nil:
+        venet.enet_host_destroy(host.h)
+
+// How many peer slots the host has, as ENet counts them: connected,
+// connecting and disconnecting peers alike. 0 for a `Host` no constructor
+// made.
+u32 host_peer_count(Host host):
+    if host.h == nil:
+        return 0
+    return venet.enet_host_get_peers_count(host.h)
+
+// Push queued outgoing traffic now rather than at the next `poll`: useful
+// right after a `send` or `broadcast` when nothing else is about to drive
+// the loop. Does nothing to a `Host` no constructor made.
+void flush(Host host):
+    if host.h == nil:
+        return
+    venet.enet_host_flush(host.h)
+
+// ── connecting ───────────────────────────────────────────────────────────
+
+// Connect `host` (built with `host_client`) to `address:port`. `address` is
+// an IPv4 literal or a name that resolves to one (ENet's resolver blocks,
+// and knows IPv4 only). The connection completes later, as a `Connected`
+// event from `poll`. Fails `Error.NOT_RESOLVED` for an address that does not
+// resolve, `Error.NO_PEER_SLOT` when the host has no room for another
+// outgoing peer, `Error.NO_HOST` and `Error.NO_MEMORY`.
+Error!Peer connect(Host host, string8 address, u16 port):
+    if host.h == nil:
+        fail Error.NO_HOST
+    ref []char8 caddr = strings.clone_to_cstring(address)
+    if caddr == nil:
+        fail Error.NO_MEMORY
+    defer #delete(caddr)
+    ^venet.ENetAddress addr = venet.address_create()
+    if addr == nil:
+        fail Error.NO_MEMORY
+    defer venet.address_destroy(addr)
+    if !venet.address_set_host(addr, cstring(caddr)):
+        fail Error.NOT_RESOLVED
+    venet.address_set_port(addr, port)
+    Peer p = venet.enet_host_connect(host.h, addr, #c.size_t(CHANNEL_COUNT), 0)
+    if p == nil:
+        fail Error.NO_PEER_SLOT
+    return p
+
+// A graceful disconnect: queues a notification the peer acknowledges. Keep
+// calling `poll` until a `Disconnected` event names this peer. Prefer this
+// over `reset` unless the peer is unresponsive.
+void disconnect(Peer peer):
+    venet.enet_peer_disconnect(peer, 0)
+
+// An immediate, unacknowledged drop: no `Disconnected` event follows. For an
+// unresponsive peer, or test and shutdown teardown that cannot afford to
+// wait out a graceful handshake.
+void reset(Peer peer):
+    venet.enet_peer_reset(peer)
+
+// ── sending ──────────────────────────────────────────────────────────────
+
+// A packet holding a copy of `data`, flagged for `cls`; nil when ENet cannot
+// allocate one.
+private ^venet.ENetPacket packet_of(Class cls, []u8 data):
+    i64 count = #len(data)
+    rawptr ptr = nil
+    if count > 0:
+        ptr = rawptr(&data[0])
+    return venet.enet_packet_create(ptr, #c.size_t(count), flags_of(cls))
+
+// Send `data` to one peer over the given delivery class; a packet is queued
+// whole or not at all. Fails `Error.NOT_QUEUED` when ENet will not queue it
+// (a peer that is not connected, or a packet larger than the host may
+// send), and `Error.NO_MEMORY`.
+Error!void send(Peer peer, Class cls, []u8 data):
+    ^venet.ENetPacket pkt = packet_of(cls, data)
+    if pkt == nil:
+        fail Error.NO_MEMORY
+    if venet.enet_peer_send(peer, channel_of(cls), pkt) != 0:
+        // ENet takes the packet only when it queues it.
+        venet.enet_packet_destroy(pkt)
+        fail Error.NOT_QUEUED
+
+// Send `data` to every peer connected to `host` over the given delivery
+// class. With no peer connected, or a `Host` no constructor made, it
+// reaches none, which is not an error.
+void broadcast(Host host, Class cls, []u8 data):
+    if host.h == nil:
+        return
+    ^venet.ENetPacket pkt = packet_of(cls, data)
+    if pkt != nil:
+        venet.enet_host_broadcast(host.h, channel_of(cls), pkt)
+
+// ── polling: the one place ENet's event loop is driven ──────────────────
+
+// One step of `host`'s event loop, waiting up to `timeout_ms` for something
+// to happen: `Idle` when nothing did. A `Received` event's `data` is on
+// `#default` and the caller's to `#delete`. Fails `Error.SERVICE_FAILED`
+// when ENet's service call fails, `Error.NO_MEMORY` when a packet's bytes
+// cannot be copied (the packet is dropped), and `Error.NO_HOST`.
+Error!Event poll(Host host, u32 timeout_ms):
+    if host.h == nil || host.ev == nil:
+        fail Error.NO_HOST
+    i32 rc = venet.enet_host_service(host.h, host.ev, timeout_ms)
+    if rc < 0:
+        fail Error.SERVICE_FAILED
+    if rc == 0:
+        return Event(Idle(timeout_ms))
+
+    venet.EventType kind = venet.event_type(host.ev)
+    Peer p = venet.event_peer(host.ev)
+    if kind == venet.EventType.Connect:
+        return Event(Connected(p))
+    if kind == venet.EventType.Disconnect:
+        return Event(Disconnected(p))
+    if kind == venet.EventType.DisconnectTimeout:
+        return Event(TimedOut(p))
+    if kind == venet.EventType.Receive:
+        ^venet.ENetPacket pkt = venet.event_packet(host.ev)
+        u32 n = venet.enet_packet_get_length(pkt)
+        ref []u8 d = #make([]u8, u64(n))
+        if d == nil:
+            venet.enet_packet_destroy(pkt)
+            fail Error.NO_MEMORY
+        _ = venet.packet_copy(pkt, d[:])
+        venet.enet_packet_destroy(pkt)
+        Received r = (p, d)
+        return Event(r)
+    return Event(Idle(timeout_ms))

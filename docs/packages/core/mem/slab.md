@@ -1,17 +1,15 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f5f6761926d6 (dirty) -->
 # core:mem/slab
 
 core:mem/slab — size classes over large chunks, behind the allocator interface.
 
-    import "core:mem"
-    import "core:mem/libc"
     import "core:mem/slab"
 
-    slab.Slab lines = slab.over(libc.allocator())
+    slab.Slab lines = slab.over(#default)       // chunks from the caller's allocator
     defer slab.destroy(&lines)
-    mem.Allocator a = slab.allocator(&lines)
-    ref []char8 run = #make([]char8, n, a)      // `#resize`, `#delete` as ever
+    using slab.allocator(&lines):
+        ref []char8 run = #make([]char8, 80)    // `#resize`, `#delete` as ever
 
 The allocator for **many small blocks that are freed one at a time**, which is
 the shape neither of the two cursor allocators in this collection can hold:
@@ -65,11 +63,10 @@ else.
 
 ## Zero bytes
 
-`Alloc` of 0 answers a **distinct, non-nil** block of the smallest class — the
-compiler's own root heap answers `calloc(1, size ? size : 1)`, and
-`core:mem/libc` clamps a zero `Resize` to one byte, so a zero-length run holds a
-real handle that `#delete` hands back. Freeing it with `old_size` 0 finds the
-same class, so the pair round-trips.
+`Alloc` of 0 answers a **distinct, non-nil** block of the smallest class,
+`core:mem`'s zero-size rule, so a zero-length run holds a real handle that
+`#delete` hands back. Freeing it with `old_size` 0 finds the same class, so
+the pair round-trips.
 
 ## Refused
 
@@ -88,7 +85,11 @@ same class, so the pair round-trips.
     allocations, which the interface zeroes, so a block carved fresh from a
     chunk is handed out without a second pass — see `take` for what that
     pass cost. A backing that does not zero hands out blocks that are not
-    zero, and a block reused off a free list is zeroed here either way.
+    zero, and a block reused off a free list is zeroed here either way. The
+    chunk `reset` keeps is zeroed as `core:mem/arena`'s blocks are: a
+    `clean` mark says how far it was ever carved, and a carve below the
+    mark zeroes its block, so a reset costs nothing and a kept chunk is
+    zeroed only where it is reused.
 
 ## What it costs
 
@@ -117,24 +118,28 @@ changes is the backing: 15 calls for the load where `malloc` is called
 allocating through one race on its free lists. One slab per thread, or a lock
 the caller owns.
 
+**Every target**: freestanding (`#NONE`), the web, and hosted (Linux, macOS
+and Windows) alike. It is Dado over the backing allocator it is handed, so
+it runs wherever that one does.
+
+**What raises into a script.** `class_size` and `class_of`, each promised by
+the `#assert_raises` above it: they are the size-class arithmetic. A `Slab`
+is chunks and free lists threaded through addresses, and everything that
+takes one is not.
+
 ## Declarations
 
-50 declarations, 25 public.
+50 declarations, 20 public.
 
 * `const u64 MAX_CLASS = 4096` — The largest request served from a size class. Above it a request is a large…
 * `const u64 CLASSES = 16` — How many size classes there are. The classes are 16, 32, and then every power…
 * `const u64 CHUNK = 65536` — The first chunk's size, and where every doubling starts. Later chunks double…
 * `const u64 CHUNK_MAX = 1048576` — The ceiling the doubling stops at, and so the most a slab holds uncarved.
-* `const u64 CHUNK_HEADER = 16` — Bytes at the front of every chunk: the link to the older chunk and the…
-* `const u64 LARGE_HEADER = 32` — Bytes in front of every large block: two links, the backing size and the…
-* `type Chunk` — A chunk's own first bytes.
-* `type Link` — A freed small block's own first bytes. Only `next` is read; the second word…
-* `type Large` — A large block's header, in front of the payload the caller holds.
 * `type Slab` — The slab. The backing allocator is captured **by value**, as…
-* `Slab over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing)` — A slab over `backing`. **It does not allocate**: the first chunk is requested…
-* `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) allocator(^Slab s)` — The allocator for `s`. The slab is the allocator's `data`, so it is borrowed…
+* `Slab over((mem.Proc proc, rawptr data) backing)` — A slab over `backing`. **It does not allocate**: the first chunk is requested…
+* `(mem.Proc proc, rawptr data) allocator(^Slab s)` — The allocator for `s`. The slab is the allocator's `data`, so it is borrowed…
 * `type SlabAllocator using mem.Allocator` — The allocator for a slab, as a declaration that takes `mem.Allocator` on:
-* `(rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) data(self)`
+* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.slab)` answers.
 * `void reset(^Slab s)` — Release every block, **keeping the oldest chunk** — the one `FreeAll` does.
 * `void destroy(^Slab s)` — Hand every chunk and every large block back. The slab is exactly what `over`
 * `u64 reserved(^Slab s)` — Bytes held from the backing allocator right now: every chunk, and every large…

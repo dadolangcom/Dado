@@ -87,19 +87,19 @@ void note(string8 line):
 void note_err(string8 text):
     colour()
     _ = io.flush(io.stdout())
-    fmt.writeln(io.stderr_sink(), g_dim, "note:", g_reset, " ", text)
+    fmt.eprintln(g_dim, "note:", g_reset, " ", text)
 
 // `warning: <text>` on standard error.
 void warn(string8 text):
     colour()
     _ = io.flush(io.stdout())
-    fmt.writeln(io.stderr_sink(), g_yellow, "warning:", g_reset, " ", text)
+    fmt.eprintln(g_yellow, "warning:", g_reset, " ", text)
 
 // `error: <text>` on standard error, and the process ends with status 1.
 void die(string8 text):
     colour()
     _ = io.flush(io.stdout())
-    fmt.writeln(io.stderr_sink(), g_red, "error:", g_reset, " ", text)
+    fmt.eprintln(g_red, "error:", g_reset, " ", text)
     _ = io.flush(io.stderr())
     os.quit_with(1)
 
@@ -152,22 +152,16 @@ string8 shown(Command c):
     ref []char8 j = strings.join(c.words[:], " ")
     return txt(j)
 
-private ref []cstring c_argv(Command c):
-    ref []cstring out = #make([]cstring, 0)
-    for w in c.words:
-        ref []char8 z = strings.clone_to_cstring(w, #default)
-        _ = #append(out, cstring(z))
-    return out
 
 private void echo(Command c):
     if g_verbose && c.echoed:
         note(txt(#format("  $ ", shown(c))))
 
-// The shell's reading of a `(exited, status)` pair.
-private i32 shell_status(bool exited, i32 status):
-    if exited: return status
-    if status < 0 && status != 0 - 1: return 128 - status
-    return 127
+// The shell's reading of an ending: the exit code, or 128 and the signal.
+private i32 shell_status(proc.Ended e):
+    switch e:
+        case proc.Exited x: return x.code
+        case proc.Signaled s: return 128 + s.signal
 
 // Run `c` with this process's own standard streams, and answer its status.
 i32 run(Command c):
@@ -180,9 +174,9 @@ i32 run_quietly(Command c):
         die(txt(#format("a command of ", #len(c.words), " words is more than the ", proc.ARG_CAP, " this driver can start: ", c.words[0])))
     _ = io.flush(io.stdout())
     _ = io.flush(io.stderr())
-    ref []cstring argv = c_argv(c)
-    (bool exited, i32 status) = proc.exec(argv[:])
-    return shell_status(exited, status)
+    try proc.Ended e = proc.exec(c.words[:]) else:
+        return 127
+    return shell_status(e)
 
 // What a command printed on standard output, and how it ended.
 type Captured:
@@ -194,14 +188,14 @@ type Captured:
 // process's own unless `quiet`, when it is thrown away. `input`, when not
 // empty, is written to its standard input.
 Captured capture(Command c, bool quiet, string8 input = ""):
-    i32 errors = proc.ERRORS_DISCARD if quiet else proc.ERRORS_INHERIT
+    proc.Errors errors = proc.Errors.Discard if quiet else proc.Errors.Inherit
     return capture_with(c, errors, input)
 
 // `capture`, with standard error folded into what is read, as `2>&1`.
 Captured capture_merged(Command c):
-    return capture_with(c, proc.ERRORS_MERGE, "")
+    return capture_with(c, proc.Errors.Merge, "")
 
-private Captured capture_with(Command c, i32 errors, string8 input):
+private Captured capture_with(Command c, proc.Errors errors, string8 input):
     Captured r
     r.status = 127
     r.out = #make([]char8, 0)
@@ -209,9 +203,8 @@ private Captured capture_with(Command c, i32 errors, string8 input):
     if #len(c.words) > proc.ARG_CAP: return r
     _ = io.flush(io.stdout())
     _ = io.flush(io.stderr())
-    ref []cstring argv = c_argv(c)
-    proc.Duplex d = proc.duplex(argv[:], errors)
-    if !proc.started(d): return r
+    try proc.Duplex d = proc.duplex(c.words[:], errors) else:
+        return r
     r.started = true
     []char8 bytes = strings.bytes(input)
     i64 sent = 0
@@ -220,23 +213,25 @@ private Captured capture_with(Command c, i32 errors, string8 input):
     [16384]char8 chunk
     for:
         if sent < #len(bytes):
-            i32 n = proc.send(&d, bytes[sent..<#len(bytes)], 10)
-            if n == proc.BROKE:
-                sent = #len(bytes)
-            else if n > 0:
-                sent += i64(n)
+            i64 n = 0
+            try n = proc.send(&d, bytes[sent..<#len(bytes)], 10) else why:
+                // `BROKE`: the child stopped reading; nothing more goes in.
+                if why == proc.Pipe.BROKE: sent = #len(bytes)
+            sent += n
             if sent >= #len(bytes):
                 _ = proc.close_input(&d)
-        i32 got = proc.receive(&d, chunk[:], 10 if sent < #len(bytes) else 0 - 1)
-        if got == proc.DRAINED || got == proc.BROKE:
-            break
+        i64 got = 0
+        try got = proc.receive(&d, chunk[:], 10 if sent < #len(bytes) else 0 - 1) else why2:
+            if why2 == proc.Pipe.BROKE: break
+            got = 0 - 1
+        if got == 0: break
         if got > 0:
             for i in 0..<got:
                 _ = #append(r.out, chunk[i])
-    proc.release(&d)
-    (bool done, bool exited, i32 status) = proc.finish(&d, 0 - 1)
-    if done:
-        r.status = shell_status(exited, status)
+    proc.close_pipes(&d)
+    try proc.Ended e = proc.finish(&d, 0 - 1) else:
+        return r
+    r.status = shell_status(e)
     return r
 
 // The first line `c` prints, trimmed; empty when it fails or says nothing.
@@ -257,15 +252,15 @@ bool succeeds(Command c):
 // killed then, and its process tree with it.
 (bool ok, bool hung) succeeds_within(Command c, i32 limit_ms):
     if #len(c.words) > proc.ARG_CAP: return (false, false)
-    ref []cstring argv = c_argv(c)
-    proc.Duplex d = proc.duplex(argv[:], proc.ERRORS_DISCARD)
-    if !proc.started(d): return (false, false)
-    proc.release(&d)
-    (bool done, bool exited, i32 status) = proc.finish(&d, limit_ms)
-    if !done:
-        _ = proc.stop(&d, 0)
-        return (false, true)
-    return (shell_status(exited, status) == 0, false)
+    try proc.Duplex d = proc.duplex(c.words[:], proc.Errors.Discard) else:
+        return (false, false)
+    proc.close_pipes(&d)
+    try proc.Ended e = proc.finish(&d, limit_ms) else why:
+        if why == proc.Pipe.WAITED:
+            try _ = proc.stop(&d, 0) else: pass
+            return (false, true)
+        return (false, false)
+    return (shell_status(e) == 0, false)
 
 // ── signals, for the program `run` starts ───────────────────────────────────
 //
@@ -317,8 +312,7 @@ string8 on_path(string8 name):
     return ""
 
 private bool runs_as_written(string8 p):
-    ref []char8 c = strings.clone_to_cstring(p, #default)
-    return fs.executable(cstring(c))
+    return fs.is_executable(p)
 
 // `s` cut at the first `sep`.
 (string8 head, string8 rest, bool found) split_byte(string8 s, char8 sep):

@@ -1,29 +1,62 @@
-// core:log — levels, a fixed-shape log record, and pluggable sinks.
+// core:log — levels, a fixed-shape log record, sinks, and a default logger.
 //
 //     import "core:log"
 //
+//     log.info("net", "listening on 8080")          // to standard error
 //     log.Record r = log.record(log.Level.Warn, "net", "retrying connect")
-//     log.emit(log.stdout_sink(), &r)
+//     log.stderr_sink().take(&r)
 //
-// This is the mechanism — mechanism down, opinion up: it knows
-// nothing about workers, frames, or a barrier — that scheduling is
-// `app:log`'s job. What lives here is the shape every sink agrees
-// on and the one sink every program gets free.
+// **Tier W H; N in part. Script class S in part.** On Linux, macOS, the BSDs,
+// Windows and the web the whole package is here. Built freestanding (`#OS ==
+// #NONE`) there is no stream to write a line to, so the sinks over streams
+// (`stdout_sink`, `stderr_sink`, `StreamSink`) and the default logger's
+// functions, which write to standard error unless told otherwise, are not
+// declared there, and a call names the missing function. The record, its
+// formatting, `Sink`, `Logger`, `Filter`, `Fanout` and `discard` stay: a
+// freestanding program logs through a sink it writes itself.
 //
-// **No allocation, ever.** `Tag` and `Msg` are fixed inline buffers, the
-// same idiom `app:ui`'s `Span` uses for names and captions: a `Record` can
-// sit in a caller's array — `app:log`'s per-worker ring, in particular —
-// with no heap involved and nothing to `delete`. The cost is the cap: a tag
-// or message longer than its buffer is silently truncated, same stance
-// `core:strings.substring` and friends take rather than failing a log call.
+// This is the mechanism — mechanism down, opinion up: it knows nothing about
+// workers, frames, or a barrier — that scheduling is `app:log`'s job. What
+// lives here is the shape every sink agrees on, the sinks every program gets
+// free, the two that compose others (a `Filter` keeps records at or above a
+// level, a `Fanout` hands each record to several sinks), and a default logger
+// for a program that wants none of that and calls `log.info`.
 //
-// **No timestamp.** `core:time` is a separate dependency this package does
-// not need for its own sake; a sink that wants one reads the clock itself
-// when a record reaches it. Keeping `Record` fixed-shape and dependency-thin
-// is worth more than saving every sink the two extra lines.
+// **The default logger** writes to standard error, keeping `Info` and above,
+// until `set_default` says otherwise. `trace`, `debug`, `info`, `warn` and
+// `error` make a record and hand it to it. It is one package variable: set it
+// once, before any thread logs, and read it from any.
+//
+// **No allocation, ever.** `Tag` and `Msg` are fixed inline buffers, the same
+// idiom `app:ui`'s `Span` uses for names and captions: a `Record` can sit in a
+// caller's array — `app:log`'s per-worker ring, in particular — with no heap
+// involved and nothing to `delete`. The cost is the cap:
+//
+// * **A message longer than `MSG_CAP` (160 bytes) is cut, and says so**: it
+//   keeps as many whole characters as fit before a closing `...`, so a reader
+//   of the log sees that something is missing, and a multi-byte character is
+//   never split. A program with more to say logs it in more than one record.
+// * **A tag longer than `TAG_CAP` (24 bytes) is cut to its first 24 bytes**,
+//   silently: a tag names a subsystem and is short by design.
+//
+// **One write per record.** The stream sinks format a record into one line,
+// `LEVEL [tag] message\n` (`put_line`), and write it with one call, so lines
+// from two threads do not interleave mid-line.
+//
+// **No timestamp, by default.** `core:time` is a separate dependency this
+// package does not need for its own sake; a sink that wants one reads the
+// clock itself when a record reaches it. Keeping `Record` fixed-shape and
+// dependency-thin is worth more than saving every sink the two extra lines.
+//
+// **What raises into a script.** The record and its text — `level_label`,
+// `tag_of`, `tag_str`, `msg_of`, `msg_str`, `record` and `put_line` — and
+// `enabled` and `discard`, each promised by the `#assert_raises` above it.
+// Nothing that hands a record to a sink is (`write`, the default logger's
+// functions, `take` through a `Sink`): a call through a `Sink` may reach any
+// implementer in the program, the stream sinks among them, and those reach
+// `core:io`'s `fwrite`.
 package log
 
-import "core:strings"
 import "core:io"
 
 // Ascending severity — a plain (non-`distinct`) `i32`-backed enum, so
@@ -31,11 +64,11 @@ import "core:io"
 // needed for a sink that wants a minimum-level filter.
 enum i32 Level: (Trace, Debug, Info, Warn, Error)
 
-// `lvl`'s fixed display name. Returns `cstring` and not `string` — every
-// arm is a literal, so the boundary a dynamic `string` would need
-// (`clone_to_cstring` + a copy) never exists; a sink writes it straight to
-// a stream with no allocation.
-cstring level_name(Level lvl):
+// `lvl`'s fixed display name: `TRACE`, `DEBUG`, `INFO`, `WARN` or `ERROR`.
+// Every answer is a literal, so it costs no allocation. A value outside the
+// five reads as `ERROR`, the most severe.
+#assert_raises
+string8 level_label(Level lvl):
     if lvl == Level.Trace:
         return "TRACE"
     if lvl == Level.Debug:
@@ -48,12 +81,21 @@ cstring level_name(Level lvl):
 
 // ── fixed inline buffers (no allocation) ────────────────────────────────
 
-const i32 TAG_CAP = 24     // a subsystem/scope name: "net", "jobs.worker3"
-const i32 MSG_CAP  = 160   // one line's worth; a sink joins/wraps, this doesn't
+// The longest tag a record keeps: a subsystem or scope name, "net",
+// "jobs.worker3".
+const i32 TAG_CAP = 24
+// The longest message a record keeps: one line's worth. A longer one is cut
+// to whole characters and ends in `...`.
+const i32 MSG_CAP  = 160
 
+// A tag's bytes, of which a record's `tag_len` are used.
 type Tag: [TAG_CAP]char8
+// A message's bytes, of which a record's `msg_len` are used.
 type Msg: [MSG_CAP]char8
 
+// `s` as a `Tag` and how many of its bytes are used: all of `s`, or its
+// first `TAG_CAP` bytes.
+#assert_raises
 (Tag t, i32 n) tag_of(string8 s):
     Tag t
     i32 n = TAG_CAP
@@ -65,6 +107,7 @@ type Msg: [MSG_CAP]char8
 
 // Read the first `n` bytes of a `Tag` back as a string (a window, no copy;
 // mirrors `app:ui.span_str`).
+#assert_raises
 string8 tag_str(^Tag t, i32 n):
     i32 m = n
     if m < 0:
@@ -73,15 +116,31 @@ string8 tag_str(^Tag t, i32 n):
         m = TAG_CAP
     return string8(t^[0..<m])
 
+// `s` as a `Msg` and how many of its bytes are used: all of `s` when it
+// fits; otherwise as many of its whole characters as leave room for `...`,
+// and then the `...`, so the cut shows and no character is split.
+#assert_raises
 (Msg m, i32 n) msg_of(string8 s):
     Msg m
-    i32 n = MSG_CAP
-    if #len(s) < MSG_CAP:
-        n = i32(#len(s))
-    for i in 0..<n:
+    i64 len = #len(s)
+    if len <= MSG_CAP:
+        for i in i64(0)..<len:
+            m[i] = s[i]
+        return (m, i32(len))
+    i64 keep = MSG_CAP - 3
+    // Back off continuation bytes (10xxxxxx), so the cut lands on the start of
+    // a character, which is then left out with everything after it.
+    for keep > 0 && u8(s[keep]) >= 0x80 && u8(s[keep]) < 0xC0:
+        keep = keep - 1
+    for i in i64(0)..<keep:
         m[i] = s[i]
-    return (m, n)
+    m[keep] = '.'
+    m[keep + 1] = '.'
+    m[keep + 2] = '.'
+    return (m, i32(keep + 3))
 
+// Read the first `n` bytes of a `Msg` back as a string (a window, no copy).
+#assert_raises
 string8 msg_str(^Msg m, i32 n):
     i32 k = n
     if k < 0:
@@ -101,46 +160,228 @@ type Record: (
     i32   msg_len,
 )
 
+// A record of `msg` at `lvl` under `tag`, each cut to its buffer as
+// `tag_of` and `msg_of` cut them.
+#assert_raises
 Record record(Level lvl, string8 tag, string8 msg):
     (Tag t, i32 tn) = tag_of(tag)
     (Msg m, i32 mn) = msg_of(msg)
     return (lvl, t, tn, m, mn)
 
+// The most bytes `put_line` writes: the longest level name, the tag in
+// brackets, the message and the newline.
+const i32 LINE_MAX = 5 + 1 + TAG_CAP + 3 + MSG_CAP + 1
+
+// `r` as the line the stream sinks write — `LEVEL [tag] message\n`, or
+// `LEVEL message\n` with no tag — into `into`, answering how many bytes it
+// took. A line that does not fit is cut at `into`'s end; `LINE_MAX` bytes
+// always suffice.
+#assert_raises
+i64 put_line(^Record r, []char8 into):
+    i64 at = 0
+    at = put_text(into, at, level_label(r^.level))
+    at = put_text(into, at, " ")
+    string8 tag = tag_str(&r^.tag, r^.tag_len)
+    if #len(tag) > 0:
+        at = put_text(into, at, "[")
+        at = put_text(into, at, tag)
+        at = put_text(into, at, "] ")
+    at = put_text(into, at, msg_str(&r^.message, r^.msg_len))
+    at = put_text(into, at, "\n")
+    return at
+
+#assert_raises
+private i64 put_text([]char8 into, i64 at, string8 text):
+    i64 n = at
+    for c in text:
+        if n >= #len(into):
+            return n
+        into[n] = c
+        n = n + 1
+    return n
+
 // ── sinks ────────────────────────────────────────────────────────────────
 //
-// The C-classic function + opaque data pair — Dado has no closures —
-// the same shape `core:jobs.JobFn`/`app:app.Backend` already use for exactly
-// this reason. `data` is nil for a sink with no state of its own, like
-// `stdout_sink` below.
-type SinkFn: void(^Record, rawptr)
+// **A sink is a trait.** A type takes it on with `using Sink` and a `take`,
+// and a `Sink` value views that implementer where it is stored: written
+// `log.Sink s = mine`, it is the pair of `mine`'s address and its type, and a
+// record handed to `s.take(&r)` reaches `mine`'s own `take`. So the
+// implementer must outlive every `Sink` made of it, as a view must outlive
+// nothing it views: a package variable, or a value the program keeps for as
+// long as it logs. `Filter` and `Fanout` are sinks that hold other sinks, and
+// the stream sinks are package variables, so the values `stdout_sink` and
+// `stderr_sink` answer can be kept anywhere.
+//
+// **An empty `Sink`** — the zero value, a `Logger` never given one — stops
+// the program when a record reaches it, naming the trait, as a call through
+// any empty trait value does. `discard()` is the sink that drops everything.
+//
+// **A record is handed to a sink with `take`**: `sink.take(&r)`. There is no
+// package function `emit(sink, r)`: a parameter whose whole type is a trait is
+// a binder, and a binder in a package function is not yet callable from
+// another package (its trait is looked for in the caller's package), so the
+// call is the trait's own.
 
-type Sink: (SinkFn fn, rawptr data)
+// Where records go. `take` is handed each record by address and may write it,
+// keep a copy, or hand it on; it does not keep the address.
+trait Sink:
+    void take(^self, ^Record r)
 
-void emit(Sink sink, ^Record r):
-    if sink.fn != nil:
-        sink.fn(r, sink.data)
+// The sink that drops everything, kept where `discard` can view it.
+private type Discard using Sink: i32
+    void take(^self, ^Record r):
+        return
 
-// `string ⇄ []char8` is free, but only reachable through a named alias —
-// `[]T` is not a callable spelling. Used to hand a `Tag`/`Msg` window to
-// `io.write_bytes`, which wants `[]char8` and not `string`.
-private type Bytes: []char8
+private Discard g_discard
 
-// "LEVEL [tag] message\n" to `out`.
-private void write_line(^io.FILE out, ^Record r):
-    io.write(out, level_name(r.level))
-    io.write(out, " ")
-    string8 tag = tag_str(&r.tag, r.tag_len)
-    if !strings.is_empty(tag):
-        io.write(out, "[")
-        io.write_bytes(out, Bytes(tag))
-        io.write(out, "] ")
-    io.write_bytes(out, Bytes(msg_str(&r.message, r.msg_len)))
-    io.write(out, "\n")
+// A sink that drops every record: for a `Logger` that should say nothing, or
+// a `Filter` with nowhere to send what it keeps.
+#assert_raises
+Sink discard():
+    return g_discard
 
-private void stdout_fn(^Record r, rawptr _data):
-    write_line(io.stdout(), r)
+// ── composing sinks ──────────────────────────────────────────────────────
 
-// The one sink every program gets with no setup: a line per record on
-// `io.stdout()`. Stateless (`data` is nil), so one value serves every call.
-Sink stdout_sink():
-    return (stdout_fn, nil)
+// A minimum level in front of a sink: it hands on the records at `min` or
+// above to `next`, and drops the rest. A `Filter` is a sink itself:
+// `log.Sink s = f` for a `Filter f` the program keeps.
+type Filter using Sink:
+    Level min
+    Sink next
+    // Hand `r` to `next` when it is at `min` or above.
+    void take(^self, ^Record r):
+        if r^.level >= self.min:
+            self.next.take(r)
+
+// The most sinks a `Fanout` holds.
+const i32 FANOUT_CAP = 8
+
+private type Sinks: [FANOUT_CAP]Sink
+
+// Several sinks behind one: it hands each record to every sink added, in the
+// order they were added. A `Fanout` is a sink itself, and its zero value holds
+// none.
+type Fanout using Sink:
+    Sinks sinks
+    i32 count
+    // Add `s`, answering whether there was room for it. Hand it a `Sink`
+    // value (`log.Sink s = mine`, then `fan.add(s)`), not the implementer
+    // itself: `add` keeps what it is handed, and an implementer passed bare is
+    // a copy on `add`'s frame, which the compiler refuses to keep (ERR0826).
+    bool add(^self, Sink s):
+        if self.count < 0 || self.count >= FANOUT_CAP:
+            return false
+        self.sinks[self.count] = s
+        self.count = self.count + 1
+        return true
+    // Hand `r` to every sink added.
+    void take(^self, ^Record r):
+        for i in 0..<self.count:
+            if i < FANOUT_CAP:
+                self.sinks[i].take(r)
+
+// ── a logger ─────────────────────────────────────────────────────────────
+
+// A sink and the least severe level it is handed: what the default logger
+// is, and what a program passes around when it wants one of its own. Its sink
+// must not be empty (see the sinks above); `discard()` silences one.
+type Logger: (Sink sink, Level min)
+
+// Whether `l` would hand on a record at `lvl`.
+#assert_raises
+bool enabled(Logger l, Level lvl):
+    return lvl >= l.min
+
+// A record of `msg` at `lvl` under `tag`, to `l`'s sink when `lvl` is at
+// its minimum or above. Below it, nothing is formatted.
+void write(Logger l, Level lvl, string8 tag, string8 msg):
+    if !enabled(l, lvl): return
+    Record r = record(lvl, tag, msg)
+    l.sink.take(&r)
+
+// ── over streams ─────────────────────────────────────────────────────────
+//
+// Every target with a stream to write to; see the head of the file for
+// `#NONE`.
+when #OS != #NONE:
+    private type Line: [LINE_MAX]char8
+
+    // The record's line, to `out`, in one write.
+    private void write_line(^io.FILE out, ^Record r):
+        Line line
+        i64 n = put_line(r, line[0..<LINE_MAX])
+        _ = io.write_bytes(out, line[0..<n])
+
+    // A line per record at `min` or above on `stream`, which the program
+    // opens, flushes and closes, and which must outlive the sink:
+    // `log.StreamSink f = (stream, log.Level.Trace)`, then `log.Sink s = f`
+    // for as long as `f` is kept. A nil stream drops every record.
+    type StreamSink using Sink:
+        ^io.FILE stream
+        Level min
+        // Write `r` as one line on `stream`, when it is at `min` or above.
+        void take(^self, ^Record r):
+            if self.stream != nil && r^.level >= self.min:
+                write_line(self.stream, r)
+
+    // Standard output or standard error, chosen when the record arrives, so
+    // the two package variables below need no stream to start with.
+    private type StdSink using Sink:
+        bool to_stderr
+        void take(^self, ^Record r):
+            if self.to_stderr:
+                write_line(io.stderr(), r)
+            else:
+                write_line(io.stdout(), r)
+
+    private StdSink g_stdout
+    private StdSink g_stderr = (true)
+
+    // A line per record on `io.stdout()`. One package variable serves every
+    // call.
+    Sink stdout_sink():
+        return g_stdout
+
+    // A line per record on `io.stderr()`, where a diagnostic survives
+    // `> /dev/null`: the default logger's sink.
+    Sink stderr_sink():
+        return g_stderr
+
+    // ── the default logger ───────────────────────────────────────────────
+
+    private Logger g_default
+    private bool g_default_set
+
+    // The default logger: standard error at `Info` and above, until
+    // `set_default` replaces it.
+    Logger default_logger():
+        if !g_default_set:
+            return (stderr_sink(), Level.Info)
+        return g_default
+
+    // Replace the default logger. Call it before any thread logs. Its sink
+    // must not be empty; `(log.discard(), log.Level.Trace)` silences the
+    // default logger.
+    void set_default(Logger l):
+        g_default = l
+        g_default_set = true
+
+    // `msg` under `tag`, at `Trace`, to the default logger.
+    void trace(string8 tag, string8 msg):
+        write(default_logger(), Level.Trace, tag, msg)
+
+    // `msg` under `tag`, at `Debug`, to the default logger.
+    void debug(string8 tag, string8 msg):
+        write(default_logger(), Level.Debug, tag, msg)
+
+    // `msg` under `tag`, at `Info`, to the default logger.
+    void info(string8 tag, string8 msg):
+        write(default_logger(), Level.Info, tag, msg)
+
+    // `msg` under `tag`, at `Warn`, to the default logger.
+    void warn(string8 tag, string8 msg):
+        write(default_logger(), Level.Warn, tag, msg)
+
+    // `msg` under `tag`, at `Error`, to the default logger.
+    void error(string8 tag, string8 msg):
+        write(default_logger(), Level.Error, tag, msg)

@@ -1,73 +1,100 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 7e1d5137cae1 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit 549ca2ce6a97 -->
 # core:http
 
-core:http — a minimal, non-blocking HTTP/1.1 server over TCP.
+core:http — HTTP/1.1 over TCP: connections for a server and a client, a
+small blocking client, and the wire format both are written on.
 
     import "core:http"
+    import "core:fmt"
 
-    http.Server s = http.listen(8080)
-    if !http.valid(s):
-        // port already bound
-    defer http.stop(s)
+    try http.Response r = http.get("example.com", 80, "/") else why:
+        fmt.println("get: ", http.message(why))
+        return 1
+    defer r.destroy()
+    fmt.println(r.status, " ", r.header("content-type"))
 
-    // once per frame / loop turn — never blocks:
-    http.Accepted a = http.poll(s)
-    if a.ok:
-        if http.method() == http.Method.Get && strings.starts_with(http.path(), "/"):
-            http.respond(a.conn, 200, "OK", "text/html", body, alloc)
+A server is `core:http/server`, the router built on this package: it
+listens with `listen`, takes each connection with `accept`, reads it with
+`receive` until `request_end` says the request is whole, and answers with
+`send`. A client is `get`, `post` and `request`, or `dial` and
+`read_response` for one that sends its own bytes.
 
-**Why this package exists.** `core:net` is a `Reliable`/`Unreliable` wrapper
-over ENet (UDP) — the shape a game session wants, and the wrong shape for a
-browser or `curl`, which speak TCP and HTTP. This package is the other half:
-a byte-stream socket a request/response protocol rides on. It is deliberately
-small — enough to serve a status page from a tool's own event loop, not a
-general web framework — and it owes tests, because it stands directly on the
-platform's BSD sockets.
+**Tier [W] H. Script class S for the wire, T for the sockets.** Built for
+Linux, macOS, the BSDs or Windows, the whole package is here, over
+`core:net`'s sockets. Built for the web it compiles and every call that
+needs a socket fails `Error.UNSUPPORTED` — a page has no listening socket
+and no raw TCP, and node's sockets are asynchronous where these calls wait —
+while the wire (`wire.dado`) works unchanged. A target with no operating
+system has no sockets, and the `#static_assert` below refuses it by name.
 
-**This package has no C of its own.** `<sys/socket.h>`, `<netinet/in.h>`,
-`<arpa/inet.h>`, `<sys/time.h>`, `<fcntl.h>` and `<unistd.h>` are bound
-directly and the bodies below are the whole implementation, layouts
-included. What that owns, and what the two platforms disagree about, is
-written beside `SockAddrIn` and above `send_flags`.
+**What raises into a script.** The wire is pure Dado and promised, each
+function by the `#assert_raises` above it: `head_end`, `head_value`,
+`request_end`, `response_end`, `status_code`, `chunked_end`, `unchunk_to`,
+`unchunk`, `build_request` and `parse_response`, with `message` here and the
+`Response` methods through `raises_test.dado`. What touches a socket is not
+and cannot be: it reaches `core:net`, which calls the platform's C and
+holds the platform's descriptors. A script that wants HTTP builds and
+parses it here and asks its host for the bytes.
 
-**Non-blocking by construction, single-threaded by design.** The listen
-socket is non-blocking, so `poll` accepts a waiting connection or answers
-"nothing" immediately — it is meant to be called from one place, one turn of
-a caller's loop, the same contract `app:input.poll` and `core:net.poll`
-already have. There is no worker thread and no queue here: a caller that
-wants concurrency puts it above this line, not inside it.
+**Listening binds the address it is given.** `listen("127.0.0.1", port)` is
+the loopback interface only, which is what a tool's status page or a dev
+bridge wants; `"0.0.0.0"` (or `"::"`) is every interface, and is a decision
+worth writing down where it is made. The listening socket is nonblocking,
+so `accept` answers `Error.WOULD_BLOCK` at once when nobody is waiting.
 
-**One request buffer, reused.** Like `core:io.read_line`, the parsed method
-and path live in package-level storage that the next `poll` overwrites — so
-read `method()` / `path()` (or copy what you need out of them) before polling
-again. That is the single-threaded contract made concrete, and it is why this
-package holds no per-connection state beyond the descriptor `Accepted` hands
-back.
+**The client waits.** `get`, `post` and `request` connect, send, and read
+the whole response — `Content-Length`, chunked, or until the server closes
+— each step bounded by `timeout_ms`, and answer a `Response` whose bytes
+are on `#default` until `destroy`. One request per connection
+(`Connection: close`), IPv4 or IPv6, no TLS: `https://` is not here.
+
+**Errors.** Every failable function fails with a member of `Error`
+(codes 1100 to 1199), and `message(why)` is a sentence for each. A
+connection's failures are `core:net`'s, read into this package's members
+at the moment they happen.
+
+**Thread-safety.** Nothing here shares state: the client, the wire, and
+`accept`/`receive`/`send` on distinct connections are safe from any
+thread.
 
 ## Declarations
 
-75 declarations, 22 public.
+54 declarations, 36 public.
 
-* `distinct type Server: i32`
-* `distinct type Conn: i32`
-* `const i32 PATHCAP = 512`
-* `const i32 REQCAP = 16384`
-* `enum i32 Method: (Get, Post, Head, Options, Other)`
-* `type Accepted: (bool ok, Conn conn)` — What `poll` hands back: whether a connection was accepted this turn, and the…
-* `Server listen(u16 port)` — Start listening on `port` (all local interfaces). Check `valid` before use —…
-* `bool valid(Server s)`
-* `void stop(Server s)` — Stop the server. The listen socket is closed; connections already handed to a…
-* `Accepted poll(Server s)` — Accept at most one waiting connection and read its request line, or answer…
-* `string8 body()` — The body of the request `poll` last accepted — the bytes after the blank line…
-* `Method method()` — The method of the request `poll` last accepted.
-* `string8 path()` — The request-target (path) of the request `poll` last accepted, as a string…
-* `const i32 RESPCAP = 32768` — The largest response this package assembles at once. A status page is a few…
-* `void respond(Conn c, i32 status, string8 reason, string8 ctype, string8 body)` — Write a complete HTTP/1.1 response to `c` and close it. `status`/`reason` are…
-* `void respond_cors(Conn c, i32 status, string8 reason, string8 ctype, string8 body)` — Like `respond`, but with a permissive CORS header set — for an endpoint a…
-* `void close_conn(Conn c)` — Close a connection without answering it — for a caller that decides, after…
-* `Conn accept(Server s)` — Accept one waiting connection without reading from it, or answer a `Conn` that…
-* `bool open(Conn c)` — Whether `c` is a connection, rather than the nothing `accept` answers.
-* `i64 receive(Conn c, []char8 into)` — Read what has arrived on `c` into `into`, waiting at most the connection's read…
-* `i64 send(Conn c, []char8 from)` — Write all of `from` to `c`. Answers how many bytes were sent; fewer than…
-* `void set_read_timeout(Conn c, i32 milliseconds)` — Set how long a `receive` on `c` waits for bytes before answering -1.
+* `const i64 MAX_RESPONSE = 16777216` — The most bytes a response may take unless a call says otherwise: 16 MiB.
+* `Error!Response get(string8 host, u16 port, string8 target, i32 timeout_ms = 5000)` — GET `target` (a path and query, `/` when empty) from `host:port`.
+* `Error!Response post(string8 host, u16 port, string8 target, string8 content_type, string8 body, i32 timeout_ms = 5000)` — POST `body`, of `content_type`, to `target` on `host:port`.
+* `Error!Response request(string8 method, string8 host, u16 port, string8 target, []Header headers, string8 body, i32 timeout_ms = 5000, i64 limit = MAX_RESPONSE)` — Send `method` for `target` to `host:port` with `headers` (after `Host`) and…
+* `Error!Response read_response(Conn c, i32 timeout_ms = 5000, i64 limit = MAX_RESPONSE, bool head_only = false)` — Read one whole response from `c`, which stays open: at most `limit` bytes,…
+* `distinct enum i32 Error` — Why a call failed.
+* `string8 message(Error why)` — A sentence for `why`, for a person: what went wrong and, where there is…
+* `distinct type Server: i64` — A listening socket. End it with `stop`.
+* `distinct type Conn: i64` — One accepted, or dialed, connection. End it with `close_conn`.
+* `Error!Server listen(string8 host, u16 port)` — Start listening on `host:port`, where `host` is a numeric address of this…
+* `void stop(Server s)` — Stop the server: the listen socket is closed. Connections already accepted…
+* `Error!Conn accept(Server s)` — Accept one waiting connection without reading from it. The connection…
+* `Error!Conn dial(string8 host, u16 port, i32 timeout_ms = 5000)` — Connect to `host:port` — a name or a numeric address, IPv4 or IPv6 —…
+* `Error!i64 receive(Conn c, []u8 into)` — Read what has arrived on `c` into `into`, waiting at most the connection's…
+* `Error!void send(Conn c, []u8 from)` — Write all of `from` to `c`, as many writes as it takes. Fails…
+* `Error!void set_timeout(Conn c, i32 milliseconds)` — Give every `receive` and every `send` on `c` at most `milliseconds` to…
+* `void close_conn(Conn c)` — Close a connection.
+* `type Header: (string8 name, string8 value)` — One `name: value` line of a head, both views of the bytes it was read from.
+* `distinct type Whole: (i64 length)` — The message is whole, and is `length` bytes: its head, the blank line and…
+* `distinct type Pending: (i64 at_least)` — More bytes are owed. `at_least` is how long the message will be once whole,…
+* `distinct type ToClose: (i64 body_at)` — From `response_end`: the body runs until the server closes the connection,…
+* `union Extent: (Whole, Pending, ToClose)` — How far a message at the front of some bytes reaches: whole, not yet, or…
+* `Error!i64 head_end(string8 raw)` — Where the head of the whole message in `raw` ends: the offset of the…
+* `string8 head_value(string8 head, string8 name, string8 fallback = "")` — The value of the header `name` in `head` (the bytes before the blank line),…
+* `Error!Extent request_end(string8 raw)` — How far the request at the front of `raw` reaches: `Whole` with its…
+* `Error!Extent response_end(string8 raw, bool head_only = false)` — How far the response at the front of `raw` reaches: `Whole`, `Pending`, or…
+* `i32 status_code(string8 head)` — The three-digit status of a status line (`HTTP/1.1 200 OK`), or 0 when the…
+* `Error!Extent chunked_end(string8 body)` — How far the chunked body at the front of `body` reaches: `Whole` with every…
+* `Error!i64 unchunk_to([]char8 out, string8 body)` — Write the data of the chunked body `body` into `out`, without its framing,…
+* `Error!ref []char8 unchunk(string8 body)` — The data of the chunked body `body`, on `#default`. Fails…
+* `ref []char8 build_request(string8 method, string8 host, u16 port, string8 target, []Header headers, string8 body)` — The bytes of an HTTP/1.1 request, on `#default`: the request line, `Host`
+* `type Response` — A response a server sent: its status, its headers and its body, every one a…
+* `string8 header(self, string8 name, string8 fallback = "")` — The value of the header `name`, matched without regard to case, or…
+* `bool has_header(self, string8 name)` — Whether the response carries the header `name`, in any case.
+* `void destroy(^self)` — Give back the bytes the response holds. Its strings are not readable…
+* `Error!Response parse_response(ref []char8 data, bool head_only = false)` — Parse the whole response in `data`, which the answer takes ownership of…

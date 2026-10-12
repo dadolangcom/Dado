@@ -11,6 +11,12 @@
 //
 // * **Linux:** `readlink("/proc/self/exe")`, which the kernel answers with the
 //   file it mapped, every symlink already followed.
+// * **FreeBSD:** `sysctl` of `KERN_PROC_PATHNAME` for this process, the
+//   kernel's own record of the image it loaded.
+// * **NetBSD:** `readlink("/proc/curproc/exe")`, which needs `/proc` mounted
+//   (it is by default); unmounted, the call fails with the system's reason.
+// * **OpenBSD:** the system keeps no record of the path a program was loaded
+//   from, so the answer is `UNSUPPORTED` rather than a guess from `argv[0]`.
 // * **macOS:** `_NSGetExecutablePath`, which answers the path the program was
 //   started by (possibly through a symlink, possibly with `..` in it), then
 //   `realpath`, which resolves it.
@@ -22,6 +28,11 @@
 // over bytes nobody frees, and a second call answers the same bytes. A path
 // longer than the system's own limit, or a system that will not say, fails
 // with `NOT_FOUND`; the bytes are UTF-8 on every system.
+//
+// **On `#WEB`** a module has no file it was loaded from that this package can
+// name, so `executable_path` fails with `UNSUPPORTED`.
+//
+// Not promised to raise: every arm asks the system through a `foreign` call.
 //
 // Thread-safety: call it first from one thread (normally `main`); after that
 // it only reads.
@@ -39,21 +50,26 @@ when #OS == #WINDOWS:
         type @incomplete @c("struct HINSTANCE__") ExeModule
         #c.ulong GetModuleFileNameW(^ExeModule module, ^u16 into, #c.ulong size)
 
-    // The image's path. `GetModuleFileNameW` answers the count it wrote, and a
-    // count equal to the buffer means the path was cut short, which is refused
+    // Where the running program's executable is: an absolute path with every
+    // link followed, UTF-8, made once and good for the whole process. Fails
+    // with `NOT_FOUND` when the system will not say, and `UNSUPPORTED` where
+    // it cannot (OpenBSD, `#WEB`).
+    //
+    // On Windows, `GetModuleFileNameW` answers the count it wrote, and a count
+    // equal to the buffer means the path was cut short, which is refused
     // rather than answered.
-    !string8 executable_path():
+    Error!string8 executable_path():
         if g_exe_made:
             string8 kept = g_exe
             return kept
         ref []u16 wide = #make([]u16, EXE_CAP)
         defer #delete(wide)
-        if wide == nil: fail NO_MEMORY
+        if wide == nil: fail Error.NO_MEMORY
         #c.ulong got = GetModuleFileNameW(nil, &wide[0], #c.ulong(EXE_CAP))
-        if got == 0 || i64(got) >= EXE_CAP: fail NOT_FOUND
+        if got == 0 || i64(got) >= EXE_CAP: fail Error.NOT_FOUND
         using #heap:
             g_exe = narrow(&wide[0], i64(got))
-        if #len(g_exe) == 0: fail NOT_FOUND
+        if #len(g_exe) == 0: fail Error.NOT_FOUND
         g_exe_made = true
         string8 made = g_exe
         return made
@@ -73,45 +89,96 @@ else when #OS == #DARWIN:
 
     // `_NSGetExecutablePath` answers -1 and the size it needs when the buffer
     // is too small; this buffer is the largest path Darwin has.
-    !string8 executable_path():
+    Error!string8 executable_path():
         if g_exe_made:
             string8 kept = g_exe
             return kept
         ref []char8 raw = #make([]char8, EXE_CAP)
         defer #delete(raw)
-        if raw == nil: fail NO_MEMORY
+        if raw == nil: fail Error.NO_MEMORY
         u32 size = u32(EXE_CAP)
-        if dyld._NSGetExecutablePath(ExeChars(rawptr(&raw[0])), &size) != 0: fail NOT_FOUND
+        if dyld._NSGetExecutablePath(ExeChars(rawptr(&raw[0])), &size) != 0: fail Error.NOT_FOUND
         rawptr resolved = rawptr(dreal.realpath(cstring(rawptr(&raw[0])), nil))
-        if resolved == nil: fail last_error()
+        if resolved == nil: try fail_last()
         i64 n = i64(dstr.strlen(cstring(resolved)))
         using #heap:
             g_exe = owned(string8(cstring(resolved)))
         dreal.free(resolved)
-        if n == 0 || #len(g_exe) != n: fail NOT_FOUND
+        if n == 0 || #len(g_exe) != n: fail Error.NOT_FOUND
         g_exe_made = true
         string8 made = g_exe
         return made
 
-else:
+// The kernel keeps the answer in a sysctl, read into a buffer of the largest
+// size it can be: `size` says how much it wrote, terminator included.
+else when #OS == #FREEBSD:
+    private foreign fbsd "sys/sysctl.h":
+        const #c.int CTL_KERN
+        const #c.int KERN_PROC
+        const #c.int KERN_PROC_PATHNAME
+        #c.int sysctl(^const #c.int name, #c.uint namelen, rawptr oldp, ^#c.size_t oldlenp, const rawptr newp, #c.size_t newlen)
+
+    Error!string8 executable_path():
+        if g_exe_made:
+            string8 kept = g_exe
+            return kept
+        ref []char8 raw = #make([]char8, EXE_CAP)
+        defer #delete(raw)
+        if raw == nil: fail Error.NO_MEMORY
+        [4]#c.int mib
+        mib[0] = fbsd.CTL_KERN
+        mib[1] = fbsd.KERN_PROC
+        mib[2] = fbsd.KERN_PROC_PATHNAME
+        mib[3] = #c.int(0 - 1)
+        #c.size_t size = #c.size_t(EXE_CAP)
+        if fbsd.sysctl(&mib[0], 4, rawptr(&raw[0]), &size, nil, 0) != 0: try fail_last()
+        i64 n = i64(size)
+        // `size` counts the terminator; a path that filled the buffer is refused.
+        if n > 0 && raw[n - 1] == '\0': n -= 1
+        if n <= 0 || n >= EXE_CAP - 1: fail Error.NOT_FOUND
+        using #heap:
+            g_exe = owned(string8(raw[0..<n]))
+        g_exe_made = true
+        string8 made = g_exe
+        return made
+
+// OpenBSD records no path for a running image, so there is nothing true to
+// answer.
+else when #OS == #OPENBSD:
+    Error!string8 executable_path():
+        fail Error.UNSUPPORTED
+
+// A module on the web has no file this package can name.
+else when #OS == #WEB:
+    Error!string8 executable_path():
+        fail Error.UNSUPPORTED
+
+// Linux reads `/proc/self/exe` and NetBSD `/proc/curproc/exe`: each a link
+// the kernel answers with the file it mapped.
+else when #OS != #NONE:
     private foreign lexe "unistd.h" define "_POSIX_C_SOURCE=200809L":
         #c.long readlink(cstring path, ^#c.char into, #c.size_t size)
 
     private type ExeChars: ^#c.char
 
+    when #OS == #NETBSD:
+        private const cstring SELF_EXE = "/proc/curproc/exe"
+    else:
+        private const cstring SELF_EXE = "/proc/self/exe"
+
     // `readlink` does not terminate what it writes and answers how much it
     // wrote; a count that fills the buffer may be a path cut short, so it is
     // refused.
-    !string8 executable_path():
+    Error!string8 executable_path():
         if g_exe_made:
             string8 kept = g_exe
             return kept
         ref []char8 raw = #make([]char8, EXE_CAP)
         defer #delete(raw)
-        if raw == nil: fail NO_MEMORY
-        i64 n = i64(lexe.readlink("/proc/self/exe", ExeChars(rawptr(&raw[0])), #c.size_t(EXE_CAP)))
-        if n < 0: fail last_error()
-        if n == 0 || n >= EXE_CAP: fail NOT_FOUND
+        if raw == nil: fail Error.NO_MEMORY
+        i64 n = i64(lexe.readlink(SELF_EXE, ExeChars(rawptr(&raw[0])), #c.size_t(EXE_CAP)))
+        if n < 0: try fail_last()
+        if n == 0 || n >= EXE_CAP: fail Error.NOT_FOUND
         using #heap:
             g_exe = owned(string8(raw[0..<n]))
         g_exe_made = true

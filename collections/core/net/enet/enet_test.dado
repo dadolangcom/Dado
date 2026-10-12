@@ -1,0 +1,202 @@
+@test
+// core:net/enet: the `Reliable` and `Unreliable` classes move bytes over
+// `vendor:enet`, in a real client and server exchange over loopback, and the
+// failures a caller can reach: a busy port, a name that does not resolve, a
+// send to a peer not yet connected, a host never made. Port 17772, apart from
+// `vendor:enet`'s own test (17771) and `app:net`'s (17774, 17775). On `#WEB`
+// and `#NONE` `init` fails `UNSUPPORTED`, and the test checks that and stops.
+package netenet
+
+private bool bytes_equal([]u8 a, []u8 b, i32 n):
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return false
+    return true
+
+// Poll `host` once, answering the event, or `Idle` after a failed poll
+// (which is reported).
+private Event step(Host host, ^bool ok):
+    try Event ev = poll(host, 10) else why:
+        ok^ = #expect(false, "poll: ", message(why)) && ok^
+        return Event(Idle(0))
+    return ev
+
+// The bytes of the next `Received` event on `host` within a second, or nil.
+private ref []u8 next_packet(Host host, ^bool ok):
+    for rounds in 0..<100:
+        Event ev = step(host, ok)
+        switch ev:
+            case Received r:
+                return r.data
+            case Idle _:
+                continue
+            case Connected _:
+                continue
+            case Disconnected _:
+                continue
+            case TimedOut _:
+                continue
+    return nil
+
+i32 test():
+    bool ok = true
+
+    when #OS == #WEB || #OS == #NONE:
+        bool refused = false
+        try init() else why:
+            refused = #expect(why == Error.UNSUPPORTED, "init fails UNSUPPORTED where there is no UDP socket, got ", message(why))
+        ok = #expect(refused, "init() fails where there is no UDP socket") && ok
+        return 0 if ok else 1
+    try init() else why:
+        _ = #expect(false, "enet.init(): ", message(why))
+        return 1
+    defer shutdown()
+
+    // A host no constructor made is refused, not dereferenced.
+    Host never
+    bool no_host = false
+    try _ = poll(never, 0) else why:
+        no_host = #expect(why == Error.NO_HOST, "poll of a zero Host fails NO_HOST, got ", message(why))
+    ok = #expect(no_host, "poll of a zero Host failed") && ok
+
+    try Host server = host_server(17772, 4) else why:
+        _ = #expect(false, "host_server(17772) — port busy? ", message(why))
+        return 1
+    defer host_destroy(server)
+
+    // The same port a second time is taken.
+    bool busy = false
+    Host again
+    try again = host_server(17772, 4) else why:
+        busy = #expect(why == Error.HOST_FAILED, "a second host_server(17772) fails HOST_FAILED, got ", message(why))
+        again = (nil, nil)
+    host_destroy(again)
+    ok = #expect(busy, "a second server on one port was refused") && ok
+
+    try Host client = host_client(1) else why:
+        _ = #expect(false, "host_client(1): ", message(why))
+        return 1
+    defer host_destroy(client)
+
+    // A name under `.invalid` never resolves (RFC 6761).
+    bool unresolved = false
+    try _ = connect(client, "no-such-host.invalid", 17772) else why:
+        unresolved = #expect(why == Error.NOT_RESOLVED, "connect to no-such-host.invalid fails NOT_RESOLVED, got ", message(why))
+    ok = #expect(unresolved, "connect to a name that does not resolve failed") && ok
+
+    try Peer client_peer = connect(client, "127.0.0.1", 17772) else why:
+        _ = #expect(false, "connect(\"127.0.0.1\", 17772): ", message(why))
+        return 1
+
+    // Not connected yet: ENet will not queue a packet for it.
+    [2]u8 early = [1, 2]
+    bool not_queued = false
+    try send(client_peer, Class.Reliable, early[:]) else why:
+        not_queued = #expect(why == Error.NOT_QUEUED, "a send before the connection fails NOT_QUEUED, got ", message(why))
+    ok = #expect(not_queued, "a send to a peer still connecting was refused") && ok
+
+    // ── drive both sides until each has its own Connected event ─────────
+    bool client_connected = false
+    bool server_connected = false
+    Peer server_peer = nil
+    i32 rounds = 0
+    for rounds < 100 && !(client_connected && server_connected):
+        switch step(client, &ok):
+            case Connected _:
+                client_connected = true
+            case Received r:
+                #delete(r.data)
+            case Idle _:
+                pass
+            case Disconnected _:
+                pass
+            case TimedOut _:
+                pass
+        switch step(server, &ok):
+            case Connected c:
+                server_connected = true
+                server_peer = c.peer
+            case Received r:
+                #delete(r.data)
+            case Idle _:
+                pass
+            case Disconnected _:
+                pass
+            case TimedOut _:
+                pass
+        rounds = rounds + 1
+    ok = #expect(client_connected, "client saw Connected within 1s") && ok
+    ok = #expect(server_connected, "server saw Connected within 1s") && ok
+    ok = #expect(server_peer != nil, "server's Connected event named a peer") && ok
+
+    // ── Reliable: client -> server, exact bytes ──────────────────────────
+    [9]u8 reliable_payload = [112, 105, 110, 103, 45, 110, 101, 116, 49]  // "ping-net1"
+    try send(client_peer, Class.Reliable, reliable_payload[:]) else why:
+        ok = #expect(false, "send(Reliable): ", message(why)) && ok
+    flush(client)
+    ref []u8 got = next_packet(server, &ok)
+    ok = #expect(got != nil, "server saw Received (Reliable) within 1s") && ok
+    if got != nil:
+        ok = #expect(#len(got) == 9, "Reliable payload length round-tripped, got ", #len(got)) && ok
+        ok = #expect(bytes_equal(got[:], reliable_payload[:], 9), "Reliable payload bytes round-tripped exactly") && ok
+        #delete(got)
+
+    // ── Unreliable: server -> client, exact bytes (loopback, so expected
+    // to arrive — this is the channel/flag plumbing under test, not ENet's
+    // own delivery guarantees) ───────────────────────────────────────────
+    [7]u8 unreliable_payload = [112, 111, 110, 103, 45, 117, 49]  // "pong-u1"
+    try send(server_peer, Class.Unreliable, unreliable_payload[:]) else why:
+        ok = #expect(false, "send(Unreliable): ", message(why)) && ok
+    flush(server)
+    got = next_packet(client, &ok)
+    ok = #expect(got != nil, "client saw Received (Unreliable) within 1s") && ok
+    if got != nil:
+        ok = #expect(#len(got) == 7, "Unreliable payload length round-tripped, got ", #len(got)) && ok
+        ok = #expect(bytes_equal(got[:], unreliable_payload[:], 7), "Unreliable payload bytes round-tripped exactly") && ok
+        #delete(got)
+
+    // ── broadcast: server -> every peer (just the one here) ─────────────
+    [4]u8 broadcast_payload = [98, 99, 97, 115]  // "bcas"
+    broadcast(server, Class.Reliable, broadcast_payload[:])
+    flush(server)
+    got = next_packet(client, &ok)
+    ok = #expect(got != nil, "client saw the broadcast within 1s") && ok
+    if got != nil:
+        ok = #expect(bytes_equal(got[:], broadcast_payload[:], 4), "broadcast payload bytes round-tripped exactly") && ok
+        #delete(got)
+
+    // ── graceful disconnect ───────────────────────────────────────────────
+    disconnect(client_peer)
+    bool client_saw_disconnect = false
+    rounds = 0
+    for rounds < 60 && !client_saw_disconnect:
+        switch step(client, &ok):
+            case Disconnected d:
+                client_saw_disconnect = d.peer == client_peer
+            case Received r:
+                #delete(r.data)
+            case Idle _:
+                pass
+            case Connected _:
+                pass
+            case TimedOut _:
+                pass
+        switch step(server, &ok):
+            case Received r:
+                #delete(r.data)
+            case Idle _:
+                pass
+            case Connected _:
+                pass
+            case Disconnected _:
+                pass
+            case TimedOut _:
+                pass
+        rounds = rounds + 1
+    ok = #expect(client_saw_disconnect, "client saw its own Disconnected within 600ms") && ok
+    ok = #expect(host_peer_count(server) <= 4, "server peer count sane post-disconnect, got ", host_peer_count(server)) && ok
+
+    // Every code has its own sentence.
+    ok = #expect(message(Error.HOST_FAILED) != message(Error.NOT_QUEUED), "message tells codes apart") && ok
+
+    return 0 if ok else 1

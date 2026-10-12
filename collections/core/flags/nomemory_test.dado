@@ -1,0 +1,200 @@
+@test
+// Allocation failure, reached through `using`: every allocation this package
+// makes is the ambient allocator's, so an allocator that refuses, or one that
+// refuses after a budget, reaches every allocation-failure answer at once.
+// Text only, so it runs on every target. What is claimed:
+//
+//   * **nothing traps**: a declaration the allocator refused makes `parse`
+//     fail with `NO_MEMORY`, and its handle reads as the zero value (a
+//     refused declaration once answered the handle -1, and a read indexed
+//     the table with it);
+//   * **a list's value the allocator refused fails `parse` with
+//     `NO_MEMORY`**, never drops the value silently;
+//   * **`error()` answers `message` of the code** when the failure sentence
+//     itself could not be allocated, never `""` after a failure;
+//   * **`help` answers `nil` or the exact text**;
+//   * **whatever `parse` answers under any budget is right**: success with
+//     every value as the unbudgeted parse reads it, or `NO_MEMORY`;
+//   * **nothing leaks**: under a budget that runs out at every allocation in
+//     turn, the blocks still live after `destroy` (and `#delete` of the help)
+//     are none.
+package flags
+
+import "core:mem"
+import "core:mem/libc"
+
+// An allocator that refuses everything.
+private rawptr refuses(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    return nil
+
+// `libc`, counting live blocks, refusing every allocation once `budget`
+// allocations have been made. Frees always go through.
+private i64 budget
+private i64 live
+
+private rawptr budgeted(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    bool fresh_block = mode == mem.AllocatorMode.Alloc || (mode == mem.AllocatorMode.Resize && old == nil)
+    if (fresh_block || mode == mem.AllocatorMode.Resize) && budget <= 0:
+        return nil
+    (mem.Proc proc, rawptr data) base = libc.allocator()
+    rawptr p = base.proc(base.data, mode, nbytes, align, old, old_size)
+    if fresh_block && p != nil:
+        live = live + 1
+        budget = budget - 1
+    else if mode == mem.AllocatorMode.Resize && p != nil:
+        budget = budget - 1
+    else if mode == mem.AllocatorMode.Free && old != nil:
+        live = live - 1
+    return p
+
+private (mem.Proc proc, rawptr data) refusing():
+    return (refuses, nil)
+
+private (mem.Proc proc, rawptr data) with_budget(i64 n):
+    budget = n
+    return (budgeted, nil)
+
+// One program's declarations, the same under every allocator.
+private type Tool:
+    Parser p
+    BoolFlag loud
+    IntFlag times
+    FloatFlag ratio
+    TextFlag mode
+    ListFlag defines
+    TextFlag who
+    ListFlag more
+    ListFlag after
+
+private Tool declare():
+    Tool t
+    t.p = parser("tool", "A tool that does a thing to some files.")
+    t.p.command("go", "go somewhere")
+    t.p.command("stay", "stay put")
+    t.loud = t.p.boolean("-l --loud", "shout")
+    t.times = t.p.integer("-n --times", "N", "how many times", 1)
+    t.ratio = t.p.real("-r --ratio", "X", "how much", 0.5)
+    t.mode = t.p.choice("--mode", "=fast|slow", "how", "fast")
+    t.defines = t.p.list("-D", "NAME=VALUE", "a definition", "go")
+    t.who = t.p.positional("WHO", "who goes", true, "go")
+    t.more = t.p.rest("FILE", "more files", "go")
+    t.after = t.p.tail("ARGS", "the words after --", "go")
+    t.p.env("--times", "TOOL_TIMES")
+    t.p.env_var("TOOL_TIMES", "3")
+    return t
+
+private const string8 LINE = "go -l -r 2.5 --mode=slow -D A=1 -D B=2 sam x.txt y.txt -- --raw z"
+
+private ref []string8 words(string8 line):
+    ref []string8 out = #make([]string8, 0)
+    i64 at = 0
+    for at < #len(line):
+        i64 end = at
+        for end < #len(line) && line[end] != ' ':
+            end += 1
+        _ = #append(out, line[at..<end])
+        at = end + 1
+    return out
+
+// Every value `LINE` gives, as the unbudgeted parse reads it.
+private bool reads_right(^Tool t, string8 got):
+    Parser p = t.p
+    bool ok = got == "go" && p.on(t.loud) && p.number(t.times) == 3 && p.amount(t.ratio) == 2.5
+    ok = ok && p.value(t.mode) == "slow" && p.value(t.who) == "sam"
+    []string8 d = p.values(t.defines)
+    []string8 m = p.values(t.more)
+    []string8 a = p.values(t.after)
+    ok = ok && #len(d) == 2 && d[0] == "A=1" && d[1] == "B=2"
+    ok = ok && #len(m) == 2 && m[0] == "x.txt" && m[1] == "y.txt"
+    ok = ok && #len(a) == 2 && a[0] == "--raw" && a[1] == "z"
+    return ok
+
+i32 test():
+    bool ok = true
+    ref []string8 args = words(LINE)
+    defer #delete(args)
+
+    // ── the unbudgeted answers, to compare against ────────────────────────
+    Tool base = declare()
+    try string8 chose = base.p.parse(args[:]) else why:
+        _ = #expect(false, "the line failed unbudgeted with ", i32(why), ": ", base.p.error())
+        return 1
+    ok = #expect(reads_right(&base, chose), "the unbudgeted parse read the line wrongly") && ok
+    ref []char8 base_help = base.p.help_for("go")
+    string8 want_help = base_help
+
+    // ── an allocator that refuses everything ──────────────────────────────
+    using refusing():
+        Tool none = declare()
+        bool starved = false
+        try string8 _ = none.p.parse(args[:]) else why:
+            starved = why == Error.NO_MEMORY
+        ok = #expect(starved, "a parser that could allocate nothing did not fail NO_MEMORY") && ok
+        ok = #expect(none.p.error() == message(Error.NO_MEMORY), "error() after a refused sentence is `", none.p.error(), "`") && ok
+        ok = #expect(!none.p.on(none.loud) && none.p.number(none.times) == 0 && none.p.amount(none.ratio) == 0.0, "a refused handle read a value") && ok
+        []string8 none_defines = none.p.values(none.defines)
+        ok = #expect(none.p.value(none.who) == "" && !none.p.given(none.who) && #len(none_defines) == 0, "a refused handle read text") && ok
+        ref []char8 no_help = none.p.help()
+        ok = #expect(no_help == nil, "help answered text with no memory") && ok
+        none.p.destroy()
+
+    // ── a list's value that cannot be kept ────────────────────────────────
+    // A run grows on the allocator it was made with, so the lists are made
+    // under a budget that the declarations use up exactly; then the `-D`
+    // that outgrows the room its list was made with fails the parse.
+    ref []string8 many = words("go sam")
+    defer #delete(many)
+    for i in 0..<300:
+        _ = #append(many, "-D")
+        _ = #append(many, "X=1")
+    live = 0
+    using with_budget(100000):
+        Tool count = declare()
+        count.p.destroy()
+    i64 declaring = 100000 - budget
+    live = 0
+    using with_budget(declaring):
+        Tool late = declare()
+        bool refused_value = false
+        try string8 _ = late.p.parse(many[:]) else why:
+            refused_value = why == Error.NO_MEMORY
+        ok = #expect(refused_value, "a list value the allocator refused was not NO_MEMORY") && ok
+        ok = #expect(late.p.error() == message(Error.NO_MEMORY), "error() is `", late.p.error(), "`") && ok
+        // The same parser, given memory again, reads the line whole.
+        budget = 100000
+        try string8 again = late.p.parse(args[:]) else why:
+            _ = #expect(false, "the parse after a refused one failed with ", i32(why))
+            return 1
+        ok = #expect(reads_right(&late, again), "a parse after a refused one read the line wrongly") && ok
+        late.p.destroy()
+    ok = #expect(live == 0, "a refused list value: ", live, " blocks leaked") && ok
+
+    // ── every budget in turn: right or NO_MEMORY, and nothing leaks ───────
+    i64 n = 0
+    bool whole = false
+    for !whole && n < 400:
+        live = 0
+        using with_budget(n):
+            Tool t = declare()
+            bool parsed = true
+            string8 got = ""
+            try got = t.p.parse(args[:]) else why:
+                parsed = false
+                ok = #expect(why == Error.NO_MEMORY, "budget ", n, ": failed with ", i32(why), ", not NO_MEMORY") && ok
+                string8 said = t.p.error()
+                ok = #expect(#len(said) > 0, "budget ", n, ": an empty error()") && ok
+            if parsed:
+                ok = #expect(reads_right(&t, got), "budget ", n, ": the parse succeeded and read the line wrongly") && ok
+            ref []char8 h = t.p.help_for("go")
+            if h != nil:
+                ok = #expect(string8(h[:]) == want_help, "budget ", n, ": help answered other text") && ok
+                whole = parsed
+                #delete(h)
+            t.p.destroy()
+        ok = #expect(live == 0, "budget ", n, ": ", live, " blocks leaked") && ok
+        n += 1
+    ok = #expect(whole, "no budget under 400 parsed the line and wrote the help") && ok
+
+    #delete(base_help)
+    base.p.destroy()
+    return 0 if ok else 1

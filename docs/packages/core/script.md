@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.3 -->
-<!-- commit eaa5ea1b6195 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f12a11494f94 -->
 # core:script
 
 core:script — the native runtime a DadoScript program runs on: QuickJS-ng, the
@@ -22,6 +22,10 @@ fork, embedded.
         return code
     try i64 n = script.result_i64(e) else code:
         return code
+
+**Tier W H.** Every hosted target (Linux, macOS and Windows) on the
+engine's archive, and the web on the page's own engine; never `#NONE`,
+which is refused by design (below).
 
 **What this package is.** The seam the generated glue of `#script_vm`,
 `#script_new`, `#script_run` and member calls through a handle calls: an
@@ -63,7 +67,29 @@ script runs on the page's own engine and a web build links none:
 `quickjs.h` is a header the compiler's web runtime supplies, implementing
 every function below over the JavaScript engine beside the module, so this
 package compiles unchanged there; its scripts are files beside the module,
-never source an engine compiles.
+never source an engine compiles. **On Windows** the archive is built as for
+any other triple (`x86_64-windows-gnu`, by the pinned zig), and the package
+has no arm of its own: what it needs of the operating system — a lock and a
+condition per engine — is `core:threads`', the files a reload or a mod
+reads are `core:io`'s, and the separator a reload's path is joined with is
+`core:path`'s.
+
+**What raises into a script.** Little, by what the package is: the seam
+between a script and its host, so nearly every function here holds the
+engine's values as addresses (`^JSContext`, `JSValue`'s pointer payload)
+or a handle as a `rawptr`, takes a name as a `cstring`, or calls the
+engine's header. That is every verb and its `_or_quit` twin, the
+`arg_`/`result_` calls, the thunk helpers (`take_`, `give_`, `read_`,
+`answer_`), the stop and pause entries (which also take `core:threads`'
+locks and an atomic word), the handle table (a lock), the channels (atomic
+flag words), the counters, the sinks (a `Sink` holds a `rawptr`) and the
+reload and mod loaders' engine halves. None of them is promised, and none
+can be without leaving the engine. Promised, each by the `#assert_raises`
+above it: the lend fingerprint's arithmetic (`mix`, `mix_float`,
+`mix_string`), `exit_status`, `failure_text` and `pend_policy`, and the
+private text and number helpers beneath them — the failure text's buffer,
+the reload's manifest and header readers and its path, the mod loader's
+file names, and the handle table's bit packing.
 
 **Values cross as scalars, and `int` in its tiers.** A DadoScript `int` is
 exactly `i64`, held in the smallest canonical tier that fits: a 32-bit
@@ -73,7 +99,7 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 
 ## Declarations
 
-550 declarations, 262 public.
+550 declarations, 187 public.
 
 * `type Parking` — A script's error a callback met, waiting for the innermost thunk running…
 * `JSValue thunk_left(^JSContext ctx, JSValue answer)` — A thunk is done: its depth let go of, and its answer given back — or the…
@@ -107,11 +133,11 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 * `const i32 OTHER_VM = -2147483639` — An instance crossed into a script on another VM than its own — an argument…
 * `string8 failure_text()` — `#script_error()`: the text of the last failure a verb answered on this…
 * `!void call_function(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)` — The calls, one per answer's type.
-* `!i64 call_function_int(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)`
-* `!f64 call_function_float(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)`
-* `!bool call_function_bool(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)`
+* `!i64 call_function_int(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)` — As `call_function`, answering the function's `int`. Called by generated code.
+* `!f64 call_function_float(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)` — As `call_function`, answering the function's `float`. Called by generated code.
+* `!bool call_function_bool(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)` — As `call_function`, answering the function's `bool`. Called by generated code.
 * `!ref([]char8) call_function_string(const rawptr table, const rawptr bound, const rawptr channels, i32 index, cstring module, cstring class, cstring function, bool seam)` — A `string` answer is a create verb's, as a member call's: a copy on the…
-* `!ref([]char8) function_text(i64 n)`
+* `!ref([]char8) function_text(i64 n)` — The page's `n` bytes, copied onto the ambient allocator; the caller owns…
 * `type Slot` — One handle's slot. A free slot is on the free list, by `next`.
 * `i64 live_handles()` — How many handles are live, on every engine: what a test reads.
 * `void inline_entered(^JSContext ctx)` — An inline crossing beginning while a run lent the script a Dado structure:
@@ -121,81 +147,6 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 * `void pend_policy(i32 policy)` — The next VM's policy, `on_error:`.
 * `type Reloading` — What an engine keeps of its reloads: how many it has evaluated, which…
 * `!void reload_engine(rawptr vm, cstring module, cstring class, string8 dir, cstring manifest)` — `#script_reload(vm, Class, dir)` under `try`: the class `class` of the…
-* `type JSRuntime`
-* `type JSContext`
-* `type JSModuleDef`
-* `cunion JSValueUnion`
-* `type JSValue`
-* `type JSMallocFunctions`
-* `enum @c("JSCFunctionEnum") JSCFunctionEnum`
-* `enum @c("JSPromiseStateEnum") JSPromiseStateEnum`
-* `const i32 JS_TAG_BIG_INT` — The value tags this package reads. An anonymous enum in the header, so…
-* `const i32 JS_TAG_SHORT_BIG_INT`
-* `const i32 JS_TAG_INT`
-* `const i32 JS_TAG_BOOL`
-* `const i32 JS_TAG_UNDEFINED`
-* `const i32 JS_TAG_FLOAT64`
-* `const i32 JS_TAG_STRING`
-* `const i32 JS_TAG_STRING_ROPE`
-* `const i32 JS_TAG_OBJECT`
-* `const i32 JS_TAG_EXCEPTION`
-* `const i32 JS_EVAL_TYPE_MODULE`
-* `const i32 JS_EVAL_FLAG_COMPILE_ONLY`
-* `const i32 JS_EVAL_FLAG_DADOS` — The fork's flag (patch 0002): code evaluated with it compiles the…
-* `^JSRuntime JS_NewRuntime2(^const JSMallocFunctions mf, rawptr opaque)`
-* `void JS_FreeRuntime(^JSRuntime rt)`
-* `void JS_UpdateStackTop(^JSRuntime rt)`
-* `void JS_SetInterruptHandler(^JSRuntime rt, i32(^JSRuntime, rawptr) cb, rawptr opaque)` — The hook the engine calls at its polls (`stop.dado`), and the fork's…
-* `const i32 JS_INTERRUPT_RAISE`
-* `^JSContext JS_NewContext(^JSRuntime rt)`
-* `void JS_FreeContext(^JSContext ctx)`
-* `void JS_SetContextOpaque(^JSContext ctx, rawptr opaque)`
-* `rawptr JS_GetContextOpaque(^JSContext ctx)`
-* `void JS_SetModuleLoaderFunc(^JSRuntime rt, (^#c.char)(^JSContext, cstring, cstring, rawptr) module_normalize, (^JSModuleDef)(^JSContext, cstring, rawptr) module_loader, rawptr opaque)`
-* `i32 JS_ExecutePendingJob(^JSRuntime rt, ^^JSContext pctx)`
-* `JSValue JS_Eval(^JSContext ctx, cstring input, #c.size_t input_len, cstring filename, i32 eval_flags)`
-* `JSValue JS_LoadModule(^JSContext ctx, cstring basename, cstring filename)`
-* `JSPromiseStateEnum JS_PromiseState(^JSContext ctx, JSValue promise)`
-* `JSValue JS_PromiseResult(^JSContext ctx, JSValue promise)`
-* `JSValue JS_GetGlobalObject(^JSContext ctx)`
-* `JSValue JS_GetPropertyStr(^JSContext ctx, JSValue this_obj, cstring prop)`
-* `i32 JS_SetPropertyStr(^JSContext ctx, JSValue this_obj, cstring prop, JSValue val)`
-* `i32 JS_DefinePropertyValueStr(^JSContext ctx, JSValue this_obj, cstring prop, JSValue val, i32 flags)` — A handle's mark (`handles.dado`): a property no script names, kept out…
-* `const i32 JS_PROP_WRITABLE`
-* `const i32 JS_PROP_CONFIGURABLE`
-* `JSValue JS_DupValue(^JSContext ctx, JSValue v)` — A counted reference more: what a handle holds of an instance.
-* `bool JS_IsFunction(^JSContext ctx, JSValue val)`
-* `JSValue JS_Call(^JSContext ctx, JSValue func_obj, JSValue this_obj, i32 argc, ^JSValue argv)`
-* `JSValue JS_CallConstructor(^JSContext ctx, JSValue func_obj, i32 argc, ^JSValue argv)`
-* `JSValue JS_NewCFunction2(^JSContext ctx, JSValue(^JSContext, JSValue, i32, ^JSValue) func, cstring name, i32 length, JSCFunctionEnum cproto, i32 magic)`
-* `^JSModuleDef JS_NewCModule(^JSContext ctx, cstring name_str, i32(^JSContext, ^JSModuleDef) func)`
-* `i32 JS_AddModuleExport(^JSContext ctx, ^JSModuleDef m, cstring name_str)`
-* `i32 JS_SetModuleExport(^JSContext ctx, ^JSModuleDef m, cstring export_name, JSValue val)`
-* `JSValue JS_GetException(^JSContext ctx)`
-* `JSValue JS_Throw(^JSContext ctx, JSValue obj)`
-* `bool JS_IsError(JSValue val)`
-* `JSValue JS_ThrowReferenceError(^JSContext ctx, cstring fmt, ...)`
-* `JSValue JS_ThrowTypeError(^JSContext ctx, cstring fmt, ...)`
-* `JSValue JS_ThrowPlainError(^JSContext ctx, cstring fmt, ...)`
-* `void JS_FreeValue(^JSContext ctx, JSValue v)`
-* `JSValue JS_NewBool(^JSContext ctx, bool val)`
-* `JSValue JS_NewInt32(^JSContext ctx, i32 val)`
-* `JSValue JS_NewFloat64(^JSContext ctx, f64 val)`
-* `JSValue JS_NewBigInt64(^JSContext ctx, i64 v)`
-* `JSValue JS_NewStringLen(^JSContext ctx, cstring str1, #c.size_t len1)`
-* `i32 JS_ToBigInt64(^JSContext ctx, ^i64 pres, JSValue val)`
-* `^const #c.char JS_ToCStringLen2(^JSContext ctx, ^#c.size_t plen, JSValue val1, bool cesu8)`
-* `void JS_FreeCString(^JSContext ctx, cstring ptr)` — `const char *` in the header, which is what a `cstring` is in C: a…
-* `^const u16 JS_ToCStringLenUTF16(^JSContext ctx, ^#c.size_t plen, JSValue val1)` — A string's UTF-16 code units, unmatched surrogates kept, and a string…
-* `void JS_FreeCStringUTF16(^JSContext ctx, ^const u16 ptr)`
-* `JSValue JS_NewStringUTF16(^JSContext ctx, ^const u16 buf, #c.size_t len)`
-* `JSValue JS_NewArray(^JSContext ctx)` — Arrays, for the values that cross as one: a Dado slice, array or tuple.
-* `bool JS_IsArray(JSValue val)`
-* `i32 JS_GetLength(^JSContext ctx, JSValue obj, ^i64 pres)`
-* `JSValue JS_GetPropertyInt64(^JSContext ctx, JSValue this_obj, i64 idx)`
-* `i32 JS_SetPropertyInt64(^JSContext ctx, JSValue this_obj, i64 idx, JSValue val)`
-* `bool JS_IsMap(JSValue val)`
-* `JSValue JS_ThrowOutOfMemory(^JSContext ctx)`
 * `const i32 THREW = 1` — The script threw and nothing caught it; the error's text and stack are on…
 * `const i32 NO_SUCH = 2` — No module, export, class or method has that name.
 * `type State` — One engine: a QuickJS-ng runtime and its one context, the allocator both…
@@ -213,16 +164,16 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 * `!void add_module(Engine e, cstring name, cstring source)` — Register the ES module `source` under `name`, for `load` and for any…
 * `!Handle load(Engine e, cstring name)` — Import the module `name` and evaluate it (and everything it imports) under…
 * `void arg_i64(Engine e, i64 v)` — An `int`, in the smallest canonical tier that holds it.
-* `void arg_f64(Engine e, f64 v)`
-* `void arg_bool(Engine e, bool v)`
+* `void arg_f64(Engine e, f64 v)` — A `float`, as itself.
+* `void arg_bool(Engine e, bool v)` — A `bool`, as itself.
 * `void arg_string(Engine e, string8 s)` — The string's bytes, read as UTF-8 and copied into the engine: bytes out…
 * `!void call(Engine e, Handle module, cstring function)` — Call the function `module` exports as `function` with the pushed arguments;…
 * `!Handle construct(Engine e, Handle module, cstring class)` — Construct `module`'s exported class `class` with the pushed arguments, and…
 * `!void call_method(Engine e, Handle object, cstring method)` — Call `object`'s method `method` with the pushed arguments.
 * `void release(Engine e, Handle h)` — Let go of a value the engine holds for the caller.
 * `!i64 result_i64(Engine e)` — The last answer as an `int`, from whichever tier holds it.
-* `!f64 result_f64(Engine e)`
-* `!bool result_bool(Engine e)`
+* `!f64 result_f64(Engine e)` — The last answer as a `float`; an `int` in its 32-bit tier is read as one.
+* `!bool result_bool(Engine e)` — The last answer as a `bool`.
 * `!string8 result_string(Engine e)` — The last answer as a string, borrowed: it is valid until the next call and…
 * `const i32 UNTRIED = 70` — The status a program ends with when a script fails inside a run no `try`
 * `!rawptr vm_create((rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc, const rawptr table, const rawptr bound, const rawptr channels)` — A host's `#script_vm(alloc)`: an engine on `alloc`, every row of `table`
@@ -232,44 +183,44 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 * `rawptr new_instance_or_quit(rawptr vm, cstring module, cstring class, cstring label)` — `#script_new` with no `try` around it: a failure ends the program with the…
 * `i64 run_ready(rawptr s, bool answers)` — `#script_run(c)`: the instance's `ready`, with `main`'s rules — blocking,…
 * `void push_int(rawptr s, i64 v)` — The next `run`'s arguments, pushed in order, each as its DadoScript type: `int`
-* `void push_float(rawptr s, f64 v)`
-* `void push_bool(rawptr s, bool v)`
-* `void push_string(rawptr s, string8 v)`
+* `void push_float(rawptr s, f64 v)` — A `float` argument, as `push_int`. Called by generated code.
+* `void push_bool(rawptr s, bool v)` — A `bool` argument, as `push_int`. Called by generated code.
+* `void push_string(rawptr s, string8 v)` — A `string` argument, borrowed until the run, as `push_int`. Called by…
 * `void push_instance(rawptr s, rawptr v)` — An instance, by its handle: the run checks it once it has entered — a…
 * `!void run(rawptr s, cstring entry)` — A member call `g.entry(…)` under `try` (and `#script_run(c)`, `ready`):
-* `!i64 run_int(rawptr s, cstring entry)`
-* `!f64 run_float(rawptr s, cstring entry)`
-* `!bool run_bool(rawptr s, cstring entry)`
+* `!i64 run_int(rawptr s, cstring entry)` — As `run`, answering the entry's `int`. Called by generated code.
+* `!f64 run_float(rawptr s, cstring entry)` — As `run`, answering the entry's `float`. Called by generated code.
+* `!bool run_bool(rawptr s, cstring entry)` — As `run`, answering the entry's `bool`. Called by generated code.
 * `!ref([]char8) run_string(rawptr s, cstring entry)` — A `string` answer is a create verb's: a copy of the engine's string, on the…
 * `!rawptr run_instance(rawptr s, cstring entry, cstring class)` — An instance answered: the handle Dado holds it by — the one it already has…
 * `!i64 get_int(rawptr s, cstring field)` — `g.field`, read: the field of the instance the handle holds, read as its…
-* `!f64 get_float(rawptr s, cstring field)`
-* `!bool get_bool(rawptr s, cstring field)`
-* `!ref([]char8) get_string(rawptr s, cstring field)`
-* `!rawptr get_instance(rawptr s, cstring field, cstring class)`
+* `!f64 get_float(rawptr s, cstring field)` — As `get_int`, for a `float` field. Called by generated code.
+* `!bool get_bool(rawptr s, cstring field)` — As `get_int`, for a `bool` field. Called by generated code.
+* `!ref([]char8) get_string(rawptr s, cstring field)` — As `get_int`, for a `string` field: a copy the caller owns, as…
+* `!rawptr get_instance(rawptr s, cstring field, cstring class)` — As `get_int`, for a field holding an instance of `class`: its handle, as…
 * `!void put_field(rawptr s, cstring field)` — `g.field = v`: the one pushed argument written into the field.
 * `void run_or_quit(rawptr s, cstring entry)` — A member call with no `try` around it: the same calls, and a failure ends…
-* `i64 run_int_or_quit(rawptr s, cstring entry)`
-* `f64 run_float_or_quit(rawptr s, cstring entry)`
-* `bool run_bool_or_quit(rawptr s, cstring entry)`
+* `i64 run_int_or_quit(rawptr s, cstring entry)` — As `run_or_quit`, answering the entry's `int`, or 0. Called by generated…
+* `f64 run_float_or_quit(rawptr s, cstring entry)` — As `run_or_quit`, answering the entry's `float`, or 0.0. Called by…
+* `bool run_bool_or_quit(rawptr s, cstring entry)` — As `run_or_quit`, answering the entry's `bool`, or false. Called by…
 * `ref([]char8) run_string_or_quit(rawptr s, cstring entry)` — A stopped run's empty string is still the caller's to `#delete`.
 * `rawptr run_instance_or_quit(rawptr s, cstring entry, cstring class)` — A stopped run's instance is nil, a handle that holds no script.
 * `i64 get_int_or_quit(rawptr s, cstring field)` — A field read is never under `try`: these are the only reads there are.
-* `f64 get_float_or_quit(rawptr s, cstring field)`
-* `bool get_bool_or_quit(rawptr s, cstring field)`
-* `ref([]char8) get_string_or_quit(rawptr s, cstring field)`
-* `rawptr get_instance_or_quit(rawptr s, cstring field, cstring class)`
-* `void put_or_quit(rawptr s, cstring field)`
+* `f64 get_float_or_quit(rawptr s, cstring field)` — As `get_int_or_quit`, for a `float` field, or 0.0. Called by generated…
+* `bool get_bool_or_quit(rawptr s, cstring field)` — As `get_int_or_quit`, for a `bool` field, or false. Called by generated…
+* `ref([]char8) get_string_or_quit(rawptr s, cstring field)` — As `get_int_or_quit`, for a `string` field, or an empty string the caller…
+* `rawptr get_instance_or_quit(rawptr s, cstring field, cstring class)` — As `get_int_or_quit`, for an instance field, or nil. Called by generated…
+* `void put_or_quit(rawptr s, cstring field)` — `put_field` with no `try` around it, as `run_or_quit`. Called by generated…
 * `!i64 take_int(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)` — Argument `i` as an `int`, from whichever of its three tiers holds it.
 * `!f64 take_float(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)` — Argument `i` as a `float`; an `int` in any tier is read as the nearest…
-* `!bool take_bool(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)`
+* `!bool take_bool(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)` — Argument `i` as a `bool`; any other type throws `TypeError`.
 * `!string8 take_string(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)` — Argument `i` as a `string8`: the engine's UTF-8 copy, borrowed until…
-* `void drop_string(^JSContext ctx, string8 s)`
+* `void drop_string(^JSContext ctx, string8 s)` — Gives back a string `take_string` or `read_string` borrowed from the engine.
 * `!char32 take_char32(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)` — Argument `i` as a `char32`: a string of exactly one code point, which is…
 * `!char16 take_char16(^JSContext ctx, ^JSValue argv, i32 i, cstring function, cstring param)` — Argument `i` as a `char16`: a string of exactly one UTF-16 code unit —…
 * `JSValue give_int(^JSContext ctx, i64 v)` — An `int`, in the smallest canonical tier that holds it.
-* `JSValue give_float(^JSContext ctx, f64 v)`
-* `JSValue give_bool(^JSContext ctx, bool v)`
+* `JSValue give_float(^JSContext ctx, f64 v)` — A `float`, as itself.
+* `JSValue give_bool(^JSContext ctx, bool v)` — A `bool`, as itself.
 * `JSValue give_string(^JSContext ctx, string8 s)` — A copy of `s`'s bytes, read as UTF-8: the Dado function's string may be…
 * `JSValue give_owned_string(^JSContext ctx, ref([]char8) s)` — A Dado function's new string, copied into the engine and then ended on the…
 * `JSValue give_char32(^JSContext ctx, char32 c)` — A character as a one-code-point string. A value that is no Unicode scalar…
@@ -284,13 +235,13 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 * `rawptr lend_script(^JSContext ctx, rawptr lend)` — A thunk lending Dado a script's structure for the call: `lend` goes on the…
 * `void unlend_script(^JSContext ctx, rawptr was)` — The call returned: a lend still waiting is taken off, and one settled is…
 * `rawptr lend_host(^JSContext ctx, rawptr lend)` — A run lending the script a Dado structure: as `lend_script`, on the engine…
-* `void unlend_host(^JSContext ctx, rawptr was)`
+* `void unlend_host(^JSContext ctx, rawptr was)` — The lend `lend_host` made is over: `was` is what it answered.
 * `void clear_exception(^JSContext ctx)` — Give back an error a fingerprint's reading left pending: a lend whose…
 * `JSValue lent_written(^JSContext ctx, cstring function, cstring param)` — What a thunk throws when a script's structure it lent Dado was written…
 * `i32 lent_changed(^JSContext ctx, cstring label, cstring structure)` — What a run says when a Dado structure it lent the script was written during…
 * `!i64 read_int(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — `v` as an `int`, wherever in an argument or an answer it is: `what` names…
-* `!f64 read_float(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)`
-* `!bool read_bool(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)`
+* `!f64 read_float(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — `v` as a `float`, as `read_int` finds it; an `int` in any tier is read as…
+* `!bool read_bool(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — `v` as a `bool`, as `read_int` finds it.
 * `!string8 read_string(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — `v` as a `string8`: the engine's UTF-8 copy, borrowed until `drop_string`;…
 * `!ref([]char8) read_owned_string(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — `v` as a new string a Dado host owns: a copy on the ambient allocator.
 * `!char32 read_char32(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — `v` as a `char32`: a string of exactly one code point.
@@ -298,23 +249,23 @@ crosses both ways exactly. `f64`, `bool` and strings cross as themselves.
 * `!i64 read_length(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth)` — How many elements the array `v` holds; anything but an array throws.
 * `!void read_exactly(^JSContext ctx, JSValue v, i64 n, cstring function, cstring what, ^i64 path, i32 depth)` — That `v` is an array of exactly `n` elements — a Dado `[N]T` or tuple takes…
 * `!JSValue element(^JSContext ctx, JSValue v, i64 i)` — Element `i` of the array `v`, held until `free_value` lets go of it.
-* `void free_value(^JSContext ctx, JSValue v)`
+* `void free_value(^JSContext ctx, JSValue v)` — A value the generated code built or read, released.
 * `!rawptr scratch(^JSContext ctx, u64 bytes)` — A block for the call, zeroed, on the engine's allocator; `unscratch` gives…
-* `void unscratch(^JSContext ctx, rawptr p, u64 bytes)`
+* `void unscratch(^JSContext ctx, rawptr p, u64 bytes)` — A block `scratch` gave, of `bytes` bytes, given back; nil is nothing.
 * `i32 out_of_memory(^JSContext ctx)` — What a reader answers when the ambient allocator refuses a block for an…
 * `JSValue new_array(^JSContext ctx)` — A new, empty array.
 * `!void put(^JSContext ctx, JSValue arr, i64 i, JSValue v)` — `arr[i] = v`, taking `v`. Either one already the exception marker — a…
 * `u64 mix(u64 h, u64 bits)` — A fingerprint of a value's bytes, for the lend lock: FNV-1a over 64-bit…
-* `u64 mix_float(u64 h, f64 v)`
-* `u64 mix_string(u64 h, string8 s)`
+* `u64 mix_float(u64 h, f64 v)` — `mix` over a `float`'s 64 bits.
+* `u64 mix_string(u64 h, string8 s)` — `mix` over a string's length and then each of its bytes.
 * `!^JSContext begin_run(rawptr s)` — The engine the handle holds, entered for a run of its instance, its sinks…
 * `!^JSContext begin_new(rawptr vm, cstring module)` — As `begin_run`, for `#script_new`: the VM's handle, entered with `module`
 * `void push_value(^JSContext ctx, JSValue v)` — The entered run's argument, built by a generated writer or a `give_`
 * `!void call_entered(rawptr s, cstring entry)` — The entered run's call: the method `entry` of the instance `s` holds, with…
 * `!rawptr construct_entered(^JSContext ctx, cstring module, cstring class)` — The entered construction: an instance of `class`, exported by the loaded…
 * `!i64 answer_int(^JSContext ctx)` — The entered run's scalar answer, as the entry's return type says.
-* `!f64 answer_float(^JSContext ctx)`
-* `!bool answer_bool(^JSContext ctx)`
+* `!f64 answer_float(^JSContext ctx)` — As `answer_int`, for a `float` answer.
+* `!bool answer_bool(^JSContext ctx)` — As `answer_int`, for a `bool` answer.
 * `!ref([]char8) answer_string(^JSContext ctx)` — A copy of the answer on the ambient allocator, as `run_string`'s.
 * `JSValue answer_of(^JSContext ctx)` — The entered run's answer, borrowed, for a generated reader.
 * `i32 answer_refused(^JSContext ctx, i32 code)` — The answer a generated reader refused: its error, pending, written to the…

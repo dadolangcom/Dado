@@ -6,9 +6,10 @@
 //     thread. A `send` that blocked would deadlock here — `cat` stops reading
 //     while its stdout is full — so this is the test that holds the
 //     non-blocking design, and it also counts that the pipe really did fill
-//     (`send` answered `WAITED` or a short count at least once).
-//   * **Exit status, a missing program, and a child killed by a signal** come
-//     back as three different answers.
+//     (`send` failed `WAITED` or answered a short count at least once).
+//   * **An exit code, a signal, and a missing program** come back as three
+//     different answers: `Exited`, `Signaled`, and `duplex` failing
+//     `NOT_FOUND`.
 //   * **A write to a child that has exited is `BROKE`, and this process is
 //     still here to say so** — `SIGPIPE` did not kill it.
 //   * **`close_input` is end-of-file**, and it still is with a second child
@@ -21,9 +22,65 @@
 // Every wait here has a deadline, so a regression fails rather than hangs.
 // The children are `cat`, `sleep` and `/bin/sh` running builtins, which both
 // supported platforms have.
+//
+// The `Pipe!` answers are read through `send_n`, `recv_n` and `recv_err_n` below,
+// which give the count, or -1 for `WAITED` and -2 for `BROKE`; and the endings
+// through `fin` and `halted`, as `(done, exited, status)` with a signal
+// negated.
 package proc
 
+import "core:os"
 import "core:time"
+
+private i64 send_n(^Duplex d, []char8 bytes, i32 timeout_ms):
+    try i64 n = send(d, bytes, timeout_ms) else why:
+        if why == Pipe.WAITED: return 0 - 1
+        return 0 - 2
+    return n
+
+private i64 recv_n(^Duplex d, []char8 into, i32 timeout_ms):
+    try i64 n = receive(d, into, timeout_ms) else why:
+        if why == Pipe.WAITED: return 0 - 1
+        return 0 - 2
+    return n
+
+private i64 recv_err_n(^Duplex d, []char8 into, i32 timeout_ms):
+    try i64 n = receive_errors(d, into, timeout_ms) else why:
+        if why == Pipe.WAITED: return 0 - 1
+        return 0 - 2
+    return n
+
+// `finish`'s answer as `(done, exited, status)`: not done while it runs, and
+// `(true, false, -1)` for `BROKE`.
+private (bool done, bool exited, i32 status) fin(^Duplex d, i32 timeout_ms):
+    try Ended e = finish(d, timeout_ms) else why:
+        if why == Pipe.WAITED: return (false, false, 0 - 1)
+        return (true, false, 0 - 1)
+    switch e:
+        case Exited x: return (true, true, x.code)
+        case Signaled s: return (true, false, 0 - s.signal)
+
+// `stop`'s answer as `(exited, status)`, `(false, -1)` for `BROKE`.
+private (bool exited, i32 status) halted(^Duplex d, i32 grace_ms):
+    try Ended e = stop(d, grace_ms) else:
+        return (false, 0 - 1)
+    switch e:
+        case Exited x: return (true, x.code)
+        case Signaled s: return (false, 0 - s.signal)
+
+// `duplex`, or a zero `Duplex` when it failed.
+private Duplex started_or_zero([]string8 argv, Errors errors):
+    try Duplex d = duplex(argv, errors) else:
+        Duplex zero
+        return zero
+    return d
+
+// The code `duplex` fails with, or `UNKNOWN` when it started.
+private os.Error refusal([]string8 argv, Errors errors):
+    try Duplex d = duplex(argv, errors) else why:
+        return why
+    _ = halted(&d, 0)
+    return os.Error.UNKNOWN
 
 // On Windows this file is empty: it runs `/bin/sh`, `cat` and signals, which
 // Windows does not have, and `windows_test.dado` holds the same claims there.
@@ -31,19 +88,16 @@ when #OS == #WINDOWS:
     i32 test():
         return 0
 else:
-    private foreign "errno.h":
-        const i32 ENOENT
-
-    // What `stdio_closed_parent` moves stdin aside and back with. Bound as `os`
+    // What `stdio_closed_parent` moves stdin aside and back with. Bound as `ux`
     // and not as `sys`: a binding's name is in scope only in a file that writes a
     // block under it — measured, `sys.close` here was ERR0408 until this file
     // declared a `sys` block of its own — and writing one just to reach the other
     // files' members would be a block that declares nothing it uses.
-    private foreign os "unistd.h" define "_POSIX_C_SOURCE=200809L":
+    private foreign ux "unistd.h" define "_POSIX_C_SOURCE=200809L":
         i32 dup2(i32 old, i32 new)
         i32 close(i32 fd)
 
-    private foreign os "fcntl.h" define "_POSIX_C_SOURCE=200809L":
+    private foreign ux "fcntl.h" define "_POSIX_C_SOURCE=200809L":
         const i32 F_DUPFD_CLOEXEC
         const i32 F_GETFD
         i32 fcntl(i32 fd, i32 cmd, ...)
@@ -51,7 +105,7 @@ else:
     private const i64 MIB = 1048576
 
     // A program that is not on anybody's `PATH`.
-    private const cstring MISSING = "dado-no-such-program-zqx98765"
+    private const string8 MISSING = "dado-no-such-program-zqx98765"
 
     i32 test():
         bool ok = true
@@ -72,11 +126,9 @@ else:
 
     private bool megabyte_round_trip():
         bool ok = true
-        [2]cstring argv
-        argv[0] = "cat"
-        argv[1] = "-"
-        Duplex d = duplex(argv[:])
-        if !#expect(started(d), "cat did not start, failure=", d.failure): return false
+        [2]string8 argv = ["cat", "-"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
+        if !#expect(started(d), "cat did not start"): return false
 
         ref []char8 payload = #make([]char8, MIB, #heap)
         if payload == nil: return false
@@ -91,26 +143,26 @@ else:
         i32 stalls = 0
         bool drained = false
         bool broke = false
-        f64 began = time.now()
-        for !drained && !broke && time.ms_since(began) < 20000:
+        time.Instant began = time.instant()
+        for !drained && !broke && time.as_milliseconds(time.elapsed(began)) < 20000:
             if sent < MIB:
-                i32 n = send(&d, payload[sent..<MIB], 0)
-                if n == BROKE: broke = true
-                if n == WAITED: stalls += 1
+                i64 n = send_n(&d, payload[sent..<MIB], 0)
+                if n == 0 - 2: broke = true
+                if n == 0 - 1: stalls += 1
                 if n > 0:
                     if i64(n) < MIB - sent: stalls += 1
                     sent += i64(n)
                     if sent == MIB: _ = close_input(&d)
-            i32 r = receive(&d, chunk[:], 5)
-            if r == DRAINED: drained = true
-            if r == BROKE: broke = true
+            i64 r = recv_n(&d, chunk[:], 5)
+            if r == 0: drained = true
+            if r == 0 - 2: broke = true
             if r > 0:
                 for k in 0..<r:
                     if got + i64(k) < MIB && chunk[k] != payload[got + i64(k)]: mismatches += 1
                 got += i64(r)
 
-        (bool done, bool exited, i32 status) = finish(&d, 2000)
-        release(&d)
+        (bool done, bool exited, i32 status) = fin(&d, 2000)
+        close_pipes(&d)
         ok = #expect(!broke, "the round trip broke") && ok
         ok = #expect(sent == MIB, "sent ", sent, " of ", MIB) && ok
         ok = #expect(got == MIB, "read back ", got, " of ", MIB) && ok
@@ -124,79 +176,70 @@ else:
 
     private bool statuses():
         bool ok = true
-        [3]cstring three
-        three[0] = "/bin/sh"
-        three[1] = "-c"
-        three[2] = "exit 3"
-        Duplex d = duplex(three[:])
+        [3]string8 three = ["/bin/sh", "-c", "exit 3"]
+        Duplex d = started_or_zero(three[:], Errors.Inherit)
         ok = #expect(started(d), "sh did not start") && ok
-        (bool done, bool exited, i32 status) = finish(&d, 2000)
+        (bool done, bool exited, i32 status) = fin(&d, 2000)
         ok = #expect(done && exited && status == 3, "exit 3 gave done=", done, " exited=", exited, " status=", status) && ok
         // Once reaped the answer is the record's, asked again without the kernel.
-        (bool again, bool exited2, i32 status2) = finished(&d)
+        (bool again, bool exited2, i32 status2) = fin(&d, 0)
         ok = #expect(again && exited2 && status2 == 3, "a second finished() changed its answer") && ok
-        release(&d)
+        close_pipes(&d)
 
         // `finished` before the child is done says so, and `terminate` is a
         // negated signal number with `exited` false.
-        [2]cstring nap
-        nap[0] = "sleep"
-        nap[1] = "30"
-        Duplex s = duplex(nap[:])
+        [2]string8 nap = ["sleep", "30"]
+        Duplex s = started_or_zero(nap[:], Errors.Inherit)
         ok = #expect(started(s), "sleep did not start") && ok
-        (bool early, _, _) = finished(&s)
+        (bool early, _, _) = fin(&s, 0)
         ok = #expect(!early, "sleep 30 finished at once") && ok
-        (bool timed, _, _) = finish(&s, 30)
+        (bool timed, _, _) = fin(&s, 30)
         ok = #expect(!timed, "a 30 ms finish() on sleep 30 said done") && ok
         ok = #expect(terminate(&s), "terminate refused a live child") && ok
-        (bool tdone, bool texited, i32 tstatus) = finish(&s, 2000)
+        (bool tdone, bool texited, i32 tstatus) = fin(&s, 2000)
         ok = #expect(tdone && !texited && tstatus == 0 - 15, "SIGTERM gave done=", tdone, " exited=", texited, " status=", tstatus) && ok
         // Reaped, so its pid may be anybody's now: no more signals.
         ok = #expect(!kill(&s), "kill signalled a reaped pid") && ok
         ok = #expect(!terminate(&s), "terminate signalled a reaped pid") && ok
-        release(&s)
+        close_pipes(&s)
 
         // `stop` on a child that ignores its stdin's end: grace, then SIGKILL.
-        Duplex k = duplex(nap[:])
-        f64 began = time.now()
-        (bool kexited, i32 kstatus) = stop(&k, 50)
-        i64 took = time.ms_since(began)
+        Duplex k = started_or_zero(nap[:], Errors.Inherit)
+        time.Instant began = time.instant()
+        (bool kexited, i32 kstatus) = halted(&k, 50)
+        i64 took = time.as_milliseconds(time.elapsed(began))
         ok = #expect(!kexited && kstatus == 0 - 9, "stop gave exited=", kexited, " status=", kstatus) && ok
         ok = #expect(took < 2000, "stop took ", took, " ms for a 50 ms grace") && ok
         return ok
 
     private bool missing_program():
         bool ok = true
-        [2]cstring argv
-        argv[0] = MISSING
-        argv[1] = "x"
-        Duplex d = duplex(argv[:])
+        [2]string8 argv = [MISSING, "x"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
         ok = #expect(!started(d), "a missing program reported as started") && ok
-        ok = #expect(d.failure == ENOENT, "a missing program failed with ", d.failure, ", not ENOENT") && ok
+        os.Error why = refusal(argv[:], Errors.Inherit)
+        ok = #expect(why == os.Error.NOT_FOUND, "a missing program failed with ", os.message(why), ", not NOT_FOUND") && ok
         [4]char8 bytes
-        ok = #expect(send(&d, bytes[:], 0) == BROKE, "send to a failed start was not BROKE") && ok
+        ok = #expect(send_n(&d, bytes[:], 0) == 0 - 2, "send to a failed start was not BROKE") && ok
         return ok
 
     // ── broken pipes ──────────────────────────────────────────────────────────
 
     private bool write_after_exit():
         bool ok = true
-        [3]cstring argv
-        argv[0] = "/bin/sh"
-        argv[1] = "-c"
-        argv[2] = "exit 0"
-        Duplex d = duplex(argv[:])
-        (bool done, _, _) = finish(&d, 2000)
+        [3]string8 argv = ["/bin/sh", "-c", "exit 0"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
+        (bool done, _, _) = fin(&d, 2000)
         ok = #expect(done, "sh -c 'exit 0' did not finish") && ok
         ok = #expect(ignoring_sigpipe(), "SIGPIPE was not set to ignored") && ok
 
         [64]char8 bytes
         // Reaching the line after `send` is the SIGPIPE half of the claim.
-        i32 n = send(&d, bytes[:], 100)
-        ok = #expect(n == BROKE, "a write to an exited child answered ", n) && ok
-        (i64 sent, i32 stopped) = send_all(&d, bytes[:], 100)
-        ok = #expect(sent == 0 && stopped == BROKE, "send_all to an exited child gave ", sent, ", ", stopped) && ok
-        release(&d)
+        i64 n = send_n(&d, bytes[:], 100)
+        ok = #expect(n == 0 - 2, "a write to an exited child answered ", n) && ok
+        try send_all(&d, bytes[:], 100) else why:
+            ok = #expect(why == Pipe.BROKE, "send_all to an exited child failed ", message(why)) && ok
+        close_pipes(&d)
         return ok
 
     // The ignore this package installs must not reach the child: a shell that
@@ -204,148 +247,138 @@ else:
     // inherited as ignored.
     private bool child_sigpipe_is_default():
         bool ok = true
-        [3]cstring argv
-        argv[0] = "/bin/sh"
-        argv[1] = "-c"
-        argv[2] = "kill -PIPE $$; echo alive"
-        Duplex d = duplex(argv[:])
+        [3]string8 argv = ["/bin/sh", "-c", "kill -PIPE $$; echo alive"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
         [64]char8 chunk
-        i32 total = 0
-        f64 began = time.now()
-        for time.ms_since(began) < 2000:
-            i32 r = receive(&d, chunk[:], 10)
-            if r == DRAINED || r == BROKE: break
+        i64 total = 0
+        time.Instant began = time.instant()
+        for time.as_milliseconds(time.elapsed(began)) < 2000:
+            i64 r = recv_n(&d, chunk[:], 10)
+            if r == 0 || r == 0 - 2: break
             if r > 0: total += r
-        (bool done, bool exited, i32 status) = finish(&d, 2000)
+        (bool done, bool exited, i32 status) = fin(&d, 2000)
         ok = #expect(total == 0, "the child survived its own SIGPIPE and wrote ", total, " bytes") && ok
         ok = #expect(done && !exited && status == 0 - 13, "SIGPIPE in the child gave exited=", exited, " status=", status) && ok
-        release(&d)
+        close_pipes(&d)
         return ok
 
     // ── end-of-file ───────────────────────────────────────────────────────────
 
     private bool eof_by_close_input():
         bool ok = true
-        [2]cstring argv
-        argv[0] = "cat"
-        argv[1] = "-"
-        Duplex d = duplex(argv[:])
+        [2]string8 argv = ["cat", "-"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
         [5]char8 hello
         hello[0] = char8(104)
         hello[1] = char8(101)
         hello[2] = char8(108)
         hello[3] = char8(108)
         hello[4] = char8(111)
-        (i64 sent, i32 stopped) = send_all(&d, hello[:], 1000)
-        ok = #expect(sent == 5 && stopped == 0, "send_all gave ", sent, ", ", stopped) && ok
+        try send_all(&d, hello[:], 1000) else why:
+            ok = #expect(false, "send_all failed ", message(why)) && ok
         ok = #expect(close_input(&d), "close_input did not close") && ok
         ok = #expect(!close_input(&d), "a second close_input claimed to close") && ok
-        ok = #expect(send(&d, hello[:], 0) == BROKE, "send after close_input was not BROKE") && ok
+        ok = #expect(send_n(&d, hello[:], 0) == 0 - 2, "send after close_input was not BROKE") && ok
 
         [16]char8 chunk
-        i32 total = 0
+        i64 total = 0
         bool drained = false
-        f64 began = time.now()
-        for !drained && time.ms_since(began) < 2000:
-            i32 r = receive(&d, chunk[total..<16], 10)
-            if r == DRAINED: drained = true
+        time.Instant began = time.instant()
+        for !drained && time.as_milliseconds(time.elapsed(began)) < 2000:
+            i64 r = recv_n(&d, chunk[total..<16], 10)
+            if r == 0: drained = true
             if r > 0: total += r
-            if r == BROKE: break
+            if r == 0 - 2: break
         ok = #expect(drained && total == 5, "cat gave back ", total, " bytes, drained=", drained) && ok
         ok = #expect(chunk[0] == hello[0] && chunk[4] == hello[4], "cat changed the bytes") && ok
         // End-of-file is sticky.
-        ok = #expect(receive(&d, chunk[:], 0) == DRAINED, "a second receive after the end was not DRAINED") && ok
-        (bool done, bool exited, i32 status) = finish(&d, 2000)
+        ok = #expect(recv_n(&d, chunk[:], 0) == 0, "a second receive after the end was not DRAINED") && ok
+        (bool done, bool exited, i32 status) = fin(&d, 2000)
         ok = #expect(done && exited && status == 0, "cat did not exit 0 on end-of-file") && ok
-        release(&d)
+        close_pipes(&d)
         return ok
 
     // The close-on-exec claim. `b` is started after `a`, so without the flag it
     // holds a copy of `a`'s stdin write end and `a` never sees end-of-file.
     private bool two_children():
         bool ok = true
-        [2]cstring argv
-        argv[0] = "cat"
-        argv[1] = "-"
-        Duplex a = duplex(argv[:])
-        Duplex b = duplex(argv[:])
+        [2]string8 argv = ["cat", "-"]
+        Duplex a = started_or_zero(argv[:], Errors.Inherit)
+        Duplex b = started_or_zero(argv[:], Errors.Inherit)
         ok = #expect(started(a) && started(b), "two cats did not start") && ok
         _ = close_input(&a)
-        (bool done, bool exited, i32 status) = finish(&a, 2000)
+        (bool done, bool exited, i32 status) = fin(&a, 2000)
         ok = #expect(done && exited && status == 0, "the first cat did not see end-of-file while the second lived: done=", done) && ok
-        (bool bdone, _, _) = finished(&b)
+        (bool bdone, _, _) = fin(&b, 0)
         ok = #expect(!bdone, "the second cat ended with the first") && ok
-        _ = stop(&a, 0)
-        (bool bexited, i32 bstatus) = stop(&b, 2000)
+        _ = halted(&a, 0)
+        (bool bexited, i32 bstatus) = halted(&b, 2000)
         ok = #expect(bexited && bstatus == 0, "the second cat did not end on stop: ", bstatus) && ok
         return ok
 
     // ── standard error ────────────────────────────────────────────────────────
 
-    private i32 read_all(^Duplex d, []char8 into, bool errors):
-        i32 total = 0
-        f64 began = time.now()
-        for time.ms_since(began) < 2000 && total < i32(#len(into)):
-            i32 r = 0
-            if errors: r = receive_errors(d, into[total..<#len(into)], 10)
-            else: r = receive(d, into[total..<#len(into)], 10)
-            if r == DRAINED || r == BROKE: break
+    private i64 read_all(^Duplex d, []char8 into, bool errors):
+        i64 total = 0
+        time.Instant began = time.instant()
+        for time.as_milliseconds(time.elapsed(began)) < 2000 && total < #len(into):
+            i64 r = 0
+            if errors: r = recv_err_n(d, into[total..<#len(into)], 10)
+            else: r = recv_n(d, into[total..<#len(into)], 10)
+            if r == 0 || r == 0 - 2: break
             if r > 0: total += r
         return total
 
     private bool error_modes():
         bool ok = true
-        [3]cstring argv
-        argv[0] = "/bin/sh"
-        argv[1] = "-c"
-        argv[2] = "printf out; printf err >&2"
+        [3]string8 argv = ["/bin/sh", "-c", "printf out; printf err >&2"]
         [16]char8 outb
         [16]char8 errb
 
-        Duplex p = duplex(argv[:], ERRORS_PIPE)
-        i32 po = read_all(&p, outb[:], false)
-        i32 pe = read_all(&p, errb[:], true)
+        Duplex p = started_or_zero(argv[:], Errors.Pipe)
+        i64 po = read_all(&p, outb[:], false)
+        i64 pe = read_all(&p, errb[:], true)
         ok = #expect(po == 3 && pe == 3, "ERRORS_PIPE split out=", po, " err=", pe) && ok
         ok = #expect(errb[0] == char8(101), "the stderr pipe did not carry 'err'") && ok
-        _ = stop(&p, 2000)
+        _ = halted(&p, 2000)
 
-        Duplex m = duplex(argv[:], ERRORS_MERGE)
-        i32 mo = read_all(&m, outb[:], false)
+        Duplex m = started_or_zero(argv[:], Errors.Merge)
+        i64 mo = read_all(&m, outb[:], false)
         ok = #expect(mo == 6, "ERRORS_MERGE carried ", mo, " bytes, not 6") && ok
-        ok = #expect(receive_errors(&m, errb[:], 0) == BROKE, "a merged child had a stderr pipe") && ok
-        _ = stop(&m, 2000)
+        ok = #expect(recv_err_n(&m, errb[:], 0) == 0 - 2, "a merged child had a stderr pipe") && ok
+        _ = halted(&m, 2000)
 
-        Duplex x = duplex(argv[:], ERRORS_DISCARD)
-        i32 xo = read_all(&x, outb[:], false)
+        Duplex x = started_or_zero(argv[:], Errors.Discard)
+        i64 xo = read_all(&x, outb[:], false)
         ok = #expect(xo == 3, "ERRORS_DISCARD carried ", xo, " bytes, not 3") && ok
-        (bool xexited, i32 xstatus) = stop(&x, 2000)
+        (bool xexited, i32 xstatus) = halted(&x, 2000)
         ok = #expect(xexited && xstatus == 0, "the discarding child failed: ", xstatus) && ok
 
-        Duplex bad = duplex(argv[:], 7)
-        ok = #expect(!started(bad) && bad.failure == 0 - 1, "an unknown errors mode was accepted") && ok
+        os.Error bad = refusal(argv[:], Errors(7))
+        ok = #expect(bad == os.Error.INVALID, "an unknown errors mode failed ", os.message(bad), ", not INVALID") && ok
         return ok
 
     // A parent with stdin closed gets pipe ends numbered 0 — the case
     // `above_stdio` exists for. Stdin is moved aside, closed, and put back.
     private bool stdio_closed_parent():
         bool ok = true
-        i32 saved = os.fcntl(0, os.F_DUPFD_CLOEXEC, 3)
+        i32 saved = ux.fcntl(0, ux.F_DUPFD_CLOEXEC, 3)
         if saved < 0: return #expect(false, "could not save stdin")
-        _ = os.close(0)
+        _ = ux.close(0)
 
-        [2]cstring argv
-        argv[0] = "cat"
-        argv[1] = "-"
-        Duplex d = duplex(argv[:])
+        [2]string8 argv = ["cat", "-"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
         [3]char8 abc
         abc[0] = char8(97)
         abc[1] = char8(98)
         abc[2] = char8(99)
-        (i64 sent, _) = send_all(&d, abc[:], 1000)
+        i64 sent = 3
+        try send_all(&d, abc[:], 1000) else:
+            sent = 0
         _ = close_input(&d)
         [8]char8 back
-        i32 got = read_all(&d, back[:], false)
-        (bool exited, i32 status) = stop(&d, 2000)
+        i64 got = read_all(&d, back[:], false)
+        (bool exited, i32 status) = halted(&d, 2000)
 
         // `above_stdio` itself, with 0 free: a descriptor made there is moved to
         // 3 or above and 0 is left closed, which is what keeps every end
@@ -353,13 +386,13 @@ else:
         // (glibc 2.29 and later clear close-on-exec on a `dup2` onto itself in
         // `posix_spawn`, so the scenario above passes here without the move; it
         // is for the others.)
-        i32 zero = os.fcntl(saved, os.F_DUPFD_CLOEXEC, 0)
+        i32 zero = ux.fcntl(saved, ux.F_DUPFD_CLOEXEC, 0)
         i32 moved = above_stdio(zero)
-        bool zero_free = os.fcntl(0, os.F_GETFD) < 0
-        _ = os.close(moved)
+        bool zero_free = ux.fcntl(0, ux.F_GETFD) < 0
+        _ = ux.close(moved)
 
-        _ = os.dup2(saved, 0)
-        _ = os.close(saved)
+        _ = ux.dup2(saved, 0)
+        _ = ux.close(saved)
         ok = #expect(zero == 0 && moved >= 3 && zero_free, "above_stdio: made ", zero, ", moved to ", moved, ", 0 free ", zero_free) && ok
         ok = #expect(started(d) && sent == 3 && got == 3, "with stdin closed: sent ", sent, ", got ", got) && ok
         ok = #expect(back[2] == char8(99), "with stdin closed the bytes changed") && ok
@@ -375,46 +408,40 @@ else:
         // The zero value, which must never touch descriptor 0 or pid 0.
         Duplex zero
         ok = #expect(!started(zero), "the zero Duplex is started") && ok
-        ok = #expect(send(&zero, buf[:], 0) == BROKE, "send on zero") && ok
-        ok = #expect(receive(&zero, buf[:], 0) == BROKE, "receive on zero") && ok
-        ok = #expect(receive_errors(&zero, buf[:], 0) == BROKE, "receive_errors on zero") && ok
+        ok = #expect(send_n(&zero, buf[:], 0) == 0 - 2, "send on zero") && ok
+        ok = #expect(recv_n(&zero, buf[:], 0) == 0 - 2, "receive on zero") && ok
+        ok = #expect(recv_err_n(&zero, buf[:], 0) == 0 - 2, "receive_errors on zero") && ok
         ok = #expect(!close_input(&zero), "close_input on zero") && ok
         ok = #expect(!terminate(&zero) && !kill(&zero), "a signal to the zero Duplex") && ok
-        (bool zd, _, i32 zs) = finished(&zero)
-        ok = #expect(!zd && zs == 0 - 1, "finished on zero") && ok
-        (bool zf, _, _) = finish(&zero, 0 - 1)
-        ok = #expect(!zf, "finish on zero") && ok
-        release(&zero)
-        (bool ze, i32 zst) = stop(&zero, 0)
+        try _ = finished(&zero) else zw:
+            ok = #expect(zw == Pipe.BROKE, "finished on zero failed ", message(zw)) && ok
+        try _ = finish(&zero, 0 - 1) else zf:
+            ok = #expect(zf == Pipe.BROKE, "finish on zero failed ", message(zf)) && ok
+        close_pipes(&zero)
+        (bool ze, i32 zst) = halted(&zero, 0)
         ok = #expect(!ze && zst == 0 - 1, "stop on zero") && ok
 
         // A nil pointer.
-        ok = #expect(send(nil, buf[:], 0) == BROKE, "send on nil") && ok
-        ok = #expect(receive(nil, buf[:], 0) == BROKE, "receive on nil") && ok
+        ok = #expect(send_n(nil, buf[:], 0) == 0 - 2, "send on nil") && ok
+        ok = #expect(recv_n(nil, buf[:], 0) == 0 - 2, "receive on nil") && ok
         ok = #expect(!close_input(nil) && !kill(nil), "close or kill on nil") && ok
-        release(nil)
+        close_pipes(nil)
 
         // A refused argv, and one that is empty.
-        [3]cstring holed
-        holed[0] = "cat"
-        holed[1] = nil
-        holed[2] = "x"
-        Duplex h = duplex(holed[:])
-        ok = #expect(!started(h) && h.failure == 0 - 1, "a nil inside argv was run") && ok
-        ok = #expect(duplex(holed[0..<0]).failure == 0 - 1, "an empty argv was run") && ok
+        [3]string8 holed = ["cat", "a\0b", "x"]
+        ok = #expect(refusal(holed[:], Errors.Inherit) == os.Error.INVALID, "a NUL inside an argument was run") && ok
+        ok = #expect(refusal(holed[0..<0], Errors.Inherit) == os.Error.INVALID, "an empty argv was run") && ok
 
         // Stopped, then used: every descriptor is -1 and the pid is reaped, so
         // nothing is closed or signalled twice.
-        [2]cstring argv
-        argv[0] = "cat"
-        argv[1] = "-"
-        Duplex d = duplex(argv[:])
-        _ = stop(&d, 2000)
+        [2]string8 argv = ["cat", "-"]
+        Duplex d = started_or_zero(argv[:], Errors.Inherit)
+        _ = halted(&d, 2000)
         ok = #expect(d.input == 0 - 1 && d.output == 0 - 1 && d.errors == 0 - 1, "stop left a descriptor open") && ok
-        ok = #expect(send(&d, buf[:], 0) == BROKE, "send after stop") && ok
-        ok = #expect(receive(&d, buf[:], 0) == BROKE, "receive after stop") && ok
+        ok = #expect(send_n(&d, buf[:], 0) == 0 - 2, "send after stop") && ok
+        ok = #expect(recv_n(&d, buf[:], 0) == 0 - 2, "receive after stop") && ok
         ok = #expect(!close_input(&d) && !kill(&d) && !terminate(&d), "a verb acted after stop") && ok
-        release(&d)
-        (bool done, bool exited, i32 status) = finished(&d)
+        close_pipes(&d)
+        (bool done, bool exited, i32 status) = fin(&d, 0)
         ok = #expect(done && exited && status == 0, "the stopped cat's answer changed: ", status) && ok
         return ok

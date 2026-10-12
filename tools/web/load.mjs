@@ -56,6 +56,19 @@
 // and the runtime refuses a `join` there with that reason; run `main` in a
 // worker to join.
 
+// **The host services** (`dado.arg_get`, `dado.env_*`, `dado.random_bytes`,
+// `dado.is_terminal`, `dado.host_name`, `dado.fs_*`): what the runtime's
+// `rt/web/host.c` wraps, the `dado/web.h` a `core:` package restates. Real
+// where the host offers it, else `UNSUPPORTED` (-1): under node all of them;
+// in a page the arguments and the environment come from the page's address
+// (`?dado-arg=…` repeated, `?dado-env=NAME=value` repeated), random bytes are
+// real, `is_terminal` is 0, and the host's name, the environment's writes and
+// the files are unsupported. A failure is one of the small set of codes
+// `SYS` lists, which `host.c` documents. A module whose `main` takes
+// `(argc, argv)` exports `dado_argv`, which builds the argv in its own memory
+// from `dado.arg_get`; this calls it and hands `main` the arguments —
+// `node load.mjs m.wasm -- a b` (argv[0] is the module's path).
+
 // ── DadoScript (a16-web) ──────────────────────────────────────────────────────────
 // A module that runs DadoScript scripts imports the `dados` host calls and
 // `dado.exit`, which `dados.mjs` supplies; its scripts are the modules the build
@@ -126,6 +139,350 @@ const HOST = {
     },
 };
 
+// ── the host services (`rt/web/host.c`) ────────────────────────────────────
+
+/** The error codes of the host services: `rt/web/host.c` documents them. */
+export const SYS = Object.freeze({
+    UNSUPPORTED: -1,
+    NOT_FOUND: -2,
+    EXISTS: -3,
+    DENIED: -4,
+    NOT_DIR: -5,
+    IS_DIR: -6,
+    NOT_EMPTY: -7,
+    BAD_FD: -8,
+    INVALID: -9,
+    NO_SPACE: -10,
+    IO: -11,
+    TOO_MANY: -12,
+});
+
+/** The code a node error is answered with. */
+function sysCode(e) {
+    switch (e?.code) {
+        case "ENOENT":
+            return SYS.NOT_FOUND;
+        case "EEXIST":
+            return SYS.EXISTS;
+        case "EACCES":
+        case "EPERM":
+        case "EROFS":
+            return SYS.DENIED;
+        case "ENOTDIR":
+            return SYS.NOT_DIR;
+        case "EISDIR":
+            return SYS.IS_DIR;
+        case "ENOTEMPTY":
+            return SYS.NOT_EMPTY;
+        case "EBADF":
+            return SYS.BAD_FD;
+        case "EINVAL":
+        case "ENAMETOOLONG":
+        case "ELOOP":
+        case "ESPIPE":
+        case "ERR_INVALID_ARG_TYPE":
+        case "ERR_INVALID_ARG_VALUE":
+        case "ERR_OUT_OF_RANGE":
+            return SYS.INVALID;
+        case "ENOSPC":
+        case "EDQUOT":
+            return SYS.NO_SPACE;
+        case "EMFILE":
+        case "ENFILE":
+            return SYS.TOO_MANY;
+        case "ERR_WORKER_UNSUPPORTED_OPERATION":
+            return SYS.UNSUPPORTED;
+        default:
+            return e instanceof RangeError || e instanceof TypeError ? SYS.INVALID : SYS.IO;
+    }
+}
+
+/** A view of `len` bytes of the module's memory at `ptr`. */
+function bytesAt(ctx, ptr, len) {
+    return new Uint8Array(ctx.memory().buffer, ptr >>> 0, len >>> 0);
+}
+
+/** `len` bytes at `ptr`, copied out (a shared memory's view cannot be decoded). */
+function copyAt(ctx, ptr, len) {
+    return bytesAt(ctx, ptr, len).slice();
+}
+
+const utf8Out = new TextEncoder();
+const utf8In = new TextDecoder();
+
+/** Text at `(ptr, len)`, decoded as UTF-8. */
+function textAt(ctx, ptr, len) {
+    return utf8In.decode(copyAt(ctx, ptr, len));
+}
+
+/** A path at `(ptr, len)`: its bytes, as node takes a path that may not be UTF-8. */
+function pathAt(ctx, ptr, len) {
+    return Buffer.from(copyAt(ctx, ptr, len));
+}
+
+/** Write `bytes` (a Uint8Array, or text as UTF-8) into `(buf, cap)`: at most
+ * `cap` bytes, answering the whole length. */
+function give(ctx, bytes, buf, cap) {
+    const b = typeof bytes === "string" ? utf8Out.encode(bytes) : bytes;
+    const n = Math.min(b.length, cap >>> 0);
+    if (n > 0) {
+        bytesAt(ctx, buf, n).set(b.subarray(0, n));
+    }
+    return b.length;
+}
+
+/** Entries, each followed by a NUL byte, as one run of bytes. */
+function nulList(entries) {
+    const parts = entries.map((e) => (typeof e === "string" ? utf8Out.encode(e) : e));
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length + 1, 0));
+    let at = 0;
+    for (const p of parts) {
+        out.set(p, at);
+        at += p.length + 1;
+    }
+    return out;
+}
+
+/** A host call answering a failure's code rather than throwing. */
+const sys = (f) => (...args) => {
+    try {
+        return f(...args);
+    } catch (e) {
+        return sysCode(e);
+    }
+};
+
+/** A node-only host call: unsupported anywhere else. */
+const nodeOnly = (f) => (NODE ? sys(f) : () => SYS.UNSUPPORTED);
+
+/** Whether `name` can name an environment variable. */
+const envName = (name) => name !== "" && !name.includes("=") && !name.includes("\0");
+
+/** Sleep `ms` on this thread (node may wait on every thread). */
+function nap(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Node's positional read or write, at `pos` (-1: the descriptor's own
+ * position), falling back to its own position where it cannot seek, and
+ * waiting out a descriptor that is not ready (a non-blocking standard input). */
+function moveBytes(op, fd, view, pos) {
+    let at = pos < 0n ? null : Number(pos);
+    for (;;) {
+        try {
+            return op(fd, view, 0, view.length, at);
+        } catch (e) {
+            if (e.code === "ESPIPE" && at !== null) {
+                at = null;
+            } else if (e.code === "EAGAIN") {
+                nap(1);
+            } else {
+                throw e;
+            }
+        }
+    }
+}
+
+/** Write node's (bigint) stat into the 24-byte record at `out`. */
+function writeStat(ctx, out, st) {
+    const view = new DataView(ctx.memory().buffer, out >>> 0, 24);
+    view.setBigInt64(0, BigInt(st.size), true);
+    view.setBigInt64(8, BigInt(st.mtimeNs), true);
+    const kind = st.isFile() ? 1 : st.isDirectory() ? 2 : st.isSymbolicLink() ? 3 : 0;
+    view.setInt32(16, kind, true);
+    view.setInt32(20, Number(BigInt(st.mode) & 0o7777n), true);
+    return 0;
+}
+
+/** Node's open flags for the runtime's (`host.c`). */
+function openFlags(flags) {
+    const c = nodeFs.constants;
+    const writes = (flags & 2) !== 0 || (flags & 4) !== 0;
+    let f = writes ? ((flags & 1) !== 0 ? c.O_RDWR : c.O_WRONLY) : c.O_RDONLY;
+    if (flags & 4) f |= c.O_APPEND;
+    if (flags & 8) f |= c.O_CREAT;
+    if (flags & 16) f |= c.O_TRUNC;
+    if (flags & 32) f |= c.O_EXCL;
+    return f;
+}
+
+Object.assign(HOST, {
+    "dado.arg_count": {
+        signature: "()->(i32)",
+        make: (ctx) => () => ctx.args.length,
+    },
+    "dado.arg_get": {
+        signature: "(i32,i32,i32)->(i32)",
+        make: (ctx) => (index, buf, cap) =>
+            index >= 0 && index < ctx.args.length ? give(ctx, ctx.args[index], buf, cap) : SYS.INVALID,
+    },
+    "dado.env_get": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            sys((name, len, buf, cap) => {
+                const key = textAt(ctx, name, len);
+                const value = ctx.env === null ? process.env[key] : ctx.env.get(key);
+                return value === undefined ? SYS.NOT_FOUND : give(ctx, value, buf, cap);
+            }),
+    },
+    "dado.env_set": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            sys((name, len, value, vlen) => {
+                if (ctx.env !== null) return SYS.UNSUPPORTED;
+                const key = textAt(ctx, name, len);
+                const text = textAt(ctx, value, vlen);
+                if (!envName(key) || text.includes("\0")) return SYS.INVALID;
+                process.env[key] = text;
+                return 0;
+            }),
+    },
+    "dado.env_unset": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) =>
+            sys((name, len) => {
+                if (ctx.env !== null) return SYS.UNSUPPORTED;
+                const key = textAt(ctx, name, len);
+                if (!envName(key)) return SYS.INVALID;
+                delete process.env[key];
+                return 0;
+            }),
+    },
+    "dado.env_list": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) =>
+            sys((buf, cap) => {
+                const pairs = ctx.env === null ? Object.entries(process.env) : [...ctx.env];
+                return give(ctx, nulList(pairs.map(([k, v]) => `${k}=${v}`)), buf, cap);
+            }),
+    },
+    "dado.random_bytes": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) =>
+            sys((buf, len) => {
+                // `getRandomValues` takes at most 65536 bytes, and no view of
+                // a shared memory: fill a private block and copy it in.
+                const block = new Uint8Array(Math.min(len >>> 0, 65536));
+                for (let at = 0; at < len >>> 0; at += block.length) {
+                    const n = Math.min(block.length, (len >>> 0) - at);
+                    const part = block.subarray(0, n);
+                    crypto.getRandomValues(part);
+                    bytesAt(ctx, (buf >>> 0) + at, n).set(part);
+                }
+                return 0;
+            }),
+    },
+    "dado.is_terminal": {
+        signature: "(i32)->(i32)",
+        make: () => (fd) => (NODE && fd >= 0 && nodeTty.isatty(fd) ? 1 : 0),
+    },
+    "dado.host_name": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((buf, cap) => give(ctx, nodeOs.hostname(), buf, cap)),
+    },
+    "dado.fs_open": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            nodeOnly((path, len, flags, mode) =>
+                nodeFs.openSync(pathAt(ctx, path, len), openFlags(flags), mode === 0 ? 0o666 : mode),
+            ),
+    },
+    "dado.fs_read": {
+        signature: "(i32,i32,i32,i64)->(i32)",
+        make: (ctx) =>
+            nodeOnly((fd, buf, len, pos) => moveBytes(nodeFs.readSync, fd, bytesAt(ctx, buf, len), pos)),
+    },
+    "dado.fs_write": {
+        signature: "(i32,i32,i32,i64)->(i32)",
+        make: (ctx) =>
+            nodeOnly((fd, buf, len, pos) => {
+                const view = bytesAt(ctx, buf, len);
+                let done = 0;
+                while (done < view.length) {
+                    const at = pos < 0n ? -1n : pos + BigInt(done);
+                    done += moveBytes(nodeFs.writeSync, fd, view.subarray(done), at);
+                }
+                return done;
+            }),
+    },
+    "dado.fs_close": {
+        signature: "(i32)->(i32)",
+        make: () => nodeOnly((fd) => (nodeFs.closeSync(fd), 0)),
+    },
+    "dado.fs_sync": {
+        signature: "(i32)->(i32)",
+        make: () => nodeOnly((fd) => (nodeFs.fsyncSync(fd), 0)),
+    },
+    "dado.fs_truncate": {
+        signature: "(i32,i64)->(i32)",
+        make: () => nodeOnly((fd, size) => (nodeFs.ftruncateSync(fd, Number(size)), 0)),
+    },
+    "dado.fs_stat": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            nodeOnly((path, len, follow, out) => {
+                const p = pathAt(ctx, path, len);
+                const st = follow ? nodeFs.statSync(p, { bigint: true }) : nodeFs.lstatSync(p, { bigint: true });
+                return writeStat(ctx, out, st);
+            }),
+    },
+    "dado.fs_fstat": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((fd, out) => writeStat(ctx, out, nodeFs.fstatSync(fd, { bigint: true }))),
+    },
+    "dado.fs_exists": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((path, len) => (nodeFs.existsSync(pathAt(ctx, path, len)) ? 1 : 0)),
+    },
+    "dado.fs_mkdir": {
+        signature: "(i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            nodeOnly((path, len, mode) => (nodeFs.mkdirSync(pathAt(ctx, path, len), { mode: mode === 0 ? 0o777 : mode }), 0)),
+    },
+    "dado.fs_rmdir": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((path, len) => (nodeFs.rmdirSync(pathAt(ctx, path, len)), 0)),
+    },
+    "dado.fs_unlink": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((path, len) => (nodeFs.unlinkSync(pathAt(ctx, path, len)), 0)),
+    },
+    "dado.fs_rename": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            nodeOnly((from, flen, to, tlen) => (nodeFs.renameSync(pathAt(ctx, from, flen), pathAt(ctx, to, tlen)), 0)),
+    },
+    "dado.fs_list": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            nodeOnly((path, len, buf, cap) =>
+                give(ctx, nulList(nodeFs.readdirSync(pathAt(ctx, path, len), { encoding: "buffer" })), buf, cap),
+            ),
+    },
+    "dado.fs_cwd": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((buf, cap) => give(ctx, process.cwd(), buf, cap)),
+    },
+    "dado.fs_chdir": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((path, len) => (process.chdir(textAt(ctx, path, len)), 0)),
+    },
+    "dado.fs_temp_dir": {
+        signature: "(i32,i32)->(i32)",
+        make: (ctx) => nodeOnly((buf, cap) => give(ctx, nodeOs.tmpdir(), buf, cap)),
+    },
+    "dado.fs_realpath": {
+        signature: "(i32,i32,i32,i32)->(i32)",
+        make: (ctx) =>
+            nodeOnly((path, len, buf, cap) =>
+                give(ctx, nodeFs.realpathSync(pathAt(ctx, path, len), { encoding: "buffer" }), buf, cap),
+            ),
+    },
+});
+
+/** The export that builds `main(argc, argv)`'s argv in the module's memory. */
+export const ARGV_EXPORT = "dado_argv";
+
 // DadoScript: the scripts' host calls join the table.
 Object.assign(HOST, DADOS_HOST);
 
@@ -147,6 +504,11 @@ if (typeof navigator !== "undefined" && navigator.hardwareConcurrency) {
 
 /** Whether this code runs on node (else it is a page, or a page's worker). */
 const NODE = typeof process !== "undefined" && process.versions?.node !== undefined;
+
+/** Node's file system, operating system and terminal modules, where they exist. */
+const nodeFs = NODE ? await import("node:fs") : null;
+const nodeOs = NODE ? await import("node:os") : null;
+const nodeTty = NODE ? await import("node:tty") : null;
 
 /**
  * The limits the module declares for its imported memory, read from its
@@ -369,6 +731,9 @@ export function imports(module, manifest, ctx) {
  * `options.manifest` is the `--emit=build` text; `options.hashSeed` pins the
  * hash seed (else host entropy); `options.out(fd, bytes)` receives output
  * (default: node's stdout/stderr, or the console on a page).
+ * `options.args` is the program's arguments, argv[0] first (default
+ * `["main"]`); `options.env` a `Map` the environment is read from, which
+ * makes it read-only (default: node's `process.env`, or an empty one off node).
  * `options.override(object, registry)`, a bench's only (the boundary
  * baseline's bare import, `toys-lab/baseline/`), may replace an import in the
  * import object before the module is instantiated; `registry` is the
@@ -385,11 +750,16 @@ export async function run(bytes, options = {}) {
     }
     const module = await WebAssembly.compile(bytes);
     const seed = options.hashSeed ?? null;
+    const args = (options.args ?? ["main"]).map(String);
+    const env = options.env !== undefined ? new Map(options.env) : NODE ? null : new Map();
     const ctx = {
         memory: () => memory,
         out,
         seed,
-        spawn: (slot, arg) => spawnWorker({ module, memory, manifest, seed, slot, arg, dados: ctx.dadosThread }), // STOP
+        args,
+        env,
+        spawn: (slot, arg) =>
+            spawnWorker({ module, memory, manifest, seed, slot, arg, args, env, dados: ctx.dadosThread }), // STOP
         canWait: canWaitHere(),
     };
     // DadoScript: a module that runs scripts gets a session over their registry —
@@ -420,14 +790,40 @@ export async function run(bytes, options = {}) {
             instance.exports[FLUSH_EXPORT]();
         }
     };
+    // The stack's top before `main` runs: after a stack overflow the
+    // pointer is left out of bounds, and the flush would trap too, so it is
+    // put back here first (DI-0302). A module linked without the export
+    // (an older build) keeps the old answer: what was buffered is lost.
+    const stackPointer = instance.exports.__stack_pointer;
+    const stackTop = stackPointer instanceof WebAssembly.Global ? stackPointer.value : null;
     let status;
     try {
-        // `main(void)`, or `main(argc, argv)` with no arguments: a web program
-        // has no command line.
-        status = main.length === 0 ? main() : main(0, 0);
+        // `main(void)`, or `main(argc, argv)` with the host's arguments, the
+        // argv built in the module's memory by its `dado_argv`.
+        if (main.length === 0) {
+            status = main();
+        } else {
+            const build = instance.exports[ARGV_EXPORT];
+            const argv = typeof build === "function" ? build(args.length) : 0;
+            status = argv === 0 ? main(0, 0) : main(args.length, argv);
+        }
     } catch (e) {
         if (e instanceof WebAssembly.RuntimeError) {
-            flush();
+            // A stack that overflowed leaves `__stack_pointer` out of bounds:
+            // it is put back to the top, so the flush has a stack to run on.
+            // Should the flush trap all the same, what it held is lost, and
+            // the trap is still the program's end.
+            if (stackTop !== null) {
+                stackPointer.value = stackTop;
+            }
+            try {
+                flush();
+            } catch (again) {
+                if (!(again instanceof WebAssembly.RuntimeError)) {
+                    throw again;
+                }
+            }
+            explainTrap(e, out);
             return TRAP_STATUS;
         }
         // DadoScript: the runtime ended the program with a status (`dado.exit`).
@@ -439,6 +835,23 @@ export async function run(bytes, options = {}) {
     }
     flush();
     return (status ?? 0) & 0xff;
+}
+
+/**
+ * **A trap the runtime did not report, said on fd 2.** The runtime's own
+ * (`#panic`, a failed `#assert`, a bound) write their report and then execute
+ * `unreachable`, so that one is silent here; any other (an access out of
+ * bounds, which is what a stack overflow is with the stack first, DI-0302)
+ * would otherwise end the program with 134 and not a word.
+ */
+function explainTrap(e, out) {
+    if (/unreachable/i.test(e.message)) {
+        return;
+    }
+    const why = /out of bounds/i.test(e.message)
+        ? ": most often the stack overflowing, a recursion too deep for it"
+        : "";
+    out(2, new TextEncoder().encode(`dado: the module trapped (${e.message})${why}\n`));
 }
 
 /** DadoScript: the scripts' `registry.js`, imported from `url`. */
@@ -510,8 +923,10 @@ function spawnWorker(thread) {
     }
     try {
         if (NODE) {
+            // Every thread reads and writes the one environment, as natively.
             const worker = new nodeWorkerThreads.Worker(new URL(import.meta.url), {
                 workerData: { dadoThread: thread },
+                env: nodeWorkerThreads.SHARE_ENV,
             });
             // The program ends when `main` returns, as a native one does; a
             // worker still running does not keep it alive.
@@ -537,6 +952,8 @@ const nodeWorkerThreads = NODE ? await import("node:worker_threads") : null;
  */
 async function runThread(thread) {
     const { module, memory, manifest, seed, slot, arg, dados } = thread;
+    const args = thread.args ?? [];
+    const env = thread.env ?? null;
     let out;
     if (NODE) {
         const fs = await import("node:fs");
@@ -548,7 +965,9 @@ async function runThread(thread) {
         memory: () => memory,
         out,
         seed,
-        spawn: (s, a) => spawnWorker({ module, memory, manifest, seed, slot: s, arg: a, dados }), // STOP
+        args,
+        env,
+        spawn: (s, a) => spawnWorker({ module, memory, manifest, seed, slot: s, arg: a, args, env, dados }), // STOP
         canWait: true,
     };
     if (dados) ctx.dados = await workerSession(dados); // STOP
@@ -617,17 +1036,21 @@ function defaultOut(decoder) {
 async function main(argv) {
     let wasm = null;
     let build = null;
+    let rest = [];
     for (let i = 0; i < argv.length; i++) {
-        if (argv[i] === "--build") {
+        if (argv[i] === "--") {
+            rest = argv.slice(i + 1);
+            break;
+        } else if (argv[i] === "--build") {
             build = argv[++i];
         } else if (wasm === null) {
             wasm = argv[i];
         } else {
-            throw new LoaderError(`usage: node load.mjs <module.wasm> [--build <manifest>]`);
+            throw new LoaderError(`usage: node load.mjs <module.wasm> [--build <manifest>] [-- <argument>...]`);
         }
     }
     if (wasm === null) {
-        throw new LoaderError(`usage: node load.mjs <module.wasm> [--build <manifest>]`);
+        throw new LoaderError(`usage: node load.mjs <module.wasm> [--build <manifest>] [-- <argument>...]`);
     }
     const fs = await import("node:fs");
     build ??= `${wasm}.build`;
@@ -660,6 +1083,7 @@ async function main(argv) {
         hashSeed: seed === undefined || seed === "" ? null : BigInt(seed),
         scripts,
         registry,
+        args: [wasm, ...rest],
     });
 }
 
@@ -706,7 +1130,10 @@ if (threadData?.dadoThread) {
 // is written into `#dado-status` (made when absent), set as `data-dado-status`
 // on `<html>` and as `window.dadoPage.status`, and announced with a `dado-exit`
 // event; `window.dadoPage.stdout` and `.stderr` hold what was written. A
-// `?dado-seed=N` in the page's address pins the hash seed.
+// `?dado-seed=N` in the page's address pins the hash seed. **Arguments and
+// environment**: each `?dado-arg=…` in the address is an argument, after
+// argv[0], the module's path; each `?dado-env=NAME=value` a variable of the
+// program's environment, which it can read and not write.
 //
 // **A threaded page** must be cross-origin isolated; when it is not, the
 // loader runs nothing and says which header is missing. It runs `main` in a
@@ -773,6 +1200,8 @@ if (pageChannel() !== null) {
             const status = await run(job.bytes, {
                 manifest: job.manifest,
                 hashSeed: job.hashSeed,
+                args: job.args,
+                env: job.env,
                 out: pageOut(),
                 ...pageScripts(job.manifest, job.scripts),
             });
@@ -792,6 +1221,19 @@ function pageScripts(manifest, scripts) {
         return {};
     }
     return scripts === undefined ? { registry: NO_SCRIPTS } : { scripts };
+}
+
+/** The page's environment: each `?dado-env=NAME=value`, as `[name, value]`
+ * pairs (a later one of a name wins). */
+function pageEnv(query) {
+    const env = new Map();
+    for (const pair of query.getAll("dado-env")) {
+        const at = pair.indexOf("=");
+        if (at > 0) {
+            env.set(pair.slice(0, at), pair.slice(at + 1));
+        }
+    }
+    return [...env];
 }
 
 /** Whether a manifest is a threaded module's: it imports its memory. */
@@ -937,14 +1379,17 @@ export async function runPage() {
             fetchOk(manifestUrl, "build manifest").then((r) => r.text()),
             fetchOk(moduleUrl, "module").then((r) => r.arrayBuffer()),
         ]);
-        const seed = new URLSearchParams(location.search).get("dado-seed");
+        const query = new URLSearchParams(location.search);
+        const seed = query.get("dado-seed");
         const hashSeed = seed === null || seed === "" ? null : BigInt(seed);
+        const args = [script.dataset.dadoModule, ...query.getAll("dado-arg")];
+        const env = pageEnv(query);
         // The registry of the program's scripts, by URL: `dadoc --page` names
         // it on the tag when the build wrote scripts.
         const scripts =
             script.dataset.dadoScripts === undefined ? undefined : new URL(script.dataset.dadoScripts, here).href;
         if (!threadedManifest(manifest)) {
-            finish(await run(bytes, { manifest, hashSeed, out, ...pageScripts(manifest, scripts) }));
+            finish(await run(bytes, { manifest, hashSeed, args, env, out, ...pageScripts(manifest, scripts) }));
             return settled;
         }
         if (!globalThis.crossOriginIsolated) {
@@ -994,7 +1439,7 @@ export async function runPage() {
             workers.push(worker);
             worker.postMessage(message, message.dadoMain ? [message.dadoMain.bytes] : []);
         };
-        start({ dadoMain: { bytes, manifest, hashSeed, scripts } }, true);
+        start({ dadoMain: { bytes, manifest, hashSeed, scripts, args, env } }, true);
         settled.then(() => channel.close());
     } catch (e) {
         finish(LOADER_STATUS, e instanceof LoaderError ? e.message : String(e?.stack ?? e));

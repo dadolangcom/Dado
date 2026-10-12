@@ -101,8 +101,9 @@ i32 clean():
 // directory (so a path through a symlink stays the path the person used),
 // else the system's answer.
 string8 working_dir():
-    string8 here = strings.borrow_from_cstring(fs.cwd())
-    ref []char8 own = #format(here)
+    try ref []char8 own = fs.current_dir() else why:
+        die(txt(#format("cannot read the working directory: ", os.message(why))))
+        quit 1
     string8 real_here = real(txt(own))
     (string8 pwd, bool set) = env("PWD")
     if set && path.is_abs(pwd) && real(pwd) == real_here:
@@ -110,11 +111,9 @@ string8 working_dir():
     return txt(own)
 
 private string8 real(string8 p):
-    ref []char8 c = strings.clone_to_cstring(p, #default)
-    ref []char8 out = #make([]char8, 32768)
-    i64 n = fs.real_path(cstring(c), out[:])
-    if n < 0: return p
-    return string8(cstring(rawptr(&out[0])))
+    try ref []char8 out = fs.canonical(p) else:
+        return p
+    return txt(out)
 
 // `p` made absolute against the working directory, as typed: no symlink
 // followed and nothing cleaned, since it is the person's own name for it.
@@ -324,8 +323,8 @@ private i32 check(^Plan p, ^Options o):
 bool is_library(string8 pkg):
     if !is_dir(pkg): return library_named(pkg)
     string8 dir = clean_path(pkg)
-    fs.Listing l = fs.walk(dir, #default)
-    defer fs.release(l)
+    fs.Listing l = fs.walk(dir)
+    defer l.destroy()
     for e in l.entries:
         if !e.is_dir && strings.ends_with(e.path, ".dado") && clean_path(dir_of(e.path)) == dir:
             string8 f = e.path
@@ -377,7 +376,7 @@ void set_manifest_package(bool on):
 private void write_manifest_outputs(^Plan p, ^Options o):
     if #len(o.manifest) == 0: return
     string8 json = txt(#format(p.build_dir, "/", p.stem, ".manifest.json"))
-    _ = fs.make_dirs(dir_of(json), #default)
+    try fs.make_dirs(dir_of(json)) else: pass
     Command c = command(p.dadoc)
     add(&c, txt(#format("--collections=", p.collections)))
     add_all(&c, p.imports[:])
@@ -424,8 +423,7 @@ private void write_manifest_outputs(^Plan p, ^Options o):
             x = command(node)
             add(&x, script)
         else:
-            ref []char8 sc = strings.clone_to_cstring(script, #default)
-            if !fs.executable(cstring(sc)):
+            if !fs.is_executable(script):
                 die(txt(#format("the manifest extension `", script, "` is not executable: chmod +x it, or write it as a .mjs file node runs")))
             x = command(script)
         if verbose():
@@ -599,7 +597,7 @@ private i32 build(^Plan p, ^Options o):
     else:
         c_file = txt(#format(p.build_dir, "/", p.stem, ".c"))
         out = txt(#format(p.build_dir, "/", p.stem))
-    _ = fs.make_dirs(dir_of(c_file), #default)
+    try fs.make_dirs(dir_of(c_file)) else: pass
 
     say(txt(#format("dadoc  ", o.pkg)))
     // The transpile's own order: `--release` before the shader, the
@@ -617,9 +615,12 @@ private i32 build(^Plan p, ^Options o):
     if #len(g_html_flag) > 0: add(&t, g_html_flag)
     if o.line_directives: add(&t, "--line-directives")
     add_all(&t, p.prefix_map[:])
-    // On the web, the scripts' directory beside the module, emptied first,
-    // and this compile's manifest, which alone lists the files it wrote.
-    string8 scripts_build = txt(#format(c_file, ".scripts.build"))
+    // **The build manifest from this one compile** (DI-0380): what the
+    // program needs beyond its C, read back below, as `dado test` does; a
+    // second `dadoc --emit=build` run was the whole front end again. On the
+    // web, also the scripts' directory beside the module, emptied first.
+    string8 manifest_file = txt(#format(c_file, ".build"))
+    add(&t, txt(#format("--build-manifest=", manifest_file)))
     if web:
         string8 scripts_dir = txt(#format(p.build_dir, "/", p.stem, ".scripts"))
         if o.out_given:
@@ -628,37 +629,32 @@ private i32 build(^Plan p, ^Options o):
             scripts_dir = txt(#format(scripts_dir, ".scripts"))
         remove_tree_quietly(scripts_dir)
         add(&t, txt(#format("--scripts-out=", scripts_dir)))
-        add(&t, txt(#format("--build-manifest=", scripts_build)))
-    string8 tmp_c = txt(#format(c_file, ".tmp"))
-    add(&t, "-o")
-    add(&t, tmp_c)
-    add(&t, p.pkg_abs)
-    if run(t) != 0:
-        if exists(tmp_c):
-            remove_quietly(tmp_c)
-        die("transpiling failed. Nothing was written.")
-    try fs.rename(tmp_c, c_file) else code:
-        die(txt(#format("cannot move ", tmp_c, " to ", c_file, ": ", os.message(code))))
-        return 1
-    note(txt(#format("       -> ", c_file)))
+    // **A dev build's many-file form** (CP-13 steps 3 and 4): beside the
+    // one-file C, the bodies as units of a package or so each (about 512 KiB
+    // of C; `DADO_UNIT_BYTES` to dadoc sets it) and a runtime file, which the
+    // compile below makes objects of in parallel, each at most once for what
+    // it holds (`unit_objects`). `--release` and `--one-file` are one file.
+    string8 units_dir = ""
+    if !o.release && !o.one_file:
+        units_dir = txt(#format(c_file[0..<#len(c_file) - 2], ".units"))
+    Command split = command_of(t.words[:])
+    if #len(units_dir) > 0: add(&split, txt(#format("--split-out=", units_dir)))
+    transpile(split, c_file, manifest_file, p.pkg_abs)
 
-    // What the program needs beyond its own C, from the compiler.
-    Command mc = dadoc_command(p, o, true, true)
-    add(&mc, "--emit=build")
-    add(&mc, p.pkg_abs)
-    Captured mr = capture(mc, false)
-    string8 manifest_text = ""
-    if mr.started && mr.status == 0: manifest_text = txt(mr.out)
-    if web:
-        strings.Builder joined = strings.builder(#len(manifest_text) + 256)
-        _ = strings.append(&joined, strings.trim_right(manifest_text))
-        string8 st = read_or_empty(scripts_build)
-        remove_quietly(scripts_build)
-        for l in lines_of(st):
-            if strings.starts_with(l, "js-module "):
-                _ = strings.append_char(&joined, '\n')
-                _ = strings.append(&joined, l)
-        manifest_text = txt(strings.finish(&joined))
+    string8 manifest_text = read_or_empty(manifest_file)
+    remove_quietly(manifest_file)
+    // A freestanding build is one object for the person's own linker, so its
+    // C is the one-file text a build without the split writes (`private`
+    // `static`, names counted, not hashed): the target was known only now,
+    // so `dadoc` runs again, without `--split-out`.
+    (Manifest first, bool _, string8 _) = parse_manifest(manifest_text)
+    if #len(units_dir) > 0 && first.os == "#NONE":
+        remove_tree_quietly(units_dir)
+        units_dir = ""
+        transpile(t, c_file, manifest_file, p.pkg_abs)
+        manifest_text = read_or_empty(manifest_file)
+        remove_quietly(manifest_file)
+    if web: manifest_text = js_modules_last(manifest_text)
     (Manifest m, bool mok, string8 why) = parse_manifest(manifest_text)
     if !mok: die(why)
 
@@ -680,6 +676,16 @@ private i32 build(^Plan p, ^Options o):
         _ = #append(includes, txt(#format("-I", engine_dir)))
         _ = #append(libs, join2(engine_dir, "libquickjs.a"))
         _ = #append(libs, "-lm")
+
+    // The units, in link order; none for a one-file build or a freestanding
+    // one, whose single object is what the person's own linker is handed.
+    ref []string8 units = #make([]string8, 0)
+    if #len(units_dir) > 0 && m.os != "#NONE":
+        string8 listed = read_or_empty(join2(units_dir, "units"))
+        for name in words_of(listed):
+            _ = #append(units, join2(units_dir, name))
+    g_units = units
+    g_units_cache = join2(p.build_dir, ".dado-cache")
 
     if m.os == "#WEB":
         return web_build(p, o, &m, manifest_text, c_file, g_html_flag)
@@ -705,10 +711,7 @@ private i32 build(^Plan p, ^Options o):
     k.base = words_of(setting("CFLAGS_BASE"))
     k.interop = words_of(setting("CFLAGS_INTEROP"))
     if o.werror: k.werror = words_of(setting("CFLAGS_WERROR"))
-    if o.debug:
-        k.opt = words_of("-g -O0")
-    else:
-        k.opt = words_of("-O2")
+    k.opt = opt_words(o)
     k.extra = m.flags
     k.san_c = san_c
     k.includes = includes
@@ -763,10 +766,42 @@ private i32 build(^Plan p, ^Options o):
         k.freestanding = words_of("-ffreestanding")
 
     say(txt(#format("cc     ", cc.name)))
-    if run(link_command(&k)) != 0:
+    if #len(units) > 0:
+        // Each unit's object, then one link of them all.
+        UnitsJob uj
+        uj.cache = g_units_cache
+        uj.cc_id = compiler_identity(cc)
+        uj.flags = compile_flags(&k)
+        uj.includes = includes
+        uj.jobs = os.cpu_count()
+        if uj.jobs < 1: uj.jobs = 1
+        (ref []string8 objects, bool uok) = unit_objects(&uj, units[:])
+        // An object a concurrent build swept between the check and here is
+        // compiled again, once.
+        if uok && !all_there(objects[:]):
+            (ref []string8 again, bool aok) = unit_objects(&uj, units[:])
+            objects = again
+            uok = aok
+        if !uok:
+            f.c_file = units_dir
+            explain_cc_failure(&f)
+        note(txt(#format("       ", #len(units), " files, each compiled once for what it holds: ", units_dir)))
+        k.c_file = objects[0]
+        ref []string8 rest = #make([]string8, 0)
+        for i in 1..<#len(objects):
+            _ = #append(rest, objects[i])
+        for s in m.sources:
+            _ = #append(rest, s)
+        k.sources = rest
+        if run(link_command(&k)) != 0:
+            explain_cc_failure(&f)
+        sweep_units(g_units_cache, objects[:])
+    else if run(link_command(&k)) != 0:
         explain_cc_failure(&f)
     note(txt(#format("       -> ", out)))
-    if !o.keep_c: remove_quietly(c_file)
+    if !o.keep_c:
+        remove_quietly(c_file)
+        if #len(units_dir) > 0: remove_tree_quietly(units_dir)
 
     if cmd == "build":
         say_green("built", txt(#format(" ", out)))
@@ -790,6 +825,49 @@ private i32 build(^Plan p, ^Options o):
         say(txt(#format("exit ", status)))
     _ = sanitized
     return status
+
+// Run the transpile `t` (every word but the output and the package) into
+// `c_file` by way of a temporary, so a failed run leaves nothing behind.
+private void transpile(Command t, string8 c_file, string8 manifest_file, string8 pkg):
+    string8 tmp_c = txt(#format(c_file, ".tmp"))
+    Command c = command_of(t.words[:])
+    add(&c, "-o")
+    add(&c, tmp_c)
+    add(&c, pkg)
+    if run(c) != 0:
+        if exists(tmp_c):
+            remove_quietly(tmp_c)
+        remove_quietly(manifest_file)
+        die("transpiling failed. Nothing was written.")
+    try fs.rename(tmp_c, c_file) else code:
+        die(txt(#format("cannot move ", tmp_c, " to ", c_file, ": ", os.message(code))))
+        return
+    note(txt(#format("       -> ", c_file)))
+
+// A dev build's units (`--split-out`), in link order, or none; and the
+// cache their objects go in. Set by `build` for `web_build`.
+private ref []string8 g_units
+private string8 g_units_cache = ""
+
+// A web build's manifest as the module's `.build` has always held it: the
+// `js-module` lines, which `dadoc` writes before its `pass` lines, moved to
+// the end, and everything else in its order.
+string8 js_modules_last(string8 text):
+    strings.Builder rest = strings.builder(#len(text) + 1)
+    strings.Builder js = strings.builder(64)
+    string8 left = text
+    for #len(left) > 0:
+        (string8 l, string8 tail, bool more) = strings.line(left)
+        if strings.starts_with(l, "js-module "):
+            _ = strings.append_char(&js, '\n')
+            _ = strings.append(&js, l)
+        else:
+            _ = strings.append(&rest, l)
+            _ = strings.append_char(&rest, '\n')
+        if !more: break
+        left = tail
+    string8 head = txt(strings.finish(&rest))
+    return txt(#format(strings.trim_right(head), txt(strings.finish(&js))))
 
 // The text of the file at `p`, or "" when it cannot be read.
 string8 read_or_empty(string8 p):

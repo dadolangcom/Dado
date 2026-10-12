@@ -1,10 +1,10 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f12a11494f94 -->
 # core:shader
 
 core:shader — what a compiled DadoGL shader looks like to the program that
-hands it to a graphics backend. **DadoGL is reserved and not built yet**
-(a0.13b row H14): nothing produces a `Shader` today, and `#shader_load`,
+hands it to a graphics backend. **DadoGL is reserved and not built yet**:
+nothing produces a `Shader` today, and `#shader_load`,
 which will, is refused `ERR0001`. The trait and its shapes are declared
 whole now so that a backend written against them today does not change when
 DadoGL lands.
@@ -24,6 +24,16 @@ A shader carries its **interface** as well as its code — which entry points
 it has and in which stage, what it binds where, and what vertex input it
 reads — so a backend lays out its pipeline from these answers instead of
 parsing the shader again.
+
+**Tier N W H.** Declarations only, with no `foreign` block and no state:
+the package builds freestanding (`#NONE`), on the web and hosted, Windows
+included, and any thread may use it. Which formats a backend can use is
+the backend's question, not this package's.
+
+**What raises into a script.** `is_text`, promised by the `#assert_raises`
+above it. The rest is types and a trait, which declare no body to promise;
+a `Shader`'s methods are its implementer's, and raise or not as that
+implementer's code does.
 
 ## Declarations
 

@@ -288,6 +288,14 @@ public f32 channel(Rgb c, i32 i):
     return c.r + c[i]
 ```
 
+**Under `#soa` a position is a lane.** `#soa` over `[N]E` holds one run
+per slot of `E`, so where `E` is itself a run, position k of element i
+is lane k at i: `c[i][k] = v`, `c[i][k] += v` and `&c[i][k]` reach
+that lane exactly as `c[i].x` does, at a written position or a computed
+one. What the layout does not have is the element in one piece, so
+`&c[i]`, a window `c[i][a..<b]` and `for &x in c[i]` are refused
+(`ERR0522`), and `c[i]` as a value is a copy gathered out of the lanes.
+
 **The cost is paid in the emitted name.** A mangled name spells every
 slot, so twenty of a six-slot declaration mangles to 612 characters and
 has to be cut back to the 63 C guarantees, with a hash on the end to
@@ -342,14 +350,30 @@ through names, tuple slots, either arm of a conditional, and calls.
 binding — is not returned, not stored through a parameter or into a
 package variable, not appended into a handle either reaches, not handed
 to a function that keeps it, and not read after the block that declared it
-ends (ERR0826; `#stack` storage the same, ERR0821). **A block behind a
+ends (ERR0826; `#stack` storage the same, ERR0821). A function that keeps
+a copy of what a pointer points at (`kept = f^`) keeps the copy's views
+and not the pointer, so handing it `&b` is refused only when what `b`
+holds points at this frame; through any other pointer, what was stored
+through that pointer counts too. Storing through a pointer to package
+storage, `put(&f, &SLOT)`, is storing in package storage. **A block behind a
 `ref` or a map** is not read through a view after anything that may move
 or free it — `#append`, `#resize`, `#reserve`, `#delete`, an insert,
 rebinding the handle, or a call whose body grows or frees it — and a
-`defer` counts where it runs, at the scope's exit (ERR0803). A copy of a
-handle shares its block: when either moves, the other is stale, and
-rebinding the place it was copied from hands the block to the copy. A
-`ref` passed by value to a function that frees it is gone after the call.
+`defer` counts where it runs, at the scope's exit (ERR0803). A view a
+call answers is minted at the call: when `items()` answers `store[:]` of a
+package-level `ref`, its result is not read after a call that grows
+that `ref`, as `store[:]` written in place is not. A copy of a handle
+shares its block: when either moves, the other is stale, and rebinding
+the place it was copied from hands the block to the copy. A `ref` a
+call answers after filling it with views of an argument — `split(b[:])`
+appending `b`'s sections, in place or through a `^ref []T` — is a block
+of its own: reading through it, a copy of it or a view of it after `b`
+moves is refused, and measuring or freeing it is not. A handle a call
+answers may be a copy of a handle its argument reaches — the package
+`ref` it hands back, `p^` for `grab(&b)` — and is stale when that one
+moves. A binding declared in a loop's body is a new block each pass,
+so a copy kept from the last pass is not the next pass's. A `ref`
+passed by value to a function that frees it is gone after the call.
 And one call is not handed a view into a block together with the handle
 to it, when the callee may grow the block and then use the view (ERR0827).
 
@@ -364,9 +388,21 @@ void touch(ref []Cell r):
 
 What each call does is read from the called function's body, so nothing is
 written in a signature. What is not followed is said out loud: a `foreign`
-function or a function value is taken to keep nothing, a conversion to
-`rawptr` drops what it pointed at, and a handle copy stored in the heap or
-a package variable is not tracked there.
+function or a function value is taken to keep nothing, and a conversion to
+`rawptr` drops what it pointed at. A handle copy stored in the heap or a
+package variable is not tracked there, and neither is a view stored in a
+package variable's block, nor views a callee stores into a block the caller
+owns — its own `ref` handed down by `^`, an out parameter, `p^ = split(…)`
+— nor views two hops away. A summary says which parameters an answer views,
+not which other blocks its views point into. A copy of a package handle
+handed back through `p^`, a tuple, a slot or an out parameter is not
+followed, nor is a handle reached through a window of pointers, of arrays,
+of unions or of records held by value. A pointer to package storage kept
+in a slot, a package pointer variable or a `#new`'d record is not known to
+point there. A callee that rebinds what its `^` points at on some path is
+taken to hand that block over on every path; and one that hands over only
+a slot (`take(&c)` answering `c.tris` after `c.tris = nil`) is still taken
+for a copy of any handle `c` holds, and refused after any of them moves.
 
 ### What a frame takes back
 
@@ -376,7 +412,9 @@ or a `using` of either), or a `core:mem/arena` arena
 (`arena.allocator(&a)`). It lies above the innermost frame or mark the
 function holds open on that region when it is minted — a `runtime.enter_temp`, a
 `runtime.temp_open`, an `arena.begin` — and growing it moves it above the innermost
-one open when it grows. **What ends the region ends the block**: rolling
+one open when it grows. Only what can point lies in a region: the `i64`
+that `(tmp, n) = work()` writes beside an arena's `ref` is a number.
+**What ends the region ends the block**: rolling
 the frame back (`runtime.close_temp()`, `runtime.temp_close(cp)`,
 `runtime.close_temp_hoisting`), ending the mark (`arena.end`, `arena.end_keeping`),
 destroying or resetting the arena or the scratch. After that the handle, its
@@ -1066,6 +1104,11 @@ The member is named whole by the name its slots are qualified with:
 stores each of them, but `&s.Vec2` is refused for the same reason.
 
     Vec2 base(Sprite s): return s.Vec2
+
+Where the embedded type is declared does not matter: one from another
+package (`type Desk: (staff.Person, i64 floor)`) or lower in the file
+splices the same slots, its methods are promoted, and `d.Person` names
+it whole.
 
 A **redeclaration** `type W: V` has `V`'s slots and view and none of
 its methods: `W`'s methods are what `W`'s body writes. `V.len(w)`
@@ -1877,6 +1920,18 @@ before the entry point runs — on a threaded page, in the worker that runs it,
 and again in each thread's. A script file changed after the build is
 refused by the browser, and the program does not start.
 
+A release build (`--release`) writes the scripts as one file: every
+module the compiler emitted — each class's, and the runtime's — is
+wrapped in a function of `registry.js` itself, which also holds the
+registry's table, so the page preloads one file with one hash for them.
+The scripts' own JavaScript modules and `dado-exports.js` stay files of
+their own, each preloaded with its hash. Nothing in it is evaluated from
+a string, so the strict policy above still holds. A dev build keeps one
+file per module, for `#script_reload` and a readable stack. `dado build
+--release` warns when its page still loads more than ten files — the
+module and its manifest, `loader.js` and its modules, and the script
+files.
+
 A template is refused at build time (`ERR1034`), naming the marker and
 the repair, when a required marker is missing, a marker is written
 twice, a `dado:` name is not one of the five, or a marker stands where
@@ -1894,6 +1949,15 @@ dado-status (made when absent), set as `data-dado-status` on the `<html>` elemen
 on `window.dadoPage.status`, and announced with a `dado-exit` event. A
 `?dado-seed=N` in the page's address pins the hash seed, as
 `DADO_HASH_SEED` does for `./dado run`.
+
+The module's stack comes first in its memory, below its data, so a
+recursion too deep for it runs out of bounds and traps — 134, with
+`dado: the module trapped` and the engine's reason on standard error,
+after what the program printed before it — instead of growing down into
+the program's globals. It is 8 MiB in every build, dev, test and
+`--release` alike, so a recursion that fits one fits the others. A
+`--web-threads` worker's stack is not guarded: it is 1 MiB from the
+heap, and an overflow there writes into the block below it.
 
 A threaded page (`--web-threads`) must be cross-origin isolated, so the
 build writes _headers beside it — the static-host convention — with
@@ -2061,7 +2125,8 @@ any number of those four types and write them with no separator.
 
 What DadoScript will have and the checker does not check yet is refused
 `ERR0001`, naming it. A script may import a Dado package, and calls its
-functions as a Dado file does (see *A script calls Dado*).
+functions and reads its constants as a Dado file does (see *A script
+calls Dado* and *A script reads Dado's constants*).
 
 Each class is emitted as a JavaScript module named `<package>/<Class>`,
 which `dadoc --emit=js` prints. There an `int` is still exactly `i64` —
@@ -2749,6 +2814,37 @@ answers the code. A Dado function the script's function calls sees the
 `using` allocator in effect when Dado called it. When the script's
 function fails during a Dado function the script called, the script's own
 error reaches it as that Dado function returns.
+
+### A script reads Dado's constants
+
+A script reads a constant of its package's Dado files by its bare name,
+`KIND`, and one of a Dado package it imports through the import's name,
+`lib.KIND`, as it calls their functions — a field or a method of the
+class wins over a constant of the same name. The constant is
+**interned**: the value Dado folds is written into the script's code
+where it is read, so nothing crosses when the script runs, the script
+runs the same natively and on the web, and no constant is mirrored by
+hand. A `-D` definition reaches a script as it reaches Dado.
+
+A constant is held as a Dado function's answer of its type is: every
+integer and a `char8` as an `int` (a `u64` by its bits), `f32` and `f64`
+as a `float` (an `f32` as the nearest `f32`), a `bool` as itself, a
+`char16`, a `char32` or a string of any width as a `string` (a
+`cstring` up to its first NUL, as C reads it), and a fixed array or a
+tuple of those as the script's own — a new one at each read, so a script
+changing the array it read changes no other read. One written without a
+type is its literal, as in Dado, and adapts to where it is read:
+`float f = MAX`. A constant of a declared shape reads its slots by name,
+`lib.ORIGIN.x`, and a method of the script's array or string is called
+on one, `SIZES.len()`. A constant has no storage, so a script assigning
+one, or a position or slot of one, is refused (`ERR0606`).
+
+A constant whose type does not cross — a `distinct` type, a slice
+(`const []i32`, alone or inside a tuple: write its length, `const
+[2]i32`), and for now an enum, which will cross as a script's enum and
+never as its number — one whose value C supplies (a `foreign` constant,
+whose value the compiler never learns), and one holding a function or a
+type are refused where the script reads them (`ERR1208`), naming why.
 
 ### A script binds a handler to a channel
 

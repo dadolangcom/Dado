@@ -39,12 +39,37 @@
 // **It is a singleton.** One terminal per process, and the alternative is a
 // `^Ui` first parameter on every call in the library — which is the entire
 // sugar budget spent on nothing. `open` refuses a second one.
+//
+// ── and what it costs ──────────────────────────────────────────────────────
+//
+// **Where it allocates.** `open` and `open_headless` keep the `#default` they
+// see for the UI's whole life (the cell grids, the frame arena's blocks, a
+// line edit's buffer), so a `using` around `open` chooses it. `log_open` and
+// `snapshot` allocate on the `#default` of their own call. Nothing takes an
+// allocator parameter.
+//
+// **What raises into a script.** Everything that lays out, draws or reads a
+// frame back carries the `#assert_raises` on the line above it: the
+// rectangles, the layout, the widgets, the colours and the theme, `Log`,
+// `snapshot` and `cell_at`. `kv` and `kv_float` are templates, promised at a
+// script's types in `raises_test.dado`. Not promised, each saying why in its
+// doc comment: what reaches the terminal (`open`, `close`, `step`, `run`,
+// `present`, `suspend`, `resume`, `stop`, `shell_out`, `is_terminal`,
+// `resized`), the frame arena (`open_headless`, `compose`), and the clock
+// (`clock`, and `spinner`, `toast`, `confirm_button`, `line_edit` and
+// `palette`, which animate by it).
 package tui
 
 import "core:io"
 import "core:mem/arena"
+import "core:os"
 import "core:os/proc"
 import "core:time"
+
+// **Hosted only.** A terminal is a hosted thing: a web page has none (a
+// browser terminal would be a script arm for the tty floor, not yet written),
+// and a `#NONE` build has no stream to draw on.
+#static_assert(#OS != #NONE && #OS != #WEB, "vendor:tui draws on a terminal, and a web page or a #NONE build has none: keep this build from importing vendor:tui")
 
 // ── the platform floor ─────────────────────────────────────────────────────
 //
@@ -86,20 +111,24 @@ type Frame: void()
 (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) mem
 
 private arena.Arena g_arena
-// What `open` was handed. The frame arena's blocks come from it, and so does
-// anything with a lifetime longer than a frame — a line edit's buffer.
+// The `#default` `open` saw. The cell grids and the frame arena's blocks come
+// from it, and so does anything with a lifetime longer than a frame — a line
+// edit's buffer.
 private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) g_backing
 private bool g_open
 private bool g_quit
 private bool g_ended
 private bool g_dirty = true
-private f64 g_started
+private time.Instant g_started
 
 // ── lifetime ───────────────────────────────────────────────────────────────
 
 // Whether there is a terminal to draw on, asked without changing anything. A
 // program that means to print a summary instead when the answer is no reads
 // better asking than reading `open`'s refusal as a question.
+//
+// Not promised to raise into a script: it asks the tty floor (`isatty`, a
+// foreign call).
 bool is_terminal():
     return tty_is_terminal() != 0
 
@@ -109,32 +138,36 @@ bool is_terminal():
 // False when stdin is not a terminal, which is the honest answer for a program
 // in a pipe and is worth checking rather than writing escape codes into
 // somebody's log.
+//
+// **It keeps the `#default` it sees for the UI's whole life**, since the UI
+// outlives any one frame: the cell grids, the frame arena's blocks and a line
+// edit's buffer come from it. A `using` around `open` chooses another, which
+// must then outlive `close`.
+//
+// Not promised to raise into a script: it enters raw mode through the tty
+// floor's foreign calls, and makes the frame arena, an allocator, whose
+// addresses a script has no value for.
 bool open(i32 pad = 1):
-    return open_over(#heap, pad)
-
-// The same, over an allocator you supply. Everything the library allocates —
-// the cell grids and the frame arena's blocks — comes from it.
-bool open_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, i32 pad = 1):
     if g_open: return false
     if tty_measure() < 0: return false
     if tty_raw(1) != 0: return false
 
-    g_backing = backing
-    g_arena = arena.sized(backing, 65536)
+    g_backing = #default
+    g_arena = arena.sized(g_backing, 65536)
     mem = arena.allocator(&g_arena)
     g_quit = false
     g_ended = false
     g_dirty = true
     g_force = true
     g_root_pad = pad
-    g_started = time.now()
+    g_started = time.instant()
     reset_state()
     detect_colors()
 
     ensure_out()
     // Alternate screen, reset, cursor off, all-motion mouse reporting in the
     // SGR-1006 encoding, bracketed paste.
-    _ = io.write(io.stdout(), cstring("\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h"))
+    _ = io.write(io.stdout(), "\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h")
     if io.flush(io.stdout()) != 0: return false
     g_open = true
     return true
@@ -142,6 +175,10 @@ bool open_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawpt
 // Put the terminal back, in reverse. Safe to call twice, and `tty_onsignal`
 // runs the same two steps — which is why the epilogue string is one constant in
 // one place (`EPILOGUE`, `tty.dado`) that both paths write.
+//
+// Not promised to raise into a script: it ends the frame arena (an allocator,
+// whose addresses a script has no value for) and leaves raw mode through the
+// tty floor.
 void close():
     if !g_open: return
     g_open = false
@@ -158,24 +195,30 @@ void close():
     arena.destroy(&g_arena)
 
 // End the loop after this frame. The ordinary way a program stops.
+#assert_raises
 void quit():
     g_quit = true
 
 // Ask for a repaint. A program whose state changed outside a frame — a child
 // process wrote a line, a timer fired, a socket answered — calls this, and the
 // next `step` composes a frame instead of sleeping through it.
+#assert_raises
 void wake():
     g_dirty = true
 
 // Whether stdin has ended: Ctrl-D, or a closed pipe. A loop that ignores this
 // spins.
+#assert_raises
 bool closed():
     return g_ended
 
 // Seconds since `open`. The clock every animated widget in the library reads,
 // so a spinner and a blinking caret cannot disagree about what time it is.
+//
+// Not promised to raise into a script: it reads the clock (`time.instant`), a
+// foreign call; a script reads its own.
 f64 clock():
-    return time.since(g_started)
+    return time.as_seconds_f64(time.elapsed(g_started))
 
 // Which of `frames` frames an animation running at `rate` frames a second is
 // on, `seconds` into it: the spinner's glyph and the caret's blink.
@@ -210,6 +253,9 @@ private bool g_suspended
 // Put the terminal back the way it was found, without closing the UI. The
 // screen, the modes and the cursor are all restored; the grid and every
 // widget's state are kept.
+//
+// Not promised to raise into a script: it hands the terminal back (`io.flush`
+// and the tty floor's foreign calls).
 void suspend():
     if !g_open || g_suspended: return
     g_suspended = true
@@ -222,11 +268,14 @@ void suspend():
 // Take it back. The next frame is a full repaint, because whatever ran in
 // between wrote to the same screen and the compositor's front buffer is now a
 // description of something that is no longer there.
+//
+// Not promised to raise into a script: it takes the terminal again (`io.flush`
+// and the tty floor's foreign calls).
 void resume():
     if !g_open || !g_suspended: return
     g_suspended = false
     if tty_raw(1) != 0: return
-    _ = io.write(io.stdout(), cstring("\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h"))
+    _ = io.write(io.stdout(), "\x1b[?1049h\x1b[0m\x1b[2J\x1b[?25l\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h")
     _ = io.flush(io.stdout())
     _ = tty_measure()
     forget_mouse()
@@ -234,21 +283,29 @@ void resume():
     g_dirty = true
 
 // Whether the UI is currently handed over.
+#assert_raises
 bool suspended():
     return g_suspended
 
 // Run `command` with the terminal, and take it back afterwards.
 //
-//     _ = tui.shell_out(cstring("$EDITOR +11 src/main.dado"))
+//     try proc.Ended e = tui.shell_out("$EDITOR +11 src/main.dado") else why:
+//         ...
 //
 // The child inherits this program's streams, so it gets a real terminal and
-// behaves as it would from a shell. Answers what `core:os/proc` answers:
-// whether it ended by returning, and with what.
-(bool exited, i32 status) shell_out(cstring command):
-    if !g_open: return proc.run(command)
+// behaves as it would from a shell. Answers what `core:os/proc`'s `run`
+// answers: how it ended, or why it could not be started.
+//
+// Not promised to raise into a script: it starts a program (`proc.run`, a
+// foreign call).
+os.Error!proc.Ended shell_out(string8 command):
+    if !g_open:
+        try proc.Ended e = proc.run(command)
+        return e
     suspend()
     defer resume()
-    return proc.run(command)
+    try proc.Ended e = proc.run(command)
+    return e
 
 // Stop the way Ctrl-Z does, and come back when continued.
 //
@@ -261,6 +318,9 @@ bool suspended():
 //
 // This is the same thing asked for from inside the program — a menu item, a
 // key of your own choosing — and it takes the identical path.
+//
+// Not promised to raise into a script: it signals the process (`raise`, a
+// foreign call).
 void stop():
     if !g_open: return
     suspend()
@@ -284,13 +344,15 @@ private i32 g_hh
 // rather than a convenience: the tuibox port could not be tested at all,
 // because every path through it went to a file descriptor. A layout regression
 // here is an ordinary `@test` file that asserts a string.
+//
+// It keeps the `#default` it sees for the UI's whole life, as `open` does.
+//
+// Not promised to raise into a script: it makes the frame arena, an allocator,
+// whose addresses a script has no value for.
 bool open_headless(i32 w, i32 h, i32 pad = 1):
-    return open_headless_over(w, h, #heap, pad)
-
-bool open_headless_over(i32 w, i32 h, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, i32 pad = 1):
     if g_open: return false
-    g_backing = backing
-    g_arena = arena.sized(backing, 65536)
+    g_backing = #default
+    g_arena = arena.sized(g_backing, 65536)
     mem = arena.allocator(&g_arena)
     g_headless = true
     g_hw = w
@@ -299,16 +361,19 @@ bool open_headless_over(i32 w, i32 h, (rawptr(rawptr, AllocatorMode, u64, u64, r
     g_quit = false
     g_ended = false
     g_force = true
-    g_started = time.now()
+    g_started = time.instant()
     reset_state()
     g_open = true
     return true
 
 // Run one frame into the back buffer, without presenting it. Pairs with
-// `snapshot`.
+// `snapshot`. A frame whose grid could not be allocated is not run.
+//
+// Not promised to raise into a script: it resets the frame arena, an allocator,
+// whose addresses a script has no value for.
 void compose(Frame f):
     if !g_open: return
-    begin_frame()
+    if !begin_frame(): return
     f()
     end_frame_quiet()
 
@@ -319,7 +384,9 @@ private void end_frame_quiet():
     draw_warning()
     settle_input()
 
-private void begin_frame():
+// False when the grid for this size could not be allocated: there is nothing
+// to draw on, so the frame is skipped.
+private bool begin_frame():
     arena.reset(&g_arena)
     tick_state()
     g_depth = 0
@@ -337,7 +404,7 @@ private void begin_frame():
     if h < 1: h = 1
     if w > MAX_COLS: w = MAX_COLS
     if h > MAX_ROWS: h = MAX_ROWS
-    if !ensure_grid(w, h): return
+    if !ensure_grid(w, h): return false
 
     set_clip(screen())
     clear_back()
@@ -346,6 +413,7 @@ private void begin_frame():
     g_stack[0] = (root, 0, 0, 0, Axis.Down, 0, Anchor.START, FNV_OFFSET, 0,
                   screen(), false, NOWHERE, "", false, 0, false, NOWHERE, 0, nocols,
                   true, g_theme.base, false)
+    return true
 
 private void end_frame():
     // A region left open is a `break` out of a `for tui.panel(...)`. Close it
@@ -376,6 +444,9 @@ private void end_frame():
 //
 //     for tui.step(frame, 30):
 //         drain_build_output()
+//
+// Not promised to raise into a script: it waits on the terminal (`poll` in the
+// tty floor, over addresses).
 bool step(Frame f, i32 timeout_ms):
     if !g_open: return false
     if g_quit: return false
@@ -393,14 +464,14 @@ bool step(Frame f, i32 timeout_ms):
 
     if g_dirty:
         g_dirty = false
-        f64 began = time.now()
+        time.Instant began = time.instant()
         g_frame_handed_over = false
-        begin_frame()
-        f()
-        end_frame()
-        // A frame that handed the terminal to another program (an editor
-        // through `shell_out`) waited for it, and that wait is not drawing.
-        if !g_frame_handed_over: count_frame(time.now() - began)
+        if begin_frame():
+            f()
+            end_frame()
+            // A frame that handed the terminal to another program (an editor
+            // through `shell_out`) waited for it, and that wait is not drawing.
+            if !g_frame_handed_over: count_frame(time.as_seconds_f64(time.elapsed(began)))
 
     if g_quit: return false
     if g_ended: return false
@@ -432,18 +503,22 @@ private void count_frame(f64 seconds):
 // The frames composed since `open`, the last one's time, the worst and the
 // mean, in milliseconds, and how many took longer than `frame_budget` (4 ms
 // unless set).
+#assert_raises
 (i32 frames, f64 last_ms, f64 worst_ms, f64 mean_ms, i32 over) frame_times():
     f64 mean = 0.0
     if g_frames > 0: mean = (g_frame_total / f64(g_frames)) * 1000.0
     return (g_frames, g_frame_last * 1000.0, g_frame_worst * 1000.0, mean, g_frames_over)
 
 // The time a frame may take before `frame_times` counts it as over.
+#assert_raises
 void frame_budget(f64 ms):
     g_frame_budget = ms / 1000.0
 
 // The whole loop, until `quit`. Sleeps when nothing is happening: the timeout
 // is short while something is animating and long when nothing is, so an idle
 // TUI costs nothing at all.
+//
+// Not promised to raise into a script: it is `step` in a loop.
 void run(Frame f):
     for step(f, idle_timeout()):
         pass
@@ -456,6 +531,9 @@ private i32 idle_timeout():
     return 250
 
 // Re-read the window size; true when it changed.
+//
+// Not promised to raise into a script: it asks the tty floor (`ioctl`, a
+// foreign call).
 bool resized():
     if tty_measure() != 0:
         g_force = true

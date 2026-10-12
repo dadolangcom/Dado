@@ -3,31 +3,33 @@
 // growth** — the proof that a stored value is freed.
 //
 // Each round builds a 64-section `Config` through every setter (each section
-// also overwrites one key, which is the reload shape), saves it, loads it
-// back, reads it, and destroys both. Before values became freeable this leaked
+// also overwrites one key, which is the reload shape), saves it — over the
+// previous round's file, so through `render_over` — loads it back, reads
+// it, and destroys both. Before values became freeable this leaked
 // 128 B a round from `cfg.clone` alone, because a stored value was a window
 // whose `ref` nobody held.
 //
 // **How "no growth" is measured, twice over:**
 //
 //   * **by count, in the test itself.** Every allocation this package makes
-//     goes through the allocator it is handed, and this file hands it one
-//     that counts live blocks (`Alloc` +1, `Free` −1) over `libc`. Blocks
+//     comes from the ambient allocator, and each round runs under a `using`
+//     of one that counts live blocks (`Alloc` +1, `Free` −1) over `libc`. Blocks
 //     and not bytes: a map frees its table with `old_size` 0, so a byte
 //     count kept from the `Free` side would be wrong, and a block count is
 //     exact. The claims: zero live blocks after every round; and the peak
 //     (both configs built, before `destroy`) the same in the last round as in
 //     the first — the same work holds the same memory every time.
 //   * **by LeakSanitizer**, which sees what the counter cannot — anything
-//     allocated from `#default` rather than the allocator passed in. Run
+//     allocated outside the round's `using`. Run
 //     `ASAN_OPTIONS=detect_leaks=1 ./dado test --sanitize collections/core/cfg`;
 //     it reports nothing.
 package cfg
 
 import "core:mem"
 import "core:mem/libc"
+import "core:os"
+import "core:os/fs"
 
-private const cstring PATH64 = "/tmp/dado_core_cfg_roundtrip64.ini"
 private const i64 SECTIONS = 64
 private const i32 ROUNDS = 1000
 
@@ -60,13 +62,64 @@ private rawptr counting_proc(rawptr data, mem.AllocatorMode mode, u64 nbytes, u6
 private (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) counting():
     return (counting_proc, nil)
 
+// Where a round's `Config` goes between its save and its load, and back.
+when #OS == #WEB:
+    // No file opens on the web yet, so the round trip goes through text kept
+    // between rounds, the way a file keeps it elsewhere: `render_over` the
+    // last round's text, then `parse`. The kept text is on `libc`, which the
+    // counter does not see, as a file's bytes are not.
+    private ref []char8 held
+
+    private bool open_place():
+        return true
+
+    private bool close_place():
+        #delete(held)
+        return true
+
+    private (Config back, bool ok, i32 bad, bool saved) trip(Config c):
+        ref []char8 text = render_over(c, string8(held[:]))
+        if text == nil:
+            return (empty(), false, 0, false)
+        #delete(held)
+        held = #format(string8(text[:])) using libc.allocator()
+        #delete(text)
+        (Config back, i32 bad) = parse(string8(held[:]))
+        return (back, bad == 0, bad, true)
+else:
+    // The file lives in a directory of its own, made where the system keeps
+    // temporary files and removed at the end. Its path is made before the
+    // counter is installed, so it does not see it.
+    private ref []char8 dir
+    private ref []char8 path
+
+    private bool open_place():
+        try dir = fs.make_temp_dir("dado-cfg-roundtrip64-") else code:
+            return #expect(false, "make_temp_dir: ", os.message(code))
+        path = #format(string8(dir[:]), "/roundtrip64.ini")
+        return true
+
+    private bool close_place():
+        bool ok = true
+        try fs.remove_all(string8(dir[:])) else code:
+            ok = #expect(false, "removing the temporary directory: ", os.message(code))
+        #delete(path)
+        #delete(dir)
+        return ok
+
+    private (Config back, bool ok, i32 bad, bool saved) trip(Config c):
+        bool saved = save(c, path)
+        (Config back, bool ok, i32 bad) = load(path)
+        return (back, ok, bad, saved)
+
 // Section `i`'s name, `s00` … `s63`, as a window into `names`.
 private string8 name_of(ref []char8 names, i64 i):
     return string8(names[(i * 3)..<((i * 3) + 3)])
 
 i32 test():
     bool ok = true
-    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc = counting()
+    if !open_place():
+        return 1
 
     ref []char8 names = #make([]char8, SECTIONS * 3)
     for i in 0..<SECTIONS:
@@ -81,41 +134,43 @@ i32 test():
     i32 bad_round = 0 - 1
 
     for round in 0..<ROUNDS:
-        Config c = fresh(alloc)
-        for i in 0..<SECTIONS:
-            string8 sec = name_of(names, i)
-            set_i32(&c, sec, "index", 0, alloc)
-            set_string(&c, sec, "label", sec, alloc)
-            set_f64(&c, sec, "ratio", f64(i) + 0.5, alloc)
-            set_bool(&c, sec, "even", i % 2 == 0, alloc)
-            // The overwrite: the `0` above is freed here.
-            set_i32(&c, sec, "index", i32(i) + round, alloc)
-        bool saved = save(c, PATH64, alloc)
-        (Config back, bool lok, i32 bad) = load(PATH64, alloc)
+        // Every allocation of the round is the counter's, by `using`.
+        using counting():
+            Config c = empty()
+            for i in 0..<SECTIONS:
+                string8 sec = name_of(names, i)
+                set_i32(&c, sec, "index", 0)
+                set_string(&c, sec, "label", sec)
+                set_f64(&c, sec, "ratio", f64(i) + 0.5)
+                set_bool(&c, sec, "even", i % 2 == 0)
+                // The overwrite: the `0` above is freed here.
+                set_i32(&c, sec, "index", i32(i) + round)
+            (Config back, bool lok, i32 bad, bool saved) = trip(c)
 
-        i64 probe = i64(round) % SECTIONS
-        string8 psec = name_of(names, probe)
-        bool right = saved && lok && bad == 0
-        right = right && get_i32(back, psec, "index", 0 - 1, alloc) == i32(probe) + round
-        right = right && get_string(back, psec, "label", "?") == psec
-        f64 ratio = get_f64(back, psec, "ratio", 0.0, alloc)
-        right = right && ratio > f64(probe) + 0.4999 && ratio < f64(probe) + 0.5001
-        right = right && get_bool(back, psec, "even", probe % 2 != 0) == (probe % 2 == 0)
-        if !right && bad_round < 0:
-            bad_round = round
+            i64 probe = i64(round) % SECTIONS
+            string8 psec = name_of(names, probe)
+            bool right = saved && lok && bad == 0
+            right = right && get_i32(back, psec, "index", 0 - 1) == i32(probe) + round
+            right = right && get_string(back, psec, "label", "?") == psec
+            f64 ratio = get_f64(back, psec, "ratio", 0.0)
+            right = right && ratio > f64(probe) + 0.4999 && ratio < f64(probe) + 0.5001
+            right = right && get_bool(back, psec, "even", probe % 2 != 0) == (probe % 2 == 0)
+            if !right && bad_round < 0:
+                bad_round = round
 
-        if round == 0:
-            first_peak = live_blocks
-        if round == ROUNDS - 1:
-            last_peak = live_blocks
+            if round == 0:
+                first_peak = live_blocks
+            if round == ROUNDS - 1:
+                last_peak = live_blocks
 
-        destroy(&c)
-        destroy(&back)
+            destroy(&c)
+            destroy(&back)
         if live_blocks != 0 && leaked_round < 0:
             leaked_round = round
             leaked_blocks = live_blocks
 
     #delete(names)
+    ok = close_place() && ok
 
     ok = #expect(bad_round < 0, "the 64-section round trip read back wrong in round ", bad_round) && ok
     ok = #expect(leaked_round < 0, "round ", leaked_round, " ended with ", leaked_blocks, " live blocks") && ok

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit 703d96d30a51 (dirty) -->
 # app:graphical
 
 app:graphical — the graphical runtime: a real sokol backend, a window, a
@@ -201,7 +201,7 @@ what it does.
 
 ## Declarations
 
-54 declarations, 31 public.
+55 declarations, 31 public.
 
 * `const i32 E_WINDOW_SIZE = 2` — ── failure codes ───────────────────────────────────────────────────────────…
 * `const i32 E_DRAW_UP = 3`

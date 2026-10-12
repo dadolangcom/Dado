@@ -1,104 +1,116 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 7e1d5137cae1 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f94cdafd7289 -->
 # core:os/proc
 
 core:os/proc — running another program, and reading what it says.
 
+    import "core:os"
     import "core:os/proc"
     import "core:io"
 
-    ^io.FILE p = proc.read("git rev-parse --short HEAD")
-    (cstring line, bool ok) = io.read_line(p)
-    (bool exited, i32 status) = proc.close(p)
+    try ^io.FILE p = proc.read("git rev-parse --short HEAD") else why:
+        println("cannot start git: ", os.message(why))
+        return 1
+    try ref []char8 line = io.read_line(p) else:
+        ...
+    try proc.Ended e = proc.close(p) else why:
+        ...
+    switch e:
+        case proc.Exited x: println("exited ", x.code)
+        case proc.Signaled s: println("killed by signal ", s.signal)
 
-The one thing this package is careful about: **`close` is where the exit
-status is**, not `read`. A pipe that opened tells you the shell started, and
-nothing else — a command that does not exist still opens, prints to stderr,
-and closes with 127. Reading to the end and then closing is the whole
-protocol, and it is the same one C has.
+The one thing this package is careful about: **`close` is where the
+ending is**, not `read`. A pipe that opened tells you the shell started,
+and nothing else — a command that does not exist still opens, prints to
+stderr, and closes `Exited(127)`. Reading to the end and then closing is
+the whole protocol, and it is the same one C has.
 
-`command` is handed to `/bin/sh`, so it is a shell line and not an argv:
-pipes, redirection and globs all work, and so does everything an attacker
-would like to put in a filename.
+**How a program ended is an `Ended`**: a union of `Exited` (it returned a
+code) and `Signaled` (a signal ended it), so a `switch` over one names both
+and needs no `else`. A wait that could not happen is a failure, not a third
+kind of ending. `ok(e)` is "exited 0".
 
-**`exec.dado` beside this file is the argv form, and it is the one to reach
-for unless the shell is the point.** This paragraph used to end *"there is no
-`exec` form yet, because that needs an array of strings crossing into C and
-`foreign` has no spelling for one"*, which was measured false: `rawptr`
-crosses, at a stated cost written on the `execvp` declaration there.
+**Failure is `os.Error`** for what the system refused — a pipe, a fork, a
+program that could not be started — and **`Pipe`**, this package's own,
+for a read or a write that did not move bytes: `Pipe.WAITED` when nothing
+was ready in time, `Pipe.BROKE` when the other end is gone. Zero bytes from
+a read is the end of the output, which is no failure.
 
-What these three functions cost, measured on one value — `a b ; touch FILE ;`
-— handed to `read` the way a caller assembling a command would: the space
-split one argument into two, the `;` **ran `touch`**, and its output arrived
-in the caller's own pipe. The same value with a `'` in it instead killed the
-shell line with *Unterminated quoted string* and came back as `(true, 2)`,
-which no caller can tell from a program that ran and exited 2. Nothing in
-`collections/` escapes a shell argument and there is no helper here that
-would; build the command yourself and know what is in it.
+`command` is handed to `/bin/sh` (`cmd.exe` on Windows), so it is a shell
+line and not an argv: pipes, redirection and globs all work, and so does
+everything an attacker would like to put in a filename. Nothing in
+`collections/` escapes a shell argument; build the command yourself and
+know what is in it. **`exec.dado` beside this file is the argv form, and it
+is the one to reach for unless the shell is the point**; `duplex.dado` is a
+child written to and read from at once.
 
-**`command` is a `cstring` everywhere below.** It exists only to reach
-`popen` and `system`, both of which read to a `\0`, so the parameter says so
-and the caller says how it got one: a literal — which is what a shell line
-usually is — already is one, and a command a program assembled goes through
-`strings.clone_to_cstring` and a written `cstring(…)`, which is where the
-copy that assembling it needs becomes visible.
+**On Windows** the surface is the same and the shell is `cmd.exe`: a
+`command` is a `cmd.exe` line (the `Windows` section below says how it is
+run), an argv is quoted into one command line by Windows' own rule, and a
+child and everything it starts are one job. `windows.dado` says what differs
+underneath, once.
+
+**Tier H.** Linux, macOS, the BSDs and Windows. A page and a freestanding
+build have no process to start, and the package refuses both at build time.
+
+**What raises into a script.** `ok`, promised by the `#assert_raises` above
+it: it looks at a value. Nothing else is, because everything else starts,
+feeds, reads or ends a child through the system, and what reports on the
+process (`available`, `ignoring_sigpipe`) answers about something only
+those calls make.
+
+**Thread-safety.** A `Duplex`, a `Child` or a stream belongs to one thread
+at a time. Starting children from two threads at once is not supported: the
+first `duplex` decides `SIGPIPE`'s disposition unlocked, and on Windows the
+table of children started is not locked either.
 
 ## Declarations
 
-273 declarations, 55 public.
+289 declarations, 46 public.
 
-* `const i32 DRAINED = 0` — What `drain` answers when it did not read anything, told apart. A caller that…
-* `const i32 WAITED = 0 - 1`
-* `const i32 BROKE = 0 - 2`
-* `i32 drain(^io.FILE stream, []char8 into, i32 timeout_ms = 0)`
-* `i32 drain(^io.FILE stream, []char8 into, i32 timeout_ms = 0)` — Read whatever `stream` has written, waiting at most `timeout_ms`.
-* `const i32 ERRORS_INHERIT = 0` — What `duplex` does with the child's standard error.
-* `const i32 ERRORS_PIPE = 1`
-* `const i32 ERRORS_MERGE = 2`
-* `const i32 ERRORS_DISCARD = 3`
+* `Pipe!i64 drain(^io.FILE stream, []char8 into, i32 timeout_ms = 0)`
+* `Pipe!i64 drain(^io.FILE stream, []char8 into, i32 timeout_ms = 0)` — Read whatever `stream` has written, waiting at most `timeout_ms`.
+* `enum i32 Errors` — What `duplex` does with the child's standard error.
 * `type Duplex` — A running child and the three pipes to it. Fields are readable; change them…
-* `bool started(Duplex d)` — Whether `duplex` started a child. A `Duplex` that did not holds no…
+* `bool started(Duplex d)` — Whether this `Duplex` is a started child: false for one nobody started (a…
 * `bool ignoring_sigpipe()` — Whether the first `duplex` in this process set `SIGPIPE` to ignored — false…
-* `(i64 sent, i32 stopped) send_all(^Duplex d, []char8 bytes, i32 timeout_ms = 0)` — `send` until all of `bytes` is gone, or nothing moved for `timeout_ms`.
-* `(bool exited, i32 status) stop(^Duplex d, i32 grace_ms)` — The whole ending in one call: close every pipe, give the child `grace_ms` to…
-* `Duplex duplex([]cstring argv, i32 errors = ERRORS_INHERIT)`
-* `i32 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0)`
-* `i32 receive(^Duplex d, []char8 into, i32 timeout_ms = 0)`
-* `i32 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0)`
+* `Pipe!i64 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0)` — Write as much of `bytes` as the pipe will take, waiting at most…
+* `Pipe!i64 receive(^Duplex d, []char8 into, i32 timeout_ms = 0)` — Whatever the child has written to stdout, waiting at most `timeout_ms`:
+* `Pipe!i64 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0)` — `receive` for the stderr pipe, which exists only under `Errors.Pipe`;…
+* `Pipe!void send_all(^Duplex d, []char8 bytes, i32 timeout_ms = 0)` — `send` until all of `bytes` is gone, or nothing moved for `timeout_ms`.
+* `Pipe!Ended finished(^Duplex d)` — How the child ended, without waiting: fails `Pipe.WAITED` while it is…
+* `Pipe!Ended finish(^Duplex d, i32 timeout_ms)` — `finished`, waiting up to `timeout_ms` for it (negative waits…
+* `Pipe!Ended stop(^Duplex d, i32 grace_ms)` — The whole ending in one call: close every pipe, give the child `grace_ms`
+* `os.Error!Duplex duplex([]string8 argv, Errors errors = Errors.Inherit)`
 * `bool close_input(^Duplex d)`
 * `bool terminate(^Duplex d)`
 * `bool kill(^Duplex d)`
-* `(bool done, bool exited, i32 status) finished(^Duplex d)`
-* `(bool done, bool exited, i32 status) finish(^Duplex d, i32 timeout_ms)`
-* `void release(^Duplex d)`
-* `Duplex duplex([]cstring argv, i32 errors = ERRORS_INHERIT)` — Start `argv` with its stdin and stdout on pipes to this process, and its…
-* `i32 send(^Duplex d, []char8 bytes, i32 timeout_ms = 0)` — Write as much of `bytes` as the pipe will take, waiting at most `timeout_ms`
-* `i32 receive(^Duplex d, []char8 into, i32 timeout_ms = 0)` — Whatever the child has written to stdout, waiting at most `timeout_ms`:
-* `i32 receive_errors(^Duplex d, []char8 into, i32 timeout_ms = 0)` — `receive` for the stderr pipe, which exists only under `ERRORS_PIPE`;…
+* `void close_pipes(^Duplex d)`
+* `os.Error!Duplex duplex([]string8 argv, Errors errors = Errors.Inherit)` — Start `argv` with its stdin and stdout on pipes to this process, and its…
 * `bool close_input(^Duplex d)` — Close the child's stdin, so its next read sees end-of-file. True if this…
 * `bool terminate(^Duplex d)` — Ask the child to stop (`SIGTERM`). False for a child already reaped — its…
 * `bool kill(^Duplex d)` — Stop the child whether it agrees or not (`SIGKILL`). Same refusals.
-* `(bool done, bool exited, i32 status) finished(^Duplex d)` — Whether the child has ended, without waiting. `done` false is "still…
-* `(bool done, bool exited, i32 status) finish(^Duplex d, i32 timeout_ms)` — `finished`, waiting up to `timeout_ms` for it (negative waits indefinitely).
-* `void release(^Duplex d)` — Close every descriptor the parent still holds, without waiting. The child…
-* `const i32 ARG_CAP = 255` — **The argv this package will assemble, at most.** C wants a null after the…
-* `type Child` — A running program and the pipe its standard output arrives on.
-* `bool spawned(Child c)` — Whether a `spawn` started anything.
-* `(bool exited, i32 status) exec([]cstring argv)`
-* `Child spawn([]cstring argv)`
-* `(bool exited, i32 status) wait(Child c)`
-* `(bool exited, i32 status) exec([]cstring argv)` — Run `argv` to completion with the caller's own streams, so its output goes…
-* `Child spawn([]cstring argv)` — Start `argv` and read its standard output. The `read` twin.
-* `(bool exited, i32 status) wait(Child c)` — Close the pipe and wait for the program. The `close` twin, and the same…
-* `bool opened(^io.FILE stream)`
-* `bool available()` — Whether there is a shell to run any of this with — C99's `system(NULL)`.
-* `bool ok(bool exited, i32 status)` — Whether a `(exited, status)` pair means "it worked": ended by returning, and…
-* `^io.FILE read(cstring command)` — Start `command` and read its standard output; nil when the pipe or the…
-* `^io.FILE write(cstring command)` — Start `command` and write to its standard input.
-* `(bool exited, i32 status) close(^io.FILE stream)` — Close the pipe and wait for the command. `(false, -1)` for a stream…
-* `(bool exited, i32 status) run(cstring command)` — Run `command` to completion with the caller's own streams.
-* `^io.FILE read(cstring command)` — Start `command` and read its standard output. `nil` when the pipe or the…
-* `^io.FILE write(cstring command)` — Start `command` and write to its standard input.
-* `(bool exited, i32 status) close(^io.FILE stream)` — Wait for the command and report how it ended.
-* `(bool exited, i32 status) run(cstring command)` — Run `command` to completion with the caller's own streams — so its output…
-* `ref []char8 command_line_utf8([]cstring argv)` — The UTF-8 command line `argv` quotes to: the program, then each…
+* `void close_pipes(^Duplex d)` — Close every descriptor the parent still holds, without waiting. The child…
+* `const i32 ARG_CAP = 255` — **The arguments this package will pass, at most.** Over the cap is a…
+* `type Child` — A running program and the pipe its standard output arrives on. `pid` is kept…
+* `os.Error!Ended exec([]string8 argv)` — Run `argv` to completion with the caller's own streams. Fails `INVALID`
+* `os.Error!Child spawn([]string8 argv)` — Start `argv` and read its standard output.
+* `os.Error!Ended wait(Child c)` — Close the pipe and wait for the program.
+* `os.Error!Ended exec([]string8 argv)` — Run `argv` to completion with the caller's own streams, so its output…
+* `os.Error!Child spawn([]string8 argv)` — Start `argv` and read its standard output. The `read` twin. Its standard…
+* `os.Error!Ended wait(Child c)` — Close the pipe and wait for the program. The `close` twin, and the same…
+* `distinct type Exited: (i32 code)` — It returned `code`: 0 to 255 on POSIX (127 when the program could not be…
+* `distinct type Signaled: (i32 signal)` — A signal ended it: `signal` is its number (`SIGKILL` is 9). On Windows,…
+* `union Ended: (Exited, Signaled)` — How a program ended. A wait that could not happen is a failure of the…
+* `bool ok(Ended e)` — Whether `e` means "it worked": it returned, and returned zero.
+* `distinct enum i32 Pipe` — Why `drain`, `send`, `send_all`, `receive` or `receive_errors` moved no…
+* `string8 message(Pipe why)` — A sentence for `why`, for a person.
+* `bool available()` — Whether there is a shell to run a command line with — C99's…
+* `os.Error!^io.FILE read(string8 command)` — Start `command` and read its standard output. Fails with the system's…
+* `os.Error!^io.FILE write(string8 command)` — Start `command` and write to its standard input.
+* `os.Error!Ended close(^io.FILE stream)` — Close the pipe and wait for the command. Fails `INVALID` for a stream…
+* `os.Error!Ended run(string8 command)` — Run `command` to completion with the caller's own streams.
+* `os.Error!^io.FILE read(string8 command)` — Start `command` and read its standard output. Fails with the system's…
+* `os.Error!^io.FILE write(string8 command)` — Start `command` and write to its standard input.
+* `os.Error!Ended close(^io.FILE stream)` — Wait for the command and report how it ended. Fails with the system's…
+* `os.Error!Ended run(string8 command)` — Run `command` to completion with the caller's own streams — so its…

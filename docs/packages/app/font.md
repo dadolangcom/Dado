@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f94cdafd7289 -->
 # app:font
 
 `app:font` — a glyph atlas and the metrics a layout engine needs.
@@ -260,7 +260,7 @@ growth existed, some doublings later. There is no unbounded case.
 
 ## Declarations
 
-81 declarations, 43 public.
+79 declarations, 43 public.
 
 * `enum Source: (Fallback, TrueType)` — Where a `Font`'s pixels came from. A caller that must know — to warn, to…
 * `const char32 FIRST = ' '` — The first and last codepoints `load` packs densely. Everything between them…

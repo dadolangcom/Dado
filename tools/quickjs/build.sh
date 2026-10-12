@@ -44,6 +44,11 @@
 #     --test262 DIR     with --test, also run test262 (fast conf) from a checkout in DIR
 #     --print-key       print the cache key and archive path, build nothing
 #
+# **Cross builds** name the target in the compiler's words: `--cc "zig cc
+# -target x86_64-windows-gnu"` builds the Windows archive (MinGW-w64's headers,
+# COFF objects, `zig ar` for the index), as `./dado` asks for it when its
+# target is Windows; the triple in the key is the compiler's `-dumpmachine`.
+#
 # Prints the archive directory (containing libquickjs.a, quickjs.h, PROVENANCE) last.
 # The archive is built once per key: a second run with the same key is a cache hit.
 # Concurrent runs for one key wait for each other (a lock beside the archive),
@@ -209,7 +214,14 @@ else
     $CC $CFLAGS -c "$TREE/$s.c" -o "$OUT.tmp/$s.o"
   done
   t1=$(date +%s.%N)
-  AR=ar; [ "$KIND" = clang ] && command -v llvm-ar >/dev/null && AR=llvm-ar
+  # An archive's symbol index is written by an archiver that reads the
+  # objects' format: GNU ar on Linux does not read a Windows (COFF) object and
+  # writes the archive without one, which lld then refuses. zig's and LLVM's
+  # archivers read every format their compilers write.
+  AR=ar
+  if [ "$KIND" = zig ] && command -v zig >/dev/null; then AR="zig ar"
+  elif [ "$KIND" = clang ] && command -v llvm-ar >/dev/null; then AR=llvm-ar
+  fi
   $AR rcs "$OUT.tmp/libquickjs.a" "$OUT.tmp"/*.o
   rm -f "$OUT.tmp"/*.o
   cp "$TREE/quickjs.h" "$OUT.tmp/"

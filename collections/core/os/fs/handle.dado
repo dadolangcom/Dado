@@ -1,0 +1,419 @@
+// An open file: read and write it in pieces, move about in it, cut it to a
+// length, push it to the disk, and lock it against other processes.
+//
+//     try fs.File f = fs.open_file("log.txt", fs.Open.Write | fs.Open.Create | fs.Open.Append) else why:
+//         println("log.txt: ", os.message(why))
+//         return 1
+//     defer f.close()
+//     try f.lock(true)
+//     try _ = f.write("one more line\n")
+//     try f.sync()
+//
+// `read_file` and `write_file` are whole files; this is the rest. A `File` is
+// a plain value holding the system's handle — copy it and both copies name
+// one open file, and `close` it once. Every method fails `os.Error`, and
+// `os.Error.INVALID` on a `File` that is closed or was never opened. `read`
+// and `write` move text (`char8`); `read_bytes` and `write_bytes` move the
+// same bytes as `u8`.
+//
+// **Locks are advisory and whole-file**: they stop another process that asks
+// for a lock, not one that reads or writes without asking. A shared lock
+// (`lock(false)`) admits other shared ones; an exclusive one (`lock(true)`)
+// admits nothing else. On POSIX it is `flock`, held by the open file, so it
+// ends with `close` or `unlock`; on Windows it is `LockFileEx` over the whole
+// range, and Windows also refuses reads and writes through other handles while
+// an exclusive one is held.
+//
+// **On `#WEB`** `open_file` fails with `os.Error.UNSUPPORTED`, so no `File` is
+// ever open there, and each method fails with `os.Error.INVALID`.
+//
+// Not promised to raise: a `File` holds the system's handle, and every method
+// is a `foreign` call.
+//
+// Thread-safety: one `File` from one thread at a time; the position it reads
+// and writes at is the open file's own, shared by every copy of the value.
+package fs
+
+import "core:io"
+import "core:os"
+
+// What `open_file` opens the file for, or-ed together. One of `Read` and
+// `Write` at least (`Append` counts as writing); `Append` writes always at
+// the end; `Create` makes the file when it is not there (with `0666` less the
+// umask on POSIX); `Truncate` cuts it to nothing when it is; `Exclusive`,
+// with `Create`, fails with `EXISTS` rather than open a file someone else
+// made.
+enum i32 Open:
+    // Read from the file.
+    Read = 1,
+    // Write to the file.
+    Write = 2,
+    // Write always at the end.
+    Append = 4,
+    // Make the file when it is not there.
+    Create = 8,
+    // Cut the file to nothing when it is there.
+    Truncate = 16,
+    // With `Create`: fail `EXISTS` rather than open a file already there.
+    Exclusive = 32,
+
+// Whether `flags` holds `bit`.
+private bool has(Open flags, Open bit):
+    return (i32(flags) & i32(bit)) != 0
+
+// The number `lseek` and `SetFilePointer` both read for `from`: 0, 1 and 2.
+private i32 whence_of(io.Whence from):
+    if from == io.Whence.Current: return 1
+    if from == io.Whence.End: return 2
+    return 0
+
+// An open file. `fd` is the POSIX descriptor and `handle` the Windows one;
+// each system uses its own and leaves the other at its zero. Read them only to
+// hand the file to a call this package does not make.
+type File:
+    i32 fd
+    rawptr handle
+    bool open
+
+    // Read at most `#len(into)` bytes of text at the current position,
+    // answering how many arrived: 0 at the end of the file, never 0 before it
+    // for a non-empty `into`.
+    os.Error!i64 read(self, []char8 into):
+        if #len(into) == 0: return file_read(self, nil, 0)
+        try i64 n = file_read(self, rawptr(&into[0]), #len(into))
+        return n
+
+    // `read`, into bytes.
+    os.Error!i64 read_bytes(self, []u8 into):
+        if #len(into) == 0: return file_read(self, nil, 0)
+        try i64 n = file_read(self, rawptr(&into[0]), #len(into))
+        return n
+
+    // Write all of `data` at the current position (at the end, for `Append`),
+    // answering its length.
+    os.Error!i64 write(self, string8 data):
+        []char8 bytes = Text(data)
+        rawptr from = nil
+        if #len(bytes) > 0: from = rawptr(&bytes[0])
+        try file_write(self, from, #len(bytes))
+        return #len(data)
+
+    // `write`, of bytes.
+    os.Error!i64 write_bytes(self, []u8 data):
+        rawptr from = nil
+        if #len(data) > 0: from = rawptr(&data[0])
+        try file_write(self, from, #len(data))
+        return #len(data)
+
+    // Move the position to `offset` counted `from` the start, the current
+    // position or the end, answering the new position from the start. Past
+    // the end is allowed; before the start is `INVALID`.
+    os.Error!i64 seek(self, i64 offset, io.Whence from = io.Whence.Start):
+        try i64 at = file_seek(self, offset, whence_of(from))
+        return at
+
+    // Cut or extend the file to `size` bytes; the position does not move.
+    os.Error!void truncate(self, i64 size):
+        if size < 0: fail os.Error.INVALID
+        try file_truncate(self, size)
+        return
+
+    // Push what was written to the disk before answering.
+    os.Error!void sync(self):
+        try file_sync(self)
+        return
+
+    // What the open file is: its kind, permissions, size and last write.
+    os.Error!FileInfo info(self):
+        try FileInfo i = file_info(self)
+        return i
+
+    // Take an exclusive lock (`exclusive`) or a shared one on the whole file,
+    // waiting for one another process holds.
+    os.Error!void lock(self, bool exclusive):
+        try _ = file_lock(self, exclusive, true)
+        return
+
+    // `lock` without the wait: true when the lock was taken, false when
+    // another process holds one that excludes it.
+    os.Error!bool try_lock(self, bool exclusive):
+        try bool got = file_lock(self, exclusive, false)
+        return got
+
+    // Give back the lock `lock` or `try_lock` took.
+    os.Error!void unlock(self):
+        try file_unlock(self)
+        return
+
+    // Close the file, which also gives back its lock; a closed `File` is
+    // left as it is. Through `^self`, so the value says it is closed after.
+    void close(^self):
+        if !self.open: return
+        file_close(self^)
+        self.open = false
+        self.fd = 0 - 1
+        self.handle = nil
+
+// A string's bytes, to hand the system.
+private type Text: []char8
+
+// ── Windows ─────────────────────────────────────────────────────────────────
+when #OS == #WINDOWS:
+    // Open the file at `path` as `flags` says, at position 0. Fails with
+    // `NOT_FOUND` when it is not there and `Create` was not asked, `EXISTS`
+    // under `Exclusive`, `IS_DIR` for a directory, `INVALID` for flags with
+    // neither `Read` nor `Write`, and `UNSUPPORTED` on `#WEB`.
+    //
+    // On Windows it is `CreateFileW` with every sharing mode, as `read_file`
+    // opens; `Append` asks for `FILE_APPEND_DATA` in place of
+    // `GENERIC_WRITE`, which makes every write go to the end.
+    os.Error!File open_file(string8 path, Open flags):
+        if !has(flags, Open.Read) && !has(flags, Open.Write) && !has(flags, Open.Append): fail os.Error.INVALID
+        (u32 a, bool got) = attributes_of(path)
+        if got && (a & u32(FILE_ATTRIBUTE_DIRECTORY)) != 0: fail os.Error.IS_DIR
+        #c.ulong access = 0
+        if has(flags, Open.Read): access = access | GENERIC_READ
+        if has(flags, Open.Append): access = access | FILE_APPEND_DATA
+        else if has(flags, Open.Write): access = access | GENERIC_WRITE
+        #c.ulong how = OPEN_EXISTING
+        if has(flags, Open.Create) && has(flags, Open.Exclusive): how = CREATE_NEW
+        else if has(flags, Open.Create) && has(flags, Open.Truncate): how = CREATE_ALWAYS
+        else if has(flags, Open.Create): how = OPEN_ALWAYS
+        else if has(flags, Open.Truncate): how = TRUNCATE_EXISTING
+        ref []u16 w = wide_path(path)
+        defer #delete(w)
+        if #len(w) == 0: fail os.Error.INVALID
+        rawptr h = CreateFileW(&w[0], access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nil, how, FILE_ATTRIBUTE_NORMAL, nil)
+        if h == INVALID_HANDLE_VALUE: try failed()
+        return (0 - 1, h, true)
+
+    private os.Error!i64 file_read(File f, rawptr into, i64 count):
+        if !f.open: fail os.Error.INVALID
+        i64 want = count
+        if want == 0: return 0
+        if want > 1073741824: want = 1073741824
+        #c.ulong got = 0
+        if ReadFile(f.handle, into, #c.ulong(want), &got, nil) == 0: try failed()
+        return i64(got)
+
+    private os.Error!void file_write(File f, rawptr bytes, i64 count):
+        if !f.open: fail os.Error.INVALID
+        try write_all(f.handle, bytes, count)
+        return
+
+    // `SetFilePointer` answers the low half and writes the high half back;
+    // a low half of `INVALID_SET_FILE_POINTER` is a failure only when the
+    // last error says so.
+    private os.Error!i64 file_seek(File f, i64 offset, i32 from):
+        if !f.open: fail os.Error.INVALID
+        #c.long high = #c.long(offset >> 32)
+        SetLastError(0)
+        #c.ulong low = SetFilePointer(f.handle, #c.long(offset), &high, #c.ulong(from))
+        if low == INVALID_SET_FILE_POINTER && i64(GetLastError()) != i64(NO_ERROR): try failed()
+        return (i64(high) << 32) | i64(low)
+
+    // `SetEndOfFile` cuts at the position, so the position is moved there and
+    // put back.
+    private os.Error!void file_truncate(File f, i64 size):
+        try i64 was = file_seek(f, 0, 1)
+        try _ = file_seek(f, size, 0)
+        if SetEndOfFile(f.handle) == 0:
+            os.Error code = failure()
+            try _ = file_seek(f, was, 0) else:
+                try os.fail_with(code)
+            try os.fail_with(code)
+        try _ = file_seek(f, was, 0)
+        return
+
+    private os.Error!void file_sync(File f):
+        if !f.open: fail os.Error.INVALID
+        if FlushFileBuffers(f.handle) == 0: try failed()
+        return
+
+    private os.Error!FileInfo file_info(File f):
+        if !f.open: fail os.Error.INVALID
+        FsHandleInfo got
+        if GetFileInformationByHandle(f.handle, &got) == 0: try failed()
+        return info_from(got, false)
+
+    private os.Error!bool file_lock(File f, bool exclusive, bool wait):
+        if !f.open: fail os.Error.INVALID
+        #c.ulong flags = 0
+        if exclusive: flags = flags | LOCKFILE_EXCLUSIVE_LOCK
+        if !wait: flags = flags | LOCKFILE_FAIL_IMMEDIATELY
+        FsOverlapped at
+        if LockFileEx(f.handle, flags, 0, 0xFFFFFFFF, 0xFFFFFFFF, &at) != 0: return true
+        if !wait && i64(GetLastError()) == i64(ERROR_LOCK_VIOLATION): return false
+        try failed()
+        return false
+
+    private os.Error!void file_unlock(File f):
+        if !f.open: fail os.Error.INVALID
+        FsOverlapped at
+        if UnlockFileEx(f.handle, 0, 0xFFFFFFFF, 0xFFFFFFFF, &at) == 0: try failed()
+        return
+
+    private void file_close(File f):
+        _ = CloseHandle(f.handle)
+
+// ── the web ─────────────────────────────────────────────────────────────────
+//
+// No file opens, so every method meets a closed `File`.
+else when #OS == #WEB:
+    os.Error!File open_file(string8 path, Open flags):
+        fail os.Error.UNSUPPORTED
+
+    private os.Error!i64 file_read(File f, rawptr into, i64 count):
+        fail os.Error.INVALID
+
+    private os.Error!void file_write(File f, rawptr bytes, i64 count):
+        fail os.Error.INVALID
+
+    private os.Error!i64 file_seek(File f, i64 offset, i32 from):
+        fail os.Error.INVALID
+
+    private os.Error!void file_truncate(File f, i64 size):
+        fail os.Error.INVALID
+
+    private os.Error!void file_sync(File f):
+        fail os.Error.INVALID
+
+    private os.Error!FileInfo file_info(File f):
+        fail os.Error.INVALID
+
+    private os.Error!bool file_lock(File f, bool exclusive, bool wait):
+        fail os.Error.INVALID
+
+    private os.Error!void file_unlock(File f):
+        fail os.Error.INVALID
+
+    private void file_close(File f):
+        return
+
+// ── POSIX: Linux, macOS and the BSDs ────────────────────────────────────────
+//
+// `lseek` and `ftruncate` go through `fs.dado`'s C accessors, which take
+// `int64_t` whatever `off_t` is. `flock` is `<sys/file.h>`'s, on every system
+// here though not POSIX. FreeBSD hides it from a build that asks for POSIX
+// (this tree's packages do, and FreeBSD has no macro that undoes it), so there
+// it is declared here; its four operations are written out, because they are
+// the same numbers on every system that has it.
+else:
+    when #OS == #FREEBSD:
+        private @c_body("""
+            int flock(int, int);
+            """) i32 g_flock_declared = 0
+
+    private foreign lk "sys/file.h" define "_DEFAULT_SOURCE=1" define "_DARWIN_C_SOURCE=1" define "_NETBSD_SOURCE=1" define "_BSD_SOURCE=1":
+        #c.int flock(#c.int fd, #c.int operation)
+
+    private const i32 LOCK_SH = 1
+    private const i32 LOCK_EX = 2
+    private const i32 LOCK_NB = 4
+    private const i32 LOCK_UN = 8
+
+    private foreign lkerr "errno.h":
+        const i32 errno
+        const i32 EWOULDBLOCK
+
+    private foreign hx "fcntl.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        const i32 O_RDONLY
+        const i32 O_WRONLY
+        const i32 O_RDWR
+        const i32 O_APPEND
+        const i32 O_CREAT
+        const i32 O_EXCL
+        const i32 O_TRUNC
+        const i32 O_CLOEXEC
+        i32 open(cstring path, i32 flags, ...)
+
+    private foreign hx "unistd.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
+        #c.long read(i32 fd, rawptr buf, #c.size_t count)
+        #c.int close(i32 fd)
+        #c.int fsync(i32 fd)
+
+    // `fs.dado`'s C accessors, declared again under this file's own name.
+    private foreign hx "sys/stat.h":
+        #c.int dadofs_fstat(#c.int fd, ^i64 out)
+        i64 dadofs_seek(#c.int fd, i64 offset, #c.int whence)
+        #c.int dadofs_truncate(#c.int fd, i64 size)
+
+    os.Error!File open_file(string8 path, Open flags):
+        if !has(flags, Open.Read) && !has(flags, Open.Write) && !has(flags, Open.Append): fail os.Error.INVALID
+        i32 how = hx.O_RDONLY
+        bool writes = has(flags, Open.Write) || has(flags, Open.Append)
+        if writes && has(flags, Open.Read): how = hx.O_RDWR
+        else if writes: how = hx.O_WRONLY
+        if has(flags, Open.Append): how = how | hx.O_APPEND
+        if has(flags, Open.Create): how = how | hx.O_CREAT
+        if has(flags, Open.Truncate): how = how | hx.O_TRUNC
+        if has(flags, Open.Exclusive): how = how | hx.O_EXCL
+        ref []char8 cp = c_path(path)
+        defer #delete(cp)
+        if cp == nil: fail os.Error.NO_MEMORY
+        i32 fd = hx.open(cstring(cp), how | hx.O_CLOEXEC, 0x1B6)
+        if fd < 0: try failed()
+        if is_dir(path):
+            _ = hx.close(fd)
+            fail os.Error.IS_DIR
+        return (fd, nil, true)
+
+    // A signal that interrupts the read is not a failure: it is asked again.
+    private os.Error!i64 file_read(File f, rawptr into, i64 count):
+        if !f.open: fail os.Error.INVALID
+        i64 want = count
+        if want == 0: return 0
+        if want > 1073741824: want = 1073741824
+        i64 got = 0 - 1
+        for got < 0:
+            got = i64(hx.read(f.fd, into, #c.size_t(want)))
+            if got < 0:
+                os.Error code = failure()
+                if code != os.Error.INTERRUPTED: try os.fail_with(code)
+        return got
+
+    private os.Error!void file_write(File f, rawptr bytes, i64 count):
+        if !f.open: fail os.Error.INVALID
+        try write_all(f.fd, bytes, count)
+        return
+
+    private os.Error!i64 file_seek(File f, i64 offset, i32 from):
+        if !f.open: fail os.Error.INVALID
+        i64 at = hx.dadofs_seek(#c.int(f.fd), offset, #c.int(from))
+        if at < 0: try failed()
+        return at
+
+    private os.Error!void file_truncate(File f, i64 size):
+        if !f.open: fail os.Error.INVALID
+        if hx.dadofs_truncate(#c.int(f.fd), size) != 0: try failed()
+        return
+
+    private os.Error!void file_sync(File f):
+        if !f.open: fail os.Error.INVALID
+        if hx.fsync(f.fd) != 0: try failed()
+        return
+
+    private os.Error!FileInfo file_info(File f):
+        if !f.open: fail os.Error.INVALID
+        StatOut st
+        if hx.dadofs_fstat(#c.int(f.fd), &st[0]) != 0: try failed()
+        return info_of(st)
+
+    private os.Error!bool file_lock(File f, bool exclusive, bool wait):
+        if !f.open: fail os.Error.INVALID
+        i32 op = LOCK_SH
+        if exclusive: op = LOCK_EX
+        if !wait: op = op | LOCK_NB
+        for lk.flock(#c.int(f.fd), #c.int(op)) != 0:
+            if !wait && lkerr.errno == lkerr.EWOULDBLOCK: return false
+            os.Error code = failure()
+            if code != os.Error.INTERRUPTED: try os.fail_with(code)
+        return true
+
+    private os.Error!void file_unlock(File f):
+        if !f.open: fail os.Error.INVALID
+        if lk.flock(#c.int(f.fd), #c.int(LOCK_UN)) != 0: try failed()
+        return
+
+    private void file_close(File f):
+        _ = hx.close(f.fd)

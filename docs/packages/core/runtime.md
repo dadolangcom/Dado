@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f5f6761926d6 (dirty) -->
 # core:runtime
 
 core:runtime — the scratch allocator, its checkpoints, and `TEMP_GUARD`, one
@@ -23,6 +23,28 @@ the rollback would take it back (`dadoc` refuses the caller's use, ERR0803).
 `enter_temp`/`close_temp` is the recommended pattern; `temp_open`/`temp_close`
 with a held `Checkpoint` remain for explicit, non-LIFO control.
 
+**Every target.** Built for Linux, macOS, the BSDs, Windows or the web, the
+scratch is per thread (a web module's workers included), and one a thread
+never configured configures itself over `#heap` at its first temp scope.
+Built freestanding (`#OS == #NONE`) there is no heap to fall back on: the
+program configures the scratch over storage of its own,
+
+    [65536]u8 storage
+    bump.Arena block = bump.over(storage[:])
+    using bump.allocator(&block):
+        _ = runtime.init_scratch(32768, false)
+
+and until it does, an allocation through `temp()` answers nil. Such a
+program builds with `--no-expect`: `TEMP_GUARD` and `enter_temp` warn
+through `#expect`, which has no stream there; the deferrals are kept.
+
+**What raises into a script.** The readings a program watches its scratch
+with (`ready`, `temp_allocs`, `temp_blocks`, `temp_depth`, `deferrals`) and
+`close_temp_keep`, each promised by the `#assert_raises` above it. Every
+other function hands out, marks or rewinds `core:mem/arena` storage, which
+is addressed by `rawptr`, so a script cannot hold what it answers; a script
+allocates from its own heap and has no use for a scratch arena.
+
 This is what replaces `context.temp`, the second of `Context`'s two slots.
 **It is a library and not a language feature**, and the reason it can be one
 is the ladder: `#return` is a durable destination *inside* a temp scope, so
@@ -35,12 +57,12 @@ with its own policy writes this file.
 
 The global namespace is **freestanding-total** — every
 name in it works on a target whose OS is `#NONE`. A scratch arena needs
-storage, and `init_scratch` gets its first block from C's heap, so a name
-like `temp()` in the global namespace would be a global name that does not
-work on half the targets. An import a freestanding build simply omits is the
-honest shape, and `init_scratch_over` is here so that a build with its own
-backing allocator — a static block, a pool, an OS mapping — can have the same
-scratch without `core:mem/libc` and without `<stdlib.h>`.
+storage from somewhere, and a freestanding target has nowhere it can take
+it unasked, so a name like `temp()` in the global namespace would be a
+global name that does not work there until configured. An import is the
+honest shape: `init_scratch` takes its blocks from `#default`, so a build
+with its own backing allocator — a static block, a pool, an OS mapping —
+configures the same scratch under `using` it, without `<stdlib.h>`.
 
 ## What it is made of, and what it is not
 
@@ -105,20 +127,19 @@ see that it happened at all.
 
 ## Declarations
 
-42 declarations, 21 public.
+40 declarations, 20 public.
 
 * `const u64 BLOCK = 65536` — The first block's size, and the one every doubling starts from.
 * `type Checkpoint` — Where the arena was when a scope was entered, and which scope it was.
 * `const u64 SCOPE_MAX = 64` — The recommended `enter_temp`/`close_temp` pattern keeps no `Checkpoint` at the…
-* `bool init_scratch(u64 first_block = BLOCK, bool can_grow = true)`
-* `bool init_scratch_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, u64 first_block, bool can_grow)` — The same, over a backing allocator the caller names.
+* `bool init_scratch(u64 first_block = BLOCK, bool can_grow = true)` — Configure this thread's scratch, taking its blocks from `#default`: C's…
 * `void destroy_scratch()` — Hand every block back. Every reference into the scratch is stale from here…
 * `bool ready()` — Whether this thread's scratch is configured.
-* `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) temp()` — The scratch, as an `Allocator`. This is what `using runtime.temp():` takes.
-* `bool is_temp((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a)` — Whether `a` is this package's scratch, by the state it carries.
+* `(mem.Proc proc, rawptr data) temp()` — The scratch, as an `Allocator`. This is what `using runtime.temp():` takes.
+* `bool is_temp((mem.Proc proc, rawptr data) a)` — Whether `a` is this package's scratch, by the state it carries.
 * `Checkpoint temp_open()` — Enter a temp scope: mark where the arena is, and say a scope is open.
 * `bool temp_close(Checkpoint cp)` — Leave the temp scope `cp` opened, releasing everything allocated since.
-* `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) enter_temp(bool escaping = false)` — Open a temp scope and return the arena as the ambient in one call — the…
+* `(mem.Proc proc, rawptr data) enter_temp(bool escaping = false)` — Open a temp scope and return the arena as the ambient in one call — the…
 * `bool close_temp()` — Close the innermost `enter_temp` frame. `false` when no frame is open or the…
 * `bool close_temp_keep()` — Close the innermost `enter_temp` frame **without** rolling it back, whichever way it…
 * `rawptr close_temp_hoisting(rawptr p, u64 n)` — Close the innermost `enter_temp` frame, rolling it back as `close_temp` does, but…

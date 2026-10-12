@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f94cdafd7289 -->
 # core:path
 
 core:path — the lexical algebra of file paths: join, clean, split, base,
@@ -12,6 +12,10 @@ against (`core:os/fs` answers the working directory) and why `rel` refuses
 what only the file system could answer. So the package builds and runs
 freestanding, on the web and hosted, and answers the same on every host
 for the same target.
+
+**What raises into a script.** Every public function, each promised by the
+`#assert_raises` on the line above it: all of it is Dado over bytes, and
+what makes new text takes the ambient allocator, never one written in.
 
 **The separator follows the target.** Built for Windows (`#OS ==
 #WINDOWS`) every function keeps Windows' rules; built for anything else,
@@ -64,26 +68,24 @@ outside one the caller `#delete`s it. What only cuts (`split`, `base`,
 `ext`, `volume`) answers windows into its argument and allocates nothing.
 Lengths and indices are `i64`.
 
-**Error codes.** `rel` and `match` are failable; `message(code)` answers a
-sentence for each code:
+**Error codes.** `rel` and `match` fail `Error`, this package's own codes
+in 2200 to 2299; `message(why)` answers a sentence for each:
 
-* `BAD_PATTERN` — `match`'s pattern is malformed.
-* `DIFFERENT_ROOTS` — `rel`'s paths are on different volumes, or one is
-  rooted and the other is not.
-* `UNCLIMBABLE` — `rel`'s base climbs out through `..` further than the
-  target, so the way back down needs the file system.
+* `Error.BAD_PATTERN` — `match`'s pattern is malformed.
+* `Error.DIFFERENT_ROOTS` — `rel`'s paths are on different volumes, or one
+  is rooted and the other is not.
+* `Error.UNCLIMBABLE` — `rel`'s base climbs out through `..` further than
+  the target, so the way back down needs the file system.
 
 **Thread-safety.** No package state: every function is safe to call from
 any number of threads at once.
 
 ## Declarations
 
-47 declarations, 19 public.
+45 declarations, 17 public.
 
-* `const i32 BAD_PATTERN = 1` — `match`'s code: the pattern is malformed — a `[` with no `]`, an empty…
-* `const i32 DIFFERENT_ROOTS = 2` — `rel`'s code: the two paths have no common root — different volumes, or…
-* `const i32 UNCLIMBABLE = 3` — `rel`'s code: the base reaches further up through `..` than the target,…
-* `string8 message(i32 code)` — A sentence for each of this package's codes, and one for any other.
+* `distinct enum i32 Error` — Why `rel` or `match` failed. The numbers are this package's, 2200 to…
+* `string8 message(Error why)` — A sentence for each of this package's codes, and one for any other value.
 * `const char8 SEPARATOR = '\\'` — The separator this target writes.
 * `const char8 SEPARATOR = '/'` — The separator this target writes.
 * `bool is_separator(char8 c)` — Whether `c` separates path elements on this target: `/`, and on Windows…
@@ -96,6 +98,6 @@ any number of threads at once.
 * `string8 volume(string8 p)` — The leading volume: on Windows `C:`, `\\server\share`, `\\.\COM1`, …, as…
 * `bool is_abs(string8 p)` — Whether `p` is absolute: it names the same file whatever the current…
 * `ref []char8 abs(string8 p, string8 from)` — `p` made absolute against `from`, cleaned. An absolute `p` is only…
-* `!ref([]char8) rel(string8 from, string8 to)` — The path that names `to` when joined to `from`, by lexical processing…
-* `!bool match(string8 pattern, string8 name)` — Whether the whole of `name` matches the glob `pattern`:
+* `Error!ref []char8 rel(string8 from, string8 to)` — The path that names `to` when joined to `from`, by lexical processing…
+* `Error!bool match(string8 pattern, string8 name)` — Whether the whole of `name` matches the glob `pattern`:
 * `void put(^self, char8 c)`

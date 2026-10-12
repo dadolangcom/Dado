@@ -1,0 +1,111 @@
+// The client: one HTTP/1.1 request, sent and answered, waiting for each step.
+//
+//     try http.Response r = http.get("127.0.0.1", 8080, "/status") else why:
+//         fmt.println("status: ", http.message(why))
+//         return 1
+//     defer r.destroy()
+//     fmt.println(r.status, " ", r.body)
+//
+// Every call connects, sends one request with `Connection: close`, and reads
+// the whole response — sized by `Content-Length`, decoded from chunks, or
+// read until the server closes — then closes. `timeout_ms` bounds the
+// connect, each read and each write, and the whole read; `limit` bounds the
+// bytes. The response's bytes are on `#default` until `destroy`.
+package http
+
+import "core:time"
+
+// The most bytes a response may take unless a call says otherwise: 16 MiB.
+const i64 MAX_RESPONSE = 16777216
+
+// GET `target` (a path and query, `/` when empty) from `host:port`.
+Error!Response get(string8 host, u16 port, string8 target, i32 timeout_ms = 5000):
+    []Header none
+    return request("GET", host, port, target, none, "", timeout_ms)
+
+// POST `body`, of `content_type`, to `target` on `host:port`.
+Error!Response post(string8 host, u16 port, string8 target, string8 content_type, string8 body,
+                    i32 timeout_ms = 5000):
+    [2]Header hs = [("Content-Type", content_type), ("Accept", "*/*")]
+    return request("POST", host, port, target, hs[:], body, timeout_ms)
+
+// Send `method` for `target` to `host:port` with `headers` (after `Host`) and
+// `body`, and read the response — at most `limit` bytes, failing
+// `Error.TOO_LARGE` past it. A HEAD is read without a body. Fails with
+// `dial`'s reasons, `Error.CLOSED` when the server hangs up mid-answer,
+// `Error.TIMED_OUT`, `Error.MALFORMED`, `Error.TOO_LARGE` or
+// `Error.NO_MEMORY`.
+Error!Response request(string8 method, string8 host, u16 port, string8 target, []Header headers,
+                       string8 body, i32 timeout_ms = 5000, i64 limit = MAX_RESPONSE):
+    ref []char8 wire = build_request(method, host, port, target, headers, body)
+    if wire == nil:
+        fail Error.NO_MEMORY
+    try Conn c = dial(host, port, timeout_ms) else why:
+        #delete(wire)
+        fail why
+    string8 bytes = wire
+    try send(c, bytes_of(bytes)) else why:
+        #delete(wire)
+        close_conn(c)
+        fail why
+    #delete(wire)
+    try Response r = read_response(c, timeout_ms, limit, method == "HEAD") else why:
+        close_conn(c)
+        fail why
+    close_conn(c)
+    return r
+
+// Read one whole response from `c`, which stays open: at most `limit` bytes,
+// within `timeout_ms` in all. `head_only` reads the answer to a HEAD. The
+// building block of `request`, for a caller that dialed and sent its own.
+Error!Response read_response(Conn c, i32 timeout_ms = 5000, i64 limit = MAX_RESPONSE,
+                             bool head_only = false):
+    ref []char8 data = #make([]char8, 0)
+    if data == nil:
+        fail Error.NO_MEMORY
+    [8192]u8 chunk
+    time.Instant started = time.instant()
+    bool to_close = false
+    for:
+        string8 have = data
+        try Extent extent = response_end(have, head_only) else why:
+            #delete(data)
+            fail why
+        i64 whole = -1
+        switch extent:
+            case Whole w:
+                whole = w.length
+            case ToClose _:
+                to_close = true
+            case Pending _:
+                to_close = false
+        if whole > limit:
+            #delete(data)
+            fail Error.TOO_LARGE
+        if whole >= 0:
+            #truncate(data, whole)
+            break
+        if i64(#len(data)) > limit:
+            #delete(data)
+            fail Error.TOO_LARGE
+        i64 left = i64(timeout_ms) - time.as_milliseconds(time.elapsed(started))
+        if left <= 0:
+            #delete(data)
+            fail Error.TIMED_OUT
+        try set_timeout(c, i32(left)) else why:
+            #delete(data)
+            fail why
+        try i64 n = receive(c, chunk[:]) else why:
+            #delete(data)
+            fail why
+        if n == 0:
+            // The server closed: whole only when the body runs to the close.
+            if to_close:
+                break
+            #delete(data)
+            fail Error.CLOSED
+        for i in 0..<n:
+            if !#append(data, char8(chunk[i])):
+                #delete(data)
+                fail Error.NO_MEMORY
+    return parse_response(data, head_only)

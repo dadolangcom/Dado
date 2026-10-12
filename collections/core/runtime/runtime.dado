@@ -19,6 +19,28 @@
 // `enter_temp`/`close_temp` is the recommended pattern; `temp_open`/`temp_close`
 // with a held `Checkpoint` remain for explicit, non-LIFO control.
 //
+// **Every target.** Built for Linux, macOS, the BSDs, Windows or the web, the
+// scratch is per thread (a web module's workers included), and one a thread
+// never configured configures itself over `#heap` at its first temp scope.
+// Built freestanding (`#OS == #NONE`) there is no heap to fall back on: the
+// program configures the scratch over storage of its own,
+//
+//     [65536]u8 storage
+//     bump.Arena block = bump.over(storage[:])
+//     using bump.allocator(&block):
+//         _ = runtime.init_scratch(32768, false)
+//
+// and until it does, an allocation through `temp()` answers nil. Such a
+// program builds with `--no-expect`: `TEMP_GUARD` and `enter_temp` warn
+// through `#expect`, which has no stream there; the deferrals are kept.
+//
+// **What raises into a script.** The readings a program watches its scratch
+// with (`ready`, `temp_allocs`, `temp_blocks`, `temp_depth`, `deferrals`) and
+// `close_temp_keep`, each promised by the `#assert_raises` above it. Every
+// other function hands out, marks or rewinds `core:mem/arena` storage, which
+// is addressed by `rawptr`, so a script cannot hold what it answers; a script
+// allocates from its own heap and has no use for a scratch arena.
+//
 // This is what replaces `context.temp`, the second of `Context`'s two slots.
 // **It is a library and not a language feature**, and the reason it can be one
 // is the ladder: `#return` is a durable destination *inside* a temp scope, so
@@ -31,12 +53,12 @@
 //
 // The global namespace is **freestanding-total** — every
 // name in it works on a target whose OS is `#NONE`. A scratch arena needs
-// storage, and `init_scratch` gets its first block from C's heap, so a name
-// like `temp()` in the global namespace would be a global name that does not
-// work on half the targets. An import a freestanding build simply omits is the
-// honest shape, and `init_scratch_over` is here so that a build with its own
-// backing allocator — a static block, a pool, an OS mapping — can have the same
-// scratch without `core:mem/libc` and without `<stdlib.h>`.
+// storage from somewhere, and a freestanding target has nowhere it can take
+// it unasked, so a name like `temp()` in the global namespace would be a
+// global name that does not work there until configured. An import is the
+// honest shape: `init_scratch` takes its blocks from `#default`, so a build
+// with its own backing allocator — a static block, a pool, an OS mapping —
+// configures the same scratch under `using` it, without `<stdlib.h>`.
 //
 // ## What it is made of, and what it is not
 //
@@ -101,7 +123,6 @@
 package runtime
 
 import "core:mem"
-import "core:mem/libc"
 import "core:mem/arena"
 
 // The first block's size, and the one every doubling starts from.
@@ -121,7 +142,7 @@ const u64 BLOCK = 65536
 // attribute emits the plain object.
 //
 // **A new thread starts unconfigured, and its first temp scope configures it**
-// over C's heap with the defaults (`configure_default`), so a thread spawned
+// over `#heap` with the defaults (`configure_default`), so a thread spawned
 // into a program that called `init_scratch` once needs no call of its own. It
 // frees nothing when it ends: a thread that used the scratch calls
 // `destroy_scratch()` before it returns, or its blocks are unreachable from
@@ -198,48 +219,43 @@ private @thread_local u64 g_frames_top
 
 // ── Lifetime ─────────────────────────────────────────────────────────────────
 
-// Configure the scratch over C's heap. `false` if it is already configured —
-// call `destroy_scratch` first — or if the heap could not be reached.
+// Configure this thread's scratch, taking its blocks from `#default`: C's
+// heap at depth 0 on a hosted target, or whatever allocator the call is made
+// under — `using pool: runtime.init_scratch()` — which is the freestanding door
+// and the testing door at once. A nil `#default` means the root, `#heap`.
+// `false` if it is already configured (call `destroy_scratch` first), if there
+// is no allocator to take from (`#NONE` at depth 0), or if it could not supply
+// the first block.
 //
-// **It asks for the first block here**, as `init_scratch_over` does, and
-// keeps it (C2-04). Configured lazily, the scratch was empty at every depth-1
-// frame's mark, so closing the frame handed the block back and the next frame
-// asked for it again: an allocation, a zeroing and a free per frame, and
-// `temp_blocks()` read 0 between them. A mark taken in a block keeps that block,
-// so the one block a program pays for at configuration is the one every frame
-// reuses. C's heap needs no alignment check at the door: `malloc` answers
-// storage aligned for any object, by C11 §7.22.3 — `arena.prime` asks anyway,
-// and costs nothing when the answer is yes.
+// The allocator is captured for the scratch's whole life, so it must outlive
+// it: the `using` it was configured under may close, but the allocator it
+// named may not end before `destroy_scratch`.
 //
-// **Hosted only.** C's heap is `core:mem/libc`, which is `<stdlib.h>`, which a
-// target whose `#OS` is `#NONE` does not have — and because liveness is per
-// package, a `#NONE` program that called only `init_scratch_over` still reached
-// `libc` through this one line and emitted the `#include`. Inside the `when`,
-// the name does not exist on `#NONE`, `libc` is never reached, and
-// `init_scratch_over` is the door. The `|| #OS == #UNKNOWN_OS` selects nothing
-// `#OS != #NONE` did not; it is there because a `when` over `#OS` under a
-// triple this compiler does not enumerate has to name `#UNKNOWN_OS`
-// (`ERR0908`), as `tests/collections/core/fmt` explains.
-when #OS != #NONE || #OS == #UNKNOWN_OS:
-    bool init_scratch(u64 first_block = BLOCK, bool can_grow = true):
-        return init_scratch_over(libc.allocator(), first_block, can_grow)
+// **It asks for the first block here** (`arena.prime`), and keeps it.
+// Configured lazily, the scratch was empty at every depth-1 frame's mark, so
+// closing the frame handed the block back and the next frame asked for it
+// again: an allocation, a zeroing and a free per frame, and `temp_blocks()`
+// read 0 between them. A mark taken in a block keeps that block, so the one
+// block a program pays for at configuration is the one every frame reuses.
+// And a block that is **not aligned** to `mem.MAX_ALIGN` — a hand-written
+// allocator over a byte run, over the stack, over an offset into someone
+// else's storage — is refused here with `false`, rather than as `#make`
+// answering nil three frames away.
+//
+// Not promised to raise into a script: the scratch is `core:mem/arena` storage,
+// addressed by `rawptr`.
+bool init_scratch(u64 first_block = BLOCK, bool can_grow = true):
+    (mem.Proc proc, rawptr data) backing = #default
+    if backing.proc == nil:
+        // At depth 0 `#default` is the root, and the compiler roots it — C's
+        // heap, where there is one — only in a program that allocates through
+        // the verbs; elsewhere it reads as two nil words. `#heap` is that root
+        // named directly: C's heap on a hosted target, nil on `#NONE`.
+        backing = #heap
+    return configure_over(backing, first_block, can_grow)
 
-// The same, over a backing allocator the caller names.
-//
-// This is the freestanding door and the testing door at once: a build with no
-// C heap hands in a block of its own, and a test hands in a counting allocator
-// so that *when* the scratch asks for storage is a claim rather than a guess.
-//
-// **It asks for the first block here** (`arena.prime`), and answers `false` —
-// unconfigured — when the backing allocator cannot supply one, or supplies
-// one that is not aligned to `mem.MAX_ALIGN`. A backing this door knows
-// nothing about is exactly where a misaligned block comes from — a
-// hand-written allocator over a byte run, over the stack, over an offset into
-// someone else's storage — and before this the answer was `true` and the
-// refusal arrived as `#make` answering nil three frames away. So a caller's
-// allocator pays for one block at configuration rather than at first use, and
-// in exchange `true` means the scratch works.
-bool init_scratch_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, u64 first_block, bool can_grow):
+// `init_scratch`'s body over a backing named, for the lazy default too.
+private bool configure_over((mem.Proc proc, rawptr data) backing, u64 first_block, bool can_grow):
     if !configure(backing, first_block, can_grow):
         return false
     if !arena.prime(&g_scratch):
@@ -249,7 +265,7 @@ bool init_scratch_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) pro
 
 // The state both doors set, and the checks both make: not already configured,
 // and a backing allocator that is not nil.
-private bool configure((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, u64 first_block, bool can_grow):
+private bool configure((mem.Proc proc, rawptr data) backing, u64 first_block, bool can_grow):
     if g_ready || backing.proc == nil:
         return false
     u64 n = first_block
@@ -268,6 +284,9 @@ private bool configure((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) pro
 // Hand every block back. Every reference into the scratch is stale from here
 // and nothing detects it; this is the shutdown call, not the
 // per-frame one — `reset_scratch` is that.
+//
+// Not promised to raise into a script: it hands back `core:mem/arena` blocks,
+// addressed by `rawptr`.
 void destroy_scratch():
     arena.destroy(&g_scratch)
     g_ready = false
@@ -278,6 +297,7 @@ void destroy_scratch():
     return
 
 // Whether this thread's scratch is configured.
+#assert_raises
 bool ready():
     return g_ready
 
@@ -285,20 +305,18 @@ bool ready():
 //
 // The door a new thread comes through: `temp_open` and an allocation through
 // `temp()` both ask it first, so a spawned thread's scratch is its own from its
-// first scope with no call of its own. Hosted only, for `init_scratch`'s
-// reason — on `#NONE` there is no heap to default to, the answer is `false`,
-// and `temp()` answers `nil` rather than carving from an arena with no backing.
+// first scope with no call of its own.
+//
+// **Over `#heap`, not `#default`.** This runs inside an allocation through
+// `temp()` — under `using runtime.temp()`, where `#default` *is* the scratch,
+// and an arena backed by itself asks itself for its first block forever. The
+// root heap is what a configured program's `init_scratch` takes at depth 0
+// anyway. On `#NONE` it is the nil allocator, so the answer is `false` and
+// `temp()` answers `nil` rather than carving from an arena with no backing.
 private bool ensure():
     if g_ready:
         return true
-    return configure_default()
-
-when #OS != #NONE || #OS == #UNKNOWN_OS:
-    private bool configure_default():
-        return init_scratch(BLOCK, true)
-else:
-    private bool configure_default():
-        return false
+    return configure_over(#heap, BLOCK, true)
 
 // ── The allocator ────────────────────────────────────────────────────────────
 
@@ -307,7 +325,10 @@ else:
 // A value and not a singleton: two words, and copying it copies two words. The
 // arena is the `data`, so it is borrowed by pointer — and it is a package-level
 // object, so it outlives every allocation made through it by construction.
-(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) temp():
+//
+// Not promised to raise into a script: it answers an allocator, which is two
+// addresses.
+(mem.Proc proc, rawptr data) temp():
     return (temp_proc, rawptr(&g_scratch))
 
 // Whether `a` is this package's scratch, by the state it carries.
@@ -315,13 +336,19 @@ else:
 // The question `example/memory` wrote as `#default == runtime.temp()`. An
 // `Allocator` is a procedure and a pointer and the pointer is the identity here,
 // because exactly one arena is ever behind `temp_proc`.
-bool is_temp((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a):
+//
+// The two words and not the `Allocator` trait, because the question is asked
+// of a rung (`runtime.is_temp(#default)`), and a trait binder takes
+// implementers only.
+//
+// Not promised to raise into a script: it compares an allocator's addresses.
+bool is_temp((mem.Proc proc, rawptr data) a):
     return a.data == rawptr(&g_scratch) && a.proc != nil
 
 private rawptr temp_proc(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
     if data == nil:
         return nil
-    (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) inner = arena.allocator(ArenaPtr(data))
+    (mem.Proc proc, rawptr data) inner = arena.allocator(ArenaPtr(data))
     switch mode:
         case mem.AllocatorMode.FreeAll:
             // The whole difference between this allocator and the arena
@@ -364,6 +391,9 @@ private bool fits(u64 nbytes, u64 align):
 // O(1), and it is where a surviving deferral is discharged (see the header).
 // At depth zero no scope is open, so the reset frees only storage whose scope
 // has already been left.
+//
+// Not promised to raise into a script: a `Checkpoint` holds an `arena.Mark`,
+// which is addresses.
 Checkpoint temp_open():
     _ = ensure()
     if g_depth == 0 && g_deferred > 0:
@@ -380,6 +410,9 @@ Checkpoint temp_open():
 // `true` when the rewind happened, `false` when `TEMP_GUARD` deferred it. One
 // store per block released and one per block — never one per allocation, which
 // is the property that makes a scratch allocator worth having.
+//
+// Not promised to raise into a script: it rewinds `rawptr`-addressed arena
+// storage.
 bool temp_close(Checkpoint cp):
     if !guard(cp.serial == g_open):
         // The scope is still left, so a program that misuses the API loses
@@ -423,7 +456,10 @@ bool temp_close(Checkpoint cp):
 // function has both heavy internal scratch and an escaping result, split it
 // (the result minted on `#return` before the frame opens, the internal work in
 // the frame) rather than escaping the whole frame.
-(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) enter_temp(bool escaping = false):
+//
+// Not promised to raise into a script: it answers an allocator, which is two
+// addresses.
+(mem.Proc proc, rawptr data) enter_temp(bool escaping = false):
     if !#expect(g_frames_top < SCOPE_MAX, "runtime.enter_temp: more than ", SCOPE_MAX, " nested temp frames — opening none; look for a missing close_temp"):
         return temp()
     Checkpoint cp = temp_open()
@@ -436,6 +472,9 @@ bool temp_close(Checkpoint cp):
 // rewind was deferred by TEMP_GUARD; `true` otherwise. A `nested` frame rolls
 // the arena back to its mark; an `escaping` frame leaves its bytes by design and
 // only unwinds the scope bookkeeping.
+//
+// Not promised to raise into a script: it rewinds `rawptr`-addressed arena
+// storage.
 bool close_temp():
     if g_frames_top == 0:
         return false
@@ -465,6 +504,7 @@ bool close_temp():
 // in particular, a caller's result grown **inside** the frame by an allocator that
 // turned out to draw from this scratch (see `temp_allocs`), whose growth a rollback
 // would take back while the caller still holds it.
+#assert_raises
 bool close_temp_keep():
     if g_frames_top == 0:
         return false
@@ -494,6 +534,8 @@ bool close_temp_keep():
 // answered. So is a close that `TEMP_GUARD` defers because the frame is not the
 // innermost open scope. `nil` when no frame is open, or when `p` is not the frame's
 // last allocation — the frame is then rolled back anyway, and the bytes are gone.
+//
+// Not promised to raise into a script: it takes and answers a `rawptr`.
 rawptr close_temp_hoisting(rawptr p, u64 n):
     if g_frames_top == 0:
         return nil
@@ -524,6 +566,9 @@ rawptr close_temp_hoisting(rawptr p, u64 n):
 // `false` when `TEMP_GUARD` deferred it. This is the **handle** a program needs
 // for what it used to write as `context.temp.proc(context.temp.data,
 // AllocatorMode.FreeAll, …)`: the same rollback, named, and guarded.
+//
+// Not promised to raise into a script: it rewinds `rawptr`-addressed arena
+// storage.
 bool reset_scratch():
     if !guard(g_depth == 0):
         return false
@@ -558,11 +603,15 @@ private bool guard(bool safe):
 // ── Reporting ────────────────────────────────────────────────────────────────
 
 // How many bytes the scratch is holding, across every block.
+//
+// Not promised to raise into a script: it walks the arena's blocks, which are
+// addresses.
 u64 temp_used():
     return arena.used(g_scratch)
 
 // How many blocks are live. The number a frame loop watches: it should stop
 // growing.
+#assert_raises
 u64 temp_blocks():
     return arena.blocks(g_scratch)
 
@@ -572,15 +621,18 @@ u64 temp_blocks():
 // from the scratch in between. That is the question `is_temp` cannot answer about an
 // allocator that only draws from the scratch: read it, grow a caller's result, read it
 // again, and close with `close_temp_keep` if it moved.
+#assert_raises
 u64 temp_allocs():
     return g_temp_allocs
 
 // How many temp scopes are open on this thread.
+#assert_raises
 u64 temp_depth():
     return g_depth
 
 // How many rollbacks `TEMP_GUARD` has deferred on this thread, ever. Nonzero is not a failure
 // — the guard did its job — but it is a program that is bloating where it meant
 // to reset, and it is worth printing.
+#assert_raises
 u64 deferrals():
     return g_deferrals

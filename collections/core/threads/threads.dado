@@ -1,57 +1,144 @@
-// core:threads — portable threads, locks, condition variables and atomics.
+// core:threads: threads, locks, condition variables and atomics, on every
+// hosted target and on the web.
 //
-// A thin, framework-agnostic wrapper over POSIX threads, and the foundation
-// core:jobs builds its worker pool on. Handles are opaque `rawptr`s; a thread
-// entry is an ordinary Dado function reference passed to C as a function
-// pointer.
+//     import "core:threads"
 //
-// **It is Dado over the C library, with no C of its own.** A `foreign` block
-// names the header's own types and functions and cc checks the restatement
-// against `<pthread.h>`; the atomics are the language's `#atomic_*` verbs.
+//     rawptr work(rawptr arg):
+//         return arg
 //
-// `pthread_join` takes a `pthread_t` **by value**, and that is the call this
-// package carried a two-file C shim for. It does not need one: a bodiless
-// `foreign` type is complete in C, so `pthread_t` crosses by value and `cc`
-// supplies the size — which is the only place the size was ever a question,
-// since restating it as an integer is true of glibc and false of Darwin,
-// where it is a pointer.
+//     threads.Thread t = threads.spawn(work, nil)
+//     try rawptr answer = threads.join_result(t) else why:
+//         fmt.println("join: ", threads.message(why))
 //
-// This is a `core:` library, not `app:` — it owes tests, because it wraps
-// lower-level C and OS code: a concurrency engine is exactly what a test is
-// for.
+// **Tier W H.** Linux, macOS, the BSDs and Windows run a thread on the
+// operating system's own: POSIX threads on the first three, and on Windows
+// `_beginthreadex`, slim reader/writer locks and condition variables. On the
+// web a thread is a worker on the module's shared memory, which a module has
+// only when it is built with `--web-threads`. A single-threaded web module
+// has no second thread: there `spawn` is refused at compile time (ERR1033),
+// `try_spawn` answers nil at run time, and every lock and wait works on the
+// one thread there is. A `#NONE` build is refused by the static assertion
+// below, because a freestanding target has no scheduler to run a second
+// thread on and its one thread needs no lock.
+//
+// **What raises into a script.** `message` alone, promised by the
+// `#assert_raises` above it. Everything else is a thread primitive, and could
+// not: spawning, joining, locking and waiting call the operating system or the
+// web runtime through a `foreign` block; a handle is a pointer into C's heap;
+// and the atomics, `Once` and `current_id` are atomic accesses. A script
+// shares no memory with another thread, so it has no use for any of them.
+//
+// **Handles are typed**: `Thread`, `Mutex`, `Cond` and `RwLock` are each a
+// `distinct` pointer into C's heap, so a condition variable handed where a
+// mutex is asked, or two arguments swapped, is a compile error. A nil handle
+// is the failed one (`spawn`, `mutex_new`, `cond_new` and `rwlock_new` answer
+// nil when they cannot make theirs), and every function that takes a handle
+// ignores a nil one, so a failed `mutex_new` makes `lock` do nothing rather
+// than crash. `Semaphore`, `WaitGroup`, `Barrier` and `Once` are values a
+// caller keeps in place (a package variable, or memory every thread can
+// reach) and passes by address; they are written here, in Dado, over the
+// mutex and condition variable, so they behave alike on every target, and
+// their constructors fail rather than answer one that cannot work.
+//
+// **Failure: `Error`, 2500 to 2599**, a range no other package's codes use.
+// `join_result` fails `NO_THREAD` for a nil handle, `CANNOT_WAIT` on a
+// browser's main thread and `JOIN_FAILED` when the system refuses; the
+// constructors of `Semaphore`, `WaitGroup` and `Barrier` fail `NO_MEMORY`
+// when their mutex or condition variable cannot be made.
+//
+// **An interval is a `time.Duration`**: `cond_wait_for`,
+// `Semaphore.acquire_for` and `WaitGroup.wait_for` take one, measured on a
+// monotonic clock.
 //
 // ## What a spawned thread shares, and what it does not
 //
-// **Its own:** the ambient allocator — a new thread starts at the root, C's
-// heap, never at the `using` its spawner has open, and a `using` it opens is
-// undone on it alone — and `core:runtime`'s scratch, whose depth, checkpoints
-// and arena are per thread (its first temp scope configures it). Any
+// Its own: the ambient allocator (a new thread starts at the root, C's heap,
+// never at the `using` its spawner has open, and a `using` it opens is undone
+// on it alone) and `core:runtime`'s scratch, whose depth, checkpoints and
+// arena are per thread (its first temp scope configures it). Any
 // package-level variable declared `@thread_local` is per thread the same way,
 // starting at its initializer.
 //
-// **Shared, and not synchronised by anything but you:** every other
-// package-level variable, everything a pointer reaches, and every map — two
-// threads writing one `{K: V}`, even on disjoint keys, corrupt its table. Guard
-// those with `mutex_new`/`lock`/`unlock`, or hand each thread its own. Build a
-// test that spawns with `./dado test --sanitize=thread` as well as the default.
+// Shared, and synchronised only by the program: every other package-level
+// variable, everything a pointer reaches, and every map. Two threads writing
+// one `{K: V}`, even on disjoint keys, corrupt its table. Guard those with
+// `mutex_new`, `lock` and `unlock`, or hand each thread its own. Build a test
+// that spawns with `./dado test --sanitize=thread` as well as the default.
 package threads
 
-// A thread entry: takes the argument pointer it was spawned with, returns a
-// result pointer (or nil). Matches C's `void *(*)(void *)`.
+import "core:time"
+
+#static_assert(#OS != #NONE, "core:threads needs an operating system or a web host to run a second thread on, and a #NONE target has neither; a freestanding program runs on its one thread and needs no lock")
+
+// A running thread, from `spawn` or `try_spawn`, until `join` or
+// `join_result` consumes it. Nil is the thread that could not be started.
+distinct type Thread: rawptr
+
+// A mutex, from `mutex_new`, until `mutex_free`. Nil is the one that could not
+// be made.
+distinct type Mutex: rawptr
+
+// A condition variable, from `cond_new`, until `cond_free`. Nil is the one
+// that could not be made.
+distinct type Cond: rawptr
+
+// A reader/writer lock, from `rwlock_new`, until `rwlock_free`. Nil is the one
+// that could not be made.
+distinct type RwLock: rawptr
+
+// Why a join or a constructor failed. The numbers are this package's, 2500 to
+// 2599, apart from every other package's, so a code read anywhere never means
+// two things.
+distinct enum i32 Error:
+    // The handle is nil: the thread was never started.
+    NO_THREAD = 2500,
+    // This thread may not wait: a browser's main thread cannot join. The
+    // handle is kept, so a worker can join it.
+    CANNOT_WAIT,
+    // The system refused the join.
+    JOIN_FAILED,
+    // A mutex or condition variable could not be allocated or initialised.
+    NO_MEMORY,
+
+// A sentence for each of this package's codes, and one for any other value.
+#assert_raises
+string8 message(Error why):
+    if why == Error.NO_THREAD: return "no thread: the handle is nil, so the thread was never started"
+    if why == Error.CANNOT_WAIT: return "this thread cannot wait: a browser's main thread cannot join, so join from a worker"
+    if why == Error.JOIN_FAILED: return "the system refused to join the thread"
+    if why == Error.NO_MEMORY: return "a mutex or condition variable could not be made"
+    return "not a core:threads error code"
+
+// `ns` in whole milliseconds, rounded up, for the platforms whose waits take
+// milliseconds. Saturates rather than overflowing, for a wait as long as a
+// `time.Duration` holds (a saturated deadline's `left()`).
+private i64 ceil_ms(i64 ns):
+    if ns > 9223372036854775807 - 999999:
+        return 9223372036854775807 / 1000000
+    return (ns + 999999) / 1000000
+
+// A thread's entry point: it takes the argument it was spawned with and
+// answers a result pointer (or nil), which `join_result` hands to the
+// joiner. Matches C's `void *(*)(void *)`.
 type ThreadFn: rawptr(rawptr)
 
-// **On the web** a thread is a worker on the module's shared memory, and the
-// calls below are the runtime the compiler emits into a `#WEB` program,
-// through its `dado/web.h` (not a C header: the runtime's own). A module has
-// threads only when built with `--web-threads`; without it `spawn` is refused
-// at compile time (ERR1033) and the rest works on the one thread there is. A
-// browser's main thread cannot wait, so a `join` there answers false and
-// says why on standard error; join from a worker. Node's main thread can.
+// What `Once.call` runs: the data pointer it was given.
+type OnceFn: void(rawptr)
+
+// ── the web: the runtime's workers ──────────────────────────────────────────
+//
+// The calls below are the runtime the compiler emits into a `#WEB` program,
+// through its `dado/web.h` (not a C header: the runtime's own), which also
+// defines C's `malloc` and `free` over linear memory. A browser's main thread
+// cannot wait, so a join there answers false and says why on standard error
+// (join from a worker; node's main thread can wait), a lock there spins, and
+// a condition wait there returns at once, as a condition wait always may.
 when #OS == #WEB:
     private foreign "dado/web.h":
         rawptr dado_rt__web_thread_spawn(ThreadFn entry, rawptr arg)
         bool dado_rt__web_thread_join(rawptr handle)
         i32 dado_rt__web_thread_cores()
+        void dado_rt__web_thread_yield()
         rawptr dado_rt__web_mutex_new()
         void dado_rt__web_mutex_lock(rawptr m)
         void dado_rt__web_mutex_unlock(rawptr m)
@@ -62,49 +149,366 @@ when #OS == #WEB:
         void dado_rt__web_cond_signal(rawptr c)
         void dado_rt__web_cond_broadcast(rawptr c)
         void dado_rt__web_cond_free(rawptr c)
+        rawptr malloc(#c.size_t nbytes)
+        void free(rawptr ptr)
 
-    rawptr spawn(ThreadFn fn, rawptr arg): return dado_rt__web_thread_spawn(fn, arg)
+    // A thread handle on the web: the runtime discards an entry's result, so
+    // `web_entry` runs the caller's function and keeps it here for the join.
+    private type WebThread:
+        rawptr   handle
+        ThreadFn fn
+        rawptr   arg
+        rawptr   result
 
-    bool join(rawptr t): return dado_rt__web_thread_join(t)
+    private type PWebThread: ^WebThread
 
-    i32 hardware_concurrency(): return dado_rt__web_thread_cores()
+    // The runtime's mutex is one `i32`: 0 free, 1 held, 2 held with waiters.
+    private type PWord: ^i32
 
-    rawptr mutex_new(): return dado_rt__web_mutex_new()
+    // Runs on the new worker: the caller's function, its result kept.
+    private rawptr web_entry(rawptr box):
+        PWebThread t = PWebThread(box)
+        t.result = t.fn(t.arg)
+        return nil
 
-    void lock(rawptr m): dado_rt__web_mutex_lock(m)
+    private rawptr sys_spawn(ThreadFn fn, rawptr arg):
+        rawptr box = malloc(#c.size_t(#size(WebThread)))
+        if box == nil:
+            return nil
+        PWebThread t = PWebThread(box)
+        t.fn = fn
+        t.arg = arg
+        t.result = nil
+        rawptr handle = dado_rt__web_thread_spawn(web_entry, box)
+        if handle == nil:
+            free(box)
+            return nil
+        t.handle = handle
+        return box
 
-    void unlock(rawptr m): dado_rt__web_mutex_unlock(m)
+    // A refused join (a browser's main thread) keeps the handle, so a worker
+    // can still join it.
+    private bool sys_join(rawptr box, ^rawptr result):
+        PWebThread t = PWebThread(box)
+        if !dado_rt__web_thread_join(t.handle):
+            return false
+        if result != nil:
+            result^ = t.result
+        free(box)
+        return true
 
-    void mutex_free(rawptr m): dado_rt__web_mutex_free(m)
+    private i32 sys_cores(): return dado_rt__web_thread_cores()
 
-    rawptr cond_new(): return dado_rt__web_cond_new()
+    private void sys_yield(): dado_rt__web_thread_yield()
 
-    void cond_wait(rawptr c, rawptr m): dado_rt__web_cond_wait(c, m)
+    private rawptr sys_mutex_new(): return dado_rt__web_mutex_new()
 
-    // At most `ms` milliseconds; true when woken. A single-threaded module
-    // has nobody to wake it, so there the time runs out at once.
-    bool cond_wait_for(rawptr c, rawptr m, i64 ms): return dado_rt__web_cond_wait_for(c, m, ms)
+    private void sys_lock(rawptr m): dado_rt__web_mutex_lock(m)
 
-    void cond_signal(rawptr c): dado_rt__web_cond_signal(c)
+    // The runtime's own lock takes the word from 0 to 1 in its uncontended
+    // case, and so does this, once.
+    private bool sys_try_lock(rawptr m):
+        (i32 _, bool took) = #atomic_compare_exchange(PWord(m), 0, 1, false, #ACQUIRE, #RELAXED)
+        return took
 
-    void cond_broadcast(rawptr c): dado_rt__web_cond_broadcast(c)
+    private void sys_unlock(rawptr m): dado_rt__web_mutex_unlock(m)
 
-    void cond_free(rawptr c): dado_rt__web_cond_free(c)
+    private void sys_mutex_free(rawptr m): dado_rt__web_mutex_free(m)
 
+    private rawptr sys_cond_new(): return dado_rt__web_cond_new()
+
+    private void sys_cond_wait(rawptr c, rawptr m): dado_rt__web_cond_wait(c, m)
+
+    // The runtime waits whole milliseconds, so the wait is rounded up.
+    private bool sys_cond_wait_for(rawptr c, rawptr m, i64 ns): return dado_rt__web_cond_wait_for(c, m, ceil_ms(ns))
+
+    private void sys_cond_signal(rawptr c): dado_rt__web_cond_signal(c)
+
+    private void sys_cond_broadcast(rawptr c): dado_rt__web_cond_broadcast(c)
+
+    private void sys_cond_free(rawptr c): dado_rt__web_cond_free(c)
+
+    // The web runtime has no reader/writer lock, so one is written here over
+    // its mutex and condition variable. A waiting writer holds new readers
+    // back, so a stream of readers cannot starve it.
+    private type WebRw:
+        rawptr m
+        rawptr c
+        i32    readers
+        i32    writer
+        i32    writers_waiting
+
+    private type PWebRw: ^WebRw
+
+    private rawptr sys_rwlock_new():
+        rawptr box = malloc(#c.size_t(#size(WebRw)))
+        if box == nil:
+            return nil
+        PWebRw rw = PWebRw(box)
+        rw.m = dado_rt__web_mutex_new()
+        rw.c = dado_rt__web_cond_new()
+        rw.readers = 0
+        rw.writer = 0
+        rw.writers_waiting = 0
+        if rw.m == nil || rw.c == nil:
+            sys_rwlock_free(box)
+            return nil
+        return box
+
+    private void sys_read_lock(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_lock(rw.m)
+        for rw.writer != 0 || rw.writers_waiting > 0:
+            dado_rt__web_cond_wait(rw.c, rw.m)
+        rw.readers += 1
+        dado_rt__web_mutex_unlock(rw.m)
+
+    private bool sys_try_read_lock(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_lock(rw.m)
+        bool took = rw.writer == 0 && rw.writers_waiting == 0
+        if took:
+            rw.readers += 1
+        dado_rt__web_mutex_unlock(rw.m)
+        return took
+
+    private void sys_read_unlock(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_lock(rw.m)
+        if rw.readers > 0:
+            rw.readers -= 1
+        if rw.readers == 0:
+            dado_rt__web_cond_broadcast(rw.c)
+        dado_rt__web_mutex_unlock(rw.m)
+
+    private void sys_write_lock(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_lock(rw.m)
+        rw.writers_waiting += 1
+        for rw.writer != 0 || rw.readers > 0:
+            dado_rt__web_cond_wait(rw.c, rw.m)
+        rw.writers_waiting -= 1
+        rw.writer = 1
+        dado_rt__web_mutex_unlock(rw.m)
+
+    private bool sys_try_write_lock(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_lock(rw.m)
+        bool took = rw.writer == 0 && rw.readers == 0
+        if took:
+            rw.writer = 1
+        dado_rt__web_mutex_unlock(rw.m)
+        return took
+
+    private void sys_write_unlock(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_lock(rw.m)
+        rw.writer = 0
+        dado_rt__web_cond_broadcast(rw.c)
+        dado_rt__web_mutex_unlock(rw.m)
+
+    private void sys_rwlock_free(rawptr l):
+        PWebRw rw = PWebRw(l)
+        dado_rt__web_mutex_free(rw.m)
+        dado_rt__web_cond_free(rw.c)
+        free(l)
+
+// ── Windows: _beginthreadex, SRWLOCK and CONDITION_VARIABLE ─────────────────
+//
+// A thread is started with the C runtime's `_beginthreadex`, so the runtime
+// sets up its per-thread state, and joined with `WaitForSingleObject`. The
+// entry Windows calls answers an `unsigned` where a `ThreadFn` answers a
+// pointer, so each thread starts at `win_entry`, which runs the caller's
+// function and keeps its result in the handle for the join. Its C type is
+// `unsigned (__stdcall *)(void *)`; `__stdcall` changes nothing on x86-64
+// or ARM64, the two Windows targets Dado builds for.
+//
+// A mutex and a reader/writer lock are each an `SRWLOCK`, and a condition
+// variable a `CONDITION_VARIABLE`; neither needs a destroy call, so freeing
+// one frees its memory. An SRW lock is not recursive, as a default POSIX
+// mutex is not: locking one twice on one thread deadlocks. `DWORD` is
+// `unsigned long`, 32 bits on Windows, and `BOOLEAN` is `unsigned char`.
+else when #OS == #WINDOWS:
+    private type WinEntry: #c.uint(rawptr)
+
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        type SRWLOCK
+
+        type CONDITION_VARIABLE
+
+        const #c.ulong INFINITE
+
+        const #c.ulong WAIT_OBJECT_0
+
+        void InitializeSRWLock(^SRWLOCK lock)
+        void AcquireSRWLockExclusive(^SRWLOCK lock)
+        void ReleaseSRWLockExclusive(^SRWLOCK lock)
+        #c.uchar TryAcquireSRWLockExclusive(^SRWLOCK lock)
+        void AcquireSRWLockShared(^SRWLOCK lock)
+        void ReleaseSRWLockShared(^SRWLOCK lock)
+        #c.uchar TryAcquireSRWLockShared(^SRWLOCK lock)
+        void InitializeConditionVariable(^CONDITION_VARIABLE cv)
+        #c.int SleepConditionVariableSRW(^CONDITION_VARIABLE cv, ^SRWLOCK lock, #c.ulong milliseconds, #c.ulong flags)
+        void WakeConditionVariable(^CONDITION_VARIABLE cv)
+        void WakeAllConditionVariable(^CONDITION_VARIABLE cv)
+        #c.ulong WaitForSingleObject(rawptr handle, #c.ulong milliseconds)
+        #c.int CloseHandle(rawptr handle)
+        #c.ulong GetActiveProcessorCount(#c.ushort group)
+        #c.int SwitchToThread()
+
+    // `ALL_PROCESSOR_GROUPS` is a bare `0xffff` in the header, an `int`; it
+    // is narrowed to the `WORD` the call takes there.
+    private foreign "windows.h" define "WIN32_LEAN_AND_MEAN=1":
+        const #c.int ALL_PROCESSOR_GROUPS
+
+    private foreign "process.h":
+        #c.uintptr_t _beginthreadex(rawptr security, #c.uint stack_size, WinEntry start, rawptr arg, #c.uint flags, ^#c.uint thread_id)
+
+    private foreign "stdlib.h":
+        rawptr malloc(#c.size_t nbytes)
+        void free(rawptr ptr)
+
+    private type WinThread:
+        rawptr   handle
+        ThreadFn fn
+        rawptr   arg
+        rawptr   result
+
+    private type PWinThread: ^WinThread
+
+    private type PSrw: ^SRWLOCK
+
+    private type PCv: ^CONDITION_VARIABLE
+
+    // The longest wait handed to one `SleepConditionVariableSRW`: a day, far
+    // below `INFINITE` (0xFFFFFFFF), which would never time out.
+    private const i64 LONGEST_WAIT_MS = 86400000
+
+    private #c.uint win_entry(rawptr box):
+        PWinThread t = PWinThread(box)
+        t.result = t.fn(t.arg)
+        return 0
+
+    private rawptr sys_spawn(ThreadFn fn, rawptr arg):
+        rawptr box = malloc(#c.size_t(#size(WinThread)))
+        if box == nil:
+            return nil
+        PWinThread t = PWinThread(box)
+        t.fn = fn
+        t.arg = arg
+        t.result = nil
+        #c.uintptr_t handle = _beginthreadex(nil, 0, win_entry, box, 0, nil)
+        if handle == 0:
+            free(box)
+            return nil
+        t.handle = rawptr(handle)
+        return box
+
+    private bool sys_join(rawptr box, ^rawptr result):
+        PWinThread t = PWinThread(box)
+        if WaitForSingleObject(t.handle, INFINITE) != WAIT_OBJECT_0:
+            return false
+        _ = CloseHandle(t.handle)
+        if result != nil:
+            result^ = t.result
+        free(box)
+        return true
+
+    private i32 sys_cores():
+        #c.ulong n = GetActiveProcessorCount(#c.ushort(ALL_PROCESSOR_GROUPS))
+        if n >= 1:
+            return i32(n)
+        return 1
+
+    private void sys_yield():
+        _ = SwitchToThread()
+
+    private rawptr sys_mutex_new():
+        rawptr m = malloc(#c.size_t(#size(SRWLOCK)))
+        if m != nil:
+            InitializeSRWLock(PSrw(m))
+        return m
+
+    private void sys_lock(rawptr m): AcquireSRWLockExclusive(PSrw(m))
+
+    private bool sys_try_lock(rawptr m): return TryAcquireSRWLockExclusive(PSrw(m)) != 0
+
+    private void sys_unlock(rawptr m): ReleaseSRWLockExclusive(PSrw(m))
+
+    private void sys_mutex_free(rawptr m): free(m)
+
+    private rawptr sys_cond_new():
+        rawptr c = malloc(#c.size_t(#size(CONDITION_VARIABLE)))
+        if c != nil:
+            InitializeConditionVariable(PCv(c))
+        return c
+
+    private void sys_cond_wait(rawptr c, rawptr m):
+        _ = SleepConditionVariableSRW(PCv(c), PSrw(m), INFINITE, 0)
+
+    // Waits of at most a day each until `ns`, rounded up to whole
+    // milliseconds, is spent, so no single wait is `INFINITE`. A wait that ends
+    // early answers true: woken, or woken for nothing, which the caller's
+    // predicate loop absorbs.
+    private bool sys_cond_wait_for(rawptr c, rawptr m, i64 ns):
+        i64 left = ceil_ms(ns)
+        for left > 0:
+            i64 step = left
+            if step > LONGEST_WAIT_MS:
+                step = LONGEST_WAIT_MS
+            if SleepConditionVariableSRW(PCv(c), PSrw(m), #c.ulong(step), 0) != 0:
+                return true
+            left -= step
+        return false
+
+    private void sys_cond_signal(rawptr c): WakeConditionVariable(PCv(c))
+
+    private void sys_cond_broadcast(rawptr c): WakeAllConditionVariable(PCv(c))
+
+    private void sys_cond_free(rawptr c): free(c)
+
+    private rawptr sys_rwlock_new(): return sys_mutex_new()
+
+    private void sys_read_lock(rawptr l): AcquireSRWLockShared(PSrw(l))
+
+    private bool sys_try_read_lock(rawptr l): return TryAcquireSRWLockShared(PSrw(l)) != 0
+
+    private void sys_read_unlock(rawptr l): ReleaseSRWLockShared(PSrw(l))
+
+    private void sys_write_lock(rawptr l): AcquireSRWLockExclusive(PSrw(l))
+
+    private bool sys_try_write_lock(rawptr l): return TryAcquireSRWLockExclusive(PSrw(l)) != 0
+
+    private void sys_write_unlock(rawptr l): ReleaseSRWLockExclusive(PSrw(l))
+
+    private void sys_rwlock_free(rawptr l): free(l)
+
+// ── Linux, macOS and the BSDs: POSIX threads ────────────────────────────────
+//
+// `#NONE` reaches this arm only to be refused by the static assertion at the
+// top of the file.
+//
+// A handle is C's heap, `malloc`ed at the size cc gives the pthreads object,
+// and not a Dado allocation: the API hands out a pointer, and there is no
+// way back from one to the reference `#delete` needs. Each alias is how that
+// `rawptr` becomes the typed pointer a call takes: a conversion is written
+// with a type's name, and `^pthread_t(t)` would read as a function type.
+//
+// `pthread_join` takes a `pthread_t` by value. A bodiless `foreign` type is
+// complete in C, so `pthread_t` crosses exactly as the header declares it and
+// cc supplies the size, which is a pointer on Darwin and an integer on glibc.
 else:
-    // A handle is C's heap, `malloc`ed at the size cc gives the pthreads object,
-    // and not a Dado allocation: the API hands out a `rawptr`, and there is no way
-    // back from one to the reference `#delete` needs. Each alias is how that
-    // `rawptr` becomes the typed pointer a call takes: a conversion is written
-    // with a type's name, and `^pthread_t(t)` would read as a function type.
     private type PThread: ^pthread_t
 
     private type PMutex: ^pthread_mutex_t
 
     private type PCond: ^pthread_cond_t
 
-    // The feature-test macros are emitted above every `#include`, because glibc's
-    // `<features.h>` fixes the feature set the first time any header pulls it in.
+    private type PRw: ^pthread_rwlock_t
+
+    // The feature-test macros are emitted above every `#include`, because
+    // glibc's `<features.h>` fixes the feature set the first time any header
+    // pulls it in.
     private foreign "pthread.h" define "_POSIX_C_SOURCE=200809L":
         type pthread_t
 
@@ -112,191 +516,783 @@ else:
 
         type pthread_cond_t
 
-        // The three attribute objects, which this package never builds — every
-        // call below passes `nil` for the default. Declared so the parameters say
-        // the `const pthread_attr_t *` the header does: a `rawptr` there is a
-        // `void *` and a different C type, which the `_Generic` assertion over
-        // each foreign signature refuses.
+        type pthread_rwlock_t
+
+        // The attribute objects. Only a condition variable's is built (for its
+        // clock, below); every other call passes `nil` for the default. Each
+        // is declared so the parameters say the `const pthread_attr_t *` the
+        // header does: a `rawptr` there is a `void *` and a different C type,
+        // which the `_Generic` assertion over each foreign signature refuses.
         type pthread_attr_t
 
         type pthread_mutexattr_t
 
         type pthread_condattr_t
 
+        type pthread_rwlockattr_t
+
         #c.int pthread_create(^pthread_t thread, ^const pthread_attr_t attr, ThreadFn entry, rawptr arg)
-
-        // **The one pthreads call that takes its object by value.** It is why
-        // `systhreads.c` existed and why it does not any more: a bodiless
-        // `foreign` type is complete in C, so `pthread_t` crosses here exactly as
-        // the header declares it and `cc` supplies the size.
         #c.int pthread_join(pthread_t thread, ^rawptr retval)
-
         #c.int pthread_mutex_init(^pthread_mutex_t mutex, ^const pthread_mutexattr_t attr)
-
         #c.int pthread_mutex_lock(^pthread_mutex_t mutex)
-
+        #c.int pthread_mutex_trylock(^pthread_mutex_t mutex)
         #c.int pthread_mutex_unlock(^pthread_mutex_t mutex)
-
         #c.int pthread_mutex_destroy(^pthread_mutex_t mutex)
-
         #c.int pthread_cond_init(^pthread_cond_t cond, ^const pthread_condattr_t attr)
-
         #c.int pthread_cond_wait(^pthread_cond_t cond, ^pthread_mutex_t mutex)
-
-        #c.int pthread_cond_timedwait(^pthread_cond_t cond, ^pthread_mutex_t mutex, ^const ThreadsTimespec abstime)
-
         #c.int pthread_cond_signal(^pthread_cond_t cond)
-
         #c.int pthread_cond_broadcast(^pthread_cond_t cond)
-
         #c.int pthread_cond_destroy(^pthread_cond_t cond)
+        #c.int pthread_condattr_init(^pthread_condattr_t attr)
+        #c.int pthread_condattr_destroy(^pthread_condattr_t attr)
+        #c.int pthread_rwlock_init(^pthread_rwlock_t lock, ^const pthread_rwlockattr_t attr)
+        #c.int pthread_rwlock_rdlock(^pthread_rwlock_t lock)
+        #c.int pthread_rwlock_tryrdlock(^pthread_rwlock_t lock)
+        #c.int pthread_rwlock_wrlock(^pthread_rwlock_t lock)
+        #c.int pthread_rwlock_trywrlock(^pthread_rwlock_t lock)
+        #c.int pthread_rwlock_unlock(^pthread_rwlock_t lock)
+        #c.int pthread_rwlock_destroy(^pthread_rwlock_t lock)
 
-    // C11's wall clock, which `pthread_cond_timedwait`'s deadline is read on;
+    // `time_t`: `long` on Linux, macOS, FreeBSD and NetBSD, and `long long`
+    // on OpenBSD, where it is 64 bits on every architecture.
+    when #OS == #OPENBSD:
+        private type TimeT: #c.llong
+    else:
+        private type TimeT: #c.long
+
     // `ThreadsTimespec` names `struct timespec`, which POSIX declares tagged.
     private foreign "time.h" define "ThreadsTimespec=struct timespec":
         type ThreadsTimespec:
-            #c.long tv_sec,
+            TimeT   tv_sec,
             #c.long tv_nsec,
 
-        const #c.int TIME_UTC
+    private foreign "sched.h":
+        #c.int sched_yield()
 
-        #c.int timespec_get(^ThreadsTimespec ts, #c.int base)
-
-    // `_SC_NPROCESSORS_ONLN` is not POSIX, and Darwin hides it under
-    // `_POSIX_C_SOURCE` unless `_DARWIN_C_SOURCE` is defined too. Each macro is
-    // inert on the platform it is not for.
-    private foreign "unistd.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
-        const #c.int _SC_NPROCESSORS_ONLN
-
+    private foreign "unistd.h" define "_POSIX_C_SOURCE=200809L":
         #c.long sysconf(#c.int name)
 
-    // `#c.size_t` and not `u64`: the same width, and on Darwin not the same type
-    // (`uint64_t` is `unsigned long long` there), which the emitter's `_Generic`
-    // assertion on this restatement would refuse.
+    // `_SC_NPROCESSORS_ONLN` is not POSIX, and strict POSIX hides it: Darwin
+    // shows it again under `_DARWIN_C_SOURCE` and NetBSD under
+    // `_NETBSD_SOURCE` (each macro is inert on the platform it is not for),
+    // and FreeBSD has no such macro, so there its value, 58 in FreeBSD's
+    // `<unistd.h>`, is restated.
+    when #OS == #FREEBSD:
+        private const #c.int NPROCESSORS_ONLN = 58
+    else:
+        private foreign "unistd.h" define "_DARWIN_C_SOURCE=1" define "_NETBSD_SOURCE=1":
+            const #c.int _SC_NPROCESSORS_ONLN
+
+        private const #c.int NPROCESSORS_ONLN = _SC_NPROCESSORS_ONLN
+
+    // `#c.size_t` and not `u64`: the same width, and on Darwin not the same
+    // type (`uint64_t` is `unsigned long long` there), which the emitter's
+    // `_Generic` assertion on this restatement would refuse.
     private foreign "stdlib.h":
         rawptr malloc(#c.size_t nbytes)
 
         void free(rawptr ptr)
 
-    // ── threads ─────────────────────────────────────────────────────────────────
+    // A timed wait is measured on the monotonic clock, so setting the wall
+    // clock neither ends one early nor stretches it. Darwin has no
+    // `pthread_condattr_setclock`, and waits a relative time instead with
+    // `pthread_cond_timedwait_relative_np`, which it declares only outside
+    // strict POSIX.
+    when #OS == #DARWIN:
+        private foreign "pthread.h" define "_DARWIN_C_SOURCE=1":
+            #c.int pthread_cond_timedwait_relative_np(^pthread_cond_t cond, ^pthread_mutex_t mutex, ^const ThreadsTimespec reltime)
 
-    // Spawn a thread running `fn(arg)`. Returns an opaque handle, or nil on failure.
-    // The handle is consumed by `join`.
-    rawptr spawn(ThreadFn fn, rawptr arg):
+        private bool cond_init(rawptr c):
+            return pthread_cond_init(PCond(c), nil) == 0
+
+        private bool timed_wait(rawptr c, rawptr m, i64 ns):
+            ThreadsTimespec rel = (TimeT(ns / 1000000000), #c.long(ns % 1000000000))
+            return pthread_cond_timedwait_relative_np(PCond(c), PMutex(m), &rel) == 0
+
+    // `clockid_t` is an `int` on glibc, musl and the BSDs, and is restated as
+    // one.
+    else:
+        private foreign "pthread.h" define "_POSIX_C_SOURCE=200809L":
+            #c.int pthread_condattr_setclock(^pthread_condattr_t attr, #c.int clock)
+
+            #c.int pthread_cond_timedwait(^pthread_cond_t cond, ^pthread_mutex_t mutex, ^const ThreadsTimespec abstime)
+
+        private foreign "time.h" define "_POSIX_C_SOURCE=200809L":
+            const #c.int CLOCK_MONOTONIC
+
+            #c.int clock_gettime(#c.int clock, ^ThreadsTimespec now)
+
+        private type PCondAttr: ^pthread_condattr_t
+
+        private bool cond_init(rawptr c):
+            rawptr attr = malloc(#c.size_t(#size(pthread_condattr_t)))
+            if attr == nil:
+                return false
+            if pthread_condattr_init(PCondAttr(attr)) != 0:
+                free(attr)
+                return false
+            bool ok = pthread_condattr_setclock(PCondAttr(attr), CLOCK_MONOTONIC) == 0
+            ok = ok && pthread_cond_init(PCond(c), PCondAttr(attr)) == 0
+            _ = pthread_condattr_destroy(PCondAttr(attr))
+            free(attr)
+            return ok
+
+        private bool timed_wait(rawptr c, rawptr m, i64 ns):
+            ThreadsTimespec at = (0, 0)
+            _ = clock_gettime(CLOCK_MONOTONIC, &at)
+            i64 sum = i64(at.tv_nsec) + ns % 1000000000
+            at.tv_sec = TimeT(i64(at.tv_sec) + ns / 1000000000 + sum / 1000000000)
+            at.tv_nsec = #c.long(sum % 1000000000)
+            return pthread_cond_timedwait(PCond(c), PMutex(m), &at) == 0
+
+    private rawptr sys_spawn(ThreadFn fn, rawptr arg):
         rawptr t = malloc(#c.size_t(#size(pthread_t)))
         if t != nil && pthread_create(PThread(t), nil, fn, arg) != 0:
             free(t)
             return nil
-
         return t
 
-    // Join and free a thread handle. True on success; a nil handle is a failure.
-    bool join(rawptr t):
-        if t == nil:
-            return false
-
-        // The handle is a `rawptr` to C's heap, so the thread is read back out of
-        // it by dereferencing the alias — `PThread(t)^` — and handed over by
-        // value, which is what the header asks for. The exit value is not wanted:
-        // `join`'s answer is whether the join succeeded.
-        #c.int rc = pthread_join(PThread(t)^, nil)
+    // The handle is a pointer to C's heap, so the thread is read back out of
+    // it through the alias, `PThread(t)^`, and handed over by value.
+    private bool sys_join(rawptr t, ^rawptr result):
+        #c.int rc = pthread_join(PThread(t)^, result)
         free(t)
         return rc == 0
 
-    // The online processor count, at least 1.
-    i32 hardware_concurrency():
-        #c.long n = sysconf(_SC_NPROCESSORS_ONLN)
+    private i32 sys_cores():
+        #c.long n = sysconf(NPROCESSORS_ONLN)
         if n >= 1:
             return i32(n)
-
         return 1
 
-    // ── mutex ────────────────────────────────────────────────────────────────────
-    // A nil handle is ignored by every call that takes one, and `mutex_new`
-    // answers nil when it cannot allocate or initialise.
+    private void sys_yield():
+        _ = sched_yield()
 
-    rawptr mutex_new():
+    private rawptr sys_mutex_new():
         rawptr m = malloc(#c.size_t(#size(pthread_mutex_t)))
         if m != nil && pthread_mutex_init(PMutex(m), nil) != 0:
             free(m)
             return nil
-
         return m
 
-    void lock(rawptr m):
-        if m != nil:
-            _ = pthread_mutex_lock(PMutex(m))
+    private void sys_lock(rawptr m):
+        _ = pthread_mutex_lock(PMutex(m))
 
-    void unlock(rawptr m):
-        if m != nil:
-            _ = pthread_mutex_unlock(PMutex(m))
+    private bool sys_try_lock(rawptr m): return pthread_mutex_trylock(PMutex(m)) == 0
 
-    void mutex_free(rawptr m):
-        if m == nil:
-            return
+    private void sys_unlock(rawptr m):
+        _ = pthread_mutex_unlock(PMutex(m))
 
+    private void sys_mutex_free(rawptr m):
         _ = pthread_mutex_destroy(PMutex(m))
         free(m)
 
-    // ── condition variable ───────────────────────────────────────────────────────
-    // Wait releases `m` while blocked and re-acquires it before returning, so a
-    // caller holds `m`, loops on its predicate, and `cond_wait`s inside the loop.
-    // Nil handles are ignored, as for a mutex.
-
-    rawptr cond_new():
+    private rawptr sys_cond_new():
         rawptr c = malloc(#c.size_t(#size(pthread_cond_t)))
-        if c != nil && pthread_cond_init(PCond(c), nil) != 0:
+        if c != nil && !cond_init(c):
             free(c)
             return nil
-
         return c
 
-    void cond_wait(rawptr c, rawptr m):
-        if c != nil && m != nil:
-            _ = pthread_cond_wait(PCond(c), PMutex(m))
+    private void sys_cond_wait(rawptr c, rawptr m):
+        _ = pthread_cond_wait(PCond(c), PMutex(m))
 
-    // `cond_wait` for at most `ms` milliseconds: true when woken, false when
-    // the time ran out first (or `ms` is not positive, which waits not at
-    // all). Like `cond_wait` it may wake for nothing, so a caller loops on
-    // its predicate and on its own deadline.
-    bool cond_wait_for(rawptr c, rawptr m, i64 ms):
-        if c == nil || m == nil || ms <= 0:
-            return false
+    private bool sys_cond_wait_for(rawptr c, rawptr m, i64 ns): return timed_wait(c, m, ns)
 
-        ThreadsTimespec at = (0, 0)
-        _ = timespec_get(&at, TIME_UTC)
-        i64 ns = i64(at.tv_nsec) + ms % 1000 * 1000000
-        at.tv_sec = #c.long(i64(at.tv_sec) + ms / 1000 + ns / 1000000000)
-        at.tv_nsec = #c.long(ns % 1000000000)
-        return pthread_cond_timedwait(PCond(c), PMutex(m), &at) == 0
+    private void sys_cond_signal(rawptr c):
+        _ = pthread_cond_signal(PCond(c))
 
-    void cond_signal(rawptr c):
-        if c != nil:
-            _ = pthread_cond_signal(PCond(c))
+    private void sys_cond_broadcast(rawptr c):
+        _ = pthread_cond_broadcast(PCond(c))
 
-    void cond_broadcast(rawptr c):
-        if c != nil:
-            _ = pthread_cond_broadcast(PCond(c))
-
-    void cond_free(rawptr c):
-        if c == nil:
-            return
-
+    private void sys_cond_free(rawptr c):
         _ = pthread_cond_destroy(PCond(c))
         free(c)
 
-// ── atomics on a caller-owned i32 cell ───────────────────────────────────────
-// The cell is an ordinary `i32` the caller keeps alive (in a heap allocation
-// shared between threads). These are sequentially consistent: each is one
-// `#atomic_*` verb at `#SEQ_CST`, for a caller that holds a cell and not an
-// ordering. A caller choosing its own ordering writes the verb itself, as
-// core:jobs does.
+    private rawptr sys_rwlock_new():
+        rawptr l = malloc(#c.size_t(#size(pthread_rwlock_t)))
+        if l != nil && pthread_rwlock_init(PRw(l), nil) != 0:
+            free(l)
+            return nil
+        return l
 
-i32 atomic_load(^i32 p): return #atomic_load(p, #SEQ_CST)
-void atomic_store(^i32 p, i32 v): #atomic_store(p, v, #SEQ_CST)
-i32 atomic_fetch_add(^i32 p, i32 d): return #atomic_fetch_add(p, d, #SEQ_CST)
+    private void sys_read_lock(rawptr l):
+        _ = pthread_rwlock_rdlock(PRw(l))
 
-bool atomic_cas(^i32 p, i32 expected, i32 desired):
-    (i32 _, bool swapped) = #atomic_compare_exchange(p, expected, desired,
-        false, #SEQ_CST, #SEQ_CST)
+    private bool sys_try_read_lock(rawptr l): return pthread_rwlock_tryrdlock(PRw(l)) == 0
+
+    private void sys_read_unlock(rawptr l):
+        _ = pthread_rwlock_unlock(PRw(l))
+
+    private void sys_write_lock(rawptr l):
+        _ = pthread_rwlock_wrlock(PRw(l))
+
+    private bool sys_try_write_lock(rawptr l): return pthread_rwlock_trywrlock(PRw(l)) == 0
+
+    private void sys_write_unlock(rawptr l):
+        _ = pthread_rwlock_unlock(PRw(l))
+
+    private void sys_rwlock_free(rawptr l):
+        _ = pthread_rwlock_destroy(PRw(l))
+        free(l)
+
+// ── threads ─────────────────────────────────────────────────────────────────
+
+// Starts a thread running `fn(arg)` and answers its handle, or nil when the
+// thread could not be started. The handle is consumed by `join` or
+// `join_result`; one that is never joined leaks its thread's resources. A
+// single-threaded web build that reaches a call of `spawn` is refused at
+// compile time (ERR1033).
+Thread spawn(ThreadFn fn, rawptr arg): return Thread(sys_spawn(fn, arg))
+
+// `spawn` for code that may be built single-threaded: a single-threaded web
+// module answers nil at run time where a `spawn` it reaches is refused at
+// compile time. A library that falls back to running its work on the calling
+// thread (`core:jobs` is one) starts its threads with this.
+Thread try_spawn(ThreadFn fn, rawptr arg): return Thread(sys_spawn(fn, arg))
+
+// Waits for the thread to finish and frees its handle. Answers true when the
+// join succeeded; a nil handle answers false. On a browser's main thread a
+// join cannot wait, so it answers false, says why on standard error, and
+// keeps the handle for a worker to join. `join_result` is the form that says
+// why, and answers what the thread's function did.
+bool join(Thread t):
+    if t == nil:
+        return false
+    return sys_join(rawptr(t), nil)
+
+// Waits for the thread to finish, frees its handle, and answers the pointer
+// the thread's function answered. Fails `NO_THREAD` for a nil handle,
+// `CANNOT_WAIT` on a browser's main thread (which keeps the handle, for a
+// worker to join), and `JOIN_FAILED` when the system refuses.
+Error!rawptr join_result(Thread t):
+    if t == nil:
+        fail Error.NO_THREAD
+    rawptr result = nil
+    if !sys_join(rawptr(t), &result):
+        // The web's one refusal is a thread that may not wait.
+        if #OS == #WEB:
+            fail Error.CANNOT_WAIT
+        fail Error.JOIN_FAILED
+    return result
+
+// The number of processors this program may run threads on, at least 1:
+// the online processors on POSIX, the active ones across every processor
+// group on Windows, and the host's `hardwareConcurrency` on the web.
+i32 hardware_concurrency(): return sys_cores()
+
+// Gives the rest of this thread's time slice to another ready thread, if
+// there is one. On the web, where wasm has no yield, the thread waits about
+// a microsecond; on a thread that cannot wait (a browser's main thread, or a
+// single-threaded module) it returns at once.
+void yield(): sys_yield()
+
+// The calling thread's number: 1 for the first thread that asks, then 2,
+// and so on. It is unique for the life of the program and never reused, and
+// is not the operating system's thread id.
+u64 current_id():
+    if g_thread_id == 0:
+        g_thread_id = #atomic_fetch_add(&g_next_thread_id, 1, #RELAXED) + 1
+    return g_thread_id
+
+// The calling thread's number, 0 until `current_id` assigns one.
+private @thread_local u64 g_thread_id = 0
+
+// The last number `current_id` handed out.
+private u64 g_next_thread_id = 0
+
+// ── mutex ───────────────────────────────────────────────────────────────────
+//
+// A mutex is not recursive: a thread that locks one it already holds
+// deadlocks. Every call ignores a nil handle.
+
+// A new unlocked mutex, or nil when it cannot be allocated or initialised.
+// Free it with `mutex_free`.
+Mutex mutex_new(): return Mutex(sys_mutex_new())
+
+// Blocks until this thread holds `m`.
+void lock(Mutex m):
+    if m != nil:
+        sys_lock(rawptr(m))
+
+// Takes `m` if no thread holds it, without waiting. True when this thread now
+// holds it; false when another does, or `m` is nil.
+bool try_lock(Mutex m):
+    if m == nil:
+        return false
+    return sys_try_lock(rawptr(m))
+
+// Releases `m`, which this thread holds.
+void unlock(Mutex m):
+    if m != nil:
+        sys_unlock(rawptr(m))
+
+// Frees `m`, which no thread may hold or wait on.
+void mutex_free(Mutex m):
+    if m != nil:
+        sys_mutex_free(rawptr(m))
+
+// ── condition variable ──────────────────────────────────────────────────────
+//
+// A wait releases `m` while blocked and takes it again before returning, so a
+// caller holds `m`, loops on its predicate, and waits inside the loop: any
+// wait may return without a signal. Every call ignores a nil handle.
+
+// A new condition variable, or nil when it cannot be allocated or
+// initialised. Free it with `cond_free`.
+Cond cond_new(): return Cond(sys_cond_new())
+
+// Waits for a signal on `c`, releasing `m` (which this thread holds) while it
+// waits.
+void cond_wait(Cond c, Mutex m):
+    if c != nil && m != nil:
+        sys_cond_wait(rawptr(c), rawptr(m))
+
+// `cond_wait` for at most `d`: true when woken, false when the time ran out
+// first or `d` is not positive (which waits not at all). The time is measured
+// on a monotonic clock; Windows and the web wait whole milliseconds, so there
+// it is rounded up to the next one. Like `cond_wait` it may wake for nothing,
+// so a caller loops on its predicate and on its own deadline (a
+// `time.Deadline`'s `left()` is the argument for the next wait). A
+// single-threaded web module has nobody to wake it, so there the time runs
+// out at once.
+bool cond_wait_for(Cond c, Mutex m, time.Duration d):
+    i64 ns = time.as_nanoseconds(d)
+    if c == nil || m == nil || ns <= 0:
+        return false
+    return sys_cond_wait_for(rawptr(c), rawptr(m), ns)
+
+// Wakes one thread waiting on `c`, if any.
+void cond_signal(Cond c):
+    if c != nil:
+        sys_cond_signal(rawptr(c))
+
+// Wakes every thread waiting on `c`.
+void cond_broadcast(Cond c):
+    if c != nil:
+        sys_cond_broadcast(rawptr(c))
+
+// Frees `c`, which no thread may be waiting on.
+void cond_free(Cond c):
+    if c != nil:
+        sys_cond_free(rawptr(c))
+
+// ── reader/writer lock ──────────────────────────────────────────────────────
+//
+// Any number of readers, or one writer. Like a mutex it is not recursive, and
+// a reader may not become a writer while it reads. Every call ignores a nil
+// handle.
+
+// A new unlocked reader/writer lock, or nil when it cannot be allocated or
+// initialised. Free it with `rwlock_free`.
+RwLock rwlock_new(): return RwLock(sys_rwlock_new())
+
+// Blocks until this thread may read under `l`.
+void read_lock(RwLock l):
+    if l != nil:
+        sys_read_lock(rawptr(l))
+
+// Takes `l` for reading if no writer holds it, without waiting. True when
+// this thread now reads under it.
+bool try_read_lock(RwLock l):
+    if l == nil:
+        return false
+    return sys_try_read_lock(rawptr(l))
+
+// Ends this thread's read of `l`.
+void read_unlock(RwLock l):
+    if l != nil:
+        sys_read_unlock(rawptr(l))
+
+// Blocks until this thread is the one writer under `l`.
+void write_lock(RwLock l):
+    if l != nil:
+        sys_write_lock(rawptr(l))
+
+// Takes `l` for writing if nobody holds it, without waiting. True when this
+// thread now writes under it.
+bool try_write_lock(RwLock l):
+    if l == nil:
+        return false
+    return sys_try_write_lock(rawptr(l))
+
+// Ends this thread's write under `l`.
+void write_unlock(RwLock l):
+    if l != nil:
+        sys_write_unlock(rawptr(l))
+
+// Frees `l`, which no thread may hold.
+void rwlock_free(RwLock l):
+    if l != nil:
+        sys_rwlock_free(rawptr(l))
+
+// ── atomics ─────────────────────────────────────────────────────────────────
+//
+// An atomic here is an access, not a type: each function below works on an
+// ordinary cell the caller keeps alive (in memory every thread can reach),
+// and the ordering is an argument. The language's `#atomic_*` verbs take the
+// ordering as a constant, so each function chooses the verb by a `switch` on
+// it; called with a constant, the C compiler keeps only that arm. Each
+// ordering defaults to `Order.SeqCst`, so a caller that holds a cell and not
+// an ordering writes none. `i32`, `u32`, `i64`, `u64` and `rawptr` cells are
+// what the verbs take; a `bool` is kept in an `AtomicBool`.
+
+// A memory ordering, weakest first. A load given `Release` or `AcqRel`
+// acquires, and a store given `Acquire` or `AcqRel` releases: each is
+// strengthened to the nearest ordering C allows for that access.
+enum i32 Order: (Relaxed, Acquire, Release, AcqRel, SeqCst)
+
+// The value at `p`.
+T atomic_load(^$T p, Order order = Order.SeqCst) where T in (i32, u32, i64, u64, rawptr):
+    switch order:
+        case Order.Relaxed: return #atomic_load(p, #RELAXED)
+        case Order.Acquire, Order.Release, Order.AcqRel: return #atomic_load(p, #ACQUIRE)
+        case Order.SeqCst: return #atomic_load(p, #SEQ_CST)
+        else: return #atomic_load(p, #SEQ_CST)
+
+// Writes `v` at `p`.
+void atomic_store(^$T p, T v, Order order = Order.SeqCst) where T in (i32, u32, i64, u64, rawptr):
+    switch order:
+        case Order.Relaxed: #atomic_store(p, v, #RELAXED)
+        case Order.Acquire, Order.Release, Order.AcqRel: #atomic_store(p, v, #RELEASE)
+        case Order.SeqCst: #atomic_store(p, v, #SEQ_CST)
+        else: #atomic_store(p, v, #SEQ_CST)
+
+// Writes `v` at `p` and answers the value that was there.
+T atomic_exchange(^$T p, T v, Order order = Order.SeqCst) where T in (i32, u32, i64, u64, rawptr):
+    switch order:
+        case Order.Relaxed: return #atomic_exchange(p, v, #RELAXED)
+        case Order.Acquire: return #atomic_exchange(p, v, #ACQUIRE)
+        case Order.Release: return #atomic_exchange(p, v, #RELEASE)
+        case Order.AcqRel: return #atomic_exchange(p, v, #ACQ_REL)
+        case Order.SeqCst: return #atomic_exchange(p, v, #SEQ_CST)
+        else: return #atomic_exchange(p, v, #SEQ_CST)
+
+// Writes `desired` at `p` if `expected` is there, and answers what was there
+// and whether it wrote. `order` applies when it writes; when it does not, the
+// read is `Acquire` for `Acquire` and `AcqRel`, `Relaxed` for `Relaxed` and
+// `Release`, and `SeqCst` for `SeqCst`.
+(T, bool) atomic_compare_exchange(^$T p, T expected, T desired, Order order = Order.SeqCst) where T in (i32, u32, i64, u64, rawptr):
+    switch order:
+        case Order.Relaxed: return #atomic_compare_exchange(p, expected, desired, false, #RELAXED, #RELAXED)
+        case Order.Acquire: return #atomic_compare_exchange(p, expected, desired, false, #ACQUIRE, #ACQUIRE)
+        case Order.Release: return #atomic_compare_exchange(p, expected, desired, false, #RELEASE, #RELAXED)
+        case Order.AcqRel: return #atomic_compare_exchange(p, expected, desired, false, #ACQ_REL, #ACQUIRE)
+        case Order.SeqCst: return #atomic_compare_exchange(p, expected, desired, false, #SEQ_CST, #SEQ_CST)
+        else: return #atomic_compare_exchange(p, expected, desired, false, #SEQ_CST, #SEQ_CST)
+
+// `atomic_compare_exchange`, answering only whether it wrote.
+bool atomic_cas(^$T p, T expected, T desired, Order order = Order.SeqCst) where T in (i32, u32, i64, u64, rawptr):
+    (T _, bool swapped) = atomic_compare_exchange(p, expected, desired, order)
     return swapped
+
+// Adds `d` at `p` and answers the value that was there before. It wraps on
+// overflow.
+T atomic_fetch_add(^$T p, T d, Order order = Order.SeqCst) where T in (i32, u32, i64, u64):
+    switch order:
+        case Order.Relaxed: return #atomic_fetch_add(p, d, #RELAXED)
+        case Order.Acquire: return #atomic_fetch_add(p, d, #ACQUIRE)
+        case Order.Release: return #atomic_fetch_add(p, d, #RELEASE)
+        case Order.AcqRel: return #atomic_fetch_add(p, d, #ACQ_REL)
+        case Order.SeqCst: return #atomic_fetch_add(p, d, #SEQ_CST)
+        else: return #atomic_fetch_add(p, d, #SEQ_CST)
+
+// Subtracts `d` at `p` and answers the value that was there before. It wraps
+// on overflow.
+T atomic_fetch_sub(^$T p, T d, Order order = Order.SeqCst) where T in (i32, u32, i64, u64):
+    switch order:
+        case Order.Relaxed: return #atomic_fetch_sub(p, d, #RELAXED)
+        case Order.Acquire: return #atomic_fetch_sub(p, d, #ACQUIRE)
+        case Order.Release: return #atomic_fetch_sub(p, d, #RELEASE)
+        case Order.AcqRel: return #atomic_fetch_sub(p, d, #ACQ_REL)
+        case Order.SeqCst: return #atomic_fetch_sub(p, d, #SEQ_CST)
+        else: return #atomic_fetch_sub(p, d, #SEQ_CST)
+
+// Ands `bits` into the value at `p` and answers the value that was there
+// before.
+T atomic_fetch_and(^$T p, T bits, Order order = Order.SeqCst) where T in (i32, u32, i64, u64):
+    switch order:
+        case Order.Relaxed: return #atomic_fetch_and(p, bits, #RELAXED)
+        case Order.Acquire: return #atomic_fetch_and(p, bits, #ACQUIRE)
+        case Order.Release: return #atomic_fetch_and(p, bits, #RELEASE)
+        case Order.AcqRel: return #atomic_fetch_and(p, bits, #ACQ_REL)
+        case Order.SeqCst: return #atomic_fetch_and(p, bits, #SEQ_CST)
+        else: return #atomic_fetch_and(p, bits, #SEQ_CST)
+
+// Ors `bits` into the value at `p` and answers the value that was there
+// before.
+T atomic_fetch_or(^$T p, T bits, Order order = Order.SeqCst) where T in (i32, u32, i64, u64):
+    switch order:
+        case Order.Relaxed: return #atomic_fetch_or(p, bits, #RELAXED)
+        case Order.Acquire: return #atomic_fetch_or(p, bits, #ACQUIRE)
+        case Order.Release: return #atomic_fetch_or(p, bits, #RELEASE)
+        case Order.AcqRel: return #atomic_fetch_or(p, bits, #ACQ_REL)
+        case Order.SeqCst: return #atomic_fetch_or(p, bits, #SEQ_CST)
+        else: return #atomic_fetch_or(p, bits, #SEQ_CST)
+
+// Xors `bits` into the value at `p` and answers the value that was there
+// before.
+T atomic_fetch_xor(^$T p, T bits, Order order = Order.SeqCst) where T in (i32, u32, i64, u64):
+    switch order:
+        case Order.Relaxed: return #atomic_fetch_xor(p, bits, #RELAXED)
+        case Order.Acquire: return #atomic_fetch_xor(p, bits, #ACQUIRE)
+        case Order.Release: return #atomic_fetch_xor(p, bits, #RELEASE)
+        case Order.AcqRel: return #atomic_fetch_xor(p, bits, #ACQ_REL)
+        case Order.SeqCst: return #atomic_fetch_xor(p, bits, #SEQ_CST)
+        else: return #atomic_fetch_xor(p, bits, #SEQ_CST)
+
+// Orders the memory accesses before it against those after it, as `order`
+// says, without being an access itself. `Relaxed` orders nothing.
+void atomic_fence(Order order = Order.SeqCst):
+    switch order:
+        case Order.Relaxed: return
+        case Order.Acquire: #fence(#ACQUIRE)
+        case Order.Release: #fence(#RELEASE)
+        case Order.AcqRel: #fence(#ACQ_REL)
+        case Order.SeqCst: #fence(#SEQ_CST)
+        else: #fence(#SEQ_CST)
+
+// A `bool` read and written atomically. The verbs take no `bool` cell, so it
+// is kept as an `i32`, 0 or 1. Its zero value is false.
+type AtomicBool:
+    i32 bits
+
+    // The value.
+    bool load(^self, Order order = Order.SeqCst):
+        return atomic_load(&self.bits, order) != 0
+
+    // Sets the value to `v`.
+    void store(^self, bool v, Order order = Order.SeqCst):
+        atomic_store(&self.bits, 1 if v else 0, order)
+
+    // Sets the value to `v` and answers the one it replaced.
+    bool exchange(^self, bool v, Order order = Order.SeqCst):
+        return atomic_exchange(&self.bits, 1 if v else 0, order) != 0
+
+    // Sets the value to `desired` if it is `expected`, and answers whether it
+    // did.
+    bool compare_exchange(^self, bool expected, bool desired, Order order = Order.SeqCst):
+        return atomic_cas(&self.bits, 1 if expected else 0, 1 if desired else 0, order)
+
+// ── Once ────────────────────────────────────────────────────────────────────
+
+// What `Once.state` holds: not yet run, running, done.
+private const i32 ONCE_NEW = 0
+private const i32 ONCE_RUNNING = 1
+private const i32 ONCE_DONE = 2
+
+// Runs a function once, whichever thread asks first. Its zero value has not
+// run, so a package variable needs no initialiser:
+//
+//     threads.Once g_setup
+//
+//     g_setup.call(setup, nil)
+//
+// A thread that calls while another runs the function waits (yielding) until
+// it has finished. The function must not call `call` on the same `Once`,
+// which would wait on itself.
+type Once:
+    i32 state
+
+    // Runs `fn(data)` if no call has run it yet, and returns once it has run.
+    void call(^self, OnceFn fn, rawptr data):
+        if #atomic_load(&self.state, #ACQUIRE) == ONCE_DONE:
+            return
+        (i32 _, bool mine) = #atomic_compare_exchange(&self.state, ONCE_NEW, ONCE_RUNNING, false, #ACQUIRE, #ACQUIRE)
+        if mine:
+            fn(data)
+            #atomic_store(&self.state, ONCE_DONE, #RELEASE)
+            return
+        for #atomic_load(&self.state, #ACQUIRE) != ONCE_DONE:
+            yield()
+
+    // Whether the function has run to its end.
+    bool done(^self):
+        return #atomic_load(&self.state, #ACQUIRE) == ONCE_DONE
+
+// ── Semaphore, WaitGroup, Barrier ───────────────────────────────────────────
+//
+// Each is a mutex and a condition variable with a count, made by its
+// constructor and freed by `destroy`. A constructor fails `NO_MEMORY` when
+// either primitive cannot be made, having freed the other, so a value a
+// caller holds always works.
+
+// A mutex and a condition variable, or `NO_MEMORY` with neither.
+private Error!(Mutex m, Cond c) pair_new():
+    Mutex m = mutex_new()
+    Cond c = cond_new()
+    if m == nil || c == nil:
+        mutex_free(m)
+        cond_free(c)
+        fail Error.NO_MEMORY
+    return (m, c)
+
+// A counting semaphore: `acquire` takes one unit, waiting while there are
+// none, and `release` gives units back.
+type Semaphore:
+    Mutex mtx
+    Cond  cv
+    i64   count
+
+    // Takes a unit, waiting until one is free.
+    void acquire(^self):
+        lock(self.mtx)
+        for self.count <= 0:
+            cond_wait(self.cv, self.mtx)
+        self.count -= 1
+        unlock(self.mtx)
+
+    // Takes a unit if one is free, without waiting. True when it took one.
+    bool try_acquire(^self):
+        lock(self.mtx)
+        bool took = self.count > 0
+        if took:
+            self.count -= 1
+        unlock(self.mtx)
+        return took
+
+    // Takes a unit, waiting at most `d` for one. True when it took one.
+    bool acquire_for(^self, time.Duration d):
+        time.Deadline due = time.deadline(d)
+        lock(self.mtx)
+        for self.count <= 0:
+            if due.passed():
+                unlock(self.mtx)
+                return false
+            _ = cond_wait_for(self.cv, self.mtx, due.left())
+        self.count -= 1
+        unlock(self.mtx)
+        return true
+
+    // Gives back `n` units (one by default), waking as many waiters. A count
+    // below 1 gives back nothing.
+    void release(^self, i64 n = 1):
+        if n < 1:
+            return
+        lock(self.mtx)
+        self.count += n
+        if n == 1:
+            cond_signal(self.cv)
+        else:
+            cond_broadcast(self.cv)
+        unlock(self.mtx)
+
+    // The units free now, which may change before the caller reads it.
+    i64 available(^self):
+        lock(self.mtx)
+        i64 n = self.count
+        unlock(self.mtx)
+        return n
+
+    // Frees its mutex and condition variable. No thread may be waiting.
+    void destroy(^self):
+        mutex_free(self.mtx)
+        cond_free(self.cv)
+        self.mtx = nil
+        self.cv = nil
+
+// A semaphore holding `initial` units (0 when `initial` is negative). Fails
+// `NO_MEMORY` when its mutex or condition variable cannot be made. End it
+// with `destroy`.
+Error!Semaphore semaphore(i64 initial):
+    i64 n = initial
+    if n < 0:
+        n = 0
+    try (Mutex m, Cond c) = pair_new()
+    return (m, c, n)
+
+// Waits for a counted set of tasks: `add` counts them in, each task calls
+// `done` as it finishes, and `wait` returns once the count is back to 0.
+type WaitGroup:
+    Mutex mtx
+    Cond  cv
+    i64   count
+
+    // Adds `n` to the count. When the count reaches 0 or below it is 0, and
+    // every waiter wakes.
+    void add(^self, i64 n):
+        lock(self.mtx)
+        self.count += n
+        if self.count <= 0:
+            self.count = 0
+            cond_broadcast(self.cv)
+        unlock(self.mtx)
+
+    // One task finished: `add(-1)`.
+    void done(^self):
+        self.add(-1)
+
+    // Waits until the count is 0.
+    void wait(^self):
+        lock(self.mtx)
+        for self.count > 0:
+            cond_wait(self.cv, self.mtx)
+        unlock(self.mtx)
+
+    // Waits at most `d` for the count to reach 0. True when it did.
+    bool wait_for(^self, time.Duration d):
+        time.Deadline due = time.deadline(d)
+        lock(self.mtx)
+        for self.count > 0:
+            if due.passed():
+                unlock(self.mtx)
+                return false
+            _ = cond_wait_for(self.cv, self.mtx, due.left())
+        unlock(self.mtx)
+        return true
+
+    // Frees its mutex and condition variable. No thread may be waiting.
+    void destroy(^self):
+        mutex_free(self.mtx)
+        cond_free(self.cv)
+        self.mtx = nil
+        self.cv = nil
+
+// A wait group with a count of 0. Fails `NO_MEMORY` when its mutex or
+// condition variable cannot be made. End it with `destroy`.
+Error!WaitGroup wait_group():
+    try (Mutex m, Cond c) = pair_new()
+    return (m, c, 0)
+
+// Holds each of a fixed number of threads at `wait` until all of them have
+// arrived, then lets them all go and starts over for the next round.
+type Barrier:
+    Mutex mtx
+    Cond  cv
+    i32   parties
+    i32   arrived
+    i64   round
+
+    // Waits until `parties` threads have called `wait` in this round. Answers
+    // true on exactly one of them, the last to arrive, and false on the rest.
+    bool wait(^self):
+        lock(self.mtx)
+        i64 mine = self.round
+        self.arrived += 1
+        if self.arrived >= self.parties:
+            self.arrived = 0
+            self.round += 1
+            cond_broadcast(self.cv)
+            unlock(self.mtx)
+            return true
+        for self.round == mine:
+            cond_wait(self.cv, self.mtx)
+        unlock(self.mtx)
+        return false
+
+    // Frees its mutex and condition variable. No thread may be waiting.
+    void destroy(^self):
+        mutex_free(self.mtx)
+        cond_free(self.cv)
+        self.mtx = nil
+        self.cv = nil
+
+// A barrier for `parties` threads (1 when `parties` is below 1). Fails
+// `NO_MEMORY` when its mutex or condition variable cannot be made. End it
+// with `destroy`.
+Error!Barrier barrier(i32 parties):
+    i32 n = parties
+    if n < 1:
+        n = 1
+    try (Mutex m, Cond c) = pair_new()
+    return (m, c, n, 0, 0)

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit 703d96d30a51 (dirty) -->
 # app:log
 
 app:log — thread-safe logging from any worker, flushed at the barrier.
@@ -55,11 +55,12 @@ the next person does not have to rediscover them:
 
   1. Repointing would have moved the inversion, not removed it — `app:log`
      would still `import "app:ui"`.
-  2. It does not need to live here. `add_sink` takes a `corelog.Sink`, which
-     is a plain `(fn, rawptr)` pair, so a program that wants its log on
-     screen writes a sink of its own that appends each record to lines it
-     keeps, and shows those lines in an `app:ui` text view whose source
-     reads them. The UI knowledge stays on the UI side of the boundary.
+  2. It does not need to live here. `add_sink` takes a `corelog.Sink`, a
+     trait, so a program that wants its log on screen writes a sink of its
+     own — a type `using corelog.Sink` whose `take` appends each record to
+     lines it keeps — and shows those lines in an `app:ui` text view whose
+     source reads them. The UI knowledge stays on the UI side of the
+     boundary.
 
 ## Declarations
 

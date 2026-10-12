@@ -249,12 +249,12 @@ tui.hints()                           // spends the last one
 | **static** | `text` (with `anchor:`) `title` `label` `muted` `paragraph` `kv` `kv_text` `kv_float` `badge` `badge_quiet` `dot` |
 | **indicators** | `spinner` `progress` |
 | **controls** | `button` `confirm_button` `checkbox` `radio` `select` `list` `tabs` `line_edit` (+ `edited` `set_text`) |
-| **panes** | `log` (+ `log_open` `log_feed` `log_say` `log_at` `log_clear`) `table` `table_row` |
+| **panes** | `log` (+ `log_open` `log_feed` `log_say` `log_at` `log_clear` `log_close`) `table` `table_row` |
 | **overlays** | `modal` `toast` (+ `toasts_clear` `toasts_showing`) `palette` `overlay_up` `dim_rect` |
 | **input** | `key` `bind` `hint` `hints` `typed` `mouse` `clicked` `clicked_in` `hovering` `wheel` |
 | **identity** | `push_id` `pop_id` |
-| **style** | `theme` `now` `rgb` `hex` `ansi` `mix` `DARK` `LIGHT` `MONO` |
-| **lifetime** | `open` `open_over` `close` `run` `step` `quit` `wake` `clock` `closed` |
+| **style** | `theme` `now` `rgb` `hex` `ansi` `mix` `DARK` `LIGHT` `MONO` `colors` `color_depth` (`ColorDepth`) `truecolor` |
+| **lifetime** | `open` `close` `run` `step` `quit` `wake` `clock` `closed` |
 | **the terminal** | `suspend` `resume` `suspended` `shell_out` `stop` |
 | **headless** | `open_headless` `compose` `snapshot` `cell_at` `color_rgb` `sink` |
 
@@ -371,10 +371,11 @@ has no cleanup and no leak.
 > formatted there and kept in a package variable is pointing at reclaimed
 > memory by the time anything reads it, and what you see is a few bytes of the
 > *next* frame's formatting where your value should be. Anything that outlives a
-> frame needs an allocator that does too — `open`'s backing, or `#heap`. This is
+> frame needs an allocator that does too — the `#default` outside the frame, or `#heap`. This is
 > the one thing the arena makes easy to get wrong, and it is worth the arena. After the first frame the arena is the size the
 program needs and steady state asks the heap for nothing. The cell grids and a
-line edit's buffer come from the allocator `open` was given.
+line edit's buffer come from the `#default` `open` saw, so a `using` around
+`open` chooses where the UI lives.
 
 There are no fixed ceilings on widget counts. The predecessor's `MAX_BOXES` was
 a `#panic`.
@@ -427,6 +428,11 @@ to need two naming conventions.**
 ## Testing
 
 * `layout_test.dado` — headless compose and snapshot, no terminal.
+* `colors_test.dado` — each `ColorDepth` as the bytes a terminal is sent, and
+  `color_rgb`.
+* `using_test.dado` — where the library allocates, and what `open_headless`,
+  `snapshot` and `log_open` answer under an allocator that refuses.
+* `raises_test.dado` — `kv` and `kv_float` promised at a script's types.
 * `tty_test.dado` — the platform arm with its streams on pipes, on every OS
   and under Wine: no terminal is a refusal and not a failure, the size falls
   back to 80x24, and on Windows a console's UTF-16 (a split surrogate pair

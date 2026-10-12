@@ -1,98 +1,351 @@
 @test
-// core:http — lifecycle and a real loopback round trip.
+// core:http — connections and the client against each other over loopback,
+// in one process.
 //
-// The round trip runs a `curl` in the background through `core:os/proc` (popen
-// starts the child immediately, so it runs concurrently with our accept loop),
-// then accepts the connection it makes and answers it. The whole accept loop is
-// **wall-clock bounded** (`time.since` < 5s) so a missing `curl`, a firewall, or
-// any other reason a connection never arrives fails the test rather than hanging
-// the gate. `--retry-connrefused` rides out the gap before the server is polling.
+// Where the client only connects and sends, both halves run on this thread:
+// a loopback `dial` completes against the listen backlog before anyone
+// accepts, the request sits in the socket's buffer, the server half accepts,
+// reads it with `receive` until `request_end` says it is whole, and answers
+// with `send`; the client then reads the answer. Where the test wants the
+// client's whole `get`/`post` (which waits for its answer before it
+// returns), a second thread plays the server. Every wait is bounded, so a
+// connection that never arrives fails the test rather than hanging the gate.
 //
-// PORT is a literal here and in the curl command below; keep the two equal.
+// The failures a connection meets are here too: a port in use, a host that
+// is not an address, nothing waiting to accept, nothing listening, a read
+// that times out, a server that hangs up mid-answer, an answer over the
+// caller's limit. On the web there are no sockets: the test checks that
+// `listen` and `dial` fail `UNSUPPORTED`, which is the whole of what that
+// arm promises.
 package http
 
-import "core:os/proc"
-import "core:io"
 import "core:strings"
 import "core:time"
+import "core:threads"
 
 const u16 PORT = 18973
 
 i32 test():
+    when #OS == #WEB:
+        bool ok = false
+        try Server s = listen("127.0.0.1", PORT) else why:
+            ok = #expect(why == Error.UNSUPPORTED, "web listen fails UNSUPPORTED, got ", message(why))
+            try Conn c = dial("127.0.0.1", PORT) else why2:
+                ok = #expect(why2 == Error.UNSUPPORTED, "web dial fails UNSUPPORTED, got ", message(why2)) && ok
+                return 0 if ok else 1
+            close_conn(c)
+            return 1
+        stop(s)
+        return 1
+    else:
+        return hosted()
+
+// `text`'s bytes, copied, for a `send`.
+private ref []u8 bytes(string8 text):
+    ref []u8 out = #make([]u8, #len(text))
+    for i in 0..<#len(text):
+        out[i] = u8(text[i])
+    return out
+
+// Send `text` on `c`; false with a printed reason when it did not all go.
+private bool send_text(Conn c, string8 text):
+    ref []u8 b = bytes(text)
+    defer #delete(b)
+    try send(c, b[:]) else why:
+        return #expect(false, "send: ", message(why))
+    return true
+
+// The next connection on `s`, waiting up to five seconds for one.
+private Error!Conn accept_within(Server s):
+    time.Instant t0 = time.instant()
+    for time.as_seconds_f64(time.elapsed(t0)) < 5.0:
+        try Conn c = accept(s) else why:
+            if why != Error.WOULD_BLOCK:
+                fail why
+            time.sleep(time.milliseconds(2))
+            continue
+        return c
+    fail Error.TIMED_OUT
+
+// Read one whole request from `c`, as `request_end` measures it.
+private Error!ref []char8 read_request(Conn c):
+    ref []char8 data = #make([]char8, 0)
+    [4096]u8 chunk
+    for:
+        string8 have = data
+        try Extent e = request_end(have) else why:
+            #delete(data)
+            fail why
+        switch e:
+            case Whole w:
+                #truncate(data, w.length)
+                return data
+            case Pending _:
+                pass
+            case ToClose _:
+                pass
+        try i64 n = receive(c, chunk[:]) else why:
+            #delete(data)
+            fail why
+        if n == 0:
+            #delete(data)
+            fail Error.CLOSED
+        for i in 0..<n:
+            _ = #append(data, char8(chunk[i]))
+    fail Error.CLOSED
+
+// The response a test server sends: `status`, `content-type: text/plain`,
+// and `body`.
+private ref []char8 answer(i32 status, string8 body):
+    return #format("HTTP/1.1 ", status, " ", "OK" if status == 200 else "Created",
+                   "\r\nContent-Type: text/plain\r\nContent-Length: ", #len(body),
+                   "\r\nConnection: close\r\n\r\n", body)
+
+private i32 hosted():
     bool ok = true
 
-    Server s = listen(PORT)
-    ok = #expect(valid(s), "listen on ", i32(PORT)) && ok
-    if !valid(s):
+    try Server s = listen("127.0.0.1", PORT) else why:
+        #expect(false, "listen on ", i32(PORT), ": ", message(why))
         return 1
 
-    // a second bind on the same port must fail — proves the bind is real and
-    // not a stub that hands back an unbound descriptor
-    Server dup = listen(PORT)
-    ok = #expect(!valid(dup), "second bind on the same port is refused") && ok
-    if valid(dup):
-        stop(dup)
+    // A second bind on the same port must fail — proves the bind is real.
+    bool in_use = false
+    Server dup = Server(-1)
+    try dup = listen("127.0.0.1", PORT) else why:
+        in_use = #expect(why == Error.IN_USE, "second bind is IN_USE, got ", message(why))
+    stop(dup)
+    ok = #expect(in_use, "a second bind on the same port is refused") && ok
 
-    // non-blocking: with no client waiting, poll answers "nothing" at once
-    Accepted empty = poll(s)
-    ok = #expect(!empty.ok, "poll with no client returns nothing") && ok
+    // A host that is not an address of this machine.
+    bool odd = false
+    Server bad = Server(-1)
+    try bad = listen("not an address", PORT) else why:
+        odd = #expect(why == Error.UNREACHABLE, "a non-numeric bind host fails UNREACHABLE, got ", message(why))
+    stop(bad)
+    ok = #expect(odd, "a non-numeric bind host is refused") && ok
 
-    // the client, running concurrently
-    ^io.FILE cli = proc.read(
-        "curl -s --retry 3 --retry-delay 1 --retry-connrefused http://127.0.0.1:18973/ping 2>/dev/null")
-    ok = #expect(proc.opened(cli), "curl launched") && ok
+    // Nonblocking: with no client waiting, accept answers WOULD_BLOCK at once.
+    bool empty = false
+    Conn none = Conn(-1)
+    try none = accept(s) else why:
+        empty = #expect(why == Error.WOULD_BLOCK, "accept with no client fails WOULD_BLOCK, got ", message(why))
+    close_conn(none)
+    ok = #expect(empty, "accept with no client answers no connection") && ok
 
-    f64 t0 = time.now()
-    bool served = false
-    for time.since(t0) < 5.0 && !served:
-        Accepted a = poll(s)
-        if a.ok:
-            ok = #expect(method() == Method.Get, "request method is GET") && ok
-            ok = #expect(strings.starts_with(path(), "/ping"),
-                        "request path starts with /ping (got ", path(), ")") && ok
-            respond(a.conn, 200, "OK", "text/plain", "pong")
-            served = true
-        else:
-            time.nap(5)
-    ok = #expect(served, "server accepted and answered within 5s") && ok
+    // ── GET, both halves on this thread ─────────────────────────────────────
+    []Header no_headers
+    ok = round_trip(s, build_request("GET", "127.0.0.1", PORT, "/ping?x=1", no_headers, ""),
+                    "GET /ping?x=1 ", "", "pong") && ok
 
-    // curl's stdout is exactly the body we sent
-    (cstring pong, bool got) = io.read_line(cli)
-    ok = #expect(got, "curl produced a body") && ok
-    if got:
-        string8 pong_s = strings.borrow_from_cstring(pong)
-        ok = #expect(#len(pong_s) == 4, "body is 4 bytes ('pong'), got ", #len(pong_s)) && ok
-    _ = proc.close(cli)
+    // ── a chunked POST body arrives whole ───────────────────────────────────
+    ok = round_trip(s, owned("POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Trailer: t\r\n\r\n"),
+                    "POST /c ", "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-Trailer: t\r\n\r\n", "ok") && ok
 
-    // ── a POST with a body, answered with CORS ────────────────────────────────
-    // curl -si prints the response headers; grep keeps only the CORS one, so a
-    // non-empty line back proves respond_cors sent it.
-    ^io.FILE cli2 = proc.read(
-        "curl -si --retry 3 --retry-connrefused -X POST --data '{\"events\":[{\"type\":\"log\",\"text\":\"hi\"}]}' http://127.0.0.1:18973/ingest 2>/dev/null | grep -i 'access-control-allow-origin'")
-    ok = #expect(proc.opened(cli2), "curl POST launched") && ok
+    // ── a body larger than one segment, and a response larger still ─────────
+    strings.Builder big = strings.builder()
+    for i in 0..<1000:
+        _ = strings.append(&big, "0123456789")
+    ref []char8 ten_k_bytes = strings.finish(&big)
+    string8 ten_k = ten_k_bytes
+    ok = round_trip(s, build_request("POST", "127.0.0.1", PORT, "/big", no_headers, ten_k),
+                    "POST /big ", ten_k, "") && ok
+    strings.Builder huge = strings.builder()
+    for i in 0..<4000:
+        _ = strings.append(&huge, "abcdefghij")
+    ref []char8 forty_k_bytes = strings.finish(&huge)
+    string8 forty_k = forty_k_bytes
+    ok = round_trip(s, build_request("GET", "127.0.0.1", PORT, "/huge", no_headers, ""),
+                    "GET /huge ", "", forty_k) && ok
+    #delete(ten_k_bytes)
+    #delete(forty_k_bytes)
 
-    f64 t1 = time.now()
-    bool posted = false
-    for time.since(t1) < 5.0 && !posted:
-        Accepted a = poll(s)
-        if a.ok:
-            ok = #expect(method() == Method.Post, "method is POST") && ok
-            ok = #expect(strings.starts_with(path(), "/ingest"), "path /ingest, got ", path()) && ok
-            ok = #expect(strings.contains(body(), "\"text\":\"hi\""),
-                        "the POST body reached body()") && ok
-            respond_cors(a.conn, 204, "No Content", "text/plain", "")
-            posted = true
-        else:
-            time.nap(5)
-    ok = #expect(posted, "server received the POST within 5s") && ok
-
-    (cstring hdr, bool gh) = io.read_line(cli2)
-    string8 hdr_s = strings.borrow_from_cstring(hdr)
-    ok = #expect(gh && #len(hdr_s) > 0, "response carried the CORS header") && ok
-    _ = proc.close(cli2)
-
+    ok = failures(s) && ok
     stop(s)
 
-    if ok:
-        return 0
-    return 1
+    // ── nothing listening ───────────────────────────────────────────────────
+    bool refused = false
+    Conn c = Conn(-1)
+    try c = dial("127.0.0.1", PORT, 2000) else why:
+        refused = #expect(why == Error.REFUSED, "dial with nothing listening is REFUSED, got ", message(why))
+    close_conn(c)
+    ok = #expect(refused, "a dial with nothing listening fails") && ok
+
+    // ── the whole client, against a server on another thread ───────────────
+    ok = client_calls() && ok
+    return 0 if ok else 1
+
+// Send `request` from a client on this thread, accept and read it on `s`,
+// check it starts with `want_line` and its body is `want_body`, answer
+// `reply`, and check what the client reads back. Takes `request`.
+private bool round_trip(Server s, ref []char8 request, string8 want_line, string8 want_body,
+                        string8 reply):
+    bool ok = true
+    try Conn c = dial("127.0.0.1", PORT, 2000) else why:
+        #delete(request)
+        return #expect(false, "dial: ", message(why))
+    string8 req_text = request
+    ok = send_text(c, req_text) && ok
+    #delete(request)
+
+    try Conn served = accept_within(s) else why:
+        close_conn(c)
+        return #expect(false, "accept for ", want_line, ": ", message(why))
+    try ref []char8 got = read_request(served) else why:
+        close_conn(served)
+        close_conn(c)
+        return #expect(false, "read the request ", want_line, ": ", message(why))
+    string8 raw = got
+    ok = #expect(strings.starts_with(raw, want_line), "the request line is ", want_line) && ok
+    i64 at = 0
+    try at = head_end(raw) else:
+        at = 0
+    string8 body = raw[at + 4..<i64(#len(raw))]
+    ok = #expect(body == want_body, "body of ", want_line, " (", #len(body), " bytes, want ", #len(want_body), ")") && ok
+    #delete(got)
+    ref []char8 resp = answer(200, reply)
+    string8 resp_text = resp
+    ok = send_text(served, resp_text) && ok
+    #delete(resp)
+    close_conn(served)
+
+    try Response r = read_response(c, 2000) else why:
+        close_conn(c)
+        return #expect(false, "read_response for ", want_line, ": ", message(why))
+    close_conn(c)
+    ok = #expect(r.status == 200, "status for ", want_line, ": ", r.status) && ok
+    ok = #expect(r.body == reply, "the client read the answer to ", want_line, " (", #len(r.body), " bytes)") && ok
+    ok = #expect(r.header("content-type") == "text/plain", "content-type header") && ok
+    r.destroy()
+    return ok
+
+// What a connection meets when the other side misbehaves.
+private bool failures(Server s):
+    bool ok = true
+
+    // A read that waits out its timeout.
+    try Conn quiet = dial("127.0.0.1", PORT, 2000) else why:
+        return #expect(false, "dial: ", message(why))
+    try Conn quiet_served = accept_within(s) else why:
+        close_conn(quiet)
+        return #expect(false, "accept: ", message(why))
+    try set_timeout(quiet_served, 50) else why:
+        ok = #expect(false, "set_timeout: ", message(why)) && ok
+    [16]u8 buf
+    bool timed_out = false
+    i64 n = -1
+    try n = receive(quiet_served, buf[:]) else why:
+        timed_out = #expect(why == Error.TIMED_OUT, "a receive with nothing sent fails TIMED_OUT, got ", message(why))
+    ok = #expect(timed_out && n == -1, "a receive with nothing sent timed out") && ok
+
+    // A server that hangs up mid-answer.
+    ok = send_text(quiet_served, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort") && ok
+    close_conn(quiet_served)
+    bool closed = false
+    Response cut
+    try cut = read_response(quiet, 2000) else why:
+        closed = #expect(why == Error.CLOSED, "an answer cut short fails CLOSED, got ", message(why))
+    cut.destroy()
+    close_conn(quiet)
+    ok = #expect(closed, "an answer cut short is refused") && ok
+
+    // An answer over the caller's limit.
+    try Conn greedy = dial("127.0.0.1", PORT, 2000) else why:
+        return #expect(false, "dial: ", message(why))
+    try Conn greedy_served = accept_within(s) else why:
+        close_conn(greedy)
+        return #expect(false, "accept: ", message(why))
+    ref []char8 long_answer = answer(200, "0123456789012345678901234567890123456789")
+    string8 long_text = long_answer
+    ok = send_text(greedy_served, long_text) && ok
+    #delete(long_answer)
+    close_conn(greedy_served)
+    bool too_large = false
+    Response over
+    try over = read_response(greedy, 2000, 16) else why:
+        too_large = #expect(why == Error.TOO_LARGE, "an answer over the limit fails TOO_LARGE, got ", message(why))
+    over.destroy()
+    close_conn(greedy)
+    ok = #expect(too_large, "an answer over the limit is refused") && ok
+    return ok
+
+private ref []char8 owned(string8 text):
+    ref []char8 out = #make([]char8, 0)
+    for c in text:
+        _ = #append(out, c)
+    return out
+
+// ── a server on another thread ──────────────────────────────────────────────
+
+private const u16 PORT2 = 18975
+
+// What the server thread is told and tells back.
+private type Shared: (Server s, i32 served)
+private type SharedPtr: ^Shared
+
+// Answer three connections on `s`: the first with a fixed-length body, the
+// second chunked, the third echoing a POST's body. Each waits at most 5 s.
+private rawptr serve_three(rawptr arg):
+    SharedPtr p = SharedPtr(arg)
+    Server s = p^.s
+    for k in 0..<3:
+        try Conn c = accept_within(s) else:
+            return nil
+        try ref []char8 req = read_request(c) else:
+            close_conn(c)
+            return nil
+        if k == 0:
+            ref []char8 a = answer(200, "plain answer")
+            _ = send_text(c, a)
+            #delete(a)
+        else if k == 1:
+            _ = send_text(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Kind: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
+        else:
+            string8 raw = req
+            i64 at = 0
+            try at = head_end(raw) else:
+                at = 0
+            ref []char8 a = answer(201, raw[at + 4..<i64(#len(raw))])
+            _ = send_text(c, a)
+            #delete(a)
+        #delete(req)
+        close_conn(c)
+        p^.served = p^.served + 1
+    return nil
+
+private bool client_calls():
+    bool ok = true
+    try Server s = listen("127.0.0.1", PORT2) else why:
+        return #expect(false, "listen on ", i32(PORT2), ": ", message(why))
+    Shared shared = (s, 0)
+    threads.Thread t = threads.spawn(serve_three, rawptr(&shared))
+    if t == nil:
+        stop(s)
+        return #expect(false, "spawned the server thread")
+
+    Response a
+    try a = get("127.0.0.1", PORT2, "/a") else why:
+        ok = #expect(false, "get: ", message(why)) && ok
+        a.status = 0
+    ok = #expect(a.status == 200 && a.body == "plain answer", "get read a sized body: ", a.body) && ok
+    ok = #expect(a.reason == "OK" && a.version == "HTTP/1.1", "status line parts") && ok
+    a.destroy()
+
+    Response b
+    try b = get("localhost", PORT2, "/b") else why:
+        ok = #expect(false, "get localhost: ", message(why)) && ok
+        b.status = 0
+    ok = #expect(b.status == 200 && b.body == "Wikipedia", "get read a chunked body: ", b.body) && ok
+    ok = #expect(b.header("x-kind") == "chunked", "a header of a chunked response") && ok
+    b.destroy()
+
+    Response c
+    try c = post("127.0.0.1", PORT2, "/c", "application/json", "{\"n\": 1}") else why:
+        ok = #expect(false, "post: ", message(why)) && ok
+        c.status = 0
+    ok = #expect(c.status == 201 && c.body == "{\"n\": 1}", "post's body came back: ", c.body) && ok
+    c.destroy()
+
+    _ = threads.join(t)
+    ok = #expect(shared.served == 3, "the server thread answered three, answered ", shared.served) && ok
+    stop(s)
+    return ok

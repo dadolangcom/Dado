@@ -57,6 +57,17 @@
  * Note what the clause costs: it is **program-global**, so a program linking
  * this package defines `ENET_IPV4_ONLY` for every other package in it. Nothing
  * outside this directory names the macro, so today that is free. */
+
+/* A web build (wasm32, freestanding) and a `#NONE` build compile every `.c`
+ * file of a package they reach, and neither has the C library or the sockets
+ * ENet is written on: `enet.h` includes <assert.h>, <stdlib.h> and the socket
+ * headers first thing. `enet.dado` declares Dado stubs for those targets, so
+ * this translation unit compiles to nothing there. The typedef keeps it from
+ * being empty, which ISO C does not allow. */
+#if defined(__wasm__) || (defined(__STDC_HOSTED__) && __STDC_HOSTED__ == 0)
+typedef int dado_enet_not_built_here;
+#else
 #define ENET_IPV4_ONLY
 #define ENET_IMPLEMENTATION
 #include "enet.h"
+#endif

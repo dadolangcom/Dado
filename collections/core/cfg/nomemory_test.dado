@@ -1,0 +1,118 @@
+@test
+// Allocation failure, reached through `using`: every allocation this package
+// makes is the ambient allocator's, so an allocator that refuses, or one that
+// refuses after a budget, reaches every allocation-failure answer at once.
+// Text only, so it runs on every target. What is claimed:
+//
+//   * **a setter whose copy or insert fails leaves the key as it was** — the
+//     old value, or absent — and stores no `nil` (a setter once stored one,
+//     and `get` then answered `""` as if it were there); a section made only
+//     for that key is not left behind, empty.
+//   * **`parse` counts a line it could not store in `bad_lines`**, and a
+//     `Config` it answers holds only what it could store, every value right.
+//   * **`render` and `render_over` answer `nil`** when they cannot finish,
+//     and the exact text when they can.
+//   * **nothing leaks on any of those paths**: under a budget that runs out
+//     at every allocation in turn, the blocks still live after `destroy`
+//     (and `#delete` of the text) are none.
+package cfg
+
+import "core:mem"
+import "core:mem/libc"
+
+// An allocator that refuses everything.
+private rawptr refuses(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    return nil
+
+// `libc`, counting live blocks, refusing every allocation once `budget`
+// allocations have been made. Frees always go through.
+private i64 budget
+private i64 live
+
+private rawptr budgeted(rawptr data, mem.AllocatorMode mode, u64 nbytes, u64 align, rawptr old, u64 old_size):
+    bool fresh_block = mode == mem.AllocatorMode.Alloc || (mode == mem.AllocatorMode.Resize && old == nil)
+    if (fresh_block || mode == mem.AllocatorMode.Resize) && budget <= 0:
+        return nil
+    (mem.Proc proc, rawptr data) base = libc.allocator()
+    rawptr p = base.proc(base.data, mode, nbytes, align, old, old_size)
+    if fresh_block && p != nil:
+        live = live + 1
+        budget = budget - 1
+    else if mode == mem.AllocatorMode.Resize && p != nil:
+        budget = budget - 1
+    else if mode == mem.AllocatorMode.Free && old != nil:
+        live = live - 1
+    return p
+
+private (mem.Proc proc, rawptr data) with_budget(i64 n):
+    budget = n
+    return (budgeted, nil)
+
+private const string8 TEXT = "; a comment\nname = camp\n[window]\nwidth = 800\ntitle = \"  padded  \"\n[audio]\nvolume = 5\n"
+
+i32 test():
+    bool ok = true
+
+    // ── a setter that cannot allocate leaves the key as it was ────────────
+    Config c = empty()
+    set_string(&c, "s", "k", "old")
+    set_string(&c, "s", "k", "new") using (refuses, nil)
+    ok = #expect(get_string(c, "s", "k", "?") == "old", "a refused overwrite changed the value to ", get_string(c, "s", "k", "?")) && ok
+    set_i32(&c, "s", "fresh", 7) using (refuses, nil)
+    ok = #expect(get_i32(c, "s", "fresh", 0 - 1) == 0 - 1, "a refused new key was stored") && ok
+    bool absent = false
+    string8 seen = ""
+    try seen = get(c, "s", "fresh") else why:
+        absent = why == Error.NOT_FOUND
+    ok = #expect(absent, "get answered a refused key as ", seen) && ok
+    set_bool(&c, "brand_new", "on", true) using (refuses, nil)
+    set_f64(&c, "s", "f", 2.5) using (refuses, nil)
+    set_i64(&c, "s", "i", 5) using (refuses, nil)
+    set_u64(&c, "s", "u", 5) using (refuses, nil)
+    ref []char8 shown = render(c)
+    ok = #expect(shown != nil && string8(shown[:]) == "[s]\nk = old\n", "after refused setters the Config renders as:\n", string8(shown[:])) && ok
+    #delete(shown)
+
+    // ── render and render_over that cannot allocate answer nil ────────────
+    ok = #expect(render(c) using (refuses, nil) == nil, "a refused render answered text") && ok
+    ok = #expect(render_over(c, "[s]\nk = old\n") using (refuses, nil) == nil, "a refused render_over answered text") && ok
+    destroy(&c)
+
+    // ── parse that cannot allocate stores nothing and counts every line ───
+    (Config none, i32 nbad) = parse(TEXT) using (refuses, nil)
+    ok = #expect(nbad > 0, "a refused parse counted no bad lines") && ok
+    ok = #expect(get_string(none, "window", "width", "?") == "?", "a refused parse stored width") && ok
+    destroy(&none)
+
+    // ── every allocation failing in turn: right or refused, never wrong ───
+    //
+    // The whole parse, a render over its text after a change, and the end of
+    // both, with the budget running out one allocation later each time, until
+    // a budget large enough for all of it.
+    i64 n = 0
+    bool whole = false
+    for !whole && n < 400:
+        live = 0
+        using with_budget(n):
+            (Config p, i32 bad) = parse(TEXT)
+            if bad == 0:
+                ok = #expect(get_string(p, "", "name", "?") == "camp" && get_i32(p, "window", "width", 0) == 800 && get_string(p, "window", "title", "?") == "  padded  " && get_i32(p, "audio", "volume", 0) == 5,
+                             "budget ", n, ": a clean parse read back wrong") && ok
+            else:
+                // What was stored is right; what was not is absent.
+                string8 width = get_string(p, "window", "width", "800")
+                ok = #expect(width == "800", "budget ", n, ": a partial parse stored width as ", width) && ok
+            set_i32(&p, "window", "width", 1024)
+            ref []char8 out = render_over(p, TEXT)
+            if out != nil:
+                i32 w = get_i32(p, "window", "width", 0)
+                string8 want = "; a comment\nname = camp\n[window]\nwidth = 1024\ntitle = \"  padded  \"\n[audio]\nvolume = 5\n"
+                if bad == 0 && w == 1024:
+                    ok = #expect(string8(out[:]) == want, "budget ", n, ": render_over wrote:\n", string8(out[:])) && ok
+                    whole = true
+            #delete(out)
+            destroy(&p)
+        ok = #expect(live == 0, "budget ", n, ": ", live, " blocks still live after destroy") && ok
+        n = n + 1
+    ok = #expect(whole, "no budget under 400 allocations was enough for a parse and a render") && ok
+    return 0 if ok else 1

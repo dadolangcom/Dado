@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 2b5ebeeb9435 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit 703d96d30a51 (dirty) -->
 # core:jobs
 
 core:jobs — a general task system and the worker pool the runtime parallelises
@@ -63,21 +63,38 @@ is its worker's, and the worker's first scope configures it. A
 across workers; **a map or any other structure a job shares with another
 thread is not synchronised** and needs a `core:threads` mutex.
 
+**Tier W H.** The pooled engine runs wherever `core:threads` does: Linux,
+macOS, the BSDs, Windows, and a web module built with `--web-threads`. A
+single-threaded web module has no thread to start, so there `start` runs
+the serial engine whatever `nthreads` asks for, and answers true;
+`Scheduler.nworkers` says which engine runs. A `#NONE` build is refused by
+the static assertion below: the pool is `core:threads`', and a freestanding
+target has no second thread to run it on.
+
+**The scratch arenas grow on the allocator `start` was called under**
+(`#default`: C's heap, unless a `using` around `start` says otherwise), and
+keep it until `stop`. That is the one allocator this package captures, and
+it is captured on purpose: the arenas outlive the `using` they were made in
+and are reset and grown from every worker thread, whose own ambient is the
+root.
+
+**What raises into a script.** Nothing here. A job is a function reference
+and a `rawptr` to its data, the scheduler's handles are `core:threads`'
+thread and lock handles, and its counters are atomic accesses, so every
+function reaches something a script cannot hold. A script that wants work done in parallel
+asks Dado code that owns a scheduler.
+
 This is a `core:` library and owes tests: it is a concurrency engine and
 wraps core:threads.
 
 ## The atomics are the language's, and the ordering is written at each call
 
 Every atomic access below is a `#atomic_*` intrinsic over an ordinary `i32`
-the scheduler already owns, and not a call to `core:threads`' wrappers. Those
-are one verb each at `#SEQ_CST`, because a function cannot take an ordering
-as a parameter: the ordering has to be a constant at the machine
-instruction, which is exactly why `#atomic_*` takes a `#` member the checker
-folds and refuses. A wrapper fixes one ordering for every caller, and this
-package wants four.
-
-So the orderings below are written per access rather than paid for uniformly,
-and each is chosen rather than defaulted:
+the scheduler already owns, with its ordering written at the access. The
+verb takes the ordering as a constant, so the C compiler emits exactly that
+instruction; `core:threads`' `atomic_*` functions take an `Order` argument
+and pick the verb with a `switch`, which costs nothing once inlined but
+says less at the call than the verb does. Each ordering here is chosen:
 
   * **the batch counter's decrement is `#ACQ_REL`** — release, so that a
     thread which sees the count reach zero sees everything the job wrote
@@ -93,25 +110,24 @@ and each is chosen rather than defaulted:
     claimed by a compare-exchange that carries its own ordering. A stronger
     ordering here would buy nothing and cost a fence per submission.
 
-`core:threads` keeps its atomic wrappers and its tests: they are what a
-program that holds a cell and not an ordering needs, and `jobs` not calling
-them is not a reason to delete them.
+Each `Scheduler` keeps its own workers' identities, so any number of them
+may run at once, each with its own pool.
 
 ## Declarations
 
-29 declarations, 14 public.
+28 declarations, 14 public.
 
-* `const i32 MAX_WORKERS = 64`
-* `const i32 QCAP = 8192`
-* `const i32 HCAP = 8192`
+* `const i32 MAX_WORKERS = 64` — The most participants one scheduler has: the calling thread and up to 63…
+* `const i32 QCAP = 8192` — The job ring's capacity. A submission into a full ring runs on the…
+* `const i32 HCAP = 8192` — The batch-counter ring's capacity: how many batches can be unfinished at…
 * `type JobArgs` — What a job sees. `scratch` is this worker's private arena — `using…
-* `type JobFn: void(^JobArgs)`
+* `type JobFn: void(^JobArgs)` — A job: called with its `JobArgs`, once per `submit` and once per chunk of a…
 * `distinct type Handle: i32` — A completion token. Serial handles are always done; a pooled handle names a…
-* `type Scheduler` — The scheduler. One instance, owned by the caller (a package global — the inline…
-* `bool start(^Scheduler s, i32 nthreads)` — Start the scheduler with `nthreads` worker threads (0 → the serial engine, all…
-* `void stop(^Scheduler s)` — Stop the pool: signal drain, wake all workers, join them, free primitives and…
-* `void reset_scratch(^Scheduler s)` — Reset the per-participant scratch arenas — the app calls this once a frame.
-* `Handle submit(^Scheduler s, JobFn fn, rawptr data)` — Submit one job. Serial: runs inline now. Pooled: enqueued; `wait` the handle.
-* `Handle submit_after(^Scheduler s, JobFn fn, rawptr data, Handle dep)` — Submit `fn` to run after `dep` completes. v1: since callers wait on `dep`
-* `void parallel_for(^Scheduler s, i32 n, i32 grain, JobFn fn, rawptr data)` — Fork-join over [0, n) in `grain`-sized chunks, then join before returning.
-* `void wait(^Scheduler s, Handle h)` — Cooperatively wait for a handle: the waiting thread runs other ready jobs while…
+* `type Scheduler` — The scheduler, owned by the caller: a package variable, since the inline…
+* `bool start(^Scheduler s, i32 nthreads)` — Starts the scheduler with `nthreads` worker threads (0 is the serial…
+* `void stop(^Scheduler s)` — Stops the pool: lets the workers drain the queue, wakes and joins them,…
+* `void reset_scratch(^Scheduler s)` — Resets every participant's scratch arena, taking back everything jobs…
+* `Handle submit(^Scheduler s, JobFn fn, rawptr data)` — Submits one job. The serial engine runs it now, on this thread; the pooled…
+* `Handle submit_after(^Scheduler s, JobFn fn, rawptr data, Handle dep)` — Submits `fn` to run after `dep` has finished. It waits for `dep` on this…
+* `void parallel_for(^Scheduler s, i32 n, i32 grain, JobFn fn, rawptr data)` — Runs `fn` over [0, n) in chunks of `grain` indices (1 when `grain` is…
+* `void wait(^Scheduler s, Handle h)` — Waits for a handle's job to finish, running other queued jobs on this…

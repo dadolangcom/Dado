@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.2 -->
-<!-- commit 7e1d5137cae1 (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit dc7ad747d949 -->
 # vendor:tui
 
 vendor:tui — a terminal UI you can throw together in seconds.
@@ -44,20 +44,39 @@ frame."** One rule for every widget in the library, which is what makes
 `^Ui` first parameter on every call in the library — which is the entire
 sugar budget spent on nothing. `open` refuses a second one.
 
+── and what it costs ──────────────────────────────────────────────────────
+
+**Where it allocates.** `open` and `open_headless` keep the `#default` they
+see for the UI's whole life (the cell grids, the frame arena's blocks, a
+line edit's buffer), so a `using` around `open` chooses it. `log_open` and
+`snapshot` allocate on the `#default` of their own call. Nothing takes an
+allocator parameter.
+
+**What raises into a script.** Everything that lays out, draws or reads a
+frame back carries the `#assert_raises` on the line above it: the
+rectangles, the layout, the widgets, the colours and the theme, `Log`,
+`snapshot` and `cell_at`. `kv` and `kv_float` are templates, promised at a
+script's types in `raises_test.dado`. Not promised, each saying why in its
+doc comment: what reaches the terminal (`open`, `close`, `step`, `run`,
+`present`, `suspend`, `resume`, `stop`, `shell_out`, `is_terminal`,
+`resized`), the frame arena (`open_headless`, `compose`), and the clock
+(`clock`, and `spinner`, `toast`, `confirm_button`, `line_edit` and
+`palette`, which animate by it).
+
 ## Declarations
 
-561 declarations, 193 public.
+557 declarations, 188 public.
 
 * `type Rect: (i32 x, i32 y, i32 w, i32 h)` — A rectangle in terminal cells. Zero-based and half-open: a `Rect` at (0,0)
-* `const Rect NOWHERE = (0, 0, 0, 0)`
-* `bool empty(Rect r)`
-* `bool holds(Rect r, i32 x, i32 y)`
-* `Rect intersect(Rect a, Rect b)`
-* `Rect inset(Rect r, i32 by)`
-* `i32 cols()`
-* `i32 rows()`
+* `const Rect NOWHERE = (0, 0, 0, 0)` — The empty rectangle: what `intersect` answers for two that do not meet.
+* `bool empty(Rect r)` — Whether `r` covers no cell: a zero or negative width or height.
+* `bool holds(Rect r, i32 x, i32 y)` — Whether the cell (x, y) is inside `r`.
+* `Rect intersect(Rect a, Rect b)` — The cells `a` and `b` share; `NOWHERE` when they share none.
+* `Rect inset(Rect r, i32 by)` — `r` shrunk by `by` cells on every side (grown, for a negative `by`). Can…
+* `i32 cols()` — The width of the grid the last frame was composed on, in cells.
+* `i32 rows()` — The height of the grid the last frame was composed on, in cells.
 * `Rect screen()` — The whole terminal, as a rectangle.
-* `Rect clip()`
+* `Rect clip()` — The rectangle drawing is clipped to here: the interior of the innermost…
 * `void fill_rect(Rect r, Style st)` — Paint a rectangle in one style, glyph and all. `fill_rect(r, surface)` is…
 * `void tint_rect(Rect r, Color bg)` — Repaint a rectangle's background without touching its glyphs — the selection…
 * `void dim_rect(Rect r, u32 amount)` — Push everything in `r` toward the window's own background.
@@ -71,13 +90,13 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `bool tabs(^i32 active, ..string8 labels)` — A row of tabs. `active` is yours; the answer is whether it changed.
 * `bool tabs_of(^i32 active, []string8 labels, string8 tag = "tabs")` — The same, when the labels are data rather than written out.
 * `bool select(string8 label, ^i32 index, ..string8 options)` — One of a set, cycled in place: `‹ clang ›`.
-* `bool select_of(string8 label, ^i32 index, []string8 options)`
+* `bool select_of(string8 label, ^i32 index, []string8 options)` — `select` over a run of options rather than a list of arguments.
 * `bool confirm_button(string8 label, string8 armed = "sure?", i32 width = AUTO, f64 window = 3.0, bool enabled = true)` — A button that asks first: the press arms it, and a second press within…
 * `bool armed(string8 label)` — Whether the confirm button with this label is currently waiting for its…
 * `bool line_edit(string8 label, ^ref []char8 buf, string8 placeholder = "", bool secret = false, i32 width = FLOW)` — A single-line text field. The buffer is yours, and it is a `^ref []char8`
-* `string8 edited(ref []char8 buf)` — The contents of a line edit's buffer, as a `string` to read.
+* `string8 edited(ref []char8 buf)` — The contents of a line edit's buffer, as a `string8` to read.
 * `ref []char8 set_text(ref []char8 buf, string8 s)` — Put `s` into a line edit's buffer, minting one if there is none. Answers the…
-* `const u32 K_NONE = 0`
+* `const u32 K_NONE = 0` — The keys that are not text. `K_NONE` is no key at all.
 * `const u32 K_ENTER = K_BASE + 1`
 * `const u32 K_TAB = K_BASE + 2`
 * `const u32 K_ESC = K_BASE + 3`
@@ -93,27 +112,27 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `const u32 K_LEFT = K_BASE + 13`
 * `const u32 K_RIGHT = K_BASE + 14`
 * `const u32 K_F1 = K_BASE + 20`
-* `distinct enum u32 Mod`
-* `type KeyEvent: (u32 code, Mod mods)`
-* `void animate()`
+* `distinct enum u32 Mod` — The modifiers held with a key. A flag set: `Mod.CTRL | Mod.SHIFT`.
+* `type KeyEvent: (u32 code, Mod mods)` — One key as it arrived: a code point for text, a `K_*` code for anything…
+* `void animate()` — Ask for another frame soon. A widget that moves on its own (a spinner, a…
 * `(i32 bytes, i32 keys) input_counters()` — Diagnostics for the pty harness: how many bytes the decoder has been handed…
 * `bool key(string8 spec)` — Was this key pressed on this frame? Consumes it, so two widgets cannot both…
-* `string8 typed()` — The printable characters typed this frame, in order, as a `string` from the…
-* `(i32 x, i32 y) mouse()`
-* `bool mouse_down()`
+* `string8 typed()` — The printable characters typed this frame, in order, as a `string8` from the…
+* `(i32 x, i32 y) mouse()` — Where the mouse is, in cells; (-1, -1) before it has moved over the window.
+* `bool mouse_down()` — Whether a mouse button is held.
 * `bool clicked_in(Rect r)` — Did a press land inside `r` this frame? The hit test every clickable widget…
-* `bool hovering(Rect r)`
+* `bool hovering(Rect r)` — Whether the mouse is over `r` and no overlay above this frame's region takes…
 * `i32 wheel()` — How far the wheel turned this frame, in lines. Negative is up.
 * `bool overlay_up()` — Whether an overlay is up, for a program that wants to say so.
-* `bool has_focus(u32 id)`
-* `type Action: void()`
+* `bool has_focus(u32 id)` — Whether the widget with the id `id` has the keyboard focus.
+* `type Action: void()` — What `bind` runs when its key is pressed. No arguments, because there are no…
 * `void hint(string8 spec, string8 describe)` — Advertise a key in the hints bar **without claiming it**.
 * `void bind(string8 spec, string8 describe, Action f)` — Run `f` when `spec` is pressed, and show it in the hints bar. `describe` may…
 * `const i32 AUTO = 0 - 1` — Fit the content. The default cross size for a row's children.
 * `const i32 REST = 0 - 2` — Everything the region has left along this axis. The default cross size for a…
 * `const i32 FLOW = 0 - 3` — Fill the cross axis, take the natural size along the main one. The default…
 * `i32 pct(i32 n)` — A fraction of the region's extent along this axis. `pct(50)` in a row is…
-* `enum Axis: (Down, Right)`
+* `enum Axis: (Down, Right)` — The direction a container stacks its children: `Down` in a `column`,…
 * `enum Anchor: (START, MIDDLE, END)` — Where along the *main* axis a widget is placed. `START` packs forward from…
 * `const Anchor LEFT = Anchor.START` — The spellings that read right in each direction. They are the same three…
 * `const Anchor CENTER = Anchor.MIDDLE`
@@ -123,8 +142,8 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `const Anchor BOTTOM = Anchor.END`
 * `const i32 MAX_TABLE_COLS = 12` — A table wider than this is a table that wanted to be a list.
 * `void push_id(i32 n)` — Distinguish otherwise identical widgets in a loop.
-* `void push_id_str(string8 s)`
-* `void pop_id()`
+* `void push_id_str(string8 s)` — `push_id` with a string, for a loop over named things.
+* `void pop_id()` — End what `push_id` or `push_id_str` began.
 * `Rect available()` — Where the next widget would go, without taking it.
 * `void align(Anchor a)` — Set the anchor for everything placed after this, until the region closes.
 * `void gap(i32 n)` — Set the gap between everything placed after this.
@@ -141,55 +160,52 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `void rule(string8 title = "")` — A themed hairline across the region, optionally with an inset caption.
 * `bool modal(string8 title, ^bool open, i32 width = 0 - 1, i32 height = 0 - 1, u32 dim = 150)` — A centred panel above everything else, with the screen behind it dimmed.
 * `void toast(string8 s, Color color = DEFAULT, f64 seconds = 4.0)` — Show `s` for `seconds`. The default colour is the accent; pass `err` or `ok`
-* `void toasts_clear()`
-* `i32 toasts_showing()`
-* `i32 palette(^bool open, ^ref []char8 query, []string8 items, string8 title = "Commands")`
+* `void toasts_clear()` — Take every toast off the screen now.
+* `i32 toasts_showing()` — How many toasts are on screen.
+* `i32 palette(^bool open, ^ref []char8 query, []string8 items, string8 title = "Commands")` — Not promised to raise into a script: its query is a `line_edit`, whose caret…
 * `bool table([]string8 headers, []i32 widths, i32 height = REST, string8 tag = "table")` — Open a table: draws the header row, then leaves a column open for the body.
 * `bool table_row(i32 height = 1, string8 tag = "tr", bool selected = false)` — One row of the enclosing table. Zebra striping alternates on the row index,…
 * `type Log` — A byte run plus the offset each line starts at. Two growable runs rather than…
-* `Log log_open((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc, i32 budget = 262144)` — A log over `alloc`, keeping roughly `budget` bytes of scrollback.
-* `void log_close(^Log l)`
-* `void log_clear(^Log l)`
+* `Log log_open(i32 budget = 262144)` — A log keeping roughly `budget` bytes of scrollback, growing on the…
+* `void log_close(^Log l)` — End a log: its storage goes back to the allocator `log_open` saw, and it…
+* `void log_clear(^Log l)` — Drop every line, keeping the storage for what comes next.
 * `void log_feed(^Log l, []char8 chunk)` — Append a chunk. It may end mid-line, hold several lines, or be one byte —…
 * `void log_say(^Log l, string8 s)` — One whole line.
-* `i32 log_lines(Log l)`
-* `string8 log_at(^Log l, i32 i)` — One line, as a `string` window over the log's own bytes.
-* `type LogPaint: Color(string8)` — The pane. Follows the tail unless the reader has scrolled up, which is the…
+* `i32 log_lines(Log l)` — How many lines the log holds, the partial last one included.
+* `string8 log_at(^Log l, i32 i)` — One line, as a `string8` window over the log's own bytes.
+* `type LogPaint: Color(string8)` — What colour a log line should be. A function reference, because there are no…
 * `Color plain(string8 line)` — The default painter: every line the ordinary log colour. It exists because…
-* `bool log(^Log l, i32 height = REST, string8 tag = "log", LogPaint paint = plain)`
+* `bool log(^Log l, i32 height = REST, string8 tag = "log", LogPaint paint = plain)` — The pane. Follows the tail unless the reader has scrolled up, which is the…
 * `void log_scroll(string8 tag, i32 by)` — Scroll the log pane opened with `tag` by `by` lines, negative for up, as…
 * `void log_follow(string8 tag = "log")` — Follow the tail again, from wherever the reader scrolled to.
-* `const i32 COLORS_NONE = 0` — How many colours the terminal is sent. The compositor downgrades every…
-* `const i32 COLORS_16 = 16`
-* `const i32 COLORS_256 = 256`
-* `const i32 COLORS_TRUE = 16777216`
+* `enum ColorDepth: (None, Colors16, Colors256, TrueColor)` — How many colours the terminal is sent. The compositor downgrades every…
 * `void sink(Sink out)` — Send frames somewhere other than stdout. The library never opens a stream of…
 * `void truecolor(bool on)` — Whether 24-bit colour is available. Decided once at `open` from the…
-* `void colors(i32 depth)` — Set the colour depth outright: `COLORS_NONE`, `COLORS_16`, `COLORS_256` or…
-* `i32 color_depth()` — The colour depth in force, so a program can choose a theme written for it:
+* `void colors(ColorDepth depth)` — Set the colour depth outright, whatever the environment said at `open`.
+* `ColorDepth color_depth()` — The colour depth in force, so a program can choose a theme written for it:
 * `(i32 bytes, i32 writes) frame_output()` — The bytes and writes the last `present` sent: `(bytes, writes)`. Writes is…
 * `void present()` — Walk the grid and write what changed. `front` is updated as we go, so it…
 * `(u32 glyph, Color fg, Color bg, Attr attr, bool cont) cell_at(i32 x, i32 y)` — What is painted at (x, y) in the frame just composed. `cont` marks the right…
-* `(u32 value, bool has) color_rgb(Color c)` — The 24-bit value behind a colour, resolved through the theme's default.
-* `string8 snapshot((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc)` — The current frame as plain text, one row per line, no colour. For golden…
+* `!u32 color_rgb(Color c)` — The 24-bit value behind a colour made by `rgb` or `hex`, as `0xRRGGBB`.
+* `ref []char8 snapshot()` — The current frame as plain text, one row per line, no colour. For golden…
 * `distinct type Color: u32` — ── colour ─────────────────────────────────────────────────────────────────…
 * `const u32 RGB = 0x02000000` — The same bit, spelled for the theme tables below. A `const` folds and a call…
 * `const Color DEFAULT = Color(KIND_NONE)` — The terminal's own foreground or background — whatever the user configured.
 * `Color rgb(u32 r, u32 g, u32 b)` — A 24-bit colour from three components.
 * `Color hex(u32 v)` — A 24-bit colour written the way a designer writes one: `hex(0x89B4FA)`.
 * `Color ansi(u32 i)` — A 256-colour palette index. 0..7 are the terminal's own eight, 8..15 their…
-* `bool is_default(Color c)`
+* `bool is_default(Color c)` — Whether `c` is `DEFAULT`, the terminal's own colour.
 * `Color mix(Color a, Color b, u32 t)` — Blend two colours, `t` in 0..255 parts of `b`. Used for the surface ramp's…
 * `distinct enum u16 Attr` — ── attributes ─────────────────────────────────────────────────────────────…
-* `bool has_attr(Attr set, Attr one)`
+* `bool has_attr(Attr set, Attr one)` — Whether `set` has `one` on.
 * `type Style` — ── style ──────────────────────────────────────────────────────────────────…
-* `const Style PLAIN = (DEFAULT, DEFAULT, Attr.NONE)`
-* `Style styled(Color fg, Color bg = DEFAULT, Attr attr = Attr.NONE)`
+* `const Style PLAIN = (DEFAULT, DEFAULT, Attr.NONE)` — The terminal's own colours and no attribute.
+* `Style styled(Color fg, Color bg = DEFAULT, Attr attr = Attr.NONE)` — A style, with the background and the attributes optional.
 * `type BorderSet` — ── borders ────────────────────────────────────────────────────────────────…
 * `const BorderSet ROUND = ("╭", "╮", "╰", "╯", "─", "│", "├", "┤", "┬", "┴", "┼")` — Rounded corners, light weight. The default, because a 1px-looking box with…
-* `const BorderSet SINGLE = ("┌", "┐", "└", "┘", "─", "│", "├", "┤", "┬", "┴", "┼")`
-* `const BorderSet DOUBLE = ("╔", "╗", "╚", "╝", "═", "║", "╠", "╣", "╦", "╩", "╬")`
-* `const BorderSet THICK = ("┏", "┓", "┗", "┛", "━", "┃", "┣", "┫", "┳", "┻", "╋")`
+* `const BorderSet SINGLE = ("┌", "┐", "└", "┘", "─", "│", "├", "┤", "┬", "┴", "┼")` — Square corners, light weight.
+* `const BorderSet DOUBLE = ("╔", "╗", "╚", "╝", "═", "║", "╠", "╣", "╦", "╩", "╬")` — Double lines.
+* `const BorderSet THICK = ("┏", "┓", "┗", "┛", "━", "┃", "┣", "┫", "┳", "┻", "╋")` — Square corners, heavy weight.
 * `const BorderSet ASCII = ("+", "+", "+", "+", "-", "|", "+", "+", "+", "+", "+")` — For a terminal whose font has no box drawing, and for `TERM=dumb`.
 * `type Theme` — ── the theme ──────────────────────────────────────────────────────────────…
 * `` const Theme DARK = ( Color(RGB | 0x11111B), // base Color(RGB | 0x0D0D14), // mantle Color(RGB | 0x181825), // surface Color(RGB | 0x1E1E2E), // overlay Color(RGB | 0xCDD6F4), // text Color(RGB | 0xA6ADC8), // subtext Color(RGB | 0x7F849C), // muted Color(RGB | 0x45475A), // faint Color(RGB | 0x89B4FA), // accent Color(RGB | 0x11111B), // on_accent Color(RGB | 0xA6E3A1), // ok Color(RGB | 0xF9E2AF), // warn Color(RGB | 0xF38BA8), // err Color(RGB | 0x94E2D5), // info Color(RGB | 0x313244), // border — one step above `faint`, deliberately quiet Color(RGB | 0x89B4FA), // border_focus ROUND, true, ) `` — The default. A cool, low-chroma dark palette with a genuine four-step…
@@ -201,7 +217,6 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) mem` — ── storage ────────────────────────────────────────────────────────────────…
 * `bool is_terminal()` — Whether there is a terminal to draw on, asked without changing anything. A…
 * `bool open(i32 pad = 1)` — Enter raw mode, switch to the alternate screen, turn on SGR mouse reporting…
-* `bool open_over((rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, i32 pad = 1)` — The same, over an allocator you supply. Everything the library allocates —…
 * `void close()` — Put the terminal back, in reverse. Safe to call twice, and `tty_onsignal`
 * `void quit()` — End the loop after this frame. The ordinary way a program stops.
 * `void wake()` — Ask for a repaint. A program whose state changed outside a frame — a child…
@@ -210,24 +225,23 @@ sugar budget spent on nothing. `open` refuses a second one.
 * `void suspend()` — Put the terminal back the way it was found, without closing the UI. The…
 * `void resume()` — Take it back. The next frame is a full repaint, because whatever ran in…
 * `bool suspended()` — Whether the UI is currently handed over.
-* `(bool exited, i32 status) shell_out(cstring command)` — Run `command` with the terminal, and take it back afterwards.
+* `os.Error!proc.Ended shell_out(string8 command)` — Run `command` with the terminal, and take it back afterwards.
 * `void stop()` — Stop the way Ctrl-Z does, and come back when continued.
 * `bool open_headless(i32 w, i32 h, i32 pad = 1)` — Open a UI of a fixed size with no terminal anywhere: no raw mode, no…
-* `bool open_headless_over(i32 w, i32 h, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) backing, i32 pad = 1)`
 * `void compose(Frame f)` — Run one frame into the back buffer, without presenting it. Pairs with…
 * `bool step(Frame f, i32 timeout_ms)` — One iteration: wait up to `timeout_ms` for input, then compose a frame if…
 * `(i32 frames, f64 last_ms, f64 worst_ms, f64 mean_ms, i32 over) frame_times()` — The frames composed since `open`, the last one's time, the worst and the…
 * `void frame_budget(f64 ms)` — The time a frame may take before `frame_times` counts it as over.
 * `void run(Frame f)` — The whole loop, until `quit`. Sleeps when nothing is happening: the timeout…
 * `bool resized()` — Re-read the window size; true when it changed.
-* `Rect rect_of()`
-* `bool hovered()`
-* `bool focused()`
+* `Rect rect_of()` — Where the last widget placed landed.
+* `bool hovered()` — Whether the mouse is over the last widget placed.
+* `bool focused()` — Whether the last widget placed has the keyboard focus.
 * `bool clicked()` — Was the last widget placed clicked on this frame? The companion to…
 * `void text(string8 s, Color color = DEFAULT, Attr attr = Attr.NONE, Anchor anchor = Anchor.START)` — One line of text, clipped to the region.
 * `void title(string8 s)` — A heading. Bold, in the theme's loudest text, with a blank line under it —…
 * `void label(string8 s)` — Quieter than `text`. Captions, units, the second half of a sentence.
-* `void muted(string8 s)`
+* `void muted(string8 s)` — Quieter than `label`: what a reader may skip.
 * `i32 paragraph(string8 s, Color color = DEFAULT)` — Word-wrapped to the region's width. Answers how many rows it took.
 * `void kv(string8 key, $T value)` — An aligned key/value line: the key in the quiet text colour, a run of dots,…
 * `void kv_text(string8 key, string8 value)` — The same, when the value is already a string.

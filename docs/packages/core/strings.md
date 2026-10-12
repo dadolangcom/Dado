@@ -1,77 +1,99 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit f5f6761926d6 -->
 # core:strings
 
-std/strings — the operations `==` does not give you.
+core:strings — the operations `==` does not give you: ordering, search,
+cutting into windows, splitting, and building new text.
 
-The language gives `string` equality by contents and stops there, because
-it says nothing about collation and inventing an ordering is not a
-compiler's business. C has one, so this package borrows it.
+**Tier N W H. Script class S**, except the C boundary at the bottom of the
+file. Pure Dado: the package has no `foreign` block and emits no `#include`,
+so it builds and runs freestanding, on the web and hosted (Linux, macOS,
+Windows), and answers the same for the same bytes everywhere. Every search
+and copy is a byte loop written here rather than `strcmp`, `strstr` or
+`memcpy`, which also makes each one right about a string that holds an
+interior `\0`: C's stopped at the first one. Its one import is `core:chars`,
+for the ASCII case mapping, which is as pure.
 
-**This package used to be a wrapper over `<string.h>` and is not any more.**
+**What raises into a script**: every function here but three, each promised
+by the `#assert_raises` on the line above it, and the `Builder` and
+`Splitter` verbs too (they are package-level functions taking a pointer).
+The three left out say why on their own lines: `offset_in` compares
+addresses, and `borrow_from_cstring` and `clone_from_cstring` read a
+`cstring`, which is C's, an address.
 
-Every parameter here was declared `cstring`, and a `string` crossed into one
-as its `ptr` half with no cast and no check — which was safe only because
-a `\0` at `ptr[len]` was guaranteed. That conversion was deleted and
-the wrappers went with it: `strcmp`, `strncmp`, `strstr` and `strchr` are
-now written in Dado, ten lines of loops over bytes this package can already
-index.
+**Bytes, not characters.** Every function answers about the bytes of a
+`string8`: `compare` orders by their numbers (no collation), `to_upper`,
+`to_lower` and `equal_fold` map ASCII only, and an index is a byte index.
+`core:chars` is where code points and display widths are.
 
-That is a better package and not a consolation. `strcmp` answered the C
-library's question — *how do these compare up to the first `\0`* — and every
-function here was quietly wrong for a string holding an interior one, which
-`#len` of a string had already stopped being wrong about. It also means a program that
-compares strings no longer carries `<string.h>`, so it stays freestanding
-— the freestanding rule, now reaching one more package.
-
-Parsing is not this package's: since `STR-FREESTANDING` `to_i32` and
-`to_f64` are **`core:strings/parse`**'s. They moved with the
-`private foreign "stdlib.h"` block they were the only users of, which is
-why the move was the fix rather than a tidy-up; that package has since
-replaced `atoi` and `atof` with Dado and includes nothing.
+**Parsing is next door**, in `core:strings/parse`: a parser is not a string
+operation, and the package stays one a caller can decline.
 
 **Who ends what this package returns.** A window (`substring`, `rest`,
-`trim`, the splitters, `bytes`) allocates nothing and is good as long as the
-bytes it was cut from; new text (`concat`, `join`, a `Builder`'s `finish`)
-is a `ref []char8` from the ambient allocator, so under a `using` arena you
-never free it and outside one the caller `#delete`s it.
+`trim` and its kin, the splitters, `bytes`) allocates nothing and is good as
+long as the bytes it was cut from; new text (`concat`, `join`, `replace`,
+`repeat`, `to_upper`, `to_lower`, `clone`, `clone_to_cstring`,
+`clone_from_cstring`, a `Builder`'s `finish`) is a
+`ref []char8` from the ambient allocator, and `split` answers a
+`ref []string8` of windows the same way. Under a `using` arena nothing
+needs freeing; outside one the caller `#delete`s it. Each answers `nil` when
+its allocation fails.
+
+**Thread-safety.** There is no package state. Any number of threads may
+read one string at once; a `Builder` or a `Splitter` belongs to one thread
+at a time.
 
 ## Declarations
 
-36 declarations, 35 public.
+55 declarations, 50 public.
 
 * `i32 compare(string8 a, string8 b)` — Ordering: byte by byte, and the shorter one first where one is a prefix of…
-* `bool before(string8 a, string8 b)`
-* `bool after(string8 a, string8 b)`
-* `bool starts_with(string8 s, string8 prefix)`
-* `bool contains(string8 haystack, string8 needle)` — The naive search, which is the right one at this size: no table to build, no…
-* `bool has_byte(string8 s, char8 byte)` — Searching for `'\0'` finds an interior one and reports it, where `strchr`
-* `bool ends_with(string8 s, string8 suffix)`
-* `bool is_empty(string8 s)` — **`#len(s) == 0` and not `s == ""`**, which is the same answer and a cheaper…
-* `i64 index_of(string8 s, char8 byte)` — Where `byte` first occurs, or -1. Written by hand rather than through…
-* `i64 last_index_of(string8 s, char8 byte)` — Where it last occurs, or -1. Ranges are ascending only, so the…
+* `bool before(string8 a, string8 b)` — Whether `a` orders before `b` under `compare`.
+* `bool after(string8 a, string8 b)` — Whether `a` orders after `b` under `compare`.
+* `bool starts_with(string8 s, string8 prefix)` — Whether `s` begins with `prefix`. Every string begins with `""`.
+* `bool contains(string8 haystack, string8 needle)` — Whether `needle` occurs anywhere in `haystack`. Every string contains `""`.
+* `bool has_byte(string8 s, char8 byte)` — Whether `byte` occurs in `s`. Searching for `'\0'` finds an interior one,…
+* `bool ends_with(string8 s, string8 suffix)` — Whether `s` ends with `suffix`. Every string ends with `""`.
+* `bool is_empty(string8 s)` — Whether `s` has no bytes. `#len(s) == 0` and not `s == ""`: the same…
+* `i64 index_of(string8 s, char8 byte)` — Where `byte` first occurs, or -1. `find` is the same question about a run…
+* `i64 last_index_of(string8 s, char8 byte)` — Where `byte` last occurs, or -1. Ranges are ascending only, so the walk…
 * `i64 count_byte(string8 s, char8 byte)` — How many times `byte` occurs. The one a program splitting on a separator…
-* `bool is_space(char8 b)` — Whether `b` is one of the four bytes this package treats as space.
+* `i64 find(string8 s, string8 needle)` — Where `needle` first occurs in `s`, as a byte index, or -1. An empty…
+* `i64 find_last(string8 s, string8 needle)` — Where `needle` last occurs in `s`, as a byte index, or -1. An empty…
+* `i64 count(string8 s, string8 needle)` — How many times `needle` occurs in `s` without overlapping, counted from the…
+* `bool equal_fold(string8 a, string8 b)` — Whether `a` and `b` are equal when ASCII letters are compared without…
 * `string8 substring(string8 s, i64 at, i64 count)` — `count` bytes of `s` from `at`, **clamped** rather than refused.
 * `string8 rest(string8 s, i64 at)` — Everything of `s` from `at` to the end: `substring(s, at, #len(s))` said…
-* `string8 trim_left(string8 s)`
-* `string8 trim_right(string8 s)`
-* `string8 trim(string8 s)`
+* `string8 trim_left(string8 s)` — `s` without the space it begins with: the four bytes `trim` names.
+* `string8 trim_right(string8 s)` — `s` without the space it ends with: the four bytes `trim` names.
+* `string8 trim(string8 s)` — `s` without the space at either end. **Space here is four bytes**: space,…
 * `(string8 head, string8 rest, bool found) split_first(string8 s, string8 sep)` — The **cursor pair**, and the shape every splitter here takes.
 * `(string8 head, string8 rest, bool found) line(string8 s)` — One line, and the rest. `\n` is the separator and a trailing `\r` is dropped,…
 * `string8 trim_right_cr(string8 s)` — `trim_right`'s one-byte cousin, kept separate because `line` must not eat…
 * `(string8 head, string8 rest, bool found) field(string8 s)` — One whitespace-separated field, and the rest. Leading space is skipped, so…
-* `(i64 at, bool ok) offset_in(string8 parent, string8 window)` — Where `window`'s bytes start inside `parent`'s, and whether they lie…
-* `type Bytes: []char8` — `Bytes` is the name the `string8 → []char8` conversion is reached through:
+* `string8 trim_prefix(string8 s, string8 prefix)` — `s` without `prefix` when it begins with it, and `s` unchanged otherwise.
+* `string8 trim_suffix(string8 s, string8 suffix)` — `s` without `suffix` when it ends with it, and `s` unchanged otherwise.
+* `(string8 head, string8 rest, bool found) split_last(string8 s, string8 sep)` — `split_first` from the other end: `head` is the bytes before the **last**
+* `ref []string8 split(string8 s, string8 sep)` — Every piece of `s` between the occurrences of `sep`, as windows into `s`,…
+* `type Splitter` — A walk over the pieces of a string between the occurrences of a…
+* `Splitter splitter(string8 s, string8 sep)` — A `Splitter` over `s`, separated by `sep`. Nothing is copied: the pieces it…
+* `bool split_next(^Splitter it, ^string8 piece)` — The next piece into `piece`, and `true`; or `false`, and `piece`
+* `!i64 offset_in(string8 parent, string8 window)` — Where `window`'s bytes start inside `parent`'s, failing (code 1) when they…
 * `[]char8 bytes(string8 s)` — `s`'s bytes, as a window over them. **A pure reinterpret**: the two words…
+* `ref []char8 clone(string8 s)` — A new run holding `s`'s bytes: the plain owned copy, for text that must…
 * `ref []char8 concat(string8 a, string8 b)` — A new run holding `a` then `b`. See the convention above: allocated from…
 * `ref []char8 join([]string8 parts, string8 sep)` — Every part, with `sep` between each two. `join([], sep)` is an empty run,…
+* `ref []char8 replace(string8 s, string8 old, string8 new)` — `s` with every non-overlapping `old`, read from the left, replaced by…
+* `ref []char8 replace_n(string8 s, string8 old, string8 new, i64 n)` — `replace`, stopping after the first `n` occurrences; a negative `n` is…
+* `ref []char8 repeat(string8 s, i64 n)` — `s`, `n` times over, as a new run from the ambient allocator. A `n` of zero…
+* `ref []char8 to_upper(string8 s)` — `s` with every ASCII small letter made a capital, as a new run from the…
+* `ref []char8 to_lower(string8 s)` — `s` with every ASCII capital made a small letter, as `to_upper` does the…
 * `type Builder: ref []char8` — Text built a piece at a time, when the pieces are not all known at once.
 * `Builder builder(i64 room = 16)` — An empty builder with room for `room` bytes before its first growth,…
 * `bool append(^Builder b, string8 s)` — `s` on the end. `false`, and nothing appended, when the run could not grow.
 * `bool append_char(^Builder b, char8 c)` — One byte on the end. `false`, and nothing appended, when the run could not…
 * `string8 text(Builder b)` — What has been built so far, as text. A window into the builder's run, so it…
 * `ref []char8 finish(^Builder b)` — The run, handed over: the caller owns it now (see the convention above),…
-* `string8 borrow_from_cstring(cstring c)` — The bytes at `c`, as a `string`, **without copying them**.
-* `ref []char8 clone_to_cstring(string8 s, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc)` — Copy `s`'s bytes into an owned run and put a `\0` after them, so the result…
-* `ref []char8 clone_from_cstring(cstring c, (rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) alloc)` — Copy a NUL-terminated C string into an owned run, so C's bytes become a value…
+* `string8 borrow_from_cstring(cstring c)` — The bytes at `c`, as a `string8`, **without copying them**.
+* `ref []char8 clone_to_cstring(string8 s)` — `s`'s bytes in a new run with a `\0` after them, so `cstring(run)` can…
+* `ref []char8 clone_from_cstring(cstring c)` — A NUL-terminated C string's bytes in a new run, so C's bytes become a value…

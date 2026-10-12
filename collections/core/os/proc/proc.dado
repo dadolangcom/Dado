@@ -1,65 +1,169 @@
 // core:os/proc — running another program, and reading what it says.
 //
+//     import "core:os"
 //     import "core:os/proc"
 //     import "core:io"
 //
-//     ^io.FILE p = proc.read("git rev-parse --short HEAD")
-//     (cstring line, bool ok) = io.read_line(p)
-//     (bool exited, i32 status) = proc.close(p)
+//     try ^io.FILE p = proc.read("git rev-parse --short HEAD") else why:
+//         println("cannot start git: ", os.message(why))
+//         return 1
+//     try ref []char8 line = io.read_line(p) else:
+//         ...
+//     try proc.Ended e = proc.close(p) else why:
+//         ...
+//     switch e:
+//         case proc.Exited x: println("exited ", x.code)
+//         case proc.Signaled s: println("killed by signal ", s.signal)
 //
-// The one thing this package is careful about: **`close` is where the exit
-// status is**, not `read`. A pipe that opened tells you the shell started, and
-// nothing else — a command that does not exist still opens, prints to stderr,
-// and closes with 127. Reading to the end and then closing is the whole
-// protocol, and it is the same one C has.
+// The one thing this package is careful about: **`close` is where the
+// ending is**, not `read`. A pipe that opened tells you the shell started,
+// and nothing else — a command that does not exist still opens, prints to
+// stderr, and closes `Exited(127)`. Reading to the end and then closing is
+// the whole protocol, and it is the same one C has.
 //
-// `command` is handed to `/bin/sh`, so it is a shell line and not an argv:
-// pipes, redirection and globs all work, and so does everything an attacker
-// would like to put in a filename.
+// **How a program ended is an `Ended`**: a union of `Exited` (it returned a
+// code) and `Signaled` (a signal ended it), so a `switch` over one names both
+// and needs no `else`. A wait that could not happen is a failure, not a third
+// kind of ending. `ok(e)` is "exited 0".
 //
-// **`exec.dado` beside this file is the argv form, and it is the one to reach
-// for unless the shell is the point.** This paragraph used to end *"there is no
-// `exec` form yet, because that needs an array of strings crossing into C and
-// `foreign` has no spelling for one"*, which was measured false: `rawptr`
-// crosses, at a stated cost written on the `execvp` declaration there.
+// **Failure is `os.Error`** for what the system refused — a pipe, a fork, a
+// program that could not be started — and **`Pipe`**, this package's own,
+// for a read or a write that did not move bytes: `Pipe.WAITED` when nothing
+// was ready in time, `Pipe.BROKE` when the other end is gone. Zero bytes from
+// a read is the end of the output, which is no failure.
 //
-// What these three functions cost, measured on one value — `a b ; touch FILE ;`
-// — handed to `read` the way a caller assembling a command would: the space
-// split one argument into two, the `;` **ran `touch`**, and its output arrived
-// in the caller's own pipe. The same value with a `'` in it instead killed the
-// shell line with *Unterminated quoted string* and came back as `(true, 2)`,
-// which no caller can tell from a program that ran and exited 2. Nothing in
-// `collections/` escapes a shell argument and there is no helper here that
-// would; build the command yourself and know what is in it.
+// `command` is handed to `/bin/sh` (`cmd.exe` on Windows), so it is a shell
+// line and not an argv: pipes, redirection and globs all work, and so does
+// everything an attacker would like to put in a filename. Nothing in
+// `collections/` escapes a shell argument; build the command yourself and
+// know what is in it. **`exec.dado` beside this file is the argv form, and it
+// is the one to reach for unless the shell is the point**; `duplex.dado` is a
+// child written to and read from at once.
 //
-// **`command` is a `cstring` everywhere below.** It exists only to reach
-// `popen` and `system`, both of which read to a `\0`, so the parameter says so
-// and the caller says how it got one: a literal — which is what a shell line
-// usually is — already is one, and a command a program assembled goes through
-// `strings.clone_to_cstring` and a written `cstring(…)`, which is where the
-// copy that assembling it needs becomes visible.
+// **On Windows** the surface is the same and the shell is `cmd.exe`: a
+// `command` is a `cmd.exe` line (the `Windows` section below says how it is
+// run), an argv is quoted into one command line by Windows' own rule, and a
+// child and everything it starts are one job. `windows.dado` says what differs
+// underneath, once.
+//
+// **Tier H.** Linux, macOS, the BSDs and Windows. A page and a freestanding
+// build have no process to start, and the package refuses both at build time.
+//
+// **What raises into a script.** `ok`, promised by the `#assert_raises` above
+// it: it looks at a value. Nothing else is, because everything else starts,
+// feeds, reads or ends a child through the system, and what reports on the
+// process (`available`, `ignoring_sigpipe`) answers about something only
+// those calls make.
+//
+// **Thread-safety.** A `Duplex`, a `Child` or a stream belongs to one thread
+// at a time. Starting children from two threads at once is not supported: the
+// first `duplex` decides `SIGPIPE`'s disposition unlocked, and on Windows the
+// table of children started is not locked either.
 package proc
 
 import "core:io"
+import "core:os"
+
+#static_assert(#OS != #NONE && #OS != #WEB, "core:os/proc starts other programs, and a web page or a #NONE build has no process to start one from: keep this build from importing core:os/proc")
+
+// ── how a program ended ─────────────────────────────────────────────────────
+
+// It returned `code`: 0 to 255 on POSIX (127 when the program could not be
+// run at all), the whole 32-bit exit code on Windows (9009 for a command
+// `cmd.exe` could not find).
+distinct type Exited: (i32 code)
+
+// A signal ended it: `signal` is its number (`SIGKILL` is 9). On Windows,
+// which has no signals, a child this package ended reads `Signaled(9)`.
+distinct type Signaled: (i32 signal)
+
+// How a program ended. A wait that could not happen is a failure of the
+// call that waited, never a third member.
+union Ended: (Exited, Signaled)
+
+// Whether `e` means "it worked": it returned, and returned zero.
+#assert_raises
+bool ok(Ended e):
+    switch e:
+        case Exited x: return x.code == 0
+        case Signaled _: return false
+
+// ── a pipe that did not move bytes ──────────────────────────────────────────
+
+// Why `drain`, `send`, `send_all`, `receive` or `receive_errors` moved no
+// bytes, and why `finish` has no ending yet. The numbers are this package's,
+// 2100 to 2199.
+distinct enum i32 Pipe:
+    // Nothing was ready within the timeout: no bytes to read, no room to
+    // write, or (for `finish`) the child is still running.
+    WAITED = 2100,
+    // The other end is gone, or there was never one: the child closed the
+    // pipe or exited, `close_input` ran, or the handle was not started.
+    BROKE,
+
+// A sentence for `why`, for a person.
+#assert_raises
+string8 message(Pipe why):
+    if why == Pipe.WAITED: return "nothing was ready in time: try again, or wait longer"
+    if why == Pipe.BROKE: return "the pipe is broken: the other program closed it or has ended"
+    return "not a code of core:os/proc"
+
+// The raw answers the private readers and writers give, turned into `Pipe`
+// at the public edge: a count of zero or more, or one of these.
+private const i32 DRAINED = 0
+private const i32 WAITED = 0 - 1
+private const i32 BROKE = 0 - 2
+
+// `n` as a public answer: the count, or the `Pipe` code its sentinel names.
+private Pipe!i64 piped(i64 n):
+    if n == i64(WAITED): fail Pipe.WAITED
+    if n < 0: fail Pipe.BROKE
+    return n
+
+// `(exited, status)` — an exit code, or a negated signal number with `exited`
+// false, and `(false, -1)` for a wait that never happened — as an `Ended`,
+// and whether it is one.
+private (Ended e, bool known) ending(bool exited, i32 status):
+    if exited:
+        Exited x = Exited(status)
+        return (Ended(x), true)
+    if status < 0 - 1:
+        Signaled s = Signaled(0 - status)
+        return (Ended(s), true)
+    Exited none = Exited(0 - 1)
+    return (Ended(none), false)
+
+// `ending`, failing `UNKNOWN` (the system's own reason, when it kept one)
+// for a wait that never happened.
+private os.Error!Ended ended_or_fail(bool exited, i32 status):
+    (Ended e, bool known) = ending(exited, status)
+    if !known:
+        os.Error why = os.last_error()
+        if why == os.Error.UNKNOWN: fail os.Error.UNKNOWN
+        try os.fail_with(why)
+    return e
+
+// `s` with a `\0` after it, for a C call, or `nil` when it could not be
+// allocated; the caller deletes it.
+private ref []char8 terminated(string8 s):
+    i64 n = #len(s)
+    ref []char8 out = #make([]char8, n + 1)
+    if out == nil: return out
+    for i in 0..<n:
+        out[i] = s[i]
+    out[n] = '\0'
+    return out
 
 // `system(NULL)` is C99's question, and every C runtime answers it.
 private foreign "stdlib.h":
     i32 system(cstring command)
 
-bool opened(^io.FILE stream):
-    return stream != nil
-
-// Whether there is a shell to run any of this with — C99's `system(NULL)`.
-// False on a freestanding target, and worth asking once rather than reading
-// -1 back from everything.
+// Whether there is a shell to run a command line with — C99's
+// `system(NULL)` — worth asking once rather than reading a failure back from
+// every `run`.
 bool available():
     cstring nothing = nil
     return system(nothing) != 0
-
-// Whether a `(exited, status)` pair means "it worked": ended by returning, and
-// returned zero. Written as a function so the two-part test has one spelling.
-bool ok(bool exited, i32 status):
-    return exited && status == 0
 
 // ── Windows ─────────────────────────────────────────────────────────────────
 //
@@ -67,73 +171,53 @@ bool ok(bool exited, i32 status):
 // `%ComSpec% /d /s /c "<command>"`, through `CreateProcessW` (`windows.dado`),
 // and not through the C runtime's `_popen`: `_popen` writes `cmd.exe /c`
 // without `/s`, so `cmd.exe` keeps or strips the outer quotes of a command by
-// a guess — a line starting with a quoted program path and holding one more
-// quoted argument loses both outer quotes and fails. With `/s` the rule is
-// fixed (the first and last `"` on the line are removed, and what is between
-// is the command, as written), so the command reaches `cmd.exe` exactly as
-// the caller wrote it, and nothing here quotes or escapes it. `/d` skips the
+// a guess. With `/s` the rule is fixed (the first and last `"` on the line
+// are removed, and what is between is the command, as written), so the
+// command reaches `cmd.exe` exactly as the caller wrote it. `/d` skips the
 // AutoRun commands a user may have registered. Starting it here also gives
 // the child only the handles it is meant to have and puts it in a job.
 //
-// **A command `cmd.exe` cannot find is 9009, not 127**, and the pipe still
-// opens — the interpreter started, which is all an open says on any platform.
-// The status is otherwise the command's exit code: `exit 3` closes with
-// `(true, 3)`.
+// **A command `cmd.exe` cannot find is `Exited(9009)`, not 127**, and the
+// pipe still opens — the interpreter started, which is all an open says on
+// any platform.
 when #OS == #WINDOWS:
-    // Start `command` and read its standard output; nil when the pipe or the
-    // start failed.
-    ^io.FILE read(cstring command):
-        if command == nil: return nil
-        return open_shell(command, true)
+    // Start `command` and read its standard output. Fails with the system's
+    // reason when the pipe or the start failed.
+    os.Error!^io.FILE read(string8 command):
+        (^io.FILE f, i32 why) = open_shell(command, true)
+        if f == nil: try os.fail_with(os.from_system(i64(why)))
+        return f
 
     // Start `command` and write to its standard input.
-    ^io.FILE write(cstring command):
-        if command == nil: return nil
-        return open_shell(command, false)
+    os.Error!^io.FILE write(string8 command):
+        (^io.FILE f, i32 why) = open_shell(command, false)
+        if f == nil: try os.fail_with(os.from_system(i64(why)))
+        return f
 
-    // Close the pipe and wait for the command. `(false, -1)` for a stream
+    // Close the pipe and wait for the command. Fails `INVALID` for a stream
     // `read` or `write` did not open, which is left open.
-    (bool exited, i32 status) close(^io.FILE stream):
-        if stream == nil: return (false, 0 - 1)
+    os.Error!Ended close(^io.FILE stream):
         i32 at = slot_of_stream(stream)
-        if at < 0: return (false, 0 - 1)
+        if at < 0: fail os.Error.INVALID
         _ = io.close(stream)
         (_, bool exited, i32 status) = reap_slot(at, 0 - 1)
-        return (exited, status)
+        try Ended e = ended_or_fail(exited, status)
+        return e
 
     // Run `command` to completion with the caller's own streams.
-    (bool exited, i32 status) run(cstring command):
-        if command == nil: return (false, 0 - 1)
+    os.Error!Ended run(string8 command):
         (i32 pid, i32 why) = launch_shell(command, std_handle(STD_INPUT_HANDLE), std_handle(STD_OUTPUT_HANDLE), std_handle(STD_ERROR_HANDLE))
-        if why != 0: return (false, 0 - 1)
+        if why != 0: try os.fail_with(os.from_system(i64(why)))
         (_, bool exited, i32 status) = reap_pid(pid, 0 - 1)
-        return (exited, status)
+        try Ended e = ended_or_fail(exited, status)
+        return e
 
-// ── POSIX: Linux and macOS ──────────────────────────────────────────────────
+// ── POSIX: Linux, macOS and the BSDs ────────────────────────────────────────
 else:
-    // **`proc.c` and `proc.h` are deleted, and nothing here needed writing in C.**
-    // The shim existed to reach three things a `foreign` block was thought unable
-    // to name, and it could name all three:
-    //
-    //   * **`popen` and `pclose` need a feature-test macro.** That is the `define`
-    //     clause, which is emitted above every `#include` precisely because
-    //     `<features.h>` fixes the feature set the first time any header pulls it
-    //     in. Both macros are written unconditionally: each is inert on the
-    //     platform it is not for, which is cheaper than a `when` on `#OS` and says
-    //     the same thing.
-    //   * **`WIFEXITED` and friends are function-like macros.** A `foreign`
-    //     function member emits a **call**, and a call is exactly what the
-    //     preprocessor expands — so restating one as `i32 WIFEXITED(i32)` works,
-    //     and the C compiler checks the arity. Nothing about a macro needs a
-    //     wrapper function; it needed a call site, and a `foreign` member is one.
-    //   * **`system(NULL)`.** `nil` is a `cstring`'s zero and crosses as `NULL`.
-    //
-    // What is left is the *decoding*, which was always Dado's to do and was in C
-    // only because the macros were: `raw` is an opaque wait status, and turning it
-    // into `(exited, status)` is `decode` below.
-    //
-    // `^io.FILE` is `core:io`'s opaque type, imported rather than declared a second
-    // time — there is one `FILE` in the program.
+    // `popen` and `pclose` need a feature-test macro, which is the `define`
+    // clause; `WIFEXITED` and friends are function-like macros, restated as
+    // `@macro` calls. `^io.FILE` is `core:io`'s opaque type — there is one
+    // `FILE` in the program.
     private foreign "stdio.h" define "_POSIX_C_SOURCE=200809L" define "_DARWIN_C_SOURCE=1":
         ^io.FILE popen(cstring command, cstring mode)
         i32 pclose(^io.FILE stream)
@@ -144,12 +228,9 @@ else:
         @macro i32 WEXITSTATUS(i32 status)
         @macro i32 WTERMSIG(i32 status)
 
-    // A wait status, as the pair every caller here wants.
-    //
-    // `exited` is false for a process a signal killed, and `status` is then the
-    // **negated signal number** — the one encoding that cannot be confused with an
-    // exit code, since an exit code is 0..255. A negative `raw` is a wait that
-    // never happened and is `(false, -1)`.
+    // A wait status, as the pair every caller here wants: an exit code, or
+    // the **negated signal number** with `exited` false. A negative `raw` is a
+    // wait that never happened and is `(false, -1)`.
     private (bool exited, i32 status) decode(i32 raw):
         if raw < 0:
             return (false, 0 - 1)
@@ -159,46 +240,44 @@ else:
             return (false, 0 - WTERMSIG(raw))
         return (false, 0 - 1)
 
-    // ── opening ───────────────────────────────────────────────────────────────
+    // `command` through `popen` with `mode`, failing with the reason.
+    private os.Error!^io.FILE open_shell(string8 command, cstring mode):
+        ref []char8 c = terminated(command)
+        defer #delete(c)
+        if c == nil: fail os.Error.NO_MEMORY
+        ^io.FILE f = popen(cstring(c), mode)
+        if f == nil: try os.fail_last()
+        return f
 
-    // Start `command` and read its standard output. `nil` when the pipe or the
-    // fork failed — which is not the same as the command failing, and the two are
-    // worth keeping apart: this one means the *system* said no.
+    // Start `command` and read its standard output. Fails with the system's
+    // reason when the pipe or the fork failed — which is not the same as the
+    // command failing, and the two are worth keeping apart.
     //
-    // Its standard error is not redirected and goes wherever the caller's does.
-    // Append `2>&1` to fold it in, which is a decision about the command and
-    // belongs in the command.
-    ^io.FILE read(cstring command):
-        if command == nil:
-            return nil
-        return popen(command, "r")
+    // Its standard error is not redirected and goes wherever the caller's
+    // does. Append `2>&1` to fold it in, which is a decision about the command.
+    os.Error!^io.FILE read(string8 command):
+        try ^io.FILE f = open_shell(command, "r")
+        return f
 
     // Start `command` and write to its standard input.
-    ^io.FILE write(cstring command):
-        if command == nil:
-            return nil
-        return popen(command, "w")
+    os.Error!^io.FILE write(string8 command):
+        try ^io.FILE f = open_shell(command, "w")
+        return f
 
-    // ── closing, which is where the answer is ─────────────────────────────────
+    // Wait for the command and report how it ended. Fails with the system's
+    // reason when the stream was not opened here or the wait failed.
+    os.Error!Ended close(^io.FILE stream):
+        if stream == nil: fail os.Error.INVALID
+        (bool exited, i32 status) = decode(pclose(stream))
+        try Ended e = ended_or_fail(exited, status)
+        return e
 
-    // Wait for the command and report how it ended.
-    //
-    // `exited` is false for a process a signal killed, and `status` is then the
-    // **negated signal number** — the one encoding that cannot be confused with an
-    // exit code, since an exit code is 0..255. A stream that was not opened here,
-    // or a wait that failed, is `(false, -1)`.
-    (bool exited, i32 status) close(^io.FILE stream):
-        if stream == nil:
-            return (false, 0 - 1)
-        return decode(pclose(stream))
-
-    // ── the whole thing in one call ───────────────────────────────────────────
-
-    // Run `command` to completion with the caller's own streams — so its output
-    // goes straight to the terminal and nothing is captured. The pair `close`
-    // returns, for the same reason.
-    (bool exited, i32 status) run(cstring command):
-        if command == nil:
-            return (false, 0 - 1)
-        return decode(system(command))
-
+    // Run `command` to completion with the caller's own streams — so its
+    // output goes straight to the terminal and nothing is captured.
+    os.Error!Ended run(string8 command):
+        ref []char8 c = terminated(command)
+        defer #delete(c)
+        if c == nil: fail os.Error.NO_MEMORY
+        (bool exited, i32 status) = decode(system(cstring(c)))
+        try Ended e = ended_or_fail(exited, status)
+        return e

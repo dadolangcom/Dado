@@ -24,15 +24,39 @@
 // `text`, `html`, `json`, `redirect`, `status` — and adjusted by chaining
 // (`.with_header(…)`, `.with_status(…)`). HEAD is answered for every GET
 // route; a path that matches a route of another method is answered 405 with
-// `Allow`; anything else is 404, or what `app.fallback` returns.
+// `Allow`; anything else is 404, or what `app.on_not_found` returns.
 //
 // **The low level is a route whose handler writes the response itself**:
 // `app.raw("GET", "/events", stream)` hands it the request and a `^Writer`
 // that sets the status and the headers and then writes the body in as many
 // pieces as it likes, flushed to the connection as they come — no
 // `Content-Length`, the body ends when the connection closes. And the `App`'s
-// slots are its configuration, set before `run`: the most bytes a request may
-// take, how long to wait for them, whether to log.
+// slots are its configuration, set before `run`: the address to bind, the most
+// bytes a request may take, how long to wait for them, whether to keep a
+// connection open between requests, whether to log.
+//
+// **Tier [W] H. Script class S for the router and the wire, T for serving.**
+// On Linux, macOS, the BSDs and Windows the whole package runs, over
+// `core:http`'s socket arms. On the web it compiles, `run` and `listen` fail
+// as `core:http.listen` does there (`UNSUPPORTED`: a page has no listening
+// socket), and `App.handle` — bytes in, bytes out — still routes and answers,
+// with a `files` route answering 501 since a page has no directory to read.
+// A target with no operating system is refused, by the `#static_assert` below.
+//
+// **What raises into a script.** The pieces that are bytes in and bytes out
+// are promised, each by the `#assert_raises` above it: `parse`, `decode`,
+// `content_type`, `respond`, `text`, `html`, `json`, `redirect`, `status`,
+// `not_found`, `bad_request`, `escape`, `serialize`, `serialize_with`,
+// `reason` and `app`, and the methods of `Request`, `Response` and the route
+// table through `raises_test.dado`. Not promised: `App.handle`, `run`,
+// `listen`, `step` and the `Writer`'s writing, because a `files` route reads
+// the disk (`core:os/fs`) and a writer on a connection sends through
+// `core:http`'s sockets — both the platform's C. A route's handler is the
+// caller's, and is promised or not by its own author.
+//
+// **Handlers are plain functions**, with no state of their own: a handler
+// that needs some keeps it in its package. A route holding state of its own
+// (a context the app carries, or a trait) is a later addition.
 //
 // **Memory is per request and is nobody's job.** Each request runs inside its
 // own `core:runtime` scratch frame, installed as `#default`, so everything a
@@ -42,10 +66,15 @@
 //
 // **One request at a time**, on the thread that calls `run` or `step`: the
 // accept is non-blocking and the read waits at most `read_timeout_ms`. A
-// connection is answered and closed (`Connection: close`); there is no
-// keep-alive, no TLS and no chunked request body. That is the server this is:
-// a tool's dashboard, a dev server for a web build, a webhook — not a front
-// door on the internet.
+// request body may come with `Content-Length` or chunked. By default a
+// connection is answered and closed (`Connection: close`); set
+// `keep_alive_ms` and a client that asks to keep it gets its next request
+// read on the same connection, waiting that long for it and at most
+// `keep_alive_requests` times — which, one connection at a time, holds every
+// other client off for as long as it waits, and is why it is off unless asked.
+// There is no TLS. That is the server this is: a tool's dashboard, a dev
+// server for a web build, a webhook — not a front door on the internet, which
+// is also why it binds `127.0.0.1` unless `host` says otherwise.
 package server
 
 import "core:http"
@@ -54,7 +83,10 @@ import "core:runtime"
 import "core:time"
 import "core:fmt"
 import "core:io"
+import "core:os"
 import "core:os/fs"
+
+#static_assert(#OS != #NONE, "core:http/server listens on a TCP socket, and a target with no operating system (`#NONE`) has none")
 
 // A handler: the request in, the response out.
 type Handler: Response(Request)
@@ -62,25 +94,28 @@ type Handler: Response(Request)
 // A raw handler: the request, and the writer it answers through.
 type RawHandler: void(Request, ^Writer)
 
-private const i32 KIND_HANDLER = 0
-private const i32 KIND_RAW     = 1
-private const i32 KIND_FILES   = 2
+// A `files` route: the directory it serves.
+distinct type Files: (string8 dir)
 
-type Route:
-    string8 method      // "" answers every method
-    string8 pattern
-    i32 kind
-    Handler handler
-    RawHandler raw
-    string8 dir         // KIND_FILES: the directory served
+// What a route does with a request that matches it: hand it to a handler,
+// to a raw handler, or serve a file.
+union Action: (Handler, RawHandler, Files)
 
+// One entry of an app's route table, as `get`, `raw` or `files` adds it.
+// `method` "" answers every method.
+type Route: (string8 method, string8 pattern, Action action)
+
+// An app: its routes, and its configuration, set before `run` or `listen`.
 type App:
     ref []Route routes
     ref []Header always         // sent with every response (`header`)
     Handler fallback            // answers what no route matches; 404 when unset
     bool has_fallback
+    string8 host                // the address to bind: "127.0.0.1"; "0.0.0.0" or "::" for every interface
     i64 max_request             // the most bytes one request may take: 413 past it
     i32 read_timeout_ms         // how long to wait for a request's bytes: 408 past it
+    i32 keep_alive_ms           // 0: close after every response; else how long to wait for the next
+    i32 keep_alive_requests     // the most requests one kept connection carries
     bool quiet                  // no log line per request
     http.Server listener
     bool listening
@@ -88,48 +123,42 @@ type App:
 
     // ── routes ──────────────────────────────────────────────────────────────
 
+    // A route for GET (and so HEAD) on `pattern`.
     void get(^self, string8 pattern, Handler h):
         self.route("GET", pattern, h)
 
+    // A route for POST on `pattern`.
     void post(^self, string8 pattern, Handler h):
         self.route("POST", pattern, h)
 
+    // A route for PUT on `pattern`.
     void put(^self, string8 pattern, Handler h):
         self.route("PUT", pattern, h)
 
+    // A route for PATCH on `pattern`.
     void patch(^self, string8 pattern, Handler h):
         self.route("PATCH", pattern, h)
 
+    // A route for DELETE on `pattern`.
     void delete(^self, string8 pattern, Handler h):
         self.route("DELETE", pattern, h)
 
     // A route for `method` — any method's name, or "" for every method.
     void route(^self, string8 method, string8 pattern, Handler h):
-        Route r
-        r.method = method
-        r.pattern = pattern
-        r.kind = KIND_HANDLER
-        r.handler = h
+        Route r = (method, pattern, Action(h))
         self.add(r)
 
     // A route whose handler writes the response itself, through a `Writer`.
     void raw(^self, string8 method, string8 pattern, RawHandler h):
-        Route r
-        r.method = method
-        r.pattern = pattern
-        r.kind = KIND_RAW
-        r.raw = h
+        Route r = (method, pattern, Action(h))
         self.add(r)
 
     // Serve the files under `dir` at `prefix`: `/static/app.js` is
     // `<dir>/app.js`, a directory answers its `index.html`, and a path that
-    // climbs out of `dir` is 404. The content type is the extension's.
+    // climbs out of `dir` — or, on Windows, names a device or a stream — is
+    // 404. The content type is the extension's.
     void files(^self, string8 prefix, string8 dir):
-        Route r
-        r.method = "GET"
-        r.pattern = prefix
-        r.kind = KIND_FILES
-        r.dir = dir
+        Route r = ("GET", prefix, Action(Files(dir)))
         self.add(r)
 
     // Send `name: value` with every response this app makes — a policy
@@ -157,42 +186,50 @@ type App:
 
     // Serve on `port` until `max_requests` have been answered or `seconds`
     // have passed (0 is no limit for either). Answers 0, or 1 when the port
-    // could not be bound.
+    // could not be bound — taken, or no sockets on this target — after
+    // saying why.
     i32 run(^self, u16 port = 8000, i64 max_requests = 0, f64 seconds = 0.0):
-        if !self.listen(port):
-            fmt.println("server: could not listen on port ", i32(port), " (already in use?)")
+        try self.listen(port) else why:
+            fmt.println("server: could not listen on ", self.host, ":", i32(port), ": ",
+                        http.message(why))
             return 1
         if !self.quiet:
-            fmt.println("server: serving on http://localhost:", i32(port), "/")
+            fmt.println("server: serving on http://", self.host, ":", i32(port), "/")
             _ = io.flush(io.stdout())
-        f64 started = time.now()
+        time.Instant started = time.instant()
         for max_requests == 0 || self.served < max_requests:
-            if seconds > 0.0 && time.since(started) >= seconds:
+            if seconds > 0.0 && time.as_seconds_f64(time.elapsed(started)) >= seconds:
                 break
             if !self.step():
-                time.nap(2)
+                time.sleep(time.milliseconds(2))
         self.close()
         return 0
 
-    // Start listening on `port`, for a caller that runs its own loop with
-    // `step`. Answers false when the port could not be bound.
-    bool listen(^self, u16 port):
-        self.listener = http.listen(port)
-        self.listening = http.valid(self.listener)
-        return self.listening
+    // Start listening on `port` at `host`, for a caller that runs its own
+    // loop with `step`. Fails as `core:http`'s `listen` does: `IN_USE` when
+    // the port is taken, `UNREACHABLE` when `host` is not this machine's,
+    // `UNSUPPORTED` on the web.
+    http.Error!void listen(^self, u16 port):
+        string8 at = self.host if #len(self.host) > 0 else "127.0.0.1"
+        self.host = at
+        self.listening = false
+        try self.listener = http.listen(at, port)
+        self.listening = true
 
-    // Answer at most one waiting request, and say whether there was one. Never
-    // waits for a connection; a connection that arrived waits up to
-    // `read_timeout_ms` for its bytes.
+    // Answer at most one waiting connection — every request it carries, when
+    // it is kept alive — and say whether there was one. Never waits for a
+    // connection; a connection that arrived waits up to `read_timeout_ms` for
+    // its bytes.
     bool step(^self):
         if !self.listening:
             return false
-        http.Conn c = http.accept(self.listener)
-        if !http.open(c):
+        try http.Conn c = http.accept(self.listener) else:
             return false
         self.serve_connection(c)
         return true
 
+    // Stop listening. Routes and configuration are kept, so `listen` may be
+    // called again.
     void close(^self):
         if self.listening:
             http.stop(self.listener)
@@ -210,51 +247,71 @@ type App:
     ref []char8 handle(^self, string8 raw):
         Writer w = buffered_writer()
         self.dispatch(raw, &w)
-        return w.out
+        return w.st.out
 
     // ── one connection ──────────────────────────────────────────────────────
 
     private void serve_connection(^self, http.Conn c):
-        f64 started = time.now()
-        using runtime.enter_temp():
-            http.set_read_timeout(c, self.read_timeout_ms)
-            (ref []char8 raw, i32 problem) = read_request(c, self.max_request, self.read_timeout_ms)
-            Writer w = connection_writer(c)
-            w.extra = self.always
-            if problem != 0:
-                w.send_response(status(problem), false)
-            else:
-                string8 bytes = raw
-                self.dispatch(bytes, &w)
-            w.finish()
-            if !self.quiet:
-                fmt.println(w.method, " ", w.path, " ", w.status_sent, "  ", time.ms_since(started), " ms")
-                // A line per request as it happens, even when stdout is a
-                // pipe or a file and would otherwise hold it.
-                _ = io.flush(io.stdout())
-        _ = runtime.close_temp()
+        i32 count = 0
+        for:
+            time.Instant started = time.instant()
+            bool again = false
+            using runtime.enter_temp():
+                // The first request waits `read_timeout_ms`; a kept
+                // connection's next one waits `keep_alive_ms` for its first
+                // byte, and closes quietly when none comes.
+                i32 first_wait = self.read_timeout_ms if count == 0 else self.keep_alive_ms
+                (ref []char8 raw, i32 problem, bool extra) = read_request(c, self.max_request,
+                                                                          self.read_timeout_ms, first_wait, count > 0)
+                if problem >= 0:
+                    Writer w = connection_writer(c)
+                    w.st.extra = self.always
+                    if problem != 0:
+                        w.send_response(status(problem), false)
+                    else:
+                        // Pipelined bytes past this request are not kept, so
+                        // a client that sent them is answered and closed.
+                        w.st.may_keep = self.keep_alive_ms > 0 && !extra && count + 1 < self.keep_alive_requests
+                        string8 bytes = raw
+                        self.dispatch(bytes, &w)
+                    w.finish()
+                    again = w.st.kept && !w.st.failed
+                    self.served = self.served + 1
+                    if !self.quiet:
+                        fmt.println(w.st.method, " ", w.st.path, " ", w.st.status_sent, "  ", time.as_milliseconds(time.elapsed(started)), " ms")
+                        // A line per request as it happens, even when stdout is
+                        // a pipe or a file and would otherwise hold it.
+                        _ = io.flush(io.stdout())
+            _ = runtime.close_temp()
+            count = count + 1
+            if !again:
+                break
         http.close_conn(c)
-        self.served = self.served + 1
 
     // Parse `raw`, find its route, and answer through `w`.
     private void dispatch(^self, string8 raw, ^Writer w):
-        w.extra = self.always
-        (Request req, i32 outcome) = parse(raw)
-        if outcome == PARSE_PARTIAL:
-            w.send_response(status(400), false)
-            return
-        if outcome != PARSE_DONE:
-            w.send_response(status(outcome), false)
-            return
-        w.method = req.method
-        w.path = req.path
+        w.st.extra = self.always
+        switch parse(raw):
+            case Request req:
+                self.route_request(req, w)
+            case http.Pending _:
+                w.send_response(status(400), false)
+            case Refused refused:
+                w.send_response(status(refused.status), false)
+
+    // Answer the parsed request `parsed` through `w`, by the first route
+    // whose pattern matches and whose method answers.
+    private void route_request(^self, Request parsed, ^Writer w):
+        Request req = parsed
+        w.st.method = req.method
+        w.st.path = req.path
+        w.st.may_keep = w.st.may_keep && wants_keep_alive(req)
         bool head = req.method == "HEAD"
 
-        // The first route whose pattern matches and whose method answers.
         // HEAD is answered by a GET route, without the body.
         strings.Builder allowed = strings.builder()
         for r in self.routes:
-            (bool hit, ref []Header params) = match(r.pattern, req.path, r.kind == KIND_FILES)
+            (bool hit, ref []Header params) = match(r.pattern, req.path, is_files(r.action))
             if !hit:
                 continue
             bool method_ok = #len(r.method) == 0 || r.method == req.method || (head && r.method == "GET")
@@ -264,14 +321,14 @@ type App:
                 _ = strings.append(&allowed, r.method)
                 continue
             req.params = params
-            if r.kind == KIND_RAW:
-                w.head_only = head
-                r.raw(req, w)
-                return
-            if r.kind == KIND_FILES:
-                w.send_response(serve_file(r.dir, req.param("path"), req.path), head)
-                return
-            w.send_response(r.handler(req), head)
+            switch r.action:
+                case RawHandler raw_handler:
+                    w.st.head_only = head
+                    raw_handler(req, w)
+                case Files files:
+                    w.send_response(serve_file(files.dir, req.param("path"), req.path), head)
+                case Handler handler:
+                    w.send_response(handler(req), head)
             return
 
         string8 allow = strings.text(allowed)
@@ -283,13 +340,35 @@ type App:
             return
         w.send_response(not_found(), head)
 
-// A new app with the default configuration: 1 MiB requests, a 5 s read.
+// Whether a route serves files, and so matches its pattern as a prefix.
+#assert_raises
+private bool is_files(Action a):
+    switch a:
+        case Files _: return true
+        case Handler _: return false
+        case RawHandler _: return false
+
+// A new app with the default configuration: bound to `127.0.0.1`, 1 MiB
+// requests, a 5 s read, every connection closed after its response.
+#assert_raises
 App app():
     App a
+    a.host = "127.0.0.1"
     a.max_request = 1048576
     a.read_timeout_ms = 5000
+    a.keep_alive_ms = 0
+    a.keep_alive_requests = 100
     a.listener = http.Server(0 - 1)
     return a
+
+// Whether the client asked to keep the connection: HTTP/1.1 unless it said
+// `Connection: close`, HTTP/1.0 only when it said `keep-alive`.
+#assert_raises
+private bool wants_keep_alive(Request req):
+    string8 conn = req.header("connection")
+    if req.version == "HTTP/1.1":
+        return !same_fold(conn, "close")
+    return same_fold(conn, "keep-alive")
 
 // ── matching a route ─────────────────────────────────────────────────────────
 
@@ -298,7 +377,8 @@ App app():
 // takes the rest. A `prefix` match — a `files` route — matches the pattern and
 // anything under it, capturing what is under it as `path`. A trailing `/` is
 // not a segment.
-(bool hit, ref []Header params) match(string8 pattern, string8 path, bool prefix = false):
+#assert_raises
+private (bool hit, ref []Header params) match(string8 pattern, string8 path, bool prefix = false):
     ref []Header params = #make([]Header, 0)
     string8 p = trim_slashes(pattern)
     string8 q = trim_slashes(path)
@@ -326,6 +406,7 @@ App app():
             return (false, params)
     return (false, params)
 
+#assert_raises
 private string8 trim_slashes(string8 s):
     string8 t = s
     for #len(t) > 0 && t[0] == '/':
@@ -336,84 +417,129 @@ private string8 trim_slashes(string8 s):
 
 // ── reading a request off a connection ───────────────────────────────────────
 
-// Read one request from `c` into a buffer on `#default`. Answers the bytes and
-// 0, or the status to answer instead: 408 when the bytes stop before the
-// request is whole, 413 when it is larger than `limit`.
-private (ref []char8 raw, i32 problem) read_request(http.Conn c, i64 limit, i32 timeout_ms):
+// Read one request from `c` into a buffer on `#default`, waiting `first_ms`
+// for its first bytes and `timeout_ms` for the rest. Answers the bytes and
+// 0, or the status to answer instead — 408 when the bytes stop before the
+// request is whole, 413 when it is larger than `limit`, 400 when it is
+// malformed — or -1 when the client closed before sending a byte, or sent
+// none within `first_ms` on a `kept` connection: either is closed without an
+// answer. `extra` says bytes past the request arrived.
+private (ref []char8 raw, i32 problem, bool extra) read_request(http.Conn c, i64 limit, i32 timeout_ms,
+                                                                 i32 first_ms, bool kept):
     ref []char8 buf = #make([]char8, 0)
     if buf == nil:
-        return (buf, 500)
+        return (buf, 500, false)
     _ = #reserve(buf, 8192)
-    [8192]char8 chunk
-    f64 started = time.now()
+    [8192]u8 chunk
+    time.Instant started = time.instant()
+    try http.set_timeout(c, first_ms) else:
+        return (buf, -1, false)
+    bool waiting = true
     for:
         string8 have = buf
-        (i64 want, bool known) = expected_size(have)
-        if known && i64(#len(buf)) >= want:
-            return (buf, 0)
-        if known && want > limit:
-            return (buf, 413)
+        try http.Extent extent = http.request_end(have) else:
+            return (buf, 400, false)
+        switch extent:
+            case http.Whole w:
+                if w.length > limit:
+                    return (buf, 413, false)
+                return (buf, 0, i64(#len(buf)) > w.length)
+            case http.Pending p:
+                // A `Content-Length` larger than the limit is refused before
+                // its body is read.
+                if p.at_least > limit:
+                    return (buf, 413, false)
+            case http.ToClose _:
+                return (buf, 400, false)
         if i64(#len(buf)) > limit:
-            return (buf, 413)
-        if time.ms_since(started) > i64(timeout_ms):
-            return (buf, 408)
-        i64 n = http.receive(c, chunk[:])
+            return (buf, 413, false)
+        i32 allowed = first_ms if waiting else timeout_ms
+        if time.as_milliseconds(time.elapsed(started)) > i64(allowed):
+            return (buf, -1 if waiting && kept else 408, false)
+        i64 n = 0
+        try n = http.receive(c, chunk[:]) else why:
+            if why == http.Error.TIMED_OUT:
+                continue
+            return (buf, -1 if waiting else 400, false)
         if n == 0:
-            return (buf, 400)
-        if n < 0:
-            continue
+            return (buf, -1 if waiting else 400, false)
+        if waiting:
+            waiting = false
+            started = time.instant()
+            try http.set_timeout(c, timeout_ms) else:
+                return (buf, -1, false)
         for i in 0..<n:
-            if !#append(buf, chunk[i]):
-                return (buf, 500)
-    return (buf, 500)
+            if !#append(buf, char8(chunk[i])):
+                return (buf, 500, false)
+    return (buf, 500, false)
 
 // ── static files ─────────────────────────────────────────────────────────────
 
-// The file `rel` under `dir`, or 404 when there is none or `rel` climbs out.
-// A directory asked for without its trailing slash is redirected to
-// `asked` with one, so the page's relative links resolve inside it.
-private Response serve_file(string8 dir, string8 rel, string8 asked):
-    string8 clean = decode(rel)
-    string8 rest = clean
-    for #len(rest) > 0:
-        (string8 seg, string8 more, bool _) = strings.split_first(rest, "/")
-        rest = more
-        if seg == ".." || strings.has_byte(seg, '\\') || strings.has_byte(seg, char8(0)):
+// Whether `seg`, one segment of a requested path, may name a file under the
+// served directory: not `..`, no `\`, no NUL — and on Windows, where the
+// file system gives them meaning, no `:` (an alternate data stream, or a
+// drive) and none of the reserved device names (`CON`, `PRN`, `AUX`, `NUL`,
+// `COM1`–`COM9`, `LPT1`–`LPT9`), with or without an extension, in any case.
+#assert_raises
+private bool safe_segment(string8 seg):
+    if seg == ".." || strings.has_byte(seg, '\\') || strings.has_byte(seg, char8(0)):
+        return false
+    when #OS == #WINDOWS:
+        if strings.has_byte(seg, ':'):
+            return false
+        // The device is the name before the first dot, trailing spaces
+        // dropped: `nul.txt` and `CON .log` are devices too.
+        i64 dot = strings.index_of(seg, '.')
+        string8 stem = strings.substring(seg, 0, dot) if dot >= 0 else seg
+        for #len(stem) > 0 && stem[#len(stem) - 1] == ' ':
+            stem = strings.substring(stem, 0, i64(#len(stem)) - 1)
+        if same_fold(stem, "con") || same_fold(stem, "prn") || same_fold(stem, "aux") || same_fold(stem, "nul"):
+            return false
+        if #len(stem) == 4 && stem[3] >= '1' && stem[3] <= '9':
+            string8 three = strings.substring(stem, 0, 3)
+            if same_fold(three, "com") || same_fold(three, "lpt"):
+                return false
+    return true
+
+when #OS == #WEB:
+    // A page has no directory to serve from: every file is 501.
+    private Response serve_file(string8 dir, string8 rel, string8 asked):
+        _ = dir
+        _ = rel
+        _ = asked
+        return status(501)
+else:
+    // The file `rel` under `dir`, or 404 when there is none or `rel` climbs
+    // out. A directory asked for without its trailing slash is redirected to
+    // `asked` with one, so the page's relative links resolve inside it.
+    private Response serve_file(string8 dir, string8 rel, string8 asked):
+        string8 clean = decode(rel)
+        string8 rest = clean
+        for #len(rest) > 0:
+            (string8 seg, string8 more, bool _) = strings.split_first(rest, "/")
+            rest = more
+            if !safe_segment(seg):
+                return not_found()
+        ref []char8 full = #format(dir, "/", clean)
+        string8 path = full
+        if fs.is_dir(path):
+            if !strings.ends_with(asked, "/"):
+                return redirect(#format(asked, "/"), 301)
+            full = #format(dir, "/", clean, "index.html")
+            path = full
+        if !fs.is_file(path):
             return not_found()
-    ref []char8 full = #format(dir, "/", clean)
-    string8 path = full
-    ref []char8 cpath = strings.clone_to_cstring(path, #default)
-    if cpath == nil:
-        return status(500)
-    if fs.is_dir(cstring(cpath)):
-        if !strings.ends_with(asked, "/"):
-            return redirect(#format(asked, "/"), 301)
-        full = #format(dir, "/", clean, "index.html")
-        path = full
-        cpath = strings.clone_to_cstring(path, #default)
-        if cpath == nil:
+        try ref []char8 body = fs.read_file(path) else code:
+            if code == os.Error.NOT_FOUND || code == os.Error.IS_DIR:
+                return not_found()
+            if code == os.Error.PERMISSION:
+                return status(403)
             return status(500)
-    if !fs.is_file(cstring(cpath)):
-        return not_found()
-    i64 size = fs.bytes(cstring(cpath))
-    if size < 0:
-        return not_found()
-    ref []char8 body = #make([]char8, size)
-    if body == nil:
-        return status(500)
-    ^io.FILE f = io.open_read(cstring(cpath))
-    if !io.opened(f):
-        return status(403)
-    i64 got = 0
-    if size > 0:
-        got = io.read_bytes(f, body[:])
-    _ = io.close(f)
-    if got != size:
-        return status(500)
-    string8 bytes = body
-    return respond(bytes, content_type(path))
+        string8 bytes = body
+        return respond(bytes, content_type(path))
 
 // The content type for `path`'s extension.
+#assert_raises
 string8 content_type(string8 path):
     i64 dot = strings.last_index_of(path, '.')
     if dot < 0:

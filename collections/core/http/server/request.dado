@@ -1,13 +1,15 @@
 // The request: parsed once from the bytes that arrived, and read through methods.
 //
 // Every string a `Request` holds is a view into the bytes the server read, so
-// parsing allocates nothing and a handler reads `req.path` or
-// `req.header("content-type")` for free. What does allocate — a decoded query
-// or form value — lands on `#default`, which inside a running server is the
-// request's own scratch frame: it is reclaimed when the response has been
-// sent, and a handler never frees anything.
+// parsing allocates little and a handler reads `req.path` or
+// `req.header("content-type")` for free. What does allocate — the header list,
+// a chunked body's decoded bytes, a decoded query or form value — lands on
+// `#default`, which inside a running server is the request's own scratch
+// frame: it is reclaimed when the response has been sent, and a handler never
+// frees anything.
 package server
 
+import "core:http"
 import "core:strings"
 
 // One `name: value` pair: a request header, a response header, or a route's
@@ -17,6 +19,7 @@ type Header: (string8 name, string8 value)
 // The most headers a request may carry; one more is answered 431.
 const i32 MAX_HEADERS = 100
 
+// One parsed request. Its strings view the bytes it was parsed from.
 type Request:
     string8 method              // as sent: "GET", "POST", …
     string8 target              // the request-target, query included
@@ -35,6 +38,7 @@ type Request:
                 return h.value
         return fallback
 
+    // Whether the request carries the header `name`, in any case.
     bool has_header(self, string8 name):
         for h in self.headers:
             if same_fold(h.name, name):
@@ -54,6 +58,7 @@ type Request:
     string8 query(self, string8 name, string8 fallback = ""):
         return lookup_encoded(self.query_string, name, fallback)
 
+    // Whether the query names `name`, with or without a value.
     bool has_query(self, string8 name):
         return has_encoded(self.query_string, name)
 
@@ -69,20 +74,36 @@ type Request:
 
 // ── parsing ──────────────────────────────────────────────────────────────────
 
-// How a parse ended: `Done`, `Partial` (the headers have not all arrived, or
-// the body is shorter than its `Content-Length`), or an HTTP status to answer.
-const i32 PARSE_DONE    = 0
-const i32 PARSE_PARTIAL = 1
+// The request cannot be served: `status` is what to answer instead — 400 (it
+// is malformed), 431 (too many headers), 501 (a transfer coding other than
+// chunked), or 500 (an allocation failed).
+distinct type Refused: (i32 status)
 
-// Parse one request from `raw`. Answers the request and `PARSE_DONE`, or
-// `PARSE_PARTIAL` while more bytes are owed, or the status a malformed request
-// is answered with: 400, 431 (too many headers) or 501 (a chunked body, which
-// this server does not read). The request views `raw`, which must outlive it.
-(Request req, i32 outcome) parse(string8 raw):
+// What `parse` answers: the request, more bytes owed (`core:http`'s
+// `Pending`), or the status a request that cannot be served is answered
+// with. A `switch` over it names all three and needs no `else`.
+union Parsed: (Request, http.Pending, Refused)
+
+// Parse one request from `raw`. Answers the `Request`, or `http.Pending`
+// while more bytes are owed — the head has not all arrived, or the body is
+// shorter than its `Content-Length` or its chunks say — or `Refused` with
+// the status to answer. A chunked body is decoded onto `#default`;
+// otherwise the request views `raw`, which must outlive it.
+#assert_raises
+Parsed parse(string8 raw):
     Request r
-    (i64 head_end, bool complete) = find_head_end(raw)
-    if !complete:
-        return (r, PARSE_PARTIAL)
+    try http.Extent extent = http.request_end(raw) else:
+        return Parsed(Refused(400))
+    i64 end = 0
+    switch extent:
+        case http.Whole w:
+            end = w.length
+        case http.Pending pending:
+            return Parsed(pending)
+        case http.ToClose _:
+            return Parsed(Refused(400))
+    try i64 head_end = http.head_end(raw) else:
+        return Parsed(Refused(400))
 
     string8 head = strings.substring(raw, 0, head_end)
     (string8 line, string8 rest, bool _) = strings.split_first(head, "\r\n")
@@ -91,13 +112,13 @@ const i32 PARSE_PARTIAL = 1
     (string8 method, string8 after_method, bool m_ok) = strings.split_first(line, " ")
     (string8 target, string8 version, bool t_ok) = strings.split_first(after_method, " ")
     if !m_ok || !t_ok || #len(method) == 0 || #len(target) == 0:
-        return (r, 400)
+        return Parsed(Refused(400))
     if !strings.starts_with(version, "HTTP/1."):
-        return (r, 400)
+        return Parsed(Refused(400))
     r.headers = #make([]Header, 0)
     r.params = #make([]Header, 0)
     if r.headers == nil || r.params == nil:
-        return (r, 500)
+        return Parsed(Refused(500))
     r.method = method
     r.target = target
     r.version = version
@@ -114,73 +135,29 @@ const i32 PARSE_PARTIAL = 1
             continue
         (string8 name, string8 value, bool colon) = strings.split_first(h, ":")
         if !colon || #len(name) == 0:
-            return (r, 400)
+            return Parsed(Refused(400))
         if #len(r.headers) == MAX_HEADERS:
-            return (r, 431)
+            return Parsed(Refused(431))
         Header pair = (name, strings.trim(value))
         if !#append(r.headers, pair):
-            return (r, 500)
+            return Parsed(Refused(500))
 
-    if same_fold(r.header("transfer-encoding"), "chunked"):
-        return (r, 501)
-
-    // The body: exactly `Content-Length` bytes after the head.
-    i64 length = 0
-    string8 cl = r.header("content-length")
-    if #len(cl) > 0:
-        (i64 n, bool ok) = parse_count(cl)
-        if !ok:
-            return (r, 400)
-        length = n
     i64 body_at = head_end + 4
-    if i64(#len(raw)) - body_at < length:
-        return (r, PARSE_PARTIAL)
-    r.body = strings.substring(raw, body_at, length)
-    return (r, PARSE_DONE)
-
-// How many bytes the whole request in `raw` takes, once its head has arrived:
-// the head, the blank line and `Content-Length`'s body. `ok` is false while the
-// head is incomplete or the length is malformed.
-(i64 total, bool ok) expected_size(string8 raw):
-    (i64 head_end, bool complete) = find_head_end(raw)
-    if !complete:
-        return (0, false)
-    string8 head = strings.substring(raw, 0, head_end)
-    string8 lines = head
-    for #len(lines) > 0:
-        (string8 h, string8 more, bool _) = strings.split_first(lines, "\r\n")
-        lines = more
-        (string8 name, string8 value, bool colon) = strings.split_first(h, ":")
-        if colon && same_fold(name, "content-length"):
-            (i64 n, bool ok) = parse_count(strings.trim(value))
-            if !ok:
-                return (0, false)
-            return (head_end + 4 + n, true)
-    return (head_end + 4, true)
-
-// Where the head ends: the offset of the `\r\n\r\n` that closes it.
-private (i64 at, bool found) find_head_end(string8 raw):
-    i64 n = i64(#len(raw))
-    i64 i = 0
-    for i + 3 < n:
-        if raw[i] == '\r' && raw[i + 1] == '\n' && raw[i + 2] == '\r' && raw[i + 3] == '\n':
-            return (i, true)
-        i = i + 1
-    return (0, false)
-
-// A non-negative decimal count, as `Content-Length` writes one.
-private (i64 n, bool ok) parse_count(string8 s):
-    if #len(s) == 0 || #len(s) > 15:
-        return (0, false)
-    i64 n = 0
-    for c in s:
-        if c < '0' || c > '9':
-            return (0, false)
-        n = n * 10 + i64(c - '0')
-    return (n, true)
+    string8 body = strings.substring(raw, body_at, end - body_at)
+    string8 coding = r.header("transfer-encoding")
+    if #len(coding) > 0:
+        if !same_fold(coding, "chunked"):
+            return Parsed(Refused(501))
+        try ref []char8 plain = http.unchunk(body) else why:
+            return Parsed(Refused(400 if why == http.Error.MALFORMED else 500))
+        r.body = plain
+        return Parsed(r)
+    r.body = body
+    return Parsed(r)
 
 // ASCII case-insensitive equality: header names are case-insensitive.
-bool same_fold(string8 a, string8 b):
+#assert_raises
+private bool same_fold(string8 a, string8 b):
     if #len(a) != #len(b):
         return false
     for i in 0..<i64(#len(a)):
@@ -188,11 +165,13 @@ bool same_fold(string8 a, string8 b):
             return false
     return true
 
+#assert_raises
 private char8 lower(char8 c):
     return char8(i32(c) + 32) if c >= 'A' && c <= 'Z' else c
 
 // ── `a=1&b=two` ─────────────────────────────────────────────────────────────
 
+#assert_raises
 private string8 lookup_encoded(string8 pairs, string8 name, string8 fallback):
     string8 rest = pairs
     for #len(rest) > 0:
@@ -203,6 +182,7 @@ private string8 lookup_encoded(string8 pairs, string8 name, string8 fallback):
             return decode(value)
     return fallback
 
+#assert_raises
 private bool has_encoded(string8 pairs, string8 name):
     string8 rest = pairs
     for #len(rest) > 0:
@@ -216,6 +196,7 @@ private bool has_encoded(string8 pairs, string8 name):
 // Percent-decode `s`, reading `+` as a space. A string with nothing to decode
 // is answered as it is, allocating nothing; otherwise the decoded copy is on
 // `#default`. A malformed escape is kept as written.
+#assert_raises
 string8 decode(string8 s):
     bool plain = true
     for c in s:
@@ -243,6 +224,7 @@ string8 decode(string8 s):
     string8 decoded = out
     return decoded
 
+#assert_raises
 private i32 hex(char8 c):
     if c >= '0' && c <= '9':
         return i32(c - '0')

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.3 -->
-<!-- commit 8e62c891753a -->
+<!-- dadoc 1.0.0-rc.4 -->
+<!-- commit cc341d1a7513 -->
 # core:geom/earcut
 
 Polygon triangulation by ear clipping, holes included.
@@ -17,11 +17,20 @@ for f64 input:
 Self-intersecting input still answers triangles; `deviation` measures how
 far they are from the polygon's area.
 
+**Errors.** `triangulate` fails with a member of `Error` (codes 1600 to 1699), and
+`message(why)` is a sentence for one.
+
+**Tier N W H.** Pure Dado over `core:math`: it builds and runs freestanding (`#NONE`), on the
+web, and hosted (Linux, macOS and Windows) alike.
+
+**What raises into a script.** Every public function, `triangulate`, `deviation` and
+`message`, each promised by the `#assert_raises` on the line above it, and with them every helper they reach.
+
 ## Declarations
 
-54 declarations, 4 public.
+51 declarations, 4 public.
 
-* `const i32 MALFORMED = 1` — `triangulate` fails with MALFORMED when `dim` is below 2, the data ends…
-* `const i32 NO_MEMORY = 2` — `triangulate` fails with NO_MEMORY when an allocation answers nil.
-* `!ref []u32 triangulate([]$T data, []u32 holes, i32 dim = 2) where T is float` — Triangulates a polygon given as flat coordinates, `dim` per vertex, of…
+* `distinct enum i32 Error` — Why `triangulate` failed. The numbers are this package's, 1600 to 1699,…
+* `string8 message(Error why)` — A sentence for each of this package's codes, and one for any other value.
+* `Error!ref []u32 triangulate([]$T data, []u32 holes, i32 dim = 2) where T is float` — Triangulates a polygon given as flat coordinates, `dim` per vertex, of…
 * `f64 deviation([]$T data, []u32 holes, i32 dim, []u32 triangles) where T is float` — How far `triangles` is from covering the polygon: the difference between…
