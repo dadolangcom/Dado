@@ -1,5 +1,5 @@
 <!-- dadoc 1.0.0-rc.4 -->
-<!-- commit cc341d1a7513 -->
+<!-- commit 9fddd51732b8 -->
 # core:geom/polygon
 
 One closed ring: its offset, and the normal of a 3D ring.
@@ -39,7 +39,7 @@ library, and run on `core:geom/tess`, whose arena allocator carries a `rawptr`.
 
 22 declarations, 6 public.
 
-* `void offset(ref [][2]$T polygon, T dt) where T is float` — Moves each vertex of a closed ring, in place, to where its two edges meet…
+* `void offset([][2]$T polygon, T dt) where T is float` — Moves each vertex of a closed ring, in place, to where its two edges meet…
 * `tess.Error!ref [][2]$T offset_by([][2]T polygon, T dt) where T is float` — A copy of `polygon` on `#default`, the caller's to `#delete`, moved as…
 * `enum i32 Join: (Miter, Bevel, Round)` — How the offset edges meet at a corner they turn away from.
 * `tess.Error!void offset_outline_edges([][2]$T polygon, []T deltas, Join join, ^clip.Contours(T) out, T arc_resolution = 0.1, T miter_limit = 0.0) where T is float` — The outline of a closed ring whose edges are each offset by their own…

@@ -1534,34 +1534,41 @@ JSValue failed(^JSContext ctx, cstring function, i32 code):
 // walked (`at [2][0]`) is the generated code's, handed down so the error names
 // the element.
 //
-// **The lend lock.** A structure lent across is locked for its call: written
-// while the call runs, by code the call reached back into, it raises. The
-// check costs nothing unless the call reached back. A lend is a `Lend` the
-// generated glue keeps on its stack and hands this package (`lend_script`,
-// `lend_host`) for the length of the call; the first time the call reaches
-// back — this package entering the engine again (`call`, `call_method`,
-// `construct`) for a script's structure a thunk lent Dado, a thunk running
-// (`thunk_entered`) for Dado's structure a run lent the script — every lend
-// still waiting is handed to its own `settle`, which fingerprints the
-// structure as it was lent. Only a settled lend is compared when the call
-// returns: a thunk reads the script's array again and throws `Error`
-// (`lent_written`) when its fingerprint moved; a run fingerprints the Dado
-// value again and fails `LENT` (`lent_changed`). What Dado does to its own
-// copy of an argument is not a write of the script's structure, so the
-// fingerprint is of the structure lent, never of the copy. The two counters,
-// `entries` and `thunks`, count the same events.
+// **A lend, and its copy back.** What a lender lends is one storage: the
+// borrower works on a copy of it, and what the borrower writes is copied back
+// into the lender's storage each time control reaches the lender again — at
+// every call back into it, and when the call returns. The generated glue does
+// the copying; a lent array keeps its length (`read_same_length`), and a
+// `string8` lent inside one, a view, takes no new text (`read_same_string`).
+//
+// **The lend lock.** While a structure is lent, its lender does not write it:
+// a write it makes from code the call reached back into raises. A lend is a
+// `Lend` the generated glue keeps on its stack and hands this package
+// (`lend_script`, `lend_host`) for the length of the call; each time the call
+// reaches back — this package entering the engine again (`call`,
+// `call_method`, `construct`) for a script's structure a thunk lent Dado, a
+// thunk running (`thunk_entered`) for Dado's structure a run lent the script
+// — every lend outstanding is handed to its own `settle`, which compares the
+// lender's structure with its fingerprint from the last time, copies the
+// borrower's writes into it, and fingerprints it again. When the call
+// returns, a lend whose lender wrote it fails: a thunk throws `Error`
+// (`lent_written`), a run fails `LENT` (`lent_changed`), and nothing more is
+// copied. The check costs nothing unless the call reached back. The two
+// counters, `entries` and `thunks`, count the same events.
 
 // The thunk side's counter: a thunk of a bound Dado function is running, so
-// every structure a run lent the script is fingerprinted before Dado runs.
+// what the script wrote into every structure a run lent it is copied back
+// before Dado runs.
 void thunk_entered(^JSContext ctx):
     Engine e = Engine(JS_GetContextOpaque(ctx))
     e^.thunks += 1
     e^.parking.active += 1
     settle_lends(&e^.host_lends)
 
-// A lend waiting for its fingerprint: the generated glue's frame begins with
-// these two, and `settle` fingerprints the rest of it.
-type Lend: (void(rawptr) settle, rawptr next)
+// A lend outstanding: the generated glue's frame begins with these two, and
+// `settle` checks, copies and fingerprints the rest of it, one phase at a
+// time (`settle_lends`).
+type Lend: (void(rawptr, i32) settle, rawptr next)
 
 // A thunk lending Dado a script's structure for the call: `lend` goes on the
 // engine's list; answers the list as it was, for `unlend_script`.
@@ -1573,12 +1580,10 @@ rawptr lend_script(^JSContext ctx, rawptr lend):
     e^.script_lends = lend
     return was
 
-// The call returned: a lend still waiting is taken off, and one settled is
-// gone already.
+// The call returned: its lends are taken off, the list as it was before.
 void unlend_script(^JSContext ctx, rawptr was):
     Engine e = Engine(JS_GetContextOpaque(ctx))
-    if e^.script_lends != nil:
-        e^.script_lends = was
+    e^.script_lends = was
 
 // A run lending the script a Dado structure: as `lend_script`, on the engine
 // the run has entered (`begin_run`).
@@ -1591,17 +1596,101 @@ rawptr lend_host(^JSContext ctx, rawptr lend):
     hold(1)
     return was
 
-// The lend `lend_host` made is over: `was` is what it answered.
+// The lends a run made with `lend_host` are over: `was` is what its first
+// answered, and each lend taken off is one fewer for the page to count.
 void unlend_host(^JSContext ctx, rawptr was):
     Engine e = Engine(JS_GetContextOpaque(ctx))
-    hold(-1)
-    if e^.host_lends != nil:
-        e^.host_lends = was
+    rawptr at = e^.host_lends
+    for at != was && at != nil:
+        hold(-1)
+        ^Lend l = ^Lend(at)
+        at = l^.next
+    e^.host_lends = was
 
-// Give back an error a fingerprint's reading left pending: a lend whose
-// structure cannot be read as it was lent is left unsettled, and unchecked.
+// Give back an error a lend's reading left pending: a copy that could not be
+// made when the call reached back is made again, or refused, when it returns.
 void clear_exception(^JSContext ctx):
     JS_FreeValue(ctx, JS_GetException(ctx))
+
+// A second reference to `v`: the glue keeps the copy of a lent structure it
+// gave the script, to copy back from, and lets go of it with `free_value`.
+JSValue dup_value(^JSContext ctx, JSValue v):
+    return JS_DupValue(ctx, v)
+
+// Whether `a` and `b` are one object: one array passed for two parameters,
+// which Dado then takes as one storage.
+bool same_object(JSValue a, JSValue b):
+    return i32(a.tag) == JS_TAG_OBJECT && b.tag == a.tag && a.u.ptr == b.u.ptr
+
+// `arr[i] = v` in an array the script holds, written in place: `v` is taken,
+// `arr` is not.
+!void put_in(^JSContext ctx, JSValue arr, i64 i, JSValue v):
+    if is_exception(v):
+        fail THREW
+    if JS_SetPropertyInt64(ctx, arr, i, v) < 0:
+        fail THREW
+
+// How many elements `v` holds when it is an array, and -1 when it is not.
+i64 array_length(^JSContext ctx, JSValue v):
+    if !JS_IsArray(v):
+        return -1
+    i64 n = 0
+    if JS_GetLength(ctx, v, &n) < 0:
+        clear_exception(ctx)
+        return -1
+    return n
+
+// That a lent array still holds the `n` elements it was lent with: a lent
+// array keeps its length, as a Dado `[]T` parameter does.
+!void read_same_length(^JSContext ctx, JSValue v, i64 n, cstring function, cstring what, ^i64 path, i32 depth):
+    try i64 got = read_length(ctx, v, function, what, path, depth)
+    if got != n:
+        [128]char8 text
+        where_into(&text, path, depth)
+        _ = JS_ThrowTypeError(ctx, "`%s`'s %s%s was lent with %d elements and now holds %d: a lent array keeps its length, so grow a copy instead", function, what, cstring(rawptr(&text)), i32(n), i32(got))
+        fail TYPE
+
+// That the string at `v` is still `s`: a `string8` lent inside an array is a
+// view of the lender's text, and takes no new text.
+!void read_same_string(^JSContext ctx, JSValue v, string8 s, cstring function, cstring what, ^i64 path, i32 depth):
+    try string8 t = read_string(ctx, v, function, what, path, depth)
+    bool same = #len(t) == #len(s)
+    if same:
+        for i in 0..<#len(s):
+            if t[i] != s[i]:
+                same = false
+                break
+    drop_string(ctx, t)
+    if !same:
+        try refused_back(ctx, function, what, path, depth, "a `string8` (a view of its text)")
+
+// Fails `TYPE` with a `TypeError` pending: the borrower wrote the value at
+// `path`, and what the lender holds there (`kind`) cannot take a new one.
+!void refused_back(^JSContext ctx, cstring function, cstring what, ^i64 path, i32 depth, cstring kind):
+    [128]char8 text
+    where_into(&text, path, depth)
+    _ = JS_ThrowTypeError(ctx, "`%s`'s %s%s was written while lent, but the lender holds %s there, which takes no new value; pass a copy to write it", function, what, cstring(rawptr(&text)), kind)
+    fail TYPE
+
+// What a run says when what the script wrote into a structure it was lent
+// could not be copied back, on the error sink and as the failure's text;
+// answers `TYPE` (or `NO_MEMORY`). `label` is the method, `structure` the
+// argument as written.
+i32 lent_refused(^JSContext ctx, cstring label, cstring structure, i32 code):
+    Engine e = Engine(JS_GetContextOpaque(ctx))
+    JSValue ex = JS_GetException(e^.ctx)
+    text_begin(e^.err)
+    err_put(e^.err, "script: what `")
+    err_put(e^.err, string8(label))
+    err_put(e^.err, "` wrote into `")
+    err_put(e^.err, string8(structure))
+    err_put(e^.err, "` did not cross back: ")
+    write_value(e, e^.err, ex, true)
+    err_put(e^.err, "\n")
+    JS_FreeValue(e^.ctx, ex)
+    if code == NO_MEMORY:
+        return NO_MEMORY
+    return TYPE
 
 // What a thunk throws when a script's structure it lent Dado was written
 // while the call ran.
@@ -1949,16 +2038,26 @@ void quit_untried(rawptr s, cstring entry, cstring verb, i32 code):
 
 private cunion Bits64: (f64 f, u64 u)
 
-// Every lend in `pending` fingerprinted, and the list emptied: the call is
-// about to reach back across.
+// Every lend outstanding in `pending` settled, as the call is about to reach
+// back across, in three passes over them all: each lender's structure checked
+// against its fingerprint (phase 0), then the borrower's writes copied back
+// (1), then each fingerprinted again (2) — so a copy into storage two lends
+// share is never taken for a write of the lender's. Each pass takes the lends
+// in the order they were made, the oldest first, so where two lends share
+// storage the later argument's copy is the one that stays, as when the call
+// returns. The list stays: the lends are outstanding until their call returns.
 private void settle_lends(^rawptr pending):
-    rawptr at = pending^
-    pending^ = nil
-    for at != nil:
-        ^Lend l = ^Lend(at)
-        rawptr next = l^.next
-        l^.settle(at)
-        at = next
+    for phase in 0..<3:
+        settle_from(pending^, i32(phase))
+
+// The lends from `at` on settled for `phase`, the oldest — the list's last —
+// first.
+private void settle_from(rawptr at, i32 phase):
+    if at == nil:
+        return
+    ^Lend l = ^Lend(at)
+    settle_from(l^.next, phase)
+    l^.settle(at, phase)
 
 // `TypeError`: what a value at `path` takes, and what it was given.
 private void mistyped_at(^JSContext ctx, JSValue v, cstring function, cstring what, ^i64 path, i32 depth, cstring wanted):

@@ -1,5 +1,5 @@
 <!-- dadoc 1.0.0-rc.4 -->
-<!-- commit cc341d1a7513 -->
+<!-- commit 9fddd51732b8 -->
 # core:geom/clip
 
 Polygon set operations, triangulation and cleanup, for any float.
@@ -22,10 +22,9 @@ input's width. They fail with tess's codes, `tess.Error`.
 
 **The set operations write their answer to `out`**, a `Contours(T)` the
 caller declares and ends with `destroy`, rather than return it. That is the
-1.0 shape, adopted deliberately: a failable function answering a generic
-type, `tess.Error!Contours(T) f(…)`, loses its failure in the compiler today
-(ERR0714), and the shape that returns the set will come beside these as an
-addition once it does not, without breaking a caller of these.
+1.0 shape, adopted deliberately; a shape that returns the set,
+`tess.Error!Contours(T) f(…)`, may come beside these later as an addition,
+without breaking a caller of these.
 
 **Tier N W H.** Pure Dado over `core:geom/earcut` and `core:geom/tess`: it builds and runs
 freestanding (`#NONE`), on the web, and hosted (Linux, macOS and Windows) alike.

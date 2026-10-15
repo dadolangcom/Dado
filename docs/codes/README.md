@@ -1,5 +1,5 @@
 <!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f12a11494f94 -->
+<!-- commit 9fddd51732b8 -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -252,7 +252,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR1303](ERR1303.md) | error | a `.dados` file with no header whose basename is not an identifier, so it names no class, or an imported directory of scripts alone whose name is no identifier |
 | [ERR1304](ERR1304.md) | error | an `init` that returns a value, a `ready` that answers something other than an `int` or nothing, or a `reloaded` that takes parameters or answers a value |
 | [ERR1305](ERR1305.md) | error | a method no DadoScript array, map or string has — another language's spelling, or one DadoScript does not admit — or a method called on a scalar |
-| [ERR1310](ERR1310.md) | error | a class rule broken — `extends` naming a Dado type or closing a cycle, an override of another shape, `super` outside a subclass or `super(…)` outside `init`, or a class-typed slot with no value |
+| [ERR1310](ERR1310.md) | error | a class rule broken — `extends` naming a Dado type or closing a cycle, an override of another shape, `super` outside a subclass or `super(…)` outside `init`, a class-typed slot with no value, or an embedded class or type that has no named slots |
 | [ERR1320](ERR1320.md) | error | a JavaScript module bound under no identifier or imported unqualified, a module importing a package manager's name, or a `foreign "x.js":` declaration a script cannot call |
 | [ERR1330](ERR1330.md) | error | `await` outside an `async` method or over a value that is not `async`, an `async` call left alone on a line, an `async` slot with no value, or an `async` `init` or generic method |
 | [ERR1340](ERR1340.md) | error | an `export` in DadoScript that publishes a type with no declaration spelling, a class that is not exported, an inner class or generic method, a name twice, or a method reading `self` of a class that is not exported |

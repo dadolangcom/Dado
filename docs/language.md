@@ -339,6 +339,42 @@ loss is stated instead of patched. **Signatures are an identity** — name,
 count, order, widths and parameter spellings all return unchanged — and a
 declaration is exactly where the round trip stops being one.
 
+### A type is built from one value per slot
+
+A type of two slots or more is built by calling it with one value per
+slot: `Vec2(1, 2)` for `type Vec2: f32 x, f32 y`. It is the literal
+`(1, 2)` written where a `Vec2` is wanted, so each value enters its
+slot as an assignment would — a literal adapts, an `int` or a `float`
+adapts to the slot's width, an explicit width only widens, and a
+change of kind is written (`Vec2(f32(n), 0)`). The slots may be named
+instead, as a call's parameters are: `Vec2(y: 2, x: 1)`, every slot
+named once and none passed by position beside them. A wrong count is
+`ERR0601`, naming the slots.
+
+```dado
+package doc_sample
+
+type Vec2:
+    f32 x
+    f32 y
+
+distinct type Metres: Vec2
+
+public Vec2 half(Vec2 v):
+    return Vec2(y: v.y / 2, x: v.x / 2)
+
+public Metres origin():
+    return Metres(0, 0)
+```
+
+A `distinct` type over a shape, a fixed array's name (`type Pair:
+[2]f32`, `Pair(1, 2)`), a nested shape and a `foreign` struct are
+built the same way, and a constant may be one, its slots passed in
+order. **One value is still a conversion:** `Vec2(q)` converts a
+`(f32, f32) q`, and a type of one slot is never built from several.
+A union is not built from slots either — `Shape(c)` picks the member
+by the value's type — and an enum is not a shape of slots.
+
 ### What a view may not outlive
 
 A pointer, a window and a trait value are **views**: Dado did not allocate
@@ -403,6 +439,46 @@ point there. A callee that rebinds what its `^` points at on some path is
 taken to hand that block over on every path; and one that hands over only
 a slot (`take(&c)` answering `c.tris` after `c.tris = nil`) is still taken
 for a copy of any handle `c` holds, and refused after any of them moves.
+
+### Arrays and slices: a read-only window is `[]const T`
+
+A window nothing is written through is `[]const T`, the word on its
+elements. It reads, indexes, walks with `for`, measures with `#len`
+and cuts sub-windows as a `[]T` does, and an element write through
+it is `ERR0606`. A `[]T`, a fixed array's `a[:]`, a `ref []T` and a
+run written in place (`[a, 2, 3]`) all stand where one is wanted,
+so a function that only reads asks for `[]const T` and every caller
+reaches it; the other direction, handing one to a `[]T` that could
+write, is refused (`ERR0504`). A window over a `const` array is one.
+
+**The word is a promise about the place, never part of a value read
+from it.** An element of a `[]const u32` indexes, `f64(x)` of a
+`const f32` widens, and a `$T` bound from one binds the type under
+the word, so `T` is `u32`. A template that only reads writes
+`[]const $T`, as `core:slices`' readers do; one written `[]$T` may
+write, so a read-only window does not reach it. `#copy` of one is a
+new block nobody else holds, a `ref []T` its caller writes, unless
+the position names `ref []const T`.
+
+```dado
+package doc_sample
+
+private i64 total([]const i32 xs):
+    i64 sum = 0
+    for x in xs:
+        sum += i64(x)
+    return sum
+
+public i64 counted():
+    [3]i32 store = [1, 2, 3]
+    []const i32 ro = store[:]
+    return total(ro) + total(store[1..<3]) + total([4, 5])
+```
+
+**`const []T` is not a type** (`ERR0401`, naming `[]const T`). In
+front of the brackets the word would sit on the window's two-word
+header, which promises its elements nothing, so it would read as
+the promise it is not; `[]const T` is the one spelling.
 
 ### What a frame takes back
 
@@ -592,9 +668,117 @@ all, which is an `i32`. A character literal that does not fit its
 character type keeps its low bits on the same terms, and `char8('é')`
 says so on purpose.
 
+**The arithmetic over literals is done in the type the literals took.**
+A literal written for a float is a float, an integer one included, so
+an operator whose operands are literals computes in that float:
+`f64 c = 7 / 2` divides two `f64`s and is 3.5, `x + 1 / 2` for an
+`f64 x` adds a half, and `f32 h = 1 / 3` is a third computed in `f32`.
+The same holds in an argument, a `return`, a default, a package variable
+and a `const` (which folds to the value the program computes), and in
+both dialects: a script's `float f = 7 / 2` is 3.5 too. Where the
+literals are integers the division is the integer one, `i32 n = 7 / 2`
+is 3, and so is an operand with no type to adapt to, which is what a
+conversion's operand is: `f64(7 / 2)` is 3.0.
+
 What has no value in any type is refused instead: an integer past 64
 bits, a constant whose folding overflows the compiler's arithmetic, and
 a float that would be infinite or not a number in its type.
+
+### `int` and `float` adapt to the width they meet
+
+`int` is `i64` and `float` is `f64`, on every target and in both
+dialects. They are one type with those two for everything that asks
+about data: identity, `==` between types, layout, `#size`, the emitted
+C (an int64_t and a double) and generic binding, so a `[]int` is a
+`[]i64`, `int(int)` is `i64(i64)`, and `typeof` of an `int` value is
+`i64`. What the name adds is a **behaviour**: a value whose type is
+written `int` or `float` **adapts** to whatever width of its own kind
+it meets — any integer width for `int`, `f32` or `f64` for `float` —
+widening or narrowing, the way a literal does. Spelling the width is
+the opt-in to strictness: `i64` keeps today's rule, under which only a
+value-preserving widening is supplied.
+
+```dado
+package doc_sample
+
+i32 clamp_to_byte(int n):
+    u8 b = n        // adapts: narrows, and wraps as u8(n) would
+    return b        // u8 widens to i32, as it always has
+```
+
+Two words, kept apart in this document: a change of **width** within
+one kind is *adapting*, and a change of **kind** is *coercing*. Nothing
+coerces implicitly, `int` and `float` included: an integer becoming a
+float is written `float(n)` or `f32(n)`, and so are a number and a
+string, a `bool` and a number, an enum and its backing integer.
+
+**The operand of a conversion is its own expression**: it is checked
+and computed on its own, its literals taking their own type, and only
+then converted. So `f32(7 / 2)` is the integer division, 3, made `3.0`,
+and `f32(1 << 23)` the integer shift made an `f32`, never a shift on
+floats. A number written alone is the target's literal — `f32(1)` is
+`1.0` in single precision, `u8(300)` the 44 the wrap asks for — and an
+integer target lets a literal in a longer operand take its width
+(`i64(1 << 40)` is a 64-bit shift), since that never changes its kind.
+Either way the conversion's result is a value of the target type, and
+the operator around it is that type's: `f64(7) / f64(2)` is 3.5.
+
+**Known at compile time**, an adapted value is a literal: a constant
+`int` that does not fit the width it meets is linted as `u8 b = 300`
+is, and folded to the value the width holds. **Not known**, it narrows
+at run time as the written conversion does — an integer keeps its low
+bits, a `float` meeting `f32` rounds — and the compiler keeps a list of
+every such place: `dadoc --emit=narrowings` prints it, one line a
+place, for code that wants to see each place it relies on the
+leniency. Nothing lints them.
+
+**A dev build warns when a narrowing changes the value**, and does
+nothing else: the value wraps or rounds exactly as it would without
+the warning. The first time a place changes a value, a line names the
+place, the value and the width (`warning: main.dado:12:12: implicit
+narrowing changed the value: the int 300 does not fit in u8, and wraps
+to 44`); later ones there are counted, and at exit each place that
+changed a value more than once is written again with its count, so a
+narrowing in a loop or every frame says so once. *Changes the value*
+means an integer the width cannot hold, or a finite `float` too large
+for `f32`, which becomes infinity. Rounding to the nearest `f32` is
+what an `f32` is, and is not reported; a NaN stays a NaN.
+
+The warning goes to standard error; on the web to the page's
+`console.warn`; for a script's value crossing into Dado (see *A script
+calls Dado*), to the script engine's error sink. A target with no C
+library (`#NONE`) has no stream: there the first warning at a
+place is handed to `narrowing_warning` if the program defines one —
+`export void narrowing_warning(cstring where, cstring width, i64
+value, f64 fvalue)`, `value` an integer's and `fvalue` a float's —
+and nothing is written when it does not. Because the check never
+changes a result, **`--release` drops it**: a release build narrows
+silently. `--narrowing-warnings` keeps it in a release build, and
+`--no-narrowing-warnings` drops it from a dev one; neither changes a
+value or a diagnostic.
+
+**Where an `int` meets an explicit width in an operator, the explicit
+width decides, from whichever side it stands on**: `i32 + int` and
+`int + i32` are both `i32` arithmetic, so reordering the operands never
+changes what is computed. Two explicit widths keep today's rule (the
+wider wins; nothing narrows), and `int` with `int` is `int`. An
+assignment, compound ones included, takes the width of its target
+(`count += n` narrows `n` into an `i32 count`); a shift takes the
+width of the value shifted, and its count adapts; a comparison compares
+the two **values**, widened to the larger type and never narrowed, so
+`i32 x < int n` cannot wrap `n`. A conditional value's two arms
+meet the same way: an explicit width on either arm is the value's type.
+
+**Shapes adapt slot by slot.** A `[2]float`, or a tuple or `type` whose
+slots are `float`, adapts to a shape of the same length whose slots are
+`f32`, each slot narrowing as a scalar would. A window or a reference
+never does: `[]int` is `[]i64`, and a `[]i32` is other storage.
+
+A generic binding binds the data: `$T` bound from an `int` argument is
+`i64`. After `is` and in a `where`, `int` and `float` still name their
+families, so `where T is int` holds for every integer width and
+`where T is float` for both floats; everywhere a type is written they
+are the type.
 
 
 ## Generics constrain, and never implement
@@ -1472,8 +1656,11 @@ is.
 widening, no common type, no conversion supplied. An untyped literal in
 one arm — `#LEN` among them — takes the other arm's type, exactly as it
 takes a typed sibling's in an array literal, so `n if n > 0 else 0` is
-`n`'s type whatever that is. Two arms of two types are refused, and
-the repair is the conversion written on the arm that should change.
+`n`'s type whatever that is. So does an arm of `int` or `float` beside
+an explicit width of its kind: the explicit width is the value's type,
+on whichever arm it is written. Two arms of two other types are
+refused, and the repair is the conversion written on the arm that
+should change.
 
 ```dado
 package doc_sample
@@ -1672,6 +1859,17 @@ literals, and package-level constants declared outside every `when`. A
 condition may not name something a `when` declares, because selection
 decides which names exist and a condition that depended on that would
 have no answer to start from.
+
+A bare name in a condition is its own package's constant when the
+package declares one, as it is on any other line, and otherwise the one
+package that does; a name two other packages declare is refused
+(`ERR0903`) until it is qualified with an import's binding,
+`lib.ROLE`. A build reaches a `@const` the same way: `-D NAME=value`
+names the one declaration of `NAME`, and where two packages each declare
+one, `-D package.NAME=value` names one of them and leaves the other at
+its default. So two libraries may each guard test-only code with a
+`@const bool FAULT_HOOKS`, and `-D libtess2.FAULT_HOOKS=true` compiles in
+one library's hooks and not the other's.
 
 Only a name known before the program runs may be branched on — `#OS`,
 `#ARCH`, `#TRIPLE` and their members. The `#` sigil splits by case and
@@ -2111,8 +2309,10 @@ nothing; **`ready`** is the entry a host runs with `#script_run`, as a
 program's main function is run, so it returns an `int` or nothing
 (`ERR1304`), and takes the arguments `#script_run` passes after the handle.
 
-A script's types are `int` (exactly Dado's `i64`, wrapping), `float`
-(`f64`), `bool` and `string` — JavaScript's string, which has no width.
+A script's types are `int` and `float` — Dado's own, `i64` and `f64`
+with the width left to the compiler (see *`int` and `float` adapt to the
+width they meet*) — `bool` and `string`, JavaScript's string, which has
+no width.
 An integer literal with nothing to adapt to is an `int`. Everything else
 is Dado's: the operators and what they accept, how a literal adapts and
 wraps, linted, where it does not fit, conditions that are `bool`, `for`
@@ -2121,7 +2321,9 @@ loops over a range or on a condition, and every conversion written. So a `float`
 a `float` — write `float(x)`. Strings join with `+` and compare with `==`
 and `!=`; a value is made a string only by `string(x)`, so
 `"total: " + 5` is refused naming `string(5)`. `print` and `println` take
-any number of those four types and write them with no separator.
+any number of those four types and write them with no separator. A fixed
+array, `[2]float`, is Dado's too: a value, with Dado's operators slot by
+slot (see *Fixed arrays*).
 
 What DadoScript will have and the checker does not check yet is refused
 `ERR0001`, naming it. A script may import a Dado package, and calls its
@@ -2149,7 +2351,10 @@ all hand over the same one. `g.hit(2)` calls a method of it, and `g.hp`
 reads or writes a field of it. A field or method is public unless written
 `private`, which keeps it to the package, or `private "file"`, which keeps
 it to the file. A field or local whose type is a class is written with its
-value, since a script has no null to start it at.
+value, since a script has no null to start it at. A class has no operators
+but its methods, and `==` asks whether two names hold the same instance; a
+value that is copied and compared by its slots is a `type` (see *Types
+and unions*).
 
 A script may hold an inner class: a `class Loot:` block with an indented
 body, named `Goblin.Loot` in the package and `Loot` inside `Goblin`. Inner
@@ -2206,6 +2411,99 @@ first, `xs.filter(bool(int v): return v > 2)`, or any function of the
 shape, a method's name among them: `xs.filter(is_big)`. `print` and `string(x)`
 write a container as Dado does, `[1, 2]` and `{ada: 36}`.
 
+### Fixed arrays
+
+A fixed array is written as Dado writes it, `[2]float`, `[4]int`,
+`[3][3]float`, its length a literal or a constant the script sees — one
+of its package's Dado files declares, `[STEPS]float`. It is Dado's fixed
+array: a **value** of that many slots, so assigning one, passing it and
+returning it copy it, where a `[]T` hands over the same array. An array
+literal is one where a fixed array is wanted — `[2]float v = [1.0, 2.0]`
+— and a `[]T` everywhere else. `v[i]` reads a slot and `v[i] = n` stores
+one: a written position past the end is refused, `ERR0519`, and a
+computed one raises as an array's index does. `for n in v` walks it,
+`for n, i in v` with the position, `n in v` asks whether a slot is `==`
+to `n`, `v.len()` is its length, which its type holds, and `v[a..<b]`
+cuts a new `[]T` out of it.
+
+Its operators are Dado's, slot by slot, with Dado's rules for which apply:
+`+ - * /` over two fixed arrays of one type, or over one and a scalar of
+its element type, `v * 2.0`; `%` and the bit operators over an `int` one;
+unary `-`; and `==` and `!=`, true when every slot is equal. Two lengths or two
+element types do not meet, and `<` is refused on a shape. A slot of
+`[4]int` wraps as an `int` does, and a fixed array prints as Dado's does,
+`[1.0, 2.0]`. A fixed array crosses between Dado and a script as the
+same type, each way (see *Arrays and tuples cross the seam*): a Dado
+`[2]f32` or `Vec2` is a script's `[2]float`. A method Dado calls whose
+fixed array's length is a constant (`[STEPS]float`) is not reached yet
+(`ERR1201`), nor is a field holding one (`ERR1219`).
+
+### Types and unions
+
+A class may declare a `type`, spelled as Dado spells one: named slots,
+one per line — `type Vec2:` over `float x` and `float y` — or the shape
+after the colon, `type Pair: [2]float`, `type Hp: int`. A class and a
+type answer different questions. A class is held by reference:
+assigning, passing and returning one hand over the same instance, `==`
+asks whether two names hold the same instance, and it has no operators
+but its methods. A type is a value: assigning, passing and returning one
+copy it, `==` compares its slots, and its operators are Dado's for its
+shape — a type whose slots share one type is that fixed array, so `Vec2`
+is a `[2]float` with its `+` and its `* 2.0`, and a type of mixed slots
+is the tuple of them. A type has no identity and extends nothing. Whether
+a value is copied or shared is decided by the word that declares it,
+`class` or `type`, never by where the value is kept.
+
+A slot holds what a script holds: an `int`, a `float`, a `bool`, a
+`string`, a fixed array, a `[]T`, a map, an enum, a tuple or another
+type. A width, `ref` and a pointer are Dado's (`ERR1301`). A slot holding
+a `[]T` or a map holds that container by reference, so a copy of the
+type shares it, as a Dado type holding a `ref []T` does: after `u = t`,
+`u.items.append(3)` is seen through `t.items`, and `u.n = 5` is not seen
+through `t.n`.
+
+A type is built as Dado builds one, by the same code: from one value per
+slot, `Vec2(1.0, 2.0)` or with the slots named, `Vec2(y: 2.0, x: 1.0)`;
+by a tuple or array literal where the type is wanted, `Vec2 v = (1.0,
+2.0)` or `Vec2 w = [3.0, 4.0]`; or by the conversion of one value of its
+shape, `Vec2(q)`. A slot is read and written by its name, `v.x` and
+`v.x = 3.0`, and by its position where the type is a fixed array,
+`v[0]`; a store changes the value the name holds and no copy of it. A field or a local written without a value holds each
+slot's zero, and `Vec2.names()` lists the slot names.
+
+A `union` is Dado's too: `union Shape: (Circle, Rect, string)` is a value
+that is exactly one of its member types, which are distinct types. A
+value becomes one by the conversion `Shape(c)`, which picks the member by
+the value's type, and is read by Dado's narrowing `switch`: each arm
+names a member's type and may bind the value as that type, `case Circle
+k:`, and a `switch` naming every member needs no `else`. A field of a
+union written without a value holds its first member's zero.
+
+Types, unions, enums and traits are declared in a class or an inner
+class. Each is named by its bare name inside the class that declares it
+and that class's inner classes, through that class's name in the outer
+class — `Board.Cell` — and through its whole path in the package,
+`Game.Board.Cell`. A package that imports it writes the import's name
+first, `npc.Game.Vec2`; a written type is at most three names, so one an
+inner class declares is not reached from another package yet. A
+class's inner classes, types, unions, enums and traits share one set of
+names. A type, a union or an enum holds no declaration, so nesting ends
+there, and a class inside an inner class is still refused. A
+declaration of the package or the class answers a name DadoScript also
+has built in, `Location` or `Error`, in a written type and in a call
+alike.
+
+A type crosses between Dado and a script as the Dado shape it is, each
+way: `type Point:` over `float x` and `float y` is Dado's `(f64 x, f64
+y)`, which a Dado `Vec2` of two `f32` slots adapts to slot by slot, and a
+type of mixed slots crosses as a tuple does. A union of a script's
+crosses into a Dado call of its method as the member Dado's value
+crosses into, and an enum of a script's, which has no number, into none
+(`ERR1201`). A script's type is data: a
+method written on one, a trait taken on with `using` and binders are not
+built yet (`ERR0001`), since behaviour written in a script lives in
+classes.
+
 ### Traits
 
 A class takes a trait on with `using`, written on its first line after any
@@ -2235,6 +2533,39 @@ class writes for it is `async` too; a call through a trait value answers
 `async int`, awaited as any other. An `async` method answering `Self` is
 not built (`ERR1330`).
 
+### A class embeds a type
+
+A class may embed a `type` by naming it as a member, on a line of its
+own, as a `type` body embeds one: `Vec2` in a class body makes each named
+slot of `Vec2` a field of the class, so a method reads and writes them as
+it does any field, bare or through `self` (`self.x`), and from outside the
+class `ship.x` reaches one. The type may be one the class, or the class
+around it, declares, or a Dado declaration the script names, `Vec2` of
+its package or `entities.Vec2` of an import. The fields start at their
+slots' zeros.
+
+The type's name, as a member, is the embedded value whole: `Vec2`, or
+`self.Vec2` and `ship.Vec2`, reads a copy of the slots as one `Vec2`,
+and `Vec2 = v` writes each of them — a plain `=`, on its own line, as Dado
+stores an embedded member. A Dado type's `self` methods are promoted:
+`ship.length()` calls `Vec2.length` with a copy of the slots, as Dado
+calls a promoted method. A `^self` method writes through a pointer, and
+there is no `Vec2` object inside a class to point at, so calling one is
+refused at the call; write the change in a method of the class and store
+the member whole. A method a trait's default gives the type, which the
+type does not write, is not reached from a script yet (`ERR0001`).
+
+A class is never embedded: inherit one with `extends`, or hold it in a
+field. A collision is refused, never an override: a slot or a promoted
+method named like a field or a method of the class, one it inherits, or
+a slot of another type it embeds, is refused, naming both. Embedding
+takes on no trait: a class that embeds an implementer of `Drawable` is
+not one, and a class's `using` is answered by the methods it writes. A
+type whose slots are not all named is not embedded, since a field is
+reached by its name; hold it in a field instead. A host reaches a
+class's own fields through a handle, and an embedded type's slots not
+yet.
+
 ### Enums and `switch`
 
 An enum is written in a class, as a trait is — `enum Mood: (Calm, Angry)`
@@ -2245,13 +2576,18 @@ its own type, and a value of it is always one of its members, written
 member prints as its name. A field or local of an enum written without a
 value holds the first member.
 
-`switch` takes an enum, an `int` or a `string`. Each `case` names members
+`switch` takes an enum, an `int`, a `string` or a union — a union read
+by Dado's narrowing arms (see *Types and unions*). Each `case` names members
 or constants, `case Mood.Calm, Mood.Sleepy:` being one arm over both, and
 an arm ends where its body ends, so `break` is refused in one. Over an
-`int` or a `string` the `else` arm is required. Over an enum it is not,
-since every value is a member: a `switch` naming every member covers them
-all. A member no arm names is reported as a warning — an error under
-`--strict` — so a member added later shows every `switch` it reaches.
+`int` or a `string` the `else` arm is required. Over an enum the script
+declares it is not, since every value is a member: a `switch` naming
+every member covers them all. A Dado enum the script names is open, as
+Dado holds it — a value of one need not be a member — so a `switch`
+over one needs `else`, as Dado's does (see *Enums, `distinct` types and
+unions cross the seam*). A member no arm names is reported as a warning
+— an error under `--strict` — so a member added later shows every
+`switch` it reaches.
 
 ### A script's failures
 
@@ -2360,10 +2696,13 @@ A tuple holds a fixed number of values of fixed types: `(int, string)` is
 its type and `(3, "ann")` a value of it, so a method may answer two
 values at once. A tuple is a value, like Dado's: assigning one copies it.
 Its slots are read by destructuring it into locals,
-`int n, string name = pair()`, an underscore naming a slot not wanted, and a slot
-is never written in place — a new tuple replaces the whole. Two tuples do
-not compare with `==`: destructure them and compare the slots. A tuple
-prints as its slots in parentheses, `(3, ann)`.
+`int n, string name = pair()`, an underscore naming a slot not wanted, or
+by a written position, `t[1]`, which also stores one. A tuple of one type
+throughout is a fixed array, `(float, float)` being `[2]float`. Its
+operators are Dado's, slot by slot: `==` compares every slot, a `string`
+by its contents, and an operator applies when it applies to every slot's
+type — so a tuple holding an array or a map has no `==`. A tuple prints
+as its slots in parentheses, `(3, ann)`.
 
 ### `any`, the untyped value
 
@@ -2428,12 +2767,19 @@ arguments and the type of each: a script's `int` parameter takes any
 integer (a `u64` by its bits), its `float` an `f32` or `f64`, its `bool`
 a `bool`, and its `string` a copy of a `string8` or a `ref([]char8)`. A
 script's array, `[]int`, takes a Dado slice, a `ref([]T)` or an array
-whose elements cross, and a tuple takes a Dado tuple of as many slots.
+whose elements cross; its fixed array, `[2]float`, a Dado array or shape
+of as many slots, `[2]f32` or `Vec2`; and a tuple a Dado tuple of as many
+slots. A Dado enum, `distinct` type or union the method's signature names
+takes a value of it, by Dado's own rules, and a union the script declares
+takes a value of one of its members' types (see *Enums, `distinct` types
+and unions cross the seam*).
 One call from Dado carries at most 16 arguments, and a call passing more
 is refused (`ERR1221`). It answers what the method returns, as Dado holds it: an int as `i64`, a
 float as `f64`, a bool as `bool`, a string as a `ref([]char8)`, an array
 as a `ref([]T)` of those — each made on the ambient allocator, which the
-program ends with `#delete` — and a tuple as a Dado tuple of those.
+program ends with `#delete` — a fixed array as a Dado array of those,
+`[2]float` as `[2]f64`, a tuple as a Dado tuple of those, and a Dado
+enum or union as itself.
 
 What a script prints and what `fmt.println` writes go to the same
 standard output, in the order they ran, unless the VM is given sinks of
@@ -2764,34 +3110,51 @@ as it calls a method of its own class — a method of the class wins over a
 Dado function of the same name — and a function of a Dado package it
 imports through the import's name, as a Dado file does. It sees what a Dado
 file of its package sees. The function takes and answers scalars — a
-sized integer, `f32` or `f64`, `bool`, `char8`, `char16`, `char32` or
-`string8` — and slices, arrays and tuples of them, and it may answer a new
-string or array as `ref([]char8)` or `ref([]T)`. It may take or answer a
-handle of a script class, `npc.Goblin`, which the script passes and
-receives as its own instance. It may be failable.
+sized integer, `f32` or `f64`, `bool`, `char8`, `char16`, `char32`, a
+string of any width or a `cstring` — and slices, arrays, tuples and maps
+of them, and it may answer a new string or array as `ref([]char8)` or
+`ref([]T)`, or a Dado function as a value. A Dado array, and a shape
+whose slots share one type, is the script's fixed array, `[2]f32` its
+`[2]float` (see *Arrays and tuples cross the seam*); a matrix and a
+`#soa` array are the arrays they are, and a map is the script's map (see
+*Maps, strings of every width, matrices and functions cross the seam*).
+A Dado enum, `distinct` type or union is the script's own, by the type
+the signature names (see *Enums, `distinct` types and unions cross the
+seam*). It may take or answer a handle of a script class, `npc.Goblin`,
+which the script passes and receives as its own instance. It may be
+failable.
 
-The script passes its own values and the compiler converts them. An
-int passed to a narrower integer wraps, as Dado's written conversion and
-a literal that does not fit do, so 300 passed to a `u8` arrives as 44;
+The script passes its own values and the compiler converts them. A
+script's `int` is Dado's, so it adapts to the width it meets as a Dado
+`int` does: an int passed to a narrower integer wraps, as Dado's written
+conversion and a literal that does not fit do, so 300 passed to a `u8`
+arrives as 44;
 an int passed to an `i64` is exact and one passed to a `u64` goes by its
 bits. A float passed to an
-`f32` rounds, and an int passed to an `f32` or `f64` becomes the nearest
-one. A float is never made an integer by itself: passing one to an
-integer parameter is refused, naming `int(x)`. A string crosses as a copy,
+`f32` rounds. A number never changes kind by itself, in either
+direction: a float passed to an integer parameter is refused, naming
+`int(x)`, and an int passed to an `f32` or `f64` — or as an element of
+an array or a slice of them — is refused, naming `float(x)`. A literal
+adapts to the float it meets, as in Dado, so `half(2)` is a call. A string crosses as a copy,
 read as UTF-8, and a `char32` takes a string of exactly one code point.
 A `char8` is a byte, which a script holds as an int: it wraps into one as
 a `u8` does. A `char16` takes a string of exactly one UTF-16 code unit —
 JavaScript's own character — and any other string raises when the call
 is made. What comes back is the script's own type: every integer and a
 `char8` an int, `f32` and `f64` a float, a `char32`, a `char16` or a Dado
-string a string.
+string of any width a string.
 
 Narrowing is never an error. Under `--strict` it is a warning
 (`WRN1207`) wherever the argument is not a constant the parameter holds
-exactly. A parameter or a result that cannot cross — a pointer, alone
+exactly. At run time a dev build checks each value the script computes
+where it calls, and the first that changes as it crosses at each place
+is reported on the engine's error sink, as Dado's own narrowing is (see
+*`int` and `float` adapt to the width they meet*). A parameter or a result that cannot cross — a pointer, alone
 or as an element, a `ref` other than a new string or array answered, a
-map, a `distinct` type — makes the function one a script cannot call
-(`ERR1206`), and the refusal names the part and what to write instead.
+map keyed by what a script's map cannot hold, an enum backed by no
+integer, a union two of whose members a script holds as one type —
+makes the function one a script cannot call (`ERR1206`), and the refusal
+names the part and what to write instead.
 
 A failable function's failure is thrown into the script as an error whose
 message names the function and the code. Nothing in the script has to
@@ -2832,19 +3195,20 @@ as a `float` (an `f32` as the nearest `f32`), a `bool` as itself, a
 `char16`, a `char32` or a string of any width as a `string` (a
 `cstring` up to its first NUL, as C reads it), and a fixed array or a
 tuple of those as the script's own — a new one at each read, so a script
-changing the array it read changes no other read. One written without a
+changing the array it read changes no other read. An enum's constant is
+the script's enum member it is, or the number no member names, and a
+`distinct` type's is its value under the tag. One written without a
 type is its literal, as in Dado, and adapts to where it is read:
 `float f = MAX`. A constant of a declared shape reads its slots by name,
 `lib.ORIGIN.x`, and a method of the script's array or string is called
 on one, `SIZES.len()`. A constant has no storage, so a script assigning
 one, or a position or slot of one, is refused (`ERR0606`).
 
-A constant whose type does not cross — a `distinct` type, a slice
-(`const []i32`, alone or inside a tuple: write its length, `const
-[2]i32`), and for now an enum, which will cross as a script's enum and
-never as its number — one whose value C supplies (a `foreign` constant,
-whose value the compiler never learns), and one holding a function or a
-type are refused where the script reads them (`ERR1208`), naming why.
+A constant whose type does not cross — a slice (`const []i32`, alone or
+inside a tuple: write its length, `const [2]i32`), an enum backed by no
+integer — one whose value C supplies (a `foreign` constant, whose value
+the compiler never learns), and one holding a function or a type are
+refused where the script reads them (`ERR1208`), naming why.
 
 ### A script binds a handler to a channel
 
@@ -2917,27 +3281,41 @@ Only there: an `any` holds no function and is given no place, and a
 comparison converts nothing.
 
 A script passes a function to a Dado function that takes one, which Dado
-calls back (below, *A script calls Dado*); Dado hands a script no function
-of its own, and a script's method that takes or answers one is not
-called from Dado.
+calls back (below, *A script calls Dado*), and Dado hands a script its
+own functions as values (below, *Maps, strings of every width, matrices
+and functions cross the seam*). A script's method answering a function
+is not called from Dado.
 
 ### Arrays and tuples cross the seam
 
 A script's `[]T` is a JavaScript array, and so is its tuple. Both cross
-the seam **as a copy, for the call**, element by element, and an element
+the seam **as a copy, for the call**, element by element — a slice's
+copy lent, its writes copied back (below) — and an element
 crosses as it would alone: into a script's `[]int` a Dado program passes a
 slice, a `ref([]T)` or an array of integers, and a Dado function a script
 calls with a `[]int` may take it as a `[]i32`, each element wrapping as a
-lone `int` would. An array, `[4]f32`, is a tuple whose slots share a type,
-and so is a declared shape like `type Vec2: (f32 x, f32 y)`: each crosses
-as a script's array, and a script's array passed into one must hold
-exactly as many elements — any other length raises when the call is made,
-naming the function, the parameter and both lengths. A tuple whose slots
-differ crosses as a script's tuple of as many slots. A map does not cross.
+lone `int` would. A **fixed array crosses as the same type**: a Dado
+array, `[4]f32`, and a declared shape whose slots share one type, like
+`type Vec2: (f32 x, f32 y)`, which is `[2]f32`, are the script's fixed
+array of as many slots, `[4]float` and `[2]float`, each slot crossing as
+a lone value does — so a `Vec2` keeps its `+` in a script. So is a
+`foreign` restatement of a C struct whose fields share one type, such
+as `raylib.Vector2`, which is one type with its `[2]f32`. A script's
+`[2]float` passed to a Dado `[2]f32` adapts slot by slot, each slot
+rounding as a lone `float` passed to an `f32` does, and an `int` slot
+passed to an `i32` wrapping as a lone `int` does; a fixed array of
+another length is refused (`ERR1201`). A script's `[]float` passed into
+one must hold exactly as many elements — any other length raises when the
+call is made, naming the function, the parameter and both lengths. Dado
+passes its arrays and same-typed shapes to a script method taking a
+`[2]float`, and the method's `[2]float` answer arrives as a `[2]f64`. A
+tuple whose slots differ crosses as a script's tuple of as many slots. A
+map, a matrix and a `#soa` array cross too (see *Maps, strings of every
+width, matrices and functions cross the seam*).
 
 The glue reads a script's array by each element's tag and never converts
 one kind into another: an element of the wrong kind raises, naming the
-function, the parameter and where the element is (`at [2][0]`). An array
+function, the parameter and where the element is (`at [2][0]`). A `[]T`
 answered to Dado is a create verb's: a `ref([]T)` on the ambient allocator,
 its strings `ref([]char8)`, each Dado's to end with `#delete`.
 
@@ -2949,15 +3327,150 @@ that holds no script `script.STALE`; its `out:` and `err:` are its own,
 `#script_error()` reads its failure's text, and without `try` it follows
 the script's `on_error:` policy.
 
-**A structure lent across is locked for its call.** While a Dado function
-holds a script's array, code it calls back into the script must not write
-that array; and while a script runs with a Dado slice, a Dado function the
-script calls must not write the slice. A write raises: in the script, an
-error naming the function and the parameter; in Dado, the run fails with
-the reserved code `script.LENT`. To write freely, pass a copy. What a Dado
-function does to its own copy of a script's array is not a write of the
-script's. Nothing is checked unless the call reached back across the
-seam, so a call that does not pays nothing for the lock.
+**What is lent is one storage.** A slice crossing either way is lent for
+the call: the borrower works on a copy, and what it writes reaches the
+lender's storage each time control comes back to the lender — when the
+call returns, whether it succeeded or failed, and before any call back
+into the lender. A Dado slice a script's method writes, `xs[1] = 20`,
+holds 20 when the method returns, and a Dado function the method calls
+meanwhile reads the script's writes so far; a script's array a Dado
+function writes holds Dado's writes when the function returns, and a
+script's method the function calls meanwhile sees them. A slice inside
+an array, a tuple or another slice is lent the same way, its elements
+written in place. A lent array keeps its length, as a Dado `[]T`
+parameter does: a script that grows or shrinks one fails the run with
+`script.TYPE`, naming the argument, and nothing of it comes back — grow
+a copy. New text comes back where the lender owns it: a `ref([]char8)`
+element takes the script's new string on its own allocator, but a
+`string8` is a view and takes none, and a script writing one fails the
+run with `script.TYPE`. One storage passed for two parameters is one
+array on the other side: `held.f(xs, xs)` hands the script one array,
+and a script's `f(a, a)` hands Dado one slice, when both parameters are
+of one type. An array, a shape and a tuple are values: each side has its
+own, and only the slices inside one are lent. What the borrower keeps
+past the call is its own copy, which the lender's later writes do not
+reach and whose later writes do not reach the lender.
+
+**A structure lent across is locked for its call.** While it is lent,
+its lender does not write it: a Dado function the script calls back into
+must not write a slice the run lent the script, and a script's method
+Dado calls back into must not write an array the script lent Dado. A
+write raises: in Dado, the run fails with the reserved code
+`script.LENT`; in the script, an error naming the function and the
+parameter. Nothing more is copied back once it has. Nothing is checked
+until the call reaches back across the seam, so a call that does not
+pays only for the copy back when it returns.
+
+### Enums, `distinct` types and unions cross the seam
+
+A Dado enum, `distinct` type or union crosses as the script's own, by the
+type the Dado signature names — a parameter written `i32` takes an `int`,
+and one written `Dir` a `Dir`, whatever the value — and the script names
+the declaration as it names a Dado function: `Dir` of its package,
+`compass.Dir` through an import.
+
+**A Dado enum is a script's enum, open.** Its members are written
+`Dir.north`, and a value crosses as the name of the member it is, as a
+script's own enum member is the string of its name — or, when no member
+names it, as its number, so every value of the enum crosses and comes
+back as itself. A value two members name crosses as the one declared
+first. `Dir(5)` makes one of a number and `int(d)` reads one's number;
+two compare with `==`, one keys a map, and one prints as its member's name
+or its number. It is open, as Dado holds it, so a script's `switch` over
+one needs `else`, as Dado's does. Passing an `int` where the signature
+names the enum is refused (`ERR1201`), naming `Dir(n)`. An enum backed
+by no integer, and a `foreign` one, whose values are C's, do not cross. A
+script's own enum is closed — its members are names with no number behind
+them, so it has no `int(x)` — and it crosses into no Dado parameter.
+
+**A `distinct` type is nominal in the script and erased when it runs.**
+`distinct type Meters: f32` is the script's `Meters`, over the type its
+shape crosses as, and Dado's rules for it hold there: `Meters(1.5)` makes
+one, `float(m)` and `int(m)` read it, `Meters` meets `Meters` under an
+operator and never a plain `float`, and a `float` passed where a `Meters`
+is taken is refused, naming `Meters(x)`. Running, it is the number it is
+over, and it crosses as that crosses, with nothing added.
+
+**A Dado union is a script's union**, the pair `[member, payload]`, its
+members the types Dado's cross as, in Dado's order: `union Value: (i32,
+f64, string8)` is the script's union of `int`, `float` and `string`, read
+with Dado's narrowing `switch` — `case int n:` — and made with
+`Value(x)`, which picks the member by the value's type. A union two of
+whose members a script holds as one type, which no `case` could tell
+apart, does not cross (`ERR1206`).
+
+Dado passes them to a script's method that names them and takes them
+back: an enum or a union answered arrives as Dado's own, and a
+`distinct` type's answer as the type its shape answers as, `f64` for
+`Meters`. A script's own union takes the Dado value of one of its
+members' types, `held.size(3)` for a `Shape` of `(int, string)`; Dado
+has no type of it to hold an answer in, so a method answering one is not
+called from Dado (`ERR1201`). A constant of an enum or a `distinct` type
+reads as its value does, and an enum inside an array crosses as one does
+alone. A field of an enum or a union is not reached through a handle yet.
+
+### Maps, strings of every width, matrices and functions cross the seam
+
+**A Dado map is a script's map**, a JavaScript `Map`, copied entry by
+entry, each key and each value crossing as it would alone — a
+`{string8: i64}` is a script's `{string: int}`, and a value may be an
+array or another map. A map crosses keyed by an integer, a `bool`, a
+string or, where a Dado function's signature names one, a Dado enum: a
+float keys no Dado map, so a script's map keyed by one has none to arrive
+as. Dado's map is copied into a new script map — and when the script
+wrote it, Dado's map is cleared and rebuilt with the script's entries as
+the call returns (or calls back into Dado), on its own allocator; one a
+Dado function answers is ended once it is copied, as a `ref([]T)`
+answered is, and a new array answered holds no map — and a script's map
+is read into a new Dado map: the one a Dado function takes
+is Dado's for the call, and the one a script's method answers is Dado's
+own on the ambient allocator, its string keys the map's copies, ended
+with `#delete`, its `ref([]char8)` values each ended by themselves. A
+value of the wrong kind raises where it crosses, naming the entry by its
+place in the map's order and its key or value: `at [1][1]`. Dado promises
+no order: the script's map has its own. The rebuilt map keeps its table
+while the script's entries fit in it; when they do not, it moves to a new
+one, and the variable passed is given it — another copy of the map's
+handle keeps the table it had, as a `ref` grown through one copy leaves
+another holding the old block, so pass a map a script may grow as the
+variable that owns it. A map inside a tuple or an array passed by value
+is rebuilt only in its own table, and a map whose values are views or
+own storage — a `string8`, a slice, a map, a `ref` — is not rebuilt: a
+script's writes that cannot be taken fail the run with `script.TYPE`. A
+Dado map lent to a script is locked for the run, as an array is: a Dado
+function the script calls that writes it fails the run with
+`script.LENT`.
+
+**A `string16`, a `string32` and a `cstring` are a script's `string`**,
+transcoded each way, as parameters, answers and elements. A `string16`
+is UTF-16, JavaScript's own, so its units cross as they are, an unpaired
+surrogate included. A `string32` is read through the UTF-8 a `string8`
+is read as, so it keeps an unpaired surrogate as a `string8` keeps it,
+and a code point past U+10FFFF is written as U+FFFD. A `cstring` is
+UTF-8 up to its NUL, so a script's string holding a NUL character raises
+where it crosses into one. A script's method answers Dado its `string`
+as Dado's own new `ref([]char8)`, whatever width Dado gave it; a field
+and a script's package function take a `string8` only.
+
+**A matrix and a `#soa` array are the arrays they are.** A matrix
+`[R,C]T` is the shape it tags, `[C][R]T` — its columns, each of its rows,
+as Dado writes one column by column — so a script holds a `[2,3]f32` as a
+`[3][2]float`, and a script's answer arrives as the plain array, which a
+matrix takes as it takes its shape. A `#soa` array is the array of its
+elements it lays out, `[N]P`, each element gathered out of the lanes or
+scattered into them; one whose element holds a container does not cross.
+
+**A Dado function is a script's function value.** A Dado function a
+script calls may answer one, and Dado may pass one to a script's method
+taking a function: `i64(i64, i64)` is the script's `int(int, int)`. Each
+call of it crosses as a script's call of that Dado function does — every
+argument read by its tag, the answer in the script's type, a failure
+thrown with its code. It crosses when each parameter and its answer cross
+as values, none a function. A value holds one of the functions the
+program names as a value; a nil one raises where it crosses. A script's
+function reaches Dado through a parameter that takes one, and is kept
+past the call only through a `(proc, rawptr data)` pair; a script's
+method answering a function is not called from Dado (`ERR1201`).
 
 ### A script names Dado's declarations
 
@@ -2965,21 +3478,21 @@ A script may write a Dado declaration of its package as a type, by its
 bare name, and one of a package it imports through the import's name:
 `entities.Vec2 p = entities.pos()`. The declaration is a view over the
 type it crosses the seam as — a shape whose slots share a type, like
-`type Vec2: (f32 x, f32 y)`, is the script's `[]float`, and a shape of
-mixed slots its tuple — so the two are interchangeable: `[]float q = p`
-checks, and so does passing the value where a `[]float` is taken. What the
-name adds is the slots' names: `p.x` reads slot 0 and `p.y` slot 1,
-exactly as `p[0]` and `p[1]` read them, so an array shorter than the
-declaration raises there as an index does. `entities.Vec2(1.0, 2.0)`
-makes one, an array or a tuple of its arguments, one per slot in order.
-A slot of an array is written as its element is, `p.x = 3.0`; a tuple
-is never written in place, so a slot of a shape held as a tuple is
-refused (`ERR1208`) and the refusal names the construction that
-replaces it. The names travel with what was written: a local, a
-parameter or a field declared with the declaration's name, a Dado
-function answering one, a construction, and a slot whose own type is a
-declaration (`r.pos.x`). A declaration whose type does not cross is not
-named (`ERR1208`).
+`type Vec2: (f32 x, f32 y)`, is the script's fixed array `[2]float`,
+with its operators, and a shape of mixed slots its tuple — so the two
+are interchangeable: `[2]float q = p` checks, as does passing the value
+where a `[2]float` is taken, and `p + q` is a `[2]float`. What the
+name adds is the slots' names, as Dado's do: `p.x` reads slot 0 and `p.y`
+slot 1, exactly as `p[0]` and `p[1]` read them. `entities.Vec2(1.0,
+2.0)` makes one, a fixed array or a tuple of its arguments, one per slot
+in order or by the slots' names, as Dado's `Vec2(1, 2)` does. A slot
+is written as `p[0]` is, `p.x = 3.0`, whether the shape is held as a
+fixed array or, of mixed slots, as a tuple. The names travel with what
+was written: a local, a parameter or a field declared with the
+declaration's name, a Dado function answering one, a construction, a
+slot whose own type is a declaration (`r.pos.x`), and an operator over
+one, `(p + q).x`, as in Dado. A declaration whose type does not cross
+is not named (`ERR1208`).
 
 ### DadoScript as a JavaScript library: `export`
 

@@ -883,6 +883,11 @@ export const DADOS_HOST = {
     }),
     "dados.bigint": entry("(i32,i64,i32)->()", (s) => (c, v, out) => s.write(out, BigInt.asIntN(64, v))),
     "dados.array": entry("(i32,i32)->()", (s) => (c, out) => s.write(out, [])),
+    "dados.map_new": entry("(i32,i32)->()", (s) => (c, out) => s.write(out, new Map())),
+    "dados.map_entries": entry("(i32,i32,i32)->()", (s) => (c, vp, out) => {
+        const m = s.read(vp);
+        s.answer(c, out, () => Array.from(m));
+    }),
     "dados.to_bigint": entry("(i32,i32,i32)->(i32)", (s) => (c, vp, where) => {
         const v = s.read(vp);
         let r;

@@ -29,6 +29,7 @@ with the diagnostic you will see:
 | `fn add(a: i32) -> i32 {` or `func`, `def` | `i32 add(i32 a):` and an indented body | ERR0201 `expected ':'` |
 | `let x = 1`, `var x`, `x := 1` | `i32 x = 1` (`auto x = f()` takes a call's type) | ERR0401 / ERR0201 |
 | `struct P { x: i32 }` | `type P:` with one `i32 x` per indented line | ERR0201 |
+| `P{3, 4}`, `P(x = 3, y = 4)` | `P(3, 4)` or `P(x: 3, y: 4)`: one value per slot (or `(3, 4)` where a `P` is wanted) | ERR0201, ERR0604 |
 | `len(xs)`, `append(xs, v)`, `make(...)` | `#len(xs)`, `#append(xs, v)`, `#make([]T, n)` | ERR0805 / ERR0405 |
 | `println("hi")` with no import | `import "core:fmt"` then `fmt.println("hi")` | ERR0405 |
 | `fmt.println("n=%d", n)` | `fmt.println("n=", n)`: arguments are printed in order, there are no format verbs | (it prints `n=%d3`) |
@@ -40,7 +41,7 @@ with the diagnostic you will see:
 | `for i in 0..n:` | `0..<n` (up to n) or `0..=n` (through n); a bare `..` spreads an argument list | ERR0607, ERR0408 |
 | `null`, `NULL`, `None` | `nil` | ERR0408 |
 | `a + b` on strings | `strings.concat(a, b)` or `#format(a, b)` | ERR0607 |
-| `i64 n = x` where `x` is `i32`, `x * 1.5` | widening is implicit; narrowing and mixing are `i32(n)`, `f64(x) * 1.5` | ERR0504 |
+| `i64 n = x` where `x` is `i32`, `x * 1.5` | widening is implicit; narrowing between written widths, and mixing integers with floats, are `i32(n)`, `f64(x) * 1.5` | ERR0504 |
 | `f(a = 2)` | `f(a: 2)` for a named argument | ERR0604 |
 | `[]` for an empty slice | `[]f64 xs` with no value is empty; `[1, 2]` is a fixed `[2]` | ERR0504 |
 | `map[string]int`, `HashMap` | maps are built in: `{string8: i32} m = {}`, `m[k] = v`, `m[k] += 1`, `k in m`, `for k, v in m:` | ERR0201, ERR0401 |
@@ -55,8 +56,12 @@ with the diagnostic you will see:
 | `*p`, `p->x` | `p^`, `p^.x`; `&x` takes an address; `^T` is a pointer type | ERR0201 |
 | an unused variable | delete it, or bind `_` | LNT0412 (an error under `--strict`) |
 
-Integer and float widths are always written: `i8`…`i64`, `u8`…`u64`, `f32`, `f64`, `bool`,
-`char8`, `string8` (UTF-8 bytes; `s[i]` is a `char8`, `s[a..<b]` a view), `rawptr`, `cstring`.
+The numbers are `i8`…`i64`, `u8`…`u64`, `f32` and `f64`, plus `int` and `float`: `int` is `i64`
+and `float` is `f64`, but a value typed `int` or `float` adapts to whatever width of its own kind
+it meets (`i32 n = count` narrows an `int count`, wrapping as `i32(count)` does, and a dev build
+warns once at that place when the value changes; `i32 + int` is `i32` arithmetic). An integer never becomes a float by itself: write `float(n)`. Systems code
+usually writes the width. The rest: `bool`, `char8`, `string8` (UTF-8 bytes; `s[i]` is a
+`char8`, `s[a..<b]` a view), `rawptr`, `cstring`.
 
 ## A complete program
 

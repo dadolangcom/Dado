@@ -86,6 +86,10 @@ export const LOADER_STATUS = 2;
 /** The runtime's console flush, which the module exports when it writes. */
 export const FLUSH_EXPORT = "dado_flush";
 
+/** The report of the run-time narrowing warning's counts, which a dev build
+ * exports when the program narrows an `int` or a `float` at run time. */
+export const NARROWINGS_EXPORT = "dado_narrowings";
+
 /** A failure of the loader itself, reported before the module runs. */
 export class LoaderError extends Error {}
 
@@ -137,7 +141,28 @@ const HOST = {
         signature: "()->(i32)",
         make: () => () => hostCores,
     },
+    // A dev build's run-time narrowing warning: one line, which the page's
+    // console shows as a warning (node writes it to standard error).
+    "dado.warn": {
+        signature: "(i32,i32)->()",
+        make: (ctx) => (ptr, len) => {
+            console.warn(new TextDecoder().decode(new Uint8Array(ctx.memory().buffer, ptr >>> 0, len >>> 0).slice()));
+        },
+    },
 };
+
+/** **The counts of the run-time narrowing warning**, as the program ends: each
+ * place the program's Dado narrowed with a loss more than once, and each one
+ * its scripts did (dev builds both). */
+function reportNarrowings(instance) {
+    if (typeof instance.exports[NARROWINGS_EXPORT] === "function") {
+        instance.exports[NARROWINGS_EXPORT]();
+    }
+    const scripts = globalThis.__dados_narrowing_reports;
+    if (Array.isArray(scripts)) {
+        for (const report of scripts) report();
+    }
+}
 
 // ── the host services (`rt/web/host.c`) ────────────────────────────────────
 
@@ -786,6 +811,7 @@ export async function run(bytes, options = {}) {
     // after any other trap (an access out of bounds), which an instance that
     // trapped still answers. Absent when the program writes nothing.
     const flush = () => {
+        reportNarrowings(instance);
         if (typeof instance.exports[FLUSH_EXPORT] === "function") {
             instance.exports[FLUSH_EXPORT]();
         }
