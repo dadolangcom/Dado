@@ -1,0 +1,812 @@
+// `dado package`: release a library and, the first time, list it in the
+// package index.
+//
+// Git is the package system. A release is a commit and a tag; the index,
+// `github.com/dadolangcom/DadoPKG`, is a list of names and repositories in its
+// README, which `dado get` reads to find a library by name. So for an author:
+//
+//     dado package          (in the library's repository)
+//     Version: patch (1.4.3), minor (1.5.0), major (2.0.0), or type one [patch]: minor
+//     ...
+//     Open a pull request adding Clipper2 to the Dado package index? [y/N] y
+//
+// In order, refusing with the reason at the first that fails, and writing
+// nothing before step 7:
+//
+//   0. the command line: `--category` and `--version` well formed, and a
+//      terminal to ask the version on when there is no `--version`;
+//   1. the library is a git repository, on a branch, with an `origin`, and
+//      its tree has no changes but `dado.json`'s and, when the committed
+//      README has T62's markers, the README's inside them (a release tags a
+//      commit, and holds both); nothing of the README staged;
+//   2. `dado.json` is read, and what it lacks is asked for, with defaults
+//      from the repository (the name of its folder, the README's
+//      `## Summary`, `origin`'s URL, a LICENSE file), every field held to
+//      `dado.json`'s rules;
+//   3. no `.dado` or `.dados` file imports through `lib:` or `imports:` (R24:
+//      a library bundles what it needs);
+//   4. the index (refreshed when stale) does not list the name for another
+//      repository; unless `--no-pr`, whether the library could be listed is
+//      found out here too, and only warned about;
+//   5. `dado test` passes here (`--no-test` skips it);
+//   6. the version: typed, or bumped from the newest of `dado.json`'s and the
+//      tags here and on `origin` (semver only);
+//   7. `dado.json` is written; so is the README, between its markers only
+//      (when it has them: the tests marker gets this run's result, or `not
+//      run` under `--no-test`, and the install marker `dado get <Name>`),
+//      read only now, so a save during the tests is not lost; both are
+//      committed in one commit, tagged `v<version>`;
+//   8. pushed, after asking;
+//   9. when the index does not list it yet, and the tag is visible at its
+//      public repository, a pull request adding its line is offered: with
+//      `gh` when it is logged in, otherwise GitHub's editor is opened with
+//      the line to paste.
+//
+// Nothing is uploaded anywhere but the author's own `origin`, and Dado holds
+// no tokens: `gh` does.
+package driver
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "core:time"
+
+// The package index: a repository whose README lists every library.
+const string8 INDEX_REPO = "https://github.com/dadolangcom/DadoPKG"
+
+// How old the local copy of the index may be before it is fetched again.
+private const i64 INDEX_MAX_AGE_S = 86400
+
+// What `dado package` was asked.
+type PackageAsk:
+    string8 dir         // the library's directory; "" is the working one
+    string8 version     // `--version`: a version, or patch / minor / major
+    string8 category    // `--category`: the index heading, for a first listing
+    bool yes            // `--yes`: push and open the request without asking
+    bool no_pr          // `--no-pr`
+    bool no_test        // `--no-test`
+    bool refresh        // `--refresh`: fetch the index even when fresh
+    string8 cc          // `--cc`: the C compiler for the tests, as `dado test` takes it
+
+private bool interactive():
+    return os.is_terminal(0) && os.is_terminal(2)
+
+// Ask `question` on standard error and answer the line typed, trimmed, or
+// `fallback` for an empty one or off a terminal.
+private string8 prompt(string8 question, string8 fallback):
+    if !interactive(): return fallback
+    _ = io.flush(io.stdout())
+    if #len(fallback) > 0:
+        fmt.eprint(question, " [", fallback, "]: ")
+    else:
+        fmt.eprint(question, ": ")
+    _ = io.flush(io.stderr())
+    [1024]char8 buf
+    try i64 n = io.read_line_into(io.stdin(), buf[:]) else:
+        return fallback
+    string8 a = strings.trim(string8(buf[0..<n]))
+    if #len(a) == 0: return fallback
+    return txt(strings.clone(a))
+
+// `git -C <dir> words…`: its output trimmed, and whether it exited 0.
+(string8 out, bool ok) git_at(string8 dir, []string8 words, bool loud = false):
+    Captured r = capture(git_in(dir, words), !loud)
+    string8 s = r.out
+    return (strings.trim(s), r.started && r.status == 0)
+
+// Run `c` with its output and its errors thrown away (a probe, or a step
+// whose failure is reported in this driver's own words); true when it exited 0.
+bool silently(Command c):
+    Captured r = capture(c, true)
+    return r.started && r.status == 0
+
+// `dado package`.
+i32 package_verb(PackageAsk a):
+    try ref []char8 cwd_own = fs.current_dir() else why:
+        die(txt(#format("cannot read the working directory: ", os.message(why))))
+        return 1
+    string8 cwd = txt(cwd_own)
+    string8 here = cwd if #len(a.dir) == 0 else absolute(a.dir, cwd)
+    if !is_dir(here):
+        die(txt(#format(here, " is not a directory")))
+    // What the command line alone can refuse is refused before any work: a
+    // bad `--category`, a `--version` that is no version, and no terminal to
+    // ask the version on.
+    if #len(a.category) > 0:
+        string8 bad = category_refusal(a.category)
+        if #len(bad) > 0: die(txt(#format("--category: ", bad)))
+    if #len(a.version) > 0:
+        string8 low = txt(strings.to_lower(strings.trim(a.version)))
+        (SemVer _, bool typed) = parse_semver(strings.trim(a.version))
+        if !typed && low != "patch" && low != "minor" && low != "major":
+            die(txt(#format("--version: `", a.version, "` is not a version (like 1.4.2) or one of patch, minor, major")))
+    else if !interactive():
+        die("there is no terminal to ask the version on: pass --version=<x.y.z|patch|minor|major>")
+
+    // 1. A git repository, on a branch, hosted, with nothing uncommitted.
+    (string8 top, bool in_git) = git_at(here, ["rev-parse", "--show-toplevel"])
+    if !in_git:
+        die(txt(#format(here, " is not in a git repository. A library is one:\n  git init && git add -A && git commit -m \"First commit\"\n  then push it somewhere public (GitHub, GitLab, Codeberg…) and run dado package again")))
+    string8 root = library_root(here, top)
+    (string8 _, bool on_branch) = git_at(root, ["symbolic-ref", "-q", "HEAD"])
+    if !on_branch:
+        die("HEAD is detached, so a release commit would belong to no branch and the push would have nothing to update. Switch to the branch to release from (git switch <branch>) and run dado package again")
+    // The URL as configured: `remote get-url` applies `url.*.insteadOf`, which
+    // can turn the public address into this machine's own way of reaching it.
+    (string8 origin, bool has_origin) = git_at(root, ["config", "--get", "remote.origin.url"])
+    if !has_origin || #len(origin) == 0:
+        die("this repository has no `origin` remote, so there is nowhere for users to fetch it from.\n  Create an empty public repository on your host, then:\n  git remote add origin <its URL> && git push -u origin HEAD")
+    // `dado.json` may be changed: the release commits it. Porcelain paths are
+    // from the work tree's top, which `root` may be below.
+    (string8 status, bool _) = git_at(root, ["status", "--porcelain", "--", "."])
+    (string8 prefix, bool _) = git_at(root, ["rev-parse", "--show-prefix"])
+    string8 manifest_rel = txt(#format(prefix, MANIFEST_FILE))
+    // The README is rewritten between its markers (T62) and committed with
+    // the release, when its committed text has them. It may differ from that
+    // text only inside the marker blocks (a release's own rewrite, left by a
+    // release that stopped); any other change to it is the author's to
+    // commit, and blocks the release like any other. A staged change is
+    // refused too: undoing a failed release resets the README's index entry
+    // to HEAD's, which would otherwise unstage it.
+    string8 readme_name = txt(#format("README", MD))
+    string8 readme_path = join2(root, readme_name)
+    string8 readme_rel = txt(#format(prefix, readme_name))
+    Captured head_read = capture(git_in(root, ["show", txt(#format("HEAD:./", readme_name))]), true)
+    string8 readme_head = head_read.out
+    (string8 _, bool readme_marked) = rewrite_markers(readme_head, "", "")
+    readme_marked = readme_marked && head_read.started && head_read.status == 0 && is_file(readme_path)
+    if readme_marked && !succeeds(git_in(root, ["diff", "--cached", "--quiet", "--", readme_name])):
+        die(txt(#format(readme_name, " has staged changes; a release commits it, so commit them first (or unstage them: git restore --staged ", readme_name, ")")))
+    ref []string8 dirty = #make([]string8, 0)
+    for l in lines_of(status):
+        // `lines_of` trims, so the status letters end at the first space.
+        (string8 _, string8 path, bool _) = strings.split_first(l, " ")
+        if strings.trim(path) == manifest_rel: continue
+        if readme_marked && strings.trim(path) == readme_rel && readme_only_markers_changed(readme_head, read_or_empty(readme_path)): continue
+        _ = #append(dirty, l)
+    if #len(dirty) > 0:
+        strings.Builder b = strings.builder(256)
+        for i in 0..<#len(dirty):
+            if i == 8:
+                _ = strings.append(&b, txt(#format("\n  … and ", #len(dirty) - 8, " more")))
+                break
+            _ = strings.append(&b, "\n  ")
+            _ = strings.append(&b, dirty[i])
+        die(txt(#format("the repository has changes that are not committed; a release tags a commit, so commit or stash them first:", strings.text(b))))
+
+    // 2. The manifest, and what it lacks.
+    string8 manifest_path = join2(root, MANIFEST_FILE)
+    Library lib
+    lib.targets = #make([]string8, 0)
+    bool first_manifest = !is_file(manifest_path)
+    string8 manifest_before = ""
+    if !first_manifest:
+        try ref []char8 t = fs.read_file(manifest_path) else code:
+            die(txt(#format("cannot read ", manifest_path, ": ", os.message(code))))
+            return 1
+        manifest_before = txt(t)
+        (Library l, bool good, string8 why) = parse_library(manifest_before)
+        if !good:
+            die(txt(#format(manifest_path, " ", why)))
+        lib = l
+    if first_manifest:
+        say(txt(#format("No ", MANIFEST_FILE, " yet: a few questions, asked once (Enter takes the default in brackets).")))
+    if #len(lib.name) == 0:
+        lib.name = ask_name(base_name(strings.trim_suffix(strings.trim_suffix(root, "/"), "\\")))
+    else:
+        string8 why = library_name_refusal(lib.name)
+        if #len(why) > 0:
+            die(txt(#format(manifest_path, ": `name` ", why)))
+    if #len(lib.description) == 0:
+        string8 summary = readme_summary(read_or_empty(readme_path))
+        lib.description = prompt("Description, one sentence for the index", summary)
+        if #len(lib.description) == 0:
+            die(txt(#format("a library needs a description, the sentence its index line shows: write \"description\" in ", MANIFEST_FILE, ", or a `## Summary` in the README, or run dado package on a terminal")))
+    if #len(lib.licence) == 0:
+        lib.licence = prompt("Licence (an SPDX identifier, e.g. MIT, Apache-2.0)", guess_licence(root))
+        if #len(lib.licence) == 0:
+            warn("no licence given: users cannot tell whether they may use the library. Add \"licence\" to dado.json")
+    if #len(lib.repository) == 0:
+        lib.repository = public_url(origin)
+    if #len(lib.targets) == 0:
+        _ = #append(lib.targets, "native")
+    // What was typed, or guessed from the README and `origin`, is held to
+    // the rules `dado.json` is read by.
+    string8 unfit = library_refusal(lib)
+    if #len(unfit) > 0:
+        die(txt(#format("cannot release: ", unfit, ". Correct it in ", MANIFEST_FILE, " (or the README's `## Summary` it came from)")))
+
+    // 3. R24.
+    check_no_remote_imports(root)
+
+    // 4. The index, before anything is written: a name it lists for another
+    //    repository is refused now, since the name goes into the tag.
+    IndexState ix = check_index(lib, a)
+
+    // 5. The tests, on this machine.
+    string8 tested = ""
+    if !a.no_test:
+        Command t = command(executable())
+        add(&t, "test")
+        if #len(a.cc) > 0: add_all(&t, ["--cc", a.cc])
+        add(&t, root)
+        say(txt(#format("Testing ", lib.name, " on this machine (dado test; --no-test skips this)")))
+        if run(t) != 0:
+            die("the tests failed, so nothing was released. Fix them, or pass --no-test to release anyway")
+        tested = tests_status(host_platform(), #DADO_VERSION)
+
+    // 6. The version: after the newest of `dado.json`'s and every semver
+    //    tag, this clone's and origin's (a release tagged from another clone,
+    //    or a manifest that missed a release, is not reused).
+    (string8 local_tags, bool _) = git_at(root, ["tag", "--list"])
+    (string8 remote_listing, bool reached) = git_at(root, ["-c", "core.askPass=true", "ls-remote", "--tags", "--", "origin"])
+    string8 remote_tags = remote_tag_names(remote_listing) if reached else ""
+    if !reached:
+        note("origin could not be reached to read its tags (offline?), so the version is checked against this clone's tags only")
+    string8 current = newest_semver_tag(txt(#format(lib.version, "\n", local_tags, "\n", remote_tags)))
+    string8 next = choose_version(current, a.version)
+    string8 tag = txt(#format("v", next))
+    (string8 _, bool taken) = git_at(root, ["rev-parse", "-q", "--verify", txt(#format("refs/tags/", tag))])
+    if taken:
+        die(txt(#format("the tag ", tag, " already exists. Choose a newer version (dado package --version=<x.y.z>), or delete the tag if it was a mistake: git tag -d ", tag)))
+    if has_tag(remote_tags, tag):
+        die(txt(#format("origin already has the tag ", tag, ", though this clone does not: fetch it (git fetch --tags origin) and choose a newer version")))
+
+    // 7. Write, commit, tag.
+    string8 old_version = lib.version
+    lib.version = next
+    try fs.write_file(manifest_path, render_library(lib)) else code:
+        die(txt(#format("cannot write ", manifest_path, ": ", os.message(code))))
+    ref []string8 paths = #make([]string8, 0)
+    _ = #append(paths, MANIFEST_FILE)
+    // Read now, after the tests and the prompts: a save made meanwhile is
+    // checked, never overwritten.
+    string8 readme_before = read_or_empty(readme_path)
+    if readme_marked:
+        if !readme_only_markers_changed(readme_head, readme_before):
+            undo_manifest(root, manifest_path, first_manifest, manifest_before, lib, old_version)
+            die(txt(#format(readme_path, " changed outside its dado: markers while dado package ran; nothing was released. Commit the change and run dado package again")))
+        if #len(tested) == 0: tested = tests_not_run(next)
+        (string8 rewritten, bool _) = rewrite_markers(readme_before, tested, install_status(lib.name))
+        if rewritten != readme_before:
+            try fs.write_file(readme_path, rewritten) else code:
+                undo_manifest(root, manifest_path, first_manifest, manifest_before, lib, old_version)
+                die(txt(#format("cannot write ", readme_path, ": ", os.message(code), "; nothing was released")))
+        if rewritten != readme_head:
+            _ = #append(paths, readme_name)
+    string8 message = txt(#format(lib.name, " ", tag))
+    ref []string8 add_words = #make([]string8, 0)
+    _ = #append(add_words, "add")
+    _ = #append(add_words, "--")
+    ref []string8 commit_words = #make([]string8, 0)
+    for w in ["commit", "-q", "-m", message, "--"]:
+        _ = #append(commit_words, w)
+    for p in paths:
+        _ = #append(add_words, p)
+        _ = #append(commit_words, p)
+    (string8 _, bool added) = git_at(root, add_words[:], true)
+    (string8 _, bool committed) = git_at(root, commit_words[:], true)
+    if !added || !committed:
+        undo_manifest(root, manifest_path, first_manifest, manifest_before, lib, old_version)
+        undo_readme(root, readme_path, readme_marked, readme_before)
+        die(txt(#format("git could not commit ", MANIFEST_FILE, " (its message is above), so nothing was released; ", MANIFEST_FILE, " is as it was, but for the answers given. Fix what git said and run dado package again")))
+    (string8 made, bool _) = git_at(root, ["rev-parse", "HEAD"])
+    (string8 _, bool tagged) = git_at(root, ["tag", "-a", tag, "-m", message], true)
+    if !tagged:
+        // Undo the release commit, so a rerun asks for this version again
+        // instead of bumping past one that was never tagged. That is safe
+        // only while HEAD is still the commit just made and has a parent;
+        // otherwise the commit stays and the tag is left to make by hand.
+        (string8 head_now, bool _) = git_at(root, ["rev-parse", "HEAD"])
+        (string8 _, bool has_parent) = git_at(root, ["rev-parse", "-q", "--verify", "HEAD~1"])
+        if head_now == made && has_parent:
+            (string8 _, bool undone) = git_at(root, ["reset", "-q", "--soft", "HEAD~1"], true)
+            if undone:
+                undo_manifest(root, manifest_path, first_manifest, manifest_before, lib, old_version)
+                undo_readme(root, readme_path, readme_marked, readme_before)
+                die(txt(#format("git could not make the tag ", tag, " (its message is above), so the release commit was undone and ", MANIFEST_FILE, " is as it was, but for the answers given. Fix what git said and run dado package again")))
+        die(txt(#format("git could not make the tag ", tag, " (its message is above). ", MANIFEST_FILE, " already holds ", next, ", committed as ", made, "; make the tag by hand: git tag -a ", tag, " -m \"", message, "\" ", made)))
+    string8 also = txt(#format(" and ", readme_name)) if #len(paths) > 1 else ""
+    say_green("released", txt(#format(" ", lib.name, " ", next, ": ", MANIFEST_FILE, also, " committed and tagged ", tag)))
+
+    // 8. Push.
+    bool push = a.yes
+    if !push && interactive():
+        push = ask(txt(#format("Push the commit and ", tag, " to origin (", origin, ")? [Y/n] ")), true)
+    if !push:
+        note(txt(#format("not pushed. When ready: git push origin HEAD ", tag)))
+        return 0
+    if !git_push(root, tag):
+        die(txt(#format("the push failed (git's message is above). The release is committed and tagged here; push it with: git push origin HEAD ", tag)))
+    say_green("pushed", txt(#format(" ", tag, " to ", origin)))
+
+    // 9. The index.
+    if a.no_pr: return 0
+    offer_listing(lib, a, ix, origin, tag)
+    return 0
+
+// The library's root: the nearest directory at or above `here` holding
+// `dado.json`, but never above the work tree's top `top`, where a manifest
+// belongs to another project that this repository only sits inside.
+// (`project_root` itself still climbs for builds: there a project folder
+// holding several repositories is a layout people use, and `dado-lsp` and
+// `dadoc` answer the same way, so changing it is not this verb's to do.)
+private string8 library_root(string8 here, string8 top):
+    string8 root = project_root(here)
+    if #len(root) == 0: return top
+    string8 r = comparable_path(root)
+    string8 t = comparable_path(top)
+    if r == t || strings.starts_with(r, txt(#format(t, "/"))): return root
+    return top
+
+// `p` resolved, with `/` for separators, and lowercased on Windows, so two
+// spellings of one folder compare equal (git prints `C:/x`, the system
+// `C:\x`; macOS's `/tmp` is `/private/tmp`).
+string8 comparable_path(string8 p):
+    string8 c = resolved(p)
+    string8 slashed = txt(strings.replace(c, "\\", "/"))
+    when #OS == #WINDOWS:
+        return txt(strings.to_lower(slashed))
+    return strings.trim_suffix(slashed, "/")
+
+// `p` with its links followed, or as it is when it cannot be resolved.
+private string8 resolved(string8 p):
+    try ref []char8 out = fs.canonical(p) else:
+        return p
+    return txt(out)
+
+// Put `dado.json` back after a release that did not happen: the text it had
+// (or, when there was none, the answers given, without a version), and out
+// of the index, so the tree is as the release found it.
+private void undo_manifest(string8 root, string8 manifest_path, bool first, string8 before, Library lib, string8 old_version):
+    Library back = lib
+    back.version = old_version
+    string8 text = render_library(back) if first else before
+    write_quietly(manifest_path, text)
+    (string8 _, bool _) = git_at(root, ["reset", "-q", "--", MANIFEST_FILE])
+
+// Put the README back as the release found it, when the release rewrote it.
+private void undo_readme(string8 root, string8 readme_path, bool marked, string8 before):
+    if !marked: return
+    write_quietly(readme_path, before)
+    (string8 _, bool _) = git_at(root, ["reset", "-q", "--", base_name(readme_path)])
+
+// This machine as the README's tests line names it: `linux-x86_64`.
+string8 host_platform():
+    return txt(#format(txt(strings.to_lower(txt(#format(#OS)))), "-", txt(strings.to_lower(txt(#format(#ARCH))))))
+
+// The name, asked until it is one, from `fallback`.
+private string8 ask_name(string8 fallback):
+    string8 suggested = fallback
+    string8 why = library_name_refusal(suggested)
+    if #len(why) > 0: suggested = ""
+    for:
+        string8 name = prompt("Name (how users fetch it: dado get <Name>)", suggested)
+        string8 refusal = library_name_refusal(name)
+        if #len(refusal) == 0: return name
+        if !interactive():
+            die(txt(#format("the library needs a name, and ", refusal, ". Write \"name\" in ", MANIFEST_FILE, ", or run dado package on a terminal")))
+        warn(refusal)
+    return ""
+
+// The version to release, from `--version` or the prompt.
+private string8 choose_version(string8 current, string8 given):
+    if #len(given) > 0:
+        (string8 v, string8 why) = next_version(current, given)
+        if #len(v) == 0: die(txt(#format("--version: ", why)))
+        return v
+    if !interactive():
+        die("there is no terminal to ask the version on: pass --version=<x.y.z|patch|minor|major>")
+    (string8 p, string8 _) = next_version(current, "patch")
+    (string8 m, string8 _) = next_version(current, "minor")
+    (string8 big, string8 _) = next_version(current, "major")
+    if #len(current) > 0:
+        say(txt(#format("Current version: ", current)))
+    else:
+        say("No version yet: this is the first release.")
+    // A first release offers minor, 0.1.0: 0.0.1 reads as a placeholder.
+    string8 offered = "minor" if #len(current) == 0 else "patch"
+    for:
+        string8 answer = prompt(txt(#format("Version: patch (", p, "), minor (", m, "), major (", big, "), or type one")), offered)
+        (string8 v, string8 why) = next_version(current, answer)
+        if #len(v) > 0: return v
+        warn(why)
+    return ""
+
+// Refuse, naming the file and line, when any source in the library imports
+// through `lib:` or `imports:` (R24).
+private void check_no_remote_imports(string8 root):
+    (string8 file, i64 n, string8 line) = first_remote_import(root)
+    if n > 0:
+        die(txt(#format(file, ":", n, ": `", line, "`\n  A library cannot fetch other libraries (R24): users would have to trace its dependencies.\n  help: copy what it needs into the library's own tree and import it by relative path (import \"./vendored/x\")")))
+
+// The first `.dado` or `.dados` file under `root` that imports through `lib:`
+// or `imports:` (R24), with the line's number and text; `n` 0 when none does.
+// The top-level `build/`, which `dado` writes, and anything under a `.git`
+// are passed over (`r24_skips`). (`dado get` reads a fetched library's
+// files from git's own list instead, hidden ones included.)
+(string8 file, i64 n, string8 line) first_remote_import(string8 root):
+    fs.Listing l = fs.walk(root)
+    for e in l.entries:
+        if e.is_dir: continue
+        if !(strings.ends_with(e.path, ".dado") || strings.ends_with(e.path, ".dados")): continue
+        // By the path below the root: the library may itself sit inside a
+        // folder named `build`.
+        string8 rel = e.path
+        if strings.starts_with(rel, root): rel = rel[#len(root)..<#len(rel)]
+        for #len(rel) > 0 && (rel[0] == '/' || rel[0] == '\\'):
+            rel = rel[1..<#len(rel)]
+        if r24_skips(rel): continue
+        try ref []char8 text = fs.read_file(e.path) else:
+            continue
+        (i64 n, string8 line) = remote_import(txt(text))
+        if n > 0: return (e.path, n, line)
+    return ("", 0, "")
+
+void make_quietly(string8 p):
+    try fs.make_dirs(p) else:
+        return
+
+// An SPDX identifier read off the repository's licence file, or "".
+private string8 guess_licence(string8 root):
+    for name in ["LICENSE", txt(#format("LICENSE", MD)), "LICENSE.txt", "LICENCE", txt(#format("LICENCE", MD)), "COPYING"]:
+        try ref []char8 t = fs.read_file(join2(root, name)) else:
+            continue
+        string8 text = txt(t)
+        if strings.contains(text, "MIT License") || strings.contains(text, "Permission is hereby granted, free of charge"): return "MIT"
+        if strings.contains(text, "Apache License") && strings.contains(text, "Version 2.0"): return "Apache-2.0"
+        if strings.contains(text, "Boost Software License"): return "BSL-1.0"
+        if strings.contains(text, "Mozilla Public License") && strings.contains(text, "2.0"): return "MPL-2.0"
+        if strings.contains(text, "This software is provided 'as-is'"): return "Zlib"
+        if strings.contains(text, "This is free and unencumbered software released into the public domain"): return "Unlicense"
+        if strings.contains(text, "GNU LESSER GENERAL PUBLIC LICENSE"): return "LGPL-3.0-or-later"
+        if strings.contains(text, "GNU GENERAL PUBLIC LICENSE") && strings.contains(text, "Version 3"): return "GPL-3.0-or-later"
+        if strings.contains(text, "Redistribution and use in source and binary forms"):
+            if strings.contains(text, "Neither the name"): return "BSD-3-Clause"
+            return "BSD-2-Clause"
+        return ""
+    return ""
+
+// Push the branch and the tag; true when both went.
+private bool git_push(string8 root, string8 tag):
+    (string8 _, bool head) = git_at(root, ["push", "-q", "origin", "HEAD"], true)
+    if !head: return false
+    (string8 _, bool t) = git_at(root, ["push", "-q", "origin", tag], true)
+    return t
+
+// ── the index ───────────────────────────────────────────────────────────────
+
+// The index's repository: `DADO_INDEX_REPO`, else DadoPKG.
+string8 index_repo():
+    (string8 v, bool set) = env("DADO_INDEX_REPO")
+    if set && #len(v) > 0: return v
+    return INDEX_REPO
+
+// Where the local copy of the index lives: `DADO_INDEX`, else the user's
+// cache (`$XDG_CACHE_HOME/dado/index`, `~/.cache/dado/index`, or on Windows
+// `%LOCALAPPDATA%\dado\index`, else `%USERPROFILE%\AppData\Local\dado\index`).
+// With none of those set, it refuses rather than write into the working
+// directory.
+string8 index_dir():
+    (string8 v, bool set) = env("DADO_INDEX")
+    if set && #len(v) > 0: return v
+    (string8 xdg, bool has_xdg) = env("XDG_CACHE_HOME")
+    if has_xdg && #len(xdg) > 0: return join3(xdg, "dado", "index")
+    when #OS == #WINDOWS:
+        (string8 local, bool has_local) = env("LOCALAPPDATA")
+        if has_local && #len(local) > 0: return join3(local, "dado", "index")
+        (string8 profile, bool has_profile) = env("USERPROFILE")
+        if has_profile && #len(profile) > 0: return join3(join3(profile, "AppData", "Local"), "dado", "index")
+    (string8 home, bool has_home) = env("HOME")
+    if has_home && #len(home) > 0: return join3(join2(home, ".cache"), "dado", "index")
+    die("there is no folder to keep the package index in: set DADO_INDEX to one (or HOME, or XDG_CACHE_HOME)")
+    return ""
+
+// The index's text, from the local copy, fetched first when there is none,
+// when it is more than a day old, or when `force`. Offline, the copy on disk
+// is used with a note. `ok` false when there is no copy at all.
+//
+// The copy is dado's alone to change: `.git/dado-index` is written when it is
+// cloned and holds the commit dado last put there. A folder that is not such
+// a clone is never deleted (an empty one is cloned into), and a clone whose
+// marker is missing, whose HEAD moved, or that has local changes is read as
+// it is and never reset.
+(string8 text, bool ok) read_index(bool force):
+    string8 dir = index_dir()
+    string8 readme = join2(dir, txt(#format("README", MD)))
+    string8 stamp = join3(dir, ".git", "dado-refreshed")
+    string8 marker = join3(dir, ".git", "dado-index")
+    if !is_dir(join2(dir, ".git")):
+        if exists(dir) && !empty_dir(dir):
+            die(txt(#format(dir, " holds files but is not dado's copy of the package index, so it is left alone. Move it away, or point DADO_INDEX at an empty or new folder")))
+        make_quietly(dir_of(dir))
+        Command c = command("git")
+        add_all(&c, ["clone", "-q", "--depth", "1", "--", index_repo(), dir])
+        if !silently(c):
+            warn(txt(#format("could not fetch the package index (", index_repo(), "); is this machine online?")))
+            return ("", false)
+        mark_index(dir, marker)
+        write_quietly(stamp, "")
+    else if force || index_age(stamp) > INDEX_MAX_AGE_S:
+        string8 why = index_untouchable(dir, marker)
+        if #len(why) > 0:
+            note(txt(#format("the package index at ", dir, " ", why, ", so it is read as it is and not refreshed")))
+        else:
+            // From `index_repo()`, not the copy's `origin`: a changed
+            // `DADO_INDEX_REPO` is followed.
+            (string8 _, bool fetched) = git_at(dir, ["fetch", "-q", "--depth", "1", "--", index_repo(), "HEAD"])
+            (string8 _, bool reset) = git_at(dir, ["reset", "-q", "--hard", "FETCH_HEAD"]) if fetched else ("", false)
+            if fetched && reset:
+                mark_index(dir, marker)
+                write_quietly(stamp, "")
+            else:
+                note("could not refresh the package index (offline?); using the copy already here")
+    try ref []char8 t = fs.read_file(readme) else:
+        return ("", false)
+    return (txt(t), true)
+
+// Record the commit dado left the index's copy at.
+private void mark_index(string8 dir, string8 marker):
+    (string8 head, bool _) = git_at(dir, ["rev-parse", "HEAD"])
+    write_quietly(marker, head)
+
+// Why the copy at `dir` must not be reset, or "".
+private string8 index_untouchable(string8 dir, string8 marker):
+    try ref []char8 m = fs.read_file(marker) else:
+        return "was not made by dado"
+    string8 left = strings.trim(txt(m))
+    (string8 head, bool _) = git_at(dir, ["rev-parse", "HEAD"])
+    if head != left: return "has commits dado did not make"
+    (string8 changes, bool _) = git_at(dir, ["status", "--porcelain"])
+    if #len(changes) > 0: return "has local changes"
+    return ""
+
+// Whether `dir` is a directory with nothing in it.
+bool empty_dir(string8 dir):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return false
+    defer l.destroy()
+    return #len(l.entries) == 0
+
+// Seconds since `stamp` was written; very large when it is missing.
+private i64 index_age(string8 stamp):
+    try fs.FileInfo info = fs.info(stamp) else:
+        return 1 << 40
+    return time.unix() - info.mtime / 1000000000
+
+// What the index says of this library, read before anything is released.
+type IndexState:
+    string8 text        // the index's README
+    bool have           // it could be read
+    bool listed         // it lists this library, at this repository
+    bool can_list       // not listed, and listable: a public web address
+
+// Read the index (refreshed when stale) and refuse a name it lists for
+// another repository: the name is in the release's tag message and would be
+// its index line's. Unless `--no-pr`, also find out now whether the library
+// could be listed, so what stands in the way is said before the release
+// rather than after; a private repository only warns, since it may still be
+// released.
+private IndexState check_index(Library lib, PackageAsk a):
+    IndexState s
+    (string8 text, bool have) = read_index(a.refresh)
+    s.text = text
+    s.have = have
+    string8 url = public_url(lib.repository)
+    if !have:
+        warn(txt(#format("the package index could not be read, so whether the name ", lib.name, " is free there was not checked")))
+    else:
+        (IndexEntry e, bool found) = index_find(text, lib.name)
+        if found:
+            if !same_repository(e.url, lib.repository):
+                die(txt(#format("the package index lists another library named ", e.name, " (", e.url, "), and names are matched ignoring case. Choose another name before releasing, since it goes into the tag: change \"name\" in ", MANIFEST_FILE, " (and in the README's title, if it says it)")))
+            s.listed = true
+            return s
+    if a.no_pr: return s
+    string8 why = index_line_refusal(lib.name, url, lib.description)
+    if #len(why) > 0:
+        die(txt(#format("cannot release a library the index could list: ", why)))
+    if !is_web_url(url):
+        warn(txt(#format(url, " is not a web address (https://…), so users could not get the library from it and it cannot be listed; the release goes ahead. To list it, push it to a public host, make that `origin` (or write its address as \"repository\" in ", MANIFEST_FILE, "), and run dado package again")))
+        return s
+    // An askpass that answers nothing makes a private repository fail
+    // rather than prompt.
+    Command probe = command("git")
+    add_all(&probe, ["-c", "credential.helper=", "-c", "core.askPass=true", "ls-remote", "-q", "--heads", "--", url])
+    if !silently(probe):
+        warn(txt(#format(url, " cannot be fetched without signing in, so it cannot be listed until it is public; the release goes ahead. Make it public and run dado package again to list it")))
+        return s
+    s.can_list = have
+    return s
+
+// After a pushed release: offer to list the library, unless it is listed or
+// cannot be (`check_index` said why).
+private void offer_listing(Library lib, PackageAsk a, IndexState ix, string8 origin, string8 tag):
+    string8 url = public_url(lib.repository)
+    if ix.listed:
+        note(txt(#format(lib.name, " is in the index already, so there is nothing to submit: dado get ", lib.name, " finds ", lib.version, " by its tag")))
+        return
+    if !ix.have:
+        note(txt(#format("the index could not be read, so no pull request was offered. The next dado package offers it again; or add this line to DadoPKG's README by hand:\n  ", index_line(lib.name, url, lib.description))))
+        return
+    if !ix.can_list: return
+    // What users will fetch must hold what was pushed: `repository` and
+    // `origin` can name different repositories.
+    Command seen = command("git")
+    add_all(&seen, ["-c", "credential.helper=", "-c", "core.askPass=true", "ls-remote", "--tags", "--", url, txt(#format("refs/tags/", tag))])
+    Captured r = capture(seen, true)
+    string8 found_raw = r.out
+    string8 found = strings.trim(found_raw)
+    if !r.started || r.status != 0 || #len(found) == 0:
+        warn(txt(#format(tag, " was pushed to origin (", origin, ") but is not at ", url, ", the repository users fetch, so the library was not offered to the index: make \"repository\" in ", MANIFEST_FILE, " and origin the same repository, then run dado package again")))
+        return
+    bool go = a.yes
+    if !go:
+        if !interactive():
+            note(txt(#format("not in the index yet: run dado package on a terminal, or with --yes, to open the pull request that lists ", lib.name)))
+            return
+        go = ask(txt(#format("Open a pull request adding ", lib.name, " to the Dado package index? [y/N] ")), false)
+    string8 line = index_line(lib.name, url, lib.description)
+    if !go:
+        note(txt(#format("not submitted. The next dado package offers it again; or add this line to DadoPKG's README by hand:\n  ", line)))
+        return
+    string8 category = choose_category(ix.text, a.category)
+    say(txt(#format("Submitting, under ## ", category, ":\n  ", line)))
+    string8 on_github = github_slug(index_repo())
+    if #len(on_github) > 0 && gh_ready():
+        string8 why = open_pr_with_gh(lib, category, line)
+        if #len(why) == 0: return
+        warn(txt(#format(why, "; so the pull request is left to GitHub's editor")))
+    open_editor_for(category, line)
+
+// The heading to list under: `--category`, or asked from the index's own.
+private string8 choose_category(string8 index, string8 given):
+    if #len(given) > 0:
+        string8 why = category_refusal(given)
+        if #len(why) > 0: die(txt(#format("--category: ", why)))
+        return index_heading(index, given)
+    ref []string8 cats = index_categories(index)
+    if !interactive(): return "Misc"
+    if #len(cats) > 0:
+        say("Categories in the index:")
+        for i in 0..<#len(cats):
+            fmt.eprintln("  ", i + 1, ". ", cats[i])
+    for:
+        string8 answer = prompt("Category: a number above, or a new name", "Misc")
+        i64 n = 0
+        try n = parse_i64(answer) else:
+            n = 0
+        if n >= 1 && n <= #len(cats): return cats[n - 1]
+        if n > 0:
+            warn(txt(#format("there is no category ", n, " in the list: type a number from 1 to ", #len(cats), ", or a new name")))
+            continue
+        string8 why = category_refusal(answer)
+        if #len(why) == 0: return index_heading(index, answer)
+        warn(why)
+    return "Misc"
+
+private !i64 parse_i64(string8 s):
+    if #len(s) == 0 || #len(s) > 6: fail 1
+    i64 n = 0
+    for i in 0..<#len(s):
+        if s[i] < '0' || s[i] > '9': fail 1
+        n = n * 10 + i64(s[i] - '0')
+    return n
+
+// `gh` is on PATH and logged in.
+private bool gh_ready():
+    string8 gh = on_path("gh")
+    if #len(gh) == 0: return false
+    Command c = command("gh")
+    add_all(&c, ["auth", "status"])
+    return silently(c)
+
+// `owner/repo` of a GitHub URL, or "".
+private string8 github_slug(string8 url):
+    string8 u = public_url(url)
+    if !strings.starts_with(u, "https://github.com/"): return ""
+    string8 prefix = "https://github.com/"
+    return u[#len(prefix)..<#len(u)]
+
+// Fork the index, commit the line on a branch, push it with `gh`'s
+// credentials, and open the request. "" when the request was opened, else
+// what stopped it.
+private string8 open_pr_with_gh(Library lib, string8 category, string8 line):
+    string8 slug = github_slug(index_repo())
+    if #len(slug) == 0:
+        return txt(#format("the index (", index_repo(), ") is not on GitHub, where gh opens pull requests"))
+    Command who = command("gh")
+    add_all(&who, ["api", "user", "--jq", ".login"])
+    Captured w = capture(who, true)
+    string8 login_raw = w.out
+    string8 login = strings.trim(login_raw)
+    if !w.started || w.status != 0 || #len(login) == 0:
+        return "gh did not say which account it is logged in as (gh api user)"
+    Command fork = command("gh")
+    add_all(&fork, ["repo", "fork", slug, "--clone=false"])
+    _ = silently(fork)
+    // A folder of its own, new and made by this run, so the one removed
+    // afterwards is never anyone else's (`DADO_INDEX` may be any folder).
+    try ref []char8 made_own = fs.make_temp_dir("dado-submit") else code:
+        return txt(#format("no temporary folder to prepare the request in: ", os.message(code), " (set TMPDIR to one you can write)"))
+    string8 made = txt(made_own)
+    defer remove_tree_quietly(made)
+    string8 work = join2(made, "DadoPKG")
+    Command clone = command("git")
+    add_all(&clone, ["clone", "-q", "--depth", "1", "--", index_repo(), work])
+    if run(clone) != 0:
+        return txt(#format("git could not clone the index into ", work, " (its message is above)"))
+    string8 readme = join2(work, txt(#format("README", MD)))
+    try ref []char8 t = fs.read_file(readme) else code:
+        return txt(#format("cannot read ", readme, ": ", os.message(code)))
+    try fs.write_file(readme, index_insert(txt(t), category, lib.name, line)) else code:
+        return txt(#format("cannot write ", readme, ": ", os.message(code)))
+    string8 branch = txt(#format("add-", txt(strings.to_lower(lib.name))))
+    string8 title = txt(#format("Add ", lib.name))
+    (string8 _, bool switched) = git_at(work, ["checkout", "-q", "-b", branch], true)
+    (string8 _, bool committed) = git_at(work, ["commit", "-q", "-am", title], true)
+    if !switched || !committed:
+        return "git could not commit the line on a branch of the index (its message is above)"
+    string8 fork_url = txt(#format("https://github.com/", login, "/", base_name(slug), ".git"))
+    // A fork just made can take a few seconds to accept a push.
+    bool pushed = false
+    for attempt in 0..<5:
+        if attempt > 0: time.sleep(time.seconds(3))
+        (string8 _, bool ok) = git_at(work, ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "push", "-q", "-f", fork_url, txt(#format("HEAD:", branch))], attempt == 4)
+        if ok:
+            pushed = true
+            break
+    if !pushed:
+        return txt(#format("git could not push to your fork, ", fork_url, " (its message is above)"))
+    string8 body = txt(#format("Adds ", lib.name, " under **", category, "**:\n\n", line, "\n\nLicence: ", lib.licence if #len(lib.licence) > 0 else "(not given)", ". Latest release: ", lib.version, ".\n\nSubmitted by `dado package`."))
+    Command pr = command("gh")
+    add_all(&pr, ["pr", "create", "--repo", slug, "--head", txt(#format(login, ":", branch)), "--title", title, "--body", body])
+    Captured r = capture(pr, false)
+    string8 url_raw = r.out
+    string8 url = strings.trim(url_raw)
+    if !r.started || r.status != 0:
+        return txt(#format("gh pr create failed (its message is above); the branch ", branch, " is pushed to your fork"))
+    say_green("opened", txt(#format(" the pull request: ", url)))
+    note(txt(#format("once it is merged, anyone can run: dado get ", lib.name)))
+    return ""
+
+// Without `gh`: GitHub's editor for the index's README, which forks it and
+// opens the request when the change is committed there.
+private void open_editor_for(string8 category, string8 line):
+    string8 slug = github_slug(index_repo())
+    if #len(slug) == 0:
+        say(txt(#format("Add this line to the README of ", index_repo(), " under `## ", category, "`, in name order (make the heading if it is not there), and propose the change there:\n\n  ", line)))
+        return
+    string8 url = txt(#format(public_url(index_repo()), "/edit/", index_branch(), "/README", MD))
+    say(txt(#format("Opening GitHub's editor for the index. Add this line under `## ", category, "`, in name order (make the heading if it is not there):\n\n  ", line, "\n\nthen press “Commit changes…” and “Propose changes”: GitHub forks the index and opens the pull request.")))
+    if !open_in_browser(url):
+        say(txt(#format("Open this page: ", url)))
+
+// The index's default branch, as its local copy recorded it at the clone, or
+// `main`.
+private string8 index_branch():
+    (string8 head, bool ok) = git_at(index_dir(), ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"])
+    if !ok || !strings.starts_with(head, "origin/"): return "main"
+    string8 branch = head[7..<#len(head)]
+    if #len(branch) == 0: return "main"
+    return branch
+
+// Open `url` in the default browser; false when no opener ran.
+private bool open_in_browser(string8 url):
+    Command c = command("open")
+    when #OS == #WINDOWS:
+        // Not `cmd /c start`: cmd would read `&` in a URL as its own.
+        c = command("rundll32")
+        add_all(&c, ["url.dll,FileProtocolHandler", url])
+        return run_quietly(c) == 0
+    else when #OS == #DARWIN:
+        add(&c, url)
+        return run_quietly(c) == 0
+    else:
+        string8 opener = on_path("xdg-open")
+        if #len(opener) == 0: return false
+        c = command("xdg-open")
+        add(&c, url)
+        return run_quietly(c) == 0

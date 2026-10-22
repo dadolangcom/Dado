@@ -423,22 +423,27 @@ void touch(ref []Cell r):
 ```
 
 What each call does is read from the called function's body, so nothing is
-written in a signature. What is not followed is said out loud: a `foreign`
-function or a function value is taken to keep nothing, and a conversion to
-`rawptr` drops what it pointed at. A handle copy stored in the heap or a
-package variable is not tracked there, and neither is a view stored in a
-package variable's block, nor views a callee stores into a block the caller
-owns — its own `ref` handed down by `^`, an out parameter, `p^ = split(…)`
-— nor views two hops away. A summary says which parameters an answer views,
-not which other blocks its views point into. A copy of a package handle
-handed back through `p^`, a tuple, a slot or an out parameter is not
-followed, nor is a handle reached through a window of pointers, of arrays,
-of unions or of records held by value. A pointer to package storage kept
-in a slot, a package pointer variable or a `#new`'d record is not known to
-point there. A callee that rebinds what its `^` points at on some path is
-taken to hand that block over on every path; and one that hands over only
-a slot (`take(&c)` answering `c.tris` after `c.tris = nil`) is still taken
-for a copy of any handle `c` holds, and refused after any of them moves.
+written in a signature, and a call through a trait value is read through
+every implementer's method. What is not followed is said out loud: a
+`foreign` function or a function value is taken to keep nothing (a handle it
+answers may be a copy of any of that type its arguments reach), and a
+conversion to `rawptr` drops what it pointed at. A copy of a handle stored
+in a block or in package storage (`hs[0] = b`, `KEEP = b`) is not followed
+there, and neither are views of a package `ref`'s own block stored in package
+storage. Views of a block stored in package storage refuse a later move of
+it in the function that stored them, and not once the block has left that
+function, returned or stored away. A record a call keeps pointers into its
+own blocks in is taken to manage them itself. Two subscripts are one
+place, so a `ref` copied out of one element (`k = hs[1]`, or the last one
+a walk bound) is stale once any element is freed. A slot handed over under a
+subscript (`ws[i].finish()`) is not recognised, so the answer stays a copy
+of what the subscripted array holds. A callee that leaves a slot `nil` on every way out
+(`take(&c)` answering `c.tris` after `c.tris = nil`, or `defer self.out =
+nil` beside `return self.out`) hands that slot's block over, as `b^ = nil` on
+every way out hands over the block `b^` held; the answer is still taken for
+a copy of any other handle `c` holds, whatever its type, and refused after
+one of those moves. A `return take(&c)` written directly is not checked
+against a `defer` that frees what `c` holds.
 
 ### Arrays and slices: a read-only window is `[]const T`
 

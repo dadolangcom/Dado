@@ -1,0 +1,719 @@
+// `dado get`: fetch a library and pin it in the project; with `--project`,
+// vendor its files into the project rather than the install's checkout.
+//
+// Git is the package manager: a library is a repository, a release a tag.
+//
+//     dado get Clipper2               the newest release, found in the index
+//     dado get clipper2@1.4.2         that release (`v` optional; a tag that is
+//                                     not semver by its exact name)
+//     dado get https://h/o/geo@v2     by address, bypassing the index
+//     dado get --project Clipper2     vendored into the project
+//     dado get                        restore every library dado.json pins
+//
+// A library goes to `collections/lib/<name>/` (the name lowercased):
+//
+//   * by default the install's, a git checkout every project on this machine
+//     can import; one per name, moved between versions with a shallow fetch.
+//     Its pin is the commit, and a build checks the checkout is at it with
+//     nothing changed, ignored or hidden from `git status`.
+//   * with `--project`, the project's own overlay (which wins over the install's) as
+//     **vendored files**: fetched into a temporary checkout, checked there,
+//     and its tracked files copied in with no `.git`, to be committed with
+//     the project. Its pin adds the files' content hash
+//     (`hash_vendored_file`), and a build checks that.
+//
+// The project's `dado.json` pins the repository, version and commit (and the
+// hash), so a project builds against exactly what it names, and on another
+// machine a bare `dado get` puts each one back.
+//
+// Nothing in a fetched tree is run: every git command on one runs with hooks,
+// fsmonitor and LFS's filters switched off (`git_lib`). A library is refused
+// on arrival when it holds a symbolic link (it could point outside its
+// folder, or hide a folder from R24's scan) or when any tracked `.dado` or
+// `.dados` file in it imports through `lib:` or `imports:` (R24: a library
+// bundles what it needs). A vendored copy leaves out git's own files
+// (`.gitignore` and the like), and a copy found holding one is refused
+// (`git_entry_in`); nothing is ever removed through a link. There is no
+// solver: a library has no dependencies.
+package driver
+
+import "core:hash"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+
+// What `dado get` was asked.
+type GetAsk:
+    string8 what        // a name, an address, either with `@<version>`; "" restores
+    bool project        // `--project`: vendored into the project, not the install's
+    bool refresh        // `--refresh`: fetch the index even when fresh
+
+// A temporary folder of this run's (a vendored library's checkout), removed
+// by `undo_fetch` when a refusal ends the process before the run's own
+// clean-up would.
+private string8 g_scratch = ""
+
+// `dado get`.
+i32 get_verb(GetAsk a):
+    string8 cwd = working_dir()
+    string8 root = project_root(cwd)
+    if #len(root) == 0:
+        die(txt(#format("dado get pins what it fetches in the project's ", MANIFEST_FILE, ", and ", cwd, " is in no project (no ", MANIFEST_FILE, " here or above, and no git work tree).\n  help: start one here, with git init, or an empty ", MANIFEST_FILE, " (echo {} > ", MANIFEST_FILE, "), then run dado get again")))
+    if inside_lib_collection(root):
+        die(txt(#format(root, " is a fetched library, inside a collections/lib/ folder, not a project: dado get would pin into the library's own ", MANIFEST_FILE, ".\n  help: run dado get from your project's folder")))
+    string8 manifest_path = join2(root, MANIFEST_FILE)
+    Library proj = read_project(manifest_path)
+    if #len(a.what) == 0:
+        if a.project:
+            die("--project chooses where a library being fetched goes; a bare dado get puts each pinned library back where its pin says (a pin with a `hash` is vendored in the project).\n  help: dado get --project <Name> vendors one")
+        return restore_pins(root, proj)
+
+    (string8 target, string8 version, bool has_version) = split_get_arg(a.what)
+    if has_version:
+        string8 bad = tag_refusal(version)
+        if #len(bad) > 0:
+            die(txt(#format("the version after `@` ", bad, ". Try: dado get ", target, "@1.4.2, or a tag's exact name")))
+    string8 name = ""
+    string8 url = ""
+    if looks_like_url(target):
+        url = target
+        name = url_library_name(url)
+        string8 why = library_name_refusal(name)
+        if #len(why) > 0:
+            die(txt(#format("a library fetched by address is named by the address's last part, and ", why, ". Fetch it from an address whose last part is a library's name (letters, digits, `-`, `_`)")))
+    else:
+        string8 why = library_name_refusal(target)
+        if #len(why) > 0:
+            die(txt(#format("`", target, "` is neither a library's name (", why, ") nor an address. Try: dado get Clipper2, or dado get https://github.com/owner/repo")))
+        (string8 index, bool have) = read_index(a.refresh)
+        if !have:
+            die(txt(#format("the package index could not be read, so `", target, "` cannot be looked up.\n  help: fetch it by address instead: dado get https://…/", target)))
+        (IndexEntry e, bool found) = index_find(index, target)
+        if !found && !a.refresh:
+            // A copy younger than a day is not fetched again, but a library
+            // listed since (the author's own, just merged) is what a miss
+            // most often means: one refresh before refusing.
+            (string8 again, bool have_again) = read_index(true)
+            if have_again:
+                (IndexEntry e2, bool found2) = index_find(again, target)
+                e = e2
+                found = found2
+        if !found:
+            die(txt(#format("the package index (", index_repo(), ") lists no library named `", target, "` (names are matched ignoring case).\n  help: check the spelling, or fetch it by address: dado get https://…/", target)))
+        if strings.equal_fold(e.category, "Unmaintained"):
+            warn(txt(#format(e.name, " is listed under Unmaintained: its author no longer looks after it, so fixes will not come. It is fetched all the same")))
+        name = e.name
+        url = e.url
+
+    string8 listing = remote_listing(url)
+    string8 tags = remote_tag_names(listing)
+    (string8 tag, string8 resolved) = resolve_tag(tags, version)
+    if #len(tag) == 0:
+        string8 listed = tag_list(tags)
+        if #len(version) == 0:
+            die(txt(#format(url, " has no release: no tag is a semver version that is not a pre-release (like v1.0.0). Its tags: ", listed, "\n  help: a pre-release, or a tag that is not semver, is fetched by name: dado get ", name, "@<tag>")))
+        die(txt(#format(url, " has no tag `", version, "`", " (nor v", version, ")" if !strings.starts_with(version, "v") else "", ". Its tags: ", listed)))
+
+    Pin old
+    bool had = false
+    for q in proj.libraries:
+        if strings.equal_fold(q.name, name):
+            old = q
+            had = true
+    (string8 overlay, string8 install) = library_dirs(root, name)
+    bool vendored = a.project || (is_dir(overlay) && overlay != install)
+    string8 dir = overlay if vendored else install
+    string8 commit = ""
+    string8 digest = ""
+    if vendored:
+        (string8 c, string8 h) = vendor(root, overlay, name, url, tag, "", "", had && #len(old.hash) > 0, old.hash)
+        commit = c
+        digest = h
+    else:
+        commit = fetch_at(install, name, url, tag, "")
+    if had && old.version == resolved && old.commit != commit && same_repository(old.repository, url):
+        warn(txt(#format("the tag ", tag, " at ", url, " now names ", short(commit), ", where ", MANIFEST_FILE, " pinned ", short(old.commit), " for ", resolved, ": its author moved it. The new commit is pinned")))
+    Pin p = Pin(name: name, repository: url, version: resolved, commit: commit, hash: digest)
+    write_project(manifest_path, with_pin(proj, p))
+    say_green("got", txt(#format(" ", name, " ", resolved, " (", short(commit), ") ", "vendored in " if vendored else "in ", dir)))
+    note(txt(#format("pinned in ", manifest_path)))
+    if vendored:
+        note(txt(#format("commit ", dir, " with the project: it is the project's copy")))
+    arrived(dir, name)
+    return 0
+
+// The first twelve digits of a commit, or all of a shorter text.
+string8 short(string8 sha):
+    if #len(sha) <= 12: return sha
+    return sha[0..<12]
+
+// Whether `root` is inside a `collections/lib/` folder: a fetched library
+// (its own `dado.json` stops `project_root`), not a project.
+private bool inside_lib_collection(string8 root):
+    string8 r = txt(#format(comparable_path(root), "/"))
+    if strings.contains(r, "/collections/lib/"): return true
+    string8 libs = txt(#format(comparable_path(join2(collections(), "lib")), "/"))
+    return strings.starts_with(r, libs)
+
+// The project's `dado.json`, or an empty one when it is not there. A file
+// that cannot be read as a manifest is refused: writing a pin into it would
+// drop what it holds.
+private Library read_project(string8 manifest_path):
+    Library none
+    none.targets = #make([]string8, 0)
+    none.libraries = #make([]Pin, 0)
+    if !is_file(manifest_path): return none
+    try ref []char8 t = fs.read_file(manifest_path) else code:
+        die(txt(#format("cannot read ", manifest_path, ": ", os.message(code))))
+        return none
+    (Library lib, bool good, string8 why) = parse_library(txt(t))
+    if !good:
+        die(txt(#format(manifest_path, " ", why, ". Correct it, then run dado get again")))
+    return lib
+
+private void write_project(string8 manifest_path, Library lib):
+    try fs.write_file(manifest_path, render_library(lib)) else code:
+        die(txt(#format("the library was fetched, but ", manifest_path, " cannot be written (", os.message(code), "), so it is not pinned. Make it writable and run dado get again")))
+
+// Library `name`'s two places: the project's overlay, where a vendored copy
+// goes, and the install's `collections/lib/`, where a checkout goes.
+(string8 overlay, string8 install) library_dirs(string8 root, string8 name):
+    string8 low = txt(strings.to_lower(name))
+    return (join3(root, "collections", join2("lib", low)), join3(collections(), "lib", low))
+
+// What `git ls-remote --tags` says of `url`. Ends the process when it cannot
+// be reached, or when `url` could be read as an option.
+private string8 remote_listing(string8 url):
+    string8 bad = url_refusal(url)
+    if #len(bad) > 0: die(txt(#format("the address ", bad)))
+    (string8 listing, bool ok) = git_at(".", ["ls-remote", "--tags", "--", url], true)
+    if !ok:
+        die(txt(#format("could not list the releases at ", url, " (git's message is above): is the address right, and is this machine online?")))
+    return listing
+
+// `tags` on one line, for a refusal; at most twelve.
+private string8 tag_list(string8 tags):
+    strings.Builder b = strings.builder(128)
+    i64 n = 0
+    string8 last = ""
+    for t in lines_of(tags):
+        // An annotated tag is listed twice (its `^{}` line).
+        if t == last: continue
+        last = t
+        if n == 12:
+            _ = strings.append(&b, ", …")
+            break
+        if n > 0: _ = strings.append(&b, ", ")
+        _ = strings.append(&b, t)
+        n += 1
+    if n == 0: return "none"
+    return strings.text(b)
+
+// The null device, for `core.hooksPath`: no hook is ever found there.
+private string8 null_device():
+    when #OS == #WINDOWS:
+        return "NUL"
+    else:
+        return "/dev/null"
+
+// `git -C <dir> words…` on a fetched tree, with nothing configured on this
+// machine run by it: no hooks, no fsmonitor, no LFS filter (a fetched
+// `.gitattributes` can ask for one), and no detached-HEAD advice.
+(string8 out, bool ok) git_lib(string8 dir, []string8 words, bool loud = false):
+    ref []string8 all = #make([]string8, 0)
+    for w in ["-c", txt(#format("core.hooksPath=", null_device())), "-c", "core.fsmonitor=false", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.clean=", "-c", "filter.lfs.required=false", "-c", "advice.detachedHead=false"]:
+        _ = #append(all, w)
+    for w in words:
+        _ = #append(all, w)
+    return git_at(dir, all[:], loud)
+
+// What would keep the checkout at `dir` from being exactly its commit, one
+// per line, or "": changed, untracked and ignored files, and files git was
+// told not to look at (`update-index --assume-unchanged`, `--skip-worktree`).
+string8 checkout_changes(string8 dir):
+    strings.Builder b = strings.builder(128)
+    (string8 status, bool _) = git_lib(dir, ["status", "--porcelain", "--ignored", "--untracked-files=all"])
+    bool any = #len(status) > 0
+    if any:
+        _ = strings.append(&b, status)
+    (string8 flags, bool _) = git_lib(dir, ["ls-files", "-v"])
+    for l in lines_of(flags):
+        if #len(l) < 2: continue
+        char8 c = l[0]
+        if (c >= 'a' && c <= 'z') || c == 'S':
+            if any: _ = strings.append(&b, "\n")
+            any = true
+            _ = strings.append(&b, txt(#format(l, "   (hidden from git status: git update-index --no-assume-unchanged --no-skip-worktree -- ", l[2..<#len(l)], ")")))
+    return strings.text(b)
+
+// Put `dir` at `tag` of `url`, library `name`'s, and answer the commit it is
+// at. With `want` set (a restore), that commit is what is checked out: the
+// tag is fetched first when it is given, and `want` itself when the tag is
+// "" (gone) or names another commit now.
+//
+// The folder is made into a checkout when it is missing or empty; a checkout
+// of the same repository with a commit and nothing changed is fetched into,
+// through its `origin`, and moved; anything else is refused, naming the
+// folder. After the move, what arrived is checked: no symbolic link, and
+// nothing importing through `lib:` or `imports:` (R24). A refusal puts the
+// folder back as it was: what this run made is removed, a moved checkout
+// moved back.
+string8 fetch_at(string8 dir, string8 name, string8 url, string8 tag, string8 want):
+    string8 bad = url_refusal(url)
+    if #len(bad) > 0: die(txt(#format("the address ", bad)))
+    bool created = !exists(dir)
+    bool fresh = created || empty_dir(dir)
+    string8 before = ""
+    if !fresh:
+        if !is_dir(join2(dir, ".git")) || comparable_path(git_top(dir)) != comparable_path(dir):
+            die(txt(#format(dir, " holds files but is not a git checkout, so dado get leaves it alone.\n  help: move it away (or delete it if it is nothing of yours), then run dado get again")))
+        (string8 head, bool has_head) = git_lib(dir, ["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+        if !has_head || #len(head) == 0:
+            die(txt(#format(dir, " is a git repository with no commit, which dado get did not make, so it leaves it alone.\n  help: move it away (or delete it if it is nothing of yours), then run dado get again")))
+        before = head
+        (string8 origin, bool _) = git_lib(dir, ["config", "--get", "remote.origin.url"])
+        if !same_repository(origin, url):
+            die(txt(#format(dir, " is a checkout of ", origin if #len(origin) > 0 else "a repository with no origin", ", not of ", url, ", so dado get leaves it alone.\n  help: move it away, then run dado get again")))
+        string8 changes = checkout_changes(dir)
+        if #len(changes) > 0:
+            die(txt(#format(dir, " has files that are not its commit's (changed, untracked, ignored or hidden from git status), which moving it to another version would lose or overwrite:\n  ", txt(strings.replace(changes, "\n", "\n  ")), "\n  help: keep them elsewhere (git -C ", dir, " stash -u, or a fork), or discard them (git -C ", dir, " checkout -- . && git -C ", dir, " clean -fdx), then run dado get again")))
+    else:
+        make_quietly(dir)
+        (string8 _, bool made) = git_lib(dir, ["init", "-q"], true)
+        (string8 _, bool remote) = git_lib(dir, ["remote", "add", "--", "origin", url], true)
+        if !made || !remote:
+            undo_fetch(dir, created, fresh, "")
+            die(txt(#format("git could not make a checkout in ", dir, " (its message is above)")))
+    string8 point = want
+    string8 commit = ""
+    if #len(tag) > 0:
+        string8 ref_spec = txt(#format("+refs/tags/", tag, ":refs/tags/", tag))
+        (string8 _, bool fetched) = git_lib(dir, ["fetch", "-q", "--no-tags", "--depth", "1", "--", "origin", ref_spec], true)
+        if !fetched:
+            undo_fetch(dir, created, fresh, before)
+            die(txt(#format("git could not fetch ", tag, " from ", url, " (its message is above)")))
+        (string8 at_tag, bool _) = git_lib(dir, ["rev-parse", "-q", "--verify", txt(#format("refs/tags/", tag, "^{commit}"))])
+        commit = at_tag
+        if #len(want) == 0 || commit == want:
+            point = ""
+        else:
+            warn(txt(#format("the tag ", tag, " at ", url, " now names ", short(commit), ", not the pinned ", short(want), ": its author moved it. The pinned commit is fetched; dado get ", name, "@", tag, " takes the new one and pins it")))
+    if #len(point) > 0:
+        (string8 _, bool got) = git_lib(dir, ["fetch", "-q", "--no-tags", "--depth", "1", "--", "origin", want], true)
+        if !got:
+            undo_fetch(dir, created, fresh, before)
+            die(txt(#format(url, " no longer has the pinned commit ", want, ", so it cannot be restored (git's message is above).\n  help: take a release it has: dado get ", name, "@<version>, which pins it anew")))
+        commit = want
+    if !is_commit(commit):
+        undo_fetch(dir, created, fresh, before)
+        die(txt(#format("git fetched ", tag, " from ", url, " but it names no commit")))
+    (string8 _, bool moved) = git_lib(dir, ["checkout", "-q", "--detach", commit], true)
+    if !moved:
+        undo_fetch(dir, created, fresh, before)
+        die(txt(#format("git could not check out ", commit, " in ", dir, " (its message is above)")))
+    string8 refusal = arrival_refusal(dir)
+    if #len(refusal) > 0:
+        undo_fetch(dir, created, fresh, before)
+        string8 back = "removed" if fresh else txt(#format("left at ", short(before), " as it was"))
+        die(txt(#format(refusal, "\n  ", name, " is not taken; ", dir, " is ", back, ".")))
+    return commit
+
+// Why the library checked out at `dir` cannot be taken, or "": it holds a
+// symbolic link, or imports through `lib:` or `imports:` (R24).
+private string8 arrival_refusal(string8 dir):
+    // Every tracked file, from git's own list: hidden folders and `build/`
+    // included, which a walk of the folder would pass over.
+    (string8 staged, bool _) = git_lib(dir, ["-c", "core.quotePath=false", "ls-files", "-s", "-z"])
+    for entry in strings.split(staged, "\x00"):
+        (string8 mode_etc, string8 path, bool tab) = strings.split_first(entry, "\t")
+        if !tab: continue
+        if strings.starts_with(mode_etc, "120000 "):
+            return txt(#format(join2(dir, path), " is a symbolic link. A fetched library holds none: one can point outside its folder, or hide files from the checks made on arrival.\n  help: ask its author to replace the link with the file it points to"))
+        if !(strings.ends_with(path, ".dado") || strings.ends_with(path, ".dados")): continue
+        string8 file = join2(dir, path)
+        try ref []char8 text = fs.read_file(file) else:
+            continue
+        (i64 n, string8 line) = remote_import(txt(text))
+        if n > 0:
+            return txt(#format(file, ":", n, ": `", line, "`\n  This library imports through `lib:` or `imports:`, and a library cannot fetch other libraries (R24).\n  help: ask its author to bundle what it needs and import it by relative path"))
+    return ""
+
+// The top of the work tree `dir` is in, or "".
+private string8 git_top(string8 dir):
+    (string8 top, bool ok) = git_lib(dir, ["rev-parse", "--show-toplevel"])
+    return top if ok else ""
+
+// Put a folder back after a fetch that is refused: one this run made is
+// removed, one that was there empty is emptied, and an existing checkout is
+// moved back to `before`. This run's scratch folder goes too.
+private void undo_fetch(string8 dir, bool created, bool fresh, string8 before):
+    if created:
+        remove_tree_quietly(dir)
+    else if fresh:
+        try fs.Listing l = fs.read_dir(dir) else:
+            return
+        for e in l.entries:
+            remove_tree_quietly(join2(dir, e.path))
+    else if #len(before) > 0:
+        (string8 _, bool _) = git_lib(dir, ["checkout", "-q", "-f", "--detach", before])
+    if #len(g_scratch) > 0:
+        remove_tree_quietly(g_scratch)
+        g_scratch = ""
+
+// Vendor `tag` of `url` (at `want` when set) into the project's folder
+// `dest`: fetched into a temporary checkout, checked there (`fetch_at`), and
+// its tracked files but git's own (`vendored_skips`) copied to `dest`, with
+// no `.git`. Answers the commit and the copy's content hash; with
+// `want_hash` set (a restore) the copy must hash to it.
+//
+// `dest` may already hold a copy only when this project pins it with a hash
+// (`replace`) and the copy still hashes to `pinned_hash`: edited files are
+// never deleted. Nothing is removed through a symbolic link: `dest` and the
+// folders above it up to the project's `collections/` must be none, and a
+// copy holding one is refused. The new copy is staged beside `dest` and
+// swapped in, the old one moved aside first and put back if the swap fails.
+(string8 commit, string8 digest) vendor(string8 root, string8 dest, string8 name, string8 url, string8 tag, string8 want, string8 want_hash, bool replace, string8 pinned_hash):
+    string8 linked = link_above(root, dest)
+    if #len(linked) > 0:
+        die(txt(#format(linked, " is a symbolic link, so dado get will not write or remove anything through it (the files it reaches are outside the project).\n  help: replace the link with a real folder, then run dado get --project ", name, " again")))
+    bool there = exists(dest) && !empty_dir(dest)
+    if there:
+        if exists(join2(dest, ".git")):
+            die(not_vendored(dest, name, tag))
+        if !replace:
+            die(txt(#format(dest, " holds files that ", MANIFEST_FILE, " does not pin as ", name, "'s vendored copy, so dado get leaves them alone.\n  help: move them away, then run dado get --project ", name, " again")))
+        string8 gitty = git_entry_in(dest)
+        if #len(gitty) > 0:
+            die(txt(#format("the library ", name, " ", git_entry_problem(dest, gitty), ".\n  help: delete ", gitty, " (keep it elsewhere if it is yours), then run dado get --project ", name, " again")))
+        (string8 now, string8 bad) = tree_hash(dest)
+        if #len(bad) > 0:
+            die(txt(#format(bad, "\n  help: replace the link with what it points to, or move ", dest, " away, then run dado get --project ", name, " again")))
+        if now != pinned_hash:
+            die(txt(#format(dest, " was edited since it was vendored (its files hash to ", short(now), ", not the pinned ", short(pinned_hash), "), and moving it to another version would delete the edits.\n  help: keep them elsewhere (move the folder aside, or commit them in a fork of the library and fetch that), or delete the folder yourself; then run dado get --project ", name, " again")))
+    string8 low = txt(strings.to_lower(name))
+    string8 stage = join2(dir_of(dest), txt(#format(".", low, ".dado-get")))
+    string8 aside = join2(dir_of(dest), txt(#format(".", low, ".dado-old")))
+    for leftover in [stage, aside]:
+        if !exists(leftover): continue
+        if !is_file(join2(leftover, STAGE_MARK)) || fs.is_link(leftover):
+            die(txt(#format(leftover, " is in the way, and dado get did not make it (it holds no ", STAGE_MARK, "), so it is left alone.\n  help: move it away, then run dado get --project ", name, " again")))
+        remove_tree_quietly(leftover)
+
+    try ref []char8 made_own = fs.make_temp_dir("dado-get") else code:
+        die(txt(#format("no temporary folder to fetch into: ", os.message(code), " (set TMPDIR to one you can write)")))
+        return ("", "")
+    g_scratch = txt(made_own)
+    string8 checkout = join2(g_scratch, low)
+    string8 commit = fetch_at(checkout, name, url, tag, want)
+    (string8 listed, bool ok) = git_lib(checkout, ["-c", "core.quotePath=false", "ls-files", "-z"])
+    if !ok:
+        undo_fetch(checkout, true, true, "")
+        die(txt(#format("git could not list the files of ", name, " (its message is above)")))
+    // Staged beside `dest`, marked as dado's, so a failure leaves `dest` as
+    // it was and a leftover is known to be ours.
+    make_quietly(stage)
+    write_quietly(join2(stage, STAGE_MARK), "a copy dado get was making; safe to delete\n")
+    for rel in strings.split(listed, "\x00"):
+        if #len(rel) == 0 || vendored_skips(rel): continue
+        string8 from = join2(checkout, rel)
+        if is_dir(from): continue    // a submodule's empty folder
+        try ref []char8 bytes = fs.read_file(from) else code:
+            remove_tree_quietly(stage)
+            undo_fetch(checkout, true, true, "")
+            die(txt(#format("cannot read ", from, ": ", os.message(code))))
+            return ("", "")
+        string8 to = join2(stage, rel)
+        make_quietly(dir_of(to))
+        try fs.write_file(to, txt(bytes)) else code:
+            remove_tree_quietly(stage)
+            undo_fetch(checkout, true, true, "")
+            die(txt(#format("cannot write ", to, ": ", os.message(code))))
+            return ("", "")
+    remove_tree_quietly(g_scratch)
+    g_scratch = ""
+    // The marker is not the library's: out before the hash is taken.
+    remove_quietly(join2(stage, STAGE_MARK))
+    (string8 digest, string8 _) = tree_hash(stage)
+    if #len(want_hash) > 0 && digest != want_hash:
+        remove_tree_quietly(stage)
+        die(txt(#format(name, " at ", short(commit), " hashes to ", digest, ", not the pinned ", want_hash, ", so it is not restored: ", MANIFEST_FILE, "'s hash does not describe that commit.\n  help: dado get --project ", name, "@<version> vendors and pins it anew")))
+
+    // The swap: the old copy aside, the new one in, then the old one gone.
+    bool moved_aside = false
+    if exists(dest):
+        try fs.rename(dest, aside) else code:
+            remove_tree_quietly(stage)
+            die(txt(#format("cannot move ", dest, " aside to ", aside, ": ", os.message(code), "; it is as it was")))
+        write_quietly(join2(aside, STAGE_MARK), "an old copy dado get replaced; safe to delete\n")
+        moved_aside = true
+    try fs.rename(stage, dest) else code:
+        if moved_aside:
+            remove_quietly(join2(aside, STAGE_MARK))
+            try fs.rename(aside, dest) else:
+                die(txt(#format("cannot move ", stage, " to ", dest, " (", os.message(code), "), nor the old copy back from ", aside, ": move it back by hand")))
+        remove_tree_quietly(stage)
+        die(txt(#format("cannot move ", stage, " to ", dest, ": ", os.message(code), "; ", dest, " is as it was")))
+    if moved_aside: remove_tree_quietly(aside)
+    ignored_by_project(root, dest)
+    return (commit, digest)
+
+// The file that marks a folder beside a vendored copy as dado get's own
+// (its staging copy, or the old copy being replaced), and so safe to remove.
+private const string8 STAGE_MARK = ".dado-get-staging"
+
+// The first of `dest` and the folders above it, up to and including the
+// project's `collections/`, that is a symbolic link; "" when none is.
+private string8 link_above(string8 root, string8 dest):
+    string8 stop = comparable_path(join2(root, "collections"))
+    string8 at = dest
+    for:
+        if fs.is_link(at): return at
+        if comparable_path(at) == stop: return ""
+        string8 up = dir_of(at)
+        if up == at || #len(up) == 0: return ""
+        at = up
+    return ""
+
+// Warn when the project's git ignores files of the copy just vendored at
+// `dest`: `git add -A` would leave them out, and a fresh clone of the
+// project would then fail the copy's hash.
+private void ignored_by_project(string8 root, string8 dest):
+    (string8 _, bool in_git) = git_at(root, ["rev-parse", "--is-inside-work-tree"])
+    if !in_git: return
+    (ref []string8 rels, string8 _) = vendored_files(dest)
+    if #len(rels) == 0: return
+    strings.Builder input = strings.builder(256)
+    for rel in rels:
+        _ = strings.append(&input, join2(dest, rel))
+        _ = strings.append(&input, "\n")
+    Captured r = capture(git_in(root, ["check-ignore", "--no-index", "--stdin"]), true, strings.text(input))
+    string8 out_raw = r.out
+    string8 ignored = strings.trim(out_raw)
+    if #len(ignored) == 0: return
+    warn(txt(#format("the project's git ignores some of the vendored files, so they would not be committed and a fresh clone would fail the copy's hash:\n  ", txt(strings.replace(ignored, "\n", "\n  ")), "\n  help: un-ignore them (a `!` line in the project's .gitignore), or add them with git add -f")))
+
+// Whether `rel`, a path in a library, is left out of its vendored copy and
+// the copy's hash: anything named `.git…` at any depth (`.gitignore`,
+// `.gitattributes`, `.github/`, `.gitmodules`), which would change how the
+// project's own git treats the copy.
+bool vendored_skips(string8 rel):
+    for part in strings.split(txt(strings.replace(rel, "\\", "/")), "/"):
+        if strings.starts_with(part, ".git"): return true
+    return false
+
+// Every file of the vendored copy at `dir`, by its path relative to it with
+// `/`, sorted by byte, hidden ones included and `vendored_skips` left out;
+// and the first symbolic link under it, which makes the copy unreadable as
+// one (`link` is then set).
+(ref []string8 rels, string8 link) vendored_files(string8 dir):
+    ref []string8 out = #make([]string8, 0)
+    string8 link = collect_files(dir, "", &out)
+    sort_texts(out[:])
+    return (out, link)
+
+private string8 collect_files(string8 dir, string8 prefix, ^ref []string8 out):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return ""
+    defer l.destroy()
+    for e in l.entries:
+        string8 rel = e.path if #len(prefix) == 0 else txt(#format(prefix, "/", e.path))
+        if vendored_skips(rel): continue
+        string8 full = join2(dir, e.path)
+        if fs.is_link(full): return full
+        if e.is_dir:
+            string8 link = collect_files(full, rel, out)
+            if #len(link) > 0: return link
+            continue
+        _ = #append(out^, rel)
+    return ""
+
+// The first entry under the vendored copy at `dir`, at any depth, named
+// `.git…` (`vendored_skips`), by its full path; "" when there is none. A
+// vendored copy never holds one: the hash passes over them, so one added
+// later (a `.gitignore` keeping the copy's files out of the project's
+// commits, a `.git` making a folder a nested repository) would go unseen.
+// Symbolic links are not followed (`tree_hash` refuses them).
+string8 git_entry_in(string8 dir):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return ""
+    defer l.destroy()
+    for e in l.entries:
+        string8 full = join2(dir, e.path)
+        if strings.starts_with(e.path, ".git"): return full
+        if e.is_dir && !fs.is_link(full):
+            string8 inner = git_entry_in(full)
+            if #len(inner) > 0: return inner
+    return ""
+
+// The refusal for git's file `entry` found in the vendored copy at `dir`.
+string8 git_entry_problem(string8 dir, string8 entry):
+    return txt(#format("vendored at ", dir, " holds ", entry, ", one of git's own files, which a vendored copy never has: its hash passes over them, and one can change what the project's git commits (a .gitignore there can keep the copy's files out of a commit)"))
+
+// The content hash of the vendored copy at `dir` (`hash_vendored_file` holds
+// the recipe), or why it has none: a symbolic link under it (`bad`).
+(string8 digest, string8 bad) tree_hash(string8 dir):
+    (ref []string8 rels, string8 link) = vendored_files(dir)
+    if #len(link) > 0:
+        return ("", txt(#format(link, " is a symbolic link; a vendored copy holds none, since one can bring in files from outside the project")))
+    hash.Sha256 h = hash.sha256_init()
+    for rel in rels:
+        try ref []char8 bytes = fs.read_file(join2(dir, rel)) else:
+            hash_vendored_file(&h, rel, "\x00unreadable")
+            continue
+        hash_vendored_file(&h, rel, txt(bytes))
+    return (vendored_digest(&h), "")
+
+// The refusal for a project folder that is a git checkout where a vendored
+// copy belongs (an earlier `dado get --project` made checkouts).
+private string8 not_vendored(string8 dir, string8 name, string8 version):
+    string8 v = txt(#format("@", version)) if #len(version) > 0 else ""
+    return txt(#format(dir, " is a git checkout, but a project's copy of a library is vendored files, committed with the project, with no .git.\n  help: move it away (or delete it), then: dado get --project ", name, v))
+
+// After a fetch: a warning when the library's own `dado.json` calls it
+// something else, and how to import it.
+private void arrived(string8 dir, string8 name):
+    string8 own = join2(dir, MANIFEST_FILE)
+    if is_file(own):
+        (Library lib, bool good, string8 why) = parse_library(read_or_empty(own))
+        if !good:
+            warn(txt(#format(own, " ", why, " (the library's own manifest; the fetch goes ahead)")))
+        else if #len(lib.name) > 0 && !strings.equal_fold(lib.name, name):
+            warn(txt(#format("the library calls itself ", lib.name, " in its ", MANIFEST_FILE, ", not ", name, "; it is imported as lib:", txt(strings.to_lower(name)), ", the name it was fetched by")))
+    ref []string8 imports = library_imports(dir, txt(strings.to_lower(name)))
+    if #len(imports) == 0:
+        note("it holds no .dado files at its top or one folder down; its README says how it is used")
+        return
+    say("Import it with:")
+    for i in 0..<#len(imports):
+        if i == 8:
+            say(txt(#format("  … and ", #len(imports) - 8, " more (dado api lib:", txt(strings.to_lower(name)), "/<package>)")))
+            break
+        say(txt(#format("  ", imports[i])))
+
+// The import lines for the packages in a library at `dir` (`import_line`):
+// its top when it holds `.dado` files, and each folder one level down that
+// does (not `build/`, `tests/` or a hidden one), each by the package its
+// files declare.
+ref []string8 library_imports(string8 dir, string8 low):
+    ref []string8 out = #make([]string8, 0)
+    (bool top, string8 top_pkg) = package_in(dir)
+    if top: _ = #append(out, import_line(txt(#format("lib:", low)), top_pkg))
+    try fs.Listing l = fs.read_dir(dir) else:
+        return out
+    defer l.destroy()
+    ref []string8 names = #make([]string8, 0)
+    for e in l.entries:
+        if !e.is_dir || strings.starts_with(e.path, ".") || e.path == "build" || e.path == "tests": continue
+        (bool has, string8 _) = package_in(join2(dir, e.path))
+        if has: _ = #append(names, e.path)
+    sort_texts(names[:])
+    for n in names:
+        (bool _, string8 pkg) = package_in(join2(dir, n))
+        _ = #append(out, import_line(txt(#format("lib:", low, "/", n)), pkg))
+    return out
+
+// Whether `dir` holds a `.dado` file that is not a test, and the package the
+// first of them (by name) declares, "" when it cannot be read.
+private (bool has, string8 pkg) package_in(string8 dir):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return (false, "")
+    defer l.destroy()
+    ref []string8 files = #make([]string8, 0)
+    for e in l.entries:
+        if !e.is_dir && strings.ends_with(e.path, ".dado") && !strings.ends_with(e.path, "_test.dado"):
+            _ = #append(files, e.path)
+    if #len(files) == 0: return (false, "")
+    sort_texts(files[:])
+    try ref []char8 text = fs.read_file(join2(dir, files[0])) else:
+        return (true, "")
+    return (true, declared_package(txt(text)))
+
+// What is wrong with pin `p`'s copy in the project at `root`, the command
+// that fixes it, and whether a bare `dado get` may fix it (a copy that is
+// missing, or an install checkout at another commit); "" when nothing is.
+//
+// A pin with a `hash` is a vendored copy in the project's overlay, checked by
+// its content hash. One without is the install's checkout, checked by its
+// commit and that nothing differs from it; a project folder for it then is
+// refused, since it would win in a build unchecked.
+(string8 problem, string8 fix, bool restorable) pin_problem(string8 root, Pin p):
+    (string8 overlay, string8 install) = library_dirs(root, p.name)
+    string8 vendor_fix = txt(#format("dado get --project ", p.name, "@", p.version))
+    string8 get_fix = txt(#format("dado get ", p.name, "@", p.version))
+    bool own_overlay = comparable_path(overlay) != comparable_path(install)
+    if #len(p.hash) > 0:
+        string8 linked = link_above(root, overlay)
+        if #len(linked) > 0:
+            return (txt(#format("is reached through ", linked, ", a symbolic link, so its vendored copy is not the project's own")), txt(#format("replace the link with a real folder, then: ", vendor_fix)), false)
+        if !exists(overlay) || empty_dir(overlay):
+            return (txt(#format("is not vendored in the project (there is no ", overlay, ")")), txt(#format(vendor_fix, " (or a bare dado get, for every library ", MANIFEST_FILE, " pins)")), true)
+        if exists(join2(overlay, ".git")):
+            return (txt(#format("at ", overlay, " is a git checkout, not vendored files")), txt(#format("move it away (or delete it), then: ", vendor_fix)), false)
+        string8 gitty = git_entry_in(overlay)
+        if #len(gitty) > 0:
+            return (git_entry_problem(overlay, gitty), txt(#format("delete ", gitty, " (a vendored copy is checked by its hash and committed whole), then build again; or move the folder away and: ", vendor_fix)), false)
+        (string8 h, string8 bad) = tree_hash(overlay)
+        if #len(bad) > 0:
+            return (txt(#format("vendored at ", overlay, " cannot be checked: ", bad)), txt(#format("replace the link with what it points to, or move the folder away, then: ", vendor_fix)), false)
+        if h != p.hash:
+            return (txt(#format("vendored at ", overlay, " was edited: its files hash to ", short(h), ", not the pinned ", short(p.hash))), txt(#format("keep the edits elsewhere (move the folder aside, or fork the library and fetch your fork) or delete the folder, then: ", vendor_fix)), false)
+        return ("", "", false)
+    if own_overlay && is_dir(overlay):
+        if exists(join2(overlay, ".git")):
+            return (txt(#format("has a git checkout at ", overlay, ", which a build would use unchecked; a project's copy is vendored files now")), txt(#format("move it away (or delete it), then: ", vendor_fix, " to vendor it, or a bare dado get to use the install's")), false)
+        return (txt(#format("has files at ", overlay, " that the pin does not describe (it has no hash), which a build would use unchecked")), txt(#format(vendor_fix, " to vendor it, or move the folder away to use the install's")), false)
+    if !exists(install):
+        return (txt(#format("is not fetched (there is no ", install, ")")), txt(#format(get_fix, " (or a bare dado get, for every library ", MANIFEST_FILE, " pins)")), true)
+    if !is_dir(join2(install, ".git")) || comparable_path(git_top(install)) != comparable_path(install):
+        return (txt(#format("at ", install, " is not a git checkout")), txt(#format("move it away, then: ", get_fix)), false)
+    (string8 head, bool _) = git_lib(install, ["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+    string8 changes = checkout_changes(install)
+    if #len(changes) > 0:
+        return (txt(#format("at ", install, " has files that are not its commit's (changed, untracked, ignored or hidden from git status)")), txt(#format("keep them elsewhere (git -C ", install, " stash -u) or discard them, then: ", get_fix)), false)
+    if head != p.commit:
+        return (txt(#format("at ", install, " is at ", short(head) if #len(head) > 0 else "no commit")), get_fix, true)
+    return ("", "", false)
+
+// Bare `dado get`: every pinned library back where its pin says, the second
+// machine's case. A copy already right is left alone.
+private i32 restore_pins(string8 root, Library proj):
+    if #len(proj.libraries) == 0:
+        say(txt(#format(join2(root, MANIFEST_FILE), " pins no libraries, so there is nothing to restore. Fetch one with: dado get <Name>")))
+        return 0
+    for p in proj.libraries:
+        (string8 overlay, string8 install) = library_dirs(root, p.name)
+        string8 dir = overlay if #len(p.hash) > 0 else install
+        (string8 problem, string8 fix, bool restorable) = pin_problem(root, p)
+        if #len(problem) == 0:
+            say_green("ok", txt(#format(" ", p.name, " ", p.version, " (", short(p.commit), ") in ", dir)))
+            continue
+        if !restorable:
+            die(txt(#format("the library ", p.name, " ", problem, ", so it is not restored.\n  help: ", fix)))
+        // A tag that is gone leaves "": the commit is what the pin promises.
+        string8 tag = restore_tag(remote_listing(p.repository), p.version, p.commit)
+        if #len(p.hash) > 0:
+            (string8 c, string8 _) = vendor(root, overlay, p.name, p.repository, tag, p.commit, p.hash, false, "")
+            say_green("got", txt(#format(" ", p.name, " ", p.version, " (", short(c), ") vendored in ", overlay)))
+        else:
+            string8 commit = fetch_at(install, p.name, p.repository, tag, p.commit)
+            say_green("got", txt(#format(" ", p.name, " ", p.version, " (", short(commit), ") in ", install)))
+    return 0
+
+// Before a build: each library the project pins is where its pin says and
+// exactly what it pins (`pin_problem`); otherwise the build is refused with
+// the command that fixes it. Nothing is read but `dado.json`, and nothing
+// run, when no library is pinned.
+void check_pins(string8 dir):
+    string8 root = project_root(dir)
+    if #len(root) == 0: return
+    string8 manifest_path = join2(root, MANIFEST_FILE)
+    if !is_file(manifest_path): return
+    string8 text = read_or_empty(manifest_path)
+    if !strings.contains(text, "\"libraries\""): return
+    (Library lib, bool good, string8 why) = parse_library(text)
+    if !good:
+        die(txt(#format(manifest_path, " ", why, ", so the libraries it pins cannot be checked. Correct it and build again")))
+    for p in lib.libraries:
+        (string8 problem, string8 fix, bool _) = pin_problem(root, p)
+        if #len(problem) == 0: continue
+        die(txt(#format("the library ", p.name, " ", problem, ", but ", manifest_path, " pins ", p.version, " (", short(p.commit), ").\n  help: ", fix)))

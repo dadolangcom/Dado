@@ -1352,10 +1352,29 @@ export async function runPage() {
             (fd === 2 ? console.error : console.log)(line);
         }
     };
+    // A partial line written after the program finished — by a Dado function
+    // a page's callback calls once `main` returned — goes to the console when
+    // the task that wrote it ends, so nothing waits for a newline that may
+    // never come; it is on the page already.
+    let tail = false;
+    const lineEnd = () => {
+        tail = false;
+        for (const fd of [1, 2]) {
+            if (pending[fd] !== "") {
+                (fd === 2 ? console.error : console.log)(pending[fd]);
+                pending[fd] = "";
+            }
+        }
+    };
+    // What is written after the program finished is shown too: `main`
+    // returning ends the run, not the page, and a page's callbacks may still
+    // call Dado functions that print.
     const out = (fd, bytes) => {
-        if (!done) {
-            const which = fd === 2 ? 2 : 1;
-            write(which, decoders[which].decode(bytes, { stream: true }));
+        const which = fd === 2 ? 2 : 1;
+        write(which, decoders[which].decode(bytes, { stream: true }));
+        if (done && !tail && pending[which] !== "") {
+            tail = true;
+            setTimeout(lineEnd, 0);
         }
     };
     let settle;

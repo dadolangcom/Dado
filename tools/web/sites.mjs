@@ -2,7 +2,9 @@
 // `load.mjs` does, and then report every script's call of a Dado function:
 // where it is, what it calls, how it crosses (`inline` or `thunk`) and why,
 // and — in a dev build — how often it crossed, how many narrowing wraps there
-// changed the value, and how many of its calls fell back to the thunk.
+// changed the value, and how many of its calls left the fast path (a string
+// encoded into a block of the heap or with a lone surrogate, a character
+// that raised).
 //
 //     node tools/web/sites.mjs build/game.wasm
 //

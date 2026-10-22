@@ -56,9 +56,12 @@ private const i64 MAX_RECEIVING = 127
 // One channel a script binds a handler to, as the glue's table lays it out: its
 // qualified name, the generated function that drains it into a handler —
 // answering 0, or `STOPPED` with the stop pending in the engine, and adding
-// how many messages it delivered to its last argument — its owner word, and
-// its index in the program's channel directory, which names its bit.
-type ChannelRow: (cstring name, i32(^JSContext, JSValue, ^i64) deliver, rawptr owner, i64 index)
+// how many messages it delivered to its last argument — its owner word, its
+// index in the program's channel directory, which names its bit, and its
+// producers' word with whether the channel keeps only its latest value: a
+// queue's `tail` (twice the messages ever sent, and a flag) or a latest
+// channel's `word` (its buffers' rotation), which every `#send` moves.
+type ChannelRow: (cstring name, i32(^JSContext, JSValue, ^i64) deliver, rawptr owner, i64 index, rawptr sent, i64 latest)
 
 // The glue's table: the program's flag word and bitmap, and its rows in
 // directory order.
@@ -77,6 +80,13 @@ type Receivers:
 // The rows any VM has bound, one bit each; read by every watch, written
 // under the handle table's lock.
 private u64 g_received
+// The glue's table, as the first `receive` found it (one per program): what
+// a crossing with no VM running reads (`mark_sends`, `sent_unheard`).
+private rawptr g_table
+// Each bound row's producers' word as a crossing with no VM running began,
+// by row, and whether they were taken.
+private [MAX_CHANNELS]u64 g_marks
+private bool g_marked
 // Which ids a receiving VM holds, by `id - 1`.
 private [MAX_RECEIVING]bool g_ids
 
@@ -131,6 +141,7 @@ JSValue receive_channel(^JSContext ctx, JSValue handler, i64 row):
     e^.receivers.rows = e^.receivers.rows | row_bit(row)
     table_lock()
     g_received = g_received | row_bit(row)
+    g_table = rawptr(e^.channels)
     table_unlock()
     // What was sent before the `receive` is delivered at the next safe
     // point, as what comes after it is.
@@ -238,6 +249,65 @@ private i32 watch(Engine e, ^i64 delivered):
     if again:
         _ = #atomic_fetch_or(flags_of(t), u32(1), #RELEASE)
     return got
+
+// A bound row's producers' word: it moves at every `#send` to the channel.
+// A latest channel's rotation comes back to where it was after two sends, so
+// two in one crossing look like none; a latest channel keeps one value
+// anyway, which the next send replaces.
+private u64 sends_of(ChannelRow r):
+    if r.latest != 0:
+        return u64(#atomic_load(^u32(r.sent), #ACQUIRE))
+    return #atomic_load(^u64(r.sent), #ACQUIRE) >> u64(1)
+
+// The rows bound to a script, and the glue's table: none while no `receive`
+// has run.
+private (u64 rows, ^ChannelTable t) bound_rows():
+    table_lock()
+    u64 rows = g_received
+    rawptr at = g_table
+    table_unlock()
+    if rows == 0 || at == nil:
+        return (0, nil)
+    return (rows, ^ChannelTable(at))
+
+// A crossing with no VM running beginning — on the web, a script's call of a
+// Dado function after `main` returned: each bound channel's producers' word,
+// so that its end can tell what this call sent from what already waited.
+void mark_sends():
+    (u64 rows, ^ChannelTable t) = bound_rows()
+    g_marked = rows != 0
+    if rows == 0:
+        return
+    i64 count = t^.count
+    if count > i64(MAX_CHANNELS):
+        count = i64(MAX_CHANNELS)
+    for r in 0..<count:
+        if (rows & row_bit(r)) != 0:
+            g_marks[r] = sends_of(channel_row(t, r))
+
+// That crossing's end: whether it sent a message on a channel a script
+// receives which still waits — nothing can call a handler with no VM
+// running. A message that waited before the call began is not this call's,
+// and is not said again at every call after it.
+bool sent_unheard():
+    if !g_marked:
+        return false
+    g_marked = false
+    (u64 rows, ^ChannelTable t) = bound_rows()
+    if rows == 0:
+        return false
+    i64 count = t^.count
+    if count > i64(MAX_CHANNELS):
+        count = i64(MAX_CHANNELS)
+    for r in 0..<count:
+        if (rows & row_bit(r)) == 0:
+            continue
+        ChannelRow row = channel_row(t, r)
+        if sends_of(row) == g_marks[r]:
+            continue
+        if (#atomic_load(bits_word(t, row.index / 64), #ACQUIRE) & channel_bit(row.index)) != 0:
+            return true
+    return false
 
 // One message into a handler, from a channel's generated drain: `argv` its
 // fields, which this takes. Answers 0, or `STOPPED` with the stop pending; a

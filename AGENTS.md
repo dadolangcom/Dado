@@ -173,7 +173,7 @@ stable machine-readable answer.
 | everything that uses a declaration | `dado refs mypkg.area` |
 | change whole declarations, checked before anything is written | `dado inspect mypkg.area -o area.dado`, edit the file, `dado apply area.dado` |
 | where the toolchain is, and whether it is healthy | `dado where`, `dado doctor` |
-| a new project | `dado new hello` |
+| a new project | `dado new hello` (a program), `dado new library Geo`; `dado init <library\|program>` sets up the folder you are in |
 | this guide | `dado agent` |
 
 `dado apply` refuses (and writes nothing) when the new text does not parse or a name in it does

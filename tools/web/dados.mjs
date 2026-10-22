@@ -281,17 +281,29 @@ export class Session {
     // ── inline crossings (a16-inline) ────────────────────────────────────
 
     /** The lend lock before an inline crossing, while a run has lent the
-     * script a Dado structure: as a thunk's entry, every lend fingerprinted. */
+     * script a Dado structure: as a thunk's entry, every lend fingerprinted.
+     * With no VM running (after `main` returned), before a crossing whose
+     * callee can reach `#send`: what the channels scripts receive have been
+     * sent so far, marked for `channels`. */
     settle() {
         this.exports.dados_settle(this.current);
     }
 
     /** The safe point after an inline crossing whose callee can reach
      * `#send`, the any-channel bit set: channels delivered to the running VM's
-     * handlers; a stop a handler met is thrown into the script. */
+     * handlers; a stop a handler met is thrown into the script. With no VM
+     * running — `main` has returned — nothing can deliver, and a message this
+     * call sent for a script's handler is said, not dropped (2); one that
+     * waited before the call is not this call's, and is not said. */
     channels() {
         const c = this.current;
-        if (this.exports.dados_channels(c) !== 0) throw this.take(c);
+        const r = this.exports.dados_channels(c);
+        if (r === 2) {
+            throw engineError(() => new Error(
+                "a message was sent on a channel a script receives after `main` returned, and on the web a script's handlers are called only while `main` runs (at a crossing's return or `#script_pump`): it waits in the channel, undelivered",
+            ));
+        }
+        if (r !== 0) throw this.take(c);
     }
 
     /** A failable Dado function's failure at an inline site: the `Error` its
@@ -1061,7 +1073,7 @@ export const DADOS_HOST = {
         const name = s.cstr(np);
         const known = s.modules.get(name);
         if (isC === 0 && known === undefined) {
-            s.raise(c, new ReferenceError(`could not load module '${name}': the build wrote no file for it`));
+            s.raise(c, new ReferenceError(`could not load module '${name}': the build wrote no file for it. On the web a script's modules are the files the build writes beside the module, from its classes and the JavaScript they import; a module registered as a string (\`script.add_module\`) is never compiled there`));
             return 0;
         }
         s.defs.set(defp >>> 0, {

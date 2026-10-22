@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 703d96d30a51 (dirty) -->
+<!-- dadoc 1.0.0-rc.6 -->
+<!-- commit 4de070662e29 -->
 # app:log
 
 app:log — thread-safe logging from any worker, flushed at the barrier.
@@ -64,5 +64,15 @@ the next person does not have to rediscover them:
 
 ## Declarations
 
-0 declarations, 0 public.
+17 declarations, 10 public.
 
+* `const i32 RING_CAP = 64`
+* `void trace(string8 tag, string8 msg, i32 worker = 0)`
+* `void debug(string8 tag, string8 msg, i32 worker = 0)`
+* `void info (string8 tag, string8 msg, i32 worker = 0)`
+* `void warn (string8 tag, string8 msg, i32 worker = 0)`
+* `void error(string8 tag, string8 msg, i32 worker = 0)`
+* `i32 dropped(i32 worker)` — How many records this worker has dropped since its last flush — a sign a…
+* `const i32 MAX_SINKS = 8`
+* `void add_sink(corelog.Sink s)` — Register another sink. A no-op past `MAX_SINKS` — eight is more than any…
+* `void flush()` — Merge every worker's buffered records — worker 0 first, then 1..N, oldest…
