@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 9fddd51732b8 -->
+<!-- dadoc 1.0.0-rc.6 -->
+<!-- commit 1dcb7bb16c7f (dirty) -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -142,7 +142,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [LNT0731](LNT0731.md) | lint | a `switch` over an `enum` whose arms leave a declared member unnamed |
 | [ERR0801](ERR0801.md) | error | a key whose `==` is not stable and total, so an entry could be inserted and never found again |
 | [ERR0802](ERR0802.md) | error | a `$K` bound to a type whose `==` is not stable and total, so the map it keys has no key |
-| [ERR0803](ERR0803.md) | error | a view, a walk or a handle used after the block under it may have moved or been taken back — `#append`, `#resize`, `#reserve`, `#delete`, an insert, rebinding the handle, handing a `^` to it to a call, `#send`ing the `ref` to a channel, draining the channel a `#peek` lent it from, or ending the region it was minted in (a scratch frame rolled back, an arena's mark ended, an arena destroyed) — on some path through the same function |
+| [WRN0803](WRN0803.md) | warning | a view, a walk or a handle used after the block under it may have moved or been taken back — `#append`, `#resize`, `#reserve`, `#delete`, an insert, rebinding the handle, handing a `^` to it to a call, `#send`ing the `ref` to a channel, draining the channel a `#peek` lent it from, or ending the region it was minted in (a scratch frame rolled back, an arena's mark ended, an arena destroyed) — on some path through the same function |
 | [ERR0804](ERR0804.md) | error | an assignment to `#default`, which is immutable within a scope — a nested suite shadows it with `using`, and nothing rebinds it |
 | [ERR0805](ERR0805.md) | error | a spelling the language has retired, written where its replacement belongs — the message names the repair |
 | [ERR0807](ERR0807.md) | error | a lifetime rung written on `resize`, which grows a block where it already lives and so takes no allocator at all |

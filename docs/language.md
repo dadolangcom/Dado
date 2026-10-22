@@ -395,7 +395,13 @@ storage, `put(&f, &SLOT)`, is storing in package storage. **A block behind a
 `ref` or a map** is not read through a view after anything that may move
 or free it — `#append`, `#resize`, `#reserve`, `#delete`, an insert,
 rebinding the handle, or a call whose body grows or frees it — and a
-`defer` counts where it runs, at the scope's exit (ERR0803). A view a
+`defer` counts where it runs, at the scope's exit. **Such a read is a
+warning, not a refusal** (WRN0803), `--strict` included: the compiler
+does not yet tell a read that must follow the move from one that only
+may, so the program builds, and `dado test`'s AddressSanitizer (with a C
+compiler that has one: `--cc clang` or `--cc gcc`) catches the read if it
+happens. Everything below that this section says
+of a stale view or handle is that warning. A view a
 call answers is minted at the call: when `items()` answers `store[:]` of a
 package-level `ref`, its result is not read after a call that grows
 that `ref`, as `store[:]` written in place is not. A copy of a handle
@@ -404,7 +410,7 @@ the place it was copied from hands the block to the copy. A `ref` a
 call answers after filling it with views of an argument — `split(b[:])`
 appending `b`'s sections, in place or through a `^ref []T` — is a block
 of its own: reading through it, a copy of it or a view of it after `b`
-moves is refused, and measuring or freeing it is not. A handle a call
+moves is warned about, and measuring or freeing it is not. A handle a call
 answers may be a copy of a handle its argument reaches — the package
 `ref` it hands back, `p^` for `grab(&b)` — and is stale when that one
 moves. A binding declared in a loop's body is a new block each pass,
@@ -430,7 +436,7 @@ answers may be a copy of any of that type its arguments reach), and a
 conversion to `rawptr` drops what it pointed at. A copy of a handle stored
 in a block or in package storage (`hs[0] = b`, `KEEP = b`) is not followed
 there, and neither are views of a package `ref`'s own block stored in package
-storage. Views of a block stored in package storage refuse a later move of
+storage. Views of a block stored in package storage warn at a later move of
 it in the function that stored them, and not once the block has left that
 function, returned or stored away. A record a call keeps pointers into its
 own blocks in is taken to manage them itself. Two subscripts are one
@@ -441,7 +447,7 @@ of what the subscripted array holds. A callee that leaves a slot `nil` on every 
 (`take(&c)` answering `c.tris` after `c.tris = nil`, or `defer self.out =
 nil` beside `return self.out`) hands that slot's block over, as `b^ = nil` on
 every way out hands over the block `b^` held; the answer is still taken for
-a copy of any other handle `c` holds, whatever its type, and refused after
+a copy of any other handle `c` holds, whatever its type, and warned about after
 one of those moves. A `return take(&c)` written directly is not checked
 against a `defer` that frees what `c` holds.
 
@@ -500,7 +506,7 @@ the frame back (`runtime.close_temp()`, `runtime.temp_close(cp)`,
 `runtime.close_temp_hoisting`), ending the mark (`arena.end`, `arena.end_keeping`),
 destroying or resetting the arena or the scratch. After that the handle, its
 copies and its views are not read, written, walked, grown or handed on
-(ERR0803); `#len`, `#cap`, `#delete` and rebinding stay legal. A frame
+(WRN0803, a warning); `#len`, `#cap`, `#delete` and rebinding stay legal. A frame
 closed with `runtime.close_temp_keep()`, or opened escaping
 (`runtime.enter_temp(true)`), is not rolled back: what it held belongs to the
 enclosing frame.
@@ -523,7 +529,7 @@ void build(^ref []i64 out):
 using runtime.enter_temp():
     ref []i64 small = #make([]i64, 0)
     build(&small)
-    i64 v = small[0]              // ERR0803: the call took it back
+    i64 v = small[0]              // WRN0803: the call took it back
 ```
 
 What is not followed is said out loud. A handle whose allocator the

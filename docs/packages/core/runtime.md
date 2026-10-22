@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 (dirty) -->
+<!-- dadoc 1.0.0-rc.6 -->
+<!-- commit 1dcb7bb16c7f (dirty) -->
 # core:runtime
 
 core:runtime — the scratch allocator, its checkpoints, and `TEMP_GUARD`, one
@@ -18,7 +18,7 @@ of each per thread.
 
 The result is minted **before** the frame opens. Minted inside it on `#return`, it
 would lie above the frame's mark whenever the caller is itself in the scratch, and
-the rollback would take it back (`dadoc` refuses the caller's use, ERR0803).
+the rollback would take it back (`dadoc` warns at the caller's use, WRN0803).
 
 `enter_temp`/`close_temp` is the recommended pattern; `temp_open`/`temp_close`
 with a held `Checkpoint` remain for explicit, non-LIFO control.

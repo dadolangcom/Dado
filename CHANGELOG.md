@@ -10,7 +10,33 @@ is under **Breaking** (a removal is under **Removed**, and breaks a program that
 the old name or signature, the new one, and what to write instead. Diagnostic codes are the
 ones `dado explain` describes.
 
-## 1.0.0-rc.7 (unreleased)
+## 1.0.0-rc.7.1 (2026-10-22)
+
+### Breaking
+
+_Nothing yet._
+
+### Added
+
+_Nothing yet._
+
+### Changed
+
+- The escape check's stale-read diagnostic is a warning: `ERR0803` is now `WRN0803`, a warning and never an error, `--strict` included, so it no longer fails `dado check`, `build`, `run` or `test`. rc.7's hardened check refused real programs that read nothing freed — the three shapes it added under **Breaking** in rc.7 among them; one user's project went from 0 errors on rc.6 to 239 on rc.7 — and the check cannot yet tell a read that must follow a move or free from one that only may. Same detection, same message and `help:` line; only the severity and the letters change, and `dado explain ERR0803` still answers (as the former spelling of `WRN0803`). rc.8 splits the check: a read proven to follow a move or free is an error again, and one that only may stays this warning.
+
+### Fixed
+
+_Nothing yet._
+
+### Removed
+
+_Nothing yet._
+
+### Known issues
+
+- A read that may follow a move or free of the block under it — `^i32 p = &xs[1]`, then `#append(xs, 9)`, then `p^ = 3` — now compiles, with `WRN0803`, including one that certainly reads freed memory. `dado test` catches it at run time with AddressSanitizer (`heap-use-after-free`) when the C compiler has one — `--cc clang` or `--cc gcc`; the pinned zig has none and sanitizes with UBSan alone, which does not see it.
+
+## 1.0.0-rc.7 (2026-10-21)
 
 ### Breaking
 
