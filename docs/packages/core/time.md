@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 703d96d30a51 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:time
 
 core:time — measuring how long something took, and waiting.
@@ -65,8 +65,8 @@ arithmetic can be tested, and run in a script, without a clock.
 **What raises into a script.** Everything written in Dado alone is promised
 by the `#assert_raises` on the line above it: the `Duration` constructors
 and readers, `between` and `add`, the calendar, RFC 3339 and `message`, and
-the `_at` methods of `Stopwatch` and `Deadline` (through `raises_test.dado`,
-since a method cannot carry the promise). What reads a clock or waits is
+the `_at` methods of `Stopwatch` and `Deadline` and `Stopwatch.reset`. What
+reads a clock or waits is
 not: each platform's clock is a foreign call (`clock_gettime`,
 `QueryPerformanceCounter`, the web host's `performance.now()`), and a
 script reads its own clock.
@@ -118,20 +118,20 @@ any header pulls it in. So the macro is written here and the sidecar is gone.
 * `i64 unix_nanos()` — Nanoseconds since the Unix epoch, 1970-01-01 UTC. Wall time — settable, and…
 * `i64 unix()` — Whole seconds since the Unix epoch.
 * `type Stopwatch` — An accumulating timer over the monotonic clock: it adds up the intervals…
-* `void start(^self)` — Start it, or keep it running if it is already.
-* `void stop(^self)` — Stop it, adding the interval since it started to its total. A…
-* `void reset(^self)` — Stopped, at zero.
-* `void restart(^self)` — At zero, and running from now.
-* `Duration elapsed(self)` — The total it has run for, including the interval in progress.
-* `void start_at(^self, Instant now)` — `start`, at the reading `now`.
-* `void stop_at(^self, Instant now)` — `stop`, at the reading `now`.
-* `Duration elapsed_at(self, Instant now)` — `elapsed`, at the reading `now`.
+* `void Stopwatch.start(^self)` — Start it, or keep it running if it is already.
+* `void Stopwatch.stop(^self)` — Stop it, adding the interval since it started to its total. A…
+* `void Stopwatch.reset(^self)` — Stopped, at zero.
+* `void Stopwatch.restart(^self)` — At zero, and running from now.
+* `Duration Stopwatch.elapsed(self)` — The total it has run for, including the interval in progress.
+* `void Stopwatch.start_at(^self, Instant now)` — `start`, at the reading `now`.
+* `void Stopwatch.stop_at(^self, Instant now)` — `stop`, at the reading `now`.
+* `Duration Stopwatch.elapsed_at(self, Instant now)` — `elapsed`, at the reading `now`.
 * `Stopwatch stopwatch()` — A stopwatch at zero, running from now.
 * `type Deadline` — A moment on the monotonic clock by which something has to be done: a…
-* `bool passed(self)` — Whether the deadline has passed: true from the moment it falls due.
-* `Duration left(self)` — What is left before it falls due, and zero once it has — never…
-* `bool passed_at(self, Instant now)` — `passed`, at the reading `now`.
-* `Duration left_at(self, Instant now)` — `left`, at the reading `now`.
+* `bool Deadline.passed(self)` — Whether the deadline has passed: true from the moment it falls due.
+* `Duration Deadline.left(self)` — What is left before it falls due, and zero once it has — never…
+* `bool Deadline.passed_at(self, Instant now)` — `passed`, at the reading `now`.
+* `Duration Deadline.left_at(self, Instant now)` — `left`, at the reading `now`.
 * `Deadline deadline(Duration timeout)` — The deadline `timeout` from now.
 * `Deadline deadline_from(Instant start, Duration timeout)` — The deadline `timeout` after `start`. A timeout too long for the clock…
 * `type DateTime` — A moment as the calendar writes it, in UTC. `month` is 1 to 12, `day` 1 to…

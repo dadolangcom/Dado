@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 703d96d30a51 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:threads
 
 core:threads: threads, locks, condition variables and atomics, on every
@@ -120,31 +120,31 @@ that spawns with `./dado test --sanitize=thread` as well as the default.
 * `T atomic_fetch_xor(^$T p, T bits, Order order = Order.SeqCst) where T in (i32, u32, i64, u64)` — Xors `bits` into the value at `p` and answers the value that was there…
 * `void atomic_fence(Order order = Order.SeqCst)` — Orders the memory accesses before it against those after it, as `order`
 * `type AtomicBool` — A `bool` read and written atomically. The verbs take no `bool` cell, so it…
-* `bool load(^self, Order order = Order.SeqCst)` — The value.
-* `void store(^self, bool v, Order order = Order.SeqCst)` — Sets the value to `v`.
-* `bool exchange(^self, bool v, Order order = Order.SeqCst)` — Sets the value to `v` and answers the one it replaced.
-* `bool compare_exchange(^self, bool expected, bool desired, Order order = Order.SeqCst)` — Sets the value to `desired` if it is `expected`, and answers whether it…
+* `bool AtomicBool.load(^self, Order order = Order.SeqCst)` — The value.
+* `void AtomicBool.store(^self, bool v, Order order = Order.SeqCst)` — Sets the value to `v`.
+* `bool AtomicBool.exchange(^self, bool v, Order order = Order.SeqCst)` — Sets the value to `v` and answers the one it replaced.
+* `bool AtomicBool.compare_exchange(^self, bool expected, bool desired, Order order = Order.SeqCst)` — Sets the value to `desired` if it is `expected`, and answers whether it…
 * `type Once` — Runs a function once, whichever thread asks first. Its zero value has not…
-* `void call(^self, OnceFn fn, rawptr data)` — Runs `fn(data)` if no call has run it yet, and returns once it has run.
-* `bool done(^self)` — Whether the function has run to its end.
+* `void Once.call(^self, OnceFn fn, rawptr data)` — Runs `fn(data)` if no call has run it yet, and returns once it has run.
+* `bool Once.done(^self)` — Whether the function has run to its end.
 * `type Semaphore` — A counting semaphore: `acquire` takes one unit, waiting while there are…
-* `void acquire(^self)` — Takes a unit, waiting until one is free.
-* `bool try_acquire(^self)` — Takes a unit if one is free, without waiting. True when it took one.
-* `bool acquire_for(^self, time.Duration d)` — Takes a unit, waiting at most `d` for one. True when it took one.
-* `void release(^self, i64 n = 1)` — Gives back `n` units (one by default), waking as many waiters. A count…
-* `i64 available(^self)` — The units free now, which may change before the caller reads it.
-* `void destroy(^self)` — Frees its mutex and condition variable. No thread may be waiting.
+* `void Semaphore.acquire(^self)` — Takes a unit, waiting until one is free.
+* `bool Semaphore.try_acquire(^self)` — Takes a unit if one is free, without waiting. True when it took one.
+* `bool Semaphore.acquire_for(^self, time.Duration d)` — Takes a unit, waiting at most `d` for one. True when it took one.
+* `void Semaphore.release(^self, i64 n = 1)` — Gives back `n` units (one by default), waking as many waiters. A count…
+* `i64 Semaphore.available(^self)` — The units free now, which may change before the caller reads it.
+* `void Semaphore.destroy(^self)` — Frees its mutex and condition variable. No thread may be waiting.
 * `Error!Semaphore semaphore(i64 initial)` — A semaphore holding `initial` units (0 when `initial` is negative). Fails…
 * `type WaitGroup` — Waits for a counted set of tasks: `add` counts them in, each task calls…
-* `void add(^self, i64 n)` — Adds `n` to the count. When the count reaches 0 or below it is 0, and…
-* `void done(^self)` — One task finished: `add(-1)`.
-* `void wait(^self)` — Waits until the count is 0.
-* `bool wait_for(^self, time.Duration d)` — Waits at most `d` for the count to reach 0. True when it did.
-* `void destroy(^self)` — Frees its mutex and condition variable. No thread may be waiting.
+* `void WaitGroup.add(^self, i64 n)` — Adds `n` to the count. When the count reaches 0 or below it is 0, and…
+* `void WaitGroup.done(^self)` — One task finished: `add(-1)`.
+* `void WaitGroup.wait(^self)` — Waits until the count is 0.
+* `bool WaitGroup.wait_for(^self, time.Duration d)` — Waits at most `d` for the count to reach 0. True when it did.
+* `void WaitGroup.destroy(^self)` — Frees its mutex and condition variable. No thread may be waiting.
 * `Error!WaitGroup wait_group()` — A wait group with a count of 0. Fails `NO_MEMORY` when its mutex or…
 * `type Barrier` — Holds each of a fixed number of threads at `wait` until all of them have…
-* `bool wait(^self)` — Waits until `parties` threads have called `wait` in this round. Answers…
-* `void destroy(^self)` — Frees its mutex and condition variable. No thread may be waiting.
+* `bool Barrier.wait(^self)` — Waits until `parties` threads have called `wait` in this round. Answers…
+* `void Barrier.destroy(^self)` — Frees its mutex and condition variable. No thread may be waiting.
 * `Error!Barrier barrier(i32 parties)` — A barrier for `parties` threads (1 when `parties` is below 1). Fails…
 
 ## channels/back-pressure

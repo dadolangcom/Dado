@@ -43,7 +43,7 @@ with the diagnostic you will see:
 | `a + b` on strings | `strings.concat(a, b)` or `#format(a, b)` | ERR0607 |
 | `i64 n = x` where `x` is `i32`, `x * 1.5` | widening is implicit; narrowing between written widths, and mixing integers with floats, are `i32(n)`, `f64(x) * 1.5` | ERR0504 |
 | `f(a = 2)` | `f(a: 2)` for a named argument | ERR0604 |
-| `[]` for an empty slice | `[]f64 xs` with no value is empty; `[1, 2]` is a fixed `[2]` | ERR0504 |
+| `[]` for an empty slice | `[]f64 xs` with no value is empty, as is `nil` where a slice is wanted (`= nil`, a default, an argument); `[1, 2]` is a fixed `[2]` | ERR0504 |
 | `map[string]int`, `HashMap` | maps are built in: `{string8: i32} m = {}`, `m[k] = v`, `m[k] += 1`, `k in m`, `for k, v in m:` | ERR0201, ERR0401 |
 | `x = m[k]` for a key that may be missing | a read is failable: `try c = m[k] else:` | ERR0611 |
 | `try i32 c = f() else: c = 0` | the `else` of a declaring `try` must leave; declare `c` first and write `try c = f() else:` | ERR0716 |
@@ -111,6 +111,9 @@ i32 main():
 
 Allocation: `#make` takes from the current allocator (C's heap unless a scope says
 otherwise); `ref` marks a value that owns what it points at, and `#delete` gives it back. A
+`ref []T` is made before it grows: a zero one (a slot of a zero-valued record, or one after
+`#delete`) is `nil` with no allocator, so `#append` to it answers `false` and stores nothing,
+the same answer as running out of memory. A zero map, by contrast, is usable. A
 `using arena.allocator(&a):` block (`core:mem/arena`) makes every allocation in it come from an
 arena freed at once. `defer` runs a statement at the end of its scope.
 
@@ -137,7 +140,26 @@ i32 test():
     return 0 if ok else 1
 ```
 
-`dado test hello` builds each test file into its own program and runs it under the sanitizers.
+`dado test hello` builds each test file into its own program and runs it under ASan and UBSan.
+Builds come in three tiers, each a preset of switches written at any tier: a dev build (`build`,
+`run`) carries Dado's own checks (`--dado-checks`); `--debug` (which also compiles `-g -O0`), and
+`dado test`, adds the call stack (`--full-trace`) and C's sanitizers (`--c-sanitize`); `--release`
+has none of them. `--sanitize` is Dado's checks plus C's sanitizers, `--no-sanitize` neither; a
+feature's own `--no-…` switch beats both. Dado's checks trap a read the compiler could only warn
+of (`WRN0803`; one it proves is `ERR0803` and does not build) if the block it reads really was
+freed, naming the read and the free. The stack makes every trap (a bounds check, `#assert`, that
+stale read) print `  at file:line:col in main.f` for each call outward, and `#trace()` answers
+them as a `ref []Location` (the caller `#delete`s it; without the stack it answers just the place
+it is written, which is `#location()`: one `Location` by value, a constant in every build,
+nothing to free; as a default, `Location at = #location()`, it is each caller's place). The
+pinned `zig cc` has no AddressSanitizer, so a build with C's sanitizers and no
+`--cc` uses the first compiler found that has one here (`CC`, then gcc and clang on `PATH`, then
+the usual places; `dado doctor` lists them all) and says which; with none, or on Windows, or under
+`--cc zig`, it is UBSan alone. The summary line names the ones that ran: `(sanitized: asan,
+ubsan)` or `(sanitized: ubsan)`.
+`dado test --target=web` is UBSan alone, there being no runtime for wasm: a check in C reports
+its place through the console and traps. On `#NONE`, `--sanitize` calls a weak
+`undefined_behavior(check, file, line, column)` the program may define, then traps.
 
 ## The collections
 

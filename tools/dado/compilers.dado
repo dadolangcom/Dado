@@ -1,0 +1,302 @@
+// The C compilers on this machine: **one discovery, read by two callers** —
+// the sanitized build with no `--cc` (`sanitizing_compiler`, which takes the
+// first whose AddressSanitizer runs) and `dado doctor` (which lists every
+// one), so what doctor says is what `--debug` and `dado test` pick.
+//
+// **Where it looks, in order:** `CC` when it is set (said, and tried first);
+// then `gcc` and `clang` on `PATH`, then their versioned names on `PATH`
+// (`gcc-14` … `gcc-9`, `clang-20` … `clang-14`); then the places each system
+// keeps compilers off `PATH` (`compiler_places`). One file found twice — `gcc`
+// a link to `gcc-13`, `/bin` a link to `/usr/bin` — is listed once, under its
+// first name. `DADO_CC_SEARCH=path` looks at `CC` and `PATH` alone.
+package driver
+
+import "core:fmt"
+import "core:os/fs"
+import "core:strings"
+
+// A place a C compiler may be: `how` is `path` (a name looked up on `PATH`),
+// `file` (a path, used when it runs), `glob` (a path with a wildcard in one
+// component, newest version first) or `xcrun` (`xcrun --find <what>`).
+type Place:
+    string8 how
+    string8 what
+
+private void put_place(^ref []Place out, string8 how, string8 what):
+    Place p
+    p.how = how
+    p.what = what
+    _ = #append(out^, p)
+
+// The newest and oldest versioned names looked up on `PATH`.
+private const i64 GCC_NEWEST = 14
+private const i64 GCC_OLDEST = 9
+private const i64 CLANG_NEWEST = 20
+private const i64 CLANG_OLDEST = 14
+
+// Every place a C compiler is looked for on a host whose `#OS` is `os`, in
+// order, after `CC`: the names on `PATH` first, then the system's own places.
+ref []Place compiler_places(string8 os):
+    ref []Place out = #make([]Place, 0)
+    put_place(&out, "path", "gcc")
+    put_place(&out, "path", "clang")
+    for i in 0..<GCC_NEWEST - GCC_OLDEST + 1:
+        put_place(&out, "path", txt(#format("gcc-", GCC_NEWEST - i)))
+    for i in 0..<CLANG_NEWEST - CLANG_OLDEST + 1:
+        put_place(&out, "path", txt(#format("clang-", CLANG_NEWEST - i)))
+    if os == "#DARWIN":
+        put_place(&out, "xcrun", "clang")
+        put_place(&out, "file", "/opt/homebrew/opt/llvm/bin/clang")
+        put_place(&out, "file", "/usr/local/opt/llvm/bin/clang")
+        put_place(&out, "glob", "/opt/homebrew/bin/gcc-[0-9]*")
+        put_place(&out, "glob", "/usr/local/bin/gcc-[0-9]*")
+    else if os == "#LINUX":
+        for dir in ["/usr/bin", "/usr/local/bin"]:
+            put_place(&out, "file", txt(#format(dir, "/gcc")))
+            put_place(&out, "file", txt(#format(dir, "/clang")))
+            put_place(&out, "glob", txt(#format(dir, "/gcc-[0-9]*")))
+            put_place(&out, "glob", txt(#format(dir, "/clang-[0-9]*")))
+        put_place(&out, "glob", "/usr/lib/llvm-*/bin/clang")
+    else if os == "#WINDOWS":
+        for env in ["ucrt64", "mingw64", "clang64"]:
+            put_place(&out, "file", txt(#format("C:\\msys64\\", env, "\\bin\\gcc.exe")))
+            put_place(&out, "file", txt(#format("C:\\msys64\\", env, "\\bin\\clang.exe")))
+        put_place(&out, "file", "C:\\Program Files\\LLVM\\bin\\clang.exe")
+    return out
+
+// The version number a compiler's path carries: the last run of digits
+// that follows a `-` (`gcc-13`, `/usr/lib/llvm-18/bin/clang`), or -1.
+i64 version_number(string8 p):
+    i64 found = 0 - 1
+    i64 i = 0
+    for i < #len(p):
+        if p[i] == '-' && i + 1 < #len(p) && p[i + 1] >= '0' && p[i + 1] <= '9':
+            i64 n = 0
+            i64 j = i + 1
+            for j < #len(p) && p[j] >= '0' && p[j] <= '9' && j - i < 10:
+                n = n * 10 + i64(p[j] - '0')
+                j += 1
+            found = n
+            i = j
+            continue
+        i += 1
+    return found
+
+// `paths` in place, the highest `version_number` first; equal ones keep
+// their order.
+void newest_first([]string8 paths):
+    for i in 1..<#len(paths):
+        string8 v = paths[i]
+        i64 n = version_number(v)
+        i64 j = i
+        for j > 0 && version_number(paths[j - 1]) < n:
+            paths[j] = paths[j - 1]
+            j -= 1
+        paths[j] = v
+
+// The version in a compiler's `--version` first line: its last word when
+// that starts with a digit (gcc: `gcc (Ubuntu 13.3.0-6ubuntu2~24.04)
+// 13.3.0`), else its first word that starts with a digit and holds a `.`
+// (clang: `Ubuntu clang version 18.1.3 (1ubuntu1)`); "" when there is none.
+string8 version_of(string8 line):
+    ref []string8 w = words_of(line)
+    if #len(w) == 0: return ""
+    string8 last = w[#len(w) - 1]
+    if last[0] >= '0' && last[0] <= '9': return last
+    for x in w:
+        if #len(x) > 0 && x[0] >= '0' && x[0] <= '9' && strings.has_byte(x, '.'):
+            return x
+    return ""
+
+// ── finding them ────────────────────────────────────────────────────────────
+
+// One compiler found: the words that start it, its name on a line, the file
+// it runs as, and where it was found (`CC`, `PATH`, `xcrun` or `place`).
+type FoundCompiler:
+    ref []string8 words
+    string8 name
+    string8 file
+    string8 via
+
+private ref []FoundCompiler g_found
+private bool g_found_asked
+private string8 g_cc_said           // `CC` as set, or ""
+private bool g_cc_runs              // whether it named a program that runs
+
+// `CC` as set (empty when it is not), and whether it named a program that
+// runs: what `c_compilers` found of it.
+(string8 cc, bool runs) cc_variable():
+    _ = c_compilers()
+    return (g_cc_said, g_cc_runs)
+
+// Every C compiler found here, in the order above, asked once a run.
+[]FoundCompiler c_compilers():
+    if g_found_asked: return g_found[:]
+    g_found_asked = true
+    g_found = #make([]FoundCompiler, 0)
+    ref []string8 seen = #make([]string8, 0)
+    (string8 cc, bool cc_set) = env("CC")
+    string8 cc_trimmed = strings.trim(cc)
+    if cc_set && #len(cc_trimmed) > 0:
+        g_cc_said = cc_trimmed
+        ref []string8 w = words_of(g_cc_said)
+        string8 file = on_path(w[0])
+        if #len(file) > 0:
+            g_cc_runs = true
+            add_found(&seen, w, g_cc_said, file, "CC")
+    // `DADO_CC_SEARCH=path` keeps the search to `CC` and `PATH`.
+    (string8 search, bool _) = env("DADO_CC_SEARCH")
+    for place in compiler_places(this_os()):
+        if search == "path" && place.how != "path": continue
+        if place.how == "path":
+            string8 file = on_path(place.what)
+            if #len(file) > 0: add_found(&seen, one_word(place.what), place.what, file, "PATH")
+        else if place.how == "file":
+            if fs.is_executable(place.what): add_found(&seen, one_word(place.what), place.what, place.what, "place")
+        else if place.how == "glob":
+            try fs.Listing l = fs.glob(place.what) else:
+                continue
+            ref []string8 paths = #make([]string8, 0)
+            for e in l.entries:
+                ref []char8 own = #format(e.path)
+                _ = #append(paths, txt(own))
+            l.destroy()
+            newest_first(paths[:])
+            for p in paths:
+                if fs.is_executable(p): add_found(&seen, one_word(p), p, p, "place")
+        else if place.how == "xcrun":
+            string8 xcrun = on_path("xcrun")
+            if #len(xcrun) == 0: continue
+            Command c = command(xcrun)
+            add(&c, "--find")
+            add(&c, place.what)
+            string8 file = first_line(c, true)
+            if #len(file) > 0 && fs.is_executable(file): add_found(&seen, one_word(file), file, file, "xcrun")
+    return g_found[:]
+
+private ref []string8 one_word(string8 w):
+    ref []string8 out = #make([]string8, 0)
+    _ = #append(out, w)
+    return out
+
+// `file` added under `name`, unless the file it resolves to was found before.
+private void add_found(^ref []string8 seen, []string8 words, string8 name, string8 file, string8 via):
+    string8 real_file = real(file)
+    for s in seen^:
+        if s == real_file: return
+    _ = #append(seen^, real_file)
+    FoundCompiler f
+    ref []string8 w = #make([]string8, 0)
+    for x in words:
+        _ = #append(w, x)
+    f.words = w
+    f.name = name
+    f.file = file
+    f.via = via
+    _ = #append(g_found, f)
+
+// The `Compiler` that runs `f`.
+Compiler found_compiler(FoundCompiler f):
+    Compiler c = given_compiler(f.words[0])
+    c.words = f.words
+    c.name = f.name
+    return c
+
+// ── doctor's table ──────────────────────────────────────────────────────────
+
+// One row of `dado doctor`'s compiler table.
+type CompilerRow:
+    string8 name
+    string8 version
+    string8 file
+    string8 via
+    string8 asan        // yes, no, hangs
+    string8 ubsan       // yes, no
+    bool chosen         // what `--debug` and `dado test` build with
+
+// The table as text: a header, a row per compiler (`*` before the one a
+// sanitized build picks), then a line saying which that is and why.
+string8 compilers_text([]CompilerRow rows, string8 cc_said, bool cc_runs):
+    strings.Builder b = strings.builder(512)
+    i64 wn = 8
+    i64 wv = 7
+    for r in rows:
+        if #len(r.name) > wn: wn = #len(r.name)
+        if #len(r.version) > wv: wv = #len(r.version)
+    _ = strings.append(&b, txt(#format("\nC compilers (CC, then PATH, then the usual places):\n    ", padded("compiler", wn), "  ", padded("version", wv), "  ASan   UBSan  found  path\n")))
+    string8 picked = ""
+    for r in rows:
+        string8 mark = "  * " if r.chosen else "    "
+        if r.chosen: picked = r.name
+        _ = strings.append(&b, txt(#format(mark, padded(r.name, wn), "  ", padded(r.version if #len(r.version) > 0 else "?", wv), "  ", padded(r.asan, 5), "  ", padded(r.ubsan, 5), "  ", padded(r.via, 5), "  ", r.file, "\n")))
+    if #len(cc_said) > 0 && !cc_runs:
+        _ = strings.append(&b, txt(#format("    CC=", cc_said, " is set, and is not a program that runs here\n")))
+    if #len(picked) > 0:
+        _ = strings.append(&b, txt(#format("  * dado test and --debug build with ", picked, "\n")))
+    return txt(strings.finish(&b))
+
+// The table as a JSON array of objects, one per row.
+string8 compilers_json([]CompilerRow rows):
+    strings.Builder b = strings.builder(512)
+    _ = strings.append(&b, "[")
+    i64 i = 0
+    for r in rows:
+        _ = strings.append(&b, "\n    " if i == 0 else ",\n    ")
+        _ = strings.append(&b, txt(#format("{\"name\": ", json_quote(r.name), ", \"version\": ", json_quote(r.version), ", \"path\": ", json_quote(r.file), ", \"found\": ", json_quote(r.via), ", \"asan\": ", json_quote(r.asan), ", \"ubsan\": ", json_quote(r.ubsan), ", \"chosen\": ", "true" if r.chosen else "false", "}")))
+        i += 1
+    _ = strings.append(&b, "\n  ]" if i > 0 else "]")
+    return txt(strings.finish(&b))
+
+private string8 probe_said(i32 answer):
+    if answer == PROBE_RAN: return "yes"
+    if answer == PROBE_HUNG: return "hangs"
+    return "no"
+
+// Every compiler found, probed for AddressSanitizer (with UBSan, as a
+// sanitized build compiles) and for UBSan alone, then the pinned zig (which
+// has no AddressSanitizer, so only its UBSan is asked), the one
+// `sanitizing_compiler` picks marked. The probes are cached as a build's are.
+ref []CompilerRow compiler_rows():
+    ref []CompilerRow rows = #make([]CompilerRow, 0)
+    Compiler z = compiler("zig", true)
+    string8 picked = ""
+    if z.found && !cross_compiling():
+        Compiler p = sanitizing_compiler(z, false)
+        if !p.zig: picked = p.name
+    (ref []string8 ac, ref []string8 al) = sanitizer_words(setting("CFLAGS_SANITIZE"), setting("LDFLAGS_SANITIZE"), false)
+    (ref []string8 uc, ref []string8 ul) = sanitizer_words(setting("CFLAGS_SANITIZE"), setting("LDFLAGS_SANITIZE"), true)
+    for f in c_compilers():
+        Compiler c = found_compiler(f)
+        CompilerRow r
+        r.name = f.name
+        r.file = f.file
+        r.via = f.via
+        Command v = command_of(c.words[:])
+        add(&v, "--version")
+        r.version = version_of(first_line(v, true))
+        r.asan = probe_said(cached_probe(c, ac[:], al[:]))
+        r.ubsan = probe_said(cached_probe(c, uc[:], ul[:]))
+        r.chosen = #len(picked) > 0 && f.name == picked
+        _ = #append(rows, r)
+    if z.found:
+        CompilerRow r
+        r.name = "zig cc"
+        r.file = z.words[0]
+        r.via = "pin"
+        Command v = command(z.words[0])
+        add(&v, "version")
+        r.version = first_line(v, true)
+        r.asan = "no"
+        r.ubsan = probe_said(cached_probe(z, uc[:], ul[:]))
+        r.chosen = #len(picked) == 0
+        _ = #append(rows, r)
+    return rows
+
+// `dado doctor`'s compiler table on standard output, as text or JSON.
+void print_compilers(bool json):
+    ref []CompilerRow rows = compiler_rows()
+    (string8 cc, bool runs) = cc_variable()
+    if json:
+        fmt.print(compilers_json(rows[:]))
+        return
+    fmt.print(compilers_text(rows[:], cc, runs))

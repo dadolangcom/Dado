@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # app:headless
 
 app:headless — the same runtime with nothing on the other end of it.
@@ -131,7 +131,7 @@ second backstop is the runtime's: a hook that fails stops the loop too, and
 
 48 declarations, 30 public.
 
-* `const i32 E_FRAME_BUDGET = 2` — ── failure codes ───────────────────────────────────────────────────────────…
+* `const i32 E_FRAME_BUDGET = 2` — Three, and each is one thing this facade can actually see. A failure that…
 * `const i32 E_DRAW_UP = 3`
 * `const i32 E_ROOT_CANVAS = 4`
 * `!void init(string8 name, i32 max_frames = 0)` — Install the headless backend on the app singleton. This is the first line of…

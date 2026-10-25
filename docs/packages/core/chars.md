@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit f4253b706f10 (dirty) -->
 # core:chars
 
 core:chars — one byte's class and case, UTF-8 code points, and how wide a
@@ -29,10 +29,10 @@ of `é` answers no.
 letters `SS`, one code point to two, and a `char8 → char8` function has
 nowhere to put the second. There is no `char32` case mapping in `core`.
 
-**The segmentation is code points, not graphemes.** `decode`,
-`decode_bytes`, `encode`, `count`, `valid`, `prev_start`, `decode_last`,
-`width`, `display_width` and `fit` (`utf8.dado`) are correct UTF-8 and
-correct per code point;
+**The segmentation is code points, not graphemes.** `decode`, `encode`,
+`count`, `valid`, `prev_start`, `decode_last`, `width`, `display_width` and
+`fit` (`utf8.dado`) are correct UTF-8 and correct per code point (bytes held
+as `[]u8` are decoded as the text they view, `decode(string8(b), at)`);
 `cluster_end` (`cluster.dado`) groups a base with the zero-width code points
 after it, which is what a cell grid needs and is **not** Unicode's extended
 grapheme cluster — `cluster.dado` says where the two differ. `count` counts
@@ -59,7 +59,7 @@ any number of threads may call anything at once.
 
 ## Declarations
 
-43 declarations, 33 public.
+42 declarations, 32 public.
 
 * `bool is_alpha(char8 c)` — Whether `c` is an ASCII letter, `A`..`Z` or `a`..`z`.
 * `bool is_digit(char8 c)` — Whether `c` is an ASCII decimal digit, `0`..`9`. A hex digit's letters are…
@@ -83,7 +83,6 @@ any number of threads may call anything at once.
 * `i64 cluster_start(string8 s, i64 at)` — The byte index where the cluster **before** `at` begins — the step a caret…
 * `const char32 REPLACEMENT = char32(0xFFFD)` — U+FFFD, the replacement character — what a malformed sequence decodes to.
 * `(char32 cp, i64 size) decode(string8 s, i64 at)` — Decode one character from `s` beginning at byte `at`.
-* `(char32 cp, i64 size) decode_bytes([]u8 s, i64 at)` — `decode` over bytes rather than text: the code point at `s[at]` and how…
 * `i64 encoded_size(char32 cp)` — How many bytes `cp` encodes to. Zero for a value that is not a character.
 * `i64 encode(char32 cp, []char8 into, i64 at)` — Encode `cp` into `into` at byte `at`. Answers how many bytes were written,…
 * `i64 count(string8 s)` — How many characters are in `s`, as opposed to how many bytes.

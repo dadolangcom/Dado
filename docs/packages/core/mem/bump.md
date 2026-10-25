@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:mem/bump
 
 core:mem/bump — a cursor over a block, behind the allocator interface.
@@ -61,7 +61,7 @@ allocating from one race on its cursor.
 * `Arena over([]u8 storage)` — An arena over storage that already exists — a `[N]u8` on the stack, a…
 * `(mem.Proc proc, rawptr data) allocator(^Arena arena)` — The allocator for `arena`. The arena is the allocator's `data`, so it is…
 * `type BumpAllocator using mem.Allocator` — The allocator for a bump arena, as a declaration that takes `mem.Allocator` on:
-* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.arena)` answers.
+* `(mem.Proc proc, rawptr data) BumpAllocator.data(self)` — The two words `allocator(self.arena)` answers.
 * `u64 used(Arena a)` — How many bytes are in use, alignment padding included. A test asserting an…
 * `u64 available(Arena a)` — How many bytes are left: the capacity `over` kept, less `used`. A request…
 * `void reset(^Arena a)` — Release every allocation in one store. **Lifetime-ending**: every…

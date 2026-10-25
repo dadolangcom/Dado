@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit fa29e0260488 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:hash
 
 core:hash — hashes over bytes: the SHA family and HMAC for digests,
@@ -14,10 +14,8 @@ hosted (POSIX and Windows) unchanged, and answers the same bits on each.
 **What raises into a script.** Every package-level function, each
 promised by the `#assert_raises` on the line above it; the generic
 digest verbs are checked at each instantiation a program makes, and the
-tests make one at each digest size. The methods of
-`Sha1`, `Sha256` and `Sha512` cannot carry the promise themselves, so
-`raises_test.dado` makes it for them through a private function that
-calls each one. Nothing is left out.
+tests make one at each digest size. Every method of `Sha1`, `Sha256` and
+`Sha512` carries its own. Nothing is left out.
 
 **Thread-safety.** Nothing here is shared: there is no package state. A
 `Sha256` (or `Sha1`, `Sha512`) is a plain value; one thread at a time may
@@ -112,25 +110,25 @@ A key, seed or running hash always comes first.
 * `bool equal_hex([$N]u8 digest, string8 text)` — Whether `text` is `digest` in hex: exactly two digits a byte, upper or…
 * `type Sha256Digest: [32]u8` — The 32 bytes of a SHA-256 digest, in the order FIPS 180-4 writes them.
 * `type Sha256` — A SHA-256 in progress. Start one with `sha256_init`, feed it with…
-* `void update(^self, []u8 data)` — Feed `data`. Any split of a message across calls gives the digest the…
-* `void update_text(^self, string8 text)` — Feed the bytes of `text`.
-* `Sha256Digest finish(^self)` — Pad, compress the last block and answer the digest. The state is…
+* `void Sha256.update(^self, []u8 data)` — Feed `data`. Any split of a message across calls gives the digest the…
+* `void Sha256.update_text(^self, string8 text)` — Feed the bytes of `text`.
+* `Sha256Digest Sha256.finish(^self)` — Pad, compress the last block and answer the digest. The state is…
 * `Sha256 sha256_init()` — A fresh SHA-256: FIPS 180-4's initial hash value, nothing fed.
 * `Sha256Digest sha256([]u8 data)` — The SHA-256 of `data`, in one call.
 * `Sha256Digest sha256_text(string8 text)` — The SHA-256 of the bytes of `text`, in one call.
 * `type Sha1Digest: [20]u8` — The 20 bytes of a SHA-1 digest, in the order FIPS 180-4 writes them.
 * `type Sha1` — A SHA-1 in progress: `sha1_init`, then `update` as the bytes arrive,…
-* `void update(^self, []u8 data)` — Feed `data`. Any split of a message across calls gives the digest…
-* `void update_text(^self, string8 text)` — Feed the bytes of `text`.
-* `Sha1Digest finish(^self)` — Pad, compress the last block and answer the digest. The state is…
+* `void Sha1.update(^self, []u8 data)` — Feed `data`. Any split of a message across calls gives the digest…
+* `void Sha1.update_text(^self, string8 text)` — Feed the bytes of `text`.
+* `Sha1Digest Sha1.finish(^self)` — Pad, compress the last block and answer the digest. The state is…
 * `Sha1 sha1_init()` — A fresh SHA-1: FIPS 180-4's initial hash value, nothing fed.
 * `Sha1Digest sha1([]u8 data)` — The SHA-1 of `data`, in one call.
 * `Sha1Digest sha1_text(string8 text)` — The SHA-1 of the bytes of `text`, in one call.
 * `type Sha512Digest: [64]u8` — The 64 bytes of a SHA-512 digest, in the order FIPS 180-4 writes them.
 * `type Sha512` — A SHA-512 in progress: `sha512_init`, then `update` as the bytes…
-* `void update(^self, []u8 data)` — Feed `data`. Any split of a message across calls gives the digest…
-* `void update_text(^self, string8 text)` — Feed the bytes of `text`.
-* `Sha512Digest finish(^self)` — Pad, compress the last block and answer the digest. The state is…
+* `void Sha512.update(^self, []u8 data)` — Feed `data`. Any split of a message across calls gives the digest…
+* `void Sha512.update_text(^self, string8 text)` — Feed the bytes of `text`.
+* `Sha512Digest Sha512.finish(^self)` — Pad, compress the last block and answer the digest. The state is…
 * `Sha512 sha512_init()` — A fresh SHA-512: FIPS 180-4's initial hash value, nothing fed.
 * `Sha512Digest sha512([]u8 data)` — The SHA-512 of `data`, in one call.
 * `Sha512Digest sha512_text(string8 text)` — The SHA-512 of the bytes of `text`, in one call.

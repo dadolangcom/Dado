@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f94cdafd7289 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:io
 
 core:io — files and the standard streams, through C's `<stdio.h>` where
@@ -58,9 +58,10 @@ answer C's own shape — a short count, `end_of_file()`, `at_end` and
 `failed` — because that is what the C library knows. To delete or move a
 file, `core:os/fs` has `remove_file` and `rename`.
 
-**What raises into a script.** `cursor`, a `Cursor`'s `read`, and
-`read_all` over a cursor, promised through `raises_test.dado` (a method
-and a binder carry no `#assert_raises` of their own). Nothing else here
+**What raises into a script.** `cursor` and a `Cursor`'s `read`, each
+promised on the line above it, and `read_all` over a cursor, promised in
+`reader_test.dado` at that instantiation (a promise on the template would
+bind every `Reader` a program passes). Nothing else here
 can be: this package is the boundary with C's streams, so every other
 function reaches a `foreign` call or holds a `^FILE` (an opaque C type) or
 the `rawptr` of a `Sink`. A script has its own `print`, and reads files
@@ -89,11 +90,11 @@ put text on a Windows console.
 
 ## Declarations
 
-137 declarations, 63 public.
+137 declarations, 39 public.
 
 * `trait Reader` — A source of bytes: the read side of a `Sink`. A type takes it on with…
 * `type Cursor using Reader` — Bytes already in memory, read from the front: `at` is how many have been…
-* `os.Error!i64 read(^self, []char8 into)` — The next bytes, up to `#len(into)`; zero at the end. Never fails.
+* `os.Error!i64 Cursor.read(^self, []char8 into)` — The next bytes, up to `#len(into)`; zero at the end. Never fails.
 * `Cursor cursor([]char8 bytes)` — A cursor at the start of `bytes`.
 * `os.Error!ref []char8 read_all(^Reader r)` — Everything `r` has left, as new text on the ambient allocator, which the…
 * `os.Error!i64 copy(^Reader from, Sink to)` — Every byte `from` has left, written to `to`, answering how many were…
@@ -120,36 +121,12 @@ put text on a Windows console.
 * `Sink stdout_sink()` — The page's standard output, as a sink.
 * `Sink stderr_sink()` — The page's standard error, as a sink.
 * `type FILE` — A C stream: what `open` answers and every function here takes, held…
-* `^FILE stdin()` — The process's standard input. In binary mode from the first call.
-* `^FILE stdout()` — The process's standard output. In binary mode from the first call.
-* `^FILE stderr()` — The process's standard error. In binary mode from the first call.
-* `^FILE stdin()` — The process's standard input. POSIX has no text mode: a stream is…
-* `^FILE stdout()` — The process's standard output.
-* `^FILE stderr()` — The process's standard error.
-* `os.Error!^FILE open(string8 path, string8 mode)`
-* `os.Error!^FILE open(string8 path, string8 mode)`
-* `i32 close(^FILE stream)` — Flush and close `stream`: 0, or `end_of_file()` when the flush or the…
-* `i32 write(^FILE stream, string8 text)` — Write `text`: 0, or `end_of_file()` when the stream did not take all of…
-* `i32 write_byte(^FILE stream, char8 byte)` — `fputc` takes an `int` and always has: C's character functions are written…
-* `i32 flush(^FILE stream)` — Hand what the C library holds for `stream` to the system: 0, or…
-* `i32 read_byte(^FILE stream)` — One byte, or `end_of_file()` when there are none left.
-* `i32 end_of_file()` — The value `read_byte` answers at the end: C's `EOF`, a negative `int`
-* `i64 read_bytes(^FILE stream, []char8 into)` — Read up to `#len(into)` bytes into the caller's slice, and answer how many…
-* `i64 write_bytes(^FILE stream, []char8 from)` — Write a slice's bytes, and answer how many were written. Short means the…
-* `bool at_end(^FILE stream)` — Whether a read has reached the end of `stream`: the end-of-file flag,…
-* `bool failed(^FILE stream)` — Whether a read or a write on `stream` has failed: the error flag, which…
-* `void clear_errors(^FILE stream)` — Clear the end-of-file and error flags.
-* `Sink sink(^FILE stream)` — A sink that writes to `stream`. The stream is borrowed and must outlive…
-* `Sink stdout_sink()` — The process's standard output, as a sink.
-* `Sink stderr_sink()` — The process's standard error, as a sink — a diagnostic that survives…
-* `bool seek(^FILE stream, i64 offset, Whence from)` — Move the stream's position to `offset` bytes from `from`, answering…
-* `i64 tell(^FILE stream)` — The stream's position in bytes from its start, or -1 when it has none…
 * `os.Error!^FILE open_read(string8 path)` — Open `path` for reading, as bytes: `open(path, "rb")`.
 * `os.Error!^FILE open_write(string8 path)` — Open `path` for writing, created if absent and emptied if present:
 * `os.Error!^FILE open_append(string8 path)` — Open `path` for writing at its end, created if absent: `open(path, "ab")`.
 * `i32 write_line(^FILE stream, string8 text)` — Write `text`, then a `\n`: 0, or `end_of_file()` when either failed.
 * `type StreamReader using Reader` — A stream, read as a `Reader`. The stream is borrowed and must outlive…
-* `os.Error!i64 read(^self, []char8 into)` — What `read_bytes` reads; fails `IO` when the read failed with…
+* `os.Error!i64 StreamReader.read(^self, []char8 into)` — What `read_bytes` reads; fails `IO` when the read failed with…
 * `StreamReader reader(^FILE stream)` — A reader over `stream`, which is borrowed and must outlive the reader.
 * `StreamReader stdin_reader()` — The process's standard input, as a reader (empty on the web).
 * `os.Error!ref []char8 read_line(^FILE stream)` — The next line of `stream`, as new text on the ambient allocator, which…

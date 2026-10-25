@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 1ebdf675b8e5 (dirty) -->
 # core:mem/libc
 
 core:mem/libc — C's heap behind the `Allocator` interface.
@@ -46,6 +46,14 @@ and imports this package only to hold the allocator as a value.
     Free      free
     FreeAll   **unimplemented**, returns `nil`
 
+**An alignment above `mem.MAX_ALIGN` is refused**, `nil`, for `Alloc` and
+`Resize` alike. `malloc` aligns for every fundamental type and no more, and
+a block aligned to less than it was asked for is C undefined behaviour the
+first time it is used as what it was asked for — a type holding a channel
+asks for 128. The compiler's own root heap, `#heap`, over-allocates and
+honours any alignment; this package stays C's heap exactly, so that what it
+hands out is what `free` takes back.
+
 `FreeAll` returning `nil` is not a stub to be filled in later. C's heap has
 no notion of "everything this allocator handed out", so there is nothing to
 release; the interface drops `Query_Features` because trying and getting
@@ -64,4 +72,4 @@ exist.
 
 * `(mem.Proc proc, rawptr data) allocator()` — The allocator. A value, not a singleton: it is two words and copying it…
 * `type Heap using mem.Allocator` — C's heap as a declaration that takes `mem.Allocator` on, for code that…
-* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator()` answers.
+* `(mem.Proc proc, rawptr data) Heap.data(self)` — The two words `allocator()` answers.

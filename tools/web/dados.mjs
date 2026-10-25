@@ -1073,7 +1073,7 @@ export const DADOS_HOST = {
         const name = s.cstr(np);
         const known = s.modules.get(name);
         if (isC === 0 && known === undefined) {
-            s.raise(c, new ReferenceError(`could not load module '${name}': the build wrote no file for it. On the web a script's modules are the files the build writes beside the module, from its classes and the JavaScript they import; a module registered as a string (\`script.add_module\`) is never compiled there`));
+            s.raise(c, new ReferenceError(`could not load module '${name}': the build wrote no file for it. On the web a script's modules are the files the build writes beside the module, from its classes and the JavaScript they import; a module registered as a string, as \`core:script\`'s own tests register theirs, is never compiled there`));
             return 0;
         }
         s.defs.set(defp >>> 0, {

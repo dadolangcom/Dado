@@ -16,13 +16,18 @@
 // A compiler with no runtime here warns once and runs unsanitized;
 // `--sanitize=thread` swaps AddressSanitizer for ThreadSanitizer and is an
 // error where it cannot run. The pinned zig has no AddressSanitizer on Linux
-// and links a combined list without it, so under zig `address` is dropped,
+// and links a combined list without it, so with no `--cc` a gcc or clang
+// that has one is used instead (`run_compiler`); where zig is still the
+// compiler (`--cc zig`, none here that can, Windows) `address` is dropped,
 // the build says so once, the binaries are named `.ubsan`, and the summary
-// says `(sanitized: ubsan)` rather than claim a check that did not run.
+// says `(sanitized: ubsan)` rather than claim a check that did not run; with
+// AddressSanitizer it says `(sanitized: asan, ubsan)`. A web test (run under
+// node) is sanitized by default too, with C's UBSan alone, there being no
+// AddressSanitizer for wasm: `(sanitized: ubsan)`.
 //
 // **The summary counts what ran.** `(sanitized…)` is printed only when every
-// test that ran was built with a sanitizer, a web test (run under node) never
-// is, and a test's standard error is shown only when it failed.
+// test that ran was built with a sanitizer, and a test's standard error is
+// shown only when it failed.
 package driver
 
 import "core:fmt"
@@ -35,15 +40,17 @@ import "core:strings"
 // What `--filter` and `--shard` asked for, set before the command runs.
 private string8 g_filter = ""
 private string8 g_shard = ""
-private bool g_sanitize_asked
+// The one test file `dado test <pkg>/<file>_test.dado` named, or "".
+private string8 g_test_file = ""
+
+void set_test_file(string8 file):
+    g_test_file = file
 
 // What `test` reads off the command line beyond the shared options: the
-// filter, the slice, and whether `--sanitize` was written (a web test
-// refuses it, where the default is dropped quietly).
-void set_test_selection(string8 filter, string8 shard, bool sanitize_asked):
+// filter and the slice.
+void set_test_selection(string8 filter, string8 shard):
     g_filter = filter
     g_shard = shard
-    g_sanitize_asked = sanitize_asked
 
 // `FAIL …`, its first word in red.
 void say_red(string8 word, string8 rest):
@@ -122,14 +129,17 @@ string8 test_name(string8 file):
 
 // What the summary says about the sanitizers: nothing unless the tests that
 // ran were sanitized (the sanitizers are chosen once per run, so one
-// sanitized run means all were); `thread` for ThreadSanitizer; `ubsan` under the
-// pinned zig, which has no AddressSanitizer, or when the compiler's hung at
-// start-up; otherwise plain `(sanitized)`.
-string8 sanitizer_marker(i64 sanitized_runs, string8 kind, bool zig):
+// sanitized run means all were), and then which ran, by name:
+// `tsan, ubsan` for `--sanitize=thread`; `ubsan` alone under the pinned zig,
+// which has no AddressSanitizer, on the web, which has none for wasm, or when
+// the compiler's hung at start-up;
+// otherwise `asan, ubsan`. A reader asking whether AddressSanitizer ran looks
+// for `(sanitized: asan`.
+string8 sanitizer_marker(i64 sanitized_runs, string8 kind, bool ubsan_alone):
     if sanitized_runs == 0: return ""
-    if kind == "thread": return " (sanitized: thread)"
-    if zig: return " (sanitized: ubsan)"
-    return " (sanitized)"
+    if kind == "thread": return " (sanitized: tsan, ubsan)"
+    if ubsan_alone: return " (sanitized: ubsan)"
+    return " (sanitized: asan, ubsan)"
 
 // The result line: `P passed, F failed`, the slice when sharded, how many
 // `--filter` left out when it left any out, and the sanitizer marker.
@@ -177,6 +187,14 @@ string8 web_manifest(string8 text, string8 scripts):
         if !more: break
         rest = tail
     return txt(strings.finish(&b))
+
+// Where a test's C goes: `<build>/<stem>.<test>.<configuration>.c`, beside
+// its binary and named for the same configuration (`gcc.asan`, `zig.ubsan`,
+// `web`), so a native and a web run of one package at once never compile
+// each other's C. Without the caches the transpile's slot is `<this>.d`, kept
+// apart the same way.
+string8 test_c_path(string8 build_dir, string8 stem, string8 name, string8 cfg):
+    return txt(#format(build_dir, "/", stem, ".", name, ".", cfg, ".c"))
 
 // ── running one test ────────────────────────────────────────────────────────
 
@@ -293,7 +311,7 @@ i32 test_command(^Plan p, ^Options o):
 
     bool web = targets_web()
     Compiler cc = no_compiler("")
-    if !web: cc = need_compiler(o.cc)
+    if !web: cc = need(run_compiler(o, false))
     // Which build a binary is, in its name, so two configurations of one
     // package never overwrite each other's between the link and the run.
     string8 cfg = "web"
@@ -346,11 +364,14 @@ i32 test_command(^Plan p, ^Options o):
         if !in_slice(index, shard_k, shard_n):
             other_slices += 1
             continue
+        if #len(g_test_file) > 0 && clean_path(t.path) != clean_path(g_test_file):
+            filtered += 1
+            continue
         if #len(g_filter) > 0 && !strings.contains(name, g_filter):
             filtered += 1
             continue
 
-        string8 t_c = txt(#format(p.build_dir, "/", p.stem, ".", name, ".c"))
+        string8 t_c = test_c_path(p.build_dir, p.stem, name, cfg)
         try fs.make_dirs(dir_of(t_c)) else: pass
 
         // **One transpile per test for every pass that asks the same
@@ -363,6 +384,8 @@ i32 test_command(^Plan p, ^Options o):
         if o.strict: add(&x, "--strict")
         add(&x, txt(#format("--test=", t.path)))
         if o.line_directives: add(&x, "--line-directives")
+        string8 handlers = ubsan_handlers_flag(o)
+        if #len(handlers) > 0: add(&x, handlers)
         add_all(&x, p.prefix_map[:])
         add(&x, p.pkg_abs)
         ref []string8 args = #make([]string8, 0)
@@ -458,10 +481,9 @@ i32 test_command(^Plan p, ^Options o):
         for l in m.links:
             _ = #append(libs, l)
 
-        // A web test: a module, run under node, unsanitized.
+        // A web test: a module, run under node, under C's UBSan alone when
+        // sanitized (`web_compile_flags`), which is the default here too.
         if m.os == "#WEB":
-            if g_sanitize_asked:
-                die("`dado test --target=web` cannot sanitize: there is no sanitizer runtime for wasm.\n  Drop --sanitize; the tests run under node unsanitized, and the summary says so by omission.")
             if #len(libs) > 0:
                 ref []char8 lj = strings.join(libs[:], " ")
                 die(txt(#format("a web build cannot link native libraries, and this test's build asks for: ", txt(lj))))
@@ -482,6 +504,7 @@ i32 test_command(^Plan p, ^Options o):
                 say_red("FAIL", txt(#format(" ", name, " (the C did not build for wasm32)")))
                 failed += 1
                 continue
+            if o.sanitize: sanitized_runs += 1
             string8 scripts_name = txt(#format(path.base(wasm[0..<#len(wasm) - 5]), ".scripts"))
             try fs.write_file(txt(#format(wasm, ".build")), web_manifest(txt(mtext), scripts_name)) else code:
                 die(txt(#format("cannot write ", wasm, ".build: ", os.message(code))))
@@ -580,6 +603,7 @@ i32 test_command(^Plan p, ^Options o):
         for own in own_objects:
             remove_if_there(own)
         if !built:
+            if sanitized: recheck_sanitizer(cc, san_c[:], san_l[:])
             say_red("FAIL", txt(#format(" ", name, " (the C did not build)")))
             failed += 1
             continue
@@ -590,6 +614,11 @@ i32 test_command(^Plan p, ^Options o):
         Command r = command_of(runner_words[:])
         add(&r, bin)
         (i32 status, string8 said) = run_test_binary(r)
+        string8 unstarted = exec_failure(bin) if status == 127 && #len(runner_words) == 0 else ""
+        if #len(unstarted) > 0:
+            say_red("FAIL", txt(#format(" ", name, " (", unstarted, ")")))
+            failed += 1
+            continue
         report(name, as_posix_status(status, m.os), t.status, said, &passed, &failed)
 
     if passed + failed == 0:
@@ -601,11 +630,14 @@ i32 test_command(^Plan p, ^Options o):
         // would pass a gate whose test was renamed. Only a run that asked
         // for no selection may find no tests and succeed: a package with no
         // `@test` file (`dado package` tests every library it releases).
+        if #len(g_test_file) > 0:
+            die(txt(#format(g_test_file, " is not an @test file of the package ", dir_of(g_test_file), matching, " (", index + 1, " tests in the package)")))
         if #len(g_filter) > 0:
             die(txt(#format("--filter '", g_filter, "' selects no test of ", o.pkg, " (", index + 1, " in the package)")))
         note(txt(#format("no @test files in ", o.pkg)))
         return 0
-    string8 marker = sanitizer_marker(sanitized_runs, o.sanitize_kind, ubsan_only(cc))
+    // The web has UBSan alone: no AddressSanitizer runtime for wasm.
+    string8 marker = sanitizer_marker(sanitized_runs, o.sanitize_kind, web || ubsan_only(cc))
     fmt.println(summary_line(passed, failed, filtered, shard_k, shard_n, other_slices, marker))
     if failed > 0: return 1
     return 0

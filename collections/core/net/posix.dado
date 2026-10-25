@@ -269,6 +269,8 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
     // listener's, and this package answers the same on both.
     private Error!i64 sys_accept(i64 h):
         #c.int c = psock.accept(#c.int(h), nil, nil)
+        for c < 0 && perrno.errno == perrno.EINTR:
+            c = psock.accept(#c.int(h), nil, nil)
         if c < 0:
             try fail_last()
         _ = fcntl(c, F_SETFD, FD_CLOEXEC)
@@ -279,7 +281,9 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
         return i64(c)
 
     // Connect; a nonblocking socket answers `Error.WOULD_BLOCK` while the
-    // connection is under way.
+    // connection is under way. A blocking connect a signal interrupts goes on
+    // in the background and cannot be asked again, so it is waited out and
+    // its outcome read, as a nonblocking one's is.
     private Error!void sys_connect(i64 h, Endpoint to):
         #c.int rc = 0
         if to.ip.family == Family.V4:
@@ -288,6 +292,15 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
         else:
             NetSockAddrIn6 a = sockaddr6(in6_of(to.ip.bytes), htons(to.port), to.ip.zone)
             rc = psock.connect(#c.int(h), SockAddrIn(rawptr(&a)), #c.uint(#size(NetSockAddrIn6)))
+        if rc != 0 && perrno.errno == perrno.EINTR:
+            NetPollFd p = (#c.int(h), #c.short(POLLOUT), 0)
+            #c.int ready = poll_one(&p, -1)
+            for ready < 0 && perrno.errno == perrno.EINTR:
+                ready = poll_one(&p, -1)
+            if ready < 0:
+                try fail_last()
+            try sys_connect_result(h)
+            return
         if rc != 0:
             try fail_last()
 
@@ -300,14 +313,21 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
         if err != 0:
             try fail_errno(i32(err))
 
+    // A call a signal interrupts before it moved a byte is made again, here
+    // and in every call below that can wait: the signal's handler has run, and
+    // the caller asked for the bytes, not for the signal.
     private Error!i64 sys_recv(i64 h, []u8 into):
         #c.long n = psock.recv(#c.int(h), bytes_of(into), #c.size_t(#len(into)), 0)
+        for n < 0 && perrno.errno == perrno.EINTR:
+            n = psock.recv(#c.int(h), bytes_of(into), #c.size_t(#len(into)), 0)
         if n < 0:
             try fail_last()
         return i64(n)
 
     private Error!i64 sys_send(i64 h, []u8 from):
         #c.long n = psock.send(#c.int(h), bytes_of(from), #c.size_t(#len(from)), send_flags())
+        for n < 0 && perrno.errno == perrno.EINTR:
+            n = psock.send(#c.int(h), bytes_of(from), #c.size_t(#len(from)), send_flags())
         if n < 0:
             try fail_last()
         return i64(n)
@@ -317,9 +337,13 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
         if to.ip.family == Family.V4:
             NetSockAddrIn a = sockaddr4(in4_of(to.ip), htons(to.port))
             n = psock.sendto(#c.int(h), bytes_of(data), #c.size_t(#len(data)), 0, SockAddrIn(rawptr(&a)), #c.uint(#size(NetSockAddrIn)))
+            for n < 0 && perrno.errno == perrno.EINTR:
+                n = psock.sendto(#c.int(h), bytes_of(data), #c.size_t(#len(data)), 0, SockAddrIn(rawptr(&a)), #c.uint(#size(NetSockAddrIn)))
         else:
             NetSockAddrIn6 a = sockaddr6(in6_of(to.ip.bytes), htons(to.port), to.ip.zone)
             n = psock.sendto(#c.int(h), bytes_of(data), #c.size_t(#len(data)), 0, SockAddrIn(rawptr(&a)), #c.uint(#size(NetSockAddrIn6)))
+            for n < 0 && perrno.errno == perrno.EINTR:
+                n = psock.sendto(#c.int(h), bytes_of(data), #c.size_t(#len(data)), 0, SockAddrIn(rawptr(&a)), #c.uint(#size(NetSockAddrIn6)))
         if n < 0:
             try fail_last()
         return i64(n)
@@ -328,6 +352,9 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
         NetSockAddrIn6 from
         #c.uint size = #c.uint(#size(NetSockAddrIn6))
         #c.long n = psock.recvfrom(#c.int(h), bytes_of(into), #c.size_t(#len(into)), 0, SockAddrOut(rawptr(&from)), &size)
+        for n < 0 && perrno.errno == perrno.EINTR:
+            size = #c.uint(#size(NetSockAddrIn6))
+            n = psock.recvfrom(#c.int(h), bytes_of(into), #c.size_t(#len(into)), 0, SockAddrOut(rawptr(&from)), &size)
         if n < 0:
             try fail_last()
         try Endpoint sender = endpoint_from(&from)
@@ -376,11 +403,13 @@ when #OS != #WINDOWS && #OS != #WEB && #OS != #NONE && #OS != #WASI && #OS != #E
             try fail_last()
 
     // `poll` on one descriptor. An error or a hang-up counts as ready, so the
-    // next call reports it.
+    // next call reports it. Interrupted, it waits again for the whole timeout.
     private Error!bool sys_wait(i64 h, Ready what, i32 timeout_ms):
         #c.int events = POLLIN if what == Ready.Read else POLLOUT
         NetPollFd p = (#c.int(h), #c.short(events), 0)
         #c.int rc = poll_one(&p, #c.int(timeout_ms))
+        for rc < 0 && perrno.errno == perrno.EINTR:
+            rc = poll_one(&p, #c.int(timeout_ms))
         if rc < 0:
             try fail_last()
         return rc > 0

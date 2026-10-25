@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit ad4cc5b13c3d (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # vendor:enet
 
 vendor:enet — Dado bindings for the zpl-c/enet single-header fork of ENet
@@ -105,21 +105,19 @@ literal as it is and converts a `u64` with `#c.size_t(n)`.
 
 ## Declarations
 
-126 declarations, 120 public.
+126 declarations, 63 public.
 
 * `type @c("struct in_addr") InAddr`
 * `void address_set_any(^ENetAddress addr)` — "Bind to every interface." `enet.h` spells this `ENET_HOST_ANY`, which under…
-* `type @c("struct in_addr") InAddr` — ── hand-written, above the marker, and it stays across a regeneration ──…
-* `void address_set_any(^ENetAddress addr)` — "Bind to every interface." `enet.h` spells this `ENET_HOST_ANY`, which under…
-* `enum @c("ENetPacketFlag") PacketFlag` — bindgen:begin declarations — regenerated; edits between the markers are lost…
+* `enum @c("ENetPacketFlag") PacketFlag`
 * `enum @c("ENetPeerState") PeerState`
 * `enum @c("ENetEventType") EventType`
-* `type ENetPacket` — ── Types ─────────────────────────────────────────────────────────────…
+* `type ENetPacket`
 * `type ENetAddress`
 * `type ENetPeer`
 * `type ENetHost`
 * `type ENetEvent`
-* `^ENetPacket enet_packet_create(const rawptr data, #c.size_t dataLength, u32 flags)` — ── Functions ─────────────────────────────────────────────────────────…
+* `^ENetPacket enet_packet_create(const rawptr data, #c.size_t dataLength, u32 flags)`
 * `void enet_packet_destroy(^ENetPacket packet)`
 * `i32 enet_initialize()`
 * `void enet_deinitialize()`
@@ -171,59 +169,4 @@ literal as it is and converts a `u64` with `#c.size_t(n)`.
 * `enum i32 PacketFlag` — `#WEB` and `#NONE`: the same names, in Dado, and nothing to drive. A page…
 * `enum i32 PeerState`
 * `enum i32 EventType`
-* `type ENetPacket` — The handles are never built here, so their bodies are a placeholder…
-* `type ENetPeer`
-* `type ENetHost`
 * `type InAddr`
-* `type ENetAddress`
-* `type ENetEvent`
-* `^ENetPacket enet_packet_create(const rawptr data, #c.size_t dataLength, u32 flags)`
-* `void enet_packet_destroy(^ENetPacket packet)`
-* `i32 enet_initialize()`
-* `void enet_deinitialize()`
-* `u32 enet_linked_version()`
-* `u32 enet_time_get()`
-* `i32 enet_address_set_host_new(^ENetAddress address, cstring hostName)`
-* `i32 enet_address_get_host_new(^const ENetAddress address, ^#c.char hostName, #c.size_t nameLength)`
-* `u32 enet_host_get_peers_count(^ENetHost host)`
-* `u32 enet_host_get_packets_sent(^ENetHost host)`
-* `u32 enet_host_get_packets_received(^ENetHost host)`
-* `u32 enet_host_get_bytes_sent(^ENetHost host)`
-* `u32 enet_host_get_bytes_received(^ENetHost host)`
-* `u32 enet_peer_get_rtt(^ENetPeer peer)`
-* `PeerState enet_peer_get_state(^ENetPeer peer)`
-* `rawptr enet_peer_get_data(^ENetPeer peer)`
-* `void enet_peer_set_data(^ENetPeer peer, const rawptr data)`
-* `rawptr enet_packet_get_data(^ENetPacket packet)`
-* `u32 enet_packet_get_length(^ENetPacket packet)`
-* `^ENetHost enet_host_create(^const ENetAddress address, #c.size_t peerCount, #c.size_t channelLimit, u32 incomingBandwidth, u32 outgoingBandwidth)`
-* `void enet_host_destroy(^ENetHost host)`
-* `^ENetPeer enet_host_connect(^ENetHost host, ^const ENetAddress address, #c.size_t channelCount, u32 data)`
-* `i32 enet_host_check_events(^ENetHost host, ^ENetEvent event)`
-* `i32 enet_host_service(^ENetHost host, ^ENetEvent event, u32 timeout)`
-* `void enet_host_flush(^ENetHost host)`
-* `void enet_host_broadcast(^ENetHost host, u8 channelID, ^ENetPacket packet)`
-* `void enet_host_channel_limit(^ENetHost host, #c.size_t channelLimit)`
-* `void enet_host_bandwidth_limit(^ENetHost host, u32 incomingBandwidth, u32 outgoingBandwidth)`
-* `i32 enet_peer_send(^ENetPeer peer, u8 channelID, ^ENetPacket packet)`
-* `^ENetPacket enet_peer_receive(^ENetPeer peer, ^u8 channelID)`
-* `void enet_peer_ping(^ENetPeer peer)`
-* `void enet_peer_reset(^ENetPeer peer)`
-* `void enet_peer_disconnect(^ENetPeer peer, u32 data)`
-* `void enet_peer_disconnect_now(^ENetPeer peer, u32 data)`
-* `void enet_peer_disconnect_later(^ENetPeer peer, u32 data)`
-* `^ENetAddress address_create()` — The wrappers above the stubs, with nothing to allocate or copy.
-* `void address_destroy(^ENetAddress addr)`
-* `bool address_set_host(^ENetAddress addr, cstring hostname)`
-* `void address_set_any(^ENetAddress addr)`
-* `void address_set_port(^ENetAddress addr, u16 port)`
-* `u16 address_get_port(^ENetAddress addr)`
-* `bool address_get_host(^ENetAddress addr, []char8 out)`
-* `^ENetEvent event_create()`
-* `void event_destroy(^ENetEvent ev)`
-* `EventType event_type(^ENetEvent ev)`
-* `^ENetPeer event_peer(^ENetEvent ev)`
-* `u8 event_channel_id(^ENetEvent ev)`
-* `u32 event_data(^ENetEvent ev)`
-* `^ENetPacket event_packet(^ENetEvent ev)`
-* `u64 packet_copy(^ENetPacket packet, []u8 out)`

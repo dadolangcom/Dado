@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit cc341d1a7513 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit e4c631696a09 (dirty) -->
 # core:geom/xform
 
 A 2D affine transform: translation, rotation and a per-axis scale, as `app:graph` composes a
@@ -28,11 +28,12 @@ version would be a second type with a second copy of every function, and no call
 **Tier N W H.** Pure Dado over `core:linalg`: it builds and runs freestanding (`#NONE`), on the
 web, and hosted (Linux, macOS and Windows) alike.
 
-**What raises into a script.** The functions that are arithmetic on the matrix:
-`transform_point`, `transform_vector`, `position_of` and `inverse`, each promised by the
-`#assert_raises` on the line above it. `from_trs`, `rotation_of` and `scale_of` are not: they
-reach the C library's `cos`, `sin`, `atan2` and `sqrt` through `core:linalg` wherever there
-is one.
+**What raises into a script.** The functions that are arithmetic on the matrix, and
+`scale_of`, whose square root is `core:linalg.length`'s correctly rounded C `sqrt`:
+`transform_point`, `transform_vector`, `position_of`, `inverse` and `scale_of`, each
+promised by the `#assert_raises` on the line above it. `from_trs` and `rotation_of` are not:
+they reach the C library's `cos`, `sin` and `atan2` through `core:linalg` wherever there is
+one.
 
 ## Declarations
 

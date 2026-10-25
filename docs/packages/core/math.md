@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit fa29e0260488 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit f4253b706f10 (dirty) -->
 # core:math
 
 core:math — the scalar mathematics a program reaches for: roots and powers,
@@ -27,9 +27,9 @@ three kinds:
   `cosine`, `tangent`, `arccosine` and `angle` are restatements of
   `<math.h>` when hosted and on `#WEB`, and on `#NONE`, which has no C
   library, the Dado transliterations of musl and msun in `soft.dado`.
-  One exception: `fused_multiply_add` is `soft.dado`'s on Windows too,
-  because MinGW-w64's `fma` answers NaN where it should not (its comment
-  says where).
+  One exception: `fused_multiply_add` is `soft.dado`'s on every target
+  but `#WEB`, because the `fma` a program built by the pinned zig links
+  answers NaN where it should not (its comment says where).
 * **The C library's when hosted, Dado's elsewhere.** `arcsine`,
   `arctangent`, the hyperbolic functions, `cube_root`, `two_to`,
   `ln_one_plus` and `e_to_minus_one` are `<math.h>`'s when hosted; the
@@ -94,11 +94,12 @@ promised by the `#assert_raises` above it and checked at each
 instantiation a program makes: they hold nothing foreign and nothing of
 C's address model, so a script calling one runs it as script. The Dado
 libm in `soft.dado` is promised too, each function on its own line, which
-is what keeps `#NONE`'s answers pure. The functions of the second and
-third kinds are not promised, because on a hosted target they call into
-C, and each says so on its own line: a transcendental is the platform's
-until a script's own is pinned to the same bits, and `root` is C's for
-speed, as said above.
+is what keeps `#NONE`'s answers pure. So is `root`: its C is `<math.h>`'s
+`sqrt`, which IEEE 754 requires to be correctly rounded, so the checker
+accepts that call as raising. The rest of the second and third kinds are
+not promised, because on a hosted target they call into C, and each says
+so on its own line: a transcendental is the platform's until a script's
+own is pinned to the same bits.
 
 **Thread-safety.** No function here has state; any thread may call any of
 them. **Failure:** none. A domain error answers a NaN (`root(-1.0)`,

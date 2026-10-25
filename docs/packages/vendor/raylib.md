@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # vendor:raylib
 
 vendor:raylib — a restatement of the parts of raylib 6.x a game reaches for.
@@ -41,14 +41,14 @@ Linux. The `link` clauses below name `-lraylib` and the platform libraries.
 
 163 declarations, 163 public.
 
-* `enum @c("KeyboardKey") key` — bindgen:begin declarations — regenerated; edits between the markers are lost…
+* `enum @c("KeyboardKey") key`
 * `enum @c("MouseButton") mouse_button`
 * `enum @c("MouseCursor") mouse_cursor`
 * `enum @c("GamepadButton") gamepad_button`
 * `enum @c("GamepadAxis") gamepad_axis`
 * `enum @c("TextureFilter") texture_filter`
 * `enum @c("TextureWrap") texture_wrap`
-* `type Vector2` — ── Types ─────────────────────────────────────────────────────────────…
+* `type Vector2`
 * `type Vector3`
 * `type Vector4`
 * `type Color`
@@ -56,7 +56,7 @@ Linux. The `link` clauses below name `-lraylib` and the platform libraries.
 * `type Texture2D`
 * `type RenderTexture2D`
 * `type Camera2D`
-* `void InitWindow(i32 width, i32 height, cstring title)` — ── Functions ─────────────────────────────────────────────────────────…
+* `void InitWindow(i32 width, i32 height, cstring title)`
 * `void CloseWindow()`
 * `bool WindowShouldClose()`
 * `bool IsWindowReady()`

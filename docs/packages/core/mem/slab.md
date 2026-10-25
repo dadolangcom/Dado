@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:mem/slab
 
 core:mem/slab — size classes over large chunks, behind the allocator interface.
@@ -139,7 +139,7 @@ takes one is not.
 * `Slab over((mem.Proc proc, rawptr data) backing)` — A slab over `backing`. **It does not allocate**: the first chunk is requested…
 * `(mem.Proc proc, rawptr data) allocator(^Slab s)` — The allocator for `s`. The slab is the allocator's `data`, so it is borrowed…
 * `type SlabAllocator using mem.Allocator` — The allocator for a slab, as a declaration that takes `mem.Allocator` on:
-* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.slab)` answers.
+* `(mem.Proc proc, rawptr data) SlabAllocator.data(self)` — The two words `allocator(self.slab)` answers.
 * `void reset(^Slab s)` — Release every block, **keeping the oldest chunk** — the one `FreeAll` does.
 * `void destroy(^Slab s)` — Hand every chunk and every large block back. The slab is exactly what `over`
 * `u64 reserved(^Slab s)` — Bytes held from the backing allocator right now: every chunk, and every large…

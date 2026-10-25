@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit cc341d1a7513 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit e4c631696a09 (dirty) -->
 # core:geom/halfedge
 
 A half-edge polygon mesh: a box and a prism (a planar contour extruded along its own normal),
@@ -23,15 +23,10 @@ valid. A mesh's runs are on the allocator that was `#default` when it was made.
 builds and runs freestanding (`#NONE`), on the web, and hosted (Linux, macOS and Windows)
 alike.
 
-**What raises into a script.** `message`, the index helpers, the traversal queries and the
-frees: `destroy`, `destroy_baked`, `box_face`, `prism_wall`, `prism_top`, `prism_bottom`,
-`face_loop_edges`, `face_vertices`, `face_centroid`, `edge_endpoints`,
-`is_boundary_edge`, `vertex_incoming_edge`, `vertex_incoming_edges`, `vertex_faces`,
-`vertex_neighbors`, `face_neighbors` and `triangles`, each promised by the
-`#assert_raises` on the line above it. The builders (`from_box`, `from_polygon3`), the
-normals and UVs, the face plane and normal, the moves (`translate_vertex`, `translate_edge`,
-`translate_face`, `refresh`) and `bake_geometry` are not: each normalizes a vector, and
-`core:linalg.length` takes that square root from the C library's `sqrt` wherever there is one.
+**What raises into a script.** Every public function, each promised by the `#assert_raises`
+on the line above it. The builders, the normals and UVs, the face plane and normal, the moves
+and `bake_geometry` normalize vectors through `core:linalg.length`, whose square root is the
+C library's `sqrt` wherever there is one: correctly rounded, so it raises.
 
 ## Declarations
 

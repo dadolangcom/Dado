@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit cc341d1a7513 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit e4c631696a09 (dirty) -->
 # core:geom/sat
 
 Separating-axis tests for convex polygons in 2D: whether two overlap, and the shortest push that
@@ -19,9 +19,10 @@ negative one asks for clearance. A concave shape goes in as convex parts (`overl
 **Tier N W H.** Pure Dado over `core:linalg`: it builds and runs freestanding (`#NONE`), on
 the web, and hosted (Linux, macOS and Windows) alike.
 
-**What raises into a script.** Nothing. Every function measures depth along unit axes, and
-`core:linalg.length` takes the square root that makes them unit from the C library's `sqrt`
-wherever there is one.
+**What raises into a script.** Every public function, each promised by the `#assert_raises`
+on the line above it. They measure depth along unit axes, and the square root that makes an
+axis unit is `core:linalg.length`'s, the C library's `sqrt` wherever there is one: correctly
+rounded, so it raises.
 
 ## Declarations
 

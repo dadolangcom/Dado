@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit cc341d1a7513 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit e4c631696a09 (dirty) -->
 # core:geom/hit
 
 Ray and box tests for picking and collision, in 3D.
@@ -18,10 +18,9 @@ tests are in core:geom/line and core:geom/point.
 **Tier N W H.** Pure Dado over `core:linalg` and `core:math`: it builds and runs freestanding
 (`#NONE`), on the web, and hosted (Linux, macOS and Windows) alike.
 
-**What raises into a script.** `ray_aabb`, `inverse_dir`, `ray_triangle`, `ray_plane` and
-`aabb_aabb`, each promised by the `#assert_raises` on the line above it. `ray_sphere` is not:
-it takes a square root, which `core:math` answers from the C library's `sqrt` wherever there
-is one.
+**What raises into a script.** Every public function, each promised by the `#assert_raises`
+on the line above it. `ray_sphere`'s square root is `core:math`'s, the C library's `sqrt`
+wherever there is one: correctly rounded, so it raises.
 
 ## Declarations
 

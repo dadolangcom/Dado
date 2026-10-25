@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit a397e1c892b1 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:flags
 
 core:flags — command lines: flags, positionals, subcommands, and the help
@@ -29,10 +29,8 @@ supplies, and `env_var` the variables the caller read, so the same
 declarations parse a test's words, a script's, or `main`'s, on every target
 alike — freestanding, the web and hosted (Linux, macOS, Windows).
 
-**What raises into a script**: everything. `message` and `parser` carry
-`#assert_raises` on the line above them, and every method of `Parser` is
-promised through the private function of `raises_test.dado`, since a
-method cannot carry the promise itself yet.
+**What raises into a script**: everything. `message`, `parser` and every
+method of `Parser` carry `#assert_raises` on the line above them.
 
 **The shape, and why.** A `Parser` holds a table of declarations. Each
 declaring method answers a small typed handle (`BoolFlag`, `TextFlag`,
@@ -176,29 +174,29 @@ are independent.
 * `distinct type FloatFlag: i64` — A number with a fraction: what `core:strings/parse`'s `to_f64` reads.
 * `distinct type ListFlag: i64` — A list: a repeatable flag's values, or the words a `rest` or `tail`
 * `type Parser` — A program's command line: what it declares, and what the last `parse`
-* `void command(^self, string8 name, string8 summary)` — A command word, with the one line the help shows beside it (`""`
-* `BoolFlag boolean(^self, string8 names, string8 summary, string8 scope = "")` — A switch, off unless given. A value written to it (`--release=yes`)
-* `TextFlag text(^self, string8 names, string8 form, string8 summary, string8 default = "", string8 scope = "")` — A flag with one text value; the last one given wins. `default` is what…
-* `IntFlag integer(^self, string8 names, string8 form, string8 summary, i64 default = 0, string8 scope = "")` — A flag whose value must be a whole number (decimal, an optional sign).
-* `FloatFlag real(^self, string8 names, string8 form, string8 summary, f64 default = 0.0, string8 scope = "")` — A flag whose value must be a number: decimal digits with an optional…
-* `void env(^self, string8 spelling, string8 variable)` — The flag spelled `spelling` (any one of its spellings) takes its value…
-* `void env_var(^self, string8 name, string8 value)` — One variable of the environment the program read, for the flags `env`
-* `ListFlag list(^self, string8 names, string8 form, string8 summary, string8 scope = "")` — A repeatable flag: every value given, in order (`-D A=1 -D B=2`).
-* `TextFlag choice(^self, string8 names, string8 form, string8 summary, string8 default = "", string8 scope = "")` — A flag whose value must be one of the choices its form lists between…
-* `TextFlag positional(^self, string8 name, string8 summary, bool required = false, string8 scope = "")` — One positional word, filled in declaration order. A `required` one…
-* `ListFlag rest(^self, string8 name, string8 summary, string8 scope = "")` — Every positional word left over once the `positional`s are filled.
-* `ListFlag tail(^self, string8 name, string8 summary, string8 scope = "")` — The words after `--`, exactly as written, flags or not.
-* `Error!string8 parse(^self, []string8 args)` — Read `args` (the words after the program's name) against the…
-* `bool wants_help(self)` — Whether the last `parse` stopped at `-h` or `--help`.
-* `string8 error(self)` — The full sentence for the last failure of `parse`, or `message` of its…
-* `string8 command_name(self)` — The command word the last `parse` chose, or `""`.
-* `bool on(self, BoolFlag f)` — Whether the switch was given.
-* `string8 value(self, TextFlag f)` — The text given, or the default when it was not.
-* `bool given(self, TextFlag f)` — Whether the text was given at all, which tells a form-`[=PATH]` flag…
-* `i64 number(self, IntFlag f)` — The number given, or the default when it was not.
-* `f64 amount(self, FloatFlag f)` — The number given, or the default when it was not.
-* `[]string8 values(self, ListFlag f)` — Every value given, in order; empty when none was.
-* `ref []char8 help(self)` — The help for the command the last `parse` chose, or for the program…
-* `ref []char8 help_for(self, string8 command)` — The help for `command`, or for the program when `command` is `""`
-* `void destroy(^self)` — Free what the parser holds. Not needed under a `using` arena. The…
+* `void Parser.command(^self, string8 name, string8 summary)` — A command word, with the one line the help shows beside it (`""`
+* `BoolFlag Parser.boolean(^self, string8 names, string8 summary, string8 scope = "")` — A switch, off unless given. A value written to it (`--release=yes`)
+* `TextFlag Parser.text(^self, string8 names, string8 form, string8 summary, string8 default = "", string8 scope = "")` — A flag with one text value; the last one given wins. `default` is what…
+* `IntFlag Parser.integer(^self, string8 names, string8 form, string8 summary, i64 default = 0, string8 scope = "")` — A flag whose value must be a whole number (decimal, an optional sign).
+* `FloatFlag Parser.real(^self, string8 names, string8 form, string8 summary, f64 default = 0.0, string8 scope = "")` — A flag whose value must be a number: decimal digits with an optional…
+* `void Parser.env(^self, string8 spelling, string8 variable)` — The flag spelled `spelling` (any one of its spellings) takes its value…
+* `void Parser.env_var(^self, string8 name, string8 value)` — One variable of the environment the program read, for the flags `env`
+* `ListFlag Parser.list(^self, string8 names, string8 form, string8 summary, string8 scope = "")` — A repeatable flag: every value given, in order (`-D A=1 -D B=2`).
+* `TextFlag Parser.choice(^self, string8 names, string8 form, string8 summary, string8 default = "", string8 scope = "")` — A flag whose value must be one of the choices its form lists between…
+* `TextFlag Parser.positional(^self, string8 name, string8 summary, bool required = false, string8 scope = "")` — One positional word, filled in declaration order. A `required` one…
+* `ListFlag Parser.rest(^self, string8 name, string8 summary, string8 scope = "")` — Every positional word left over once the `positional`s are filled.
+* `ListFlag Parser.tail(^self, string8 name, string8 summary, string8 scope = "")` — The words after `--`, exactly as written, flags or not.
+* `Error!string8 Parser.parse(^self, []string8 args)` — Read `args` (the words after the program's name) against the…
+* `bool Parser.wants_help(self)` — Whether the last `parse` stopped at `-h` or `--help`.
+* `string8 Parser.error(self)` — The full sentence for the last failure of `parse`, or `message` of its…
+* `string8 Parser.command_name(self)` — The command word the last `parse` chose, or `""`.
+* `bool Parser.on(self, BoolFlag f)` — Whether the switch was given.
+* `string8 Parser.value(self, TextFlag f)` — The text given, or the default when it was not.
+* `bool Parser.given(self, TextFlag f)` — Whether the text was given at all, which tells a form-`[=PATH]` flag…
+* `i64 Parser.number(self, IntFlag f)` — The number given, or the default when it was not.
+* `f64 Parser.amount(self, FloatFlag f)` — The number given, or the default when it was not.
+* `[]string8 Parser.values(self, ListFlag f)` — Every value given, in order; empty when none was.
+* `ref []char8 Parser.help(self)` — The help for the command the last `parse` chose, or for the program…
+* `ref []char8 Parser.help_for(self, string8 command)` — The help for `command`, or for the program when `command` is `""`
+* `void Parser.destroy(^self)` — Free what the parser holds. Not needed under a `using` arena. The…
 * `Parser parser(string8 program, string8 summary)` — A parser for `program`, which the help and the error sentences name, with…

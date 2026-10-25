@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 9fddd51732b8 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit e4c631696a09 (dirty) -->
 # core:geom/polygon
 
 One closed ring: its offset, and the normal of a 3D ring.
@@ -30,10 +30,11 @@ package comment says why that is the 1.0 shape.
 **Tier N W H.** Pure Dado over `core:math`, `core:geom/clip` and `core:geom/tess`: it builds
 and runs freestanding (`#NONE`), on the web, and hosted (Linux, macOS and Windows) alike.
 
-**What raises into a script.** Nothing yet. `offset`, `offset_by` and `normal` take square
-roots through `core:math.root`, which is the C library's `sqrt` wherever there is one; they
-are promised with it. The outline offsets also take angles, sines and cosines from the C
-library, and run on `core:geom/tess`, whose arena allocator carries a `rawptr`.
+**What raises into a script.** `offset`, `offset_by` and `normal`, each promised by the
+`#assert_raises` on the line above it: their square roots are `core:math.root`'s, the C
+library's `sqrt` wherever there is one, correctly rounded. The outline offsets are not: they
+take angles, sines and cosines from the C library, and run on `core:geom/tess`, whose arena
+allocator carries a `rawptr`.
 
 ## Declarations
 

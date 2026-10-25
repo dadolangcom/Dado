@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:mem/arena
 
 core:mem/arena — a bump arena that **grows**, behind the allocator interface.
@@ -82,7 +82,7 @@ allocating from one race on its cursor.
 * `bool prime(^Arena a)` — Request the first block **now** rather than on the first allocation, and say…
 * `(mem.Proc proc, rawptr data) allocator(^Arena a)` — The allocator for `a`. The arena is the allocator's `data`, so it is borrowed…
 * `type ArenaAllocator using mem.Allocator` — The allocator for an arena, as a declaration that takes `mem.Allocator` on:
-* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.arena)` answers.
+* `(mem.Proc proc, rawptr data) ArenaAllocator.data(self)` — The two words `allocator(self.arena)` answers.
 * `void reset(^Arena a)` — Release every allocation, **keeping the oldest block**. One store per block…
 * `void destroy(^Arena a)` — Hand every block back, including the oldest. The arena is reusable…
 * `Mark begin(^Arena a)` — Where the arena is now. `bump.used` is already this for a single block; a…

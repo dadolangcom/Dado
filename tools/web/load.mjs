@@ -32,6 +32,9 @@
 // a `#panic`, an `abort`, an out-of-bounds access — is 134, the status a shell
 // reports for SIGABRT, so `@test 134` means the same thing on both. A loader
 // failure (a missing import, a bad manifest) is 2, before the module runs.
+// A module built with C's sanitizer (a `sanitize c` line) whose C traps in
+// one of the checks that say nothing on the web is said to have, on fd 2
+// (`explainTrap`).
 //
 // **Threads** (a module built with `./dado --target=web --web-threads`). Such
 // a module imports its memory (`wasm-import env memory memory`), and this
@@ -634,6 +637,50 @@ export function declaredExports(manifest) {
     return out;
 }
 
+/** Whether a manifest's C was built with C's sanitizer and carries its own
+ * handlers for it: a `sanitize c` line, which `--ubsan-handlers` writes. */
+export function sanitizesC(manifest) {
+    return manifest.split("\n").some((line) => {
+        const parts = line.trim().split(" ");
+        return parts[0] === "sanitize" && parts.includes("c");
+    });
+}
+
+/** What the loader says of a bare trap in a module built with C's sanitizer. */
+export const C_CHECK_TRAP =
+    "dado: the module trapped (unreachable) with no report: most often one of C's " +
+    "undefined-behaviour checks, which on the web trap without a word (a misaligned " +
+    "or null pointer, an index out of bounds, …); natively, `dado test` names the " +
+    "check and its place\n";
+
+/**
+ * **Whether the module's last words were a report**, watching what it writes
+ * through `out`. A report — C's sanitizer's, a `#panic`'s, a failed check's —
+ * is written to fd 2 and ends with a newline (the console hands fd 2 over at
+ * each one), and then the console's abort flushes fd 1, which is the one
+ * write that may follow it before the trap. Anything else written after it
+ * means the program went on. A line written to fd 2 that was not a report,
+ * followed by a silent trap with nothing written between, reads as reported:
+ * the loader then says less, never something wrong.
+ */
+function reportWatch(out) {
+    const watch = { reported: false, flushed: false, out: null };
+    watch.out = (fd, bytes) => {
+        if (bytes.length > 0) {
+            if (fd === 2) {
+                watch.reported = bytes[bytes.length - 1] === 0x0a;
+                watch.flushed = false;
+            } else if (watch.reported && !watch.flushed) {
+                watch.flushed = true;
+            } else {
+                watch.reported = false;
+            }
+        }
+        out(fd, bytes);
+    };
+    return watch;
+}
+
 /** The kind `WebAssembly.Module.exports` reports for a manifest signature. */
 function exportKind(signature) {
     return signature.startsWith("(") ? "function" : signature;
@@ -767,7 +814,11 @@ export function imports(module, manifest, ctx) {
 export async function run(bytes, options = {}) {
     const manifest = options.manifest ?? "";
     const decoder = new TextDecoder();
-    const out = options.out ?? defaultOut(decoder);
+    const said = options.out ?? defaultOut(decoder);
+    // A module whose C carries its own UBSan handlers: whether its last
+    // words were a report, so a trap that had none can be named.
+    const reports = sanitizesC(manifest) ? reportWatch(said) : null;
+    const out = reports?.out ?? said;
     const limits = memoryImportLimits(bytes);
     let memory = null;
     if (limits !== null) {
@@ -849,7 +900,7 @@ export async function run(bytes, options = {}) {
                     throw again;
                 }
             }
-            explainTrap(e, out);
+            explainTrap(e, said, reports !== null && !reports.reported);
             return TRAP_STATUS;
         }
         // DadoScript: the runtime ended the program with a status (`dado.exit`).
@@ -869,9 +920,19 @@ export async function run(bytes, options = {}) {
  * `unreachable`, so that one is silent here; any other (an access out of
  * bounds, which is what a stack overflow is with the stack first, DI-0302)
  * would otherwise end the program with 134 and not a word.
+ *
+ * `silentC`: the module's C was built with C's sanitizer (`sanitize c`) and
+ * nothing was reported before the trap. Its checks for signed overflow,
+ * shifts, division and float to integer report through the console and then
+ * trap; every other one (a misaligned or null pointer, an index out of
+ * bounds, …) is a bare `unreachable`, which is said here, since nothing else
+ * says it.
  */
-function explainTrap(e, out) {
+function explainTrap(e, out, silentC = false) {
     if (/unreachable/i.test(e.message)) {
+        if (silentC) {
+            out(2, new TextEncoder().encode(C_CHECK_TRAP));
+        }
         return;
     }
     const why = /out of bounds/i.test(e.message)

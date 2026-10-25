@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # app:graph
 
 app:graph — the neutral scene graph: parent/child, composed
@@ -194,7 +194,7 @@ stays correct for exactly as long as nobody edits one of them.
 * `type Node: (i32 index, u32 generation)` — A handle to one node. See the package doc comment for why this is an…
 * `const Node INVALID = (-1, 0)` — The handle that names "no node" — an invalid parent (a root), an absent…
 * `bool valid(Node n)`
-* `type ReadyFn: void(^Graph, Node, rawptr)` — ── lifecycle hooks ─────────────────────────────────────────────────────…
+* `type ReadyFn: void(^Graph, Node, rawptr)` — Each takes the `Graph` it belongs to (there is no implicit self and no…
 * `type ProcessFn: void(^Graph, Node, f32, rawptr)`
 * `type TreeFn: void(^Graph, Node, rawptr)`
 * `type Graph` — The tree. See the package doc comment for the ownership model, and for why…

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.3 -->
-<!-- commit 8e62c891753a -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # vendor:three
 
 DadoScript classes over three.js r184, the JavaScript 3D library.
@@ -32,894 +32,793 @@ and `THREE_PIN` records its version and hashes.
 
 ## Declarations
 
-913 declarations, 892 public.
+913 declarations, 791 public.
 
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void init(float width = 1.0, float height = 1.0, float depth = 1.0, int widthSegments = 1, int heightSegments = 1, int depthSegments = 1)`
-* `any parameters()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_cb(any target, string method)`
+* `class BoxGeometry`
+* `void BoxGeometry.init(float width = 1.0, float height = 1.0, float depth = 1.0, int widthSegments = 1, int heightSegments = 1, int depthSegments = 1)`
+* `any BoxGeometry.parameters()`
+* `class BufferAttribute`
 * `any h = 0`
-* `void init(any array, float itemSize, bool normalized = false)`
-* `float id()`
-* `string name()`
-* `void set_name(string v)`
-* `any array()`
-* `void set_array(any v)`
-* `float itemSize()`
-* `void set_itemSize(float v)`
-* `int usage()`
-* `void set_usage(int v)`
-* `int gpuType()`
-* `void set_gpuType(int v)`
-* `[]any updateRanges()`
-* `void set_updateRanges([]any v)`
-* `float version()`
-* `void set_version(float v)`
-* `bool normalized()`
-* `void set_normalized(bool v)`
-* `float count()`
-* `bool needsUpdate()`
-* `void set_needsUpdate(bool v)`
-* `bool isBufferAttribute()`
-* `BufferAttribute onUpload(any callback_target, string callback_method)`
-* `BufferAttribute setUsage(int usage)`
-* `void addUpdateRange(float start, float count)`
-* `void clearUpdateRanges()`
-* `BufferAttribute clone()`
-* `BufferAttribute copy(BufferAttribute source)`
-* `BufferAttribute copyAt(float index1, BufferAttribute attribute, float index2)`
-* `BufferAttribute copyArray(any array)`
-* `BufferAttribute applyMatrix4(Matrix4 m)`
-* `BufferAttribute transformDirection(Matrix4 m)`
-* `BufferAttribute set(any value, float offset = 0.0)`
-* `float getComponent(float index, float component)`
-* `void setComponent(float index, float component, float value)`
-* `float getX(float index)`
-* `BufferAttribute setX(float index, float x)`
-* `float getY(float index)`
-* `BufferAttribute setY(float index, float y)`
-* `float getZ(float index)`
-* `BufferAttribute setZ(float index, float z)`
-* `float getW(float index)`
-* `BufferAttribute setW(float index, float z)`
-* `BufferAttribute setXY(float index, float x, float y)`
-* `BufferAttribute setXYZ(float index, float x, float y, float z)`
-* `BufferAttribute setXYZW(float index, float x, float y, float z, float w)`
-* `any toJSON()`
-* `void dispose()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_null()`
-* `any h = 0`
-* `void init()`
-* `int id()`
-* `void set_id(int v)`
-* `string uuid()`
-* `void set_uuid(string v)`
-* `string name()`
-* `void set_name(string v)`
-* `string type_()`
-* `bool has_index()`
-* `BufferAttribute index()`
-* `void set_index(BufferAttribute v)`
-* `void clear_index()`
-* `bool has_indirect()`
-* `any indirect()`
-* `void set_indirect(any v)`
-* `void clear_indirect()`
-* `any indirectOffset()`
-* `void set_indirectOffset(any v)`
-* `any attributes()`
-* `void set_attributes(any v)`
-* `any morphAttributes()`
-* `void set_morphAttributes(any v)`
-* `bool morphTargetsRelative()`
-* `void set_morphTargetsRelative(bool v)`
-* `[]any groups()`
-* `void set_groups([]any v)`
-* `any drawRange()`
-* `void set_drawRange(any v)`
-* `any userData()`
-* `void set_userData(any v)`
-* `bool isBufferGeometry()`
-* `BufferGeometry setIndex(any index)`
-* `BufferGeometry setIndirect(any indirect, any indirectOffset)`
-* `any getIndirect()`
-* `void addGroup(float start, float count, float materialIndex)`
-* `void clearGroups()`
-* `void setDrawRange(float start, float count)`
-* `BufferGeometry applyMatrix4(Matrix4 matrix)`
-* `BufferGeometry rotateX(float angle)`
-* `BufferGeometry rotateY(float angle)`
-* `BufferGeometry rotateZ(float angle)`
-* `BufferGeometry translate(float x, float y, float z)`
-* `BufferGeometry scale(float x, float y, float z)`
-* `BufferGeometry lookAt(Vector3 vector)`
-* `BufferGeometry center()`
-* `BufferGeometry setFromPoints(any points)`
-* `void computeBoundingBox()`
-* `void computeBoundingSphere()`
-* `void computeTangents()`
-* `void computeVertexNormals()`
-* `void normalizeNormals()`
-* `BufferGeometry toNonIndexed()`
-* `any toJSON()`
-* `BufferGeometry clone()`
-* `BufferGeometry copy(BufferGeometry source)`
-* `void dispose()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void init()`
-* `bool isCamera()`
-* `Matrix4 matrixWorldInverse()`
-* `void set_matrixWorldInverse(Matrix4 v)`
-* `Matrix4 projectionMatrix()`
-* `void set_projectionMatrix(Matrix4 v)`
-* `Matrix4 projectionMatrixInverse()`
-* `void set_projectionMatrixInverse(Matrix4 v)`
-* `int coordinateSystem()`
-* `void set_coordinateSystem(int v)`
-* `bool reversedDepth()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any h = 0`
-* `void init(float r, float g, float b)`
-* `bool isColor()`
-* `float r()`
-* `void set_r(float v)`
-* `float g()`
-* `void set_g(float v)`
-* `float b()`
-* `void set_b(float v)`
-* `Color setFromVector3(Vector3 vector)`
-* `Color setScalar(float scalar)`
-* `Color setHex(int hex)`
-* `Color setRGB(float r, float g, float b, string colorSpace)`
-* `Color setHSL(float h_, float s, float l, string colorSpace)`
-* `Color setStyle(string style, string colorSpace)`
-* `Color setColorName(string style, string colorSpace)`
-* `Color clone()`
-* `Color copy(Color color)`
-* `Color copySRGBToLinear(Color color)`
-* `Color copyLinearToSRGB(Color color)`
-* `Color convertSRGBToLinear()`
-* `Color convertLinearToSRGB()`
-* `int getHex()`
-* `string getHexString()`
-* `any getHSL(any target, string colorSpace)`
-* `any getRGB(any target, string colorSpace)`
-* `string getStyle()`
-* `Color offsetHSL(float h_, float s, float l)`
-* `Color add(Color color)`
-* `Color addColors(Color color1, Color color2)`
-* `Color addScalar(float s)`
-* `Color sub(Color color)`
-* `Color multiply(Color color)`
-* `Color multiplyScalar(float s)`
-* `Color lerp(Color color, float alpha)`
-* `Color lerpColors(Color color1, Color color2, float alpha)`
-* `Color lerpHSL(Color color, float alpha)`
-* `bool equals(Color color)`
-* `Color fromArray(any array, float offset)`
-* `[]float toArray([]float array, float offset)`
-* `float toJSON()`
-* `Color fromBufferAttribute(any attribute, float index)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `any dts_u(any v)`
-* `void init(any color = 16777215, float intensity = 1.0)`
-* `bool isDirectionalLight()`
-* `Object3D target()`
-* `void set_target(Object3D v)`
-* `any shadow()`
-* `void set_shadow(any v)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_cb(any target, string method)`
-* `any h = 0`
-* `void init(float x, float y, float z, string order)`
-* `float x()`
-* `void set_x(float v)`
-* `float y()`
-* `void set_y(float v)`
-* `float z()`
-* `void set_z(float v)`
-* `string order()`
-* `void set_order(string v)`
-* `bool isEuler()`
-* `Euler set(float x, float y, float z, string order)`
-* `Euler clone()`
-* `Euler copy(Euler euler)`
-* `Euler setFromRotationMatrix(Matrix4 m, string order, bool update)`
-* `Euler setFromVector3(Vector3 v, string order)`
-* `Euler reorder(string newOrder)`
-* `bool equals(Euler euler)`
-* `Euler fromArray(any array)`
-* `any toArray(any array, float offset)`
-* `Euler _onChange(any callback_target, string callback_method)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_null()`
-* `void init(float size = 10.0, int divisions = 10, any color1 = 4473924, any color2 = 8947848)`
-* `void dispose()`
-* `bool isLineSegments()`
-* `bool isLine()`
-* `BufferGeometry geometry()`
-* `void set_geometry(BufferGeometry v)`
-* `bool has_morphTargetInfluences()`
-* `[]float morphTargetInfluences()`
-* `void set_morphTargetInfluences([]float v)`
-* `void clear_morphTargetInfluences()`
-* `bool has_morphTargetDictionary()`
-* `any morphTargetDictionary()`
-* `void set_morphTargetDictionary(any v)`
-* `void clear_morphTargetDictionary()`
-* `GridHelper computeLineDistances()`
-* `void updateMorphTargets()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `any dts_u(any v)`
-* `void init(any skyColor = 16777215, any groundColor = 16777215, float intensity = 1.0)`
-* `bool isHemisphereLight()`
-* `Color groundColor()`
-* `void set_groundColor(Color v)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `void init(any color = 16777215, float intensity = 1.0)`
-* `bool isLight()`
-* `Color color()`
-* `void set_color(Color v)`
-* `float intensity()`
-* `void set_intensity(float v)`
-* `void dispose()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_obj({string: any} m)`
-* `any dts_null()`
-* `any h = 0`
-* `void init()`
-* `string name()`
-* `void set_name(string v)`
-* `int blending()`
-* `void set_blending(int v)`
-* `int side()`
-* `void set_side(int v)`
-* `bool vertexColors()`
-* `void set_vertexColors(bool v)`
-* `float opacity()`
-* `void set_opacity(float v)`
-* `bool transparent()`
-* `void set_transparent(bool v)`
-* `bool alphaHash()`
-* `void set_alphaHash(bool v)`
-* `int blendSrc()`
-* `void set_blendSrc(int v)`
-* `int blendDst()`
-* `void set_blendDst(int v)`
-* `int blendEquation()`
-* `void set_blendEquation(int v)`
-* `bool has_blendSrcAlpha()`
-* `int blendSrcAlpha()`
-* `void set_blendSrcAlpha(int v)`
-* `void clear_blendSrcAlpha()`
-* `bool has_blendDstAlpha()`
-* `int blendDstAlpha()`
-* `void set_blendDstAlpha(int v)`
-* `void clear_blendDstAlpha()`
-* `bool has_blendEquationAlpha()`
-* `int blendEquationAlpha()`
-* `void set_blendEquationAlpha(int v)`
-* `void clear_blendEquationAlpha()`
-* `Color blendColor()`
-* `void set_blendColor(Color v)`
-* `float blendAlpha()`
-* `void set_blendAlpha(float v)`
-* `int depthFunc()`
-* `void set_depthFunc(int v)`
-* `bool depthTest()`
-* `void set_depthTest(bool v)`
-* `bool depthWrite()`
-* `void set_depthWrite(bool v)`
-* `float stencilWriteMask()`
-* `void set_stencilWriteMask(float v)`
-* `int stencilFunc()`
-* `void set_stencilFunc(int v)`
-* `float stencilRef()`
-* `void set_stencilRef(float v)`
-* `float stencilFuncMask()`
-* `void set_stencilFuncMask(float v)`
-* `int stencilFail()`
-* `void set_stencilFail(int v)`
-* `int stencilZFail()`
-* `void set_stencilZFail(int v)`
-* `int stencilZPass()`
-* `void set_stencilZPass(int v)`
-* `bool stencilWrite()`
-* `void set_stencilWrite(bool v)`
-* `bool clipIntersection()`
-* `void set_clipIntersection(bool v)`
-* `bool clipShadows()`
-* `void set_clipShadows(bool v)`
-* `bool has_shadowSide()`
-* `int shadowSide()`
-* `void set_shadowSide(int v)`
-* `void clear_shadowSide()`
-* `bool colorWrite()`
-* `void set_colorWrite(bool v)`
-* `bool has_precision()`
-* `string precision()`
-* `void set_precision(string v)`
-* `void clear_precision()`
-* `bool polygonOffset()`
-* `void set_polygonOffset(bool v)`
-* `float polygonOffsetFactor()`
-* `void set_polygonOffsetFactor(float v)`
-* `float polygonOffsetUnits()`
-* `void set_polygonOffsetUnits(float v)`
-* `bool dithering()`
-* `void set_dithering(bool v)`
-* `bool alphaToCoverage()`
-* `void set_alphaToCoverage(bool v)`
-* `bool premultipliedAlpha()`
-* `void set_premultipliedAlpha(bool v)`
-* `bool forceSinglePass()`
-* `void set_forceSinglePass(bool v)`
-* `bool allowOverride()`
-* `void set_allowOverride(bool v)`
-* `bool visible()`
-* `void set_visible(bool v)`
-* `bool toneMapped()`
-* `void set_toneMapped(bool v)`
-* `any userData()`
-* `void set_userData(any v)`
-* `float alphaTest()`
-* `void set_alphaTest(float v)`
-* `bool isMaterial()`
-* `string uuid()`
-* `string type_()`
-* `void set_type(string v)`
-* `float version()`
-* `bool has_defines()`
-* `any defines()`
-* `void set_defines(any v)`
-* `void clear_defines()`
-* `void onBeforeCompile(any parameters, WebGLRenderer renderer)`
-* `string customProgramCacheKey()`
-* `void setValues({string: any} values)`
-* `any toJSON(any meta)`
-* `Material clone()`
-* `Material copy(Material source)`
-* `void dispose()`
-* `bool needsUpdate()`
-* `void set_needsUpdate(bool v)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any h = 0`
-* `void init()`
-* `bool isMatrix4()`
-* `[]float elements()`
-* `void set_elements([]float v)`
-* `Matrix4 set(float n11, float n12, float n13, float n14, float n21, float n22, float n23, float n24, float n31, float n32, float n33, float n34, float n41, float n42, float n43, float n44)`
-* `Matrix4 identity()`
-* `Matrix4 clone()`
-* `Matrix4 copy(Matrix4 m)`
-* `Matrix4 copyPosition(Matrix4 m)`
-* `Matrix4 extractBasis(Vector3 xAxis, Vector3 yAxis, Vector3 zAxis)`
-* `Matrix4 makeBasis(Vector3 xAxis, Vector3 yAxis, Vector3 zAxis)`
-* `Matrix4 extractRotation(Matrix4 m)`
-* `Matrix4 makeRotationFromEuler(Euler euler)`
-* `Matrix4 lookAt(Vector3 eye, Vector3 target, Vector3 up)`
-* `Matrix4 multiply(Matrix4 m)`
-* `Matrix4 premultiply(Matrix4 m)`
-* `Matrix4 multiplyMatrices(Matrix4 a, Matrix4 b)`
-* `Matrix4 multiplyScalar(float s)`
-* `float determinant()`
-* `Matrix4 transpose()`
-* `Matrix4 setPosition(Vector3 v)`
-* `Matrix4 invert()`
-* `Matrix4 scale(Vector3 v)`
-* `float getMaxScaleOnAxis()`
-* `Matrix4 makeTranslation(Vector3 v)`
-* `Matrix4 makeRotationX(float theta)`
-* `Matrix4 makeRotationY(float theta)`
-* `Matrix4 makeRotationZ(float theta)`
-* `Matrix4 makeRotationAxis(Vector3 axis, float angle)`
-* `Matrix4 makeScale(float x, float y, float z)`
-* `Matrix4 makeShear(float xy, float xz, float yx, float yz, float zx, float zy)`
-* `Matrix4 makePerspective(float left, float right, float top, float bottom, float near, float far, int coordinateSystem, bool reversedDepth)`
-* `Matrix4 makeOrthographic(float left, float right, float top, float bottom, float near, float far, int coordinateSystem, bool reversedDepth)`
-* `bool equals(Matrix4 matrix)`
-* `Matrix4 fromArray(any array, float offset)`
-* `[]float toArray()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_null()`
-* `void init(BufferGeometry geometry, any material)`
-* `bool isMesh()`
-* `BufferGeometry geometry()`
-* `void set_geometry(BufferGeometry v)`
-* `any material()`
-* `void set_material(any v)`
-* `bool has_morphTargetInfluences()`
-* `[]float morphTargetInfluences()`
-* `void set_morphTargetInfluences([]float v)`
-* `void clear_morphTargetInfluences()`
-* `bool has_morphTargetDictionary()`
-* `any morphTargetDictionary()`
-* `void set_morphTargetDictionary(any v)`
-* `void clear_morphTargetDictionary()`
-* `float count()`
-* `void set_count(float v)`
-* `void updateMorphTargets()`
-* `Vector3 getVertexPosition(float index, Vector3 target)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_obj({string: any} m)`
-* `void init({string: any} parameters)`
-* `Color color()`
-* `void set_color(Color v)`
-* `float lightMapIntensity()`
-* `void set_lightMapIntensity(float v)`
-* `float aoMapIntensity()`
-* `void set_aoMapIntensity(float v)`
-* `Euler envMapRotation()`
-* `void set_envMapRotation(Euler v)`
-* `int combine()`
-* `void set_combine(int v)`
-* `float reflectivity()`
-* `void set_reflectivity(float v)`
-* `float refractionRatio()`
-* `void set_refractionRatio(float v)`
-* `bool wireframe()`
-* `void set_wireframe(bool v)`
-* `float wireframeLinewidth()`
-* `void set_wireframeLinewidth(float v)`
-* `string wireframeLinecap()`
-* `void set_wireframeLinecap(string v)`
-* `string wireframeLinejoin()`
-* `void set_wireframeLinejoin(string v)`
-* `bool fog()`
-* `void set_fog(bool v)`
-* `bool isMeshBasicMaterial()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_obj({string: any} m)`
-* `void init({string: any} parameters)`
-* `Color color()`
-* `void set_color(Color v)`
-* `float roughness()`
-* `void set_roughness(float v)`
-* `float metalness()`
-* `void set_metalness(float v)`
-* `float lightMapIntensity()`
-* `void set_lightMapIntensity(float v)`
-* `float aoMapIntensity()`
-* `void set_aoMapIntensity(float v)`
-* `Color emissive()`
-* `void set_emissive(Color v)`
-* `float emissiveIntensity()`
-* `void set_emissiveIntensity(float v)`
-* `float bumpScale()`
-* `void set_bumpScale(float v)`
-* `int normalMapType()`
-* `void set_normalMapType(int v)`
-* `float displacementScale()`
-* `void set_displacementScale(float v)`
-* `float displacementBias()`
-* `void set_displacementBias(float v)`
-* `Euler envMapRotation()`
-* `void set_envMapRotation(Euler v)`
-* `float envMapIntensity()`
-* `void set_envMapIntensity(float v)`
-* `bool wireframe()`
-* `void set_wireframe(bool v)`
-* `float wireframeLinewidth()`
-* `void set_wireframeLinewidth(float v)`
-* `string wireframeLinecap()`
-* `void set_wireframeLinecap(string v)`
-* `string wireframeLinejoin()`
-* `void set_wireframeLinejoin(string v)`
-* `bool flatShading()`
-* `void set_flatShading(bool v)`
-* `bool fog()`
-* `void set_fog(bool v)`
-* `bool isMeshStandardMaterial()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_hs(any xs)`
-* `any dts_cb(any target, string method)`
-* `any dts_null()`
-* `any h = 0`
-* `void init()`
-* `bool isObject3D()`
-* `int id()`
-* `string uuid()`
-* `void set_uuid(string v)`
-* `string name()`
-* `void set_name(string v)`
-* `string type_()`
-* `bool has_parent()`
-* `Object3D parent()`
-* `void set_parent(Object3D v)`
-* `void clear_parent()`
-* `[]Object3D children()`
-* `void set_children([]Object3D v)`
-* `Vector3 up()`
-* `void set_up(Vector3 v)`
-* `Vector3 position()`
-* `Euler rotation()`
-* `Vector3 scale()`
-* `Matrix4 modelViewMatrix()`
-* `Matrix4 matrix()`
-* `void set_matrix(Matrix4 v)`
-* `Matrix4 matrixWorld()`
-* `void set_matrixWorld(Matrix4 v)`
-* `bool matrixAutoUpdate()`
-* `void set_matrixAutoUpdate(bool v)`
-* `bool matrixWorldAutoUpdate()`
-* `void set_matrixWorldAutoUpdate(bool v)`
-* `bool matrixWorldNeedsUpdate()`
-* `void set_matrixWorldNeedsUpdate(bool v)`
-* `bool visible()`
-* `void set_visible(bool v)`
-* `bool castShadow()`
-* `void set_castShadow(bool v)`
-* `bool receiveShadow()`
-* `void set_receiveShadow(bool v)`
-* `bool frustumCulled()`
-* `void set_frustumCulled(bool v)`
-* `float renderOrder()`
-* `void set_renderOrder(float v)`
-* `bool has_customDepthMaterial()`
-* `Material customDepthMaterial()`
-* `void set_customDepthMaterial(Material v)`
-* `void clear_customDepthMaterial()`
-* `bool has_customDistanceMaterial()`
-* `Material customDistanceMaterial()`
-* `void set_customDistanceMaterial(Material v)`
-* `void clear_customDistanceMaterial()`
-* `bool static()`
-* `void set_static(bool v)`
-* `any userData()`
-* `void set_userData(any v)`
-* `bool has_pivot()`
-* `Vector3 pivot()`
-* `void set_pivot(Vector3 v)`
-* `void clear_pivot()`
-* `void applyMatrix4(Matrix4 matrix)`
-* `void setRotationFromAxisAngle(Vector3 axis, float angle)`
-* `void setRotationFromEuler(Euler euler)`
-* `void setRotationFromMatrix(Matrix4 m)`
-* `Object3D rotateOnAxis(Vector3 axis, float angle)`
-* `Object3D rotateOnWorldAxis(Vector3 axis, float angle)`
-* `Object3D rotateX(float angle)`
-* `Object3D rotateY(float angle)`
-* `Object3D rotateZ(float angle)`
-* `Object3D translateOnAxis(Vector3 axis, float distance)`
-* `Object3D translateX(float distance)`
-* `Object3D translateY(float distance)`
-* `Object3D translateZ(float distance)`
-* `Vector3 localToWorld(Vector3 vector)`
-* `Vector3 worldToLocal(Vector3 vector)`
-* `void lookAt(Vector3 vector)`
-* `void lookAtXYZ(float x, float y, float z)`
-* `Object3D add(Object3D object)`
-* `Object3D remove(Object3D object)`
-* `Object3D removeFromParent()`
-* `Object3D clear()`
-* `Object3D attach(Object3D object)`
-* `[]Object3D getObjectsByProperty(string name, any value, []Object3D optionalTarget)`
-* `Vector3 getWorldPosition(Vector3 target)`
-* `Vector3 getWorldScale(Vector3 target)`
-* `Vector3 getWorldDirection(Vector3 target)`
-* `void traverse(any callback_target, string callback_method)`
-* `void traverseVisible(any callback_target, string callback_method)`
-* `void traverseAncestors(any callback_target, string callback_method)`
-* `void updateMatrix()`
-* `void updateMatrixWorld(bool force)`
-* `void updateWorldMatrix(bool updateParents, bool updateChildren)`
-* `any toJSON(any meta)`
-* `Object3D clone(bool recursive = true)`
-* `Object3D copy(Object3D object, bool recursive = true)`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_null()`
-* `void init(float fov = 50.0, float aspect = 1.0, float near = 0.1, float far = 2000.0)`
-* `bool isPerspectiveCamera()`
-* `float fov()`
-* `void set_fov(float v)`
-* `float zoom()`
-* `void set_zoom(float v)`
-* `float near()`
-* `void set_near(float v)`
-* `float far()`
-* `void set_far(float v)`
-* `float focus()`
-* `void set_focus(float v)`
-* `float aspect()`
-* `void set_aspect(float v)`
-* `bool has_view()`
-* `any view_()`
-* `void set_view(any v)`
-* `void clear_view()`
-* `float filmGauge()`
-* `void set_filmGauge(float v)`
-* `float filmOffset()`
-* `void set_filmOffset(float v)`
-* `void setFocalLength(float focalLength)`
-* `float getFocalLength()`
-* `float getEffectiveFOV()`
-* `float getFilmWidth()`
-* `float getFilmHeight()`
-* `void setViewOffset(float fullWidth, float fullHeight, float x, float y, float width, float height)`
-* `void clearViewOffset()`
-* `void updateProjectionMatrix()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `void init(float width = 1.0, float height = 1.0, int widthSegments = 1, int heightSegments = 1)`
-* `any parameters()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_null()`
-* `void init()`
-* `bool isScene()`
-* `bool has_background()`
-* `any background()`
-* `void set_background(any v)`
-* `void clear_background()`
-* `bool has_fog()`
-* `any fog()`
-* `void set_fog(any v)`
-* `void clear_fog()`
-* `float backgroundBlurriness()`
-* `void set_backgroundBlurriness(float v)`
-* `float backgroundIntensity()`
-* `void set_backgroundIntensity(float v)`
-* `Euler backgroundRotation()`
-* `void set_backgroundRotation(Euler v)`
-* `float environmentIntensity()`
-* `void set_environmentIntensity(float v)`
-* `Euler environmentRotation()`
-* `void set_environmentRotation(Euler v)`
-* `bool has_overrideMaterial()`
-* `Material overrideMaterial()`
-* `void set_overrideMaterial(Material v)`
-* `void clear_overrideMaterial()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_skip()`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_obj({string: any} m)`
-* `any dts_null()`
-* `void init({string: any} parameters)`
-* `any uniforms()`
-* `void set_uniforms(any v)`
-* `string vertexShader()`
-* `void set_vertexShader(string v)`
-* `string fragmentShader()`
-* `void set_fragmentShader(string v)`
-* `float linewidth()`
-* `void set_linewidth(float v)`
-* `bool wireframe()`
-* `void set_wireframe(bool v)`
-* `float wireframeLinewidth()`
-* `void set_wireframeLinewidth(float v)`
-* `bool fog()`
-* `void set_fog(bool v)`
-* `bool lights()`
-* `void set_lights(bool v)`
-* `bool clipping()`
-* `void set_clipping(bool v)`
-* `any extensions()`
-* `void set_extensions(any v)`
-* `any defaultAttributeValues()`
-* `void set_defaultAttributeValues(any v)`
-* `bool has_index0AttributeName()`
-* `string index0AttributeName()`
-* `void set_index0AttributeName(string v)`
-* `void clear_index0AttributeName()`
-* `bool uniformsNeedUpdate()`
-* `void set_uniformsNeedUpdate(bool v)`
-* `bool has_glslVersion()`
-* `string glslVersion()`
-* `void set_glslVersion(string v)`
-* `void clear_glslVersion()`
-* `bool isShaderMaterial()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any h = 0`
-* `void init(float x, float y, float z)`
-* `float x()`
-* `void set_x(float v)`
-* `float y()`
-* `void set_y(float v)`
-* `float z()`
-* `void set_z(float v)`
-* `bool isVector3()`
-* `Vector3 set(float x, float y, float z)`
-* `Vector3 setScalar(float scalar)`
-* `Vector3 setX(float x)`
-* `Vector3 setY(float y)`
-* `Vector3 setZ(float z)`
-* `Vector3 setComponent(float index, float value)`
-* `float getComponent(float index)`
-* `Vector3 clone()`
-* `Vector3 copy(Vector3 v)`
-* `Vector3 add(Vector3 v)`
-* `Vector3 addScalar(float s)`
-* `Vector3 addVectors(Vector3 a, Vector3 b)`
-* `Vector3 addScaledVector(Vector3 v, float s)`
-* `Vector3 sub(Vector3 v)`
-* `Vector3 subScalar(float s)`
-* `Vector3 subVectors(Vector3 a, Vector3 b)`
-* `Vector3 multiply(Vector3 v)`
-* `Vector3 multiplyScalar(float s)`
-* `Vector3 multiplyVectors(Vector3 a, Vector3 b)`
-* `Vector3 applyEuler(Euler euler)`
-* `Vector3 applyAxisAngle(Vector3 axis, float angle)`
-* `Vector3 applyMatrix4(Matrix4 m)`
-* `Vector3 applyQuaternion(any q)`
-* `Vector3 project(Camera camera)`
-* `Vector3 unproject(Camera camera)`
-* `Vector3 transformDirection(Matrix4 m)`
-* `Vector3 divide(Vector3 v)`
-* `Vector3 divideScalar(float s)`
-* `Vector3 min(Vector3 v)`
-* `Vector3 max(Vector3 v)`
-* `Vector3 clamp(Vector3 min, Vector3 max)`
-* `Vector3 clampScalar(float min, float max)`
-* `Vector3 clampLength(float min, float max)`
-* `Vector3 floor()`
-* `Vector3 ceil()`
-* `Vector3 round()`
-* `Vector3 roundToZero()`
-* `Vector3 negate()`
-* `float dot(Vector3 v)`
-* `float lengthSq()`
-* `float length()`
-* `float manhattanLength()`
-* `Vector3 normalize()`
-* `Vector3 setLength(float l)`
-* `Vector3 lerp(Vector3 v, float alpha)`
-* `Vector3 lerpVectors(Vector3 v1, Vector3 v2, float alpha)`
-* `Vector3 cross(Vector3 v)`
-* `Vector3 crossVectors(Vector3 a, Vector3 b)`
-* `Vector3 projectOnVector(Vector3 v)`
-* `Vector3 projectOnPlane(Vector3 planeNormal)`
-* `Vector3 reflect(Vector3 vector)`
-* `float angleTo(Vector3 v)`
-* `float distanceTo(Vector3 v)`
-* `float distanceToSquared(Vector3 v)`
-* `float manhattanDistanceTo(Vector3 v)`
-* `Vector3 setFromSphericalCoords(float r, float phi, float theta)`
-* `Vector3 setFromCylindricalCoords(float radius, float theta, float y)`
-* `Vector3 setFromMatrixPosition(Matrix4 m)`
-* `Vector3 setFromMatrixScale(Matrix4 m)`
-* `Vector3 setFromMatrixColumn(Matrix4 matrix, float index)`
-* `Vector3 setFromEuler(Euler e)`
-* `Vector3 setFromColor(any color)`
-* `bool equals(Vector3 v)`
-* `Vector3 fromArray(any array, float offset)`
-* `[]float toArray([]float array, float offset)`
-* `Vector3 fromBufferAttribute(any attribute, float index)`
-* `Vector3 random()`
-* `Vector3 randomDirection()`
-* `any dts_make(any self, string name, ..any args)`
-* `void dts_adopt(any o, string name)`
-* `any dts_cached(any o, string name)`
-* `bool dts_nil(any v)`
-* `any dts_u(any v)`
-* `any dts_obj({string: any} m)`
-* `any dts_cb(any target, string method)`
-* `any h = 0`
-* `void init({string: any} parameters)`
-* `any domElement()`
-* `void set_domElement(any v)`
-* `bool autoClear()`
-* `void set_autoClear(bool v)`
-* `bool autoClearColor()`
-* `void set_autoClearColor(bool v)`
-* `bool autoClearDepth()`
-* `void set_autoClearDepth(bool v)`
-* `bool autoClearStencil()`
-* `void set_autoClearStencil(bool v)`
-* `any debug()`
-* `void set_debug(any v)`
-* `bool sortObjects()`
-* `void set_sortObjects(bool v)`
-* `bool localClippingEnabled()`
-* `void set_localClippingEnabled(bool v)`
-* `string outputColorSpace()`
-* `void set_outputColorSpace(string v)`
-* `int coordinateSystem()`
-* `int toneMapping()`
-* `void set_toneMapping(int v)`
-* `float toneMappingExposure()`
-* `void set_toneMappingExposure(float v)`
-* `float transmissionResolutionScale()`
-* `void set_transmissionResolutionScale(float v)`
-* `any shadowMap()`
-* `void set_shadowMap(any v)`
-* `any getContext()`
-* `any getContextAttributes()`
-* `void forceContextLoss()`
-* `void forceContextRestore()`
-* `float getPixelRatio()`
-* `void setPixelRatio(float value)`
-* `void setSize(float width, float height, bool updateStyle = true)`
-* `void setDrawingBufferSize(float width, float height, float pixelRatio)`
-* `void setEffects([]any effects)`
-* `void setViewport(any x, float y, float width, float height)`
-* `void setScissor(any x, float y, float width, float height)`
-* `bool getScissorTest()`
-* `void setScissorTest(bool enable)`
-* `void setOpaqueSort(any method_target, string method_method)`
-* `void setTransparentSort(any method_target, string method_method)`
-* `Color getClearColor(Color target)`
-* `void setClearColor(any color, float alpha = 1.0)`
-* `float getClearAlpha()`
-* `void setClearAlpha(float alpha)`
-* `void clear(bool color, bool depth, bool stencil)`
-* `void clearColor()`
-* `void clearDepth()`
-* `void clearStencil()`
-* `void setNodesHandler(any nodesHandler)`
-* `void dispose()`
-* `void renderBufferDirect(Camera camera, Scene scene, BufferGeometry geometry, Material material, Object3D object, any group)`
-* `void setAnimationLoop(any callback_target, string callback_method)`
-* `void render(Object3D scene, Camera camera)`
-* `float getActiveCubeFace()`
-* `float getActiveMipmapLevel()`
-* `void resetState()`
+* `void BufferAttribute.init(any array, float itemSize, bool normalized = false)`
+* `float BufferAttribute.id()`
+* `string BufferAttribute.name()`
+* `void BufferAttribute.set_name(string v)`
+* `any BufferAttribute.array()`
+* `void BufferAttribute.set_array(any v)`
+* `float BufferAttribute.itemSize()`
+* `void BufferAttribute.set_itemSize(float v)`
+* `int BufferAttribute.usage()`
+* `void BufferAttribute.set_usage(int v)`
+* `int BufferAttribute.gpuType()`
+* `void BufferAttribute.set_gpuType(int v)`
+* `[]any BufferAttribute.updateRanges()`
+* `void BufferAttribute.set_updateRanges([]any v)`
+* `float BufferAttribute.version()`
+* `void BufferAttribute.set_version(float v)`
+* `bool BufferAttribute.normalized()`
+* `void BufferAttribute.set_normalized(bool v)`
+* `float BufferAttribute.count()`
+* `bool BufferAttribute.needsUpdate()`
+* `void BufferAttribute.set_needsUpdate(bool v)`
+* `bool BufferAttribute.isBufferAttribute()`
+* `BufferAttribute BufferAttribute.onUpload(any callback_target, string callback_method)`
+* `BufferAttribute BufferAttribute.setUsage(int usage)`
+* `void BufferAttribute.addUpdateRange(float start, float count)`
+* `void BufferAttribute.clearUpdateRanges()`
+* `BufferAttribute BufferAttribute.clone()`
+* `BufferAttribute BufferAttribute.copy(BufferAttribute source)`
+* `BufferAttribute BufferAttribute.copyAt(float index1, BufferAttribute attribute, float index2)`
+* `BufferAttribute BufferAttribute.copyArray(any array)`
+* `BufferAttribute BufferAttribute.applyMatrix4(Matrix4 m)`
+* `BufferAttribute BufferAttribute.transformDirection(Matrix4 m)`
+* `BufferAttribute BufferAttribute.set(any value, float offset = 0.0)`
+* `float BufferAttribute.getComponent(float index, float component)`
+* `void BufferAttribute.setComponent(float index, float component, float value)`
+* `float BufferAttribute.getX(float index)`
+* `BufferAttribute BufferAttribute.setX(float index, float x)`
+* `float BufferAttribute.getY(float index)`
+* `BufferAttribute BufferAttribute.setY(float index, float y)`
+* `float BufferAttribute.getZ(float index)`
+* `BufferAttribute BufferAttribute.setZ(float index, float z)`
+* `float BufferAttribute.getW(float index)`
+* `BufferAttribute BufferAttribute.setW(float index, float z)`
+* `BufferAttribute BufferAttribute.setXY(float index, float x, float y)`
+* `BufferAttribute BufferAttribute.setXYZ(float index, float x, float y, float z)`
+* `BufferAttribute BufferAttribute.setXYZW(float index, float x, float y, float z, float w)`
+* `any BufferAttribute.toJSON()`
+* `void BufferAttribute.dispose()`
+* `class BufferGeometry`
+* `void BufferGeometry.init()`
+* `int BufferGeometry.id()`
+* `void BufferGeometry.set_id(int v)`
+* `string BufferGeometry.uuid()`
+* `void BufferGeometry.set_uuid(string v)`
+* `string BufferGeometry.name()`
+* `void BufferGeometry.set_name(string v)`
+* `string BufferGeometry.type_()`
+* `bool BufferGeometry.has_index()`
+* `BufferAttribute BufferGeometry.index()`
+* `void BufferGeometry.set_index(BufferAttribute v)`
+* `void BufferGeometry.clear_index()`
+* `bool BufferGeometry.has_indirect()`
+* `any BufferGeometry.indirect()`
+* `void BufferGeometry.set_indirect(any v)`
+* `void BufferGeometry.clear_indirect()`
+* `any BufferGeometry.indirectOffset()`
+* `void BufferGeometry.set_indirectOffset(any v)`
+* `any BufferGeometry.attributes()`
+* `void BufferGeometry.set_attributes(any v)`
+* `any BufferGeometry.morphAttributes()`
+* `void BufferGeometry.set_morphAttributes(any v)`
+* `bool BufferGeometry.morphTargetsRelative()`
+* `void BufferGeometry.set_morphTargetsRelative(bool v)`
+* `[]any BufferGeometry.groups()`
+* `void BufferGeometry.set_groups([]any v)`
+* `any BufferGeometry.drawRange()`
+* `void BufferGeometry.set_drawRange(any v)`
+* `any BufferGeometry.userData()`
+* `void BufferGeometry.set_userData(any v)`
+* `bool BufferGeometry.isBufferGeometry()`
+* `BufferGeometry BufferGeometry.setIndex(any index)`
+* `BufferGeometry BufferGeometry.setIndirect(any indirect, any indirectOffset)`
+* `any BufferGeometry.getIndirect()`
+* `void BufferGeometry.addGroup(float start, float count, float materialIndex)`
+* `void BufferGeometry.clearGroups()`
+* `void BufferGeometry.setDrawRange(float start, float count)`
+* `BufferGeometry BufferGeometry.applyMatrix4(Matrix4 matrix)`
+* `BufferGeometry BufferGeometry.rotateX(float angle)`
+* `BufferGeometry BufferGeometry.rotateY(float angle)`
+* `BufferGeometry BufferGeometry.rotateZ(float angle)`
+* `BufferGeometry BufferGeometry.translate(float x, float y, float z)`
+* `BufferGeometry BufferGeometry.scale(float x, float y, float z)`
+* `BufferGeometry BufferGeometry.lookAt(Vector3 vector)`
+* `BufferGeometry BufferGeometry.center()`
+* `BufferGeometry BufferGeometry.setFromPoints(any points)`
+* `void BufferGeometry.computeBoundingBox()`
+* `void BufferGeometry.computeBoundingSphere()`
+* `void BufferGeometry.computeTangents()`
+* `void BufferGeometry.computeVertexNormals()`
+* `void BufferGeometry.normalizeNormals()`
+* `BufferGeometry BufferGeometry.toNonIndexed()`
+* `any BufferGeometry.toJSON()`
+* `BufferGeometry BufferGeometry.clone()`
+* `BufferGeometry BufferGeometry.copy(BufferGeometry source)`
+* `void BufferGeometry.dispose()`
+* `class Camera`
+* `void Camera.init()`
+* `bool Camera.isCamera()`
+* `Matrix4 Camera.matrixWorldInverse()`
+* `void Camera.set_matrixWorldInverse(Matrix4 v)`
+* `Matrix4 Camera.projectionMatrix()`
+* `void Camera.set_projectionMatrix(Matrix4 v)`
+* `Matrix4 Camera.projectionMatrixInverse()`
+* `void Camera.set_projectionMatrixInverse(Matrix4 v)`
+* `int Camera.coordinateSystem()`
+* `void Camera.set_coordinateSystem(int v)`
+* `bool Camera.reversedDepth()`
+* `class Color`
+* `void Color.init(float r, float g, float b)`
+* `bool Color.isColor()`
+* `float Color.r()`
+* `void Color.set_r(float v)`
+* `float Color.g()`
+* `void Color.set_g(float v)`
+* `float Color.b()`
+* `void Color.set_b(float v)`
+* `Color Color.setFromVector3(Vector3 vector)`
+* `Color Color.setScalar(float scalar)`
+* `Color Color.setHex(int hex)`
+* `Color Color.setRGB(float r, float g, float b, string colorSpace)`
+* `Color Color.setHSL(float h_, float s, float l, string colorSpace)`
+* `Color Color.setStyle(string style, string colorSpace)`
+* `Color Color.setColorName(string style, string colorSpace)`
+* `Color Color.clone()`
+* `Color Color.copy(Color color)`
+* `Color Color.copySRGBToLinear(Color color)`
+* `Color Color.copyLinearToSRGB(Color color)`
+* `Color Color.convertSRGBToLinear()`
+* `Color Color.convertLinearToSRGB()`
+* `int Color.getHex()`
+* `string Color.getHexString()`
+* `any Color.getHSL(any target, string colorSpace)`
+* `any Color.getRGB(any target, string colorSpace)`
+* `string Color.getStyle()`
+* `Color Color.offsetHSL(float h_, float s, float l)`
+* `Color Color.add(Color color)`
+* `Color Color.addColors(Color color1, Color color2)`
+* `Color Color.addScalar(float s)`
+* `Color Color.sub(Color color)`
+* `Color Color.multiply(Color color)`
+* `Color Color.multiplyScalar(float s)`
+* `Color Color.lerp(Color color, float alpha)`
+* `Color Color.lerpColors(Color color1, Color color2, float alpha)`
+* `Color Color.lerpHSL(Color color, float alpha)`
+* `bool Color.equals(Color color)`
+* `Color Color.fromArray(any array, float offset)`
+* `[]float Color.toArray([]float array, float offset)`
+* `float Color.toJSON()`
+* `Color Color.fromBufferAttribute(any attribute, float index)`
+* `class DirectionalLight`
+* `void DirectionalLight.init(any color = 16777215, float intensity = 1.0)`
+* `bool DirectionalLight.isDirectionalLight()`
+* `Object3D DirectionalLight.target()`
+* `void DirectionalLight.set_target(Object3D v)`
+* `any DirectionalLight.shadow()`
+* `void DirectionalLight.set_shadow(any v)`
+* `class Euler`
+* `void Euler.init(float x, float y, float z, string order)`
+* `float Euler.x()`
+* `void Euler.set_x(float v)`
+* `float Euler.y()`
+* `void Euler.set_y(float v)`
+* `float Euler.z()`
+* `void Euler.set_z(float v)`
+* `string Euler.order()`
+* `void Euler.set_order(string v)`
+* `bool Euler.isEuler()`
+* `Euler Euler.set(float x, float y, float z, string order)`
+* `Euler Euler.clone()`
+* `Euler Euler.copy(Euler euler)`
+* `Euler Euler.setFromRotationMatrix(Matrix4 m, string order, bool update)`
+* `Euler Euler.setFromVector3(Vector3 v, string order)`
+* `Euler Euler.reorder(string newOrder)`
+* `bool Euler.equals(Euler euler)`
+* `Euler Euler.fromArray(any array)`
+* `any Euler.toArray(any array, float offset)`
+* `Euler Euler._onChange(any callback_target, string callback_method)`
+* `class GridHelper`
+* `void GridHelper.init(float size = 10.0, int divisions = 10, any color1 = 4473924, any color2 = 8947848)`
+* `void GridHelper.dispose()`
+* `bool GridHelper.isLineSegments()`
+* `bool GridHelper.isLine()`
+* `BufferGeometry GridHelper.geometry()`
+* `void GridHelper.set_geometry(BufferGeometry v)`
+* `bool GridHelper.has_morphTargetInfluences()`
+* `[]float GridHelper.morphTargetInfluences()`
+* `void GridHelper.set_morphTargetInfluences([]float v)`
+* `void GridHelper.clear_morphTargetInfluences()`
+* `bool GridHelper.has_morphTargetDictionary()`
+* `any GridHelper.morphTargetDictionary()`
+* `void GridHelper.set_morphTargetDictionary(any v)`
+* `void GridHelper.clear_morphTargetDictionary()`
+* `GridHelper GridHelper.computeLineDistances()`
+* `void GridHelper.updateMorphTargets()`
+* `class HemisphereLight`
+* `void HemisphereLight.init(any skyColor = 16777215, any groundColor = 16777215, float intensity = 1.0)`
+* `bool HemisphereLight.isHemisphereLight()`
+* `Color HemisphereLight.groundColor()`
+* `void HemisphereLight.set_groundColor(Color v)`
+* `class Light`
+* `void Light.init(any color = 16777215, float intensity = 1.0)`
+* `bool Light.isLight()`
+* `Color Light.color()`
+* `void Light.set_color(Color v)`
+* `float Light.intensity()`
+* `void Light.set_intensity(float v)`
+* `void Light.dispose()`
+* `class Material`
+* `void Material.init()`
+* `string Material.name()`
+* `void Material.set_name(string v)`
+* `int Material.blending()`
+* `void Material.set_blending(int v)`
+* `int Material.side()`
+* `void Material.set_side(int v)`
+* `bool Material.vertexColors()`
+* `void Material.set_vertexColors(bool v)`
+* `float Material.opacity()`
+* `void Material.set_opacity(float v)`
+* `bool Material.transparent()`
+* `void Material.set_transparent(bool v)`
+* `bool Material.alphaHash()`
+* `void Material.set_alphaHash(bool v)`
+* `int Material.blendSrc()`
+* `void Material.set_blendSrc(int v)`
+* `int Material.blendDst()`
+* `void Material.set_blendDst(int v)`
+* `int Material.blendEquation()`
+* `void Material.set_blendEquation(int v)`
+* `bool Material.has_blendSrcAlpha()`
+* `int Material.blendSrcAlpha()`
+* `void Material.set_blendSrcAlpha(int v)`
+* `void Material.clear_blendSrcAlpha()`
+* `bool Material.has_blendDstAlpha()`
+* `int Material.blendDstAlpha()`
+* `void Material.set_blendDstAlpha(int v)`
+* `void Material.clear_blendDstAlpha()`
+* `bool Material.has_blendEquationAlpha()`
+* `int Material.blendEquationAlpha()`
+* `void Material.set_blendEquationAlpha(int v)`
+* `void Material.clear_blendEquationAlpha()`
+* `Color Material.blendColor()`
+* `void Material.set_blendColor(Color v)`
+* `float Material.blendAlpha()`
+* `void Material.set_blendAlpha(float v)`
+* `int Material.depthFunc()`
+* `void Material.set_depthFunc(int v)`
+* `bool Material.depthTest()`
+* `void Material.set_depthTest(bool v)`
+* `bool Material.depthWrite()`
+* `void Material.set_depthWrite(bool v)`
+* `float Material.stencilWriteMask()`
+* `void Material.set_stencilWriteMask(float v)`
+* `int Material.stencilFunc()`
+* `void Material.set_stencilFunc(int v)`
+* `float Material.stencilRef()`
+* `void Material.set_stencilRef(float v)`
+* `float Material.stencilFuncMask()`
+* `void Material.set_stencilFuncMask(float v)`
+* `int Material.stencilFail()`
+* `void Material.set_stencilFail(int v)`
+* `int Material.stencilZFail()`
+* `void Material.set_stencilZFail(int v)`
+* `int Material.stencilZPass()`
+* `void Material.set_stencilZPass(int v)`
+* `bool Material.stencilWrite()`
+* `void Material.set_stencilWrite(bool v)`
+* `bool Material.clipIntersection()`
+* `void Material.set_clipIntersection(bool v)`
+* `bool Material.clipShadows()`
+* `void Material.set_clipShadows(bool v)`
+* `bool Material.has_shadowSide()`
+* `int Material.shadowSide()`
+* `void Material.set_shadowSide(int v)`
+* `void Material.clear_shadowSide()`
+* `bool Material.colorWrite()`
+* `void Material.set_colorWrite(bool v)`
+* `bool Material.has_precision()`
+* `string Material.precision()`
+* `void Material.set_precision(string v)`
+* `void Material.clear_precision()`
+* `bool Material.polygonOffset()`
+* `void Material.set_polygonOffset(bool v)`
+* `float Material.polygonOffsetFactor()`
+* `void Material.set_polygonOffsetFactor(float v)`
+* `float Material.polygonOffsetUnits()`
+* `void Material.set_polygonOffsetUnits(float v)`
+* `bool Material.dithering()`
+* `void Material.set_dithering(bool v)`
+* `bool Material.alphaToCoverage()`
+* `void Material.set_alphaToCoverage(bool v)`
+* `bool Material.premultipliedAlpha()`
+* `void Material.set_premultipliedAlpha(bool v)`
+* `bool Material.forceSinglePass()`
+* `void Material.set_forceSinglePass(bool v)`
+* `bool Material.allowOverride()`
+* `void Material.set_allowOverride(bool v)`
+* `bool Material.visible()`
+* `void Material.set_visible(bool v)`
+* `bool Material.toneMapped()`
+* `void Material.set_toneMapped(bool v)`
+* `any Material.userData()`
+* `void Material.set_userData(any v)`
+* `float Material.alphaTest()`
+* `void Material.set_alphaTest(float v)`
+* `bool Material.isMaterial()`
+* `string Material.uuid()`
+* `string Material.type_()`
+* `void Material.set_type(string v)`
+* `float Material.version()`
+* `bool Material.has_defines()`
+* `any Material.defines()`
+* `void Material.set_defines(any v)`
+* `void Material.clear_defines()`
+* `void Material.onBeforeCompile(any parameters, WebGLRenderer renderer)`
+* `string Material.customProgramCacheKey()`
+* `void Material.setValues({string: any} values)`
+* `any Material.toJSON(any meta)`
+* `Material Material.clone()`
+* `Material Material.copy(Material source)`
+* `void Material.dispose()`
+* `bool Material.needsUpdate()`
+* `void Material.set_needsUpdate(bool v)`
+* `class Matrix4`
+* `void Matrix4.init()`
+* `bool Matrix4.isMatrix4()`
+* `[]float Matrix4.elements()`
+* `void Matrix4.set_elements([]float v)`
+* `Matrix4 Matrix4.set(float n11, float n12, float n13, float n14, float n21, float n22, float n23, float n24, float n31, float n32, float n33, float n34, float n41, float n42, float n43, float n44)`
+* `Matrix4 Matrix4.identity()`
+* `Matrix4 Matrix4.clone()`
+* `Matrix4 Matrix4.copy(Matrix4 m)`
+* `Matrix4 Matrix4.copyPosition(Matrix4 m)`
+* `Matrix4 Matrix4.extractBasis(Vector3 xAxis, Vector3 yAxis, Vector3 zAxis)`
+* `Matrix4 Matrix4.makeBasis(Vector3 xAxis, Vector3 yAxis, Vector3 zAxis)`
+* `Matrix4 Matrix4.extractRotation(Matrix4 m)`
+* `Matrix4 Matrix4.makeRotationFromEuler(Euler euler)`
+* `Matrix4 Matrix4.lookAt(Vector3 eye, Vector3 target, Vector3 up)`
+* `Matrix4 Matrix4.multiply(Matrix4 m)`
+* `Matrix4 Matrix4.premultiply(Matrix4 m)`
+* `Matrix4 Matrix4.multiplyMatrices(Matrix4 a, Matrix4 b)`
+* `Matrix4 Matrix4.multiplyScalar(float s)`
+* `float Matrix4.determinant()`
+* `Matrix4 Matrix4.transpose()`
+* `Matrix4 Matrix4.setPosition(Vector3 v)`
+* `Matrix4 Matrix4.invert()`
+* `Matrix4 Matrix4.scale(Vector3 v)`
+* `float Matrix4.getMaxScaleOnAxis()`
+* `Matrix4 Matrix4.makeTranslation(Vector3 v)`
+* `Matrix4 Matrix4.makeRotationX(float theta)`
+* `Matrix4 Matrix4.makeRotationY(float theta)`
+* `Matrix4 Matrix4.makeRotationZ(float theta)`
+* `Matrix4 Matrix4.makeRotationAxis(Vector3 axis, float angle)`
+* `Matrix4 Matrix4.makeScale(float x, float y, float z)`
+* `Matrix4 Matrix4.makeShear(float xy, float xz, float yx, float yz, float zx, float zy)`
+* `Matrix4 Matrix4.makePerspective(float left, float right, float top, float bottom, float near, float far, int coordinateSystem, bool reversedDepth)`
+* `Matrix4 Matrix4.makeOrthographic(float left, float right, float top, float bottom, float near, float far, int coordinateSystem, bool reversedDepth)`
+* `bool Matrix4.equals(Matrix4 matrix)`
+* `Matrix4 Matrix4.fromArray(any array, float offset)`
+* `[]float Matrix4.toArray()`
+* `class Mesh`
+* `void Mesh.init(BufferGeometry geometry, any material)`
+* `bool Mesh.isMesh()`
+* `BufferGeometry Mesh.geometry()`
+* `void Mesh.set_geometry(BufferGeometry v)`
+* `any Mesh.material()`
+* `void Mesh.set_material(any v)`
+* `bool Mesh.has_morphTargetInfluences()`
+* `[]float Mesh.morphTargetInfluences()`
+* `void Mesh.set_morphTargetInfluences([]float v)`
+* `void Mesh.clear_morphTargetInfluences()`
+* `bool Mesh.has_morphTargetDictionary()`
+* `any Mesh.morphTargetDictionary()`
+* `void Mesh.set_morphTargetDictionary(any v)`
+* `void Mesh.clear_morphTargetDictionary()`
+* `float Mesh.count()`
+* `void Mesh.set_count(float v)`
+* `void Mesh.updateMorphTargets()`
+* `Vector3 Mesh.getVertexPosition(float index, Vector3 target)`
+* `class MeshBasicMaterial`
+* `void MeshBasicMaterial.init({string: any} parameters)`
+* `Color MeshBasicMaterial.color()`
+* `void MeshBasicMaterial.set_color(Color v)`
+* `float MeshBasicMaterial.lightMapIntensity()`
+* `void MeshBasicMaterial.set_lightMapIntensity(float v)`
+* `float MeshBasicMaterial.aoMapIntensity()`
+* `void MeshBasicMaterial.set_aoMapIntensity(float v)`
+* `Euler MeshBasicMaterial.envMapRotation()`
+* `void MeshBasicMaterial.set_envMapRotation(Euler v)`
+* `int MeshBasicMaterial.combine()`
+* `void MeshBasicMaterial.set_combine(int v)`
+* `float MeshBasicMaterial.reflectivity()`
+* `void MeshBasicMaterial.set_reflectivity(float v)`
+* `float MeshBasicMaterial.refractionRatio()`
+* `void MeshBasicMaterial.set_refractionRatio(float v)`
+* `bool MeshBasicMaterial.wireframe()`
+* `void MeshBasicMaterial.set_wireframe(bool v)`
+* `float MeshBasicMaterial.wireframeLinewidth()`
+* `void MeshBasicMaterial.set_wireframeLinewidth(float v)`
+* `string MeshBasicMaterial.wireframeLinecap()`
+* `void MeshBasicMaterial.set_wireframeLinecap(string v)`
+* `string MeshBasicMaterial.wireframeLinejoin()`
+* `void MeshBasicMaterial.set_wireframeLinejoin(string v)`
+* `bool MeshBasicMaterial.fog()`
+* `void MeshBasicMaterial.set_fog(bool v)`
+* `bool MeshBasicMaterial.isMeshBasicMaterial()`
+* `class MeshStandardMaterial`
+* `void MeshStandardMaterial.init({string: any} parameters)`
+* `Color MeshStandardMaterial.color()`
+* `void MeshStandardMaterial.set_color(Color v)`
+* `float MeshStandardMaterial.roughness()`
+* `void MeshStandardMaterial.set_roughness(float v)`
+* `float MeshStandardMaterial.metalness()`
+* `void MeshStandardMaterial.set_metalness(float v)`
+* `float MeshStandardMaterial.lightMapIntensity()`
+* `void MeshStandardMaterial.set_lightMapIntensity(float v)`
+* `float MeshStandardMaterial.aoMapIntensity()`
+* `void MeshStandardMaterial.set_aoMapIntensity(float v)`
+* `Color MeshStandardMaterial.emissive()`
+* `void MeshStandardMaterial.set_emissive(Color v)`
+* `float MeshStandardMaterial.emissiveIntensity()`
+* `void MeshStandardMaterial.set_emissiveIntensity(float v)`
+* `float MeshStandardMaterial.bumpScale()`
+* `void MeshStandardMaterial.set_bumpScale(float v)`
+* `int MeshStandardMaterial.normalMapType()`
+* `void MeshStandardMaterial.set_normalMapType(int v)`
+* `float MeshStandardMaterial.displacementScale()`
+* `void MeshStandardMaterial.set_displacementScale(float v)`
+* `float MeshStandardMaterial.displacementBias()`
+* `void MeshStandardMaterial.set_displacementBias(float v)`
+* `Euler MeshStandardMaterial.envMapRotation()`
+* `void MeshStandardMaterial.set_envMapRotation(Euler v)`
+* `float MeshStandardMaterial.envMapIntensity()`
+* `void MeshStandardMaterial.set_envMapIntensity(float v)`
+* `bool MeshStandardMaterial.wireframe()`
+* `void MeshStandardMaterial.set_wireframe(bool v)`
+* `float MeshStandardMaterial.wireframeLinewidth()`
+* `void MeshStandardMaterial.set_wireframeLinewidth(float v)`
+* `string MeshStandardMaterial.wireframeLinecap()`
+* `void MeshStandardMaterial.set_wireframeLinecap(string v)`
+* `string MeshStandardMaterial.wireframeLinejoin()`
+* `void MeshStandardMaterial.set_wireframeLinejoin(string v)`
+* `bool MeshStandardMaterial.flatShading()`
+* `void MeshStandardMaterial.set_flatShading(bool v)`
+* `bool MeshStandardMaterial.fog()`
+* `void MeshStandardMaterial.set_fog(bool v)`
+* `bool MeshStandardMaterial.isMeshStandardMaterial()`
+* `class Object3D`
+* `void Object3D.init()`
+* `bool Object3D.isObject3D()`
+* `int Object3D.id()`
+* `string Object3D.uuid()`
+* `void Object3D.set_uuid(string v)`
+* `string Object3D.name()`
+* `void Object3D.set_name(string v)`
+* `string Object3D.type_()`
+* `bool Object3D.has_parent()`
+* `Object3D Object3D.parent()`
+* `void Object3D.set_parent(Object3D v)`
+* `void Object3D.clear_parent()`
+* `[]Object3D Object3D.children()`
+* `void Object3D.set_children([]Object3D v)`
+* `Vector3 Object3D.up()`
+* `void Object3D.set_up(Vector3 v)`
+* `Vector3 Object3D.position()`
+* `Euler Object3D.rotation()`
+* `Vector3 Object3D.scale()`
+* `Matrix4 Object3D.modelViewMatrix()`
+* `Matrix4 Object3D.matrix()`
+* `void Object3D.set_matrix(Matrix4 v)`
+* `Matrix4 Object3D.matrixWorld()`
+* `void Object3D.set_matrixWorld(Matrix4 v)`
+* `bool Object3D.matrixAutoUpdate()`
+* `void Object3D.set_matrixAutoUpdate(bool v)`
+* `bool Object3D.matrixWorldAutoUpdate()`
+* `void Object3D.set_matrixWorldAutoUpdate(bool v)`
+* `bool Object3D.matrixWorldNeedsUpdate()`
+* `void Object3D.set_matrixWorldNeedsUpdate(bool v)`
+* `bool Object3D.visible()`
+* `void Object3D.set_visible(bool v)`
+* `bool Object3D.castShadow()`
+* `void Object3D.set_castShadow(bool v)`
+* `bool Object3D.receiveShadow()`
+* `void Object3D.set_receiveShadow(bool v)`
+* `bool Object3D.frustumCulled()`
+* `void Object3D.set_frustumCulled(bool v)`
+* `float Object3D.renderOrder()`
+* `void Object3D.set_renderOrder(float v)`
+* `bool Object3D.has_customDepthMaterial()`
+* `Material Object3D.customDepthMaterial()`
+* `void Object3D.set_customDepthMaterial(Material v)`
+* `void Object3D.clear_customDepthMaterial()`
+* `bool Object3D.has_customDistanceMaterial()`
+* `Material Object3D.customDistanceMaterial()`
+* `void Object3D.set_customDistanceMaterial(Material v)`
+* `void Object3D.clear_customDistanceMaterial()`
+* `bool Object3D.static()`
+* `void Object3D.set_static(bool v)`
+* `any Object3D.userData()`
+* `void Object3D.set_userData(any v)`
+* `bool Object3D.has_pivot()`
+* `Vector3 Object3D.pivot()`
+* `void Object3D.set_pivot(Vector3 v)`
+* `void Object3D.clear_pivot()`
+* `void Object3D.applyMatrix4(Matrix4 matrix)`
+* `void Object3D.setRotationFromAxisAngle(Vector3 axis, float angle)`
+* `void Object3D.setRotationFromEuler(Euler euler)`
+* `void Object3D.setRotationFromMatrix(Matrix4 m)`
+* `Object3D Object3D.rotateOnAxis(Vector3 axis, float angle)`
+* `Object3D Object3D.rotateOnWorldAxis(Vector3 axis, float angle)`
+* `Object3D Object3D.rotateX(float angle)`
+* `Object3D Object3D.rotateY(float angle)`
+* `Object3D Object3D.rotateZ(float angle)`
+* `Object3D Object3D.translateOnAxis(Vector3 axis, float distance)`
+* `Object3D Object3D.translateX(float distance)`
+* `Object3D Object3D.translateY(float distance)`
+* `Object3D Object3D.translateZ(float distance)`
+* `Vector3 Object3D.localToWorld(Vector3 vector)`
+* `Vector3 Object3D.worldToLocal(Vector3 vector)`
+* `void Object3D.lookAt(Vector3 vector)`
+* `void Object3D.lookAtXYZ(float x, float y, float z)`
+* `Object3D Object3D.add(Object3D object)`
+* `Object3D Object3D.remove(Object3D object)`
+* `Object3D Object3D.removeFromParent()`
+* `Object3D Object3D.clear()`
+* `Object3D Object3D.attach(Object3D object)`
+* `[]Object3D Object3D.getObjectsByProperty(string name, any value, []Object3D optionalTarget)`
+* `Vector3 Object3D.getWorldPosition(Vector3 target)`
+* `Vector3 Object3D.getWorldScale(Vector3 target)`
+* `Vector3 Object3D.getWorldDirection(Vector3 target)`
+* `void Object3D.traverse(any callback_target, string callback_method)`
+* `void Object3D.traverseVisible(any callback_target, string callback_method)`
+* `void Object3D.traverseAncestors(any callback_target, string callback_method)`
+* `void Object3D.updateMatrix()`
+* `void Object3D.updateMatrixWorld(bool force)`
+* `void Object3D.updateWorldMatrix(bool updateParents, bool updateChildren)`
+* `any Object3D.toJSON(any meta)`
+* `Object3D Object3D.clone(bool recursive = true)`
+* `Object3D Object3D.copy(Object3D object, bool recursive = true)`
+* `class PerspectiveCamera`
+* `void PerspectiveCamera.init(float fov = 50.0, float aspect = 1.0, float near = 0.1, float far = 2000.0)`
+* `bool PerspectiveCamera.isPerspectiveCamera()`
+* `float PerspectiveCamera.fov()`
+* `void PerspectiveCamera.set_fov(float v)`
+* `float PerspectiveCamera.zoom()`
+* `void PerspectiveCamera.set_zoom(float v)`
+* `float PerspectiveCamera.near()`
+* `void PerspectiveCamera.set_near(float v)`
+* `float PerspectiveCamera.far()`
+* `void PerspectiveCamera.set_far(float v)`
+* `float PerspectiveCamera.focus()`
+* `void PerspectiveCamera.set_focus(float v)`
+* `float PerspectiveCamera.aspect()`
+* `void PerspectiveCamera.set_aspect(float v)`
+* `bool PerspectiveCamera.has_view()`
+* `any PerspectiveCamera.view_()`
+* `void PerspectiveCamera.set_view(any v)`
+* `void PerspectiveCamera.clear_view()`
+* `float PerspectiveCamera.filmGauge()`
+* `void PerspectiveCamera.set_filmGauge(float v)`
+* `float PerspectiveCamera.filmOffset()`
+* `void PerspectiveCamera.set_filmOffset(float v)`
+* `void PerspectiveCamera.setFocalLength(float focalLength)`
+* `float PerspectiveCamera.getFocalLength()`
+* `float PerspectiveCamera.getEffectiveFOV()`
+* `float PerspectiveCamera.getFilmWidth()`
+* `float PerspectiveCamera.getFilmHeight()`
+* `void PerspectiveCamera.setViewOffset(float fullWidth, float fullHeight, float x, float y, float width, float height)`
+* `void PerspectiveCamera.clearViewOffset()`
+* `void PerspectiveCamera.updateProjectionMatrix()`
+* `class PlaneGeometry`
+* `void PlaneGeometry.init(float width = 1.0, float height = 1.0, int widthSegments = 1, int heightSegments = 1)`
+* `any PlaneGeometry.parameters()`
+* `class Scene`
+* `void Scene.init()`
+* `bool Scene.isScene()`
+* `bool Scene.has_background()`
+* `any Scene.background()`
+* `void Scene.set_background(any v)`
+* `void Scene.clear_background()`
+* `bool Scene.has_fog()`
+* `any Scene.fog()`
+* `void Scene.set_fog(any v)`
+* `void Scene.clear_fog()`
+* `float Scene.backgroundBlurriness()`
+* `void Scene.set_backgroundBlurriness(float v)`
+* `float Scene.backgroundIntensity()`
+* `void Scene.set_backgroundIntensity(float v)`
+* `Euler Scene.backgroundRotation()`
+* `void Scene.set_backgroundRotation(Euler v)`
+* `float Scene.environmentIntensity()`
+* `void Scene.set_environmentIntensity(float v)`
+* `Euler Scene.environmentRotation()`
+* `void Scene.set_environmentRotation(Euler v)`
+* `bool Scene.has_overrideMaterial()`
+* `Material Scene.overrideMaterial()`
+* `void Scene.set_overrideMaterial(Material v)`
+* `void Scene.clear_overrideMaterial()`
+* `class ShaderMaterial`
+* `void ShaderMaterial.init({string: any} parameters)`
+* `any ShaderMaterial.uniforms()`
+* `void ShaderMaterial.set_uniforms(any v)`
+* `string ShaderMaterial.vertexShader()`
+* `void ShaderMaterial.set_vertexShader(string v)`
+* `string ShaderMaterial.fragmentShader()`
+* `void ShaderMaterial.set_fragmentShader(string v)`
+* `float ShaderMaterial.linewidth()`
+* `void ShaderMaterial.set_linewidth(float v)`
+* `bool ShaderMaterial.wireframe()`
+* `void ShaderMaterial.set_wireframe(bool v)`
+* `float ShaderMaterial.wireframeLinewidth()`
+* `void ShaderMaterial.set_wireframeLinewidth(float v)`
+* `bool ShaderMaterial.fog()`
+* `void ShaderMaterial.set_fog(bool v)`
+* `bool ShaderMaterial.lights()`
+* `void ShaderMaterial.set_lights(bool v)`
+* `bool ShaderMaterial.clipping()`
+* `void ShaderMaterial.set_clipping(bool v)`
+* `any ShaderMaterial.extensions()`
+* `void ShaderMaterial.set_extensions(any v)`
+* `any ShaderMaterial.defaultAttributeValues()`
+* `void ShaderMaterial.set_defaultAttributeValues(any v)`
+* `bool ShaderMaterial.has_index0AttributeName()`
+* `string ShaderMaterial.index0AttributeName()`
+* `void ShaderMaterial.set_index0AttributeName(string v)`
+* `void ShaderMaterial.clear_index0AttributeName()`
+* `bool ShaderMaterial.uniformsNeedUpdate()`
+* `void ShaderMaterial.set_uniformsNeedUpdate(bool v)`
+* `bool ShaderMaterial.has_glslVersion()`
+* `string ShaderMaterial.glslVersion()`
+* `void ShaderMaterial.set_glslVersion(string v)`
+* `void ShaderMaterial.clear_glslVersion()`
+* `bool ShaderMaterial.isShaderMaterial()`
+* `class Vector3`
+* `void Vector3.init(float x, float y, float z)`
+* `float Vector3.x()`
+* `void Vector3.set_x(float v)`
+* `float Vector3.y()`
+* `void Vector3.set_y(float v)`
+* `float Vector3.z()`
+* `void Vector3.set_z(float v)`
+* `bool Vector3.isVector3()`
+* `Vector3 Vector3.set(float x, float y, float z)`
+* `Vector3 Vector3.setScalar(float scalar)`
+* `Vector3 Vector3.setX(float x)`
+* `Vector3 Vector3.setY(float y)`
+* `Vector3 Vector3.setZ(float z)`
+* `Vector3 Vector3.setComponent(float index, float value)`
+* `float Vector3.getComponent(float index)`
+* `Vector3 Vector3.clone()`
+* `Vector3 Vector3.copy(Vector3 v)`
+* `Vector3 Vector3.add(Vector3 v)`
+* `Vector3 Vector3.addScalar(float s)`
+* `Vector3 Vector3.addVectors(Vector3 a, Vector3 b)`
+* `Vector3 Vector3.addScaledVector(Vector3 v, float s)`
+* `Vector3 Vector3.sub(Vector3 v)`
+* `Vector3 Vector3.subScalar(float s)`
+* `Vector3 Vector3.subVectors(Vector3 a, Vector3 b)`
+* `Vector3 Vector3.multiply(Vector3 v)`
+* `Vector3 Vector3.multiplyScalar(float s)`
+* `Vector3 Vector3.multiplyVectors(Vector3 a, Vector3 b)`
+* `Vector3 Vector3.applyEuler(Euler euler)`
+* `Vector3 Vector3.applyAxisAngle(Vector3 axis, float angle)`
+* `Vector3 Vector3.applyMatrix4(Matrix4 m)`
+* `Vector3 Vector3.applyQuaternion(any q)`
+* `Vector3 Vector3.project(Camera camera)`
+* `Vector3 Vector3.unproject(Camera camera)`
+* `Vector3 Vector3.transformDirection(Matrix4 m)`
+* `Vector3 Vector3.divide(Vector3 v)`
+* `Vector3 Vector3.divideScalar(float s)`
+* `Vector3 Vector3.min(Vector3 v)`
+* `Vector3 Vector3.max(Vector3 v)`
+* `Vector3 Vector3.clamp(Vector3 min, Vector3 max)`
+* `Vector3 Vector3.clampScalar(float min, float max)`
+* `Vector3 Vector3.clampLength(float min, float max)`
+* `Vector3 Vector3.floor()`
+* `Vector3 Vector3.ceil()`
+* `Vector3 Vector3.round()`
+* `Vector3 Vector3.roundToZero()`
+* `Vector3 Vector3.negate()`
+* `float Vector3.dot(Vector3 v)`
+* `float Vector3.lengthSq()`
+* `float Vector3.length()`
+* `float Vector3.manhattanLength()`
+* `Vector3 Vector3.normalize()`
+* `Vector3 Vector3.setLength(float l)`
+* `Vector3 Vector3.lerp(Vector3 v, float alpha)`
+* `Vector3 Vector3.lerpVectors(Vector3 v1, Vector3 v2, float alpha)`
+* `Vector3 Vector3.cross(Vector3 v)`
+* `Vector3 Vector3.crossVectors(Vector3 a, Vector3 b)`
+* `Vector3 Vector3.projectOnVector(Vector3 v)`
+* `Vector3 Vector3.projectOnPlane(Vector3 planeNormal)`
+* `Vector3 Vector3.reflect(Vector3 vector)`
+* `float Vector3.angleTo(Vector3 v)`
+* `float Vector3.distanceTo(Vector3 v)`
+* `float Vector3.distanceToSquared(Vector3 v)`
+* `float Vector3.manhattanDistanceTo(Vector3 v)`
+* `Vector3 Vector3.setFromSphericalCoords(float r, float phi, float theta)`
+* `Vector3 Vector3.setFromCylindricalCoords(float radius, float theta, float y)`
+* `Vector3 Vector3.setFromMatrixPosition(Matrix4 m)`
+* `Vector3 Vector3.setFromMatrixScale(Matrix4 m)`
+* `Vector3 Vector3.setFromMatrixColumn(Matrix4 matrix, float index)`
+* `Vector3 Vector3.setFromEuler(Euler e)`
+* `Vector3 Vector3.setFromColor(any color)`
+* `bool Vector3.equals(Vector3 v)`
+* `Vector3 Vector3.fromArray(any array, float offset)`
+* `[]float Vector3.toArray([]float array, float offset)`
+* `Vector3 Vector3.fromBufferAttribute(any attribute, float index)`
+* `Vector3 Vector3.random()`
+* `Vector3 Vector3.randomDirection()`
+* `class WebGLRenderer`
+* `void WebGLRenderer.init({string: any} parameters)`
+* `any WebGLRenderer.domElement()`
+* `void WebGLRenderer.set_domElement(any v)`
+* `bool WebGLRenderer.autoClear()`
+* `void WebGLRenderer.set_autoClear(bool v)`
+* `bool WebGLRenderer.autoClearColor()`
+* `void WebGLRenderer.set_autoClearColor(bool v)`
+* `bool WebGLRenderer.autoClearDepth()`
+* `void WebGLRenderer.set_autoClearDepth(bool v)`
+* `bool WebGLRenderer.autoClearStencil()`
+* `void WebGLRenderer.set_autoClearStencil(bool v)`
+* `any WebGLRenderer.debug()`
+* `void WebGLRenderer.set_debug(any v)`
+* `bool WebGLRenderer.sortObjects()`
+* `void WebGLRenderer.set_sortObjects(bool v)`
+* `bool WebGLRenderer.localClippingEnabled()`
+* `void WebGLRenderer.set_localClippingEnabled(bool v)`
+* `string WebGLRenderer.outputColorSpace()`
+* `void WebGLRenderer.set_outputColorSpace(string v)`
+* `int WebGLRenderer.coordinateSystem()`
+* `int WebGLRenderer.toneMapping()`
+* `void WebGLRenderer.set_toneMapping(int v)`
+* `float WebGLRenderer.toneMappingExposure()`
+* `void WebGLRenderer.set_toneMappingExposure(float v)`
+* `float WebGLRenderer.transmissionResolutionScale()`
+* `void WebGLRenderer.set_transmissionResolutionScale(float v)`
+* `any WebGLRenderer.shadowMap()`
+* `void WebGLRenderer.set_shadowMap(any v)`
+* `any WebGLRenderer.getContext()`
+* `any WebGLRenderer.getContextAttributes()`
+* `void WebGLRenderer.forceContextLoss()`
+* `void WebGLRenderer.forceContextRestore()`
+* `float WebGLRenderer.getPixelRatio()`
+* `void WebGLRenderer.setPixelRatio(float value)`
+* `void WebGLRenderer.setSize(float width, float height, bool updateStyle = true)`
+* `void WebGLRenderer.setDrawingBufferSize(float width, float height, float pixelRatio)`
+* `void WebGLRenderer.setEffects([]any effects)`
+* `void WebGLRenderer.setViewport(any x, float y, float width, float height)`
+* `void WebGLRenderer.setScissor(any x, float y, float width, float height)`
+* `bool WebGLRenderer.getScissorTest()`
+* `void WebGLRenderer.setScissorTest(bool enable)`
+* `void WebGLRenderer.setOpaqueSort(any method_target, string method_method)`
+* `void WebGLRenderer.setTransparentSort(any method_target, string method_method)`
+* `Color WebGLRenderer.getClearColor(Color target)`
+* `void WebGLRenderer.setClearColor(any color, float alpha = 1.0)`
+* `float WebGLRenderer.getClearAlpha()`
+* `void WebGLRenderer.setClearAlpha(float alpha)`
+* `void WebGLRenderer.clear(bool color, bool depth, bool stencil)`
+* `void WebGLRenderer.clearColor()`
+* `void WebGLRenderer.clearDepth()`
+* `void WebGLRenderer.clearStencil()`
+* `void WebGLRenderer.setNodesHandler(any nodesHandler)`
+* `void WebGLRenderer.dispose()`
+* `void WebGLRenderer.renderBufferDirect(Camera camera, Scene scene, BufferGeometry geometry, Material material, Object3D object, any group)`
+* `void WebGLRenderer.setAnimationLoop(any callback_target, string callback_method)`
+* `void WebGLRenderer.render(Object3D scene, Camera camera)`
+* `float WebGLRenderer.getActiveCubeFace()`
+* `float WebGLRenderer.getActiveMipmapLevel()`
+* `void WebGLRenderer.resetState()`
 * `i64 PCFShadowMap()` — dtsgen:begin consts — regenerated; edits between the markers are lost…
 * `i64 PCFSoftShadowMap()`
 * `string8 SRGBColorSpace()`

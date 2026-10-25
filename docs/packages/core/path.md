@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f94cdafd7289 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 56eb0a49a5fe (dirty) -->
 # core:path
 
 core:path — the lexical algebra of file paths: join, clean, split, base,
@@ -82,7 +82,7 @@ any number of threads at once.
 
 ## Declarations
 
-45 declarations, 17 public.
+45 declarations, 16 public.
 
 * `distinct enum i32 Error` — Why `rel` or `match` failed. The numbers are this package's, 2200 to…
 * `string8 message(Error why)` — A sentence for each of this package's codes, and one for any other value.
@@ -100,4 +100,3 @@ any number of threads at once.
 * `ref []char8 abs(string8 p, string8 from)` — `p` made absolute against `from`, cleaned. An absolute `p` is only…
 * `Error!ref []char8 rel(string8 from, string8 to)` — The path that names `to` when joined to `from`, by lexical processing…
 * `Error!bool match(string8 pattern, string8 name)` — Whether the whole of `name` matches the glob `pattern`:
-* `void put(^self, char8 c)`

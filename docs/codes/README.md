@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.6 -->
-<!-- commit 1dcb7bb16c7f (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit a0ef6b75b8d5 (dirty) -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -52,12 +52,13 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0411](ERR0411.md) | error | a name that starts with the prefix emitted names use |
 | [LNT0412](LNT0412.md) | lint | a name is declared and never read |
 | [ERR0413](ERR0413.md) | error | a name another package declared but does not export |
-| [ERR0414](ERR0414.md) | error | a name one of the global builtins already owns |
+| [ERR0414](ERR0414.md) | error | a name one of the global builtins or the language's own type names already owns |
 | [ERR0415](ERR0415.md) | error | a name that is not a member of that enum |
 | [ERR0416](ERR0416.md) | error | a name that is not a member of the union it is spelled against |
 | [ERR0417](ERR0417.md) | error | a `#` name the compiler does not define |
 | [ERR0418](ERR0418.md) | error | an `@` name that is not one of the ten attributes, or one of them written where none may go |
 | [WRN0419](WRN0419.md) | warning | a package-level declaration that writes no visibility word, so it is public by default rather than by decision |
+| [WRN0420](WRN0420.md) | warning | a type, enum or trait named like one of the language's own types, so its own package never names it plainly |
 | [ERR0501](ERR0501.md) | error | type declaration resolves only to itself |
 | [ERR0502](ERR0502.md) | error | array length is not a compile-time integer |
 | [ERR0503](ERR0503.md) | error | a view names a different number of slots than the tuple has |
@@ -136,13 +137,14 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0721](ERR0721.md) | error | `#peek` or `#drain` somewhere other than the head of a `for` — stored, passed, returned, indexed, or `#peek` as a statement — or `#release` written as a value |
 | [ERR0722](ERR0722.md) | error | a `#slots` walk over a value with no declared slots to name, or a `break` or `continue` aimed at one |
 | [ERR0723](ERR0723.md) | error | an `E!T` whose `E` is not an enum, is a C enum, or is backed by something other than `i32`, or one on a `foreign` function |
-| [ERR0724](ERR0724.md) | error | a `fail` in a function marked `E!T` whose code is not known to be a member of `E` |
+| [ERR0724](ERR0724.md) | error | a `fail` in a function marked `E!T` whose code is not an `E`, or is a constant that is no member of `E` |
 | [ERR0725](ERR0725.md) | error | a failure of another enum, or a plain failure, passed on by a function marked `E!T` |
 | [ERR0730](ERR0730.md) | error | a `break` written in a `switch` arm, where C would leave the `switch` and Dado would leave the enclosing loop |
 | [LNT0731](LNT0731.md) | lint | a `switch` over an `enum` whose arms leave a declared member unnamed |
 | [ERR0801](ERR0801.md) | error | a key whose `==` is not stable and total, so an entry could be inserted and never found again |
 | [ERR0802](ERR0802.md) | error | a `$K` bound to a type whose `==` is not stable and total, so the map it keys has no key |
 | [WRN0803](WRN0803.md) | warning | a view, a walk or a handle used after the block under it may have moved or been taken back — `#append`, `#resize`, `#reserve`, `#delete`, an insert, rebinding the handle, handing a `^` to it to a call, `#send`ing the `ref` to a channel, draining the channel a `#peek` lent it from, or ending the region it was minted in (a scratch frame rolled back, an arena's mark ended, an arena destroyed) — on some path through the same function |
+| [ERR0803](ERR0803.md) | error | a view, a pointer or a handle read after the block under it was freed on every path through the same function |
 | [ERR0804](ERR0804.md) | error | an assignment to `#default`, which is immutable within a scope — a nested suite shadows it with `using`, and nothing rebinds it |
 | [ERR0805](ERR0805.md) | error | a spelling the language has retired, written where its replacement belongs — the message names the repair |
 | [ERR0807](ERR0807.md) | error | a lifetime rung written on `resize`, which grows a block where it already lives and so takes no allocator at all |
@@ -161,6 +163,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0823](ERR0823.md) | error | a `#peek`, `#drain`, discard or `#release` of a channel inside a `for` already walking that channel |
 | [ERR0824](ERR0824.md) | error | a place read after its `ref` moved into a channel by `#send`, on a path where the `#send` succeeded |
 | [LNT0825](LNT0825.md) | lint | one package-level channel walked from two thread roots |
+| [WRN0826](WRN0826.md) | warning | a copy of storage on this frame kept where it outlives the frame, which may point at other storage on the frame through a write the compiler cannot follow |
 | [ERR0826](ERR0826.md) | error | a pointer, window or trait value of storage on this frame that outlives it — returned, stored through a parameter or into a package-level variable, appended into a handle one of those reaches, or read after its block ends |
 | [ERR0827](ERR0827.md) | error | one call handed both a view into a block and the handle to it, where the callee may move the block and then read or write through the view |
 | [ERR0828](ERR0828.md) | error | a `#truncate` to a count the compiler can see is negative, which is no length a run can have |
@@ -246,7 +249,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR1225](ERR1225.md) | error | a DadoScript feature a web build cannot run — `#script_reload`, `Script.load`, a call from Dado of an `async` method, or `#script_pause` single-threaded |
 | [ERR1226](ERR1226.md) | error | a Dado call of a script's package function that names no published function, names two, or gives it what a function by its package does not take |
 | [ERR1227](ERR1227.md) | error | an `#assert_raises` over a function that, or a function it reaches, does not raise into a script |
-| [ERR1228](ERR1228.md) | error | an `#assert_raises` naming no function of its package, or written above something that is not one |
+| [ERR1228](ERR1228.md) | error | an `#assert_raises` naming no function of its package, or written above something that is not a function or a method |
 | [ERR1301](ERR1301.md) | error | a Dado construct written in DadoScript — memory management, a `#` spelling, an explicit width, the C boundary, or a word only Dado has |
 | [ERR1302](ERR1302.md) | error | a DadoScript construct written in Dado code — a lambda, `async`, `await`, `assert`, `super`, a script's header, or a `foreign` block over JavaScript |
 | [ERR1303](ERR1303.md) | error | a `.dados` file with no header whose basename is not an identifier, so it names no class, or an imported directory of scripts alone whose name is no identifier |

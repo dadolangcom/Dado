@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # app:ui
 
 app:ui — a UI framework whose layout and text are bound to a monospace cell
@@ -250,7 +250,7 @@ that is rolled back every frame.
 * `const [4]u8 TREE_SEL_UNFOCUSED_BG = [42, 46, 56, 255]`
 * `const [4]u8 TREE_FOLDER = [214, 172, 92, 255]`
 * `const [4]u8 TREE_FILE = [150, 160, 176, 255]`
-* `const i32 SYNTAX_PLAIN = 0` — ── Syntax roles ────────────────────────────────────────────────────────────…
+* `const i32 SYNTAX_PLAIN = 0` — A styled run of text (`StyleSpan`) names a **role**, a small index into the…
 * `const i32 SYNTAX_KEYWORD = 1`
 * `const i32 SYNTAX_TYPE = 2`
 * `const i32 SYNTAX_BUILTIN = 3`
@@ -269,7 +269,7 @@ that is rolled back every frame.
 * `[SYNTAX_ROLES][4]u8 syntax_default()` — The default palette, indexed by role.
 * `type PanelTheme: ([4]u8 bg, [5]StyleBox box)` — `bg` is the background of the blank cells a panel paints in its margins:
 * `type LabelTheme: ([4]u8 fg, [4]u8 bg, StyleBox box)`
-* `const i32 MARK_MATCH = 0` — ── Mark roles ──────────────────────────────────────────────────────────────…
+* `const i32 MARK_MATCH = 0` — A **mark** is a background a program lays under byte ranges of a text…
 * `const i32 MARK_CURRENT = 1`
 * `const i32 MARK_ROLES = 2`
 * `const [4]u8 MARK_MATCH_BG = [92, 74, 22, 255]`

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:mem/gc
 
 core:mem/gc — a conservative mark-sweep collector behind `mem.Allocator`.
@@ -50,7 +50,7 @@ stack is scanned (see *Roots* below).
 * `void init(^Heap h)` — Everything between the current frame and the top of this thread's stack is…
 * `(mem.Proc proc, rawptr data) allocator(^Heap h)` — `h` as an allocator: the two words `using` and the verbs take.
 * `type HeapAllocator using mem.Allocator` — The allocator for a collected heap, as a declaration that takes `mem.Allocator` on:
-* `(mem.Proc proc, rawptr data) data(self)` — The two words `allocator(self.heap)` answers.
+* `(mem.Proc proc, rawptr data) HeapAllocator.data(self)` — The two words `allocator(self.heap)` answers.
 * `i32 live(^const Heap h)` — How many blocks `h` holds now, reachable or not yet collected.
 * `i64 collections(^const Heap h)` — How many collections `h` has run, by hand or when its table filled.
 * `i64 freed(^const Heap h)` — How many blocks `h`'s collections have freed, in all.

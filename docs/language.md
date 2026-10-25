@@ -168,9 +168,9 @@ further symbol property is still a deliberate act, just a cheaper one.
 
 The cost is real and is the one chosen: a new attribute is an edit to
 the compiler, so nobody can add one from a library. In exchange the set
-is enumerated in exactly one place — the list this arm carries — which
-is what lets the refusal name the whole family with no second list to
-fall out of step with it.
+is enumerated in exactly one place — the table this arm reads — which
+is what lets the refusal name the whole family, and an editor describe
+each member, with no second list to fall out of step with it.
 
 ### A `@c` position is not a family member
 
@@ -255,7 +255,10 @@ there being nothing else for it to name. With `type Outer: (Inner r)`,
 `o.r` is the `Outer` seen as its `Inner`: `o.r.a` is the element's
 slot `a`, `o.r = v` stores the whole value, and `o.a` reads the same
 slot, since `Outer` is `Inner`. A slot holding a `ref T` or a `^T`
-names the reference.
+names the reference, and reached through a pointer it still does:
+with `type W: (^Stream s)`, a `^W` is a pointer to a pointer, and
+`p.s` (a `^self` method's `self.s` among them) dereferences once, to
+the `W`, where `p.n` goes on to the `Stream`'s own slot `n`.
 
 ```dado
 type Cfg: ([4]f64 thickness)
@@ -300,6 +303,30 @@ one. What the layout does not have is the element in one piece, so
 slot, so twenty of a six-slot declaration mangles to 612 characters and
 has to be cut back to the 63 C guarantees, with a hash on the end to
 keep two long names from becoming one.
+
+**A name written `[1]T` still windows as a run of one.** By the
+collapse a `[1]u32` is a `u32`, so handed where a `[]u32` is wanted
+it is one `u32`, and refused (`ERR0504`). But the `[1]` a local or a
+parameter was declared with asks for a run of one, and that is all a
+window needs: `one[:]` over `[1]u32 one` is a `[]u32` one long over
+the binding's own storage, with no heap. It is so for every `T`, so
+`[1]string8 s` windows to a `[]string8` holding one string, never to
+the string's characters. The run being one long, its bounds are
+**constants**, written or named: `one[0..<1]`, or the empty
+`one[1..<1]`; a bound computed at run time is refused (`ERR0504`),
+its help naming `one[:]`. The window is a view of the frame's
+storage, so it does not outlive the frame (`ERR0826`).
+
+```dado
+package doc_sample
+
+private i64 count([]const u32 xs):
+    return #len(xs)
+
+public i64 counted():
+    [1]u32 one = [4]
+    return count(one[:]) + count(one[1..<1])
+```
 
 
 The immediate consequence is about **names**, and it is the one that surprises
@@ -389,19 +416,98 @@ to a function that keeps it, and not read after the block that declared it
 ends (ERR0826; `#stack` storage the same, ERR0821). A function that keeps
 a copy of what a pointer points at (`kept = f^`) keeps the copy's views
 and not the pointer, so handing it `&b` is refused only when what `b`
-holds points at this frame; through any other pointer, what was stored
-through that pointer counts too. Storing through a pointer to package
+holds points at this frame, and so is handing it a pointer local bound
+to `&b` and neither assigned nor addressed since (`^const F p = &b;
+keep(p)`); what `b` holds counts what was stored into it through
+another pointer to it, a pointer to that pointer (`^^F qq = &q;
+qq^.rows = local[:]`) included, and what the function itself stores
+through its pointer before keeping the copy (`f.rows = r` ahead of
+`kept = f^`); through any other pointer, what was stored through that
+pointer counts too. Where `b` may have come to point at this frame
+through a write the compiler cannot follow — `&b` handed beside a view of
+the frame to a function value or a `foreign` function, or a view of the
+frame stored through a pointer converted from `rawptr` — handing `&b`
+(or such a pointer local) to a function that keeps a copy is warned of (WRN0826),
+not refused. Storing through a pointer to package
 storage, `put(&f, &SLOT)`, is storing in package storage. **A block behind a
 `ref` or a map** is not read through a view after anything that may move
 or free it — `#append`, `#resize`, `#reserve`, `#delete`, an insert,
 rebinding the handle, or a call whose body grows or frees it — and a
-`defer` counts where it runs, at the scope's exit. **Such a read is a
-warning, not a refusal** (WRN0803), `--strict` included: the compiler
-does not yet tell a read that must follow the move from one that only
-may, so the program builds, and `dado test`'s AddressSanitizer (with a C
-compiler that has one: `--cc clang` or `--cc gcc`) catches the read if it
-happens. Everything below that this section says
-of a stale view or handle is that warning. A view a
+`defer` counts where it runs, at the scope's exit. **A read the compiler
+can prove bad is refused** (ERR0803), and only one that meets every one
+of these: **the read touches the block** — a subscript of the view,
+pointer or second handle, `^` of it, a slot read through it, a `for` over
+it or `#copy` of it when it holds an element (constant bounds that select
+one, `a[1..<3]`, or the whole of a `#make` of a constant count above zero,
+`a[:]`; a window that may hold none reads nothing), a write through it, or
+a second `#delete` — and not
+handing it to a call, comparing it, measuring it (`#len`, `#cap`) or
+copying it into another binding, which read nothing of the block; **the
+value was minted from a `ref` this function holds** (a local or a
+by-value parameter, or a slot of a record held so), directly or through
+copies, **and the function takes the address of none of them anywhere** —
+not of the handle, not of the value read, not of a binding it was copied
+through, not even to lend it to a call (`&v`, `&h` of a record holding
+one, `&e` handed to a function, a `^self` method called on it) — and
+assigns none of them but as a plain `name = value`; **on every path to
+the read the block was freed after the mint** — by `#delete`, by a
+`defer` that ran, or by a call whose body frees the `ref` it is handed by
+value on every way out — with nothing between that could have put another
+block there; and **the free gave the block back to an allocator that
+frees**. `#delete` frees through the allocator the block was minted on,
+so that is a block minted on `#heap` (written on the `#make`, or a `using
+#heap` around it), or on the default allocator in the program's `main`
+outside every `using`, where `main` is not written `public` or `export`
+and nothing in the program calls or names it — and in either case only on
+a target with a heap: on `#NONE` no allocator frees (`#make` answers an
+empty `ref` and `#delete` of it does nothing). In an arena or the scratch
+`#delete` frees nothing, and the default allocator of any other function,
+or of a library's `main`, is its caller's, who may have opened a `using`
+of one around the call. **Every other such read is a warning** (WRN0803),
+`--strict` included, because it is possible and not proven: a stale value
+handed to a call, compared or measured, a binding whose address is taken
+(through which it may have been rebound), a free on some paths only (a
+branch, a loop that may not run, the right side of `&&` or `||`, one
+arm of `x if c else y`), a free
+through an allocator the compiler cannot show frees, a read in a branch
+a constant rules out (`if DEBUG:` of `const bool DEBUG = false`), a
+growth, which may have stayed in place, a callee that only may free, a
+function value, a free through another copy of the handle, a place
+handed as `&a` to a call that answers the pointer back (`q = id(&a)`,
+through which another block may be put there), a walk, a walk or
+`#copy` of a window that may hold no element, a view returned
+past a `defer` that frees it (the caller may only measure it), or
+anything below the compiler follows only approximately. The order is the
+language's: a subscript's brackets run before its element is read, and
+an assignment's place before its value, so `v[consume(a)]` and
+`b[consume(a)] = v[1]` read after the free, and `b[v[0]] = consume(a)`
+before it. The warning
+lets the program build, and **a dev build traps on the read if it
+happens**: Dado's sanitizer, on in every build but `--release` (which
+`--sanitize` keeps it in) and dropped by `--no-sanitize`, keeps a
+witness beside each warned view, pointer or handle copy declared in the
+body (`[]i32 v = a[:]`, not a parameter) whose address is never taken. A
+`#delete`, a growth that moved the block (not one that stayed in place)
+or an `arena.reset` or `arena.destroy` of the arena that minted it
+records itself there when the block it frees holds the address the
+binding points at, and a read through the binding (an element, a field,
+a walk) then stops the program with the warning's message, the read's
+place and the free's. A view or pointer minted from such a binding after
+the free (`w = v[1..<2]`, `p = &v[0]`, `w = v`) carries its record on. A
+`#delete` or a growth records only when it gave the block back to C's
+heap, which the run checks of the handle's allocator: in an arena or a
+bump `#delete` frees nothing and a growth leaves the old block there, so
+neither traps, and on `#NONE` no free records. A block still alive never
+traps: a free on a path the run did not take, a handover, a `#send` or a
+rebinding leaves the read alone, and so does handing the binding on,
+measuring it or comparing it, which reads no byte of the block. What it
+does not follow — a callee's free, a scratch frame's rollback,
+`arena.end` of a mark, a free through an allocator other than C's heap, a
+map's growth, a parameter — is left to C's AddressSanitizer (`--sanitize`
+with a C compiler that has one).
+Everything below that
+this section says of a stale view or handle is that warning, or that
+error where the free is proven. A view a
 call answers is minted at the call: when `items()` answers `store[:]` of a
 package-level `ref`, its result is not read after a call that grows
 that `ref`, as `store[:]` written in place is not. A copy of a handle
@@ -413,9 +519,42 @@ of its own: reading through it, a copy of it or a view of it after `b`
 moves is warned about, and measuring or freeing it is not. A handle a call
 answers may be a copy of a handle its argument reaches — the package
 `ref` it hands back, `p^` for `grab(&b)` — and is stale when that one
-moves. A binding declared in a loop's body is a new block each pass,
+moves. A pointer or window a call answers out of one handle slot of a
+record (`&e.pool[i]`, `e.keys[0..<n]`, `&e.polys[i].pts[j]`, or another
+call's such answer handed straight back, `return at(E, i)`) is tied to
+that slot, as the same access written in place is, and not to the
+record's other slots, while no two of those slots may hold one block.
+Once two may — one written from another, here or in a callee, before or
+after the answer was taken, or a record a function answers without
+building it from distinct blocks (`return (x, x)`; one handle beside
+fresh blocks, `return (pool, #make([]i32, 0))`, is distinct) — a move of
+any of them reaches the answer; a function that relies on a record handed
+in holding its slots apart is warned of at a call that hands it one whose
+slots may share, a call through a function value included, which is
+checked against every function the program takes as a value. The tie is
+made only for a record the function sees every write to: a local held by
+value, a parameter, or a pointer local bound from a pointer parameter by
+name (`^Eng F = E`) and neither assigned nor addressed after, which names
+the parameter. Through any other pointer local (`F = id(E)`, `F = E` on one
+branch, `me = self` in a method that does not spell `self`), a subscript
+or package storage, the answer is tied to every handle the record holds,
+and a callee that may write the record through one may write any record.
+One answered from several slots, from a pointer slot,
+or from a slot the callee rebinds is tied to every handle the record
+holds. A record written from `ref` locals (`Two t = (a, b)`) holds the
+handles: a move through its slot (`#append(t.a, 2)`, `#delete(t.a)`)
+leaves the local stale, not the record, unless another slot of the
+record views, points into or holds that block (`R t = (a, a[0..<2])`),
+or a value stored in the record since, or a call handed it, may, or the
+function takes the local's address (`&a`); a move of the local leaves the
+record stale. A binding declared in a loop's body is a new block each pass,
 so a copy kept from the last pass is not the next pass's. A `ref`
-passed by value to a function that frees it is gone after the call.
+passed by value to a function that frees it is gone after the call. One
+handed by value, or as `&x` to a function that leaves `x^` `nil`, and kept
+in a container (`if !#append(b.items, x): #delete(x)`) is handed over:
+the container holds the handle, a later move of a copy the caller still
+has leaves it stale, and a callee that keeps the block and moves or frees
+it on one path is warned of (WRN0803).
 And one call is not handed a view into a block together with the handle
 to it, when the callee may grow the block and then use the view (ERR0827).
 
@@ -430,10 +569,29 @@ void touch(ref []Cell r):
 
 What each call does is read from the called function's body, so nothing is
 written in a signature, and a call through a trait value is read through
-every implementer's method. What is not followed is said out loud: a
-`foreign` function or a function value is taken to keep nothing (a handle it
-answers may be a copy of any of that type its arguments reach), and a
-conversion to `rawptr` drops what it pointed at. A copy of a handle stored
+every implementer's method; a call through a local bound to one function by
+name (`auto f = step`) and never assigned is read through that function. What
+is not followed is said out loud: a `foreign` function or any other function
+value is taken to keep nothing (a handle it answers may be a copy of any of
+that type its arguments reach; a pointer or window a function value answers
+may point into the block of any handle an argument reaches, and one a
+`foreign` function answers is tied only to an argument of its own type), and
+a conversion to `rawptr` drops what it pointed at (a frame escape through
+either is warned of, WRN0826, as above). A function that reads a
+pointer or window it took through one parameter after it moves or frees a
+block through another relies on the two reaching distinct blocks, and a
+call that hands it two that may reach one — one place twice (`use2(&e,
+&e)`, `use2(&x, &x)`), a record and one of its slots (`use3(&e, e.pool)`,
+`use4(&e, &e.pool)`), records holding one block (`use2(&e, &f)` with `Eng f
+= (e.pool, …)`) — is warned of (WRN0803); an argument the caller
+cannot name (a call's answer) is not checked. A pointer local that is no
+other name for a parameter but may point at its record (`^Eng F = G`, then
+`F = E`) reaches what a move through the parameter moves. A function the
+program exports, or one a script calls, may be handed records or pairs of
+arguments that share a block from outside Dado, and what it relies on of
+them is checked only at the calls Dado sees: a warning at the export
+itself would stand at every exported function that reads a pointer across
+a move, whatever its callers hand it. A copy of a handle stored
 in a block or in package storage (`hs[0] = b`, `KEEP = b`) is not followed
 there, and neither are views of a package `ref`'s own block stored in package
 storage. Views of a block stored in package storage warn at a later move of
@@ -447,9 +605,40 @@ of what the subscripted array holds. A callee that leaves a slot `nil` on every 
 (`take(&c)` answering `c.tris` after `c.tris = nil`, or `defer self.out =
 nil` beside `return self.out`) hands that slot's block over, as `b^ = nil` on
 every way out hands over the block `b^` held; the answer is still taken for
-a copy of any other handle `c` holds, whatever its type, and warned about after
-one of those moves. A `return take(&c)` written directly is not checked
-against a `defer` that frees what `c` holds.
+a copy of any other handle of its type `c` holds, and warned about after one
+of those moves. A slot written from a fresh block (`#make`, `nil`), here or
+in a callee, holds neither a block handed over before nor another slot's;
+two handle types that differ only by a `distinct` tag (`ref []u32` and
+`distinct type Owned: ref []u32`) are one type here, since a conversion
+between them is no copy. A `return take(&c)` written directly is not checked
+against a `defer` that frees what `c` holds. Whether a callee keeps a
+`ref` it was handed is read per path only through `if !#append(…)` and
+`if #append(…)`. A pointer into a record's slot taken in place
+(`&m.pos[1]` of `M m = (pos, nor)`) is not stale when the local the slot
+was copied from grows, nor, in a record of a generic type declared with
+no value (`Two(u32) t`), when another slot holding the same block is
+freed. A record copied whole shares its blocks with the copy only as
+far as the copy is followed: one made through a pointer (`f = q^`), out
+of a call's answer (`same(e)`), from another copy (`g = f`), or into a
+tuple (`(e, 1)`) or another record's slot (`b.e = e`) is not, so freeing
+the copy's block leaves what was taken out of the original live; and
+records made to share a block by assignment after they are declared (`f = e`,
+or `f.pool = e.pool`) and handed to a function that relies on its
+parameters reaching distinct blocks (`use2(&e, &f)`) are not warned of.
+An answer out of a handle inside a slot's block
+(`&e.polys[i].pts[0]`) is not stale when that inner handle is freed or
+grown. A `ref` handed into a container is followed as one copy in one
+place: a callee that copies `x^` into a container and leaves `x^` holding
+it, or stores a handed `ref` in two slots, makes owners the caller does not
+see, and a free through one leaves the others live; once a callee has kept
+it in a container a local record holds, that container freeing or growing
+the block leaves the caller's name, a copy of it or a view of it stale, and
+package storage doing so does not; and a callee
+that keeps a `ref` and frees it through a local copy, or on a path decided
+by an `#append` of something else, leaves what it kept live. Swapping two
+`ref` locals through a temporary (`t = a; a = b; b = t`) warns of a view of
+the old block, as any rebinding does; `(a, b) = (b, a)` hands each block to
+its new name.
 
 ### Arrays and slices: a read-only window is `[]const T`
 
@@ -490,6 +679,42 @@ public i64 counted():
 front of the brackets the word would sit on the window's two-word
 header, which promises its elements nothing, so it would read as
 the promise it is not; `[]const T` is the one spelling.
+
+### Bytes and text are views of each other
+
+A `string8`, a `[]char8` and a `[]u8` are the same two words — a
+pointer to 8-bit units and a count — and a conversion between any
+two of them is a **view**: the same bytes under the other type, no
+copy, nothing read. `string8(b)` of a `[]u8` or a `[]char8` is text;
+a window is reached through its name, since `[]char8(b)` written in
+place reads as a function type: `Chars(b)` for `type Chars: []char8`,
+`Bytes(s)` for `type Bytes: []u8`, either way. `const` elements are
+kept and never dropped, so a `[]const u8` becomes a `[]const char8` or
+a `string8`, and a `[]char8` from it is refused (`ERR0504`). A
+`ref []u8` converts through the window it lends and still owns its
+block, and the result is a view of that block like any other: read
+after the block moves or is freed, it is warned of (`WRN0803`), and
+of storage on the frame it does not outlive the frame (`ERR0826`).
+
+```dado
+package doc_sample
+
+type Chars: []char8
+
+public string8 as_text([]u8 b):
+    return string8(b)
+
+public []char8 as_chars([]u8 b):
+    return Chars(b)
+```
+
+**A view conversion never checks that the bytes are UTF-8**: it is
+O(1) and never fails, so it cannot read them. A `string8` is UTF-8 by
+convention, and nothing relies on it for safety: `#len` counts bytes,
+`for` walks units, `==` and a map key compare bytes, and printing
+writes them as they are. `core:chars`' decoders answer U+FFFD for a
+malformed sequence and move on. Bytes from outside the program that
+must be text are asked first, with `chars.valid(s)`.
 
 ### What a frame takes back
 
@@ -572,6 +797,58 @@ public i32 pop(^ref []i32 stack):
     i32 value = stack^[top]
     #truncate(stack^, top)
     return value
+```
+
+### A run is made before it grows
+
+A reference carries the allocator that made it, and the verbs that
+grow one — `#append`, `#resize`, `#reserve` — ask that allocator. **A
+`ref []T` that was never made has none**: a slot of a zero-valued
+record, a declared local, or one `#delete` has just nilled is `nil`,
+so each of the three answers `false` and changes nothing — the same
+`false` an allocator that ran out gives. Make it first,
+`#make([]T, 0)`, under whatever `using` should own it. To tell the two
+failures apart, ask `xs == nil` before growing: a made run is never
+`nil`, even an empty one. A zero map is different: it is empty and
+usable, and takes its table on the first insert.
+
+```dado
+package doc_sample
+
+type Bag:
+    ref []i32 items
+
+// 1 when the bag was never made, 2 when memory ran out, 0 when `x` is in.
+public i32 put(^Bag b, i32 x):
+    if b.items == nil:
+        return 1
+    if !#append(b.items, x):
+        return 2
+    return 0
+```
+
+**A window is not a reference, and its `nil` is the empty one.**
+Where a `[]T` is wanted, `nil` is the value a `[]T` declared with
+nothing holds, the empty window: `[]i32 q = nil`, `q = nil`, an
+argument, a parameter's default. Compared, it is that value too, and
+`==` compares windows by their elements, so for a `[]T`, `q == nil`
+asks whether the window is empty, an empty window over real storage
+included. That is a different question from the one above: for a
+`ref []T`, `nil` is a run never made, and a made one is not `nil`
+however short.
+
+```dado
+package doc_sample
+
+// The first element, or `fallback` when there is none.
+private i32 first_or([]const i32 xs, i32 fallback):
+    if xs == nil:
+        return fallback
+    return xs[0]
+
+public i32 firsts():
+    [2]i32 store = [7, 8]
+    return first_or(store[0..<0], 1) + first_or(nil, 2) + first_or(store[:], 0)
 ```
 
 
@@ -790,6 +1067,83 @@ A generic binding binds the data: `$T` bound from an `int` argument is
 families, so `where T is int` holds for every integer width and
 `where T is float` for both floats; everywhere a type is written they
 are the type.
+
+### An address reads as a number, and only one way
+
+`u64(p)` and `i64(p)` of a `rawptr`, `const` or not, are the address
+as a number. Those two widths hold every address a supported target
+has, so the conversion means the same everywhere, and the C reads it
+through `#c.uintptr_t`, which widens without a word on a 32-bit target.
+A typed pointer forgets its type first, `u64(rawptr(&x))`, which is
+the step that says so. A narrower width, `u32(p)`, is refused
+(`ERR0504`), since an address need not fit it; its help names
+`u32(u64(p))`, which narrows a number on purpose.
+
+**The way back is not opened.** A number becomes an address only
+through `#c.uintptr_t`, `rawptr(#c.uintptr_t(n))`, where the program
+says in C's own type that the number was one: that type is the one C
+promises an address survives the round trip through, and `u64` is
+Dado's width, which promises nothing of the kind. `rawptr(n)` of a
+`u64` is `ERR0504`.
+
+```dado
+package doc_sample
+
+// How far `p` sits past a 64-byte boundary.
+public u64 misalignment(const rawptr p):
+    return u64(p) & 63
+
+// Back to an address, through the one type C promises the trip for.
+public rawptr address(u64 n):
+    return rawptr(#c.uintptr_t(n))
+```
+
+### A union is one of its members, and a member converts into it
+
+`union Extent: (Whole, Pending, ToClose)` is exactly one of three types,
+with a tag saying which. A member is a **type**, not a name: the
+discriminant is the member's type, so members are pairwise distinct
+types — two `type` declarations over one shape are one type, and
+`distinct` is how two members that hold the same shape are told apart.
+
+**A value of a member's type converts into the union.** `Extent(w)`
+writes it; and where the union is the declared type — a `return` from a
+function answering it, a local, an assignment, an argument, a slot of a
+construction or a literal — the conversion is supplied, as a reference
+lends its view there: `return Whole(n)` from an `Error!Extent` function.
+It is supplied only where the value's type *is* one member's type, so
+the member is the one `Extent(w)` would pick and no other could be. A
+value that would only become a member's type by adapting (an `int`, a
+narrower width) is not converted, and nor is a member of a member: a
+union inside a union is two conversions, and the inner one is written,
+`return Outer(Inner(v))` or `return Inner(v)`.
+
+**A member that carries nothing is a `distinct` over a byte**: a shape
+with no slots has no value to hold (`ERR0506`), so a case with no data is
+written `distinct type Idle: u8`, built as `Idle(0)`, and matched by
+`case Idle:`. A union's storage is its largest member's, so the byte
+costs nothing.
+
+```dado
+package doc_sample
+
+distinct type Idle: u8
+distinct type Got: (i32 n)
+
+union Event: (Idle, Got)
+
+public Event poll(i32 n):
+    if n == 0:
+        return Idle(0)
+    return Got(n)
+
+public i32 size(Event e):
+    switch e:
+        case Idle:
+            return 0
+        case Got g:
+            return g.n
+```
 
 
 ## Generics constrain, and never implement
@@ -1064,6 +1418,10 @@ A method's first parameter is its receiver, written with no type:
 to it. The word is a receiver only there — `self` is an ordinary name
 everywhere else, including a typed parameter called `self`.
 
+A method is promised to raise into a script as a function is:
+`#assert_raises` alone on the line above it, in the body, and checked
+as the function `Vec2.len` it is checked and emitted as.
+
 A `trait` body is methods only, because a trait prescribes methods
 and never a shape: a signature ending its line is one every
 implementer writes, and one with a `:` and a suite is a default. A
@@ -1129,6 +1487,16 @@ of a template's own binding. A literal or a shape written out
 implements nothing — `Drawable` is answered by a declaration's
 `using` — and a declaration that does not take the trait on is
 refused at the call, naming the `using` to add.
+
+**Taking a trait on publishes the trait's methods through it.** A
+binder or a `where T has Drawable` template in the trait's package
+calls `v.draw()` on an implementer declared `private` in another
+package, as a `Drawable` trait value always could: a method a trait
+the declaration takes on prescribes, required or default, is reached
+from every file that can name the trait, whatever the declaration's
+visibility or the method's. `private` still hides the type's name,
+and every method no trait prescribes keeps the visibility it was
+declared with.
 
 ### Default bodies
 
@@ -1375,6 +1743,41 @@ consequence people meet first: a caller that does not restate them
 reaches the slots by the axes instead, and a name the caller never
 declared is not found.
 
+**A function's type is the same two tuples, written return first**:
+`i32(i32)`, and a return of several slots spelled whole in front of
+the parameters, in a `type` body as anywhere a type is written:
+`type Fn: (f32, bool)(i32, rawptr)`. A return that opens with a
+prefix (`[]`, `[N]`, `^`, a qualifier) is **bracketed**, because a
+prefix takes the whole type after it: `[]i32(i32)` is a run of
+`i32(i32)` functions, the same reading that makes `[]Pair(T)` a run of
+`Pair(T)`, and the function answering `[]i32` is `([]i32)(i32)`.
+Diagnostics, hovers and `#spell` print a function's type that way, so
+the refusal of one where the other is wanted (`ERR0504`) shows two
+spellings that differ, and its help names the bracketed one.
+
+```dado
+package doc_sample
+
+type Fn: (f32, bool)(i32, rawptr)
+
+private (f32, bool) probe(i32 n, rawptr p):
+    return (f32(n), p == nil)
+
+private []i32 none(i32 n):
+    return nil
+
+private i32 twice(i32 x):
+    return x * 2
+
+public i32 calls():
+    Fn f = probe
+    ([]i32)(i32) mk = none
+    []i32(i32) fs = [twice, twice]
+    (f32 _, bool at_nil) = f(1, nil)
+    []i32 got = mk(3)
+    return fs[1](i32(#len(got))) + (1 if at_nil else 0)
+```
+
 
 A procedure that can fail says so in its return type, and what it fails with is
 a code rather than a value — which is the one thing about failure that every
@@ -1393,14 +1796,26 @@ suite.
 
 **`E!T` says which codes.** With an enum in front of the mark,
 `Why!i32 measure(string8 s):` fails only with a member of `Why` — an `enum`
-or a `distinct enum` backed by `i32`. Every `fail` in it is known to be a
-member, and every failure it passes on comes from a call failing with the
-same enum, so the code a caller binds is a `Why` and one of its members by
-construction. That makes it the second thing a `switch` may be exhaustive
-over: name every member, and the `else` may be left out. The binding is
-read-only, so it stays a member. A member equal to 0 may be declared — an
-enum that also names success, `OK = 0` — but is never a failure: no `fail`
-may use it, no caller binds it, and a closed `switch` need not name it.
+or a `distinct enum` backed by `i32`. Every `fail` in it fails with a
+`Why`, and every failure it passes on comes from a call failing with the
+same enum, so the code a caller binds is a `Why` and one of its members.
+That makes it the second thing a `switch` may be exhaustive over: name
+every member, and the `else` may be left out. The binding is read-only, so
+it stays a member. A member equal to 0 may be declared — an enum that also
+names success, `OK = 0` — but is never a failure: no `fail` may use it, no
+caller binds it, and a closed `switch` need not name it.
+
+**A constant is judged where it is written; a value is trusted, and
+checked.** `fail 7`, `fail Other.A` and `fail Why(9)` are refused: each is
+proven not to be a member. A value of `Why` that does not fold — a kept
+failure, `fail self.failed`, or a function translating another package's
+codes, `fail mine(why)` — is accepted. A `distinct enum` converts from any
+`i32`, so such a value need not be a member, but nothing proves it is not,
+and the compiler refuses only what it can prove. A code that is 0 at run
+time stops the program where it fails, in every build, as any computed
+code does; a sanitized build (a dev build, or `--sanitize`) also stops it
+where it fails with a code that is no member, rather than letting a
+caller's closed `switch` route it into an arm that does not name it.
 
 ```dado
 package doc_sample
@@ -1431,6 +1846,113 @@ one, is handled where it arrives and failed with a member. A `foreign`
 function names no enum, because what C answers is not checked here. Across
 every boundary the code is the same `i32` either way.
 
+### Where the program is: `#trace()`
+
+`#trace()` answers where the program is, as a `ref []Location`
+innermost first: the place it is written, then the place of each call
+the run is inside, out to `main` (or a thread's first function). A
+`Location` is `(string8 file, i32 line, i32 column, string8 function)`,
+DadoScript's four fields, and the function is named with its package,
+`main.update`, a method with its type's, `main.Box.get`. The run is
+minted on the ambient allocator and the caller frees it, `#delete(t)`.
+
+What the calls are is known only in a build that keeps the full call
+stack: `--debug`, `dado test`, and any build given `--full-trace`
+(`--no-full-trace` drops it from those). There each function's entry
+pushes a frame on a stack of the thread's own, its every exit pops it,
+and each call notes its line and column in the caller's frame first.
+Past 4,096 calls deep a call is counted and not kept. Any other build —
+a plain `dado build` or `dado run`, `--release` — has no such stack, and
+`#trace()` there answers one element, the place it is written: a
+constant, and the first element of the full answer, so code that reads
+`t[0]` or prints the run means the same in both builds. The same stack
+is what a trap prints: a bounds check, an `#assert`, a stale read the
+sanitizer caught, or the first report of a narrowing that changed a
+value writes the place as `at main.dado:12:5 in main.update`, then one
+such line for each call outward, 32 at most and `… N more` past them.
+Without the stack the trap writes its own `at main.dado:12:5` line
+alone.
+
+### Where it is written: `#location()`
+
+`#location()` answers the place it is written as one `Location`, by
+value: `Location here = #location()`. Its file, line and column are
+spelled as `#trace()` spells its own first element, and its function
+is the one it is written in, `main.update`. It is a constant of static
+strings, the same in every build (dev, `--debug`, `--release`,
+`--sanitize`, `--full-trace`) and on every target, the web and `#NONE` included:
+nothing is allocated, so there is nothing to `#delete`, and it needs no
+allocator. It goes wherever a `Location` does — a local, an argument,
+a return, a slot. A `#trace()` with no shadow stack to read answers
+one element, equal in content to `#location()` written at the same
+place; where the stack is kept, that is its first element. DadoScript
+writes it `Location()`.
+
+**As a parameter's default it is the caller's place.** A parameter
+written `Location at = #location()` is given, by each call that leaves
+it out, the place of that call — its file, line and column, and the
+function the call is written in — as DadoScript's
+`Location at = Location()` is, and as Odin's caller location is. So a
+logging function says where it was called from with nothing written at
+the call:
+
+```dado
+package doc_sample
+
+import "core:fmt"
+
+public void log(string8 msg, Location at = #location()):
+    fmt.println(at.file, ":", at.line, ": ", msg)
+
+public void start():
+    log("starting")
+```
+
+A named call that omits it, a method's default and a generic function's
+are the same rule, and a call that passes a `Location` passes its own.
+Only the direct form is a caller's default: a `#location()` inside a
+larger default value is refused, naming it. A call through a function
+value applies no default, since a default is not part of the function's
+type, and a DadoScript call of a Dado function passes every argument.
+
+**In a `const` or package variable's initializer it folds** to the place
+it is written: `const Location here = #location()` is that line wherever
+the constant is read, and names no function (a block's `const` names the
+one it is in). Every other compile-time position — an array length, a
+`when` — takes it as the call it is, and refuses it there, as it
+refuses `#trace()` in all of them.
+
+### C's undefined behaviour on the web and on `#NONE`
+
+Dado's own arithmetic has none of the behaviours C leaves undefined: a
+`+` wraps, a shift past the width is defined, a zero divisor is Dado's
+own check and a `float` narrows to an integer by saturating. C's
+undefined-behaviour sanitizer therefore finds C's — a package's `.c`
+sources and inline `foreign` C — and natively `dado test`, `--debug`
+and `--sanitize` on a build or a run compile it with its runtime. The
+web and `#NONE` have no runtime to link, so there a sanitized build
+(`dado test --target=web` and `--debug` by default, as natively;
+`--sanitize` otherwise) is UBSan alone: signed overflow, shifts,
+division by zero and float-to-integer overflow call handlers the
+emitted C defines (`dadoc --ubsan-handlers`), and every other check is
+a bare trap. On the web the check is reported through the console —
+`ubsan: ub.c:2:37: signed integer overflow: 2147483647 + 1 cannot be
+represented in type 'int'`, then, where the build keeps the full call
+stack (`dado test`, `--debug`, `--full-trace`), the Dado calls it is
+under — and the module traps, status 134 from the loader. A
+`#NONE` target has nowhere to write: the handler calls
+`undefined_behavior` if the program's link defines one, `void
+undefined_behavior(const char *check, const char *file, unsigned line,
+unsigned column)`, `check` being the check's `-fsanitize=` name
+(`signed-integer-overflow`, `unsigned-integer-overflow`,
+`integer-divide-by-zero`, `shift-exponent`, `shift-base`,
+`float-cast-overflow`), and then traps. `--sanitize` and
+`--sanitize=address` there say the build is UBSan alone, and
+`--sanitize=thread` is an error. Sanitized or not, a `#NONE` object
+asks nothing of the link beyond the hook and the memcpy, memset,
+memmove and memcmp every freestanding compiler may call: its compile
+turns off the compiler's own default UBSan and stack protector.
+
 
 Visibility is the one thing here that is **not** downstream of the type system,
 and it is worth saying so out loud, because the two look alike and are not.
@@ -1450,6 +1972,9 @@ package-level declaration (`WRN0419`, a warning and never an error).
 is still the tuple it is, and another package that writes the same slots
 gets the same type — because the shape was never the package's to own.
 That is structural identity holding, not a rule about visibility.
+Nor does it hide what a `using` promised: a trait's methods are reached
+through the trait wherever the trait is visible, a `private` type's
+among them, and the type's other methods stay as private as it is.
 
 The file-scoped form narrows a name to one file of a package and is
 otherwise `private`: both emit the same C linkage, and the whole
@@ -1576,6 +2101,28 @@ A parameter may carry a default, and the value is folded at the
 declaration: it may name a constant and it may not name a call, nor
 another parameter — a parameter is not in scope where its neighbour's
 default is written, and that is a scope fact rather than an ordering one.
+The one default that is not folded there is `Location at = #location()`,
+which is the place of each call that leaves it out (see *Where it is
+written: `#location()`*).
+
+`nil` is a default for a parameter whose type takes it — a window, a
+pointer, a `ref`, a function — and it folds to that type's zero: the
+empty window for `[]f64 xs = nil`, the null pointer for
+`^Node next = nil`. No address is a constant, but a zero is, and the
+zero is what is folded.
+
+```dado
+package doc_sample
+
+public i64 total([]const i64 xs = nil):
+    i64 sum = 0
+    for x in xs:
+        sum += x
+    return sum
+
+public i64 nothing():
+    return total()
+```
 
 Defaults are **trailing-only**, and the refusal is at the declaration
 rather than at some later call. A positional call fills slots left to
@@ -1797,10 +2344,11 @@ is narrowing with no flow analysis anywhere — the type comes from the arm
 rather than from a deduction about what ran before it.
 
 **The failure an `E!` call answered is the other**, bound by its
-`else` as an `E`: every code such a function fails with was checked to be
-a member, and the binding is read-only, so a `switch` over it that names
-every member needs no `else` either, and one that leaves a member out is
-refused naming it.
+`else` as an `E`: every code such a function fails with is a member —
+a constant checked to be one where it is written, a value of `E` checked
+where it fails in a sanitized build — and the binding is read-only, so a
+`switch` over it that names every member needs no `else` either, and one
+that leaves a member out is refused naming it.
 
 ```dado
 package doc_sample

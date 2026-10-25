@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 703d96d30a51 (dirty) -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # app:graphical
 
 app:graphical — the graphical runtime: a real sokol backend, a window, a
@@ -203,7 +203,7 @@ what it does.
 
 55 declarations, 31 public.
 
-* `const i32 E_WINDOW_SIZE = 2` — ── failure codes ───────────────────────────────────────────────────────────…
+* `const i32 E_WINDOW_SIZE = 2` — Three, and each is one thing this facade can actually see. A failure that…
 * `const i32 E_DRAW_UP = 3`
 * `const i32 E_ROOT_CANVAS = 4`
 * `!void init(i32 width, i32 height, string8 title)` — Open a window `width` x `height` titled `title`: remember the window and…

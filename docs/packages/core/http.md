@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit 549ca2ce6a97 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6c56ce20508a (dirty) -->
 # core:http
 
 core:http — HTTP/1.1 over TCP: connections for a server and a client, a
@@ -31,8 +31,8 @@ system has no sockets, and the `#static_assert` below refuses it by name.
 **What raises into a script.** The wire is pure Dado and promised, each
 function by the `#assert_raises` above it: `head_end`, `head_value`,
 `request_end`, `response_end`, `status_code`, `chunked_end`, `unchunk_to`,
-`unchunk`, `build_request` and `parse_response`, with `message` here and the
-`Response` methods through `raises_test.dado`. What touches a socket is not
+`unchunk`, `build_request` and `parse_response`, with `message` here and
+each of `Response`'s methods. What touches a socket is not
 and cannot be: it reaches `core:net`, which calls the platform's C and
 holds the platform's descriptors. A script that wants HTTP builds and
 parses it here and asks its host for the bytes.
@@ -60,7 +60,7 @@ thread.
 
 ## Declarations
 
-54 declarations, 36 public.
+48 declarations, 36 public.
 
 * `const i64 MAX_RESPONSE = 16777216` — The most bytes a response may take unless a call says otherwise: 16 MiB.
 * `Error!Response get(string8 host, u16 port, string8 target, i32 timeout_ms = 5000)` — GET `target` (a path and query, `/` when empty) from `host:port`.
@@ -94,7 +94,7 @@ thread.
 * `Error!ref []char8 unchunk(string8 body)` — The data of the chunked body `body`, on `#default`. Fails…
 * `ref []char8 build_request(string8 method, string8 host, u16 port, string8 target, []Header headers, string8 body)` — The bytes of an HTTP/1.1 request, on `#default`: the request line, `Host`
 * `type Response` — A response a server sent: its status, its headers and its body, every one a…
-* `string8 header(self, string8 name, string8 fallback = "")` — The value of the header `name`, matched without regard to case, or…
-* `bool has_header(self, string8 name)` — Whether the response carries the header `name`, in any case.
-* `void destroy(^self)` — Give back the bytes the response holds. Its strings are not readable…
+* `string8 Response.header(self, string8 name, string8 fallback = "")` — The value of the header `name`, matched without regard to case, or…
+* `bool Response.has_header(self, string8 name)` — Whether the response carries the header `name`, in any case.
+* `void Response.destroy(^self)` — Give back the bytes the response holds. Its strings are not readable…
 * `Error!Response parse_response(ref []char8 data, bool head_only = false)` — Parse the whole response in `data`, which the answer takes ownership of…

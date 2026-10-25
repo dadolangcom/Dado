@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f12a11494f94 -->
+<!-- dadoc 1.0.0-rc.8 -->
+<!-- commit 6cb64404021e (dirty) -->
 # core:shader
 
 core:shader — what a compiled DadoGL shader looks like to the program that
@@ -9,16 +9,23 @@ which will, is refused `ERR0001`. The trait and its shapes are declared
 whole now so that a backend written against them today does not change when
 DadoGL lands.
 
+**Outside the standard library's 1.0 promise until DadoGL is designed.**
+What a real producer needs of the trait (push constants, specialization
+constants, a compute stage's workgroup size, storage-texture formats) is not
+known yet, and adding a method to a trait breaks every implementer. So this
+package may change in any release until DadoGL ships; then it takes the
+promise the rest of `core:` carries.
+
     import "core:shader"
 
     void upload(shader.Shader s):
         switch s.format():
-        case shader.Format.Wgsl:
-            create_module(s.to_string())
-        case shader.Format.Spirv:
-            create_module_spirv(s.to_bytes())
-        else:
-            pass
+            case shader.Format.Wgsl:
+                create_module(s.to_string())
+            case shader.Format.Spirv:
+                create_module_spirv(s.to_bytes())
+            else:
+                pass
 
 A shader carries its **interface** as well as its code — which entry points
 it has and in which stage, what it binds where, and what vertex input it

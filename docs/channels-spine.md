@@ -106,14 +106,11 @@ message and send it after the loop.
 **Holding a channel in a value.** A `type` may hold a channel as a field; the
 value is then one mailbox at one address and is never copied (`ERR0531`) —
 pass `^T` or `ref T`. A `#delete` of such a value while its queue still holds
-`ref` payloads traps in a debug build. **Known limitation:** the struct asks for
-128-byte alignment (each party's words on their own cache line), but a value
-made by `#new` is aligned only as the allocator aligns — 16 bytes — so on the
-heap the line separation the layout promises does not hold, and C calls an
-object at an address its type's alignment does not divide undefined. Package
-channels and locals are aligned as asked. Prefer a package-level channel, or a
-holder that is not heap-allocated, until allocation honours the type's
-alignment.
+`ref` payloads traps in a debug build. The struct asks for 128-byte alignment
+(each party's words on their own cache line), and a value made by `#new` or
+`#make` asks its allocator for it: the root heap honours it, and an allocator
+that cannot — `core:mem/libc`, an arena — answers `nil` rather than a block
+aligned to less.
 
 ## The payload: what a message may hold, and who owns it
 
