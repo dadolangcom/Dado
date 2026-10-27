@@ -10,6 +10,44 @@ is under **Breaking** (a removal is under **Removed**, and breaks a program that
 the old name or signature, the new one, and what to write instead. Diagnostic codes are the
 ones `dado explain` describes.
 
+## 1.0.0-rc.8.1 (2026-10-27)
+
+### Breaking
+
+_Nothing yet._
+
+### Added
+
+- `dado warnings [PKG]` checks a package as `dado check` does and lists every warning and lint it finds, each in full. It takes `check`'s flags (`--tests`, a single `@test` file, `-D`, `--target`, `--lenient`).
+- `dadoc --warnings=count` prints the errors in full and one line counting the warnings and lints by code instead of each one; `--warnings=all`, the default, prints every one. `--emit=diagnostics` and `--emit=explained` always list everything.
+- The VS Code extension's `dado.showWarnings` setting (default off) shows the compiler's warnings (`WRN` codes) as squiggles. `dado-lsp` reads it as `showWarnings`, in `initializationOptions` and in `workspace/didChangeConfiguration`'s `dado` settings.
+
+### Changed
+
+- `dado build`, `check`, `run` and `test` no longer print each warning, which on ordinary code (`WRN0803` above all) pushed everything else out of view. The errors are printed in full as before, then one line, such as `214 warnings and 3 lints not shown (WRN0803 210, WRN1207 4, LNT0412 3): dado warnings lists them`. `dado emit` prints what `dadoc` prints. A `dadoc` older than `--warnings=` is not given it, and prints every warning as before.
+- The editor no longer shows warnings (`WRN` codes) unless `dado.showWarnings` is on. Errors and lints are shown as before, since a `--strict` build, the default, refuses a lint.
+
+### Fixed
+
+- The Windows installer (`irm https://raw.githubusercontent.com/dadolangcom/Dado/main/install.ps1 | iex`):
+  - It no longer closes the PowerShell window it runs in when it finishes, which took every message the install printed with it.
+  - It no longer leaves `$ErrorActionPreference` set to `Stop` in that window.
+  - It asks for TLS 1.2, which Windows PowerShell 5.1 on an older .NET does not offer GitHub by itself.
+  - It turns off the progress bar, which made Windows PowerShell 5.1's download of the archive take minutes.
+  - It says before downloading anything that git is needed, when there is none on `PATH`, with where to get it.
+  - An install that stopped part way can be run again. It used to refuse with "already holds a Dado install: run 'dado upgrade' there", though there was no `dado` yet.
+  - A failure is one line in red, and run as a file (`powershell -File install.ps1`) it sets the exit status.
+- `install.bat` works from a folder whose name holds an apostrophe (a user folder such as `O'Brien`), and is written with the CRLF line endings `cmd.exe` expects.
+- `dado install` and `dado uninstall` on Windows read and write your user `PATH` in the registry. Entries written with a variable, such as `%USERPROFILE%\...`, stay variables, and the value keeps its kind (`REG_EXPAND_SZ`); before, the whole `PATH` was written back with every variable expanded. A folder with a name outside ASCII is written back as itself, not in the console's code page.
+
+### Removed
+
+_Nothing yet._
+
+### Known issues
+
+_Nothing yet._
+
 ## 1.0.0-rc.8 (2026-10-25)
 
 ### Breaking

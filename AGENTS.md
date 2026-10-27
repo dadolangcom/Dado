@@ -19,6 +19,10 @@ rest: each one names the rule that was broken and what to write instead.
 
 Fix the first diagnostic first: later ones are often the same mistake seen again.
 
+Warnings are counted, not printed: `check`, `build`, `run` and `test` end with one line such as
+`12 warnings not shown (WRN0803 12): dado warnings lists them`. A warning never stops a build. Run
+`dado warnings <package>` to read each one, with its place and its `help:`.
+
 ## Where you will guess wrong
 
 Dado looks like several languages and is none of them. These are the guesses that fail first,
