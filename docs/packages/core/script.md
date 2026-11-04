@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit 6cb64404021e (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 925bfab21e40 (dirty) -->
 # core:script
 
 core:script — the native runtime a DadoScript program runs on: QuickJS-ng, the
@@ -66,7 +66,7 @@ The build learns that it needs the archive from the compiler: a program whose
 live set holds this package gets an `engine quickjs` line in its build
 manifest, and the driver answers it with the archive's directory on the
 include path and the archive on the link line. A program that never reaches
-this package links nothing and stays one translation unit.
+this package links nothing of the engine's.
 
 **Hand-restated, not generated, and checked all the same.** Every other
 binding of a C library in this tree is `bindgen`'s output over a header in

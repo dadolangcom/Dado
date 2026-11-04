@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit f5f6761926d6 -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 0d36c1af4ae9 (dirty) -->
 # core:strings
 
 core:strings — the operations `==` does not give you: ordering, search,
@@ -90,8 +90,8 @@ at a time.
 * `ref []char8 to_lower(string8 s)` — `s` with every ASCII capital made a small letter, as `to_upper` does the…
 * `type Builder: ref []char8` — Text built a piece at a time, when the pieces are not all known at once.
 * `Builder builder(i64 room = 16)` — An empty builder with room for `room` bytes before its first growth,…
-* `bool append(^Builder b, string8 s)` — `s` on the end. `false`, and nothing appended, when the run could not grow.
-* `bool append_char(^Builder b, char8 c)` — One byte on the end. `false`, and nothing appended, when the run could not…
+* `void append(^Builder b, string8 s)` — `s` on the end.
+* `void append_char(^Builder b, char8 c)` — One byte on the end.
 * `string8 text(Builder b)` — What has been built so far, as text. A window into the builder's run, so it…
 * `ref []char8 finish(^Builder b)` — The run, handed over: the caller owns it now (see the convention above),…
 * `string8 borrow_from_cstring(cstring c)` — The bytes at `c`, as a `string8`, **without copying them**.

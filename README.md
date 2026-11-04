@@ -60,7 +60,7 @@ import "core:fmt"
 i32 main():
     ref []i64 owned = #make([]i64, 3)
     owned[0] = 7
-    #append(owned, 8)
+    owned = #append(owned, 8)
     []i64 window = owned[:]
     fmt.println(#len(owned), " ", window[0])
     #delete(owned)

@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit 6c56ce20508a (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 925bfab21e40 (dirty) -->
 # core:time
 
 core:time — measuring how long something took, and waiting.
@@ -89,7 +89,7 @@ a feature-test macro had to live in a `.c`. The first half is still true and
 measured: with no macro, `-std=c11` gets `implicit declaration of function
 'clock_gettime'` and `'CLOCK_MONOTONIC' undeclared`. The second half is not:
 a `define` clause on a `foreign` block is emitted above *every* `#include` in
-the generated translation unit, which is exactly where a feature-test macro
+every C file of the program, which is exactly where a feature-test macro
 has to be, because `<features.h>` fixes the whole feature set the first time
 any header pulls it in. So the macro is written here and the sidecar is gone.
 

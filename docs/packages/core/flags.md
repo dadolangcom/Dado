@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit 6c56ce20508a (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 0ca5c37af76e (dirty) -->
 # core:flags
 
 core:flags — command lines: flags, positionals, subcommands, and the help
@@ -164,7 +164,7 @@ are independent.
 
 ## Declarations
 
-100 declarations, 34 public.
+99 declarations, 34 public.
 
 * `distinct enum i32 Error` — Why `parse` failed. The numbers are this package's, 1400 to 1499, apart…
 * `string8 message(Error why)` — A sentence for each of this package's codes, and one for any other value.

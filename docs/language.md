@@ -433,6 +433,8 @@ storage, `put(&f, &SLOT)`, is storing in package storage. **A block behind a
 `ref` or a map** is not read through a view after anything that may move
 or free it — `#append`, `#resize`, `#reserve`, `#delete`, an insert,
 rebinding the handle, or a call whose body grows or frees it — and a
+growth whose answer goes to another place (`ys = #append(xs, v)`) leaves
+the run it was handed stale as well, as below; a
 `defer` counts where it runs, at the scope's exit. **A read the compiler
 can prove bad is refused** (ERR0803), and only one that meets every one
 of these: **the read touches the block** — a subscript of the view,
@@ -542,16 +544,27 @@ and a callee that may write the record through one may write any record.
 One answered from several slots, from a pointer slot,
 or from a slot the callee rebinds is tied to every handle the record
 holds. A record written from `ref` locals (`Two t = (a, b)`) holds the
-handles: a move through its slot (`#append(t.a, 2)`, `#delete(t.a)`)
+handles: a move through its slot (`t.a = #append(t.a, 2)`, `#delete(t.a)`)
 leaves the local stale, not the record, unless another slot of the
 record views, points into or holds that block (`R t = (a, a[0..<2])`),
 or a value stored in the record since, or a call handed it, may, or the
 function takes the local's address (`&a`); a move of the local leaves the
 record stale. A binding declared in a loop's body is a new block each pass,
 so a copy kept from the last pass is not the next pass's. A `ref`
-passed by value to a function that frees it is gone after the call. One
+passed by value to a function that frees it is gone after the call, and
+one passed by value to a function that grows it is stale after the call
+(`zs = push(ys, 1)`; `ys = push(ys, 1)` is not). A growth written into
+another place than the run it grows (`ys = #append(xs, v)`, `ref []T ys =
+#append(xs, v)`, `return #append(xs, v)`, a growth handed to a call) moves
+the run into its answer: the run handed in is stale after it, an error to read on every
+path and a warning on some, until it is rebound — a slot, an element or
+`p^` as well as a name (`x = #append(s.items, 1)` leaves `s.items` stale
+until `s.items` is written); a callee that grows a slot of a record handed
+by value, or a function value any function the program takes as a value
+may be, leaves the caller's copy stale the same way; `xs = #append(xs, v)`, the
+same place on both sides, grows it where it lives. One
 handed by value, or as `&x` to a function that leaves `x^` `nil`, and kept
-in a container (`if !#append(b.items, x): #delete(x)`) is handed over:
+in a container (`b.items = #append(b.items, x)`) is handed over:
 the container holds the handle, a later move of a copy the caller still
 has leaves it stale, and a callee that keeps the block and moves or frees
 it on one path is warned of (WRN0803).
@@ -611,9 +624,7 @@ in a callee, holds neither a block handed over before nor another slot's;
 two handle types that differ only by a `distinct` tag (`ref []u32` and
 `distinct type Owned: ref []u32`) are one type here, since a conversion
 between them is no copy. A `return take(&c)` written directly is not checked
-against a `defer` that frees what `c` holds. Whether a callee keeps a
-`ref` it was handed is read per path only through `if !#append(…)` and
-`if #append(…)`. A pointer into a record's slot taken in place
+against a `defer` that frees what `c` holds. A pointer into a record's slot taken in place
 (`&m.pos[1]` of `M m = (pos, nor)`) is not stale when the local the slot
 was copied from grows, nor, in a record of a generic type declared with
 no value (`Two(u32) t`), when another slot holding the same block is
@@ -634,8 +645,8 @@ see, and a free through one leaves the others live; once a callee has kept
 it in a container a local record holds, that container freeing or growing
 the block leaves the caller's name, a copy of it or a view of it stale, and
 package storage doing so does not; and a callee
-that keeps a `ref` and frees it through a local copy, or on a path decided
-by an `#append` of something else, leaves what it kept live. Swapping two
+that keeps a `ref` and frees it through a local copy leaves what it kept
+live. Swapping two
 `ref` locals through a temporary (`t = a; a = b; b = t`) warns of a view of
 the old block, as any rebinding does; `(a, b) = (b, a)` hands each block to
 its new name.
@@ -748,7 +759,7 @@ memory that is already gone.
 ```
 void build(^ref []i64 out):
     using runtime.enter_temp():
-        _ = #append(out^, 1)      // grown above build's frame
+        out^ = #append(out^, 1)   // grown above build's frame
     _ = runtime.close_temp()      // ... and rolled back with it
 
 using runtime.enter_temp():
@@ -766,7 +777,10 @@ hoisting it, or keeping the frame when `runtime.temp_allocs()` moved. A
 frame some path closes with `runtime.close_temp_keep()` is taken to decide at its
 close. A handle kept in a struct's field, a `rawptr` (the bytes
 `runtime.close_temp_hoisting` and `arena.end_keeping` hand back among them), and a frame
-opened or closed on only some paths are not followed either.
+opened or closed on only some paths are not followed either, and neither is
+a run handed by value and answered back: `small = build(small)`, for a
+`ref []i64 build(ref []i64 out)` that grows its parameter inside a frame it rolls
+back, is not warned of.
 
 ### `#truncate` shortens a run where it lives
 
@@ -799,18 +813,30 @@ public i32 pop(^ref []i32 stack):
     return value
 ```
 
-### A run is made before it grows
+### A run grows where it is, and answers its handle
 
 A reference carries the allocator that made it, and the verbs that
-grow one — `#append`, `#resize`, `#reserve` — ask that allocator. **A
-`ref []T` that was never made has none**: a slot of a zero-valued
-record, a declared local, or one `#delete` has just nilled is `nil`,
-so each of the three answers `false` and changes nothing — the same
-`false` an allocator that ran out gives. Make it first,
-`#make([]T, 0)`, under whatever `using` should own it. To tell the two
-failures apart, ask `xs == nil` before growing: a made run is never
-`nil`, even an empty one. A zero map is different: it is empty and
-usable, and takes its table on the first insert.
+grow one — `#append`, `#resize`, `#reserve` — ask that allocator and
+**answer the grown handle**: `xs = #append(xs, v)`, as Go writes it.
+The block may move, so the run handed in is moved into the answer; a
+dropped answer is `ERR0829`. When the same place is written on both
+sides and holds no call, it is evaluated once, so
+`rows[i].cells = #append(rows[i].cells, v)` grows the run where it
+lives. A different place on the left moves the run:
+after `ys = #append(xs, v)`, the run handed in is stale until it is
+rebound.
+`#append(xs, ..ys)` appends every element of a run (a `[]T`, a
+`ref []T`, a fixed array), growing once by `#len(ys)`; into a
+`ref []char8`, the run appended may be text, as Go's `append(b, s...)`:
+`b = #append(b, ..name)`.
+
+**Growth cannot fail and be answered.** An allocator that declines —
+out of memory, an exhausted arena, a `#stack` rung, which cannot grow —
+stops the program, naming the verb, the run and the count, and
+`--no-assert` does not remove it. **A run that was never made grows on
+its own**: a `nil` `ref []T` (a slot of a zero-valued record, a
+declared local, one `#delete` has just nilled) takes its block from the
+current allocator, the one `#make([]T, 0)` written there would use.
 
 ```dado
 package doc_sample
@@ -818,13 +844,35 @@ package doc_sample
 type Bag:
     ref []i32 items
 
-// 1 when the bag was never made, 2 when memory ran out, 0 when `x` is in.
-public i32 put(^Bag b, i32 x):
-    if b.items == nil:
-        return 1
-    if !#append(b.items, x):
-        return 2
-    return 0
+// A bag that was never made grows on its first `put`.
+public void put(^Bag b, i32 x):
+    b.items = #append(b.items, x)
+```
+
+**A helper grows a run it is handed by answering it.** A `ref []T`
+parameter is the callee's own copy of the handle, so the callee
+answers the grown run and the caller writes it back, `ys = push2(ys,
+1, 2)`; a caller that keeps its old copy, `zs = push2(ys, 1, 2)`,
+holds a stale one (`WRN0803`). A function that grows a by-value
+parameter and neither answers nor keeps it loses the block
+(`LNT0830`). Through `^ref []T` the caller's run grows where it lives,
+`out^ = #append(out^, v)`. Only `#truncate` through a by-value copy is
+refused (`ERR0813`), since it answers nothing.
+
+```dado
+package doc_sample
+
+public ref []i32 push2(ref []i32 xs, i32 a, i32 b):
+    xs = #append(xs, a)
+    return #append(xs, b)
+
+public void push_into(^ref []i32 out, i32 v):
+    out^ = #append(out^, v)
+
+public ref []char8 greet(string8 name):
+    ref []char8 b = nil
+    b = #append(b, .."hello, ")
+    return #append(b, ..name)
 ```
 
 **A window is not a reference, and its `nil` is the empty one.**

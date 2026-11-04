@@ -5,11 +5,16 @@
 // `@test <status>` names the status a file passes with, so a test of a
 // deliberate failure is written `@test 134` (an abort).
 //
-// The compiler says which files are tests (`dadoc --emit=tests`, one
-// `test <path> <status>` line each), and each is transpiled with
-// `--test=<path>` and its own build manifest, because a test file may be the
-// only thing importing a package and so reach headers, `.c` files and link
-// clauses the ordinary build does not.
+// The compiler says which files are tests and which build together
+// (`dadoc --emit=test-groups`, one `test <path> <status> <group>` line each;
+// from a `dadoc` without it, `--emit=tests`, each file alone). **A group is
+// one program**: the package and the group's files transpiled once, with
+// `--test=<path>` for each and one build manifest, because a test file may be
+// the only thing importing a package and so reach headers, `.c` files and
+// link clauses the ordinary build does not; its C `main` runs the test its
+// argument names, so each test is still its own process. Two files that
+// declare one package-level name are in different groups, and a group that
+// does not compile is built a file at a time. The web builds each file alone.
 //
 // **Sanitized by default** with the `defaults` flags, because Dado
 // bounds-checks nothing and a test is where an out-of-bounds goes unwatched.
@@ -31,11 +36,16 @@
 package driver
 
 import "core:fmt"
+import "core:hash"
+import "core:io"
+import "core:mem/arena"
+import "core:mem/libc"
 import "core:os"
 import "core:os/fs"
 import "core:os/proc"
 import "core:path"
 import "core:strings"
+import "core:time"
 
 // What `--filter` and `--shard` asked for, set before the command runs.
 private string8 g_filter = ""
@@ -51,6 +61,12 @@ void set_test_file(string8 file):
 void set_test_selection(string8 filter, string8 shard):
     g_filter = filter
     g_shard = shard
+
+// What `-j` asked for, as written, or "": how many processes at once.
+private string8 g_jobs = ""
+
+void set_test_jobs(string8 jobs):
+    g_jobs = jobs
 
 // `FAIL …`, its first word in red.
 void say_red(string8 word, string8 rest):
@@ -98,19 +114,22 @@ bool in_slice(i64 i, i64 k, i64 n):
     if n == 0: return true
     return i % n == k - 1
 
-// One line of `dadoc --emit=tests`.
+// One line of `dadoc --emit=tests`, or of `--emit=test-groups`, which adds
+// the group the file builds in (-1 when the line has none).
 type TestEntry:
     string8 path
     i32 status
+    i64 group
 
-// `text` read as the tests manifest. `ok` false, and `why` the line, at a
-// line that is not `test <path> <status>`.
+// `text` read as the tests manifest: `test <path> <status>` lines, each with
+// its group after it when `dadoc --emit=test-groups` wrote it. `ok` false,
+// and `why` the line, at a line that is neither.
 (ref []TestEntry tests, bool ok, string8 why) parse_tests(string8 text):
     ref []TestEntry out = #make([]TestEntry, 0)
     for l in lines_of(text):
         ref []string8 w = words_of(l)
         if #len(w) == 0: continue
-        if w[0] != "test" || #len(w) != 3:
+        if w[0] != "test" || (#len(w) != 3 && #len(w) != 4):
             return (out, false, txt(#format("unrecognised test manifest line: ", l)))
         (i64 status, bool sok) = decimal(w[2])
         if !sok:
@@ -118,8 +137,45 @@ type TestEntry:
         TestEntry e
         e.path = w[1]
         e.status = i32(status)
-        _ = #append(out, e)
+        e.group = 0 - 1
+        if #len(w) == 4:
+            (i64 g, bool gok) = decimal(w[3])
+            if !gok:
+                return (out, false, txt(#format("unrecognised test manifest line: ", l)))
+            e.group = g
+        out = #append(out, e)
     return (out, true, "")
+
+// **Which tests build as one program**: `group[i]` is the place in `tests`
+// of the first selected test of test `i`'s group, when that group holds
+// two or more of the selected tests, and -1 for a test built alone (no
+// group, or the only one of its group selected); `member[i]` is test `i`'s
+// place among its group's selected tests, the argument its program runs it
+// by. `tests` is in manifest order, and so is each group.
+(ref []i64 group, ref []i64 member) program_groups([]TestEntry tests):
+    ref []i64 group = #make([]i64, 0)
+    ref []i64 member = #make([]i64, 0)
+    {i64: i64} first = {}
+    {i64: i64} count = {}
+    for i in 0..<#len(tests):
+        i64 g = tests[i].group
+        group = #append(group, 0 - 1)
+        member = #append(member, 0)
+        if g < 0: continue
+        if !(g in first):
+            first[g] = i64(i)
+            count[g] = 0
+        (i64 n, bool _) = count[g]
+        member[i] = n
+        count[g] = n + 1
+    for i in 0..<#len(tests):
+        i64 g = tests[i].group
+        if g < 0: continue
+        (i64 n, bool _) = count[g]
+        if n < 2: continue
+        (i64 at, bool _) = first[g]
+        group[i] = at
+    return (group, member)
 
 // A test file's name in the report: its base name without `.dado`.
 string8 test_name(string8 file):
@@ -145,12 +201,12 @@ string8 sanitizer_marker(i64 sanitized_runs, string8 kind, bool ubsan_alone):
 // `--filter` left out when it left any out, and the sanitizer marker.
 string8 summary_line(i64 passed, i64 failed, i64 filtered, i64 k, i64 n, i64 other_slices, string8 marker):
     strings.Builder b = strings.builder(96)
-    _ = strings.append(&b, txt(#format(passed, " passed, ", failed, " failed")))
+    strings.append(&b, txt(#format(passed, " passed, ", failed, " failed")))
     if n > 0:
-        _ = strings.append(&b, txt(#format(" (slice ", k, "/", n, "; ", other_slices, " in the other slices)")))
+        strings.append(&b, txt(#format(" (slice ", k, "/", n, "; ", other_slices, " in the other slices)")))
     if filtered > 0:
-        _ = strings.append(&b, txt(#format(", ", filtered, " filtered out")))
-    _ = strings.append(&b, marker)
+        strings.append(&b, txt(#format(", ", filtered, " filtered out")))
+    strings.append(&b, marker)
     return txt(strings.finish(&b))
 
 // `text` with every line, blank ones too, indented by seven spaces, each
@@ -160,9 +216,9 @@ string8 indented(string8 text):
     string8 rest = text
     for #len(rest) > 0:
         (string8 l, string8 tail, bool more) = strings.line(rest)
-        _ = strings.append(&b, "       ")
-        _ = strings.append(&b, l)
-        _ = strings.append_char(&b, '\n')
+        strings.append(&b, "       ")
+        strings.append(&b, l)
+        strings.append_char(&b, '\n')
         if !more: break
         rest = tail
     return txt(strings.finish(&b))
@@ -182,8 +238,8 @@ string8 web_manifest(string8 text, string8 scripts):
             i64 slash = strings.index_of(value, '/')
             if slash >= 0:
                 line = txt(#format("js-module ", scripts, "/", value[slash + 1..<#len(value)]))
-        _ = strings.append(&b, line)
-        _ = strings.append_char(&b, '\n')
+        strings.append(&b, line)
+        strings.append_char(&b, '\n')
         if !more: break
         rest = tail
     return txt(strings.finish(&b))
@@ -197,37 +253,6 @@ string8 test_c_path(string8 build_dir, string8 stem, string8 name, string8 cfg):
     return txt(#format(build_dir, "/", stem, ".", name, ".", cfg, ".c"))
 
 // ── running one test ────────────────────────────────────────────────────────
-
-// Run `c` with its standard output thrown away and its standard error kept,
-// and answer its status and what it said there.
-private (i32 status, string8 said) run_test_binary(Command c):
-    ref []char8 err = #make([]char8, 0)
-    if #len(c.words) > proc.ARG_CAP: return (127, txt(err))
-    try proc.Duplex d = proc.duplex(c.words[:], proc.Errors.Pipe) else:
-        return (127, txt(err))
-    _ = proc.close_input(&d)
-    [16384]char8 chunk
-    bool out_open = true
-    bool err_open = true
-    for out_open || err_open:
-        if out_open:
-            i64 got = 0 - 1
-            try got = proc.receive(&d, chunk[:], 10 if err_open else 0 - 1) else why:
-                if why == proc.Pipe.BROKE: out_open = false
-            if got == 0: out_open = false
-        if err_open:
-            i64 got = 0 - 1
-            try got = proc.receive_errors(&d, chunk[:], 10 if out_open else 0 - 1) else why2:
-                if why2 == proc.Pipe.BROKE: err_open = false
-            if got == 0:
-                err_open = false
-            else if got > 0:
-                for i in 0..<got:
-                    _ = #append(err, chunk[i])
-    proc.close_pipes(&d)
-    try proc.Ended e = proc.finish(&d, 0 - 1) else:
-        return (127, txt(err))
-    return (shell_status(e), txt(err))
 
 // A Windows program's exit status read as POSIX's, so one `@test <status>`
 // holds on both. Windows' C runtime ends an `abort` with exit code 3, where a
@@ -294,8 +319,534 @@ private Command compile_flags(^Link k):
     add_all(&c, k.san_c[:])
     return c
 
+// ── many at once ────────────────────────────────────────────────────────────
+
+// How many processes `dado test` runs at once: `-j N` when it was written,
+// else `DADO_JOBS`, else `cores` (at least one). `ok` false for a count that
+// is not a whole number of at least 1.
+(i32 jobs, bool ok) jobs_of(string8 flag, string8 from_env, i32 cores):
+    string8 t = flag
+    if #len(t) == 0: t = from_env
+    if #len(t) == 0: return (cores if cores >= 1 else 1, true)
+    (i64 n, bool nok) = decimal(t)
+    if !nok || n < 1: return (0, false)
+    return (i32(n), true)
+
+// What one command of a pool said and how it ended: its status (127 when it
+// did not start), its standard output (when the pool keeps it) and its
+// standard error.
+type Ran:
+    i32 status
+    ref []char8 out
+    ref []char8 err
+
+// **Commands run at most `jobs` at a time, each one's output read into its
+// own buffers**, so nothing two of them print is interleaved and the caller
+// shows each where it belongs, in the order a run of one at a time would.
+// `pool_step` starts what fits and answers the commands that ended.
+type Pool:
+    ref []Command commands
+    i32 jobs
+    bool keep_out
+    ref []Ran ran
+    ref []proc.Duplex ds
+    ref []bool out_open
+    ref []bool err_open
+    ref []i32 state          // 0 not started, 1 running, 2 ended
+    i64 next
+    i64 live
+    i64 ended
+
+Pool pool_of([]Command commands, i32 jobs, bool keep_out):
+    Pool p
+    p.commands = #make([]Command, 0)
+    p.jobs = jobs if jobs >= 1 else 1
+    p.keep_out = keep_out
+    p.ran = #make([]Ran, 0)
+    p.ds = #make([]proc.Duplex, 0)
+    p.out_open = #make([]bool, 0)
+    p.err_open = #make([]bool, 0)
+    p.state = #make([]i32, 0)
+    for c in commands:
+        p.commands = #append(p.commands, c)
+        Ran r
+        r.status = 127
+        r.out = #make([]char8, 0)
+        r.err = #make([]char8, 0)
+        p.ran = #append(p.ran, r)
+        proc.Duplex d
+        p.ds = #append(p.ds, d)
+        p.out_open = #append(p.out_open, false)
+        p.err_open = #append(p.err_open, false)
+        p.state = #append(p.state, 0)
+    p.next = 0
+    p.live = 0
+    p.ended = 0
+    return p
+
+bool pool_done(^Pool p):
+    return p.ended == i64(#len(p.commands))
+
+// Start commands while fewer than `jobs` run, then read what the running ones
+// say until at least one has ended; answer those that ended, in list order.
+// Nothing when every command has ended.
+ref []i64 pool_step(^Pool p):
+    ref []i64 done = #make([]i64, 0)
+    [16384]char8 chunk
+    for:
+        for p.next < i64(#len(p.commands)) && p.live < i64(p.jobs):
+            i64 i = p.next
+            p.next += 1
+            Command c = p.commands[i]
+            if verbose(): note(txt(#format("  $ ", shown(c))))
+            _ = io.flush(io.stdout())
+            _ = io.flush(io.stderr())
+            bool started = false
+            if #len(c.words) <= proc.ARG_CAP:
+                (proc.Duplex d, bool sok) = start_child(c.words[:])
+                started = sok
+                if sok: p.ds[i] = d
+            if !started:
+                p.state[i] = 2
+                p.ended += 1
+                done = #append(done, i)
+                continue
+            _ = proc.close_input(&p.ds[i])
+            p.out_open[i] = true
+            p.err_open[i] = true
+            p.state[i] = 1
+            p.live += 1
+        if #len(done) > 0 || p.live == 0: return done
+        bool read_any = false
+        for i in 0..<#len(p.commands):
+            if p.state[i] != 1: continue
+            if read_child(p, i, chunk[:]): read_any = true
+            if !p.out_open[i] && !p.err_open[i]:
+                proc.close_pipes(&p.ds[i])
+                p.ran[i].status = finish_status(&p.ds[i])
+                p.state[i] = 2
+                p.live -= 1
+                p.ended += 1
+                done = #append(done, i)
+        if #len(done) > 0: return done
+        if !read_any: time.sleep(time.milliseconds(5))
+    return done
+
+// Run every one of `commands`, `jobs` at a time; what each said, in order.
+ref []Ran run_pool([]Command commands, i32 jobs, bool keep_out):
+    Pool p = pool_of(commands, jobs, keep_out)
+    for !pool_done(&p):
+        _ = pool_step(&p)
+    return p.ran
+
+// Read what child `i` has written so far without waiting; whether anything
+// was read. A pipe that ends or breaks is closed.
+private bool read_child(^Pool p, i64 i, []char8 chunk):
+    bool any = false
+    for p.out_open[i]:
+        i64 got = 0 - 1
+        try got = proc.receive(&p.ds[i], chunk, 0) else why:
+            if why == proc.Pipe.BROKE: p.out_open[i] = false
+            break
+        if got == 0:
+            p.out_open[i] = false
+            break
+        any = true
+        if p.keep_out:
+            for k in 0..<got:
+                p.ran[i].out = #append(p.ran[i].out, chunk[k])
+    for p.err_open[i]:
+        i64 got = 0 - 1
+        try got = proc.receive_errors(&p.ds[i], chunk, 0) else why2:
+            if why2 == proc.Pipe.BROKE: p.err_open[i] = false
+            break
+        if got == 0:
+            p.err_open[i] = false
+            break
+        any = true
+        for k in 0..<got:
+            p.ran[i].err = #append(p.ran[i].err, chunk[k])
+    return any
+
+private (proc.Duplex d, bool ok) start_child([]string8 words):
+    try proc.Duplex d = proc.duplex(words, proc.Errors.Pipe) else:
+        proc.Duplex none
+        return (none, false)
+    return (d, true)
+
+private i32 finish_status(^proc.Duplex d):
+    try proc.Ended e = proc.finish(d, 0 - 1) else:
+        return 127
+    return shell_status(e)
+
+// ── the units, every test's at once ─────────────────────────────────────────
+
+// One C file of one test to compile to an object: the units `dadoc
+// --split-out` wrote and the implementation unit (`moved`: each copied to a
+// name made of what it holds first), or one of the manifest's `source` files,
+// compiled where it is.
+type UnitTask:
+    Command flags            // the compiler and every flag before the `-I`s
+    ref []string8 includes   // the `-I` list, `DADO_CFLAGS` on its tail
+    string8 cc_id
+    string8 unit
+    bool moved
+    i64 owner                // the test, by its place in the run
+
+// **Every test's units, compiled into the build's shared object cache**
+// (`<build>/.dado-cache/units/<key>.o`, where `dado build` keeps its own),
+// each at most once for what it holds, whichever test or build compiled it
+// first, `jobs` compiles at a time across all the tests.
+//
+// **A unit is compiled from a name made of what it holds**,
+// `units/<xxhash>-<length>-<name>`, not from the test's slot: the name is in
+// the object's debug information, and the path is in its key, so two tests
+// whose unit holds the same C (the vendored implementations, a package whose
+// live part is the same) read, and share, one file.
+//
+// **The key** is `dado build`'s (`find_unit`, `UnitsJob`): the unit's bytes,
+// the compiler's identity, every flag (the sanitizers, `-O`, `-g`, `-flto`,
+// `-Werror`), the `-I` list, `DADO_CFLAGS`, and every header the compile
+// read, by its bytes, from the compiler's own `-MD` file. A sanitized test's
+// object and a build's never share a key; nor do two tests whose `-I` lists
+// differ, since a header the one finds the other may not.
+//
+// Answers each task's object and whether it is there, and, for a compile
+// that failed, what the compiler said, against the task that asked first.
+(ref []string8 objects, ref []bool ok, ref []Ran said) task_objects([]UnitTask tasks, string8 cache, i32 jobs):
+    ref []string8 objects = #make([]string8, 0)
+    ref []bool ok = #make([]bool, 0)
+    ref []Ran said = #make([]Ran, 0)
+    string8 dir = join2(cache, "units")
+    try fs.make_dirs(dir) else: pass
+    i64 mark = fs_now(dir)
+    // Each large text read in an arena of its own, emptied after: every
+    // unit of every test would otherwise stay for the run.
+    arena.Arena scratch = arena.over(libc.allocator())
+    ref []string8 sources = #make([]string8, 0)
+    ref []string8 owns = #make([]string8, 0)
+    for i in 0..<#len(tasks):
+        string8 named = tasks[i].unit
+        string8 own = ""
+        if tasks[i].moved:
+            string8 hashed = ""
+            string8 held = ""
+            using arena.allocator(&scratch):
+                (string8 n, string8 h) = content_name(dir, tasks[i].unit)
+                hashed = n
+                held = h
+            named = txt(#format(hashed))
+            own = txt(#format(held))
+            arena.reset(&scratch)
+        sources = #append(sources, named)
+        owns = #append(owns, own)
+
+    {string8: i64} first = {}
+    ref []string8 books = #make([]string8, 0)
+    ref []Command compiles = #make([]Command, 0)
+    ref []i64 compiled_for = #make([]i64, 0)
+    ref []string8 tmps = #make([]string8, 0)
+    for i in 0..<#len(tasks):
+        Ran r
+        r.status = 0
+        r.out = #make([]char8, 0)
+        r.err = #make([]char8, 0)
+        said = #append(said, r)
+        ok = #append(ok, true)
+        string8 base = unit_base(tasks[i].cc_id, tasks[i].flags.words[:], tasks[i].includes[:])
+        UnitFound g
+        using arena.allocator(&scratch):
+            g = find_unit(dir, base, sources[i], owns[i], mark)
+        UnitFound f
+        f.book = txt(#format(g.book))
+        f.object = txt(#format(g.object))
+        arena.reset(&scratch)
+        books = #append(books, f.book)
+        objects = #append(objects, f.object)
+        if #len(f.object) > 0:
+            mark_used(f.object, f.book)
+            continue
+        if #len(f.book) > 0 && f.book in first: continue
+        if #len(f.book) > 0: first[f.book] = i
+        string8 tmp = join2(dir, txt(#format("unit.", os.pid(), ".", i, ".o.tmp")))
+        Command c = command_of(tasks[i].flags.words[:])
+        add_all(&c, tasks[i].includes[:])
+        add(&c, "-c")
+        add(&c, sources[i])
+        add(&c, "-o")
+        add(&c, tmp)
+        add_all(&c, depfile_words(tmp))
+        compiles = #append(compiles, c)
+        compiled_for = #append(compiled_for, i)
+        tmps = #append(tmps, tmp)
+    ref []Ran ran = run_pool(compiles[:], jobs, true)
+    for j in 0..<#len(compiles):
+        i64 i = compiled_for[j]
+        said[i] = ran[j]
+        string8 tmp = tmps[j]
+        string8 depfile = txt(#format(tmp, ".d"))
+        // No key: compiled for this build alone, under its place in the list.
+        string8 obj = join2(dir, txt(#format("unkeyed.", os.pid(), ".", i, ".o")))
+        bool built = ran[j].status == 0
+        string8 keyed = ""
+        if built:
+            string8 k = ""
+            using arena.allocator(&scratch):
+                k = book_unit(books[i], depfile, sources[i], #len(owns[i]) > 0 && sources[i] != tasks[i].unit, mark)
+            keyed = txt(#format(k))
+            arena.reset(&scratch)
+            if #len(keyed) > 0: obj = keyed
+            try fs.rename(tmp, obj) else:
+                built = false
+        remove_quietly(depfile)
+        if !built:
+            remove_quietly(tmp)
+            said[i].status = 1
+        else if #len(keyed) > 0:
+            mark_used(obj, books[i])
+        objects[i] = obj
+    arena.destroy(&scratch)
+    // A task whose unit another test's task compiled takes its object; one
+    // whose object is not there failed: its own compile, or that one.
+    for i in 0..<#len(tasks):
+        if #len(objects[i]) == 0 && books[i] in first:
+            (i64 at, bool _) = first[books[i]]
+            objects[i] = objects[at]
+        ok[i] = #len(objects[i]) > 0 && is_file(objects[i])
+    return (objects, ok, said)
+
+// Where `unit` is compiled from: `<dir>/<xxhash of its text>-<length>-<its
+// name>`, written there (aside, then renamed) unless it already is; `unit`
+// itself when it cannot be written. And its text's `content_digest`, "" when
+// it cannot be read.
+private (string8 named, string8 own) content_name(string8 dir, string8 unit):
+    try ref []char8 text = fs.read_file(unit) else:
+        return (unit, "")
+    u64 x = hash.xxh64_text(0, txt(text))
+    string8 own = txt(#format(#len(text), " ", x))
+    string8 named = join2(dir, txt(#format(x, "-", #len(text), "-", path.base(unit))))
+    write_quietly(txt(#format(named, ".used")), "")
+    if is_file(named): return (named, own)
+    string8 tmp = txt(#format(named, ".", os.pid(), ".tmp"))
+    try fs.write_file(tmp, txt(text)) else:
+        return (unit, own)
+    try fs.rename(tmp, named) else:
+        remove_quietly(tmp)
+        return (unit, own)
+    return (named, own)
+
+// What `emit_key` calls the `dadoc` at `program`: its bytes, by
+// `put_large`, read again only when its length or time moved since the last
+// run (`own_digest`, kept under `cache`): it is megabytes, and the driver
+// that hashes it is built at `-O0`. "" when it cannot be read.
+private string8 dadoc_identity(string8 program, string8 cache):
+    try fs.make_dirs(cache) else: pass
+    string8 h = own_digest(cache, program, fs_now(cache))
+    if #len(h) == 0: return ""
+    Digest d = digest()
+    put_text(&d, h)
+    return finish_digest(&d)
+
 // ── the command ─────────────────────────────────────────────────────────────
 
+// How a test that did not get to run failed, said where its result goes.
+private const i32 NOT_FAILED = 0
+private const i32 DID_NOT_COMPILE = 1
+private const i32 ENGINE_DID_NOT_BUILD = 2
+private const i32 C_DID_NOT_BUILD = 3
+private const i32 WASM_DID_NOT_BUILD = 4
+private const i32 DID_NOT_START = 5
+
+// One selected test, through the phases.
+type TestRun:
+    TestEntry t
+    string8 name
+    string8 t_c
+    Command x                // the transpile, its outputs not yet added
+    ref []string8 args       // the transpile's arguments: its slot and key
+    string8 slot
+    bool fresh
+    string8 started
+    i64 mark
+    bool marked
+    ref []char8 out          // what it printed before its result, replayed
+    ref []char8 err
+    i32 failure
+    string8 unstarted
+    bool web
+    string8 bin
+    Command run
+    i32 status
+    string8 said
+    bool done
+    // **One program per group** (`program_groups`): -1 for a test built
+    // alone; else the place in the run of its group's first test, which
+    // transpiles, compiles and links the group's program for all of them.
+    i64 lead
+    // The argument the group's program runs this test by, or "".
+    string8 selector
+    // This test's own transpile, kept for a group that falls apart.
+    Command own_x
+    ref []string8 own_args
+    string8 own_slot
+    bool own_fresh
+    string8 own_t_c
+    // `name`, or for a group's first test `name+N` (N the others): the C's
+    // and the binary's name.
+    string8 label
+    // The package's test files this program does not hold, which its
+    // transpile's key leaves out (`put_dir`), and this test's own.
+    ref []string8 skip
+    ref []string8 own_skip
+
+// Whether `r` is built by its group's first test rather than by itself.
+private bool built_by_lead(^TestRun r, i64 i):
+    return r.lead >= 0 && r.lead != i
+
+// The transpile of the selected `tests` (one for a test built alone, several
+// for a group), before its outputs are added.
+private Command transpile_of(^Plan p, ^Options o, []string8 tests):
+    Command x = dadoc_command(p, o, true, false)
+    if o.release: add(&x, "--release")
+    if o.strict: add(&x, "--strict")
+    for t in tests:
+        add(&x, txt(#format("--test=", t)))
+    if o.line_directives: add(&x, "--line-directives")
+    string8 handlers = ubsan_handlers_flag(o)
+    if #len(handlers) > 0: add(&x, handlers)
+    add_all(&x, p.prefix_map[:])
+    add(&x, p.pkg_abs)
+    return x
+
+// `r`'s transpile set to `x`: its arguments, its slot and whether the slot
+// already answers it.
+private void set_transpile(^TestRun r, Command x, string8 t_c, bool caching, string8 cache, string8 dadoc_id, []TestEntry all, []string8 held):
+    ref []string8 skip = #make([]string8, 0)
+    for t in all:
+        bool in_it = false
+        for h in held:
+            if h == t.path: in_it = true
+        if !in_it: skip = #append(skip, t.path)
+    r.skip = skip
+    ref []string8 args = #make([]string8, 0)
+    for i in 1..<#len(x.words):
+        args = #append(args, x.words[i])
+    r.args = args
+    r.x = x
+    r.t_c = t_c
+    r.slot = txt(#format(t_c, ".d"))
+    if caching: r.slot = emit_slot(cache, args[:])
+    r.fresh = caching && emit_fresh(r.slot, dadoc_id, args[:], skip[:]) && is_file(join3(r.slot, "units", "units"))
+
+// `r` built alone again, by its own transpile: its group's did not compile.
+private void build_alone(^TestRun r):
+    r.lead = 0 - 1
+    r.selector = ""
+    r.label = r.name
+    r.x = r.own_x
+    r.args = r.own_args
+    r.slot = r.own_slot
+    r.fresh = r.own_fresh
+    r.t_c = r.own_t_c
+    r.skip = r.own_skip
+    r.failure = NOT_FAILED
+    r.out = #make([]char8, 0)
+    r.err = #make([]char8, 0)
+
+// Each of `which`'s transpiles run, `jobs` at a time, and settled into its
+// slot (`settle_slot`).
+private void transpile_round(^ref []TestRun runs, []i64 which, ^Options o, i32 jobs, bool caching, string8 dadoc_id, bool web):
+    ref []Command transpiles = #make([]Command, 0)
+    ref []i64 transpiled = #make([]i64, 0)
+    i64 pid = os.pid()
+    // How many transpiles run at once, and so how many threads each `dadoc`
+    // may use: one apiece when several share the cores, its own default
+    // (`DADO_THREADS`, else a core each) when it runs alone. The C is the
+    // same either way; only who waits for whom changes. Added here, past
+    // `set_transpile`, so `--threads` is never part of the slot or its key.
+    i32 at_once = 1 if #len(o.log) > 0 else jobs
+    i64 to_transpile = 0
+    for i in which:
+        if !runs^[i].fresh: to_transpile += 1
+    for i in which:
+        ^TestRun r = &runs^[i]
+        if r.fresh: continue
+        try fs.make_dirs(r.slot) else: pass
+        // A mark taken before `dadoc` reads anything: a `.dado` file in
+        // the loaded set newer than it was edited *while* this run read
+        // it, so the C may be the old text's and must not be stored
+        // under the new text's key, which is only computed afterwards.
+        r.started = join2(r.slot, txt(#format("started.", pid)))
+        write_quietly(r.started, "")
+        (i64 mark, bool marked) = file_mtime(r.started)
+        r.mark = mark
+        r.marked = marked
+        Command x = r.x
+        add(&x, "-o")
+        add(&x, txt(#format(join2(r.slot, "prog.c"), ".", pid)))
+        add_log(&x, o)
+        add(&x, txt(#format("--build-manifest=", join2(r.slot, "build"), ".", pid)))
+        add(&x, txt(#format("--implementations=", join2(r.slot, "impl.c"), ".", pid)))
+        add(&x, txt(#format("--split-out=", join2(r.slot, "units"), ".", pid)))
+        if web: add(&x, txt(#format("--scripts-out=", join2(r.slot, "scripts"), ".", pid)))
+        if at_once > 1 && to_transpile > 1: add(&x, "--threads=1")
+        transpiles = #append(transpiles, x)
+        transpiled = #append(transpiled, i)
+    ref []Ran transpile_ran = run_pool(transpiles[:], at_once, true)
+    for j in 0..<#len(transpiled):
+        ^TestRun r = &runs^[transpiled[j]]
+        keep_said(r, transpile_ran[j])
+        settle_slot(r, transpile_ran[j].status == 0, caching, dadoc_id, pid)
+
+private void keep_said(^TestRun r, Ran said):
+    for c in said.out:
+        r.out = #append(r.out, c)
+    for c in said.err:
+        r.err = #append(r.err, c)
+
+// The test's line, after what it printed on the way.
+private void say_result(^TestRun r, ^i64 passed, ^i64 failed, Compiler cc, []string8 san_c, []string8 san_l, bool sanitized):
+    if #len(r.out) > 0: fmt.print(txt(r.out))
+    if #len(r.err) > 0:
+        _ = io.flush(io.stdout())
+        fmt.eprint(txt(r.err))
+        _ = io.flush(io.stderr())
+    if r.failure == DID_NOT_COMPILE:
+        say_red("FAIL", txt(#format(" ", r.name, " (did not compile)")))
+    else if r.failure == ENGINE_DID_NOT_BUILD:
+        say_red("FAIL", txt(#format(" ", r.name, " (the DadoScript engine did not build: tools/quickjs/build.sh --cc ", cc.name, " says why)")))
+    else if r.failure == C_DID_NOT_BUILD:
+        if sanitized: recheck_sanitizer(cc, san_c, san_l)
+        say_red("FAIL", txt(#format(" ", r.name, " (the C did not build)")))
+    else if r.failure == WASM_DID_NOT_BUILD:
+        say_red("FAIL", txt(#format(" ", r.name, " (the C did not build for wasm32)")))
+    else if r.failure == DID_NOT_START:
+        say_red("FAIL", txt(#format(" ", r.name, " (", r.unstarted, ")")))
+    else:
+        report(r.name, r.status, r.t.status, r.said, passed, failed)
+        return
+    failed^ += 1
+
+// **The tests run several at a time, and say what they did in order.** Each
+// phase (the transpiles, the units' compiles, the links, the runs) is a pool
+// of processes, `-j` of them at once (`jobs_of`; one budget, so the compiles
+// and the runs never stack on each other), and every word a process prints is
+// kept and shown under its test, in the manifest's order, as soon as every
+// test before it has been shown: the output of `-j 8` is the output of
+// `-j 1`. Under `--log` the transpiles go one at a time, since each appends
+// to the one file; a release link with link-time optimisation uses every core
+// itself, so those go one at a time too.
+//
+// **On the split, and cached** (multi-TU): each test is transpiled with
+// `--split-out`, its units compiled into the shared
+// `<build>/.dado-cache/units/` (`task_objects`), where an edit recompiles only
+// the units whose C moved and two tests share what they hold alike; and a
+// test whose sources did not move is answered from its slot (`emit_slot`)
+// without starting `dadoc`. Not also with `--transpile-cache`, as `dado
+// build` is: that kept a second copy of every slot's C (160 MB for
+// `collections/app/ui`), by the same question, and answered only when the
+// slot did. `--release` is the release tier's build, link-time optimisation
+// included (`lto_words`).
 i32 test_command(^Plan p, ^Options o):
     if #len(o.strip) > 0:
         ref []char8 j = strings.join(o.strip[:], " ")
@@ -308,6 +859,11 @@ i32 test_command(^Plan p, ^Options o):
             die(txt(#format("--shard takes <k>/<n> with 1 <= k <= n, not `", g_shard, "`")))
         shard_k = k
         shard_n = n
+    (string8 jobs_env, bool _) = env("DADO_JOBS")
+    (i32 jobs, bool jok) = jobs_of(g_jobs, jobs_env, os.cpu_count())
+    if !jok:
+        if #len(g_jobs) > 0: die(txt(#format("-j takes a number of jobs, 1 or more, not `", g_jobs, "`")))
+        die(txt(#format("DADO_JOBS takes a number of jobs, 1 or more, not `", jobs_env, "`")))
 
     bool web = targets_web()
     Compiler cc = no_compiler("")
@@ -325,12 +881,19 @@ i32 test_command(^Plan p, ^Options o):
             cfg = txt(#format(cfg, ".asan"))
     try fs.make_dirs(p.build_dir) else: pass
 
-    Command tc = dadoc_command(p, o, true, false)
-    add(&tc, "--emit=tests")
-    add(&tc, p.pkg_abs)
-    Captured listed_tests = capture(tc, false)
+    // The tests and the groups they build in (`--emit=test-groups`); from a
+    // `dadoc` that has no groups, the tests alone, each built by itself.
+    Command gc = dadoc_command(p, o, true, false)
+    add(&gc, "--emit=test-groups")
+    add(&gc, p.pkg_abs)
+    Captured listed_tests = capture(gc, true)
     if !listed_tests.started || listed_tests.status != 0:
-        die(txt(#format("cannot read the tests of ", o.pkg)))
+        Command tc = dadoc_command(p, o, true, false)
+        add(&tc, "--emit=tests")
+        add(&tc, p.pkg_abs)
+        listed_tests = capture(tc, false)
+        if !listed_tests.started || listed_tests.status != 0:
+            die(txt(#format("cannot read the tests of ", o.pkg)))
     (ref []TestEntry tests, bool tok, string8 twhy) = parse_tests(txt(listed_tests.out))
     if !tok: die(twhy)
 
@@ -349,15 +912,15 @@ i32 test_command(^Plan p, ^Options o):
     string8 web_node = ""
 
     // Once per run: what `emit_key` calls this `dadoc`. A digest that cannot
-    // be taken turns the caches off for the run rather than keying them on
+    // be taken turns the emit cache off for the run rather than keying it on
     // nothing; the compiler's identity is asked at the first native test.
     string8 cache = join2(p.build_dir, ".dado-cache")
-    Digest dd = digest()
-    put_file(&dd, p.dadoc)
-    string8 dadoc_id = finish_digest(&dd)
+    string8 dadoc_id = dadoc_identity(p.dadoc, cache)
     bool caching = #len(dadoc_id) > 0
     string8 cc_id = ""
 
+    // ── which tests, and their transpiles ──
+    ref []TestRun runs = #make([]TestRun, 0)
     for t in tests:
         string8 name = test_name(t.path)
         index += 1
@@ -370,97 +933,108 @@ i32 test_command(^Plan p, ^Options o):
         if #len(g_filter) > 0 && !strings.contains(name, g_filter):
             filtered += 1
             continue
-
+        TestRun r
+        r.t = t
+        r.name = name
+        r.label = name
+        r.out = #make([]char8, 0)
+        r.err = #make([]char8, 0)
+        r.failure = NOT_FAILED
+        r.done = false
+        r.lead = 0 - 1
+        r.selector = ""
         string8 t_c = test_c_path(p.build_dir, p.stem, name, cfg)
         try fs.make_dirs(dir_of(t_c)) else: pass
+        // **One transpile per program for every pass that asks the same
+        // question** — see `emit_slot`. The slot holds the C, its manifest,
+        // its units and, when there is one, the implementation unit, all from
+        // one `dadoc` run; without the caches it is this program's own and
+        // never reused.
+        ref []string8 one = #make([]string8, 0)
+        one = #append(one, t.path)
+        set_transpile(&r, transpile_of(p, o, one[:]), t_c, caching, cache, dadoc_id, tests[:], one[:])
+        r.own_x = r.x
+        r.own_args = r.args
+        r.own_slot = r.slot
+        r.own_fresh = r.fresh
+        r.own_t_c = r.t_c
+        r.own_skip = r.skip
+        runs = #append(runs, r)
 
-        // **One transpile per test for every pass that asks the same
-        // question** — see `emit_slot`. The slot holds the C, its manifest
-        // and, when there is one, the implementation unit, all from one
-        // `dadoc` run; without the caches it is this test's own and never
-        // reused.
-        Command x = dadoc_command(p, o, true, false)
-        if o.release: add(&x, "--release")
-        if o.strict: add(&x, "--strict")
-        add(&x, txt(#format("--test=", t.path)))
-        if o.line_directives: add(&x, "--line-directives")
-        string8 handlers = ubsan_handlers_flag(o)
-        if #len(handlers) > 0: add(&x, handlers)
-        add_all(&x, p.prefix_map[:])
-        add(&x, p.pkg_abs)
-        ref []string8 args = #make([]string8, 0)
-        for i in 1..<#len(x.words):
-            _ = #append(args, x.words[i])
-        string8 slot = txt(#format(t_c, ".d"))
-        if caching: slot = emit_slot(cache, args[:])
-        string8 slot_c = join2(slot, "prog.c")
-        string8 slot_build = join2(slot, "build")
-        string8 slot_impl = join2(slot, "impl.c")
-        string8 slot_key = join2(slot, "key")
-        string8 t_scripts = join2(slot, "scripts")
-        if !caching || !emit_fresh(slot, dadoc_id, args[:]):
-            try fs.make_dirs(slot) else: pass
-            i64 pid = os.pid()
-            // A mark taken before `dadoc` reads anything: a `.dado` file in
-            // the loaded set newer than it was edited *while* this run read
-            // it, so the C may be the old text's and must not be stored
-            // under the new text's key, which is only computed afterwards.
-            string8 started = join2(slot, txt(#format("started.", pid)))
-            write_quietly(started, "")
-            (i64 mark, bool marked) = file_mtime(started)
-            string8 tmp_c = txt(#format(slot_c, ".", pid))
-            string8 tmp_build = txt(#format(slot_build, ".", pid))
-            string8 tmp_impl = txt(#format(slot_impl, ".", pid))
-            string8 tmp_scripts = txt(#format(t_scripts, ".", pid))
-            add(&x, "-o")
-            add(&x, tmp_c)
-            add(&x, txt(#format("--build-manifest=", tmp_build)))
-            if caching: add(&x, txt(#format("--implementations=", tmp_impl)))
-            if web: add(&x, txt(#format("--scripts-out=", tmp_scripts)))
-            if run(x) != 0:
-                remove_if_there(tmp_c)
-                remove_if_there(tmp_build)
-                remove_if_there(tmp_impl)
-                remove_if_there(slot_key)
-                remove_if_there(started)
-                remove_tree_quietly(tmp_scripts)
-                say_red("FAIL", txt(#format(" ", name, " (did not compile)")))
-                failed += 1
-                continue
-            // The key last, so a slot whose key matches is never half-written.
-            remove_if_there(slot_key)
-            move_or_die(tmp_c, slot_c)
-            move_or_die(tmp_build, slot_build)
-            if exists(tmp_impl):
-                move_or_die(tmp_impl, slot_impl)
-            else:
-                remove_if_there(slot_impl)
-            remove_tree_quietly(t_scripts)
-            if exists(tmp_scripts): move_or_die(tmp_scripts, t_scripts)
-            string8 written = read_or_empty(slot_build)
-            bool moved = !marked || sources_moved(written, mark)
-            remove_if_there(started)
-            if caching && !moved:
-                string8 key = emit_key(dadoc_id, args[:], written)
-                if #len(key) > 0:
-                    string8 tmp_key = txt(#format(slot_key, ".", pid))
-                    try fs.write_file(tmp_key, key) else:
-                        key = ""
-                    if #len(key) > 0:
-                        try fs.rename(tmp_key, slot_key) else:
-                            remove_if_there(tmp_key)
+    // **One program per group of test files** (`dadoc --emit=test-groups`):
+    // the package and every test file of a group checked, emitted and
+    // linked once, its C `main` running the test its argument names, and
+    // each test still its own process (below). Files whose package-level
+    // names meet are in different groups, so a group is a program that
+    // compiles; the web builds one module per test.
+    if !web:
+        ref []TestEntry selected = #make([]TestEntry, 0)
+        for r in runs:
+            selected = #append(selected, r.t)
+        (ref []i64 group, ref []i64 member) = program_groups(selected[:])
+        for i in 0..<#len(runs):
+            runs[i].lead = group[i]
+            if group[i] >= 0: runs[i].selector = txt(#format(member[i]))
+        for i in 0..<#len(runs):
+            if runs[i].lead != i64(i): continue
+            ref []string8 paths = #make([]string8, 0)
+            for j in i..<#len(runs):
+                if runs[j].lead == i64(i): paths = #append(paths, runs[j].t.path)
+            runs[i].label = txt(#format(runs[i].name, "+", #len(paths) - 1))
+            string8 g_c = test_c_path(p.build_dir, p.stem, runs[i].label, cfg)
+            set_transpile(&runs[i], transpile_of(p, o, paths[:]), g_c, caching, cache, dadoc_id, tests[:], paths[:])
+
+    i64 pid = os.pid()
+    ref []i64 first_round = #make([]i64, 0)
+    for i in 0..<#len(runs):
+        if !built_by_lead(&runs[i], i64(i)): first_round = #append(first_round, i64(i))
+    transpile_round(&runs, first_round[:], o, jobs, caching, dadoc_id, web)
+    // **A group that did not compile is built a file at a time**, so each
+    // file's own diagnostics are said against it and the files that compile
+    // still run. What the group's transpile said is not shown: it is said
+    // again, by the file it is about.
+    ref []i64 second_round = #make([]i64, 0)
+    for i in 0..<#len(runs):
+        if runs[i].lead != i64(i) || runs[i].failure != DID_NOT_COMPILE: continue
+        for j in i..<#len(runs):
+            if runs[j].lead != i64(i): continue
+            build_alone(&runs[j])
+            second_round = #append(second_round, j)
+    if #len(second_round) > 0:
+        if verbose(): note("  a group of test files did not compile together: building them one at a time")
+        transpile_round(&runs, second_round[:], o, jobs, caching, dadoc_id, web)
+
+    // ── each test's build, laid out ──
+    ref []UnitTask tasks = #make([]UnitTask, 0)
+    ref []i64 first_task = #make([]i64, 0)
+    ref []i64 unit_count = #make([]i64, 0)
+    ref []i64 source_count = #make([]i64, 0)
+    ref []Link links = #make([]Link, 0)
+    ref []string8 manifests = #make([]string8, 0)
+    for i in 0..<#len(runs):
+        ^TestRun r = &runs[i]
+        first_task = #append(first_task, i64(#len(tasks)))
+        unit_count = #append(unit_count, 0)
+        source_count = #append(source_count, 0)
+        links = #append(links, new_link())
+        manifests = #append(manifests, "")
+        if r.failure != NOT_FAILED || built_by_lead(r, i64(i)): continue
+        string8 slot_c = join2(r.slot, "prog.c")
+        string8 slot_build = join2(r.slot, "build")
+        string8 slot_impl = join2(r.slot, "impl.c")
+        string8 slot_units = join2(r.slot, "units")
         // Where a person looks for the C, as before; the build reads the slot.
-        string8 t_c_tmp = txt(#format(t_c, ".", os.pid()))
+        string8 t_c_tmp = txt(#format(r.t_c, ".", pid))
         try fs.copy_file(slot_c, t_c_tmp) else code:
-            die(txt(#format("cannot copy ", slot_c, " to ", t_c, ": ", os.message(code))))
+            die(txt(#format("cannot copy ", slot_c, " to ", r.t_c, ": ", os.message(code))))
             return 1
-        move_or_die(t_c_tmp, t_c)
+        move_or_die(t_c_tmp, r.t_c)
         try ref []char8 mtext = fs.read_file(slot_build) else code:
             die(txt(#format("cannot read the build manifest ", slot_build, ": ", os.message(code))))
             return 1
+        manifests[i] = txt(mtext)
         (Manifest m, bool mok, string8 mwhy) = parse_manifest(txt(mtext))
         if !mok: die(mwhy)
-        bool has_impl = caching && is_file(slot_impl)
 
         if m.os == "#NONE":
             string8 from = ""
@@ -472,37 +1046,43 @@ i32 test_command(^Plan p, ^Options o):
             die(txt(#format("`dado test` cannot run a freestanding build.\n\n  The resolved target's `#OS` is `#NONE`, which is the assertion that there\n  is no operating system and no libc here — so there is nothing on this\n  machine to start the test with, and a test's result *is* its exit status.\n  Linking it against this host's libc anyway would report a tick for a\n  hosted run.\n\n  The target came from ", from, ".\n  Run the tests for the machine you are on, and use `dado build` for the\n  freestanding one — it compiles and stops at the object file.")))
         if #len(m.engine) > 0: engine_refusals(m.engine, m.os)
 
+        // The units, in link order, and the implementation unit after them.
+        ref []string8 units = #make([]string8, 0)
+        for uname in words_of(read_or_empty(join2(slot_units, "units"))):
+            units = #append(units, join2(slot_units, uname))
+        if is_file(slot_impl): units = #append(units, slot_impl)
+
         ref []string8 includes = #make([]string8, 0)
         for inc in m.includes:
-            _ = #append(includes, txt(#format("-I", inc)))
+            includes = #append(includes, txt(#format("-I", inc)))
         ref []string8 libs = #make([]string8, 0)
         for l in o.libs:
-            _ = #append(libs, l)
+            libs = #append(libs, l)
         for l in m.links:
-            _ = #append(libs, l)
+            libs = #append(libs, l)
 
         // A web test: a module, run under node, under C's UBSan alone when
         // sanitized (`web_compile_flags`), which is the default here too.
+        // Its units go through `web_module`, which caches them by what they
+        // hold as natively, one test at a time: a web test is compiled by a
+        // different compiler for a different target.
         if m.os == "#WEB":
+            r.web = true
             if #len(libs) > 0:
                 ref []char8 lj = strings.join(libs[:], " ")
                 die(txt(#format("a web build cannot link native libraries, and this test's build asks for: ", txt(lj))))
             if #len(web_cc) == 0: web_cc = web_compiler(o.cc)
             if #len(web_node) == 0: web_node = web_node_program(o.cmd)
-            string8 wasm = txt(#format(p.build_dir, "/", p.stem, ".", name, ".wasm"))
+            string8 wasm = txt(#format(p.build_dir, "/", p.stem, ".", r.label, ".wasm"))
             (string8 user_cflags, bool _) = env("DADO_CFLAGS")
             for w in words_of(user_cflags):
-                _ = #append(includes, w)
-            // The vendored bodies `dadoc` split out, when it did: one more
-            // unit of the module, uncached, since a web test is compiled by
-            // a different compiler for a different target.
-            ref []string8 web_sources = #make([]string8, 0)
-            for src in m.sources:
-                _ = #append(web_sources, src)
-            if has_impl: _ = #append(web_sources, slot_impl)
-            if !web_module(web_cc, o, t_c, web_sources[:], m.flags[:], includes[:], wasm):
-                say_red("FAIL", txt(#format(" ", name, " (the C did not build for wasm32)")))
-                failed += 1
+                includes = #append(includes, w)
+            g_units = units
+            g_units_cache = cache
+            bool wok = web_module(web_cc, o, r.t_c, m.sources[:], m.flags[:], includes[:], wasm)
+            g_units = #make([]string8, 0)
+            if !wok:
+                r.failure = WASM_DID_NOT_BUILD
                 continue
             if o.sanitize: sanitized_runs += 1
             string8 scripts_name = txt(#format(path.base(wasm[0..<#len(wasm) - 5]), ".scripts"))
@@ -512,12 +1092,13 @@ i32 test_command(^Plan p, ^Options o):
             string8 beside = wasm[0..<#len(wasm) - 5]
             string8 scripts_dir = txt(#format(beside, ".scripts"))
             remove_tree_quietly(scripts_dir)
+            string8 t_scripts = join2(r.slot, "scripts")
             if is_dir(t_scripts): copy_tree(t_scripts, scripts_dir)
             Command nr = command(web_node)
             add(&nr, join3(root(), "tools", join2("web", "load.mjs")))
             add(&nr, wasm)
-            (i32 wstatus, string8 wsaid) = run_test_binary(nr)
-            report(name, wstatus, t.status, wsaid, &passed, &failed)
+            r.run = nr
+            r.bin = wasm
             continue
 
         if !san_ready:
@@ -531,95 +1112,179 @@ i32 test_command(^Plan p, ^Options o):
             if #len(engine_dir) == 0:
                 engine_dir = engine_archive(cc, p.target_flag, san_c[:])
             if #len(engine_dir) == 0:
-                say_red("FAIL", txt(#format(" ", name, " (the DadoScript engine did not build: tools/quickjs/build.sh --cc ", cc.name, " says why)")))
-                failed += 1
+                r.failure = ENGINE_DID_NOT_BUILD
                 continue
-            _ = #append(includes, txt(#format("-I", engine_dir)))
-            _ = #append(libs, join2(engine_dir, "libquickjs.a"))
-            _ = #append(libs, "-lm")
+            includes = #append(includes, txt(#format("-I", engine_dir)))
+            libs = #append(libs, join2(engine_dir, "libquickjs.a"))
+            libs = #append(libs, "-lm")
 
         string8 brew = brew_prefix()
         if #len(brew) > 0 && is_dir(join2(brew, "include")):
-            _ = #append(includes, txt(#format("-I", join2(brew, "include"))))
+            includes = #append(includes, txt(#format("-I", join2(brew, "include"))))
         (string8 user_cflags, bool _) = env("DADO_CFLAGS")
         for w in words_of(user_cflags):
-            _ = #append(includes, w)
+            includes = #append(includes, w)
         ref []string8 all_libs = #make([]string8, 0)
         if #len(brew) > 0 && is_dir(join2(brew, "lib")):
-            _ = #append(all_libs, txt(#format("-L", join2(brew, "lib"))))
+            all_libs = #append(all_libs, txt(#format("-L", join2(brew, "lib"))))
         for l in libs:
-            _ = #append(all_libs, l)
+            all_libs = #append(all_libs, l)
 
-        string8 bin = txt(#format(p.build_dir, "/", p.stem, ".", name, ".", cfg))
+        r.bin = txt(#format(p.build_dir, "/", p.stem, ".", r.label, ".", cfg))
         Link k = new_link()
         k.cc = command_of(cc.words[:]).words
         k.base = words_of(setting("CFLAGS_BASE"))
         k.interop = words_of(setting("CFLAGS_INTEROP"))
         if o.werror: k.werror = words_of(setting("CFLAGS_WERROR"))
-        k.opt = opt_words(o)
+        k.opt = opt_words(o, cc.zig)
+        for w in lto_words(o, cc_family(cc), m.os):
+            k.opt = #append(k.opt, w)
         k.extra = m.flags
         k.san_c = san_c
         k.includes = includes
         k.c_file = slot_c
         k.sources = m.sources
-        k.out = bin
+        k.out = r.bin
         k.libs = all_libs
         k.exports = export_flags(m.os, m.exports[:], cc.zig)
         k.san_l = san_l
         (string8 user_ldflags, bool _) = env("DADO_LDFLAGS")
         k.ldflags = words_of(user_ldflags)
+        links[i] = k
 
-        // The objects: the vendored bodies, shared by every test that
-        // includes them, and the test's own C, from the caches when nothing
-        // they are made of has moved (`cached_object`). Without the caches
-        // the C is compiled in the link command, as it always was.
-        if caching && #len(cc_id) == 0: cc_id = compiler_identity(cc)
-        ObjectJob job
-        job.cache = cache
-        job.cc_id = cc_id
-        job.flags = compile_flags(&k)
-        job.includes = includes
-        ref []string8 own_objects = #make([]string8, 0)
-        bool built = true
-        if has_impl:
-            job.sub = "impl"
-            job.unsay = true
-            job.unit = slot_impl
-            (string8 io, bool iok, bool itemp) = cached_object(&job)
-            if iok:
-                _ = #append(k.sources, io)
-                if itemp: _ = #append(own_objects, io)
-            built = iok
-        if built && caching:
-            job.sub = "obj"
-            job.unsay = false
-            job.unit = slot_c
-            (string8 po, bool pok, bool ptemp) = cached_object(&job)
-            if pok:
-                k.c_file = po
-                if ptemp: _ = #append(own_objects, po)
-            built = pok
-        if built: built = run(link_command(&k)) == 0
-        for own in own_objects:
-            remove_if_there(own)
-        if !built:
-            if sanitized: recheck_sanitizer(cc, san_c[:], san_l[:])
-            say_red("FAIL", txt(#format(" ", name, " (the C did not build)")))
-            failed += 1
+        if #len(cc_id) == 0: cc_id = compiler_identity(cc)
+        UnitTask ut
+        ut.cc_id = cc_id
+        ut.includes = includes
+        ut.owner = i
+        // A release build's units keep their symbols to the program, as
+        // `dado build`'s do; the manifest's own C keeps its visibility.
+        ut.flags = compile_flags(&k)
+        if o.release && m.os != "#WINDOWS": add(&ut.flags, "-fvisibility=hidden")
+        ut.moved = true
+        for u in units:
+            ut.unit = u
+            tasks = #append(tasks, ut)
+        unit_count[i] = i64(#len(units))
+        UnitTask st = ut
+        st.flags = compile_flags(&k)
+        st.moved = false
+        for s in m.sources:
+            st.unit = s
+            tasks = #append(tasks, st)
+        source_count[i] = i64(#len(m.sources))
+
+    // ── every test's units, then the links ──
+    (ref []string8 objects, ref []bool built_ok, ref []Ran unit_said) = task_objects(tasks[:], cache, jobs)
+    ref []Command link_lines = #make([]Command, 0)
+    ref []i64 linked = #make([]i64, 0)
+    ref []string8 link_keys = #make([]string8, 0)
+    ref []i64 ready_bins = #make([]i64, 0)
+    for i in 0..<#len(runs):
+        ^TestRun r = &runs[i]
+        if r.failure != NOT_FAILED || r.web || built_by_lead(r, i64(i)): continue
+        i64 from = first_task[i]
+        i64 n = unit_count[i] + source_count[i]
+        bool ok = n > 0
+        for j in from..<(from + n):
+            keep_said(r, unit_said[j])
+            if !built_ok[j]: ok = false
+        if !ok:
+            r.failure = C_DID_NOT_BUILD
+            continue
+        Link k = links[i]
+        k.c_file = objects[from]
+        ref []string8 rest = #make([]string8, 0)
+        for j in (from + 1)..<(from + n):
+            rest = #append(rest, objects[j])
+        k.sources = rest
+        k.link_opt = link_opt_words(k.opt[:], cc.zig)
+        // The link compiles no C of its own, as `dado build`'s: a warning
+        // gcc's or clang's optimisation across files finds there is said,
+        // and the test is not refused for it.
+        k.werror = #make([]string8, 0)
+        // No object moved since the last link into this binary, which
+        // nothing has written since: it is not linked again (`link_key`).
+        // The run is a run all the same.
+        Command lc = link_command(&k)
+        string8 lkey = link_key(lc, cc_id)
+        if link_current(cache, r.bin, lkey):
+            ready_bins = #append(ready_bins, i)
+            continue
+        link_done(cache, r.bin, "")
+        link_lines = #append(link_lines, lc)
+        linked = #append(linked, i)
+        link_keys = #append(link_keys, lkey)
+    ref []string8 lto_on = lto_words(o, cc_family(cc))
+    bool lto = #len(lto_on) > 0 && !web
+    ref []Ran link_ran = run_pool(link_lines[:], 1 if lto else jobs, true)
+    for j in 0..<#len(linked):
+        ^TestRun r = &runs[linked[j]]
+        keep_said(r, link_ran[j])
+        if link_ran[j].status != 0:
+            r.failure = C_DID_NOT_BUILD
+            continue
+        link_done(cache, r.bin, link_keys[j])
+        ready_bins = #append(ready_bins, linked[j])
+    {i64: bool} ready = {}
+    for i in ready_bins:
+        ready[i] = true
+    for i in 0..<#len(runs):
+        ^TestRun r = &runs[i]
+        // A test of a group runs its group's program, or fails as it did.
+        if built_by_lead(r, i64(i)):
+            ^TestRun lead = &runs[r.lead]
+            manifests[i] = manifests[r.lead]
+            if lead.failure != NOT_FAILED:
+                r.failure = lead.failure
+                continue
+            r.bin = lead.bin
+        else if !(i in ready):
             continue
         if sanitized: sanitized_runs += 1
-
         (string8 runner, bool _) = env("DADO_RUNNER")
         ref []string8 runner_words = words_of(runner)
-        Command r = command_of(runner_words[:])
-        add(&r, bin)
-        (i32 status, string8 said) = run_test_binary(r)
-        string8 unstarted = exec_failure(bin) if status == 127 && #len(runner_words) == 0 else ""
-        if #len(unstarted) > 0:
-            say_red("FAIL", txt(#format(" ", name, " (", unstarted, ")")))
-            failed += 1
+        Command rc = command_of(runner_words[:])
+        add(&rc, r.bin)
+        if #len(r.selector) > 0: add(&rc, r.selector)
+        r.run = rc
+
+    // ── the runs, each test's result said in order as soon as it can be ──
+    ref []Command run_lines = #make([]Command, 0)
+    ref []i64 running = #make([]i64, 0)
+    for i in 0..<#len(runs):
+        if runs[i].failure != NOT_FAILED:
+            runs[i].done = true
             continue
-        report(name, as_posix_status(status, m.os), t.status, said, &passed, &failed)
+        run_lines = #append(run_lines, runs[i].run)
+        running = #append(running, i)
+    Pool pool = pool_of(run_lines[:], jobs, false)
+    i64 shown_upto = 0
+    for:
+        for shown_upto < i64(#len(runs)) && runs[shown_upto].done:
+            say_result(&runs[shown_upto], &passed, &failed, cc, san_c[:], san_l[:], sanitized)
+            shown_upto += 1
+        if pool_done(&pool): break
+        for j in pool_step(&pool):
+            ^TestRun r = &runs[running[j]]
+            Ran ran = pool.ran[j]
+            r.status = ran.status
+            r.said = txt(ran.err)
+            (string8 runner, bool _) = env("DADO_RUNNER")
+            ref []string8 runner_words = words_of(runner)
+            if !r.web:
+                r.unstarted = exec_failure(r.bin) if r.status == 127 && #len(runner_words) == 0 else ""
+                if #len(r.unstarted) > 0: r.failure = DID_NOT_START
+                // `manifests[...]`'s `os` decides how a Windows status reads.
+                (Manifest m, bool _, string8 _) = parse_manifest(manifests[running[j]])
+                r.status = as_posix_status(r.status, m.os)
+            r.done = true
+    for shown_upto < i64(#len(runs)):
+        say_result(&runs[shown_upto], &passed, &failed, cc, san_c[:], san_l[:], sanitized)
+        shown_upto += 1
+    for o2 in objects:
+        if strings.contains(path.base(o2), "unkeyed."): remove_if_there(o2)
+    sweep_units(cache, objects[:])
 
     if passed + failed == 0:
         string8 matching = ""
@@ -641,3 +1306,53 @@ i32 test_command(^Plan p, ^Options o):
     fmt.println(summary_line(passed, failed, filtered, shard_k, shard_n, other_slices, marker))
     if failed > 0: return 1
     return 0
+
+// A transpile's outputs moved from their `.<pid>` names into the slot, and
+// the slot's key written last, so a slot whose key matches is never
+// half-written; or, when `dadoc` failed, the test marked and the slot's
+// leftovers removed.
+private void settle_slot(^TestRun r, bool ok, bool caching, string8 dadoc_id, i64 pid):
+    string8 slot_c = join2(r.slot, "prog.c")
+    string8 slot_build = join2(r.slot, "build")
+    string8 slot_impl = join2(r.slot, "impl.c")
+    string8 slot_units = join2(r.slot, "units")
+    string8 slot_key = join2(r.slot, "key")
+    string8 t_scripts = join2(r.slot, "scripts")
+    string8 tmp_c = txt(#format(slot_c, ".", pid))
+    string8 tmp_build = txt(#format(slot_build, ".", pid))
+    string8 tmp_impl = txt(#format(slot_impl, ".", pid))
+    string8 tmp_units = txt(#format(slot_units, ".", pid))
+    string8 tmp_scripts = txt(#format(t_scripts, ".", pid))
+    if !ok:
+        remove_if_there(tmp_c)
+        remove_if_there(tmp_build)
+        remove_if_there(tmp_impl)
+        remove_tree_quietly(tmp_units)
+        remove_if_there(slot_key)
+        remove_if_there(r.started)
+        remove_tree_quietly(tmp_scripts)
+        r.failure = DID_NOT_COMPILE
+        return
+    remove_if_there(slot_key)
+    move_or_die(tmp_c, slot_c)
+    move_or_die(tmp_build, slot_build)
+    if exists(tmp_impl):
+        move_or_die(tmp_impl, slot_impl)
+    else:
+        remove_if_there(slot_impl)
+    remove_tree_quietly(slot_units)
+    if exists(tmp_units): move_or_die(tmp_units, slot_units)
+    remove_tree_quietly(t_scripts)
+    if exists(tmp_scripts): move_or_die(tmp_scripts, t_scripts)
+    string8 written = read_or_empty(slot_build)
+    bool moved = !r.marked || sources_moved(written, r.mark)
+    remove_if_there(r.started)
+    if caching && !moved:
+        string8 key = emit_key(dadoc_id, r.args[:], written, r.skip[:])
+        if #len(key) > 0:
+            string8 tmp_key = txt(#format(slot_key, ".", pid))
+            try fs.write_file(tmp_key, key) else:
+                key = ""
+            if #len(key) > 0:
+                try fs.rename(tmp_key, slot_key) else:
+                    remove_if_there(tmp_key)

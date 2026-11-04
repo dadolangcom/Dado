@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-dev+1eb4a2567aaf.dirty -->
-<!-- commit 1eb4a2567aaf (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 925bfab21e40 (dirty) -->
 # app:input/sokol
 
 app:input/sokol — the sokol decode: `sapp_event` in, `app:input`'s queue out.
@@ -29,7 +29,7 @@ copy, and it is the reason this arm is more than two lines.
 block's `#include` is emitted for every importer, reached or not. Putting the
 decode in `app:input` would put `sokol_app.h` — and, with `define
 "SOKOL_IMPL"` on its block, the whole of sokol_app's implementation — into
-the translation unit of every program that imports `app:input`, including
+the C of every program that imports `app:input`, including
 every headless one. `app:input` stays backend-neutral, as its own doc comment
 promises; the one package that already drags sokol in (`app:graphical`)
 imports this.

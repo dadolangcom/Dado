@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit a0ef6b75b8d5 (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 04e163907980 (dirty) -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -143,14 +143,14 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [LNT0731](LNT0731.md) | lint | a `switch` over an `enum` whose arms leave a declared member unnamed |
 | [ERR0801](ERR0801.md) | error | a key whose `==` is not stable and total, so an entry could be inserted and never found again |
 | [ERR0802](ERR0802.md) | error | a `$K` bound to a type whose `==` is not stable and total, so the map it keys has no key |
-| [WRN0803](WRN0803.md) | warning | a view, a walk or a handle used after the block under it may have moved or been taken back — `#append`, `#resize`, `#reserve`, `#delete`, an insert, rebinding the handle, handing a `^` to it to a call, `#send`ing the `ref` to a channel, draining the channel a `#peek` lent it from, or ending the region it was minted in (a scratch frame rolled back, an arena's mark ended, an arena destroyed) — on some path through the same function |
-| [ERR0803](ERR0803.md) | error | a view, a pointer or a handle read after the block under it was freed on every path through the same function |
+| [WRN0803](WRN0803.md) | warning | a view, a walk or a handle used after the block under it may have moved or been taken back — `#append`, `#resize`, `#reserve`, a growth that moves the run into another place (`ys = #append(xs, v)` leaves `xs` stale), `#delete`, an insert, rebinding the handle, handing a `^` to it to a call, `#send`ing the `ref` to a channel, draining the channel a `#peek` lent it from, or ending the region it was minted in (a scratch frame rolled back, an arena's mark ended, an arena destroyed) — on some path through the same function |
+| [ERR0803](ERR0803.md) | error | a view, a pointer or a handle read after the block under it was freed, or the run moved into another place by a growth, on every path through the same function |
 | [ERR0804](ERR0804.md) | error | an assignment to `#default`, which is immutable within a scope — a nested suite shadows it with `using`, and nothing rebinds it |
 | [ERR0805](ERR0805.md) | error | a spelling the language has retired, written where its replacement belongs — the message names the repair |
 | [ERR0807](ERR0807.md) | error | a lifetime rung written on `resize`, which grows a block where it already lives and so takes no allocator at all |
 | [ERR0808](ERR0808.md) | error | a `#stack` rung where there is no compound literal to emit — as a value, handed to a callee, on a verb that sizes its block at run time or allocates through the allocator's `proc`, or on a count only known at run time |
 | [ERR0810](ERR0810.md) | error | a `using` subject that is not an allocator — the two words `(proc, data)` or an implementer of the `Allocator` trait — so there is nothing for the suite to allocate through |
-| [ERR0813](ERR0813.md) | error | a `resize`, an `#append`, a `#reserve` or a `#truncate` on a by-value `ref` parameter — the callee changes its own copy of the handle and the caller is left holding the old one |
+| [ERR0813](ERR0813.md) | error | a `#truncate` on a by-value `ref` parameter — the callee shortens its own copy of the handle and the caller is left holding the old length |
 | [ERR0814](ERR0814.md) | error | `#cap`, `#append` or `#reserve` written over something that has no capacity distinct from its length — a fixed array, a borrow, a single-element reference or a map |
 | [ERR0815](ERR0815.md) | error | a `#no_bounds` written where there is no bound to waive — a one-slot shape's sole position is `0`, so its check is what the subscript means rather than a guard around it, and a map read is total |
 | [ERR0816](ERR0816.md) | error | a constant alignment that is not a power of two — the mask `(p + (n - 1)) & ~(n - 1)` is the alignment only for one, and a computed alignment is the programmer's word because the allocator interface carries one at run time |
@@ -167,6 +167,8 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0826](ERR0826.md) | error | a pointer, window or trait value of storage on this frame that outlives it — returned, stored through a parameter or into a package-level variable, appended into a handle one of those reaches, or read after its block ends |
 | [ERR0827](ERR0827.md) | error | one call handed both a view into a block and the handle to it, where the callee may move the block and then read or write through the view |
 | [ERR0828](ERR0828.md) | error | a `#truncate` to a count the compiler can see is negative, which is no length a run can have |
+| [ERR0829](ERR0829.md) | error | the handle a growth verb answers, dropped — the run it was handed has moved, and nothing holds the block |
+| [LNT0830](LNT0830.md) | lint | a `ref` parameter grown here and, on some way out, neither answered nor kept: the caller's handle is stale and the block is lost |
 | [ERR0901](ERR0901.md) | error | an initializer that is not a compile-time constant |
 | [ERR0902](ERR0902.md) | error | a division or remainder by a zero the compiler can see |
 | [ERR0903](ERR0903.md) | error | a `when` condition over a constant more than one package declares, which import order would otherwise resolve |

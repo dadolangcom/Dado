@@ -23,6 +23,11 @@ Warnings are counted, not printed: `check`, `build`, `run` and `test` end with o
 `12 warnings not shown (WRN0803 12): dado warnings lists them`. A warning never stops a build. Run
 `dado warnings <package>` to read each one, with its place and its `help:`.
 
+Errors are capped at 12: the first twelve are printed in full, in the order they were found, then
+one line such as `40 more errors not shown (ERR0829 31, ERR0504 9): --log=FILE writes them all`.
+Add `--log FILE` to any of these verbs to write every diagnostic, errors and warnings, in full to
+FILE; the terminal stays the same.
+
 ## Where you will guess wrong
 
 Dado looks like several languages and is none of them. These are the guesses that fail first,
@@ -34,7 +39,8 @@ with the diagnostic you will see:
 | `let x = 1`, `var x`, `x := 1` | `i32 x = 1` (`auto x = f()` takes a call's type) | ERR0401 / ERR0201 |
 | `struct P { x: i32 }` | `type P:` with one `i32 x` per indented line | ERR0201 |
 | `P{3, 4}`, `P(x = 3, y = 4)` | `P(3, 4)` or `P(x: 3, y: 4)`: one value per slot (or `(3, 4)` where a `P` is wanted) | ERR0201, ERR0604 |
-| `len(xs)`, `append(xs, v)`, `make(...)` | `#len(xs)`, `#append(xs, v)`, `#make([]T, n)` | ERR0805 / ERR0405 |
+| `len(xs)`, `xs = append(xs, v)`, `make(...)` | `#len(xs)`, `xs = #append(xs, v)`, `#make([]T, n)` | ERR0805 / ERR0405 |
+| `_ = #append(xs, v)`, `if !#append(xs, v):` (Dado before rc.9) | `xs = #append(xs, v)`: growth answers the run's handle, and stops the program when memory runs out | ERR0829, ERR0504 |
 | `println("hi")` with no import | `import "core:fmt"` then `fmt.println("hi")` | ERR0405 |
 | `fmt.println("n=%d", n)` | `fmt.println("n=", n)`: arguments are printed in order, there are no format verbs | (it prints `n=%d3`) |
 | `if n:`, `if p:` | `if n != 0:`, `if p != nil:`; a condition is a `bool` | ERR0702 |
@@ -103,7 +109,7 @@ i32 main():
     string8 said = shout
     fmt.println(said, " ", n)
     ref []i32 xs = #make([]i32, 0)
-    _ = #append(xs, 7)
+    xs = #append(xs, 7)
     #delete(xs)
     ^Point q = &p
     q^.x = 10
@@ -115,9 +121,9 @@ i32 main():
 
 Allocation: `#make` takes from the current allocator (C's heap unless a scope says
 otherwise); `ref` marks a value that owns what it points at, and `#delete` gives it back. A
-`ref []T` is made before it grows: a zero one (a slot of a zero-valued record, or one after
-`#delete`) is `nil` with no allocator, so `#append` to it answers `false` and stores nothing,
-the same answer as running out of memory. A zero map, by contrast, is usable. A
+`ref []T` grows by answering its handle, `xs = #append(xs, v)`: a zero one (a slot of a
+zero-valued record, or one after `#delete`) is `nil` and grows from the current allocator, and
+a growth the allocator declines stops the program. A zero map is usable too. A
 `using arena.allocator(&a):` block (`core:mem/arena`) makes every allocation in it come from an
 arena freed at once. `defer` runs a statement at the end of its scope.
 
@@ -144,7 +150,8 @@ i32 test():
     return 0 if ok else 1
 ```
 
-`dado test hello` builds each test file into its own program and runs it under ASan and UBSan.
+`dado test hello` builds the test files into one program (two files that declare one helper go
+into two) and runs each test as its own process under ASan and UBSan.
 Builds come in three tiers, each a preset of switches written at any tier: a dev build (`build`,
 `run`) carries Dado's own checks (`--dado-checks`); `--debug` (which also compiles `-g -O0`), and
 `dado test`, adds the call stack (`--full-trace`) and C's sanitizers (`--c-sanitize`); `--release`

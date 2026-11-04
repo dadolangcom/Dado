@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit 6c56ce20508a (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 925bfab21e40 (dirty) -->
 # vendor:enet
 
 vendor:enet — Dado bindings for the zpl-c/enet single-header fork of ENet
@@ -30,7 +30,7 @@ not resolve under this build. One macro, flipped in both places together,
 reverts to dual-stack if that is ever needed.
 
 **A `define` clause is program-global**: it is emitted above every
-`#include` in the single translation unit a Dado program is, so linking this
+`#include` in every C file of a Dado program, so linking this
 package defines `ENET_IPV4_ONLY` for every package beside it. Nothing
 outside this directory names that macro, so it costs nothing today — but it
 is the property to check before adding a second `define` here.

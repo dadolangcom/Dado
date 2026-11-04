@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.4 -->
-<!-- commit d5b92d013902 -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 0d36c1af4ae9 (dirty) -->
 # core:cfg
 
 core:cfg — INI text to a queryable `Config` and back, and the same to and
@@ -93,7 +93,9 @@ called under.
 **A failed allocation drops what it was for, and nothing else.** A setter
 whose copy cannot be made leaves the key as it was (the old value, or
 absent); `parse` counts a line whose value or section cannot be stored in
-`bad_lines`; `render` and `render_over` answer `nil`.
+`bad_lines`; `render` and `render_over` answer `nil` when their text cannot
+be made. A run that was made and then cannot grow stops the program, as any
+growth does.
 
 **Thread-safety.** No package state. A `Config` is a map: one thread at a
 time may change one, and any number may read one nobody is changing.

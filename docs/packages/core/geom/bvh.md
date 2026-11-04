@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit 015d59b2e2c4 (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- commit 0d36c1af4ae9 (dirty) -->
 # core:geom/bvh
 
 A static bounding volume hierarchy over 3D boxes: built once, queried for the nearest ray hit and
@@ -23,7 +23,7 @@ items a ray leaves out. The tree is built by binned SAH, and by median splits pa
 which bounds its depth. It is f32 throughout, the precision of the vertex data such a tree
 indexes.
 
-**Errors.** `build` and `overlapping` fail with a member of `Error` (codes 1500 to 1599), and
+**Errors.** `build` fails with a member of `Error` (codes 1500 to 1599), and
 `message(why)` is a sentence for one.
 
 **Tier N W H.** Pure Dado over `core:linalg` and `core:geom/hit`: it builds and runs
@@ -48,5 +48,5 @@ methods reach C or hold an address breaks the promise at the call that passes it
 * `Error!Bvh build([]Box boxes)` — Builds a tree over `boxes` on `#default`; the caller ends it with `destroy`. Item i is…
 * `void destroy(^Bvh b)` — Frees the tree's runs and leaves it empty.
 * `(i32 item, f32 t, bool hit) raycast(^const Bvh b, [3]f32 origin, [3]f32 dir, f32 t_max, ^RayTest test)` — The nearest item the ray origin + t * dir hits with t < t_max, as `test.hit_item` decides,…
-* `Error!i32 overlapping(^const Bvh b, []Box boxes, [3]f32 lo, [3]f32 hi, ^ref []i32 out)` — Appends to `out` every item whose box in `boxes` (the slice the tree was built or last refitted…
+* `i32 overlapping(^const Bvh b, []Box boxes, [3]f32 lo, [3]f32 hi, ^ref []i32 out)` — Appends to `out` every item whose box in `boxes` (the slice the tree was built or last refitted…
 * `void refit(^Bvh b, []Box boxes)` — Recomputes every node's box from `boxes`, the same items moved, children before parents. The…

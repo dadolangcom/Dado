@@ -340,8 +340,9 @@ first. A pack is a `[]T` window in the callee and allocates nothing — it is a
 compound literal in the caller's frame. There is a `_of` sibling
 (`tui.tabs_of(&page, labels)`) taking a `[]string` for when the labels are data.
 
-**`line_edit` takes a `^ref []char8`**, which is the language's own growth idiom
-(`#append` through a pointer to the handle — the repair ERR0813 names). A
+**`line_edit` takes a `^ref []char8`**, because it answers whether the text
+changed and not the grown handle: each growth is stored through the pointer
+(`buf^ = #append(buf^, c)`). A
 no-allocation program uses `tui.line_edit_fixed(label, []char8 buf, ^i32 len)`
 instead. `tui.edited(buf)` lends the current contents as a `string`.
 
