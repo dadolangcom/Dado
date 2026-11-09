@@ -1,0 +1,1292 @@
+// `--emit=manifest`:
+// the build's public surface as JSON. Names, prototypes, members, offsets and
+// the header's C are this lowering's; the rest is the Rust dadoc's.
+package lower
+
+import "language:check"
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+// The channel shapes the emitted C wrote (`chan_ty`), for the manifest.
+ref []u32 g_chans
+
+private const string8 HEXD = "0123456789abcdef"
+
+// `s` as a JSON string literal.
+string8 jstring(string8 s):
+    ref []char8 o
+    o = #append(o, '"')
+    for ch in s:
+        u8 b = u8(ch)
+        if ch == '"': put(&o, "\\\"")
+        else if ch == '\\': put(&o, "\\\\")
+        else if ch == '\n': put(&o, "\\n")
+        else if ch == '\r': put(&o, "\\r")
+        else if ch == '\t': put(&o, "\\t")
+        else if b < 0x20:
+            put(&o, "\\u00")
+            o = #append(o, HEXD[i64(b >> 4)])
+            o = #append(o, HEXD[i64(b & 15)])
+        else: o = #append(o, ch)
+    o = #append(o, '"')
+    return fresh(o)
+
+// A held copy through `#format`: a view of a record holding `^World` held
+// directly reads to the Rust dadoc's escape check as keeping the world.
+string8 fresh(string8 v):
+    if #len(v) == 0: return ""
+    return index.hold(#format(v))
+
+private string8 jnull(string8 s):
+    if #len(s) == 0: return "null"
+    return jstring(s)
+
+private string8 jbool(bool b):
+    if b: return "true"
+    return "false"
+
+private void pad(^ref []char8 o, i64 d):
+    o^ = #append(o^, '\n')
+    for _ in 0..<d:
+        put(o, "  ")
+
+// Compact JSON reindented as Rust's `Json::pretty`: two spaces a level, one
+// member a line, `[]`/`{}` when empty, a newline at the end.
+string8 jpretty(string8 s):
+    ref []char8 o
+    i64 d = 0
+    bool str = false
+    i64 i = 0
+    i64 n = #len(s)
+    for i < n:
+        char8 ch = s[i]
+        if str:
+            o = #append(o, ch)
+            if ch == '\\' && i + 1 < n:
+                o = #append(o, s[i + 1])
+                i += 2
+                continue
+            if ch == '"': str = false
+            i += 1
+            continue
+        if ch == '"':
+            str = true
+            o = #append(o, ch)
+        else if ch == '{' || ch == '[':
+            char8 nx = ' '
+            if i + 1 < n: nx = s[i + 1]
+            if nx == '}' || nx == ']':
+                o = #append(o, ch)
+                o = #append(o, nx)
+                i += 2
+                continue
+            o = #append(o, ch)
+            d += 1
+            pad(&o, d)
+        else if ch == '}' || ch == ']':
+            d -= 1
+            pad(&o, d)
+            o = #append(o, ch)
+        else if ch == ',':
+            o = #append(o, ch)
+            pad(&o, d)
+        else if ch == ':': put(&o, ": ")
+        else: o = #append(o, ch)
+        i += 1
+    o = #append(o, '\n')
+    return fresh(o)
+
+// ── Where a declaration is, and its doc comment ──
+
+// File `f`'s byte range `lo..hi` as the manifest's `span`.
+private string8 mspan(^check.World w, u32 f, u32 lo, u32 hi):
+    diag.Place pl = w.p.map.place(w.p.map.base[f] + lo)
+    return index.hold(#format("{\"file\":", jstring(w.p.map.names[f]), ",\"line\":", pl.line, ",\"column\":", pl.col, ",\"start\":", lo, ",\"end\":", hi, "}"))
+
+// The name token's span of node `n` (its own range when it has none).
+private string8 name_span(^check.World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u32 k = a.main[n]
+    if k == check.NONE: return mspan(w, f, a.lo[n], a.hi[n])
+    return mspan(w, f, w.p.files[f].t.start[k], w.p.files[f].t.end[k])
+
+private u32 name_lo(^check.World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u32 k = a.main[n]
+    if k == check.NONE: return a.lo[n]
+    return w.p.files[f].t.start[k]
+
+// The `//` run directly above the line holding byte `at` of file `f`, each
+// line's `// ` taken off (`doc_comment`), as JSON; `null` when none.
+private string8 mdoc(^check.World w, u32 f, u32 at):
+    string8 text = w.p.files[f].src
+    i64 cursor = i64(at)
+    if cursor > #len(text): cursor = #len(text)
+    for cursor > 0 && text[cursor - 1] != '\n': cursor -= 1
+    i64 rf = -1
+    i64 rt = -1
+    for cursor > 0:
+        i64 above = cursor - 1
+        for above > 0 && text[above - 1] != '\n': above -= 1
+        string8 tr = strings.trim(text[above..<cursor])
+        if rf < 0 && (strings.starts_with(tr, "@") || tr == "#assert_raises"):
+            cursor = above
+            continue
+        if !strings.starts_with(tr, "//"): break
+        string8 rest = tr[2..<#len(tr)]
+        if strings.starts_with(rest, "@") || strings.starts_with(strings.trim(rest), "─"): break
+        if rt < 0: rt = cursor
+        rf = above
+        cursor = above
+    if rf < 0: return "null"
+    ref []char8 o
+    bool first = true
+    for line in strings.split(text[rf..<rt], "\n"):
+        string8 l = line
+        if #len(l) > 0 && l[#len(l) - 1] == '\r': l = l[0..<#len(l) - 1]
+        string8 t = strings.trim_left(l)
+        if strings.starts_with(t, "//"): l = t[2..<#len(t)]
+        if strings.starts_with(l, " "): l = l[1..<#len(l)]
+        if !first: o = #append(o, '\n')
+        first = false
+        put(&o, l)
+    // `lines()` drops the run's last newline.
+    if #len(o) > 0 && rt > rf && text[rt - 1] == '\n' && strings.ends_with(fresh(o), "\n"): #truncate(o, #len(o) - 1)
+    return jstring(fresh(o))
+
+// ── The C surface ──
+
+private type MType:
+    string8 key
+    string8 name
+    u32 decl
+    string8 dado
+    string8 c
+    string8 kind
+    u32 ty
+    string8 members
+    string8 values
+    string8 under
+    string8 layout
+
+private type Surf:
+    ref []MType types
+    bool laid
+    u64 word
+    ref []char8 protos
+
+// What a type is, as the manifest's `kind` says it (Rust's `type_kind`).
+private string8 mkind(^C c, u32 x):
+    if x == check.NONE: return "other"
+    if foreign_row(c, x) != check.NONE: return "distinct"
+    u32 y = x
+    for _ in 0..<64:
+        if y == check.NONE || c.t.tag[y] != types.T_NAMED: break
+        if y in c.w.type_decl:
+            u32 d = check.NONE
+            try d = c.w.type_decl[y] else: d = check.NONE
+            if d != check.NONE && c.w.decls[d].kind == check.K_ENUM: return "enum"
+        y = c.t.body[y]
+    if y == check.NONE: return "other"
+    u8 g = c.t.tag[y]
+    if g == types.T_PRIM: return "scalar"
+    if g == types.T_ALIGNED: return "aligned"
+    if g == types.T_QUAL: return "qualified"
+    if g == types.T_CSCALAR: return "c-scalar"
+    if g == types.T_UNION && c.t.b[y] != 0: return "c-union"
+    if g == types.T_SOA: return "soa"
+    if g == types.T_BUILTIN:
+        string8 bn = c.t.text(c.t.a[y])
+        if bn == "string8" || bn == "string16" || bn == "string32": return "string"
+        if bn == "cstring": return "cstring"
+        return "other"
+    if g == types.T_FUNC: return "function"
+    if g == types.T_TRAIT: return "trait"
+    if g == types.T_UNION: return "union"
+    if g == types.T_SLICE: return "slice"
+    if g == types.T_MAP: return "map"
+    if g == types.T_PTR: return "pointer"
+    if g == types.T_DISTINCT: return "distinct"
+    if g == types.T_MATRIX: return "matrix"
+    if g == types.T_OPAQUE: return "opaque"
+    if g == types.T_TUPLE:
+        u32 e = check.NONE
+        i64 k = 0
+        if c.t.uniform(y, &e, &k): return "array"
+        return "tuple"
+    if g == types.T_REF: return "ref"
+    return "other"
+
+// The row under names and qualifiers that `kind` is about.
+private u32 under_names(^C c, u32 x):
+    u32 y = x
+    for _ in 0..<64:
+        if y == check.NONE: return y
+        u8 g = c.t.tag[y]
+        if g == types.T_NAMED: y = c.t.body[y]
+        else: return y
+    return check.NONE
+
+// The declaration naming `x`, else NONE.
+private u32 declared(^C c, u32 x):
+    if x == check.NONE || c.t.tag[x] != types.T_NAMED || !(x in c.w.type_decl): return check.NONE
+    try u32 d = c.w.type_decl[x] else: return check.NONE
+    return d
+
+private string8 tref(^C c, ^Surf s, u32 x):
+    string8 k = mkind(c, x)
+    string8 key = describe(c, s, x, k)
+    string8 cn = ty(c, x)
+    return index.hold(#format("{\"dado\":", jstring(check.named(c.w, x)), ",\"c\":", jstring(cn), ",\"kind\":", jstring(k), ",\"decl\":", jnull(key), "}"))
+
+private string8 mmember(string8 name, string8 tr, string8 cty, i64 count, i64 off):
+    string8 cnt = "null"
+    if count >= 0: cnt = index.hold(#format(count))
+    string8 of = "null"
+    if off >= 0: of = index.hold(#format(off))
+    return index.hold(#format("{\"name\":", jstring(name), ",\"type\":", tr, ",\"c\":", jstring(cty), ",\"count\":", cnt, ",\"offset\":", of, "}"))
+
+private u64 rup(u64 n, u64 to):
+    if to <= 1: return n
+    return (n + to - 1) / to * to
+
+// Size and alignment of `x` as C lays it out for a `word`-byte pointer (the
+// rules of `types/layout.dado`, the union this lowering's: tag, then payload);
+// false where the layout is C's alone.
+private bool mlay(^C c, u32 x, u64 word, ^u64 size, ^u64 align, i64 depth):
+    if depth > 64 || x == check.NONE: return false
+    u32 r = c.t.lres(x)
+    if r == check.NONE: return false
+    u8 g = c.t.tag[r]
+    if g == types.T_PRIM:
+        types.PrimRow p = types.PRIM[c.t.a[r]]
+        if p.kind == types.K_VOID: return false
+        u64 n = u64(p.bits / 8)
+        if p.kind == types.K_PTR: n = word
+        size^ = n
+        align^ = n
+        return true
+    if g == types.T_PTR || g == types.T_FUNC:
+        size^ = word
+        align^ = word
+        return true
+    if g == types.T_CSCALAR:
+        u8 z = types.C_SCALARS[c.t.a[r]].size
+        if z == 255: return false
+        u64 n = u64(z)
+        if z == 0: n = word
+        size^ = n
+        align^ = n
+        return true
+    ref []u64 sa
+    if g == types.T_BUILTIN:
+        string8 bn = c.t.text(c.t.a[r])
+        if bn == "cstring":
+            size^ = word
+            align^ = word
+            return true
+        if bn != "string8" && bn != "string16" && bn != "string32": return false
+        two(&sa, word, word)
+        two(&sa, 8, 8)
+    else if g == types.T_SLICE:
+        two(&sa, word, word)
+        two(&sa, 8, 8)
+    else if g == types.T_REF:
+        u32 h = c.t.resolve(c.t.a[r])
+        if h != check.NONE && c.t.tag[h] == types.T_SLICE:
+            two(&sa, word, word)
+            two(&sa, 8, 8)
+            two(&sa, 2 * word, word)
+            two(&sa, 4, 4)
+        else:
+            two(&sa, word, word)
+            two(&sa, 2 * word, word)
+    else if g == types.T_MAP:
+        two(&sa, word, word)
+        two(&sa, 2 * word, word)
+    else if g == types.T_TRAIT:
+        two(&sa, word, word)
+        two(&sa, 4, 4)
+    else if g == types.T_DISTINCT || g == types.T_MATRIX || g == types.T_ALIGNED:
+        u32 under = c.t.b[r]
+        if g == types.T_MATRIX: under = c.t.list(r)[0]
+        if !mlay(c, under, word, size, align, depth + 1): return false
+        if g == types.T_ALIGNED && u64(c.t.a[r]) > align^:
+            align^ = u64(c.t.a[r])
+            size^ = rup(size^, align^)
+        return true
+    else if g == types.T_TUPLE || g == types.T_UNION:
+        []u32 ms = c.t.list(r)
+        if #len(ms) == 0: return false
+        u64 ps = 0
+        u64 pa = 1
+        for m in ms:
+            u64 ms_ = 0
+            u64 ma = 0
+            if !mlay(c, m, word, &ms_, &ma, depth + 1): return false
+            if g == types.T_TUPLE:
+                two(&sa, ms_, ma)
+            else:
+                if ms_ > ps: ps = ms_
+                if ma > pa: pa = ma
+        if g == types.T_UNION:
+            ps = rup(ps, pa)
+            if c.t.b[r] != 0:
+                size^ = ps
+                align^ = pa
+                return true
+            two(&sa, 4, 4)
+            two(&sa, ps, pa)
+    else: return false
+    u64 at = 0
+    u64 al = 1
+    i64 i = 0
+    for i < #len(sa):
+        at = rup(at, sa[i + 1]) + sa[i]
+        if sa[i + 1] > al: al = sa[i + 1]
+        i += 2
+    size^ = rup(at, al)
+    align^ = al
+    return true
+
+private void two(^ref []u64 sa, u64 a, u64 b):
+    sa^ = #append(sa^, a)
+    sa^ = #append(sa^, b)
+
+// The offsets of tuple `y`'s slots for a `word`-byte pointer; empty when unknown.
+private ref []u64 slot_offsets(^C c, u32 y, u64 word):
+    ref []u64 out
+    u64 at = 0
+    for m in c.t.list(y):
+        u64 sz = 0
+        u64 al = 0
+        if !mlay(c, m, word, &sz, &al, 0):
+            #truncate(out, 0)
+            return out
+        at = rup(at, al)
+        out = #append(out, at)
+        at += sz
+    return out
+
+// The entry describing `x`, made once; its key ("" for a scalar).
+private string8 describe(^C c, ^Surf s, u32 x, string8 kind):
+    if kind == "scalar" || kind == "c-scalar" || kind == "cstring": return ""
+    if kind == "pointer":
+        u32 p = c.t.a[under_names(c, x)]
+        return describe(c, s, p, mkind(c, p))
+    if kind == "qualified" || kind == "aligned":
+        u32 q = c.t.b[under_names(c, x)]
+        return describe(c, s, q, mkind(c, q))
+    u32 d = declared(c, c.t.bare(x))
+    string8 dn = ""
+    if d != check.NONE: dn = check.name_of(c.w, c.w.decls[d].name)
+    string8 cn = ty(c, x)
+    string8 key = cn
+    if kind == "distinct" || kind == "enum" || kind == "matrix":
+        string8 nm = dn
+        if #len(nm) == 0: nm = check.shown(c.w, x)
+        key = index.hold(#format(kind, " ", nm))
+    for i in 0..<#len(s.types):
+        if s.types[i].key != key: continue
+        if #len(s.types[i].name) == 0 && #len(dn) > 0:
+            s.types[i].name = dn
+            if foreign_row(c, x) == check.NONE: s.types[i].decl = d
+        return key
+    string8 dado = check.shown(c.w, x)
+    u32 fx = foreign_row(c, x)
+    if fx != check.NONE:
+        string8 pk = ""
+        if d != check.NONE: pk = check.name_of(c.w, c.w.p.pkgs[c.w.decls[d].pkg].name)
+        dado = index.hold(#format(dn, " = distinct ", pk, ".", dn, ": ", check.shown(c.w, c.t.body[fx])))
+    u32 sd = d
+    if fx != check.NONE: sd = check.NONE
+    s.types = #append(s.types, MType(key, dn, sd, dado, cn, kind, x, "[]", "[]", "null", "null"))
+    i64 at = #len(s.types) - 1
+    ref []string8 ms
+    string8 values = "[]"
+    string8 under = "null"
+    u32 y = under_names(c, x)
+    u64 word = s.word
+    if kind == "distinct":
+        u32 ux = check.NONE
+        if fx != check.NONE: ux = c.t.body[fx]
+        else if y != check.NONE && c.t.tag[y] == types.T_DISTINCT: ux = c.t.b[y]
+        if ux != check.NONE: under = tref(c, s, ux)
+    else if kind == "matrix":
+        u32 mx = x
+        for _ in 0..<64:
+            if mx == check.NONE || c.t.tag[mx] != types.T_NAMED: break
+            mx = c.t.body[mx]
+        if mx != check.NONE && c.t.tag[mx] == types.T_MATRIX: under = tref(c, s, c.t.list(mx)[0])
+    else if kind == "enum":
+        ref []string8 vs
+        for k in c.w.order:
+            if u32(k >> 32) != d: continue
+            u32 ek = check.NONE
+            try ek = c.w.members[k] else: continue
+            if ek == check.NONE: continue
+            vs = #append(vs, index.hold(#format("{\"name\":", jstring(check.name_of(c.w, u32(k & 0xFFFFFFFF))), ",\"value\":", i64(c.w.k.w0[ek]), "}")))
+        values = index.hold(#format("[", strings.join(vs[:], ","), "]"))
+        under = tref(c, s, c.t.body[c.t.bare(x)])
+    else if kind == "string":
+        string8 pc = "const char *"
+        if y == types.STRING16: pc = "const uint16_t *"
+        if y == types.STRING32: pc = "const uint32_t *"
+        i64 lo = -1
+        if s.laid: lo = i64(rup(word, 8))
+        ms = #append(ms, mmember("ptr", "null", pc, -1, 0 if s.laid else -1))
+        ms = #append(ms, mmember("len", "null", "int64_t", -1, lo))
+    else if kind == "slice":
+        string8 et = tref(c, s, c.t.a[y])
+        i64 lo = -1
+        if s.laid: lo = i64(rup(word, 8))
+        ms = #append(ms, mmember("ptr", et, "void *", -1, 0 if s.laid else -1))
+        ms = #append(ms, mmember("len", "null", "int64_t", -1, lo))
+    else if kind == "map":
+        _ = tref(c, s, c.t.a[y])
+        _ = tref(c, s, c.t.b[y])
+    else if kind == "union" || kind == "c-union":
+        bool raw = c.t.b[y] != 0
+        []u32 alts = c.t.list(y)
+        []u32 names = c.t.slot_names(y)
+        u64 pa = 1
+        bool known = s.laid
+        for m in alts:
+            u64 msz = 0
+            u64 mal = 0
+            if !mlay(c, m, word, &msz, &mal, 0): known = false
+            else if mal > pa: pa = mal
+        i64 po = -1
+        if known: po = 0 if raw else i64(rup(4, pa))
+        if !raw: ms = #append(ms, mmember("tag", "null", "uint32_t", -1, 0 if s.laid else -1))
+        for j in 0..<#len(alts):
+            string8 tr = tref(c, s, alts[j])
+            string8 an = ""
+            if j < #len(names): an = index.hold(strings.clone(c.t.text(names[j])))
+            if #len(an) > 0:
+                string8 ad = index.hold(#format(check.named(c.w, alts[j]), " ", an))
+                tr = index.hold(#format("{\"dado\":", jstring(ad), tr[strings.index_of(tr, ',')..<#len(tr)]))
+            string8 mn = index.hold(#format("s", j))
+            if !raw: mn = index.hold(#format("u.m", j))
+            ms = #append(ms, mmember(mn, tr, ty(c, alts[j]), -1, po))
+    else if kind == "array" || kind == "tuple":
+        u32 e = check.NONE
+        i64 n = 0
+        if c.t.uniform(y, &e, &n):
+            string8 tr = tref(c, s, e)
+            u64 usz = 0
+            u64 ual = 0
+            i64 uo = -1
+            if s.laid && mlay(c, y, word, &usz, &ual, 0): uo = 0
+            ms = #append(ms, mmember("a", tr, ty(c, e), n, uo))
+        else:
+            []u32 sl = c.t.list(y)
+            ref []u64 os
+            if s.laid: os = slot_offsets(c, y, word)
+            for j in 0..<#len(sl):
+                string8 tr = tref(c, s, sl[j])
+                i64 of = -1
+                if j < #len(os): of = i64(os[j])
+                ms = #append(ms, mmember(index.hold(#format("s", j)), tr, ty(c, sl[j]), -1, of))
+    string8 lay = "null"
+    u64 lsz = 0
+    u64 lal = 0
+    if s.laid && kind != "opaque" && kind != "c-union" && mlay(c, x, word, &lsz, &lal, 0): lay = index.hold(#format("{\"size\":", lsz, ",\"align\":", lal, "}"))
+    s.types[at].members = index.hold(#format("[", strings.join(ms[:], ","), "]"))
+    s.types[at].values = values
+    s.types[at].under = under
+    s.types[at].layout = lay
+    return key
+
+// Whether `f`'s body quits on every path it has at its top level.
+private bool quits(^ir.Fn f):
+    i64 i = 0
+    i64 n = #len(f.op)
+    for i < n:
+        u8 o = f.op[i]
+        if o == ir.O_QUIT: return true
+        if o == ir.O_IF || o == ir.O_LOOP || o == ir.O_BLOCK:
+            i += 1 + i64(ir.span(f, u32(i)))
+            continue
+        i += 1
+    return false
+
+private bool returns_value(^ir.Fn f):
+    for i in 0..<#len(f.op):
+        if f.op[i] == ir.O_RETURN && f.a[i] != check.NONE: return true
+    return false
+
+// The wasm value types C type `ct` crosses as: "" void,
+// else a list; a struct crosses by address.
+private string8 wasm_of(^C c, u32 x, string8 ct):
+    ref []string8 ws
+    for wd in strings.split(ct, " "):
+        if wd != "const" && wd != "volatile" && wd != "restrict" && wd != "_Atomic" && #len(wd) > 0: ws = #append(ws, wd)
+    if #len(ws) > 0 && strings.ends_with(ws[#len(ws) - 1], "*"): return "i32"
+    string8 b = fresh(strings.join(ws[:], " "))
+    if b == "void": return ""
+    if b == "int64_t" || b == "uint64_t" || b == "long long" || b == "unsigned long long" || b == "long long int" || b == "unsigned long long int": return "i64"
+    if b == "float": return "f32"
+    if b == "double": return "f64"
+    if b == "long double": return "i64,i64"
+    for s in ["int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "_Bool", "bool", "char", "signed char", "unsigned char", "short", "unsigned short", "int", "unsigned", "unsigned int", "long", "unsigned long", "size_t", "ptrdiff_t", "intptr_t", "uintptr_t", "wchar_t", "short int", "unsigned short int", "long int", "unsigned long int", "signed", "signed int"]:
+        if b == s: return "i32"
+    return "i32"
+
+private string8 wasm_sig(^C c, u32 ft, bool fl):
+    ref []string8 ps
+    ref []string8 rs
+    u32 ret = c.t.a[ft]
+    if fl:
+        if ret != u32(types.P_VOID): ps = #append(ps, "i32")
+        rs = #append(rs, "i32")
+    else:
+        string8 rc = ty(c, ret)
+        string8 w = wasm_of(c, ret, rc)
+        u32 rr = under_names(c, ret)
+        bool direct = rc == "void" || strings.ends_with(rc, "*") || rr != check.NONE && (c.t.tag[rr] == types.T_PRIM || c.t.tag[rr] == types.T_CSCALAR || c.t.tag[rr] == types.T_FUNC) || foreign_row(c, ret) == check.NONE && rr != check.NONE && c.t.tag[rr] == types.T_DISTINCT
+        if !direct && rc != "void": ps = #append(ps, "i32")
+        else if #len(w) > 0:
+            for p in strings.split(w, ","): rs = #append(rs, p)
+    for p in c.t.params(ft):
+        string8 pc = ty(c, p)
+        string8 w = wasm_of(c, p, pc)
+        if #len(w) == 0: continue
+        for q in strings.split(w, ","): ps = #append(ps, q)
+    return index.hold(#format("(", strings.join(ps[:], ","), ")->(", strings.join(rs[:], ","), ")"))
+
+// `@symbol(…)`'s words, in written order.
+private string8 attrs(^check.World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    []u32 ks = a.list(a.b[n])
+    u32 sy = ks[2]
+    if sy == check.NONE: return "[]"
+    string8 src = w.p.files[f].src
+    string8 t = src[i64(a.lo[sy])..<i64(a.hi[sy])]
+    i64 l = strings.index_of(t, '(')
+    i64 r = strings.last_index_of(t, ')')
+    if l < 0 || r <= l: return "[]"
+    ref []string8 out
+    for wd in strings.split(t[l + 1..<r], ","):
+        string8 x = strings.trim(wd)
+        if #len(x) > 0: out = #append(out, jstring(x))
+    return index.hold(#format("[", strings.join(out[:], ","), "]"))
+
+// One exported function's entry; `alias` its `export const` name ("" none).
+private string8 mfunction(^C c, ^Surf s, u32 d, string8 alias):
+    ^check.World w = c.w
+    u32 f = w.decls[d].file
+    u32 n = w.decls[d].node
+    syntax.Ast a = w.p.files[f].a
+    u32 ft = c.t.resolve(check.resolve(w, d))
+    bool fl = (a.a[n] & syntax.F_FAILABLE) != 0
+    u32 ret = c.t.a[ft]
+    bool dest = fl && ret != u32(types.P_VOID)
+    string8 rref = tref(c, s, ret)
+    []u32 ks = a.list(a.b[n])
+    []u32 qs = ks[6..<#len(ks)]
+    []u32 pts = c.t.params(ft)
+    i64 fi = -1
+    for i in 0..<#len(w.fns):
+        if i < #len(w.jobs) && w.jobs[i].decl == d: fi = i
+    ref []string8 params
+    ref []string8 written
+    ref []string8 cps
+    string8 sym = check.name_of(w, w.decls[d].name)
+    string8 proto = ""
+    if dest:
+        bool unused = fi >= 0 && !returns_value(&w.fns[fi])
+        cps = #append(cps, index.hold(#format("{\"role\":\"destination\",\"type\":", jstring(index.hold(#format(ty(c, ret), " *"))), ",\"name\":\"dado_out\",\"unused\":", jbool(unused), "}")))
+    for i in 0..<#len(pts):
+        string8 pn = ""
+        if i < #len(qs) && qs[i] != check.NONE: pn = index.hold(strings.clone(w.p.spell(f, qs[i])))
+        string8 pr = tref(c, s, pts[i])
+        params = #append(params, index.hold(#format("{\"name\":", jstring(pn), ",\"type\":", pr, "}")))
+        written = #append(written, index.hold(#format(check.named(w, pts[i]), " ", pn)))
+        string8 cn = index.hold(#format("a", i))
+        if #len(alias) == 0 && fi >= 0: cn = slot_name(c, &w.fns[fi], u32(i))
+        cps = #append(cps, index.hold(#format("{\"role\":\"parameter\",\"type\":", jstring(ty(c, pts[i])), ",\"name\":", jstring(cn), ",\"unused\":false}")))
+    if #len(alias) > 0:
+        sym = alias
+        ref []char8 h
+        put(&h, index.hold(#format(ty(c, ret), " ", alias, "(")))
+        for i in 0..<#len(pts):
+            if i > 0: put(&h, ", ")
+            put(&h, index.hold(#format(ty(c, pts[i]), " a", i)))
+        if #len(pts) == 0: put(&h, "void")
+        put(&h, ")")
+        proto = fresh(h)
+    else if fi >= 0: proto = sig(c, &w.fns[fi])
+    put(&s.protos, proto)
+    put(&s.protos, ";\n")
+    string8 failable = "null"
+    if fl: failable = index.hold(#format("{\"code\":\"int32_t\",\"destination\":", jbool(dest), "}"))
+    string8 cret = ty(c, ret)
+    if fl: cret = "int32_t"
+    string8 bang = ""
+    if fl: bang = "!"
+    string8 signature = index.hold(#format(bang, check.named(w, ret), " ", check.name_of(w, w.decls[d].name), "(", strings.join(written[:], ", "), ")"))
+    bool nr = fi >= 0 && quits(&w.fns[fi])
+    string8 wasm = "null"
+    if w.os == "WEB": wasm = jstring(wasm_sig(c, ft, fl))
+    return index.hold(#format("{\"dialect\":\"dado\",\"name\":", jstring(check.name_of(w, w.decls[d].name)), ",\"package\":", jstring(check.name_of(w, w.p.pkgs[w.decls[d].pkg].name)), ",\"signature\":", jstring(signature), ",\"returns\":", rref, ",\"params\":[", strings.join(params[:], ","), "],\"failable\":", failable, ",\"c\":{\"symbol\":", jstring(sym), ",\"abi\":\"c\",\"returns\":", jstring(cret), ",\"params\":[", strings.join(cps[:], ","), "],\"noreturn\":", jbool(nr), ",\"attributes\":", attrs(w, f, n), ",\"prototype\":", jstring(proto), "},\"wasm\":", wasm, ",\"span\":", name_span(w, f, n), ",\"doc\":", mdoc(w, f, a.lo[n]), "}"))
+
+private string8 mtype(^check.World w, MType t):
+    string8 sp = "null"
+    string8 doc = "null"
+    if t.decl != check.NONE:
+        u32 f = w.decls[t.decl].file
+        u32 n = w.decls[t.decl].node
+        sp = name_span(w, f, n)
+        doc = mdoc(w, f, name_lo(w, f, n))
+    return index.hold(#format("{\"dialect\":\"dado\",\"key\":", jstring(t.key), ",\"name\":", jnull(t.name), ",\"dado\":", jstring(t.dado), ",\"c\":", jstring(t.c), ",\"kind\":", jstring(t.kind), ",\"layout\":", t.layout, ",\"members\":", t.members, ",\"values\":", t.values, ",\"underlying\":", t.under, ",\"span\":", sp, ",\"doc\":", doc, "}"))
+
+// A foreign declaration's header as an `#include` operand.
+private string8 include_of(string8 h):
+    string8 x = h
+    if #len(x) >= 2 && x[0] == '"': x = x[1..<#len(x) - 1]
+    if #len(x) > 0 && x[0] == '<': return index.hold(strings.clone(x))
+    return index.hold(#format("\"", x, "\""))
+
+private bool spells_word(string8 text, string8 w):
+    i64 at = 0
+    for:
+        i64 k = strings.find(text[at..<#len(text)], w)
+        if k < 0: return false
+        i64 b = at + k
+        i64 e = b + #len(w)
+        bool lo = b == 0 || !ident_char(text[b - 1])
+        bool hi = e >= #len(text) || !ident_char(text[e])
+        if lo && hi: return true
+        at = b + 1
+    return false
+
+private bool ident_char(char8 ch):
+    return ch == '_' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
+
+// The prelude's own shapes the declarations name, each behind a guard.
+private const [7]string8 PRELUDE_NAMES = ("dado_string", "dado_string16", "dado_string32", "dado_alloc", "dado_view", "dado_trait", "dado_ref")
+private const [7]string8 PRELUDE_DEFS = ("typedef struct { const char *ptr; int64_t len; } dado_string;", "typedef struct { const uint16_t *ptr; int64_t len; } dado_string16;", "typedef struct { const uint32_t *ptr; int64_t len; } dado_string32;", "typedef void *(*dado_alloc_fn)(void *, int32_t, uint64_t, uint64_t, void *, uint64_t);\ntypedef struct { dado_alloc_fn s0; void *s1; } dado_alloc;", "typedef struct { void *ptr; int64_t len; } dado_view;", "typedef struct { void *s0; uint32_t s1; } dado_trait;", "typedef struct { void *ptr; int64_t len; dado_alloc alloc; uint32_t cap; } dado_ref;")
+
+// The `dado` half: the header, the exports and the shapes they reach.
+private string8 dado_half(^check.World w):
+    C cs
+    cs.w = w
+    cs.t = &w.t
+    cs.k = &w.k
+    ^C c = &cs
+    Surf s
+    s.laid = #len(w.triple) > 0
+    s.word = pointer_bytes(w.triple)
+    // Exports in file order, a function `export const` names by its alias.
+    ref []u32 ds
+    ref []string8 als
+    for d in 0..<#len(w.decls):
+        check.Decl x = w.decls[d]
+        syntax.Ast a = w.p.files[x.file].a
+        if (a.a[x.node] & syntax.F_VIS) != syntax.VIS_EXPORT: continue
+        if x.kind == check.K_FN:
+            if check.templated(w, u32(d)) || check.name_of(w, x.name) == "main" && x.pkg == 0: continue
+            ds = #append(ds, u32(d))
+            als = #append(als, "")
+        else if x.kind == check.K_CONST && x.value != check.NONE && c.k.kind[x.value] == types.C_FN:
+            []u32 ks = a.list(a.b[x.node])
+            u32 vn = ks[1]
+            if vn == check.NONE || a.tag[vn] != syntax.E_NAME: continue
+            u32 vs = w.p.sym(x.file, vn)
+            u32 fd = check.NONE
+            for e in 0..<#len(w.decls):
+                if w.decls[e].kind == check.K_FN && w.decls[e].pkg == x.pkg && w.decls[e].name == vs: fd = u32(e)
+            if fd == check.NONE: continue
+            ds = #append(ds, fd)
+            als = #append(als, check.name_of(w, x.name))
+    for i in 1..<#len(ds):
+        i64 j = i
+        for j > 0 && later(w, ds[j - 1], ds[j]):
+            u32 t = ds[j]
+            ds[j] = ds[j - 1]
+            ds[j - 1] = t
+            string8 at = als[j]
+            als[j] = als[j - 1]
+            als[j - 1] = at
+            j -= 1
+    ref []string8 fns
+    for i in 0..<#len(ds):
+        string8 fj = mfunction(c, &s, ds[i], als[i])
+        fns = #append(fns, fj)
+    i64 pi = 0
+    for pi < #len(c.pending):
+        _ = ty(c, c.pending[pi])
+        pi += 1
+    ref []string8 tys
+    for t in s.types:
+        tys = #append(tys, mtype(w, t))
+    // The header: the prelude shapes named, then the declarations made.
+    // Through `#format`: a view of `c` (it holds `^World`) held reads to Rust as keeping `w`.
+    string8 decls = ""
+    string8 dv = c.decls
+    if #len(dv) > 0: decls = index.hold(#format(dv))
+    string8 body = index.hold(#format(decls, fresh(s.protos)))
+    ref []char8 hd
+    for i in 0..<7:
+        bool used = spells_word(body, PRELUDE_NAMES[i])
+        if i == 3 && (spells_word(body, "dado_ref") || strings.contains(decls, "dado_alloc alloc")): used = true
+        if !used: continue
+        string8 g = index.hold(#format(strings.to_upper(PRELUDE_NAMES[i]), "_DEFINED"))
+        put(&hd, index.hold(#format("#ifndef ", g, "\n#define ", g, "\n", PRELUDE_DEFS[i], "\n#endif\n\n")))
+    if #len(decls) > 0: put(&hd, decls)
+    put(&hd, aliases(c, &s, decls))
+    if #len(hd) > 0 && !strings.ends_with(fresh(hd), "\n\n"): put(&hd, "\n")
+    string8 header = fresh(hd)
+    ref []string8 incs
+    string8 all = index.hold(#format(header, body))
+    if strings.contains(all, "int8_t") || strings.contains(all, "int16_t") || strings.contains(all, "int32_t") || strings.contains(all, "int64_t") || strings.contains(all, "intptr_t"): incs = #append(incs, jstring("<stdint.h>"))
+    if spells_word(all, "size_t") || spells_word(all, "ptrdiff_t"): incs = #append(incs, jstring("<stddef.h>"))
+    if spells_word(all, "char16_t") || spells_word(all, "char32_t"): incs = #append(incs, jstring("<uchar.h>"))
+    ref []string8 seen
+    for d in 0..<#len(w.decls):
+        check.Decl x = w.decls[d]
+        if x.block == check.NONE || x.kind == check.K_METHOD: continue
+        syntax.Ast a = w.p.files[x.file].a
+        if i64(x.block) >= #len(a.tag) || a.tag[x.block] != syntax.N_FOREIGN: continue
+        string8 cn = w.t.text(check.c_name(w, u32(d)))
+        if !spells_word(all, cn): continue
+        string8 inc = include_of(w.p.spell(x.file, x.block))
+        bool have = false
+        for y in seen:
+            if y == inc: have = true
+        if have: continue
+        seen = #append(seen, inc)
+        incs = #append(incs, jstring(inc))
+    string8 pkg = check.name_of(w, w.p.pkgs[0].name)
+    string8 head = index.hold(#format("{\"guard\":", jstring(guard(pkg)), ",\"includes\":[", strings.join(incs[:], ","), "],\"declarations\":", jstring(header), "}"))
+    if check.rt_pkg(w) != check.NONE || #len(w.classes) > 0:
+        bool host = false
+        for f in w.p.pkgs[0].flo..<w.p.pkgs[0].fhi:
+            if !check.ds_file(w, f): host = true
+        if !host: head = "null"
+    return index.hold(#format("\"header\":", head, ",\"functions\":[", strings.join(fns[:], ","), "],\"types\":[", strings.join(tys[:], ","), "]"))
+
+private bool later(^check.World w, u32 x, u32 y):
+    check.Decl a = w.decls[x]
+    check.Decl b = w.decls[y]
+    if a.pkg != b.pkg: return a.pkg > b.pkg
+    if a.file != b.file: return a.file > b.file
+    return w.p.files[a.file].a.lo[a.node] > w.p.files[b.file].a.lo[b.node]
+
+// Rust's `header_guard`: `DADO_PKG_<escaped package>_H`, `_` doubled.
+private string8 guard(string8 pkg):
+    ref []char8 o
+    put(&o, "DADO_PKG_")
+    for ch in pkg:
+        if ch == '_': put(&o, "__")
+        else if ch >= 'a' && ch <= 'z': o = #append(o, char8(u8(ch) - 32))
+        else: o = #append(o, ch)
+    put(&o, "_H")
+    return fresh(o)
+
+// The public channels: package-level, not `private`, in directory order.
+private string8 channels(^check.World w):
+    ref []string8 names
+    ref []u32 rows
+    for r in g_chans:
+        string8 nm = index.hold(strings.clone(w.t.text(w.t.a[r])))
+        bool have = false
+        for x in names:
+            if x == nm: have = true
+        if have: continue
+        i64 j = #len(names)
+        names = #append(names, nm)
+        rows = #append(rows, r)
+        for j > 0 && strings.compare(names[j - 1], names[j]) > 0:
+            string8 t = names[j]
+            names[j] = names[j - 1]
+            names[j - 1] = t
+            u32 tr = rows[j]
+            rows[j] = rows[j - 1]
+            rows[j - 1] = tr
+            j -= 1
+    ref []string8 out
+    for i in 0..<#len(names):
+        i64 dot = strings.index_of(names[i], '.')
+        if dot < 0: continue
+        string8 pk = names[i][0..<dot]
+        string8 vn = names[i][dot + 1..<#len(names[i])]
+        if strings.index_of(vn, '.') >= 0: continue
+        u32 vd = check.NONE
+        for d in 0..<#len(w.decls):
+            if w.decls[d].kind == check.K_VAR && check.name_of(w, w.decls[d].name) == vn && check.name_of(w, w.p.pkgs[w.decls[d].pkg].name) == pk: vd = u32(d)
+        if vd == check.NONE: continue
+        u32 f = w.decls[vd].file
+        u32 n = w.decls[vd].node
+        u32 vis = w.p.files[f].a.a[n] & syntax.F_VIS
+        if vis == syntax.VIS_PACKAGE || vis == syntax.VIS_FILE: continue
+        u32 r = rows[i]
+        []u32 ps = w.t.list(r)
+        []u32 pns = w.t.slot_names(r)
+        ref []string8 msg
+        for j in 0..<#len(ps):
+            string8 pn = "null"
+            if j < #len(pns): pn = jstring(index.hold(strings.clone(w.t.text(pns[j]))))
+            msg = #append(msg, index.hold(#format("{\"name\":", pn, ",\"dado\":", jstring(check.named(w, ps[j])), "}")))
+        string8 kind = "queue"
+        i64 cap = i64(w.t.b[r]) - 1
+        if w.t.b[r] == 0:
+            kind = "latest"
+            cap = 1
+        out = #append(out, index.hold(#format("{\"dialect\":\"dado\",\"name\":", jstring(names[i]), ",\"kind\":", jstring(kind), ",\"capacity\":", cap, ",\"index\":", i, ",\"message\":[", strings.join(msg[:], ","), "],\"span\":", name_span(w, f, n), ",\"doc\":", mdoc(w, f, w.p.files[f].a.lo[n]), "}")))
+    return index.hold(#format("[", strings.join(out[:], ","), "]"))
+
+// ── What the scripts publish ──
+
+private const string8 JS_RESERVED = " arguments await break case catch class const continue debugger default delete do else enum eval export extends false finally for function if implements import in instanceof interface let new null package private protected public return static super switch this throw true try typeof var void while with yield print println undefined NaN Infinity BigInt Number String Math Object Map globalThis "
+
+private string8 js_param(string8 n):
+    if strings.starts_with(n, "__dados") || strings.contains(JS_RESERVED, index.hold(#format(" ", n, " "))): return index.hold(#format(n, "$"))
+    return n
+
+private bool ds_publishes(^check.World w, u32 f, u32 n):
+    u32 v = w.p.files[f].a.a[n] & syntax.F_VIS
+    return v == syntax.VIS_UNMARKED || v == syntax.VIS_PUBLIC || v == syntax.VIS_EXPORT
+
+private string8 cls_name(^check.World w, u32 ci):
+    return check.name_of(w, w.decls[w.classes[ci].decl].name)
+
+// The enum declaration `ty` names (a script's), else NONE.
+private u32 ds_enum(^check.World w, u32 ty):
+    if !check.s_enum(w, ty): return check.NONE
+    try u32 d = w.type_decl[ty] else: return check.NONE
+    return d
+
+// A type as a script spells it (Rust's `display_dados`).
+private string8 ds_spell(^check.World w, u32 ty):
+    if ty == check.NONE: return "void"
+    u32 inner = check.sa_inner(w, ty)
+    if inner != check.NONE: return index.hold(#format("async ", ds_spell(w, inner)))
+    if ty == w.sstr: return "string"
+    if ty == w.sany: return "any"
+    if ty == w.serror: return "Error"
+    if ty == w.sloc: return "Location"
+    u32 ci = check.s_class_of_ty(w, ty)
+    if ci != check.NONE: return index.hold(#format(check.name_of(w, w.p.pkgs[w.decls[w.classes[ci].decl].pkg].name), ".", cls_name(w, ci)))
+    u32 ed = ds_enum(w, ty)
+    if ed != check.NONE:
+        string8 inside = ""
+        u32 ef = w.decls[ed].file
+        u32 en = w.decls[ed].node
+        for ci in 0..<#len(w.classes):
+            if w.classes[ci].file != ef: continue
+            syntax.Ast ca = w.p.files[ef].a
+            []u32 items = ca.list(ca.b[w.classes[ci].node])
+            for it in items:
+                if it == en: inside = index.hold(#format(cls_name(w, u32(ci)), "."))
+        return index.hold(#format(check.name_of(w, w.p.pkgs[w.decls[ed].pkg].name), ".", inside, check.name_of(w, w.decls[ed].name)))
+    u32 r = w.t.resolve(ty)
+    u8 k = check.s_kind(w, ty)
+    if k == 1: return index.hold(#format("[]", ds_spell(w, w.t.a[r])))
+    if k == 2: return index.hold(#format("{", ds_spell(w, w.t.a[r]), ": ", ds_spell(w, w.t.b[r]), "}"))
+    if check.s_fn(w, ty):
+        ref []string8 xs
+        for p in w.t.params(r):
+            xs = #append(xs, ds_spell(w, p))
+        return index.hold(#format(ds_spell(w, w.t.a[r]), "(", strings.join(xs[:], ", "), ")"))
+    if check.s_tup(w, ty):
+        ref []string8 xs
+        for x in w.t.slots(ty):
+            xs = #append(xs, ds_spell(w, x))
+        return index.hold(#format("(", strings.join(xs[:], ", "), ")"))
+    if r == u32(types.P_INT): return "int"
+    if r == u32(types.P_FLOAT): return "float"
+    if r == u32(types.P_BOOL): return "bool"
+    if r == u32(types.P_VOID): return "void"
+    if r == u32(types.P_U8): return "byte"
+    w.t.dspell = true
+    string8 s = check.shown(w, ty)
+    w.t.dspell = false
+    return s
+
+// A boundary type as the manifest's `type` (Rust's `ts_type`).
+private string8 ts_json(^check.World w, u32 ty):
+    if ty == check.NONE: return "{\"kind\":\"void\"}"
+    u32 r = w.t.resolve(ty)
+    u8 k = check.s_kind(w, ty)
+    if k == 1:
+        u32 e = w.t.a[r]
+        if w.t.resolve(e) == u32(types.P_U8): return "{\"kind\":\"array\",\"of\":{\"kind\":\"byte\"}}"
+        return index.hold(#format("{\"kind\":\"array\",\"of\":", ts_json(w, e), "}"))
+    if k == 2: return index.hold(#format("{\"kind\":\"map\",\"key\":", ts_json(w, w.t.a[r]), ",\"value\":", ts_json(w, w.t.b[r]), "}"))
+    u32 inner = check.sa_inner(w, ty)
+    if inner != check.NONE: return index.hold(#format("{\"kind\":\"async\",\"of\":", ts_json(w, inner), "}"))
+    if check.s_fn(w, ty):
+        ref []string8 xs
+        for p in w.t.params(r):
+            xs = #append(xs, ts_json(w, p))
+        return index.hold(#format("{\"kind\":\"function\",\"params\":[", strings.join(xs[:], ","), "],\"returns\":", ts_json(w, w.t.a[r]), "}"))
+    if ty == w.serror: return "{\"kind\":\"error\"}"
+    if ty == w.sloc: return "{\"kind\":\"location\"}"
+    u32 ci = check.s_class_of_ty(w, ty)
+    if ci != check.NONE: return index.hold(#format("{\"kind\":\"class\",\"name\":", jstring(jid(cls_name(w, ci))), "}"))
+    u32 ed = ds_enum(w, ty)
+    if ed != check.NONE:
+        ref []string8 ms
+        for key in w.order:
+            if u32(key >> 32) == ed: ms = #append(ms, jstring(check.name_of(w, u32(key & 0xFFFFFFFF))))
+        return index.hold(#format("{\"kind\":\"enum\",\"members\":[", strings.join(ms[:], ","), "]}"))
+    if check.s_tup(w, ty):
+        ref []string8 xs
+        for x in w.t.slots(ty):
+            xs = #append(xs, ts_json(w, x))
+        if #len(xs) > 0: return index.hold(#format("{\"kind\":\"tuple\",\"elements\":[", strings.join(xs[:], ","), "]}"))
+    if ty == w.sany: return "{\"kind\":\"any\"}"
+    if ty == w.sstr: return "{\"kind\":\"string\"}"
+    if r == u32(types.P_INT): return "{\"kind\":\"int\"}"
+    if r == u32(types.P_FLOAT): return "{\"kind\":\"float\"}"
+    if r == u32(types.P_BOOL): return "{\"kind\":\"bool\"}"
+    if r == u32(types.P_U8): return "{\"kind\":\"byte\"}"
+    return "{\"kind\":\"void\"}"
+
+private string8 dparams(^check.World w, u32 m):
+    u32 ft = check.resolve(w, m)
+    if ft == check.NONE: return "[]"
+    u32 f = w.decls[m].file
+    syntax.Ast a = w.p.files[f].a
+    []u32 ks = a.list(a.b[w.decls[m].node])
+    []u32 qs = ks[6..<#len(ks)]
+    ref []u32 ps = check.s_mparams(w, w.t.resolve(ft))
+    ref []string8 out
+    for i in 0..<#len(ps):
+        string8 pn = ""
+        if i < #len(qs) && qs[i] != check.NONE: pn = index.hold(strings.clone(w.p.spell(f, qs[i])))
+        out = #append(out, index.hold(#format("{\"name\":", jstring(pn), ",\"js_name\":", jstring(js_param(pn)), ",\"dados\":", jstring(ds_spell(w, ps[i])), ",\"type\":", ts_json(w, ps[i]), "}")))
+    return index.hold(#format("[", strings.join(out[:], ","), "]"))
+
+// The class declaring method `m`.
+private u32 owner_of(^check.World w, u32 m):
+    for ci in 0..<#len(w.classes):
+        for x in w.classes[ci].methods:
+            if x == m: return u32(ci)
+    return check.NONE
+
+private string8 dmethod(^check.World w, u32 m):
+    u32 f = w.decls[m].file
+    u32 n = w.decls[m].node
+    u32 ft = w.t.resolve(check.resolve(w, m))
+    u32 ret = u32(types.P_VOID)
+    if ft != check.NONE: ret = w.t.a[ft]
+    u32 oc = owner_of(w, m)
+    string8 din = ""
+    if oc != check.NONE: din = cls_name(w, oc)
+    return index.hold(#format("{\"dialect\":\"dados\",\"name\":", jstring(check.name_of(w, w.decls[m].name)), ",\"declared_in\":", jstring(din), ",\"params\":", dparams(w, m), ",\"returns\":", ts_json(w, ret), ",\"dados_returns\":", jstring(ds_spell(w, ret)), ",\"span\":", name_span(w, f, n), ",\"doc\":", mdoc(w, f, w.p.files[f].a.lo[n]), "}"))
+
+private string8 dados_half(^check.World w):
+    ref []string8 classes
+    u32 init = w.p.names.intern("init")
+    for ci in 0..<#len(w.classes):
+        u32 cd = w.classes[ci].decl
+        u32 cf = w.decls[cd].file
+        u32 cn = w.decls[cd].node
+        if (w.p.files[cf].a.a[cn] & syntax.F_VIS) != syntax.VIS_EXPORT || check.s_outer(w, u32(ci)) != check.NONE: continue
+        // The chain, root first.
+        ref []u32 chain
+        u32 at = u32(ci)
+        for _ in 0..<64:
+            if at == check.NONE: break
+            chain = #append(chain, at)
+            at = check.s_parent(w, at)
+        string8 ctor = "[]"
+        u32 im = check.s_method_in(w, u32(ci), init)
+        if im != check.NONE: ctor = dparams(w, im)
+        ref []string8 fields
+        u32 row = check.resolve(w, cd)
+        []u32 fts = w.t.slots(row)
+        ref []check.SField fs = check.s_fields_of(w, u32(ci))
+        for k in 0..<#len(fs):
+            if fs[k].emb >= 0 || !ds_publishes(w, fs[k].file, fs[k].node) || k >= #len(fts): continue
+            u32 ff = fs[k].file
+            u32 fnode = fs[k].node
+            fields = #append(fields, index.hold(#format("{\"dialect\":\"dados\",\"name\":", jstring(check.name_of(w, fs[k].sym)), ",\"declared_in\":", jstring(cls_name(w, fs[k].cls)), ",\"dados\":", jstring(ds_spell(w, fts[k])), ",\"type\":", ts_json(w, fts[k]), ",\"span\":", name_span(w, ff, fnode), ",\"doc\":", mdoc(w, ff, name_lo(w, ff, fnode)), "}")))
+        ref []u32 names
+        i64 j = #len(chain)
+        for j > 0:
+            j -= 1
+            for m in w.classes[chain[j]].methods:
+                u32 sy = w.decls[m].name
+                if sy == init: continue
+                bool have = false
+                for x in names:
+                    if x == sy: have = true
+                if !have: names = #append(names, sy)
+        ref []string8 methods
+        for sy in names:
+            u32 r = check.s_method_in(w, u32(ci), sy)
+            if r == check.NONE || !ds_publishes(w, w.decls[r].file, w.decls[r].node): continue
+            methods = #append(methods, dmethod(w, r))
+        string8 nm = cls_name(w, u32(ci))
+        classes = #append(classes, index.hold(#format("{\"dialect\":\"dados\",\"name\":", jstring(nm), ",\"js_name\":", jstring(jid(nm)), ",\"package\":", jstring(check.name_of(w, w.p.pkgs[w.decls[cd].pkg].name)), ",\"constructor\":", ctor, ",\"fields\":[", strings.join(fields[:], ","), "],\"methods\":[", strings.join(methods[:], ","), "],\"span\":", name_span(w, cf, cn), ",\"doc\":", mdoc(w, cf, name_lo(w, cf, cn)), "}")))
+    ref []string8 fns
+    for ci in 0..<#len(w.classes):
+        for m in w.classes[ci].methods:
+            u32 mf = w.decls[m].file
+            if (w.p.files[mf].a.a[w.decls[m].node] & syntax.F_VIS) != syntax.VIS_EXPORT || w.decls[m].name == init: continue
+            if !check.s_published_fn(w, u32(ci), m): continue
+            fns = #append(fns, dmethod(w, m))
+    return index.hold(#format("\"classes\":[", strings.join(classes[:], ","), "],\"functions\":[", strings.join(fns[:], ","), "]"))
+
+// The manifest of a program that checked (Rust's `manifest::document`). The
+// world comes as a `rawptr`: Rust's escape check reads the emitter state built
+// over it as kept in package storage.
+string8 manifest(rawptr wp, string8 name, string8 version, string8 version_of_dadoc):
+    ^check.World w = ^check.World(wp)
+    string8 root = check.name_of(w, w.p.pkgs[0].name)
+    string8 nm = name
+    if #len(nm) == 0: nm = root
+    string8 os = "#UNKNOWN_OS"
+    string8 arch = "#UNKNOWN_ARCH"
+    if #len(w.triple) > 0:
+        os = index.hold(#format("#", w.os))
+        arch = index.hold(#format("#", w.arch))
+    string8 pb = "null"
+    string8 dh = dado_half(w)
+    if #len(w.triple) > 0 && !strings.starts_with(dh, "\"header\":null"): pb = index.hold(#format(pointer_bytes(w.triple)))
+    string8 ch = channels(w)
+    string8 sh = dados_half(w)
+    string8 doc = index.hold(#format("{\"schema\":\"manifest/1\",\"producer\":{\"name\":\"dadoc\",\"version\":", jstring(version_of_dadoc), "},\"package\":{\"name\":", jstring(nm), ",\"version\":", jstring(version), ",\"root\":", jstring(root), "},\"target\":{\"triple\":", jstring(w.triple), ",\"os\":", jstring(os), ",\"arch\":", jstring(arch), ",\"pointer_bytes\":", pb, "},\"dado\":{", dh, ",\"channels\":", ch, "},\"dados\":{", sh, "}}"))
+    return jpretty(doc)
+
+// The target's pointer width in bytes, by its triple's architecture.
+private u64 pointer_bytes(string8 triple):
+    for p in ["wasm32", "i386", "i486", "i586", "i686", "x86-", "arm-", "armv", "thumb", "riscv32", "mips-", "mipsel", "powerpc-", "sparc-", "avr", "msp430"]:
+        if strings.starts_with(triple, p): return 4
+    if triple == "x86" || triple == "arm": return 4
+    return 8
+
+// ── Readable names for the shapes (Sam, P14) ──
+
+// `typedef` aliases for each shape this header declares: its declared name
+// (`Pair`) and Rust's C name for the shape (`dado_tup2_i32_i32`), so a caller
+// written against Rust's header builds. An alias two shapes would take is
+// given to the first and noted.
+private string8 aliases(^C c, ^Surf s, string8 decls):
+    ref []string8 names
+    ref []string8 owners
+    ref []char8 out
+    for t in s.types:
+        if #len(t.c) < 5 || t.c[0..<5] != "dado_" || !spells_word(decls, t.c): continue
+        bool prelude = false
+        for pn in PRELUDE_NAMES:
+            if pn == t.c: prelude = true
+        if prelude: continue
+        [2]string8 al = [t.name, rust_c_name(c, t.ty)]
+        for k in 0..<2:
+            string8 a = al[k]
+            if #len(a) == 0 || a == t.c || k == 1 && a == al[0]: continue
+            string8 had = ""
+            for i in 0..<#len(names):
+                if names[i] == a: had = owners[i]
+            if had == t.c: continue
+            if #len(had) > 0:
+                put(&out, index.hold(#format("/* `", a, "` would name both ", had, " and ", t.c, ": kept for the first */\n")))
+                continue
+            names = #append(names, a)
+            owners = #append(owners, t.c)
+            put(&out, index.hold(#format("typedef ", t.c, " ", a, ";\n")))
+    if #len(out) > 0: put(&out, "\n")
+    return fresh(out)
+
+// Rust's mangled C name of row `x` (`dado_types::TypeArena::mangle`), or ""
+// where Rust has none (an undefined or recursive shape).
+private string8 rust_c_name(^C c, u32 x0):
+    u32 x = x0
+    u32 y = under_names(c, x)
+    // A `distinct` erases and a matrix is its rows (Rust's `c_type`).
+    for _ in 0..<64:
+        if y == check.NONE || c.t.tag[y] != types.T_DISTINCT && c.t.tag[y] != types.T_MATRIX: break
+        if c.t.tag[y] == types.T_DISTINCT: x = c.t.b[y]
+        else:
+            []u32 rows = c.t.list(y)
+            x = rows[0]
+        y = under_names(c, x)
+    if y == check.NONE: return ""
+    if c.t.tag[y] == types.T_OPAQUE: return c.t.text(c.t.a[y])
+    if c.t.tag[y] == types.T_CSCALAR: return types.C_SCALARS[c.t.a[y]].c
+    ref []char8 out
+    put(&out, "dado_")
+    ref []u32 path
+    ref []u32 since
+    if !rmangle(c, x, &out, &path, &since, 0): return ""
+    return rshorten(fresh(out))
+
+private bool rmangle(^C c, u32 x, ^ref []char8 out, ^ref []u32 path, ^ref []u32 since, i64 depth):
+    if depth > 64: return false
+    u32 y = under_names(c, x)
+    if y == check.NONE: return false
+    u8 g = c.t.tag[y]
+    bool tup = g == types.T_TUPLE || g == types.T_UNION
+    for i in 0..<#len(path^):
+        if path^[i] == y:
+            put(out, index.hold(#format("rec", #len(path^) - i)))
+            return true
+    if !tup:
+        for z in since^:
+            if z == y: return false
+        since^ = #append(since^, y)
+    ref []u32 outer
+    if tup:
+        path^ = #append(path^, y)
+        outer = #append(outer, ..since^[:])
+        #truncate(since^, 0)
+    bool ok = rdata(c, y, out, path, since, depth)
+    if tup:
+        #truncate(path^, #len(path^) - 1)
+        #truncate(since^, 0)
+        since^ = #append(since^, ..outer[:])
+    else:
+        #truncate(since^, #len(since^) - 1)
+    #delete(outer)
+    return ok
+
+private bool rdata(^C c, u32 y, ^ref []char8 out, ^ref []u32 path, ^ref []u32 since, i64 depth):
+    u8 g = c.t.tag[y]
+    u32 a = c.t.a[y]
+    u32 b = c.t.b[y]
+    if g == types.T_PRIM:
+        put(out, types.PRIM[types.PRIM[a].canon].name)
+        return true
+    if g == types.T_BUILTIN:
+        put(out, c.t.text(a))
+        return true
+    if g == types.T_CSCALAR:
+        put(out, rescape(types.C_SCALARS[a].c))
+        return true
+    if g == types.T_OPAQUE:
+        put(out, rescape(c.t.text(a)))
+        return true
+    if g == types.T_TUPLE:
+        []u32 es = c.t.list(y)
+        put(out, index.hold(#format("tup", #len(es))))
+        bool same = #len(es) > 1
+        for e in es:
+            if e != es[0]: same = false
+        if same:
+            ref []char8 once
+            if !rmangle(c, es[0], &once, path, since, depth + 1): return false
+            for _ in 0..<#len(es):
+                put(out, "_")
+                put(out, fresh(once))
+            return true
+        for e in es:
+            put(out, "_")
+            if !rmangle(c, e, out, path, since, depth + 1): return false
+        return true
+    if g == types.T_SLICE || g == types.T_REF || g == types.T_PTR || g == types.T_SOA:
+        put(out, "slice_" if g == types.T_SLICE else "ref_" if g == types.T_REF else "ptr_" if g == types.T_PTR else "soa_")
+        return rmangle(c, a, out, path, since, depth + 1)
+    if g == types.T_MAP:
+        put(out, "map_")
+        if !rmangle(c, a, out, path, since, depth + 1): return false
+        put(out, "_")
+        return rmangle(c, b, out, path, since, depth + 1)
+    if g == types.T_FUNC:
+        []u32 xs = c.t.list(y)
+        i64 from = 1 if b == types.F_TYPED else 0
+        put(out, index.hold(#format("failfn" if b != types.F_NONE else "fn", #len(xs) - from, "_")))
+        if !rmangle(c, a, out, path, since, depth + 1): return false
+        for i in from..<#len(xs):
+            put(out, "_")
+            if !rmangle(c, xs[i], out, path, since, depth + 1): return false
+        return true
+    if g == types.T_MATRIX:
+        put(out, index.hold(#format("mat", a, "x", b, "_")))
+        return rmangle(c, c.t.list(y)[0], out, path, since, depth + 1)
+    if g == types.T_QUAL:
+        put(out, "q")
+        string8 letters = "cvra"
+        for i in 0..<4:
+            if (a & (u32(1) << u32(i))) != 0: put(out, letters[i..<i + 1])
+        put(out, "_")
+        return rmangle(c, b, out, path, since, depth + 1)
+    if g == types.T_ALIGNED:
+        put(out, index.hold(#format("a", a, "_")))
+        return rmangle(c, b, out, path, since, depth + 1)
+    if g == types.T_DISTINCT:
+        put(out, "dst_")
+        put(out, rtag(c.t.text(a)))
+        put(out, "_")
+        return rmangle(c, b, out, path, since, depth + 1)
+    if g == types.T_UNION:
+        []u32 ms = c.t.list(y)
+        put(out, index.hold(#format("un", #len(ms), "_")))
+        put(out, rtag(c.t.text(a)))
+        for m in ms:
+            put(out, "_")
+            if !rmangle(c, m, out, path, since, depth + 1): return false
+        return true
+    if g == types.T_CHANNEL:
+        put(out, "sig_")
+        put(out, rtag(c.t.text(a)))
+        if b == 0: put(out, "_latest")
+        return true
+    if g == types.T_TRAIT:
+        put(out, "trait_")
+        put(out, rtag(c.t.text(a)))
+        return true
+    if g == types.T_TYPE:
+        put(out, "kind")
+        return true
+    return false
+
+// `escape_component`: a space as `_`, a `_` doubled.
+private string8 rescape(string8 s):
+    ref []char8 o
+    for ch in s:
+        if ch == ' ':
+            o = #append(o, '_')
+            continue
+        if ch == '_': o = #append(o, '_')
+        o = #append(o, ch)
+    return fresh(o)
+
+// `mangle_tag`: each `.` a `_`, any other non-identifier character `_x%06x`.
+private string8 rtag(string8 name):
+    ref []char8 o
+    i64 start = 0
+    for i in 0..<#len(name) + 1:
+        if i < #len(name) && name[i] != '.': continue
+        if start > 0: o = #append(o, '_')
+        for ch in rescape(name[start..<i]):
+            if ident_char(ch): o = #append(o, ch)
+            else: put(&o, index.hold(#format("_x", hex6(u32(u8(ch))))))
+        start = i + 1
+    return fresh(o)
+
+private string8 hex6(u32 v):
+    string8 digits = "0123456789abcdef"
+    ref []char8 o
+    for i in 0..<6:
+        o = #append(o, digits[i64((v >> u32(4 * (5 - i))) & 15)])
+    return fresh(o)
+
+// `shorten`: past 63 bytes, the head to its last `_` within 45 and the name's
+// FNV-1a.
+private string8 rshorten(string8 n):
+    if #len(n) <= 63: return n
+    u64 h = 0xcbf29ce484222325
+    for ch in n:
+        h = h ~ u64(u8(ch))
+        h = h * 0x100000001b3
+    i64 keep = 45
+    i64 cut = keep
+    for i in 0..<keep:
+        if n[i] == '_': cut = i
+    if cut < 5: cut = keep
+    string8 digits = "0123456789abcdef"
+    ref []char8 o
+    o = #append(o, ..n[0..<cut])
+    put(&o, "_h")
+    for i in 0..<16:
+        o = #append(o, digits[i64((h >> u64(4 * (15 - i))) & 15)])
+    return fresh(o)

@@ -137,7 +137,7 @@ The script downloads the release archive for your machine from this repository's
 Downloaded the archive in a browser instead? Unzip it somewhere permanent and run `sh install.sh`
 (or `install.bat` on Windows) from a terminal in that folder. Double-clicking the script is not
 supported. The script clears the download mark from its own folder, which macOS and Windows put on
-files from a browser, and then runs `./dadoc bootstrap`, which you can also run yourself.
+files from a browser, and then runs `./dado install`, which you can also run yourself.
 
 What the install does:
 

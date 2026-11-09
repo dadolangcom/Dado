@@ -1,0 +1,1030 @@
+// Templates without cloning: a declaration's binders, an instance's
+// environment (a tuple: each binder's type, a `$N` as a TYPE row, a pack as
+// its tuple), binding a written type against an argument's, the call that
+// instantiates, and generic types' instances. Bodies re-walk the template.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+const u8 BK_TYPE = 0
+const u8 BK_LEN = 1
+const u8 BK_PACK = 2
+const u8 BK_TRAIT = 3
+
+const [2]string8 CATEGORIES = ("int", "float")
+
+// The declaration whose binders an instance of `d` is over: a generic type
+// for its methods.
+u32 owner(^World w, u32 d):
+    if w.decls[d].kind != K_METHOD: return d
+    []u32 bs = binders(w, w.decls[d].block)
+    return w.decls[d].block if #len(bs) > 0 else d
+
+// The names `d`'s head binds, in order (gathered once).
+[]u32 binders(^World w, u32 d):
+    if !(d in w.bspan):
+        u32 f = w.decls[d].file
+        syntax.Ast a = w.p.files[f].a
+        u32 n = w.decls[d].node
+        u32 lo = u32(#len(w.bsym))
+        u8 k = w.decls[d].kind
+        if k == K_TYPE:
+            for x in a.list(a.b[n]):
+                if x == NONE || a.tag[x] != syntax.N_BINDER: continue
+                _ = builtin_tname(w, f, a.lo[x], a.hi[x], "$", w.p.spell(f, x), "binder", 0)
+                add_binder(w, w.p.sym(f, x), BK_TYPE, lo)
+        else if k == K_FN || k == K_METHOD:
+            []u32 ks = a.list(a.b[n])
+            []u32 qs = ks[6..<#len(ks)]
+            for i in 0..<#len(qs):
+                u32 q = qs[i]
+                if q == NONE: continue
+                if a.tag[q] == syntax.N_PARAM_V && a.tag[a.a[q]] == syntax.T_PACK: add_binder(w, w.p.sym(f, q), BK_PACK, lo)
+                else if kind_at(&a, qs, i):
+                    u64 sp = name_span(w, f, q)
+                    _ = builtin_tname(w, f, u32(sp >> 32), u32(sp & 0xFFFFFFFF), "", w.p.spell(f, q), "`type` parameter", 0, NONE, diag.PH_BODY)
+                    add_binder(w, w.p.sym(f, q), BK_TYPE, lo)
+                // A method's trait parameter is a trait value, not a binder (core:log's `Fanout.add`).
+                else if k == K_FN && trait_param(w, f, a.a[q]) != NONE && !ds_at(w, f, q): add_binder(w, w.p.sym(f, trait_param(w, f, a.a[q])), BK_TRAIT, lo)
+                else: scan(w, f, a.a[q], lo)
+            scan(w, f, ks[0], lo)
+        w.bspan[d] = (u64(lo) << 32) | u64(#len(w.bsym))
+    try u64 s = w.bspan[d] else: return w.bsym[0..<0]
+    return w.bsym[i64(s >> 32)..<i64(s & 0xFFFFFFFF)]
+
+u8 binder_kind(^World w, u32 d, i64 i):
+    try u64 s = w.bspan[d] else: return BK_TYPE
+    return w.bkind[i64(s >> 32) + i]
+
+private void add_binder(^World w, u32 sym, u8 k, u32 lo):
+    for i in lo..<u32(#len(w.bsym)):
+        if w.bsym[i] == sym: return
+    w.bsym = #append(w.bsym, sym)
+    w.bkind = #append(w.bkind, k)
+
+private void scan(^World w, u32 f, u32 n, u32 lo):
+    if n == NONE: return
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    if g == syntax.T_BINDING:
+        u64 sp = name_span(w, f, n)
+        _ = builtin_tname(w, f, u32(sp >> 32), u32(sp & 0xFFFFFFFF), "$", w.p.spell(f, n), "binder", 0, NONE, diag.PH_BODY)
+        add_binder(w, w.p.sym(f, n), BK_TYPE, lo)
+    if g == syntax.T_ARRAY && a.main[n] != NONE: add_binder(w, w.p.sym(f, n), BK_LEN, lo)
+    if g == syntax.T_MATRIX && a.a[n] != NONE && a.main[n] != NONE && w.p.files[f].t.sym[a.a[n]] == w.p.sym(f, n):
+        u32 at = w.p.files[f].t.start[a.main[n]]
+        w.d.phase = diag.PH_INTERFACE
+        say(w, f, 0, at, at + 1, 404, index.hold(#format("`$", w.p.spell(f, n), "` is declared twice in one signature; a binding is inferred from the arguments, so two of one name have nothing to disagree about")), "")
+    if g == syntax.T_MATRIX && a.a[n] != NONE: add_binder(w, w.p.files[f].t.sym[a.a[n]], BK_LEN, lo)
+    if g == syntax.T_MATRIX && a.main[n] != NONE: add_binder(w, w.p.sym(f, n), BK_LEN, lo)
+    if g == syntax.T_ARRAY: scan(w, f, a.b[n], lo)
+    else if g != syntax.T_BINDING:
+        ref []u32 ks
+        a.kids(n, &ks)
+        for k in ks:
+            scan(w, f, k, lo)
+
+// A trait written as a parameter's whole type (or under its `^`): the
+// name node, or NONE.
+u32 trait_param(^World w, u32 f, u32 n):
+    if n == NONE: return NONE
+    syntax.Ast a = w.p.files[f].a
+    u32 x = a.a[n] if a.tag[n] == syntax.T_POINTER else n
+    if x == NONE || a.tag[x] != syntax.T_NAME && a.tag[x] != syntax.T_PATH: return NONE
+    u32 d = using_decl(w, f, x)
+    return x if d != NONE && w.decls[d].kind == K_TRAIT else NONE
+
+// A template: a function binding more than a pack, or a generic type's
+// method.
+bool templated(^World w, u32 d):
+    u8 k = w.decls[d].kind
+    if k != K_FN && k != K_METHOD && k != K_TYPE: return false
+    u32 o = owner(w, d)
+    []u32 bs = binders(w, o)
+    if #len(bs) == 0: return false
+    return #len(bs) > 1 || binder_kind(w, o, 0) != BK_PACK
+
+bool packed_only(^World w, u32 d):
+    []u32 bs = binders(w, d)
+    return #len(bs) == 1 && binder_kind(w, d, 0) == BK_PACK
+
+// What `sym` is bound to in the current instance, or NONE; `k` its kind.
+u32 bound(^World w, u32 sym, ^u8 k):
+    if w.env == NONE || w.envd == NONE: return NONE
+    []u32 bs = binders(w, w.envd)
+    []u32 vs = w.t.list(w.env)
+    for i in 0..<#len(bs):
+        if bs[i] == sym && i < #len(vs):
+            k^ = binder_kind(w, w.envd, i)
+            return vs[i]
+    return NONE
+
+u32 len_row(^World w, i64 n):
+    return w.t.make(types.T_TYPE, u32(n), 1, nil)
+
+// A template's signature under `env`, resolved once per instance.
+u32 sig(^World w, u32 d, u32 env):
+    if env == NONE: return resolve(w, d)
+    u64 key = (u64(d) << 32) | u64(env)
+    if key in w.sigs:
+        try u32 t = w.sigs[key] else: return NONE
+        return t
+    u32 e = w.env
+    u32 ed = w.envd
+    w.env = env
+    w.envd = owner(w, d)
+    u32 t = fn_type(w, d)
+    w.env = e
+    w.envd = ed
+    w.sigs[key] = t
+    return t
+
+// `Pool(i32)`: generic type `d` over `args`, its body resolved once; `n`
+// of file `f` is where it is written. ERR0910 past eight rounds of an
+// instance built out of the one that asked for it.
+u32 instance(^World w, u32 d, []u32 args, u32 f, u32 n):
+    ref []char8 nm
+    nm = #append(nm, ..name_of(w, w.decls[d].name))
+    nm = #append(nm, '(')
+    for i in 0..<#len(args):
+        if i > 0: nm = #append(nm, ..", ")
+        // By name, as Rust's `display_by_name` spells an instance's arguments.
+        nm = #append(nm, ..named(w, args[i]))
+    nm = #append(nm, ')')
+    string8 tn = index.hold(nm)
+    u32 ty = w.t.named(name_of(w, w.p.pkgs[w.decls[d].pkg].name), tn)
+    if ty in w.type_decl: return ty
+    u32 env = w.t.tuple(args)
+    u32 par = w.asking
+    u32 depth = 0
+    u64 origin = (u64(f) << 32) | u64(n)
+    if par != NONE:
+        try u32 pe = w.inst_env[par] else: return NONE
+        try u32 pd = w.idepth[par] else: return NONE
+        try u64 po = w.iorigin[par] else: return NONE
+        if derived(w, env, pe): depth = pd + 1
+        origin = po
+    if depth > 8:
+        syntax.Ast a = w.p.files[f].a
+        ref []char8 m
+        m = #append(m, ..#format("`", tn, "` is built out of the instantiation that asked for it, ", depth, " rounds deep and `8` is the bound"))
+        if w.in_tbody:
+            u32 of = u32(origin >> 32)
+            diag.Place pl = w.p.map.place(w.p.map.base[of] + w.p.files[of].a.lo[u32(origin & 0xFFFFFFFF)])
+            try u32 pp = w.iparent[par] else: return NONE
+            m = #append(m, ..#format(", while instantiating `", w.t.text(w.t.b[par]), "`"))
+            i64 more = 0
+            if pp != NONE:
+                m = #append(m, ..#format(" inside `", w.t.text(w.t.b[pp]), "`"))
+                u32 x = pp
+                for x != NONE:
+                    try u32 nx = w.iparent[x] else: break
+                    x = nx
+                    if x != NONE: more += 1
+            if more > 0: m = #append(m, ..#format(" and ", more, " more"))
+            m = #append(m, ..#format(" — asked for by the type written at ", w.p.map.names[of], ":", pl.line, ":", pl.col))
+        say(w, f, 0, a.lo[n], a.hi[n], 910, index.hold(m), index.hold(#format("write the body at the binder itself, `^", binder_use(w, d), "`, which is the instantiation already being made")))
+        return NONE
+    w.sigs[(u64(d) << 32) | u64(env)] = ty
+    w.type_decl[ty] = d
+    w.inst_env[ty] = env
+    w.idepth[ty] = depth
+    w.iparent[ty] = par
+    w.iorigin[ty] = origin
+    u32 e = w.env
+    u32 ed = w.envd
+    bool tb = w.in_tbody
+    w.env = env
+    w.envd = d
+    w.asking = ty
+    w.in_tbody = true
+    type_body(w, d, ty)
+    string8 note = w.note
+    diag.Place pl = w.p.map.place(w.p.map.base[u32(origin >> 32)] + w.p.files[u32(origin >> 32)].a.lo[u32(origin & 0xFFFFFFFF)])
+    w.note = index.hold(#format(", while instantiating `", tn, "` — asked for by the type written at ", w.p.map.names[u32(origin >> 32)], ":", pl.line, ":", pl.col))
+    conform(w, d, ty, env)
+    w.note = note
+    w.env = e
+    w.envd = ed
+    w.asking = par
+    w.in_tbody = tb
+    return ty
+
+// `Bad(T)`: generic `d` written over its own binders.
+string8 binder_use(^World w, u32 d):
+    ref []char8 o
+    o = #append(o, ..name_of(w, w.decls[d].name))
+    o = #append(o, '(')
+    []u32 bs = binders(w, d)
+    for i in 0..<#len(bs):
+        if i > 0: o = #append(o, ..", ")
+        o = #append(o, ..name_of(w, bs[i]))
+    o = #append(o, ')')
+    return index.hold(o)
+
+// Whether instance `env` is built out of `par`'s: a binding holding one of
+// `par`'s strictly inside it.
+bool derived(^World w, u32 env, u32 par):
+    for x in w.t.list(env):
+        for y in w.t.list(par):
+            if x != y && holds_type(w, x, y, 0): return true
+    return false
+
+private bool holds_type(^World w, u32 x, u32 y, i64 depth):
+    if x == y: return true
+    if x == NONE || depth > 64: return false
+    u8 g = w.t.tag[x]
+    if g == types.T_PTR || g == types.T_SLICE || g == types.T_REF: return holds_type(w, w.t.a[x], y, depth + 1)
+    if g == types.T_TUPLE:
+        for e in w.t.list(x):
+            if holds_type(w, e, y, depth + 1): return true
+    if g == types.T_NAMED && x in w.inst_env:
+        try u32 e = w.inst_env[x] else: return false
+        return holds_type(w, e, y, depth + 1)
+    return false
+
+// The environment of instance type `ty` (through a pointer), or NONE.
+u32 env_of(^World w, u32 ty):
+    u32 t = ty
+    u32 r = w.t.resolve(ty)
+    if r != NONE && w.t.tag[r] == types.T_PTR: t = w.t.a[r]
+    if !(t in w.inst_env): return NONE
+    try u32 e = w.inst_env[t] else: return NONE
+    return e
+
+// What a generic declaration says about all its instantiations: its
+// binders (ERR0404), counts (ERR0918), embeds and channels (ERR0538), and a
+// `where` with nothing to ask (ERR0920).
+void generic_rules(^World w, u32 d):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 n = w.decls[d].node
+    []u32 ks = a.list(a.b[n])
+    string8 tn = name_of(w, w.decls[d].name)
+    string8 src = w.p.files[f].src
+    ref []string8 bs
+    for x in ks[3..<#len(ks)]:
+        if x != NONE && a.tag[x] == syntax.N_BINDER: bs = #append(bs, w.p.spell(f, x))
+    u8 ph = w.d.phase
+    w.d.phase = diag.PH_INTERFACE
+    if #len(bs) == 0:
+        if ks[1] != NONE:
+            u32 c = a.a[ks[1]] if a.tag[ks[1]] == syntax.N_WHERE else ks[1]
+            say(w, f, 0, a.lo[c], a.hi[c], 920, index.hold(#format("`", tn, "` binds no type, so the `where` at its head has nothing to ask", "\x1fA value's `is` is answered by its type, and the signature writes that type, `i32`")), index.hold(#format("declare the binder it asks about — `type ", tn, "($T) where …:` — or drop the clause")), "A `where` on a `type` is a generic declaration's domain, asked of each instantiation's arguments")
+        w.d.phase = ph
+        #delete(bs)
+        return
+    i64 bi = 0
+    for x in ks[3..<#len(ks)]:
+        if x == NONE || a.tag[x] != syntax.N_BINDER: continue
+        string8 nm = bs[bi]
+        for j in 0..<bi:
+            if bs[j] == nm: say(w, f, 0, a.lo[x], a.hi[x], 404, index.hold(#format("`$", nm, "` is declared twice in `", tn, "`'s head; an instantiation writes one type per binder, in order, so two of one name would be two arguments nothing could tell apart. Rename one")), "")
+        bi += 1
+        u32 o = lookup(w, w.decls[d].pkg, w.p.sym(f, x))
+        if o != NONE && (w.decls[o].kind == K_CONST || typeish(w.decls[o].kind)):
+            say(w, f, 0, a.lo[x], a.hi[x], 404, index.hold(#format("`$", nm, "` collides with a `", "const" if w.decls[o].kind == K_CONST else "type", "` of that name in package `", name_of(w, w.p.pkgs[w.decls[d].pkg].name), "`. A binder is refused rather than shadowed: inside `", tn, "`'s body the name would mean the argument, and everywhere else the declaration. Rename the binder")), "")
+    u32 body = ks[2]
+    if body != NONE && a.tag[body] == syntax.N_MEMBERS:
+        for m in a.list(a.b[body]):
+            if m == NONE || a.tag[m] != syntax.N_MEMBER: continue
+            u32 mt = a.list(a.b[m])[0]
+            if mt == NONE: continue
+            bin_lengths(w, f, mt, bs, tn)
+            if a.main[m] == NONE && a.tag[mt] != syntax.N_MEMBERS && a.tag[mt] != syntax.T_CHANNEL:
+                string8 wr = src[i64(a.lo[mt])..<i64(a.hi[mt])]
+                string8 bn = ""
+                if a.tag[mt] == syntax.T_NAME:
+                    for x in bs:
+                        if x == wr: bn = index.hold(#format(", and `", wr, "` is a binder, whose slots differ for every argument"))
+                say(w, f, 0, a.lo[m], a.hi[m], 538, index.hold(#format("`", wr, "` is embedded in the generic `", tn, "`", bn, ", which names its slots itself")), index.hold(#format("name the slot: `", wr, " value`")), "Embedding splices the embedded shape's slots and names into this one, and a generic body names its slots itself, so every instantiation has one view — the declaration's")
+            if a.tag[mt] == syntax.T_CHANNEL && a.main[mt] != NONE:
+                string8 cn = w.p.spell(f, mt)
+                string8 pn = name_of(w, w.p.pkgs[w.decls[d].pkg].name)
+                say(w, f, 0, a.lo[m], a.hi[m], 538, index.hold(#format("`", cn, "` is a channel member of the generic `", tn, "`, a mailbox every instantiation would share")), "declare it in a `type` that binds nothing, and hold that type here", index.hold(#format("A channel is one mailbox named after its declaration — `", pn, ".", tn, ".", cn, "`")))
+    else if body != NONE: bin_lengths(w, f, body, bs, tn)
+    w.d.phase = ph
+    #delete(bs)
+
+// ERR0918: a binder written as an array's length.
+private void bin_lengths(^World w, u32 f, u32 t, []string8 bs, string8 tn):
+    if t == NONE: return
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[t] == syntax.T_ARRAY && a.a[t] != NONE && (a.tag[a.a[t]] == syntax.T_NAME || a.tag[a.a[t]] == syntax.E_NAME):
+        string8 ln = w.p.spell(f, a.a[t])
+        for x in bs:
+            if x == ln: say(w, f, 0, a.lo[a.a[t]], a.hi[a.a[t]], 918, index.hold(#format("`", ln, "` is a binder of `", tn, "`, and a type's binders are whole types — `", tn, "(i32)` writes a type in its place, never a count")), "write the length, or a `const` naming it", "An arity is inferred from a call's arguments, so a count belongs to a function's signature")
+    ref []u32 kids
+    a.kids(t, &kids)
+    for k in kids:
+        if k != NONE: bin_lengths(w, f, k, bs, tn)
+    #delete(kids)
+
+// `G(A, B)` in a type position: ERR0538 unless one type per binder.
+u32 applied(^World w, u32 f, u32 n, u32 d, []u32 ps):
+    syntax.Ast a = w.p.files[f].a
+    []u32 bs = binders(w, d)
+    if #len(ps) != #len(bs):
+        say(w, f, 0, a.lo[n], a.hi[n], 538, generic_head(w, d, #len(ps)), "")
+        return NONE
+    ref []u32 args
+    for p in ps:
+        u32 t = resolve_type(w, f, p)
+        if t == NONE: return NONE
+        args = #append(args, t)
+    u32 wh = where_of(w, d)
+    if wh != NONE:
+        u32 env = w.t.tuple(args)
+        i8 h = pred(w, d, wh, env)
+        string8 nm = name_of(w, w.decls[d].name)
+        if h < 0: say(w, f, 0, a.lo[n], a.hi[n], 1, "this `where` is outside the slice the port builds so far", "")
+        u64 key = (u64(d) << 32) | u64(env)
+        if h == 0 && !(key in w.where_said):
+            w.where_said[key] = 1
+            syntax.Ast da = w.p.files[w.decls[d].file].a
+            string8 cl = w.p.files[w.decls[d].file].src[i64(da.lo[wh])..<i64(da.hi[wh])]
+            ref []char8 sp
+            sp = #append(sp, ..nm)
+            sp = #append(sp, '(')
+            for i in 0..<#len(args):
+                if i > 0: sp = #append(sp, ..", ")
+                sp = #append(sp, ..named(w, args[i]))
+            sp = #append(sp, ')')
+            say(w, f, 0, a.lo[n], a.hi[n], 919, index.hold(#format("`", sp, "` binds ", bindings(w, d, env), " of `", nm, "`, whose `where ", cl, "` does not hold for it", domain_note(cl, "\x1fA `where` on a generic `type` is its **domain**: it is asked of every instantiation where the type is written, so this type is what is underlined"))), index.hold(#format("write `", nm, "` at an argument the clause admits, or widen the clause")))
+        if h != 1: return NONE
+    return instance(w, d, args, f, n)
+
+string8 generic_head(^World w, u32 d, i64 given):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    string8 nm = name_of(w, w.decls[d].name)
+    ref []char8 head
+    ref []char8 use
+    for x in a.list(a.b[w.decls[d].node]):
+        if x == NONE || a.tag[x] != syntax.N_BINDER: continue
+        if #len(head) > 0:
+            head = #append(head, ..", ")
+            use = #append(use, ..", ")
+        head = #append(head, ..#format("$", w.p.spell(f, x)))
+        use = #append(use, ..("i32"))
+    []u32 bs = binders(w, d)
+    string8 wrote = index.hold(#format("`", nm, "` binds ", #len(bs), " type(s) and this writes ", given))
+    if given == 0: wrote = index.hold(#format("`", nm, "` is generic and names no type until its binders are given one each"))
+    return index.hold(#format(wrote, ": `", nm, "` is declared `", nm, "(", index.hold(head), ")` — write `", nm, "(", index.hold(use), ")`, one type per binder"))
+
+// A call of template `d`: each argument binds what its parameter's written
+// type mentions; the instance's signature then checks the arguments.
+Val generic(^World w, ^Body b, u32 n, u32 d):
+    []u32 args = call_args(w, b, n)
+    syntax.Ast a = tree(w, b)
+    u32 f = w.decls[d].file
+    syntax.Ast ca = w.p.files[f].a
+    []u32 ps = params(w, d)
+    string8 fname = name_of(w, w.decls[d].name)
+    []u32 bs = binders(w, d)
+    // A literal at a trait binder implements nothing: refused first.
+    bool lit_bad = false
+    for i in 0..<#len(ps):
+        u32 q = ps[i]
+        if q == NONE || ca.tag[q] != syntax.N_PARAM || trait_param(w, f, ptn(&ca, ps, i)) == NONE: continue
+        u32 an = NONE
+        for j in 0..<#len(args):
+            u32 g = args[j]
+            bool nm = a.tag[g] == syntax.E_ARG && a.main[g] != NONE
+            if nm && spell(w, b, g) == w.p.spell(f, q) || !nm && j == i: an = arg_value(w, b, g)
+        if an == NONE: continue
+        u8 t = a.tag[an]
+        if t == syntax.E_INT || t == syntax.E_FLOAT || t == syntax.E_STR || t == syntax.E_CHAR || t == syntax.E_TUPLE || t == syntax.E_ARRAY || t == syntax.E_MAP:
+            _ = takes_on(w, b, d, using_decl(w, f, trait_param(w, f, ptn(&ca, ps, i))), Val(V_LIT, NONE, NONE, 0, 0, 0), an)
+            lit_bad = true
+    if lit_bad: return bad()
+    for g in args:
+        if a.tag[g] == syntax.E_ARG && a.main[g] != NONE:
+            err_tok(w, b, g, 1, index.hold(#format("a named argument at a call on a template is not read by the matcher yet, so `", fname, "` cannot be instantiated from this call")))
+            return bad()
+        if a.tag[arg_value(w, b, g)] == syntax.E_SPLAT:
+            err(w, b, arg_value(w, b, g), 1, index.hold(#format("a `..` splat at a call on a template is not read by the matcher yet, so `", fname, "` cannot be instantiated from this call")))
+            return bad()
+    // The count, before anything is inferred: a trailing run of defaults may
+    // be left unwritten; a pack takes what follows the fixed parameters.
+    i64 pack_at = -1
+    i64 required = 0
+    for i in 0..<#len(ps):
+        if ps[i] != NONE && ca.tag[ps[i]] == syntax.N_PARAM_V: pack_at = i
+        else if ps[i] == NONE || ca.tag[ps[i]] != syntax.N_PARAM || ca.b[ps[i]] == NONE: required = i + 1
+    bool agrees = #len(args) >= pack_at if pack_at >= 0 else #len(args) >= required && #len(args) <= #len(ps)
+    if !agrees:
+        string8 wants = index.hold(#format(#len(ps), " parameter(s)"))
+        if pack_at >= 0: wants = index.hold(#format(pack_at, " parameter(s) ahead of its pack"))
+        else if #len(ps) > required: wants = index.hold(#format(#len(ps), " parameter(s), the last ", #len(ps) - required, " with a default,"))
+        i64 limit = pack_at if pack_at >= 0 else required
+        string8 help = ""
+        if #len(args) < limit:
+            for i in #len(args)..<limit:
+                string8 pre = "write an argument for " if i == #len(args) else index.hold(#format(help, ", "))
+                help = index.hold(#format(pre, "`", w.p.spell(f, ps[i]), "`"))
+        else: help = index.hold(#format("remove the last ", #len(args) - #len(ps), " argument(s): `", fname, "` takes at most ", #len(ps)))
+        err(w, b, n, 601, index.hold(#format("`", fname, "` has ", wants, " and this call fills ", #len(args), "\x1fThe written arguments are matched first and a default fills only a trailing parameter they leave, so the count has to agree before anything can be inferred")), help)
+        return bad()
+    bool kinds = false
+    for i in 0..<#len(ps):
+        u32 q = ps[i]
+        if q != NONE && kind_at(&ca, ps, i): kinds = true
+        if q != NONE && (ca.tag[q] == syntax.N_PARAM_V || ca.a[q] == NONE && !kind_at(&ca, ps, i) && ptn(&ca, ps, i) == NONE):
+            err(w, b, n, 1, "this call is outside the slice the port builds so far")
+            return bad()
+    // Unwritten trailing parameters take their defaults, typed once bound.
+    []u32 dps = ps[#len(args)..<#len(ps)]
+    if #len(dps) > 0 && kinds:
+        err(w, b, n, 1, "this call is outside the slice the port builds so far")
+        return bad()
+    ps = ps[0..<#len(args)]
+    ref []u32 got
+    for _ in bs:
+        got = #append(got, NONE)
+    // `type T` slots bind from the type written; the rest are the call's values.
+    ref []u32 ra
+    ref []u32 rp
+    bool tok = true
+    for i in 0..<#len(args):
+        if !kind_at(&ca, ps, i):
+            ra = #append(ra, args[i])
+            rp = #append(rp, ps[i])
+            continue
+        u32 vn = arg_value(w, b, args[i])
+        Val v = expr(w, b, vn, NONE)
+        if v.ty == NONE: tok = false
+        else if v.kind != V_TYPE:
+            err(w, b, vn, 913, index.hold(#format("`", w.p.spell(f, ps[i]), "` of `", fname, "` is a `type` parameter, so this argument has to be a **type** and it is a value\x1fEvery spelling of a type is accepted here — a name, `[]i32`, `typeof(v)`, a tuple of types, `{K: V}` — and a value is not one of them: `", fname, "(x, xs)` asks the compiler to guess from a value\x1ewrite the type: `", fname, "(i32, xs)` says which instantiation")))
+            tok = false
+        else: got[slot_of(w, d, w.p.sym(f, ps[i]))] = v.x
+    if !tok: return bad()
+    args = ra[:]
+    ps = rp[:]
+    ref []Val vals
+    bool ok = true
+    u8 lit = 0
+    u8 lits = 0
+    // The literal kinds each binder was handed directly (`$E e` given `10`).
+    ref []u8 blit
+    for _ in bs:
+        blit = #append(blit, 0)
+    u32 ut = NONE
+    i64 uslot = 0
+    // The one `distinct` tag the arguments of its shape agree on.
+    u32 tag = NONE
+    ref []u32 tagged_n
+    ref []u32 tagged_t
+    for i in 0..<#len(args):
+        u32 vn = arg_value(w, b, args[i])
+        u32 tn = ca.a[ps[i]] if kind_at(&ca, ps, i) else ptn(&ca, ps, i)
+        w.bind_param = w.p.spell(f, ps[i])
+        w.bind_call = n
+        u32 want = NONE
+        if !mentions(w, d, tn):
+            u32 e = w.env
+            w.env = NONE
+            want = resolve_type(w, f, tn)
+            w.env = e
+        i64 us = untyped_slot(w, b, vn) if want == NONE else -1
+        if us >= 0:
+            if ut == NONE:
+                ut = vn
+                uslot = us
+            vals = #append(vals, Val(V_LIT, NONE, NONE, 1, 0, 0))
+            continue
+        Val v = expr(w, b, vn, want)
+        if v.kind == V_FN: v = fn_value(w, b, v, vn)
+        vals = #append(vals, v)
+        if v.ty == NONE:
+            ok = false
+            continue
+        if (v.kind == V_LIT || v.kind == V_FLIT || a.tag[vn] == syntax.E_TUPLE) && trait_param(w, f, tn) != NONE:
+            _ = takes_on(w, b, d, using_decl(w, f, trait_param(w, f, tn)), v, vn)
+            return bad()
+        if v.kind == V_LIT || v.kind == V_FLIT:
+            u8 lk = 1
+            if v.kind == V_FLIT: lk = 2
+            if mentions(w, d, tn) && lit == 0: lit = lk
+            if mentions(w, d, tn): lits = lits | lk
+            if ca.tag[tn] == syntax.T_BINDING && slot_of(w, d, w.p.sym(f, tn)) >= 0: blit[slot_of(w, d, w.p.sym(f, tn))] = blit[slot_of(w, d, w.p.sym(f, tn))] | lk
+            continue
+        if v.kind == V_NIL: continue
+        bool whole = ca.tag[tn] == syntax.T_BINDING || (ca.tag[tn] == syntax.T_NAME || ca.tag[tn] == syntax.T_PATH) && slot_of(w, d, w.p.sym(f, tn)) >= 0
+        if ok && !whole && v.kind == V_VAL:
+            tagged_n = #append(tagged_n, vn)
+            tagged_t = #append(tagged_t, v.ty)
+            i64 from = #len(tagged_t) - 1
+            if tag == NONE && tagged(w, v.ty):
+                tag = v.ty
+                from = 0
+            if tag != NONE:
+                for k in from..<#len(tagged_t):
+                    if under(&w.t, tagged_t[k]) == under(&w.t, tag) && w.t.resolve(tagged_t[k]) != w.t.resolve(tag):
+                        err(w, b, tagged_n[k], 504, index.hold(#format("this call binds `the tag` of `", fname, "` to both ", shown(w, tag), " and ", shown(w, tagged_t[k]), ". One binding is one answer: write the two widths as two named bindings if they are meant to differ")))
+                        return bad()
+        if ok && !match(w, b, d, tn, w.t.bare(v.ty), &got, vn): ok = false
+    if !ok: return bad()
+    u32 wh = where_of(w, d)
+    for i in 0..<#len(bs):
+        if got[i] != NONE: continue
+        u8 bl = lits
+        if blit[i] != 0: bl = blit[i]
+        // A stated category places the literal in its default first (core:fmt's `put_signed`).
+        u8 c = category(w, d, wh, bs[i])
+        if c == 1 && bl == 1 || c == 3 && bl == 1:
+            got[i] = u32(types.P_I32)
+            continue
+        if c == 2 && bl != 0 || c == 3 && bl > 1:
+            got[i] = u32(types.P_F64)
+            continue
+        u32 dt = in_default(w, d, wh, bs[i], bl)
+        if dt != NONE:
+            got[i] = dt
+            continue
+        string8 bn = name_of(w, bs[i])
+        string8 cat = ""
+        bool by_written = false
+        for q in ps:
+            if names_sym(w, f, ca.a[q], bs[i]): by_written = true
+        u32 only = NONE
+        for q in dps:
+            if only == NONE && names_sym(w, f, ca.a[q], bs[i]): only = q
+        if !by_written && only != NONE:
+            string8 pn = w.p.spell(f, only)
+            err(w, b, n, 504, index.hold(#format("nothing written in this call says what `", bn, "` of `", fname, "` should be: only `", pn, "` mentions it, and this call leaves it to its default\x1fWritten arguments bind and a default only fills, so a default cannot be the one thing that binds `", bn, "`")), index.hold(#format("write the argument for `", pn, "`, so `", bn, "` has a type to bind")))
+            return bad()
+        if ut != NONE:
+            u32 sn = a.list(a.b[ut])[uslot]
+            err(w, b, n, 504, index.hold(#format("nothing in this call says what `", bn, "` of `", fname, "` should be: the tuple `", src(w, b, ut), "` has no type of its own, because its slot ", uslot, ", `", src(w, b, sn), "`, has none\x1fA binding is inferred from the arguments, and a tuple literal binds only when every slot has a type")), index.hold(#format("give slot ", uslot, " a type: bind `", src(w, b, sn), "` to a typed local and write the local in the tuple, or bind the whole tuple to a typed local first and pass that")))
+            return bad()
+        if lit != 0 && c == 0 && binder_kind(w, d, i) == BK_TYPE: cat = index.hold(#format(", or state `where ", bn, " is ", CATEGORIES[lit - 1], "` on `", fname, "` so the literal takes that category's default"))
+        err(w, b, n, 504, index.hold(#format("nothing in this call says what `", bn, "` of `", fname, "` should be\x1fA binding is inferred from the arguments, and an untyped literal supplies no answer of its own\x1ebind the value first, or write the width", cat)))
+        return bad()
+    u32 env = w.t.tuple(got)
+    for i in 0..<#len(got):
+        if got[i] == NONE || binder_kind(w, d, i) != BK_TYPE || !nameless(w, got[i]): continue
+        u32 an = n
+        for k in 0..<#len(vals):
+            if vals[k].ty == got[i]: an = arg_value(w, b, args[k])
+        err(w, b, an, 909, index.hold(#format("binding `", name_of(w, bs[i]), "` of `", fname, "` to ", shown(w, got[i]), " leaves the instantiation with no C name")))
+        return bad()
+    if wh != NONE && !(d in w.where_bad):
+        w.wr_at = NONE
+        i8 h = pred(w, d, wh, env)
+        if h < 0 && w.wr_at != NONE:
+            say(w, f, 0, ca.lo[w.wr_at], ca.hi[w.wr_at], w.wr_code, w.wr_msg, w.wr_help)
+            return bad()
+        if h < 0:
+            err(w, b, n, 1, "this `where` is outside the slice the port builds so far")
+            return bad()
+        if h == 0:
+            string8 cl = w.p.files[f].src[i64(ca.lo[wh])..<i64(ca.hi[wh])]
+            string8 help = has_repair(w, b, d, wh, env, fname)
+            if help == "": help = index.hold(#format("call `", fname, "` with an argument its `where` admits, or widen the clause"))
+            err(w, b, n, 919, index.hold(#format("this call binds ", bindings(w, d, env), " of `", fname, "`, whose `where ", cl, "` does not hold for it", domain_note(cl, "\x1fA `where` states the template's **domain**: it is asked here, at the instantiation, of what this call actually bound — the template's own line is correct for every other caller, so this one is what is underlined"))), help)
+            return bad()
+    u32 fty = sig(w, d, env)
+    if fty == NONE: return bad()
+    []u32 pts = w.t.params(fty)
+    // The answer wears the tag an argument matched through.
+    u32 wear = NONE
+    for i in 0..<#len(vals):
+        if vals[i].ty == NONE: vals[i] = expr(w, b, arg_value(w, b, args[i]), pts[i])
+        if vals[i].ty != NONE && tagged(w, vals[i].ty) && !tagged(w, pts[i]) && mentions(w, d, ptn(&ca, ps, i)) && under(&w.t, vals[i].ty) == w.t.resolve(pts[i]):
+            if wear == NONE: wear = vals[i].ty
+            vals[i] = value(spill(w, b, vals[i], arg_value(w, b, args[i])), pts[i])
+        vals[i] = coerce(w, b, vals[i], pts[i], arg_value(w, b, args[i]), index.hold(#format("slot ", i, " of `", fname, "` is")))
+        if vals[i].ty == NONE: ok = false
+    for q in dps:
+        i64 i = #len(vals)
+        u32 bf = b.file
+        u32 bb = b.base
+        b.file = f
+        b.base = 0
+        Val v = bad()
+        if location_default(w, f, ca.b[q]):
+            b.file = bf
+            b.base = bb
+            v = coerce(w, b, caller_place(w, b, n), pts[i], n)
+        else:
+            v = coerce(w, b, expr(w, b, ca.b[q], pts[i]), pts[i], ca.b[q])
+        b.file = bf
+        b.base = bb
+        if v.ty == NONE: ok = false
+        vals = #append(vals, v)
+    if !ok: return bad()
+    if w.env != NONE:
+        // Copies: the check may grow the tables these point into.
+        ref []u32 ua
+        for x in args:
+            ua = #append(ua, x)
+        ref []u32 up
+        for x in ps:
+            up = #append(up, x)
+        bool refused = unforwarded(w, b, n, d, env, ua, up)
+        #delete(ua)
+        #delete(up)
+        if refused: return bad()
+    w.ask_depth = 0
+    if w.cur != NONE && w.jobs[w.cur].env != NONE && templated(w, w.jobs[w.cur].decl) && derived(w, env, w.jobs[w.cur].env): w.ask_depth = w.jobs[w.cur].depth + 1
+    if w.ask_depth > 8 && !(((u64(d) << 32) | u64(env)) in w.jobs_by):
+        err(w, b, n, 910, index.hold(#format("instantiating `", fname, "` here binds a shape built out of the one it is already being instantiated at, ", w.ask_depth, " links deep and `8` is the bound")), "call the generic at a shape it was *given*, not at one it builds")
+        return bad()
+    if !(((u64(d) << 32) | u64(env)) in w.jobs_by):
+        i64 made = 0
+        for jb in w.jobs:
+            if jb.decl == d && jb.env != NONE: made += 1
+        if made >= 64:
+            err(w, b, n, 904, index.hold(#format("`", fname, "` has been instantiated 64 times and this call asks for another")), "stop the template calling itself at a growing arity", "Expansion is demand-driven, so a template that calls itself at a growing arity never finishes — `f(v ++ tail)` is the shape of it, adding one slot a round. The cap is generous rather than principled, on `MAX_SHAPE_SLOTS`'s precedent; through … (55 more) → `f` with N=56 → `f` with N=57 → `f` with N=58 → `f` with N=59 → `f` with N=60 → `f` with N=61 → `f` with N=62 → `f` with N=63")
+            return bad()
+    w.ask_f = b.file
+    w.ask_at = a.lo[n]
+    Val rv = emit_call(w, b, n, d, fty, job(w, d, env), bad(), vals, nil)
+    if wear != NONE && rv.kind == V_VAL && rv.ty != NONE && w.t.resolve(rv.ty) == under(&w.t, wear): rv.ty = wear
+    return rv
+
+// A tuple literal's first untyped literal slot, or -1.
+private i64 untyped_slot(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if a.tag[n] != syntax.E_TUPLE: return -1
+    []u32 ks = a.list(a.b[n])
+    for i in 0..<#len(ks):
+        u32 k = ks[i]
+        if a.tag[k] == syntax.E_UNARY: k = a.a[k]
+        if a.tag[k] == syntax.E_INT || a.tag[k] == syntax.E_FLOAT: return i
+    return -1
+
+// The call op: `dst = call fn(recv, vals…, packed…)`.
+Val emit_call(^World w, ^Body b, u32 n, u32 d, u32 fty, u32 cname, Val recv, []Val vals, []Val packed):
+    u32 ret = w.t.a[fty]
+    bool void_ = ret == u32(types.P_VOID)
+    u32 dst = NONE if void_ else temp(w, b, ret, n)
+    u8 flags = ir.R_FOREIGN if w.decls[d].kind == K_FFN else 0
+    u32 code = NONE
+    if w.t.b[fty] != types.F_NONE:
+        code = temp(w, b, code_type(w, fty), n)
+        flags = flags | ir.R_FAILABLE
+    u32 amb = entry_ambient(w, b, n) if w.decls[d].kind != K_FFN && names_caller(w, d) else NONE
+    u32 r = ir.fn_ref(&b.f, tstr(w, name_of(w, w.p.pkgs[w.decls[d].pkg].name)), cname, flags)
+    // A constant handed to C's narrow integer parameter goes through a slot of
+    // that type (`abs(-7LL)` is a `-Wabsolute-value` warning).
+    ref []u32 xs
+    []u32 pl = w.t.list(fty)
+    for j in 0..<#len(vals):
+        u32 x = vals[j].opd
+        xs = #append(xs, x)
+        if w.decls[d].kind != K_FFN || j >= #len(pl) || !ir.is_const(x) || w.k.kind[x & ~ir.OPD_CONST] != types.C_INT: continue
+        u8 ip = int_prim(w, pl[j])
+        if ip != types.P_I8 && ip != types.P_I16 && ip != types.P_I32 && ip != types.P_U8 && ip != types.P_U16 && ip != types.P_U32: continue
+        // A compiler builtin's argument stays a constant (`__builtin_frame_address(0)`).
+        if strings.starts_with(w.t.text(cname), "__builtin_"): continue
+        u32 t = temp(w, b, pl[j], n)
+        _ = ir.op(&b.f, ir.O_SET, 0, pl[j], n, t, x)
+        xs[j] = t
+    _ = ir.op(&b.f, ir.O_CALL, 0, ret, n, dst, r, NONE, code)
+    if recv.ty != NONE: ir.arg(&b.f, recv.opd)
+    for x in xs:
+        ir.arg(&b.f, x)
+    #delete(xs)
+    for v in packed:
+        ir.arg(&b.f, v.opd)
+    if amb != NONE: ir.arg(&b.f, amb)
+    if code != NONE && !failable_call(w, b, n, name_of(w, w.decls[d].name), code): return bad()
+    if void_: return Val(V_VAL, NONE, ret, NONE, 0, 0)
+    return value(dst, ret)
+
+// Whether written type `n` of `d`'s file names one of `d`'s binders.
+bool mentions(^World w, u32 d, u32 n):
+    if n == NONE: return false
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    if g == syntax.T_BINDING || (g == syntax.T_ARRAY || g == syntax.T_MATRIX) && a.main[n] != NONE || g == syntax.T_MATRIX && a.a[n] != NONE: return true
+    if g == syntax.T_NAME || g == syntax.E_NAME || g == syntax.T_PATH:
+        u32 s = w.p.sym(f, n)
+        for x in binders(w, d):
+            if x == s: return true
+        return false
+    ref []u32 ks
+    a.kids(n, &ks)
+    for k in ks:
+        if mentions(w, d, k): return true
+    return false
+
+// Whether written type `n` names binder `sym`.
+private bool names_sym(^World w, u32 f, u32 n, u32 sym):
+    if n == NONE: return false
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    if (g == syntax.T_BINDING || g == syntax.T_NAME || g == syntax.E_NAME || g == syntax.T_PATH || (g == syntax.T_ARRAY || g == syntax.T_MATRIX) && a.main[n] != NONE) && w.p.sym(f, n) == sym: return true
+    ref []u32 ks
+    a.kids(n, &ks)
+    for k in ks:
+        if names_sym(w, f, k, sym): return true
+    return false
+
+private i64 slot_of(^World w, u32 d, u32 sym):
+    []u32 bs = binders(w, d)
+    for i in 0..<#len(bs):
+        if bs[i] == sym: return i
+    return -1
+
+// Binds what written type `n` mentions from argument type `ty`.
+private bool match(^World w, ^Body b, u32 d, u32 n, u32 ty, ^ref []u32 got, u32 at):
+    if n == NONE || !mentions(w, d, n): return true
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    if g == syntax.T_BINDING || g == syntax.T_NAME || g == syntax.T_PATH:
+        i64 i = slot_of(w, d, w.p.sym(f, n))
+        if i >= 0 && binder_kind(w, d, i) == BK_TRAIT && !takes_on(w, b, d, using_decl(w, f, n), value(NONE, ty), at): return false
+        return put(w, b, d, i, w.t.bare(ty), got, at)
+    if g == syntax.T_QUAL: return match(w, b, d, a.a[n], w.t.bare(ty), got, at)
+    u32 r = under(&w.t, ty)
+    if r == NONE: return structure(w, b, d, n, ty, at)
+    u8 h = w.t.tag[r]
+    if g == syntax.T_SLICE:
+        if h == types.T_SLICE: return match(w, b, d, a.a[n], w.t.a[r], got, at)
+        if h == types.T_REF && w.t.tag[w.t.resolve(w.t.a[r])] == types.T_SLICE: return match(w, b, d, a.a[n], w.t.a[w.t.resolve(w.t.a[r])], got, at)
+        if r == types.STRING8: return match(w, b, d, a.a[n], u32(types.P_CHAR8), got, at)
+    if g == syntax.T_POINTER && (h == types.T_PTR || one_ref(w, r)): return match(w, b, d, a.a[n], w.t.a[r], got, at)
+    if g == syntax.T_MAP && h == types.T_MAP:
+        if !match(w, b, d, a.a[n], w.t.a[r], got, at) || !match(w, b, d, a.b[n], w.t.b[r], got, at): return false
+        u8 kg = a.tag[a.a[n]]
+        string8 why = unkeyable(w, w.t.a[r])
+        if (kg == syntax.T_BINDING || kg == syntax.T_NAME) && slot_of(w, d, w.p.sym(f, a.a[n])) >= 0 && #len(why) > 0:
+            string8 fname = name_of(w, w.decls[d].name)
+            err(w, b, w.bind_call, 802, index.hold(#format("this call binds `", w.p.spell(f, a.a[n]), "` of `", fname, "` to ", shown(w, w.t.a[r]), ", which cannot be a key", "\x1f`f32` is not **stable**: `NaN != NaN`, so a key could be inserted and never found again — the one failure a map cannot report. A `$K` in key position is allowed and asked here, at the instantiation, because `has`'s header states no `where #is_key(K)`; with that clause, a call like this one is refused against the template's declared domain")), index.hold(#format("call `", fname, "` with a key type, and add `where #is_key(", w.p.spell(f, a.a[n]), ")` to its header")))
+            return false
+        return true
+    if g == syntax.T_REF && h == types.T_REF: return match(w, b, d, a.a[n], w.t.a[r], got, at)
+    if g == syntax.T_MATRIX:
+        u32 m = matrix(w, ty)
+        if m == NONE: return structure(w, b, d, n, ty, at)
+        []u32 ks = a.list(a.b[n])
+        for k in 0..<2:
+            u32 have = w.t.a[m] if k == 0 else w.t.b[m]
+            u32 tok = a.a[n] if k == 0 else a.main[n]
+            u32 dn = ks[k]
+            i64 i = slot_of(w, d, w.p.files[f].t.sym[tok]) if tok != NONE else -1
+            if i < 0 && dn != NONE && a.tag[dn] == syntax.E_NAME: i = slot_of(w, d, w.p.sym(f, dn))
+            if i >= 0 && !put(w, b, d, i, len_row(w, i64(have)), got, at): return false
+            if i < 0 && dn != NONE && a.tag[dn] == syntax.E_INT && a.a[dn] != have: return structure(w, b, d, n, ty, at)
+        return match(w, b, d, ks[2], melem(w, m), got, at)
+    if g == syntax.T_ARRAY:
+        i64 count = 1
+        u32 el = ty
+        if h == types.T_TUPLE:
+            []u32 xs = w.t.list(r)
+            count = #len(xs)
+            el = xs[0] if count > 0 else NONE
+            for x in xs:
+                if w.t.resolve(x) != w.t.resolve(el): return structure(w, b, d, n, ty, at)
+        u32 ln = a.a[n]
+        i64 i = slot_of(w, d, w.p.sym(f, n)) if a.main[n] != NONE else -1
+        if i < 0 && ln != NONE && a.tag[ln] == syntax.E_NAME: i = slot_of(w, d, w.p.sym(f, ln))
+        if i >= 0 && !put(w, b, d, i, len_row(w, count), got, at): return false
+        if el == NONE: return true
+        return match(w, b, d, a.b[n], el, got, at)
+    if g == syntax.T_TUPLE && h == types.T_TUPLE:
+        []u32 ms = a.list(a.b[n])
+        []u32 xs = w.t.list(r)
+        if #len(ms) != #len(xs): return structure(w, b, d, n, ty, at)
+        for i in 0..<#len(ms):
+            if !match(w, b, d, a.list(a.b[ms[i]])[0], xs[i], got, at): return false
+        return true
+    if g == syntax.T_FN && h == types.T_FUNC:
+        []u32 ks = a.list(a.b[n])
+        []u32 xs = w.t.params(r)
+        if #len(ks) - 2 != #len(xs) || (ks[1] != NONE) != (w.t.b[r] == types.F_TYPED): return structure(w, b, d, n, ty, at)
+        if ks[0] != NONE && !match(w, b, d, ks[0], w.t.a[r], got, at): return false
+        for i in 0..<#len(xs):
+            if !match(w, b, d, ks[i + 2], xs[i], got, at): return false
+        return true
+    if g == syntax.T_FN:
+        u32 t = ty
+        // A declaration over an instance matches as the instance.
+        for _ in 0..<8:
+            if t in w.inst_env || w.t.tag[t] != types.T_NAMED || w.t.body[t] == NONE: break
+            t = w.t.bare(w.t.body[t])
+        if t in w.inst_env:
+            try u32 e = w.inst_env[t] else: return false
+            []u32 ks = a.list(a.b[n])
+            []u32 vs = w.t.list(e)
+            if #len(ks) - 2 != #len(vs): return structure(w, b, d, n, ty, at)
+            for i in 0..<#len(vs):
+                if !match(w, b, d, ks[i + 2], vs[i], got, at): return false
+            return true
+    return structure(w, b, d, n, ty, at)
+
+private bool structure(^World w, ^Body b, u32 d, u32 n, u32 ty, u32 at):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    string8 written = w.p.files[f].src[i64(a.lo[n])..<i64(a.hi[n])]
+    err(w, b, at, 504, index.hold(#format("`", name_of(w, w.decls[d].name), "` writes this parameter as ", written, " and this argument is ", shown(w, ty), "\x1fA `$` inside a shape is read by walking the written type against the argument's, so the two have to agree down to the level the binding sits at\x1epass an argument of the shape the parameter writes")))
+    return false
+
+private bool put(^World w, ^Body b, u32 d, i64 i, u32 ty, ^ref []u32 got, u32 at):
+    if i < 0: return true
+    if got^[i] == NONE:
+        got^[i] = ty
+        return true
+    if got^[i] == ty: return true
+    // A transparent `foreign` struct binds as its shape: the first stands.
+    if (foreign_struct(w, got^[i]) || foreign_struct(w, ty)) && w.t.resolve(got^[i]) == w.t.resolve(ty): return true
+    string8 x = abbreviate(shown(w, got^[i]))
+    string8 y = abbreviate(shown(w, ty))
+    if binder_kind(w, d, i) == BK_LEN:
+        x = index.hold(#format(w.t.a[got^[i]]))
+        y = index.hold(#format(w.t.a[ty]))
+    err(w, b, at, 504, index.hold(#format("this call binds `", name_of(w, binders(w, d)[i]), "` of `", name_of(w, w.decls[d].name), "` to both ", x, " and ", y, ". One binding is one answer: write the two widths as two named bindings if they are meant to differ")))
+    return false
+
+bool foreign_struct(^World w, u32 t):
+    u32 d = decl_of(w, w.t.bare(t))
+    return d != NONE && w.decls[d].kind == K_FSTRUCT
+
+// `s` cut to 48 characters, as a diagnostic shows a shape.
+string8 abbreviate(string8 s):
+    i64 n = 0
+    i64 cut = -1
+    for i in 0..<#len(s):
+        if (u8(s[i]) & 0xC0) == 0x80: continue
+        if n == 48: cut = i
+        n += 1
+    if cut < 0: return s
+    return index.hold(#format(s[0..<cut], "… (", n, " characters)"))
+
+// `N=3, T=i32`: an instance's bindings, lengths then categories then types,
+// each by name.
+string8 bindings(^World w, u32 d, u32 env):
+    []u32 bs = binders(w, d)
+    []u32 vs = w.t.list(env)
+    ref []char8 out
+    for rank in 0..<3:
+        ref []bool done
+        for _ in bs:
+            done = #append(done, false)
+        for _ in bs:
+            i64 best = -1
+            for i in 0..<#len(bs):
+                u8 k = binder_kind(w, d, i)
+                i64 r = 0 if k == BK_LEN else 2
+                if done[i] || r != rank || k == BK_PACK: continue
+                if best < 0 || bytes_less(name_of(w, bs[i]), name_of(w, bs[best])): best = i
+            if best < 0: break
+            done[best] = true
+            if #len(out) > 0: out = #append(out, ..", ")
+            string8 v = abbreviate(shown(w, vs[best]))
+            if binder_kind(w, d, best) == BK_LEN: v = index.hold(#format(w.t.a[vs[best]]))
+            string8 sigil = "$" if binder_kind(w, d, best) == BK_TRAIT else ""
+            out = #append(out, ..#format(sigil, name_of(w, bs[best]), "=", v))
+    for i in 0..<#len(bs):
+        if binder_kind(w, d, i) != BK_PACK: continue
+        ref []char8 p
+        p = #append(p, '(')
+        u32 pk = env if packed_only(w, d) else vs[i]
+        for e in w.t.list(pk):
+            if #len(p) > 1: p = #append(p, ..", ")
+            // Each element cut first, then the whole (Rust's `PackBinding::short`).
+            p = #append(p, ..abbreviate(shown(w, e)))
+        p = #append(p, ')')
+        if #len(out) > 0: out = #append(out, ..", ")
+        out = #append(out, ..#format("..", name_of(w, bs[i]), "=", abbreviate(index.hold(p))))
+    return index.hold(out)
+
+// A template's `where` condition, or NONE.
+u32 where_of(^World w, u32 d):
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    u32 x = a.list(a.b[w.decls[d].node])[1 if a.tag[w.decls[d].node] == syntax.N_TYPE else 4]
+    if x != NONE && a.tag[x] == syntax.N_WHERE: x = a.a[x]
+    return x
+
+// What an untyped literal binds `sym` to under a top-level `sym in (…)`:
+// the first member of its kind, a category's default, or NONE.
+private u32 in_default(^World w, u32 d, u32 x, u32 sym, u8 lits):
+    if x == NONE || lits == 0: return NONE
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[x] == syntax.E_BINARY && w.p.spell(f, x) == "&&":
+        u32 l = in_default(w, d, a.a[x], sym, lits)
+        return l if l != NONE else in_default(w, d, a.b[x], sym, lits)
+    if a.tag[x] != syntax.E_IN || a.tag[a.a[x]] != syntax.E_NAME || w.p.sym(f, a.a[x]) != sym || a.tag[a.b[x]] != syntax.E_TUPLE: return NONE
+    bool fl = lits > 1
+    for q in a.list(a.b[a.b[x]]):
+        string8 cs = w.p.spell(f, q) if a.tag[q] == syntax.E_NAME else ""
+        if cs == "int" && !fl: return u32(types.P_I32)
+        if cs == "float" && fl: return u32(types.P_F64)
+        if cs == "scalar": return u32(types.P_F64) if fl else u32(types.P_I32)
+        u32 qt = named_type(w, f, q)
+        u32 r = w.t.resolve(qt) if qt != NONE else NONE
+        if r == NONE || w.t.tag[r] != types.T_PRIM || qt in w.type_decl: continue
+        u8 p = types.PRIM[w.t.a[r]].canon
+        if fl && types.in_float(p) || !fl && types.in_int(p): return qt
+    return NONE
+
+// The category (1 int, 2 float, 3 scalar) a top-level `&&` of `where`
+// conditions states for binder `sym`, or 0.
+private u8 category(^World w, u32 d, u32 x, u32 sym):
+    if x == NONE: return 0
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[x] == syntax.E_BINARY && w.p.spell(f, x) == "&&":
+        u8 l = category(w, d, a.a[x], sym)
+        return l if l != 0 else category(w, d, a.b[x], sym)
+    if a.tag[x] != syntax.E_IS || a.tag[a.a[x]] != syntax.E_NAME || w.p.sym(f, a.a[x]) != sym: return 0
+    string8 c = w.p.spell(f, a.b[x])
+    if c == "int": return 1
+    if c == "float": return 2
+    return 3 if c == "scalar" else 0
+
+// Whether `where` condition `x` holds under `env`: 1, 0, or -1 when it
+// asks what the port does not decide yet.
+private i8 pred(^World w, u32 d, u32 x, u32 env):
+    WV r = wv(w, d, x, env)
+    if r.k != 1: return -1
+    return 1 if r.v != 0 else 0
+
+// Whether `t` embeds `inner`, at any depth.
+private bool embeds_ty(^World w, u32 t, u32 inner, i64 depth):
+    if depth > 16: return false
+    u32 o = w.t.bare(t)
+    for e in w.embeds:
+        if e.outer != o: continue
+        if w.t.resolve(e.inner) == w.t.resolve(inner) || embeds_ty(w, e.inner, inner, depth + 1): return true
+    // A `distinct` or a declaration over another: what it is over embeds.
+    u32 r = w.t.resolve(t)
+    if r != NONE && w.t.tag[r] == types.T_DISTINCT: return embeds_ty(w, w.t.b[r], inner, depth + 1)
+    if w.t.tag[o] == types.T_NAMED && w.t.body[o] != NONE && w.t.tag[w.t.bare(w.t.body[o])] == types.T_NAMED: return embeds_ty(w, w.t.body[o], inner, depth + 1)
+    return false
+
+// The declaration expression `n` of file `f` names, through a package.
+u32 decl_named(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[n] == syntax.E_NAME: return lookup(w, w.p.files[f].pkg, w.p.sym(f, n))
+    if a.tag[n] != syntax.E_FIELD || a.tag[a.a[n]] != syntax.E_NAME: return NONE
+    for im in w.p.pkgs[w.p.files[f].pkg].imports:
+        if im.file == f && (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == w.p.sym(f, a.a[n]): return lookup(w, im.pkg, w.p.sym(f, n))
+    return NONE
+
+// The type a name in a condition denotes, or NONE.
+private u32 named_type(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[n] != syntax.E_NAME: return NONE
+    string8 s = w.p.spell(f, n)
+    u8 p = types.prim_named(s)
+    if p != types.PRIMS: return u32(p)
+    if text_named(s) != NONE: return text_named(s)
+    u32 d = lookup(w, w.p.files[f].pkg, w.p.sym(f, n))
+    if d != NONE && typeish(w.decls[d].kind) && w.decls[d].kind != K_TRAIT: return resolve(w, d)
+    return NONE
+
+// The repair for the first `T has Trait` of `where` `x` that `env` fails, or "".
+private string8 has_repair(^World w, ^Body b, u32 d, u32 x, u32 env, string8 fname):
+    if x == NONE: return ""
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[x] == syntax.E_HAS:
+        []u32 ks = a.list(a.b[x])
+        if a.tag[ks[0]] != syntax.E_NAME: return ""
+        i64 j = slot_of(w, d, w.p.sym(f, ks[0]))
+        if j < 0 || binder_kind(w, d, j) != BK_TYPE: return ""
+        u32 t = w.t.list(env)[j]
+        for q in ks[1..<#len(ks)]:
+            u32 td = decl_named(w, f, q)
+            if td != NONE && w.decls[td].kind == K_TRAIT && !implements(w, t, td): return using_repair(w, td, decl_of(w, t), b.file, fname, "pass")
+        return ""
+    if a.tag[x] == syntax.E_BINARY:
+        string8 l = has_repair(w, b, d, a.a[x], env, fname)
+        if l != "": return l
+        return has_repair(w, b, d, a.b[x], env, fname)
+    return ""
+
+// Parameter `i` of `ps` is `type T` (or groups with one: `type T, U`):
+// bound at compile time, erased from the C.
+// Parameter `i`'s written type node; the grouping shorthand takes the one before it.
+u32 ptn(^const syntax.Ast a, []u32 ps, i64 i):
+    i64 j = i
+    for j > 0 && ps[j] != NONE && a.tag[ps[j]] == syntax.N_PARAM && a.a[ps[j]] == NONE:
+        j -= 1
+    if ps[j] == NONE || a.tag[ps[j]] != syntax.N_PARAM: return NONE
+    return a.a[ps[j]]
+
+bool kind_at(^const syntax.Ast a, []u32 ps, i64 i):
+    i64 j = i
+    for j > 0 && ps[j] != NONE && a.tag[ps[j]] == syntax.N_PARAM && a.a[ps[j]] == NONE:
+        j -= 1
+    u32 q = ps[j]
+    return q != NONE && a.tag[q] == syntax.N_PARAM && a.a[q] != NONE && a.tag[a.a[q]] == syntax.T_KIND
+
+// ERR0919's why, for a clause whose failure says nothing more of itself
+// (`has`, `#is_declared`, `#is_key` say what they found first: not yet).
+private string8 domain_note(string8 cl, string8 why):
+    if strings.contains(cl, " has ") || strings.starts_with(cl, "#is_declared") || strings.starts_with(cl, "#is_key"): return ""
+    return why

@@ -1,0 +1,511 @@
+// Channels: `#channel(N) name(params)` at package level or in a `type`;
+// `#send`, the walks `#peek`/`#drain` (a snapshot, committed at every exit
+// of the loop), the discard, `#release` and `#len`. Each lowers to an
+// intrinsic over the struct the C emits per channel.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+const u8 B_CH_SEND = 80
+const u8 B_CH_BEGIN = 81
+const u8 B_CH_HEAD = 82
+const u8 B_CH_READY = 83
+const u8 B_CH_FIELD = 84
+const u8 B_CH_COMMIT = 85
+const u8 B_CH_LEN = 86
+const u8 B_CH_RELEASE = 87
+
+// A walk open around the statement being checked; `at` spells a member
+// channel's place ("" for a package one).
+type ChWalk:
+    u32 ty
+    string8 at
+
+// A consuming walk's commit (or a peek's close), made at each exit.
+type Commit:
+    u32 ch
+    u32 i
+    u32 lim
+    u32 ty
+    bool take
+    u32 node
+
+u32 chan_of(^World w, u32 ty):
+    if ty == NONE: return NONE
+    u32 r = w.t.resolve(ty)
+    return r if r != NONE && w.t.tag[r] == types.T_CHANNEL else NONE
+
+private string8 cname(^World w, u32 r):
+    return index.hold(strings.clone(w.t.text(w.t.a[r])))
+
+// The channel type of `T_CHANNEL` node `n` in file `f`, named `q`.
+u32 chan_type(^World w, u32 d, u32 f, u32 n, string8 q):
+    syntax.Ast a = w.p.files[f].a
+    string8 src = w.p.files[f].src
+    if strings.starts_with(src[i64(a.lo[n])..<#len(src)], "#signal"): say(w, f, 0, a.lo[n], a.lo[n] + 7, 805, "`#signal` is a retired spelling and `#channel` is what replaces it", "write `#channel`")
+    []u32 ks = a.list(a.b[n])
+    bool latest = a.a[n] != NONE
+    i64 cap = 0
+    if !latest:
+        cap = capacity(w, d, f, ks[0])
+        if cap < 1: return NONE
+    ref []u32 names
+    ref []u32 params
+    u32 prev = NONE
+    bool ok = true
+    for p in ks[1..<#len(ks)]:
+        if a.tag[p] == syntax.N_PARAM_V:
+            say(w, f, 0, a.lo[p], a.hi[p], 529, index.hold(#format("`..` collects the rest of a call's arguments into a window, and a channel's message is a fixed set of fields copied into its slot, so `", w.p.spell(f, p), "` has nothing to collect into")), "write one parameter per field, or a fixed array — `[4]i32 xs`")
+            ok = false
+            continue
+        u32 ty = prev
+        if a.a[p] != NONE: ty = resolve_type(w, f, a.a[p])
+        if ty == NONE:
+            ok = false
+            continue
+        prev = ty
+        u32 at = p
+        if a.a[p] != NONE: at = a.a[p]
+        if !payload(w, f, a.lo[at], a.hi[at], ty, latest): ok = false
+        names = #append(names, tstr(w, w.p.spell(f, p)))
+        params = #append(params, ty)
+    if !ok: return NONE
+    if !latest && !fits(w, f, a.lo[ks[0]], a.hi[ks[0]], cap, params): return NONE
+    u32 t = w.t.make(types.T_CHANNEL, tstr(w, q), u32(cap + 1) if !latest else 0, params)
+    w.t.define(t, NONE, names)
+    return t
+
+private i64 capacity(^World w, u32 d, u32 f, u32 e):
+    syntax.Ast a = w.p.files[f].a
+    i64 mark = #len(w.d.list)
+    u32 c = const_value(w, d, e, u32(types.P_I64), false)
+    #truncate(w.d.list, mark)
+    if c == NONE || w.k.kind[c] != types.C_INT:
+        string8 m = "a queue channel's capacity is how many messages it holds, so it is an integer"
+        string8 h = "write a whole number — `#channel(64) name(…)` — or `#channel(latest)` for the newest message only"
+        if c == NONE:
+            m = "a queue channel's capacity is its storage, laid out before the program runs, so it is a compile-time integer and this does not fold to one"
+            h = "write a literal, a `const`, or an `@const` a `-D` may set — `#channel(64) name(…)`"
+        say(w, f, 0, a.lo[e], a.hi[e], 532, m, h)
+        return -1
+    i64 v = i64(w.k.w0[c])
+    if i64(w.k.w1[c]) < 0 || v < 1:
+        say(w, f, 0, a.lo[e], a.hi[e], 532, index.hold(#format("a queue channel holds at least one message, and this asks for ", v, ": with no slot every `#send` would fail")), "give it a capacity of 1 or more, or write `#channel(latest)` to keep only the newest message")
+        return -1
+    return v
+
+// ERR0532's bound on one channel's static storage, estimated at 8-byte words.
+private bool fits(^World w, u32 f, u32 lo, u32 hi, i64 n, []u32 params):
+    u64 msg = 0
+    u64 al = 8
+    for p in params:
+        u64 sz = 8
+        u64 pa = 8
+        if types.laid(&w.t, p):
+            sz = types.size_of(&w.t, p)
+            pa = types.align_of(&w.t, p)
+        if pa > al: al = pa
+        if pa > 0: msg = (msg + pa - 1) / pa * pa
+        msg += sz
+    u64 slot = (8 + msg + al - 1) / al * al
+    u64 total = slot * u64(n)
+    if u64(n) > 0 && total / u64(n) != slot: total = 0xFFFFFFFFFFFFFFFF
+    if total <= 1073741824: return true
+    say(w, f, 0, lo, hi, 532, index.hold(#format(n, " slots of about ", slot, " bytes each is about ", total, " bytes of static storage, past the 1073741824 one channel may reserve before `main` runs")), "give it a smaller capacity; a producer that finds it full is told so and can wait, retry or drop — which is what a bounded queue is for")
+    return false
+
+// ERR0529 / ERR0530: what a message's field may hold.
+private bool payload(^World w, u32 f, u32 lo, u32 hi, u32 ty, bool latest):
+    u32 r = w.t.resolve(ty)
+    if r != NONE && w.t.tag[r] == types.T_REF:
+        if !latest: return true
+        say(w, f, 0, lo, hi, 530, index.hold(#format("a `latest` channel keeps only its newest message, so each `#send` overwrites one nobody took — and a `", shown(w, ty), "` in it would be dropped with its allocation still live, or freed by a side effect nothing wrote")), "make it a queue — `#channel(16) name(…)` — whose `#send` fails when full rather than overwriting, or send the value itself, copied")
+        return false
+    string8 why = fault(w, ty, 0)
+    if #len(why) == 0: return true
+    say(w, f, 0, lo, hi, 529, index.hold(#format("a channel's message is copied into its slot and read later, and ", why)), "send a `ref`, which moves to the consumer, as a parameter of its own, or copy the data into a fixed array — `[64]u8 bytes`", "It is read perhaps on another thread, after the frame that sent it is gone")
+    return false
+
+private string8 fault(^World w, u32 ty, i64 depth):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || depth > 32: return ""
+    u8 g = w.t.tag[r]
+    string8 s = shown(w, ty)
+    if r == u32(types.P_VOID): return "`void` has no value to send"
+    if g == types.T_TUPLE || g == types.T_UNION:
+        for x in w.t.list(r):
+            string8 y = fault(w, x, depth + 1)
+            if #len(y) > 0: return y
+        return ""
+    if g == types.T_DISTINCT || g == types.T_QUAL || g == types.T_ALIGNED: return fault(w, w.t.b[r], depth + 1)
+    if g == types.T_MATRIX: return fault(w, w.t.list(r)[0], depth + 1)
+    if g == types.T_SOA: return fault(w, w.t.a[r], depth + 1)
+    if g == types.T_REF: return index.hold(#format("`", s, "` sits inside another type, and a `ref` moves to the consumer only as a parameter of its own"))
+    if g == types.T_SLICE: return index.hold(#format("`", s, "` is a window onto storage the sender keeps"))
+    if g == types.T_PTR: return index.hold(#format("`", s, "` points into storage the sender keeps"))
+    if r == types.CSTRING: return index.hold(#format("`", s, "` points at bytes the sender keeps"))
+    if g == types.T_BUILTIN: return index.hold(#format("`", s, "` is a window onto bytes the sender keeps"))
+    if g == types.T_MAP: return index.hold(#format("`", s, "` is a map, whose table the sender goes on owning and writing"))
+    if g == types.T_CHANNEL: return index.hold(#format("`", s, "` is a channel, a mailbox with one address that is never copied"))
+    if g == types.T_TRAIT: return index.hold(#format("`", s, "` is a trait value, a view of an implementer the sender keeps"))
+    return ""
+
+// The first channel `ty` holds in its own storage, or NONE.
+u32 held_chan(^World w, u32 ty, i64 depth = 0):
+    if ty == NONE: return NONE
+    u32 r = w.t.resolve(ty)
+    if r == NONE || depth > 32: return NONE
+    u8 g = w.t.tag[r]
+    if g == types.T_CHANNEL: return r
+    if g == types.T_TUPLE || g == types.T_UNION:
+        for x in w.t.list(r):
+            u32 c = held_chan(w, x, depth + 1)
+            if c != NONE: return c
+    if g == types.T_DISTINCT || g == types.T_QUAL || g == types.T_ALIGNED: return held_chan(w, w.t.b[r], depth + 1)
+    return NONE
+
+// ERR0531 for a signature's parameter or return (`what`) holding a channel.
+void chan_by_value(^World w, u32 f, u32 lo, u32 hi, u32 ty, string8 what):
+    u32 c = held_chan(w, ty)
+    if c == NONE: return
+    string8 s = named(w, ty)
+    say(w, f, 0, lo, hi, 531, index.hold(#format("`", s, "` holds the channel `", cname(w, c), "`, and ", what, " by value is a copy of it: a second mailbox that producers and the consumer would each be holding a different one of")), index.hold(#format("take it as `^", s, "`, which reaches the one channel where it lives, or `ref ", s, "`")))
+
+// ERR0531 for value `v` (node `vn`) copied into a `ty`.
+bool chan_copied(^World w, ^Body b, u32 ty, Val v, u32 vn):
+    if v.ty == NONE || ty == NONE || ir.is_const(v.opd): return false
+    u32 c = held_chan(w, ty)
+    if c == NONE: return false
+    string8 s = named(w, ty)
+    err(w, b, vn, 531, index.hold(#format("this copies a `", s, "`, which holds the channel `", cname(w, c), "`: a channel is one mailbox with one address, and a copy is a second one the producers and the consumer would each hold a different one of")), index.hold(#format("reach it through a pointer — `^", s, " p = &x` — and `#send`, `#drain` or `#len` through `p`")))
+    return true
+
+// ERR0531 for a binding `bn` that copies a `ty` (a walk's element, a union arm's member).
+bool chan_bound(^World w, ^Body b, u32 bn, u32 ty, string8 help):
+    u32 c = held_chan(w, ty)
+    if c == NONE: return false
+    err_tok(w, b, bn, 531, index.hold(#format("this copies a `", named(w, ty), "`, which holds the channel `", cname(w, c), "`: a channel is one mailbox with one address, and a copy is a second one the producers and the consumer would each hold a different one of")), help)
+    return true
+
+// The verb a call `n` spells (`#send`, `#peek`, `#drain`, `#release`, the
+// retired `#emit`), or 255.
+u8 chan_verb(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if n == NONE || a.tag[n] != syntax.E_CALL: return 255
+    u32 cn = a.list(a.b[n])[0]
+    if a.tag[cn] != syntax.E_NAME: return 255
+    string8 s = spell(w, b, cn)
+    if s == "#send" || s == "#emit": return B_SEND
+    if s == "#peek": return B_PEEK
+    if s == "#drain": return B_DRAIN
+    if s == "#release": return B_RELEASE
+    return 255
+
+private bool inert(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u8 g = a.tag[n]
+    if g == syntax.E_NAME: return true
+    if g == syntax.E_FIELD || g == syntax.E_DEREF || g == syntax.E_INDEX: return inert(w, b, a.a[n])
+    return false
+
+// The channel a verb acts on (ERR0614), as a place; `chan` its type.
+private u32 subject(^World w, ^Body b, u32 n, string8 verb, ^u32 chan):
+    []u32 args = call_args(w, b, n)
+    if #len(args) == 0:
+        err(w, b, n, 614, index.hold(#format("`", verb, "` acts on a channel, and names none here")), index.hold(#format("write the channel first — `", verb, "(on_pressed, …)`")))
+        return NONE
+    u32 vn = arg_value(w, b, args[0])
+    Val v = expr(w, b, vn, NONE)
+    if v.ty == NONE: return NONE
+    u32 r = chan_of(w, v.ty)
+    if r == NONE:
+        err(w, b, vn, 614, index.hold(#format("`", verb, "` acts on a channel, and this is ", shown(w, final_ty(w, v)))), "name a channel declared with `#channel(…)`, at package level or as a member of a `type` — `b.clicked`, or `p.clicked` through a `^`")
+        return NONE
+    if !inert(w, b, vn) || ir.is_const(v.opd):
+        err(w, b, vn, 614, index.hold(#format("`", verb, "` acts on a channel **where it lives**, so its first argument is a place — a name, a member, or what a pointer points at — and this is a value computed on the spot")), "name the channel, or reach it through a `^` to what holds it")
+        return NONE
+    chan^ = r
+    return v.opd
+
+private string8 walk_key(^World w, ^Body b, u32 n, u32 r):
+    u32 vn = arg_value(w, b, call_args(w, b, n)[0])
+    if tree(w, b).tag[vn] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, vn), false) == NONE: return ""
+    return src(w, b, vn)
+
+private bool walking(^World w, ^Body b, u32 r, string8 k):
+    for x in b.chans:
+        if x.ty == r && x.at == k: return true
+    return false
+
+// `#send`, `#peek`, `#drain`, `#release` as a value (`stmt`: on a line of
+// its own). Only `#send` answers one.
+Val chan_call(^World w, ^Body b, u32 n, u8 m, string8 said, bool stmt):
+    []u32 args = call_args(w, b, n)
+    if said == "#emit": err(w, b, n, 805, "`#emit` is a retired spelling and `#send` is what replaces it", "write `#send`")
+    if m == B_SEND: return send(w, b, n)
+    if m == B_DRAIN && stmt:
+        discard(w, b, n)
+        return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    if m == B_RELEASE && stmt:
+        release(w, b, n)
+        return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    string8 verb = "#release" if m == B_RELEASE else ("#drain" if m == B_DRAIN else "#peek")
+    if m == B_RELEASE: err(w, b, n, 721, "`#release` gives a channel up and answers nothing, so it stands on a line of its own: there is no value here to store, pass, return or test", "write it as a statement — `#release(ch)` — where this thread is done consuming")
+    else if stmt: err(w, b, n, 721, "`#peek` walks what a channel holds and consumes nothing, so on a line of its own it does nothing at all", "walk it — `for id, pressed in #peek(on_pressed):` — or write `#drain(ch)` to discard what is queued")
+    else: err(w, b, n, 721, index.hold(#format("`", verb, "` answers a **walk**, which commits at its loop's exit — and there is no loop here, so there is nothing for it to commit at: a walk is not stored, passed, returned or indexed")), index.hold(#format("write it at the head of a `for` — `for a, b in ", verb, "(ch):` — and use the bindings inside")))
+    for g in args:
+        _ = expr(w, b, arg_value(w, b, g), NONE)
+    return bad()
+
+private Val send(^World w, ^Body b, u32 n):
+    []u32 args = call_args(w, b, n)
+    if b.tried == n: b.passed = true
+    u32 r = NONE
+    u32 p = subject(w, b, n, "#send", &r)
+    if p == NONE:
+        for g in args[1..<#len(args)]:
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+        return bad()
+    []u32 ps = w.t.list(r)
+    string8 nm = cname(w, r)
+    if #len(args) - 1 != #len(ps):
+        err(w, b, n, 601, index.hold(#format("`", nm, "` carries ", #len(ps), " field(s), and this `#send` gives ", #len(args) - 1)), index.hold(#format("write one argument per field: `", shown(w, r), "`")))
+        for g in args[1..<#len(args)]:
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+        return bad()
+    ref []u32 vals
+    ref []u32 moved
+    ref []u32 mops
+    bool ok = true
+    for j in 0..<#len(ps):
+        u32 vn = arg_value(w, b, args[j + 1])
+        Val v = coerce(w, b, expr(w, b, vn, ps[j]), ps[j], vn, "the channel's field")
+        if v.ty == NONE:
+            ok = false
+            continue
+        vals = #append(vals, v.opd)
+        u32 pr = w.t.resolve(ps[j])
+        if pr == NONE || w.t.tag[pr] != types.T_REF || ir.is_const(v.opd) || !inert(w, b, vn): continue
+        for e in moved:
+            if !overlaps(src(w, b, e), src(w, b, vn)): continue
+            string8 x = src(w, b, e)
+            string8 y = src(w, b, vn)
+            err(w, b, vn, 824, index.hold(#format("`", x, "` held a `ref` that this `#send` has already moved into the channel, so here `", y, "` would hand the consumer the same allocation a second time — two owners of one block, which it would free twice")), index.hold(#format("give each `ref` field its own allocation — `#make` a second one, or copy `", x, "` into one — and hand each to the `#send` once")))
+            label(w, b, e, "the `ref` moved here")
+            w.soft += 1
+            break
+        moved = #append(moved, vn)
+        mops = #append(mops, v.opd)
+    bool tried = b.tried == n
+    bool queue = w.t.b[r] != 0
+    if queue && !tried: err(w, b, n, 719, index.hold(#format("`", nm, "` is a queue, and a queue's `#send` fails when it is full — which the program decides what to do about, so a bare `#send` has said nothing about it")), index.hold(#format("fail with a code — `try ", src(w, b, n), " else FULL` — or handle it in a suite: `try … else:` and, on the next line, what to do")))
+    if !queue && tried: err(w, b, n, 719, index.hold(#format("`", nm, "` is a `latest` channel, whose `#send` replaces the value nobody took and never fails, so a `try` over it has nothing to try")), "write the `#send` on its own, without `try`")
+    if !ok: return bad()
+    u32 bt = u32(types.P_BOOL)
+    u32 full = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_SEND, r, n, full, NONE)
+    ir.arg(&b.f, p)
+    for x in vals:
+        ir.arg(&b.f, x)
+    if queue && tried: guarded(w, b, n, full)
+    for j in 0..<#len(moved):
+        u32 mt = b.f.place_ty[mops[j]]
+        _ = ir.op(&b.f, ir.O_SET, 0, mt, moved[j], mops[j], zero(w, mt))
+        _ = ir.op(&b.f, ir.O_MOVE, ir.MV_SEND, NONE, moved[j], NONE, mops[j], n)
+    return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+
+// Two places as written, one inside or equal to the other.
+private bool overlaps(string8 x, string8 y):
+    string8 s = x if #len(x) <= #len(y) else y
+    string8 l = y if #len(x) <= #len(y) else x
+    if !strings.starts_with(l, s): return false
+    return #len(l) == #len(s) || l[#len(s)] == '.' || l[#len(s)] == '['
+
+private void label(^World w, ^Body b, u32 n, string8 msg):
+    syntax.Ast a = tree(w, b)
+    w.d.label(b.file, b.base, a.lo[n] - b.base, a.hi[n] - b.base, msg)
+
+// `#drain(ch[, n])`'s count, as an `i64`, or NONE (also when absent).
+private bool limit(^World w, ^Body b, u32 n, ^u32 out):
+    []u32 args = call_args(w, b, n)
+    if #len(args) < 2: return true
+    u32 vn = arg_value(w, b, args[1])
+    u32 i64t = u32(types.P_I64)
+    Val v = coerce(w, b, expr(w, b, vn, i64t), i64t, vn, "how many to take")
+    if v.ty == NONE: return false
+    out^ = v.opd
+    return true
+
+private void nested(^World w, ^Body b, u32 n, u32 r):
+    if !walking(w, b, r, walk_key(w, b, n, r)): return
+    err(w, b, n, 823, index.hold(#format("a `for` around this is already walking `", cname(w, r), "`, and a channel's walk commits where it ends")), "take what you need in the one walk — `break` out of it, or `#drain(ch, n)` a bounded number — and walk again after it", "This one would consume entries the outer walk has read or will read, and the outer one's commit would then put them back")
+
+// Opens a walk of the channel at `p`: the snapshot, then a loop whose block
+// is open (with `i` advanced past the entry it binds) when this returns.
+private Commit begin(^World w, ^Body b, u32 n, u32 p, u32 r, bool take, u32 cnt, ^u32 lp):
+    u32 u64t = u32(types.P_U64)
+    u32 bt = u32(types.P_BOOL)
+    if take: _ = ir.op(&b.f, ir.O_MOVE, ir.MV_DRAIN, NONE, n, NONE, p, n)
+    u32 lim = temp(w, b, u64t, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_BEGIN, r, n, lim, NONE)
+    ir.arg(&b.f, p)
+    ir.arg(&b.f, ir.konst(w.k.boolean(&w.t, take)))
+    if cnt != NONE: ir.arg(&b.f, cnt)
+    u32 i = temp(w, b, u64t, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_HEAD, r, n, i, NONE)
+    ir.arg(&b.f, p)
+    ir.arg(&b.f, lim)
+    lp^ = open(w, b, ir.O_LOOP, n, NONE, true)
+    u32 c = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, bt, n, c, i, lim)
+    u32 t = open(w, b, ir.O_IF, n, c, false)
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, n, NONE, 1)
+    close(w, b, t)
+    u32 ok = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_READY, r, n, ok, NONE)
+    ir.arg(&b.f, p)
+    ir.arg(&b.f, i)
+    u32 no = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_UN, ir.U_NOT, bt, n, no, ok)
+    u32 t2 = open(w, b, ir.O_IF, n, no, false)
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, n, NONE, 1)
+    close(w, b, t2)
+    return Commit(p, i, lim, r, take, n)
+
+private u32 ch_field(^World w, ^Body b, Commit c, u32 k, u32 ty):
+    u32 x = temp(w, b, ty, c.node)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_FIELD, c.ty, c.node, x, NONE)
+    ir.arg(&b.f, c.ch)
+    ir.arg(&b.f, c.i)
+    ir.arg(&b.f, ir.konst(w.k.small(&w.t, i64(k))))
+    return x
+
+private void advance(^World w, ^Body b, Commit c):
+    u32 u64t = u32(types.P_U64)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, u64t, c.node, c.i, c.i, ir.konst(w.k.small(&w.t, 1)))
+
+void commit(^World w, ^Body b, Commit c):
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_COMMIT, c.ty, c.node, NONE, NONE)
+    ir.arg(&b.f, c.ch)
+    ir.arg(&b.f, c.i)
+    ir.arg(&b.f, c.lim)
+    ir.arg(&b.f, ir.konst(w.k.boolean(&w.t, c.take)))
+
+// `#drain(ch[, n])` alone: what is queued is dropped, each `ref` freed.
+private void discard(^World w, ^Body b, u32 n):
+    u32 r = NONE
+    u32 p = subject(w, b, n, "#drain", &r)
+    if p == NONE: return
+    u32 cnt = NONE
+    if !limit(w, b, n, &cnt): return
+    nested(w, b, n, r)
+    u32 lp = NONE
+    Commit c = begin(w, b, n, p, r, true, cnt, &lp)
+    []u32 ps = w.t.list(r)
+    for k in 0..<#len(ps):
+        u32 pr = w.t.resolve(ps[k])
+        if pr == NONE || w.t.tag[pr] != types.T_REF: continue
+        u32 x = ch_field(w, b, c, u32(k), ps[k])
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_DELETE, NONE, n, NONE, NONE)
+        ir.arg(&b.f, x)
+    advance(w, b, c)
+    close(w, b, lp)
+    commit(w, b, c)
+
+private void release(^World w, ^Body b, u32 n):
+    u32 r = NONE
+    u32 p = subject(w, b, n, "#release", &r)
+    if p == NONE: return
+    []u32 args = call_args(w, b, n)
+    if #len(args) > 1:
+        err(w, b, arg_value(w, b, args[1]), 614, "`#release` takes the channel and nothing else", "write `#release(ch)`")
+        return
+    if walking(w, b, r, walk_key(w, b, n, r)):
+        err(w, b, n, 823, index.hold(#format("a `for` around this is walking `", cname(w, r), "`, and `#release` would give the channel up while the walk still holds it: the walk's commit, at the loop's exit, is this thread consuming again")), index.hold(#format("release it after the `for` — the walk ends, then `#release(", src(w, b, arg_value(w, b, args[0])), ")`")))
+        return
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_RELEASE, r, n, NONE, NONE)
+    ir.arg(&b.f, p)
+
+// `#len(ch)`.
+Val chan_len(^World w, ^Body b, u32 n, Val v, u32 vn):
+    u32 i64t = u32(types.P_I64)
+    u32 t = temp(w, b, i64t, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_CH_LEN, chan_of(w, v.ty), n, t, NONE)
+    ir.arg(&b.f, spill(w, b, v, vn))
+    return value(t, i64t)
+
+// ERR0720: `for x in ch`.
+bool chan_iterated(^World w, ^Body b, u32 it, u32 ty):
+    u32 r = chan_of(w, ty)
+    if r == NONE: return false
+    string8 s = src(w, b, it)
+    err(w, b, it, 720, index.hold(#format("`", cname(w, r), "` is a channel, and walking one either takes what it holds or leaves it for later — which a `for` over the channel itself does not say")), index.hold(#format("consuming is written: `#peek(", s, ")` to look, `#drain(", s, ")` to take")))
+    return true
+
+// `for … in #peek(ch)` / `#drain(ch[, n])`: each entry queued when the walk
+// began, its fields bound; a `#drain` commits at every exit of the loop.
+void chan_loop(^World w, ^Body b, u32 n, []u32 binds, u32 it):
+    syntax.Ast a = tree(w, b)
+    bool take = chan_verb(w, b, it) == B_DRAIN
+    string8 verb = "#drain" if take else "#peek"
+    []u32 args = call_args(w, b, it)
+    if !take && #len(args) > 1: err(w, b, it, 601, "`#peek` walks everything queued and consumes nothing, so there is no count to give it", "write `#peek(ch)`, and `break` out of the loop to stop early")
+    if #len(args) > 2: err(w, b, it, 601, index.hold(#format("`", verb, "` takes the channel and, for `#drain`, at most how many to take")))
+    u32 r = NONE
+    u32 p = subject(w, b, it, verb, &r)
+    if p == NONE: return
+    u32 cnt = NONE
+    if take && !limit(w, b, it, &cnt): return
+    nested(w, b, it, r)
+    []u32 ps = w.t.list(r)
+    ref []u32 tys
+    for x in ps:
+        u32 pr = w.t.resolve(x)
+        if !take && pr != NONE && w.t.tag[pr] == types.T_REF: tys = #append(tys, w.t.slice_of(run_shape(w, x).elem))
+        else: tys = #append(tys, x)
+    bool whole = #len(binds) == 1 && #len(tys) >= 2
+    if !whole && #len(binds) != #len(tys):
+        if #len(tys) == 0 && #len(binds) == 1:
+            if spell(w, b, binds[0]) != "_": err_tok(w, b, binds[0], 503, "this channel carries no fields, so a walk of it has nothing to bind — each step is one message that arrived", "write `for _ in #drain(tick):`")
+        else:
+            u32 hd = a.a[n]
+            err(w, b, hd, 503, index.hold(#format("a channel walks as its fields, and this one has ", #len(tys), ": the header binds ", #len(binds))), index.hold(#format("bind all ", #len(tys), " — one name per field, in order — or one name for the whole message as a tuple")))
+            return
+    for x in binds:
+        if a.a[x] == 1: err_tok(w, b, x, 709, "a channel's slot is written again by a producer once the walk commits, so there is no storage here to take the address of that outlives the step", index.hold(#format("bind it by value — `for ", spell(w, b, x), " in …`")))
+    u32 lp = NONE
+    Commit c = begin(w, b, it, p, r, take, cnt, &lp)
+    b.commits = #append(b.commits, c)
+    b.defers = #append(b.defers, Defer(NONE, b.depth, false, #len(b.commits) - 1, false))
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    scope_in(w, b)
+    ref []u32 xs
+    for k in 0..<#len(tys):
+        if whole || k < #len(binds) && spell(w, b, binds[k]) != "_": xs = #append(xs, ch_field(w, b, c, u32(k), tys[k]))
+        else: xs = #append(xs, NONE)
+    if whole:
+        u32 tt = w.t.tuple(tys)
+        u32 m = temp(w, b, tt, it)
+        _ = ir.op(&b.f, ir.O_MAKE, 0, tt, it, m, NONE)
+        for x in xs:
+            ir.arg(&b.f, x)
+        bind(w, b, binds[0], tt, m)
+    else if #len(tys) > 0:
+        for k in 0..<#len(binds):
+            if xs[k] != NONE: bind(w, b, binds[k], tys[k], xs[k])
+    for j in 0..<#len(b.locals):
+        if b.locals[j].depth == b.depth: b.locals[j].read = true
+    advance(w, b, c)
+    b.chans = #append(b.chans, ChWalk(r, walk_key(w, b, it, r)))
+    block(w, b, a.b[n])
+    #truncate(b.chans, #len(b.chans) - 1)
+    scope_out(w, b)
+    close(w, b, bl)
+    close(w, b, lp)
+    #truncate(b.defers, #len(b.defers) - 1)
+    commit(w, b, c)

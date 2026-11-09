@@ -19,6 +19,7 @@ import "core:io"
 import "core:os"
 import "core:os/fs"
 import "core:os/proc"
+import "core:path"
 import "core:strings"
 
 // Whether `-v` was given: each command is echoed before it runs.
@@ -103,11 +104,25 @@ void say_error(string8 text):
 
 // `error: <text>` on standard error, and the process ends with status 1.
 void die(string8 text):
+    drop_c()
     colour()
     _ = io.flush(io.stdout())
     fmt.eprintln(g_red, "error:", g_reset, " ", text)
     _ = io.flush(io.stderr())
     os.quit_with(1)
+
+// Generated C written only to hand to cc (P10j): removed once cc has run,
+// whether it built or not (`drop_c`; `die` too). `--keep-c` registers none.
+private ref []string8 g_c_trash
+
+void c_trash(string8 p):
+    g_c_trash = #append(g_c_trash, txt(#format(p)))
+
+void drop_c():
+    for p in g_c_trash:
+        if is_dir(p): remove_tree_quietly(p)
+        else if exists(p): remove_quietly(p)
+    #truncate(g_c_trash, 0)
 
 // Why the program at `program`, which ended with status 127 (the shell's
 // "could not run"), could not be started, or "" when it is there and
@@ -141,6 +156,11 @@ void rule():
 type Command:
     ref []string8 words
     bool echoed
+    // A compiler's: past `ARGS_WORDS` words or `ARGS_BYTES` bytes, the words
+    // after its first `args_from` go to `args_file`, read as `@<file>`
+    // (`fitted`). 0: never.
+    i64 args_from
+    string8 args_file
 
 Command command(string8 program):
     ref []string8 w = #make([]string8, 0)
@@ -148,6 +168,8 @@ Command command(string8 program):
     Command c
     c.words = w
     c.echoed = true
+    c.args_from = 0
+    c.args_file = ""
     return c
 
 Command command_of([]string8 words):
@@ -157,6 +179,8 @@ Command command_of([]string8 words):
     Command c
     c.words = all
     c.echoed = true
+    c.args_from = 0
+    c.args_file = ""
     return c
 
 void add(^Command c, string8 word):
@@ -180,6 +204,103 @@ string8 shown(Command c):
     return txt(j)
 
 
+const i64 ARGS_WORDS = 128
+const i64 ARGS_BYTES = 8000
+
+// `c` given a response file: its first `from` words (the compiler) stay on
+// the line when it is long.
+void respond(^Command c, i64 from, string8 file):
+    c.args_from = from
+    c.args_file = file
+
+// Whether `c` goes through its response file when started.
+bool long_command(Command c):
+    if c.args_from <= 0 || #len(c.args_file) == 0: return false
+    if c.args_from >= i64(#len(c.words)): return false
+    if i64(#len(c.words)) > ARGS_WORDS: return true
+    i64 bytes = 0
+    for w in c.words:
+        bytes += i64(#len(w)) + 1
+    return bytes > ARGS_BYTES
+
+// `c` as started: when `long_command`, its words after `args_from` written
+// to `args_file` and `@<file>` in their place. `why`: "" or why the file
+// could not be written.
+(Command fit, string8 why) fitted(Command c):
+    if !long_command(c): return (c, "")
+    i64 n = i64(#len(c.words))
+    bool zig = zig_program(c.words[0])
+    if !fits_response(c.words[c.args_from..<n], zig): return (c, "")
+    string8 text = response_text(c.words[c.args_from..<n], zig)
+    try fs.write_file(c.args_file, text) else code:
+        return (c, txt(#format("cannot write ", c.args_file, ": ", os.message(code))))
+    ref []string8 head = #make([]string8, 0)
+    for i in 0..<c.args_from:
+        head = #append(head, c.words[i])
+    Command f = command_of(head[:])
+    add(&f, txt(#format("@", c.args_file)))
+    f.echoed = c.echoed
+    return (f, "")
+
+// Whether `program` is zig (`zig cc`), whose response-file reader is not GCC's.
+bool zig_program(string8 program):
+    string8 b = path.base(program)
+    return strings.starts_with(b, "zig")
+
+// `words` as the compiler reads them back from `@<file>`, a word a line.
+//
+// GCC's reader (libiberty's `buildargv`), clang's (LLVM's GNU tokenizer) and
+// tcc's take a word in double quotes with `\"` and `\\` inside: every word is
+// written so. zig's (`std.process.Args`' general iterator, on every host) is
+// Windows' rule — the one `CommandLineToArgvW` and Rust's `Command` quote for —
+// where a backslash is itself unless quotes follow it: a word is quoted
+// when it is empty, holds whitespace or starts a `#` comment, and a run of
+// backslashes is doubled only in front of a `"`. zig also reads `'` as a
+// quote and no escape gives it back, so a word holding one cannot be
+// written for zig (`fits_response`).
+string8 response_text([]string8 words, bool zig = false):
+    strings.Builder b = strings.builder(4096)
+    for w in words:
+        if zig: zig_word(&b, w)
+        else:
+            strings.append_char(&b, '"')
+            for ch in w:
+                if ch == '"' || ch == '\\': strings.append_char(&b, '\\')
+                strings.append_char(&b, ch)
+            strings.append_char(&b, '"')
+        strings.append_char(&b, '\n')
+    return txt(strings.finish(&b))
+
+private void zig_word(^strings.Builder b, string8 w):
+    bool quote = #len(w) == 0 || w[0] == '#'
+    for ch in w:
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r': quote = true
+    if quote: strings.append_char(b, '"')
+    i64 slashes = 0
+    for ch in w:
+        if ch == '\\':
+            slashes += 1
+        else:
+            if ch == '"':
+                for _ in 0..<slashes + 1: strings.append_char(b, '\\')
+            slashes = 0
+        strings.append_char(b, ch)
+    if quote:
+        for _ in 0..<slashes: strings.append_char(b, '\\')
+        strings.append_char(b, '"')
+
+// Whether every word can be written to `@<file>` for this compiler: for zig,
+// none may hold a `'`.
+bool fits_response([]string8 words, bool zig):
+    if !zig: return true
+    for w in words:
+        if strings.has_byte(w, '\''): return false
+    return true
+
+// Why `c` cannot be started: too many words.
+string8 too_long(Command c):
+    return txt(#format("a command of ", #len(c.words), " words is more than the ", proc.ARG_CAP, " this driver can start: ", shown(c)))
+
 private void echo(Command c):
     if g_verbose && c.echoed:
         note(txt(#format("  $ ", shown(c))))
@@ -197,10 +318,16 @@ i32 run(Command c):
 
 // `run`, not echoed even under `-v`.
 i32 run_quietly(Command c):
-    if #len(c.words) > proc.ARG_CAP:
-        die(txt(#format("a command of ", #len(c.words), " words is more than the ", proc.ARG_CAP, " this driver can start: ", c.words[0])))
+    (Command f, string8 why) = fitted(c)
+    if #len(why) > 0: die(why)
+    if #len(f.words) > proc.ARG_CAP: die(too_long(f))
     _ = io.flush(io.stdout())
     _ = io.flush(io.stderr())
+    i32 st = exec_status(f)
+    if long_command(c): remove_quietly(c.args_file)
+    return st
+
+private i32 exec_status(Command c):
     try proc.Ended e = proc.exec(c.words[:]) else:
         return 127
     return shell_status(e)
@@ -227,10 +354,11 @@ private Captured capture_with(Command c, proc.Errors errors, string8 input):
     r.status = 127
     r.out = #make([]char8, 0)
     r.started = false
-    if #len(c.words) > proc.ARG_CAP: return r
+    (Command f, string8 why) = fitted(c)
+    if #len(why) > 0 || #len(f.words) > proc.ARG_CAP: return r
     _ = io.flush(io.stdout())
     _ = io.flush(io.stderr())
-    try proc.Duplex d = proc.duplex(c.words[:], errors) else:
+    try proc.Duplex d = proc.duplex(f.words[:], errors) else:
         return r
     r.started = true
     []char8 bytes = strings.bytes(input)
@@ -259,6 +387,7 @@ private Captured capture_with(Command c, proc.Errors errors, string8 input):
     try proc.Ended e = proc.finish(&d, 0 - 1) else:
         return r
     r.status = shell_status(e)
+    if long_command(c): remove_quietly(c.args_file)
     return r
 
 // The first line `c` prints, trimmed; empty when it fails or says nothing.

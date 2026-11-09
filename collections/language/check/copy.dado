@@ -1,0 +1,166 @@
+// Copying into existing storage: `dst[i..<j] = src`
+// copies an exact window, `#copy_into(dst, src)` the shorter of the two runs
+// and answers the count. One op, `O_INTRINSIC B_COPY_INTO` over two views,
+// memmove's semantics; `c` 1: the lengths must match (a trap).
+package check
+
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+
+// dst = how many elements moved from view args[1] into view args[0].
+const u8 B_COPY_INTO = 130
+
+// One side of a copy: a view, its element, its length when it folds (-1),
+// the `O_VIEW` that made it.
+private type CopySide:
+    u32 v
+    u32 elem
+    i64 len
+    u32 at
+
+// `dst[…] = src`.
+void copy_assign(^World w, ^Body b, u32 n, u32 pn, u32 vn):
+    CopySide d = copy_side(w, b, pn, true, "the window assigned to")
+    CopySide s = copy_side(w, b, vn, false, "the value assigned to a window")
+    if d.v == NONE || s.v == NONE: return
+    d.v = copy_again(w, b, d, vn)
+    if !copy_elem_ok(w, b, vn, d.elem, s.elem): return
+    if d.len >= 0 && s.len >= 0 && d.len != s.len:
+        err(w, b, n, 617, index.hold(#format("this window holds ", d.len, " element(s) and the run assigned to it ", s.len, ", so there is no one way to fill it")), "assign a run of the window's length, or window either side to the other's — `#copy_into(dst, src)` copies the shorter of the two and answers how many", "A slice assignment copies an **exact** window: every element of it is written and nothing past it, so both lengths are the same number. Here both are known before the program runs, so the mismatch is refused now rather than trapped later")
+        return
+    u32 ex = 0 if d.len >= 0 && s.len >= 0 else 1
+    if d.len == 0 && s.len == 0: return
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_COPY_INTO, u32(types.P_I64), n, NONE, NONE, NONE, ex)
+    ir.arg(&b.f, d.v)
+    ir.arg(&b.f, s.v)
+
+// `#copy_into(dst, src)`: the count, which folds when both lengths do.
+Val copy_into(^World w, ^Body b, u32 n):
+    []u32 args = call_args(w, b, n)
+    if #len(args) != 2:
+        err(w, b, n, 601, index.hold(#format("`#copy_into` takes two arguments, the run written into and the run read from, and this passes ", #len(args))))
+        return bad()
+    u32 dn = arg_value(w, b, args[0])
+    u32 sn = arg_value(w, b, args[1])
+    CopySide d = copy_side(w, b, dn, true, "what `#copy_into` writes into")
+    CopySide s = copy_side(w, b, sn, false, "what `#copy_into` reads from")
+    if d.v == NONE || s.v == NONE: return bad()
+    d.v = copy_again(w, b, d, sn)
+    if !copy_elem_ok(w, b, sn, d.elem, s.elem): return bad()
+    u32 i64t = u32(types.P_I64)
+    if d.len >= 0 && s.len >= 0:
+        i64 m = d.len if d.len < s.len else s.len
+        if m > 0:
+            _ = ir.op(&b.f, ir.O_INTRINSIC, B_COPY_INTO, i64t, n, NONE, NONE, NONE, 0)
+            ir.arg(&b.f, d.v)
+            ir.arg(&b.f, s.v)
+        return value(ir.konst(w.k.small(&w.t, m)), i64t)
+    u32 t = temp(w, b, i64t, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_COPY_INTO, i64t, n, t, NONE, NONE, 0)
+    ir.arg(&b.f, d.v)
+    ir.arg(&b.f, s.v)
+    return value(t, i64t)
+
+// `n` as a view over a run of elements; the destination must be writable.
+private CopySide copy_side(^World w, ^Body b, u32 n, bool dst, string8 what):
+    syntax.Ast a = tree(w, b)
+    u32 at0 = ir.count(&b.f)
+    bool win = a.tag[n] == syntax.E_SLICE
+    bool cp = false
+    Val v = bad()
+    if win:
+        v = window(w, b, n)
+        cp = b.cpath
+    else if dst && (a.tag[n] == syntax.E_NAME || a.tag[n] == syntax.E_FIELD || a.tag[n] == syntax.E_INDEX || a.tag[n] == syntax.E_DEREF):
+        v = place(w, b, n, false)
+        cp = b.cpath
+    else: v = finish(w, b, expr(w, b, n, NONE), n)
+    if v.ty == NONE: return CopySide(NONE, NONE, -1, NONE)
+    if v.kind != V_VAL:
+        err(w, b, n, 619, index.hold(#format(what, " is a run of elements; this is not a value")))
+        return CopySide(NONE, NONE, -1, NONE)
+    Run k = run_shape(w, v.ty)
+    if k.kind == RK_TEXT || is_map(w, v.ty) || k.kind == RK_NONE || k.kind == RK_ONE || k.kind == RK_PTR:
+        string8 why = index.hold(#format(shown(w, v.ty), " is not one"))
+        string8 help = "copy between arrays, windows and `ref []T` runs of one element type"
+        if k.kind == RK_TEXT:
+            why = index.hold(#format("this is ", shown(w, v.ty), ", which is text: a string is immutable and shares its bytes"))
+            help = "copy its bytes as a run — `s.bytes()` in a script, or a `[]char8` window over an array in Dado — or build the text with `#format`"
+        if is_map(w, v.ty):
+            why = index.hold(#format("this is ", shown(w, v.ty), ", a map, whose entries have no positions to copy into or out of"))
+            help = "walk it with `for k, v in m:` and write each entry"
+        if k.kind == RK_PTR:
+            why = index.hold(#format(shown(w, v.ty), " carries no extent"))
+            help = "window it with an end first — `p[..<n]`"
+        err(w, b, n, 619, index.hold(#format(what, " is a run of elements — an array, a window or a `ref []T` — and ", why)), help, "A copy moves elements by position, so both sides are runs of one element type whose lengths the copy can read. Text and maps are refused: a string is immutable, and a map has no positions")
+        return CopySide(NONE, NONE, -1, NONE)
+    u32 elem = k.elem
+    if dst && (cp || top_const(w, elem)):
+        err(w, b, n, 606, index.hold(#format(what, " is ", shown(w, copy_win_ty(w, v, k, cp)), ", whose elements are `const`, and a `const` is not something to write to")), "copy into a run that does not say `const`, or drop the word from the declaration that does", "The word says nothing is written through this access path, and a copy writes every element it moves")
+        return CopySide(NONE, NONE, -1, NONE)
+    if dst && k.kind == RK_FIXED && !win && ir.is_const(v.opd):
+        err(w, b, n, 606, index.hold(#format(what, " is a constant, and a constant has no storage to write into")), "copy into a variable")
+        return CopySide(NONE, NONE, -1, NONE)
+    if dst && !win && !ir.is_const(v.opd) && in_copied_self(w, b, v.opd):
+        err(w, b, n, 615, index.hold(#format("`", src(w, b, n), "` is part of `self`, ", COPY_LOST(w, b))), self_help(w, b))
+        return CopySide(NONE, NONE, -1, NONE)
+    if win: return CopySide(v.opd, elem, copy_len(w, b, at0, v.opd), copy_view_op(b, at0, v.opd))
+    i64 len = k.count if k.kind == RK_FIXED else -1
+    u32 p = spill(w, b, v, n)
+    u32 t = temp(w, b, w.t.slice_of(elem), n)
+    u32 iv = ir.op(&b.f, ir.O_VIEW, 0, w.t.slice_of(elem), n, t, p, NONE, NONE)
+    return CopySide(t, elem, len, iv)
+
+// A source that calls may move the destination's block: its window is
+// taken again after it, so the copy writes where the block is then.
+private u32 copy_again(^World w, ^Body b, CopySide d, u32 sn):
+    if d.at == NONE || !calls_in(w, b, sn): return d.v
+    u32 i = d.at
+    u32 t = temp(w, b, b.f.ty_of[i], b.f.node[i])
+    _ = ir.op(&b.f, ir.O_VIEW, 0, b.f.ty_of[i], b.f.node[i], t, b.f.a[i], b.f.b[i], b.f.c[i])
+    for k in b.f.alo[i]..<b.f.ahi[i]:
+        ir.arg(&b.f, b.f.args[k])
+    return t
+
+private u32 copy_view_op(^Body b, u32 at0, u32 t):
+    u32 i = ir.count(&b.f)
+    for i > at0:
+        i -= 1
+        if b.f.op[i] == ir.O_VIEW && b.f.dst[i] == t: return i
+    return NONE
+
+private u32 copy_win_ty(^World w, Val v, Run k, bool cp):
+    if cp && !top_const(w, k.elem): return w.t.slice_of(w.t.qual(1, k.elem))
+    return v.ty
+
+// The length of the window the `O_VIEW` writing `t` makes, when it folds; -1.
+private i64 copy_len(^World w, ^Body b, u32 at0, u32 t):
+    u32 i = ir.count(&b.f)
+    for i > at0:
+        i -= 1
+        if b.f.op[i] != ir.O_VIEW || b.f.dst[i] != t: continue
+        Run k = run_shape(w, b.f.place_ty[b.f.a[i]])
+        if b.f.ahi[i] > b.f.alo[i]: k = Run(RK_FIXED, NONE, 1)
+        i64 l = 0
+        i64 h = k.count
+        if b.f.c[i] == NONE && k.kind != RK_FIXED: return -1
+        if b.f.b[i] != NONE:
+            u32 lo = folded(w, b, at0, b.f.b[i])
+            if lo == NONE: return -1
+            l = i64(w.k.w0[lo])
+        if b.f.c[i] != NONE:
+            u32 hi = folded(w, b, at0, b.f.c[i])
+            if hi == NONE: return -1
+            h = i64(w.k.w0[hi])
+        return h - l if h >= l else -1
+    return -1
+
+// The source's elements are the destination's type.
+private bool copy_elem_ok(^World w, ^Body b, u32 n, u32 de, u32 se):
+    u32 x = w.t.bare(de)
+    u32 y = w.t.bare(se)
+    if x == y || w.t.resolve(x) == w.t.resolve(y) && w.t.resolve(x) != NONE: return true
+    err(w, b, n, 618, index.hold(#format("this copies ", shown(w, y), " elements into a run of ", shown(w, x), ", and a copy converts nothing")), "convert the elements one at a time, or copy from a run of the destination's element type", "A copy moves elements as they are, by memory, so the source's element type is the destination's; a conversion would be a loop, and a copy never hides one")
+    return false

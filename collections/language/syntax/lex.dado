@@ -1,0 +1,869 @@
+// The lexer: dado_lex's rules over flat arrays. Never stops at an error;
+// the stream ends in one EOF and INDENT/DEDENT balance.
+package syntax
+
+// A diagnostic. Its message is `text[msg..<mend]`, its help `text[help..<stop]`.
+type Diag:
+    u16 code
+    u32 start
+    u32 end
+    u32 msg
+    u32 mend
+    u32 help
+    u32 stop
+
+// One file's tokens (struct of arrays) and lex diagnostics.
+type Tokens:
+    ref []u8 tag
+    ref []u32 start
+    ref []u32 end
+    // Interned ids of IDENT and HASH_NAME tokens (`intern`), else empty.
+    ref []u32 sym
+    // Comments and blank runs: (start, end) pairs in source order. A comment's
+    // text starts with `/`; a blank run (merged, newlines included) does not.
+    ref []u32 trivia
+    ref []Diag diags
+    ref []char8 text
+
+    void free(^self):
+        #delete(self.tag)
+        #delete(self.start)
+        #delete(self.end)
+        #delete(self.sym)
+        #delete(self.trivia)
+        #delete(self.diags)
+        #delete(self.text)
+
+    i64 count(^self):
+        return #len(self.tag)
+
+    string8 message(^self, Diag d):
+        return string8(self.text[i64(d.msg)..<i64(d.mend)])
+
+    string8 help(^self, Diag d):
+        return string8(self.text[i64(d.help)..<i64(d.stop)])
+
+// Lexes `src`, answering its tokens and diagnostics. The caller frees them.
+Tokens lex(string8 src):
+    Lexer l
+    l.src = src
+    l.joined = -1
+    i64 room = #len(src) / 5 + 16
+    l.tag = #reserve(l.tag, room)
+    l.start = #reserve(l.start, room)
+    l.end = #reserve(l.end, room)
+    l.trivia = #reserve(l.trivia, #len(src) / 64 + 8)
+    l.indents = #append(l.indents, 0)
+    l.run()
+    #delete(l.indents)
+    #delete(l.opens)
+    #delete(l.regions)
+    Tokens t
+    t.tag = l.tag
+    t.start = l.start
+    t.end = l.end
+    t.trivia = l.trivia
+    t.diags = l.diags
+    t.text = l.text
+    return t
+
+// Where the token at `start` with tag `t` ends.
+u32 token_end(string8 src, u8 t, u32 start):
+    if t <= EOF:
+        return start
+    Lexer l
+    l.src = src
+    l.pos = i64(start)
+    l.quiet = true
+    switch t:
+        case IDENT, HASH_NAME, KW_PACKAGE, KW_IMPORT, KW_TYPE, KW_DISTINCT, KW_CONST, KW_ENUM, KW_FOREIGN, KW_VIEW, KW_FOR, KW_IN, KW_IF, KW_ELSE, KW_RETURN, KW_BREAK, KW_CONTINUE, KW_ASYNC, KW_AWAIT, KW_SUPER:
+            l.pos += 1
+            l.word_tail()
+        case INT, FLOAT:
+            l.number()
+        case STRING:
+            if l.at(1) == '"' && l.at(2) == '"':
+                l.multiline_string()
+            else:
+                l.string()
+        case CHAR:
+            l.character()
+        else:
+            string8 sp = spelling(t)
+            return start + u32(#len(sp))
+    u32 end = u32(l.pos)
+    #delete(l.tag)
+    #delete(l.start)
+    #delete(l.end)
+    return end
+
+// The token at byte `at`: the first whose end is past it, so the one holding
+// `at` or else the next (#len(t.tag) past the last). One cursor for the LSP,
+// `fmt` and the item hashes.
+i64 token_at(^Tokens t, u32 at):
+    i64 i = 0
+    i64 h = #len(t.tag)
+    for i < h:
+        i64 m = (i + h) / 2
+        if t.end[m] <= at: i = m + 1
+        else: h = m
+    return i
+
+private bool ident_start(char8 c):
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+
+private bool ident_continue(char8 c):
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+
+private bool digit(char8 c):
+    return c >= '0' && c <= '9'
+
+private bool hex(char8 c):
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+
+private i64 utf8_width(char8 c):
+    u8 b = u8(c)
+    if b < 0xC0: return 1
+    if b < 0xE0: return 2
+    if b < 0xF0: return 3
+    return 4
+
+private bool in_base(char8 c, u32 radix):
+    if radix == 16: return hex(c)
+    if radix == 2: return c == '0' || c == '1'
+    return c >= '0' && c <= '7'
+
+private const u8 CONTENT = 0
+private const u8 SKIPPED = 1
+private const u8 ENDED = 2
+
+private type Lexer:
+    string8 src
+    i64 pos
+    bool quiet
+    bool emitted
+    i64 joined
+    ref []u8 tag
+    ref []u32 start
+    ref []u32 end
+    ref []u32 indents
+    ref []u32 opens
+    // Pairs: the bracket depth a lambda body is laid out at, and where its
+    // levels begin in `indents`.
+    ref []u32 regions
+    ref []u32 trivia
+    ref []Diag diags
+    ref []char8 text
+
+    void note(^self, i64 s, i64 e):
+        if self.quiet: return
+        i64 n = #len(self.trivia)
+        if self.src[s] != '/' && n > 0 && self.trivia[n - 1] == u32(s) && self.src[i64(self.trivia[n - 2])] != '/':
+            self.trivia[n - 1] = u32(e)
+            return
+        self.trivia = #append(self.trivia, u32(s))
+        self.trivia = #append(self.trivia, u32(e))
+
+    void line_comment(^self):
+        i64 s = self.pos
+        self.skip_line()
+        i64 e = self.pos
+        if e > s && self.src[e - 1] == '\r': e -= 1
+        self.note(s, e)
+
+    char8 at(^self, i64 k):
+        i64 i = self.pos + k
+        if i >= #len(self.src): return 0
+        return self.src[i]
+
+    bool more(^self):
+        return self.pos < #len(self.src)
+
+    void push(^self, u8 t, i64 at):
+        if t == NEWLINE:
+            self.emitted = false
+        else if t > EOF:
+            self.emitted = true
+        self.tag = #append(self.tag, t)
+        self.start = #append(self.start, u32(at))
+        self.end = #append(self.end, u32(at) if t <= EOF else u32(self.pos))
+
+    u8 last(^self, i64 back):
+        i64 i = #len(self.tag) - 1 - back
+        if i < 0: return EOF
+        return self.tag[i]
+
+    // -- diagnostics ------------------------------------------------------
+
+    bool begin(^self, u16 code, i64 s, i64 e):
+        if self.quiet: return false
+        u32 m = u32(#len(self.text))
+        self.diags = #append(self.diags, Diag(code, u32(s), u32(e), m, m, m, m))
+        return true
+
+    void say(^self, string8 s):
+        if self.quiet: return
+        self.text = #append(self.text, ..s)
+        i64 d = #len(self.diags) - 1
+        self.diags[d].mend = u32(#len(self.text))
+        self.diags[d].help = self.diags[d].mend
+        self.diags[d].stop = self.diags[d].help
+
+    void num(^self, i64 n):
+        if self.quiet: return
+        u64 v = u64(n)
+        u64 p = 1
+        for p * 10 <= v:
+            p *= 10
+        for p > 0:
+            self.text = #append(self.text, char8(u8('0') + u8(v / p % 10)))
+            p /= 10
+        i64 d = #len(self.diags) - 1
+        self.diags[d].mend = u32(#len(self.text))
+        self.diags[d].help = self.diags[d].mend
+        self.diags[d].stop = self.diags[d].help
+
+    void say_help(^self, string8 s):
+        if self.quiet: return
+        self.text = #append(self.text, ..s)
+        i64 d = #len(self.diags) - 1
+        self.diags[d].stop = u32(#len(self.text))
+
+    void fail(^self, u16 code, i64 s, i64 e, string8 m):
+        if self.begin(code, s, e):
+            self.say(m)
+
+    // -- the loop ---------------------------------------------------------
+
+    void run(^self):
+        bool line_start = true
+        for self.more():
+            if line_start && self.layout_live():
+                u8 r = self.line_start()
+                if r == SKIPPED: continue
+                if r == ENDED: break
+                line_start = false
+            else if line_start:
+                line_start = false
+            if self.scan():
+                line_start = true
+        self.finish()
+
+    // Leading whitespace of a fresh line: INDENT/DEDENT, or a skipped line.
+    u8 line_start(^self):
+        i64 begin = self.pos
+        u32 width = 0
+        bool tab = false
+        for self.more():
+            char8 c = self.src[self.pos]
+            if c == ' ':
+                width += 1
+                self.pos += 1
+            else if c == '\t':
+                if !tab:
+                    tab = true
+                    self.fail(102, self.pos, self.pos + 1, "tab in indentation; Dado indents with spaces")
+                width += 1
+                self.pos += 1
+            else:
+                break
+        if !self.more(): return ENDED
+        char8 c = self.src[self.pos]
+        if c == '\n' || c == '\r':
+            self.pos += 1
+            self.note(begin, self.pos)
+            return SKIPPED
+        if c == '/' && self.at(1) == '/':
+            self.line_comment()
+            self.end_skipped_line()
+            return SKIPPED
+        if c == '/' && self.at(1) == '*':
+            self.block_comment()
+            if self.rest_blank():
+                for self.more() && (self.src[self.pos] == ' ' || self.src[self.pos] == '\t' || self.src[self.pos] == '\r'):
+                    self.pos += 1
+                if self.at(0) == '/' && self.at(1) == '/':
+                    self.line_comment()
+                self.end_skipped_line()
+                return SKIPPED
+        if self.region_line(width):
+            self.indent(begin, width)
+        return CONTENT
+
+    void indent(^self, i64 begin, u32 width):
+        i64 here = self.pos
+        u32 current = self.indents[#len(self.indents) - 1]
+        if width > current:
+            self.indents = #append(self.indents, width)
+            self.push(INDENT, here)
+        else if width < current:
+            for self.indents[#len(self.indents) - 1] > width:
+                #truncate(self.indents, #len(self.indents) - 1)
+                self.push(DEDENT, here)
+            if self.indents[#len(self.indents) - 1] != width:
+                if self.begin(103, begin, here):
+                    self.say("dedent to column ")
+                    self.num(i64(width))
+                    self.say(" matches no open indentation level")
+                self.indents = #append(self.indents, width)
+                self.push(INDENT, here)
+
+    // Whether only whitespace and a line comment remain on this line.
+    bool rest_blank(^self):
+        string8 s = self.src
+        i64 i = self.pos
+        for i < #len(s):
+            char8 c = s[i]
+            if c == ' ' || c == '\t' || c == '\r':
+                i += 1
+            else if c == '\n':
+                return true
+            else if c == '/' && i + 1 < #len(s) && s[i + 1] == '/':
+                return true
+            else:
+                return false
+        return true
+
+    void skip_line(^self):
+        string8 s = self.src
+        i64 i = self.pos
+        for i < #len(s) && s[i] != '\n':
+            i += 1
+        self.pos = i
+
+    void end_skipped_line(^self):
+        self.skip_line()
+        if self.more():
+            self.pos += 1
+
+    // One token; true when a logical line just ended.
+    bool scan(^self):
+        char8 c = self.src[self.pos]
+        if c == ' ' || c == '\t' || c == '\r':
+            self.pos += 1
+            return false
+        if c == '\n':
+            self.pos += 1
+            if !self.layout_live(): return false
+            if self.emitted && self.joins(): return false
+            if self.emitted: self.push(NEWLINE, self.pos - 1)
+            return true
+        if ident_start(c):
+            i64 s = self.pos
+            self.pos += 1
+            self.word_tail()
+            self.push(keyword(self.src[s..<self.pos]), s)
+            return false
+        if digit(c):
+            i64 s = self.pos
+            u8 t = self.number()
+            self.push(t, s)
+            return false
+        if c == '"':
+            i64 s = self.pos
+            if self.at(1) == '"' && self.at(2) == '"':
+                self.multiline_string()
+            else:
+                self.string()
+            self.push(STRING, s)
+            return false
+        if c == '\'':
+            i64 s = self.pos
+            self.character()
+            self.push(CHAR, s)
+            return false
+        if c == '/' && self.at(1) == '/':
+            self.line_comment()
+            return false
+        if c == '/' && self.at(1) == '*':
+            self.block_comment()
+            return false
+        if c == '#' && ident_start(self.at(1)):
+            i64 s = self.pos
+            self.pos += 1
+            self.word_tail()
+            self.push(HASH_NAME, s)
+            return false
+        self.operator()
+        return false
+
+    void word_tail(^self):
+        string8 s = self.src
+        i64 i = self.pos
+        for i < #len(s) && ident_continue(s[i]):
+            i += 1
+        self.pos = i
+
+    void digits(^self):
+        string8 s = self.src
+        i64 i = self.pos
+        for i < #len(s) && (digit(s[i]) || s[i] == '_'):
+            i += 1
+        self.pos = i
+
+    u8 number(^self):
+        i64 s = self.pos
+        char8 b = self.at(1)
+        if self.src[s] == '0' && (b == 'x' || b == 'X' || b == 'b' || b == 'B' || b == 'o' || b == 'O'):
+            self.based_number(s, b)
+            return INT
+        bool float = false
+        self.digits()
+        if self.at(0) == '.' && digit(self.at(1)):
+            float = true
+            self.pos += 1
+            self.digits()
+        char8 e = self.at(0)
+        if (e == 'e' || e == 'E') && self.exponent(s):
+            float = true
+        return FLOAT if float else INT
+
+    void based_number(^self, i64 s, char8 b):
+        u32 radix = 8
+        string8 name = "an octal"
+        if b == 'x' || b == 'X':
+            radix = 16
+            name = "a hexadecimal"
+        else if b == 'b' || b == 'B':
+            radix = 2
+            name = "a binary"
+        self.pos += 2
+        i64 first = self.pos
+        for self.more() && (in_base(self.src[self.pos], radix) || self.src[self.pos] == '_'):
+            self.pos += 1
+        bool none = self.pos == first
+        i64 stray = self.pos
+        self.word_tail()
+        bool out = self.pos > stray
+        if (none || out) && self.begin(108, s, self.pos):
+            self.say("`")
+            self.say(self.src[s..<self.pos])
+            if out:
+                self.say("` is not ")
+                self.say(name)
+                self.say(" literal; `")
+                self.say(self.src[stray..<self.pos])
+                self.say("` is outside base ")
+                self.num(i64(radix))
+            else:
+                self.say("` has a base prefix but no digits")
+
+    bool exponent(^self, i64 s):
+        i64 e = self.pos
+        self.pos += 1
+        char8 c = self.at(0)
+        if c == '+' || c == '-':
+            self.pos += 1
+        if digit(self.at(0)):
+            self.digits()
+            return true
+        self.pos = e + 1
+        if self.begin(108, s, self.pos):
+            self.say("`")
+            self.say(self.src[s..<self.pos])
+            self.say("` has an exponent marker but no exponent")
+        return false
+
+    void multiline_string(^self):
+        string8 src = self.src
+        i64 s = self.pos
+        i64 n = #len(src)
+        i64 i = s + 3
+        for:
+            if i >= n:
+                self.pos = n
+                self.fail(106, s, n, "multi-line string literal reaches end of file with no closing `\"\"\"`")
+                return
+            if src[i] == '"' && i + 2 < n && src[i + 1] == '"' && src[i + 2] == '"':
+                self.pos = i + 3
+                return
+            i += 1
+
+    void string(^self):
+        string8 src = self.src
+        i64 s = self.pos
+        i64 n = #len(src)
+        self.pos += 1
+        for:
+            if self.pos >= n:
+                self.fail(106, s, self.pos, "string literal reaches end of file with no closing `\"`")
+                return
+            char8 c = src[self.pos]
+            if c == '\n':
+                self.fail(106, s, self.pos, "string literal reaches end of line with no closing `\"`")
+                return
+            if c == '"':
+                self.pos += 1
+                return
+            if c == '\\':
+                i64 e = self.pos
+                self.pos += 1
+                self.escape(e)
+            else:
+                self.pos += 1
+
+    void character(^self):
+        string8 src = self.src
+        i64 s = self.pos
+        i64 n = #len(src)
+        self.pos += 1
+        i64 units = 0
+        bool closed = false
+        for self.pos < n:
+            char8 c = src[self.pos]
+            if c == '\n': break
+            if c == '\'':
+                closed = true
+                self.pos += 1
+                break
+            if c == '\\':
+                i64 e = self.pos
+                self.pos += 1
+                self.escape(e)
+            else:
+                self.pos += utf8_width(c)
+            units += 1
+        if !closed:
+            self.fail(110, s, self.pos, "character literal is never closed; `'` opens one and another closes it, and a byte of text is written `'a'`")
+            return
+        if units == 0:
+            self.fail(111, s, self.pos, "a character literal holds one character, and this holds none; `\"\"` is the empty string")
+        else if units != 1 && self.begin(111, s, self.pos):
+            self.say("a character literal holds one character, and this holds ")
+            self.num(units)
+            self.say("; `\"...\"` is how a run of them is written")
+
+    // The body of an escape; `pos` is just past the backslash at `e`.
+    void escape(^self, i64 e):
+        if !self.more(): return
+        char8 c = self.src[self.pos]
+        if c == 'n' || c == 'r' || c == 't' || c == '0' || c == '\\' || c == '"' || c == '\'':
+            self.pos += 1
+            return
+        if c == 'x':
+            self.pos += 1
+            i64 d = self.pos
+            for self.pos < d + 2 && hex(self.at(0)):
+                self.pos += 1
+            if self.pos != d + 2:
+                self.fail(107, e, self.pos, "`\\x` needs exactly two hex digits")
+            return
+        self.pos += utf8_width(c)
+        if self.pos > #len(self.src): self.pos = #len(self.src)
+        if self.begin(107, e, self.pos):
+            self.say("unknown escape `")
+            self.say(self.src[e..<self.pos])
+            self.say("`")
+
+    void block_comment(^self):
+        string8 src = self.src
+        i64 s = self.pos
+        i64 n = #len(src)
+        i64 i = s + 2
+        i64 depth = 1
+        for depth > 0:
+            if i >= n:
+                self.pos = n
+                self.fail(109, s, s + 2, "block comment reaches end of file with no closing `*/`")
+                self.note(s, n)
+                return
+            char8 c = src[i]
+            if c == '/' && i + 1 < n && src[i + 1] == '*':
+                depth += 1
+                i += 2
+            else if c == '*' && i + 1 < n && src[i + 1] == '/':
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+        self.pos = i
+        self.note(s, i)
+
+    void operator(^self):
+        i64 s = self.pos
+        char8 c = self.src[s]
+        char8 c1 = self.at(1)
+        char8 c2 = self.at(2)
+        u8 t = 255
+        switch c:
+            case '&':
+                if c1 == '~': t = AMP_TILDE_EQ if c2 == '=' else AMP_TILDE
+                else: t = AMP_AMP if c1 == '&' else (AMP_EQ if c1 == '=' else AMP)
+            case '<':
+                if c1 == '<': t = SHL_EQ if c2 == '=' else SHL
+                else: t = LT_EQ if c1 == '=' else LT
+            case '>':
+                if c1 == '>': t = SHR_EQ if c2 == '=' else SHR
+                else: t = GT_EQ if c1 == '=' else GT
+            case '.':
+                if c1 != '.': t = DOT
+                else: t = DOTDOT_EQ if c2 == '=' else (DOTDOT_LESS if c2 == '<' else DOTDOT)
+            case '|': t = PIPE_PIPE if c1 == '|' else (PIPE_EQ if c1 == '=' else PIPE)
+            case '+': t = PLUS_PLUS if c1 == '+' else (PLUS_EQ if c1 == '=' else PLUS)
+            case '=': t = EQ_EQ if c1 == '=' else ASSIGN
+            case '!': t = BANG_EQ if c1 == '=' else BANG
+            case '-': t = MINUS_EQ if c1 == '=' else MINUS
+            case '*': t = STAR_EQ if c1 == '=' else STAR
+            case '/': t = SLASH_EQ if c1 == '=' else SLASH
+            case '%': t = PERCENT_EQ if c1 == '=' else PERCENT
+            case '~': t = TILDE_EQ if c1 == '=' else TILDE
+            case '(': t = LPAREN
+            case ')': t = RPAREN
+            case '[': t = LBRACKET
+            case ']': t = RBRACKET
+            case '{': t = LBRACE
+            case '}': t = RBRACE
+            case ',': t = COMMA
+            case ':': t = COLON
+            case '@': t = AT
+            case '?': t = QUESTION
+            case '^': t = CARET
+            case '$': t = DOLLAR
+            else: t = 255
+        if t == 255:
+            i64 e = s + utf8_width(c)
+            if e > #len(self.src): e = #len(self.src)
+            self.pos = e
+            if self.begin(101, s, e):
+                self.say("unexpected character `")
+                self.say(self.src[s..<e])
+                self.say("`")
+            return
+        string8 sp = spelling(t)
+        self.pos = s + #len(sp)
+        if closes(t) || t == COMMA:
+            self.before_comma_or_closer(s)
+        if opens(t):
+            self.opens = #append(self.opens, u32(#len(self.tag)))
+        else if closes(t):
+            self.close_bracket(t, s)
+        self.push(t, s)
+        if t == COLON:
+            self.colon_pushed()
+
+    void close_bracket(^self, u8 t, i64 s):
+        i64 n = #len(self.opens)
+        if n == 0:
+            if self.begin(105, s, s + 1):
+                self.say(describe(t))
+                self.say(" matches no open bracket")
+            return
+        u8 o = self.tag[self.opens[n - 1]]
+        #truncate(self.opens, n - 1)
+        u8 want = o + 1
+        if want != t && self.begin(105, s, s + 1):
+            self.say(describe(t))
+            self.say(" closes ")
+            self.say(describe(o))
+            self.say(", which wants ")
+            self.say(describe(want))
+
+    void finish(^self):
+        i64 end = #len(self.src)
+        if self.emitted: self.push(NEWLINE, end)
+        for #len(self.regions) > 0:
+            self.end_region(end)
+        i64 k = #len(self.opens)
+        for k > 0:
+            k -= 1
+            u32 o = self.opens[k]
+            u8 t = self.tag[o]
+            i64 s = i64(self.start[o])
+            if t == LBRACE:
+                if self.begin(104, s, s + 1):
+                    self.say("`{` is never closed, so layout is suspended to the end of the file and every error below this one follows from it")
+                    self.say_help("if this `{` meant a block, delete it")
+            else if self.begin(104, s, s + 1):
+                self.say(describe(t))
+                self.say(" is never closed; whitespace stays insignificant to end of file")
+        #truncate(self.opens, 0)
+        for #len(self.indents) > 1:
+            #truncate(self.indents, #len(self.indents) - 1)
+            self.push(DEDENT, end)
+        self.push(EOF, end)
+
+    // A line ending in `&&` or `||` outside brackets: reported once, and the
+    // next line read as its continuation.
+    bool joins(^self):
+        u8 t = self.last(0)
+        if t != AMP_AMP && t != PIPE_PIPE: return false
+        i64 i = #len(self.tag) - 1
+        i64 s = i64(self.start[i])
+        if self.joined == s: return true
+        if i > 0 && self.tag[i - 1] == IDENT:
+            i64 h = i64(self.start[i - 1])
+            if h + 3 <= #len(self.src) && self.src[h..<h + 3] == "has" && (h + 3 == #len(self.src) || !ident_continue(self.src[h + 3])):
+                return false
+        self.joined = s
+        string8 op = spelling(t)
+        if self.begin(201, s, s + 2):
+            self.say("this line ends in `")
+            self.say(op)
+            self.say("`, and a line continues only inside brackets, so the condition has no right-hand side here")
+            self.say_help("put the whole condition in brackets to break it across lines: `(` before its first operand, `… ")
+            self.say_help(op)
+            self.say_help("` here, and `)` after its last, before the `:`")
+        return true
+
+    // -- lambda bodies inside brackets ------------------------------------
+
+    bool layout_live(^self):
+        i64 n = #len(self.opens)
+        if n == 0: return true
+        i64 r = #len(self.regions)
+        return r > 0 && i64(self.regions[r - 2]) == n
+
+    bool region_here(^self):
+        i64 r = #len(self.regions)
+        return #len(self.opens) > 0 && r > 0 && i64(self.regions[r - 2]) == #len(self.opens)
+
+    void colon_pushed(^self):
+        if self.layout_live() || !self.rest_blank(): return
+        if !ends_in_lambda_head(self.tag[0..<#len(self.tag) - 1]): return
+        u32 baseline = self.line_indent()
+        self.regions = #append(self.regions, u32(#len(self.opens)))
+        self.regions = #append(self.regions, u32(#len(self.indents)))
+        self.indents = #append(self.indents, baseline)
+
+    u32 line_indent(^self):
+        string8 s = self.src
+        i64 b = self.pos
+        for b > 0 && s[b - 1] != '\n':
+            b -= 1
+        u32 w = 0
+        for b < #len(s) && (s[b] == ' ' || s[b] == '\t'):
+            w += 1
+            b += 1
+        return w
+
+    void before_comma_or_closer(^self, i64 at):
+        if self.region_here():
+            self.end_region(at)
+
+    bool region_line(^self, u32 width):
+        if !self.region_here(): return true
+        char8 c = self.at(0)
+        if c == ',' || c == ')' || c == ']' || c == '}': return false
+        if width <= self.indents[self.regions[#len(self.regions) - 1]]:
+            self.end_region(self.pos)
+            return false
+        return true
+
+    void end_region(^self, i64 at):
+        i64 r = #len(self.regions)
+        if r == 0: return
+        i64 base = i64(self.regions[r - 1])
+        #truncate(self.regions, r - 2)
+        if self.emitted: self.push(NEWLINE, at)
+        for #len(self.indents) > base + 1:
+            #truncate(self.indents, #len(self.indents) - 1)
+            self.push(DEDENT, at)
+        #truncate(self.indents, base)
+
+// How a tag is written in prose: "`(`".
+string8 describe(u8 t):
+    switch t:
+        case LPAREN: return "`(`"
+        case RPAREN: return "`)`"
+        case LBRACKET: return "`[`"
+        case RBRACKET: return "`]`"
+        case LBRACE: return "`{`"
+        case RBRACE: return "`}`"
+        else: return ""
+    return ""
+
+// dado_lex's lambda_blocks rules, over tags.
+
+private u8 tag_at([]u8 t, i64 i):
+    if i < 0 || i >= #len(t): return EOF
+    return t[i]
+
+i64 matching_close([]u8 t, i64 open):
+    u32 depth = 0
+    for i in open..<#len(t):
+        u8 k = t[i]
+        if opens(k):
+            depth += 1
+        else if closes(k):
+            if depth == 0: return -1
+            depth -= 1
+            if depth == 0: return i
+        else if k == EOF:
+            return -1
+    return -1
+
+private i64 matching_open([]u8 t, i64 close):
+    u32 depth = 0
+    i64 i = close
+    for i >= 0:
+        u8 k = t[i]
+        if closes(k):
+            depth += 1
+        else if opens(k):
+            if depth == 0: return -1
+            depth -= 1
+            if depth == 0: return i
+        i -= 1
+    return -1
+
+// Whether the parameter list opened at `open` declares a first parameter:
+// a type followed by a name.
+bool declares_a_parameter([]u8 t, i64 open):
+    i64 j = open + 1
+    if tag_at(t, j) == DOTDOT: j += 1
+    i64 first = j
+    u8 last = EOF
+    u8 before = EOF
+    for:
+        u8 k = tag_at(t, j)
+        if k == COMMA || k == RPAREN || k == ASSIGN || k <= EOF: break
+        before = last
+        last = k
+        if opens(k):
+            i64 c = matching_close(t, j)
+            if c < 0: return false
+            last = t[c]
+            j = c + 1
+            continue
+        j += 1
+    return j - first >= 2 && last == IDENT && (before == IDENT || before == RBRACKET || before == RBRACE || before == RPAREN || before == HASH_NAME)
+
+private bool enclosing_is_brace([]u8 t, i64 at):
+    u32 depth = 0
+    i64 i = at - 1
+    for i >= 0:
+        u8 k = t[i]
+        if closes(k):
+            depth += 1
+        else if opens(k):
+            if depth == 0: return k == LBRACE
+            depth -= 1
+        i -= 1
+    return false
+
+private bool at_a_map_key([]u8 t, i64 open):
+    u32 depth = 0
+    i64 i = open - 1
+    for i >= 0:
+        u8 k = t[i]
+        if closes(k):
+            depth += 1
+        else if opens(k):
+            if depth == 0: return k == LBRACE
+            depth -= 1
+        else if depth == 0 && k == COLON:
+            return false
+        else if depth == 0 && k == COMMA:
+            return enclosing_is_brace(t, i)
+        i -= 1
+    return false
+
+private bool ends_in_lambda_head([]u8 t):
+    i64 close = #len(t) - 1
+    if close < 0 || t[close] != RPAREN: return false
+    i64 open = matching_open(t, close)
+    if open < 1: return false
+    u8 p = t[open - 1]
+    if p != IDENT && p != RBRACKET && p != RBRACE && p != RPAREN: return false
+    if open + 1 == close: return !at_a_map_key(t, open)
+    return declares_a_parameter(t, open)

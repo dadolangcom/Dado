@@ -1,0 +1,1449 @@
+// The host's verbs (`#script_vm`, `#script_new`, `#script_run`, `#script_error`,
+// `#delete` of a VM or a handle) and member calls through a handle, lowered
+// onto `core:script`'s functions, as Rust's `harness` does. Without the
+// runtime in the compilation (`tests/collections`), `#script_vm` is ERR1205
+// and the rest is checked against the call shapes alone.
+package check
+
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+// The `core:script` package, or NONE.
+u32 rt_pkg(^World w):
+    // By directory too: `core:script` checked as the root package (Rust's identity).
+    string8 rd = index.clean(index.hold(#format(w.p.root, "/core/script")))
+    for i in 0..<#len(w.p.pkgs):
+        if w.p.pkgs[i].key == "core:script" || index.clean(w.p.pkgs[i].dir) == rd: return u32(i)
+    return NONE
+
+bool is_vm(^World w, u32 ty):
+    return ty != NONE && w.t.resolve(ty) == w.vm
+
+// A VM or a class's handle: a `void *` in C.
+bool handle_ty(^World w, u32 ty):
+    if is_vm(w, ty): return true
+    if !(ty in w.type_decl): return false
+    try u32 d = w.type_decl[ty] else: return false
+    return w.decls[d].kind == K_CLASS
+
+// `core:script`'s `name` called with `vals` (each retyped to its parameter);
+// without the runtime, a call of type `ret` (`fails`: failable) for checking.
+private Val h_call(^World w, ^Body b, u32 n, string8 name, []Val vals, u32 ret, bool fails, string8 said = ""):
+    u32 sp = rt_pkg(w)
+    u32 d = NONE
+    if sp != NONE: d = lookup(w, sp, w.p.names.intern(name))
+    if d != NONE:
+        u32 fty = resolve(w, d)
+        if fty == NONE: return bad()
+        []u32 ps = w.t.params(fty)
+        ref []Val vs
+        for i in 0..<#len(vals):
+            vs = #append(vs, value(vals[i].opd, ps[i]))
+        if fails: b.stried = n
+        return emit_call(w, b, n, d, fty, job(w, d, NONE), bad(), vs[:], nil)
+    bool void_ = ret == u32(types.P_VOID)
+    u32 dst = NONE if void_ else temp(w, b, ret, n)
+    u32 code = NONE
+    if fails: code = temp(w, b, u32(types.P_I32), n)
+    u32 r = ir.fn_ref(&b.f, tstr(w, "script"), tstr(w, name), ir.R_FAILABLE if fails else 0)
+    _ = ir.op(&b.f, ir.O_CALL, 0, ret, n, dst, r, NONE, code)
+    for v in vals:
+        ir.arg(&b.f, v.opd)
+    if fails: b.stried = n
+    if fails && !failable_call(w, b, n, said if #len(said) > 0 else name, code): return bad()
+    return value(dst, ret)
+
+// A value the C text `c` spells, of type `ty`.
+private Val h_c(^World w, ^Body b, u32 n, string8 c, u32 ty):
+    u32 t = temp(w, b, ty, n)
+    _ = ir.op(&b.f, ir.O_C_INLINE, 0, ty, n, t, tstr(w, c))
+    return value(t, ty)
+
+private Val h_cstr(^World w, ^Body b, u32 n, string8 s):
+    return h_c(w, b, n, index.hold(#format("\"", s, "\"")), types.CSTRING)
+
+// A host verb, `m` its meaning.
+Val host_verb(^World w, ^Body b, u32 n, u8 m, string8 said):
+    syntax.Ast a = tree(w, b)
+    []u32 args = call_args(w, b, n)
+    if m == B_SCRIPT_VM || m == B_SCRIPT_NEW: b.stried = n
+    if m == B_SCRIPT_VM:
+        // `[alloc][, out: s][, err: e][, on_error: p]`.
+        u32 sp = rt_pkg(w)
+        Val al = bad()
+        ref []Val pend
+        ref []string8 pends
+        bool ok = true
+        i64 np = h_sinks(w, b, n, "#script_vm")
+        if np < 0: return bad()
+        if np > 1:
+            err(w, b, arg_value(w, b, args[1]), 601, index.hold(#format("`#script_vm` takes the allocator its engine lives on, or nothing for `#heap`, and then its sinks and policy by name; this gives ", np, " arguments. An instance is made in it by `#script_new(vm, Class, ..args)`")), "write `#script_vm()` or `#script_vm(alloc)`")
+            for g in args[0..<np]:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            return bad()
+        if vm_scope(w, b, n):
+            h_rest(w, b, n, 0)
+            return bad()
+        u32 uh = a.list(a.b[n])[1]
+        if uh != NONE && a.list(a.b[uh])[0] != NONE:
+            string8 us = src(w, b, a.list(a.b[uh])[0])
+            err(w, b, a.list(a.b[uh])[0], 1209, index.hold(#format("`#script_vm`'s allocator is its argument, never a `using`: a VM's heap lives as long as the VM, and a `using` around `#script_vm` shadows the ambient for no code at all — the VM would not be on `", us, "`")), index.hold(#format("write the allocator as the argument: `#script_vm(", us, ")`")))
+            h_rest(w, b, n, 0)
+            return bad()
+        for g in args:
+            u32 gv = arg_value(w, b, g)
+            string8 nm = ""
+            if a.tag[g] == syntax.E_ARG && a.main[g] != NONE: nm = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]
+            if nm == "":
+                u32 pt = NONE
+                u32 vd = NONE
+                if sp != NONE: vd = lookup(w, sp, w.p.names.intern("vm_create"))
+                if vd != NONE && resolve(w, vd) != NONE: pt = w.t.params(resolve(w, vd))[0]
+                Val v = expr(w, b, gv, pt)
+                if v.ty != NONE && pt != NONE: v = coerce(w, b, v, pt, gv)
+                if v.ty == NONE: ok = false
+                al = v
+                continue
+            u32 want = u32(types.P_I32)
+            string8 pn = "pend_policy"
+            if nm == "out" || nm == "err":
+                want = sink(w)
+                pn = index.hold(#format("pend_", nm))
+            Val v = expr(w, b, gv, NONE if nm == "on_error" || want == sink(w) else want)
+            if want == sink(w): v = finish(w, b, v, gv)
+            if want == sink(w) && v.ty != NONE && w.t.resolve(v.ty) != w.t.resolve(sink(w)):
+                err(w, b, gv, 504, index.hold(#format("`#script_vm`'s `", nm, ":` is a `Sink` — a procedure and a pointer, `(i64(rawptr, rawptr, i64) proc, rawptr data)`, the shape `#render` writes into — and this is ", named(w, v.ty))), index.hold(#format("pass a sink: `", nm, ": io.stdout_sink()`, `", nm, ": fmt.to_bytes(&cursor)` to capture into memory, or one of your own")))
+                ok = false
+                continue
+            if nm == "on_error" && v.ty != NONE && v.kind == V_LIT && v.lo > 1:
+                err(w, b, gv, 1217, index.hold(#format("`on_error:` is the VM's failure policy, one of `core:script`'s two, and `", src(w, b, gv), "` is neither", "\x1f`script.QUIT` ends the program when an untried call through a handle fails, and `script.CONTINUE` answers the call's zero value and goes on")), "write `on_error: script.QUIT` or `on_error: script.CONTINUE`, with `import \"core:script\"` above")
+                ok = false
+                continue
+            v = finish(w, b, v, gv)
+            if nm == "on_error" && v.ty != NONE && !ir.is_const(v.opd):
+                err(w, b, gv, 1217, index.hold(#format("`on_error:` is the VM's failure policy, one of `core:script`'s two, and `", src(w, b, gv), "` is not a constant — the policy is fixed where the VM is made", "\x1f`script.QUIT` ends the program when an untried call through a handle fails, and `script.CONTINUE` answers the call's zero value and goes on")), "write `on_error: script.QUIT` or `on_error: script.CONTINUE`, with `import \"core:script\"` above")
+                ok = false
+                continue
+            if v.ty != NONE: v = coerce(w, b, v, want, gv)
+            if v.ty == NONE:
+                ok = false
+                continue
+            pend = #append(pend, v)
+            pends = #append(pends, index.hold(strings.clone(pn)))
+        if !ok: return bad()
+        if w.os == "NONE":
+            err(w, b, n, 1205, "`#script_vm` cannot run in this build: a script needs a hosted C library, and this build's `#OS` is `#NONE`, which has none\x1fA script runs on QuickJS-ng, which allocates, formats numbers and reads the clock through a C library, even with its allocator routed through Dado's", "build the scripting half of the program for a hosted target, or keep this build from loading a script: `when #OS != #NONE:` around the call")
+            return bad()
+        if sp == NONE:
+            err(w, b, n, 1205, "`#script_vm` needs the DadoScript runtime, `core:script`, and this compilation does not hold it — the loader adds it, from the collections root, to a program that makes a VM", "build with the toolchain's collections root (`--collections=<root>`), where `core/script` lives")
+            return bad()
+        for i in 0..<#len(pend):
+            [1]Val pv = [pend[i]]
+            _ = h_call(w, b, n, pends[i], pv[:], u32(types.P_VOID), false)
+        u32 rp = u32(types.P_RAWPTR)
+        Val r = bad()
+        if al.ty != NONE:
+            [4]Val vs = [al, h_c(w, b, n, "((void *)dado_js__modules)", rp), h_c(w, b, n, "((void *)dado_js__bound)", rp), h_c(w, b, n, "((void *)dado_js__channels_p)", rp)]
+            r = h_call(w, b, n, "vm_create", vs[:], rp, true)
+        else:
+            [3]Val vs = [h_c(w, b, n, "((void *)dado_js__modules)", rp), h_c(w, b, n, "((void *)dado_js__bound)", rp), h_c(w, b, n, "((void *)dado_js__channels_p)", rp)]
+            r = h_call(w, b, n, "vm_create_on_heap", vs[:], rp, true)
+        if r.ty == NONE: return r
+        return value(r.opd, w.vm)
+    if m == B_SCRIPT_ERROR:
+        if #len(args) > 0:
+            err(w, b, arg_value(w, b, args[0]), 601, "`#script_error()` takes nothing: it answers the text of the failure the `try` around it caught", "write `#script_error()`")
+            h_rest(w, b, n, 0)
+            return bad()
+        if b.serr == 0: err(w, b, n, 1216, "`#script_error()` answers the text of the failure a `try` caught from a script, and here there is no such failure for it to mean\x1fIt is written only in the `else` of a `try` over `#script_vm`, `#script_new`, a method called through a handle (`g.hit(3)`) or `#script_reload`", "write it in that `else`: `try i64 left = g.hit(3) else code:` and then `fmt.println(code, \": \", #script_error())` in the suite")
+        return h_call(w, b, n, "failure_text", nil, types.STRING8, false)
+    if m == B_SCRIPT_NEW:
+        if h_sinks(w, b, n, "#script_new") < 0: return bad()
+        if #len(args) < 2:
+            err(w, b, n, 601, index.hold(#format("`#script_new` takes the VM to make the instance in, the class, and then the arguments of the class's `init`; this gives ", #len(args))), "write `#script_new(vm, Goblin)`, or `#script_new(vm, Goblin, 3, 4.0)` for an `init` that takes two")
+            h_rest(w, b, n, 0)
+            return bad()
+        u32 vn = arg_value(w, b, args[0])
+        u32 cn = arg_value(w, b, args[1])
+        Val vm = h_vm_arg(w, b, vn, "#script_new", "makes an instance in a VM", index.hold(#format("#script_new(vm, ", src(w, b, cn), ")")))
+        u32 cd = h_class_arg(w, b, cn, "#script_new")
+        if cd == NONE || vm.ty == NONE:
+            h_rest(w, b, n, 2)
+            return bad()
+        u32 cty = resolve(w, cd)
+        u32 ci = s_class_of_ty(w, cty)
+        // Reached (Rust's `Hosting::reached`): `--emit=bindings` lists it.
+        bool seen = false
+        for x in w.s_made:
+            if x == ci: seen = true
+        if !seen: w.s_made = #append(w.s_made, ci)
+        u32 h = spill(w, b, vm, vn)
+        u32 im = s_method_named(w, ci, "init")
+        if im != NONE: w.entries = #append(w.entries, im)
+        if !h_pushes(w, b, n, h, ci, im, 2, "init"): return bad()
+        if im != NONE && resolve(w, im) != NONE:
+            []u32 ipa = w.t.params(resolve(w, im))
+            if h_runs(w, ipa[1..<#len(ipa)], NONE):
+                Val r = h_run_helper(w, b, n, h, ci, "", ipa[1..<#len(ipa)], NONE, true, true)
+                if r.ty == NONE: return r
+                return value(r.opd, cty)
+        string8 cnm = name_of(w, w.decls[cd].name)
+        string8 mod = index.hold(#format(name_of(w, w.p.pkgs[w.decls[cd].pkg].name), "/", cnm))
+        [3]Val vs = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, mod), h_cstr(w, b, n, cnm)]
+        Val r = h_call(w, b, n, "new_instance", vs[:], u32(types.P_RAWPTR), true)
+        if r.ty == NONE: return r
+        return value(r.opd, cty)
+    if m == B_SCRIPT_RUN:
+        if h_sinks(w, b, n, "#script_run") < 0: return bad()
+        if #len(args) < 1:
+            err(w, b, n, 1, "this builtin is outside the slice the port builds so far")
+            return bad()
+        u32 gn = arg_value(w, b, args[0])
+        Val g = finish(w, b, expr(w, b, gn, NONE), gn)
+        if g.ty == NONE: return bad()
+        u32 ci = s_class_of_ty(w, g.ty)
+        if ci == NONE:
+            h_rest(w, b, n, 1)
+            string8 what = index.hold(#format("`#script_run` runs an instance's `ready`, through the handle `#script_new` answered, and `", src(w, b, gn), "` is ", named(w, g.ty)))
+            if is_vm(w, g.ty): what = index.hold(#format("`#script_run` runs an instance's `ready`, and `", src(w, b, gn), "` is the VM, which holds no instance of its own"))
+            err(w, b, gn, 1202, what, "make an instance first — `try Goblin g = #script_new(vm, Goblin)` — and pass `g`")
+            return bad()
+        u32 rd = s_method_named(w, ci, "ready")
+        if #len(args) > 1 && a.tag[arg_value(w, b, args[1])] == syntax.E_STR && h_retired(w, b, n, gn, ci, rd): return bad()
+        u32 h = spill(w, b, g, gn)
+        if rd == NONE:
+            string8 cn = name_of(w, w.decls[w.classes[ci].decl].name)
+            err(w, b, n, 1204, index.hold(#format("`#script_run` runs an instance's `ready`, the class's entry, as a program's `main` is run, and `", cn, "` has no `ready`: it ", h_has(w, ci))), index.hold(#format("declare `int ready()` or `void ready()` in `", cn, "`, or call one of its methods through the handle — `c.name(…)`")))
+            return bad()
+        bool answers = false
+        if rd != NONE:
+            if rd != NONE: w.entries = #append(w.entries, rd)
+            if !h_pushes(w, b, n, h, ci, rd, 1, "ready"): return bad()
+            u32 ft = resolve(w, rd)
+            answers = ft != NONE && w.t.a[ft] == u32(types.P_INT)
+            if #len(b.hvals) > 0:
+                []u32 rps = w.t.params(ft)
+                return h_run_helper(w, b, n, h, ci, "ready", rps[1..<#len(rps)], u32(types.P_INT) if answers else u32(types.P_VOID), false, false, true)
+        [2]Val vs = [value(h, u32(types.P_RAWPTR)), value(ir.konst(w.k.boolean(&w.t, answers)), u32(types.P_BOOL))]
+        return h_call(w, b, n, "run_ready", vs[:], u32(types.P_I64), false)
+    err(w, b, n, 1, "this builtin is outside the slice the port builds so far")
+    return bad()
+
+// `#delete(vm)` or `#delete(g)`: the handle closed and its place nilled.
+Val host_delete(^World w, ^Body b, u32 n, Val v, u32 vn):
+    u32 rp = u32(types.P_RAWPTR)
+    [1]Val vs = [value(v.opd, rp)]
+    _ = h_call(w, b, n, "close", vs[:], u32(types.P_VOID), false)
+    if !ir.is_const(v.opd): _ = ir.op(&b.f, ir.O_SET, 0, v.ty, n, v.opd, zero(w, rp))
+    return value(NONE, u32(types.P_VOID))
+
+// "has `a`, `b`": the class's methods, for a refusal.
+private string8 h_has(^World w, u32 ci):
+    ref []string8 ns
+    for m in w.classes[ci].methods:
+        ns = #append(ns, index.hold(#format("`", name_of(w, w.decls[m].name), "`")))
+    if #len(ns) == 0: return "has no methods"
+    return index.hold(#format("has ", strings.join(ns[:], ", ")))
+
+// Method `name` of class `ci`, or NONE.
+u32 s_method_named(^World w, u32 ci, string8 name):
+    return s_method_in(w, ci, w.p.names.intern(name))
+
+// The arguments of method `m` (NONE: none taken) pushed onto handle `h`.
+private bool h_pushes(^World w, ^Body b, u32 n, u32 h, u32 ci, u32 m, i64 skip, string8 what):
+    w.hwide = false
+    []u32 all_args = call_args(w, b, n)
+    []u32 args = all_args[skip..<#len(all_args)]
+    ref []u32 ps
+    ref []u32 qs
+    if m != NONE:
+        u32 ft = resolve(w, m)
+        if ft == NONE: return false
+        []u32 all = w.t.params(ft)
+        for p in all[1..<#len(all)]:
+            ps = #append(ps, p)
+        syntax.Ast ma = w.p.files[w.decls[m].file].a
+        []u32 mks = ma.list(ma.b[w.decls[m].node])
+        for q in mks[6..<#len(mks)]:
+            qs = #append(qs, q)
+    string8 cn = name_of(w, w.decls[w.classes[ci].decl].name)
+    string8 mn = index.hold(#format(cn, ".", what))
+    if #len(args) != #len(ps):
+        ref []string8 ls
+        for i in 0..<#len(ps):
+            ls = #append(ls, index.hold(#format("`", shown(w, ps[i]), " ", w.p.spell(w.decls[m].file, qs[i]), "`")))
+        string8 takes = "takes no arguments"
+        if #len(ps) == 1: takes = index.hold(#format("takes 1 argument, ", strings.join(ls[:], ", ")))
+        if #len(ps) > 1: takes = index.hold(#format("takes ", #len(ps), " arguments, ", strings.join(ls[:], ", ")))
+        for g in args:
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+        if what == "ready":
+            ref []string8 sig
+            ref []string8 pns
+            for i in 0..<#len(ps):
+                sig = #append(sig, index.hold(#format(shown(w, ps[i]), " ", w.p.spell(w.decls[m].file, qs[i]))))
+                pns = #append(pns, index.hold(strings.clone(w.p.spell(w.decls[m].file, qs[i]))))
+            string8 tk = "takes no arguments"
+            if #len(ps) == 1: tk = "takes 1 argument"
+            if #len(ps) > 1: tk = index.hold(#format("takes ", #len(ps), " arguments"))
+            string8 hs = src(w, b, arg_value(w, b, all_args[0]))
+            string8 rep = index.hold(#format("write `#script_run(", hs, ")`, or declare the values as `", mn, "`'s parameters — `int ready(int frames)` — to pass them here"))
+            if #len(ps) > 0: rep = index.hold(#format("pass `#script_run` the handle and then exactly ", #len(ps), " argument", "" if #len(ps) == 1 else "s", ": `#script_run(", hs, ", ", strings.join(pns[:], ", "), ")`"))
+            err(w, b, n, 1204, index.hold(#format("`#script_run` passes `", mn, "` the arguments after the handle, and `ready(", strings.join(sig[:], ", "), ")` ", tk, "; this gives ", #len(args))), rep)
+            return false
+        if what == "init":
+            string8 an = "an" if strings.contains("AEIOU", cn[0..<1]) else "a"
+            err(w, b, n, 1204, index.hold(#format("`#script_new` constructs ", an, " `", cn, "` with its `init`'s arguments, and `", mn, "` ", takes, "; this gives it ", #len(args))), index.hold(#format("pass `#script_new` the VM, the class and then exactly ", #len(ps), " argument", "" if #len(ps) == 1 else "s")))
+        else: err(w, b, n, 1204, index.hold(#format("`", mn, "` ", takes, ", and this call gives it ", #len(args))), index.hold(#format("pass `", what, "` exactly ", #len(ps), " argument", "" if #len(ps) == 1 else "s")))
+        return false
+    if #len(args) > 16:
+        err(w, b, n, 1221, index.hold(#format("this call of `", mn, "` passes ", #len(args), " arguments, and one call from Dado into a script carries at most 16")), index.hold(#format("give `", mn, "` at most 16 parameters: gather the rest into an array, a tuple or an instance")))
+        return false
+    ref []Val vs
+    for i in 0..<#len(args):
+        u32 g = arg_value(w, b, args[i])
+        string8 cl = h_const_len(w, m, w.p.files[w.decls[m].file].a.a[qs[i]])
+        if #len(cl) > 0:
+            _ = expr(w, b, g, NONE)
+            err(w, b, g, 1201, index.hold(#format("`", mn, "`'s parameter `", w.p.spell(w.decls[m].file, qs[i]), "` is a DadoScript `", cl, "`, and a fixed array whose length is a constant does not cross yet")), index.hold(#format("write the array's length as a number in `", name_of(w, w.decls[m].name), "`'s signature, `", shown(w, ps[i]), "`, and Dado passes it a fixed array")))
+            return false
+        Val v = h_cross(w, b, g, ps[i], mn, index.hold(strings.clone(w.p.spell(w.decls[m].file, qs[i]))))
+        if v.ty == NONE: return false
+        u32 vr = w.t.resolve(v.ty)
+        if ps[i] == w.sstr && (vr == types.STRING16 || vr == types.STRING32 || vr == types.CSTRING):
+            w.hwide = true
+            for nm in SEAM_WIDE_RT: _ = seam_rt(w, nm)
+        vs = #append(vs, v)
+    u32 mrt = NONE
+    if m != NONE && resolve(w, m) != NONE: mrt = w.t.a[resolve(w, m)]
+    if h_runs(w, ps[:], mrt):
+        b.hvals = vs
+        return true
+    for i in 0..<#len(vs):
+        string8 pn = "push_int"
+        u32 pe = s_erase(w, ps[i])
+        if s_class_of_ty(w, pe) != NONE: pn = "push_instance"
+        if pe == u32(types.P_FLOAT): pn = "push_float"
+        if pe == u32(types.P_BOOL): pn = "push_bool"
+        if pe == w.sstr: pn = "push_string"
+        [2]Val pv = [value(h, u32(types.P_RAWPTR)), vs[i]]
+        _ = h_call(w, b, n, pn, pv[:], u32(types.P_VOID), false)
+    return true
+
+// A method's type node `tn` written `[NAME]T`: its text, else "".
+private string8 h_const_len(^World w, u32 m, u32 tn):
+    syntax.Ast a = w.p.files[w.decls[m].file].a
+    if tn == NONE || a.tag[tn] != syntax.T_ARRAY || a.a[tn] == NONE || a.tag[a.a[tn]] != syntax.E_NAME: return ""
+    return index.hold(strings.clone(w.p.files[w.decls[m].file].src[i64(a.lo[tn])..<i64(a.hi[tn])]))
+
+// Dado value `g` handed to script type `st`, as the push verb takes it.
+private Val h_cross(^World w, ^Body b, u32 g, u32 st, string8 mn, string8 pn):
+    bool sc = st == u32(types.P_INT) || st == u32(types.P_FLOAT) || st == u32(types.P_BOOL) || st == w.sstr
+    u32 want = NONE
+    if st == u32(types.P_INT): want = u32(types.P_I64)
+    if st == u32(types.P_FLOAT): want = u32(types.P_F64)
+    if st == u32(types.P_BOOL): want = u32(types.P_BOOL)
+    if st == w.sstr: want = types.STRING8
+    Val v = finish(w, b, expr(w, b, g, want), g)
+    if v.ty == NONE: return bad()
+    if union_of(w, st) != NONE || s_ddist(w, st) != NONE: return h_cross_shared(w, b, g, st, v, mn, pn)
+    if s_denum(w, st) != NONE && s_denum(w, v.ty) == s_denum(w, st):
+        for rn in ["give_string", "drop_string", "read_string", "read_int", "give_int"]:
+            _ = seam_rt(w, rn)
+        return v
+    if s_kind(w, st) == 1 && s_denum(w, w.t.a[w.t.resolve(st)]) == NONE:
+        u32 he = h_elem(w, w.t.resolve(v.ty))
+        if he != NONE && s_denum(w, he) != NONE:
+            err(w, b, g, 1201, index.hold(#format("`", mn, "`'s parameter `", pn, "` is a DadoScript `", shown(w, st), "`, and this is `", shown(w, v.ty), "`: a Dado enum in it crosses as names, not numbers")), "pass the numbers themselves — build the array of the enum's integer from the values — or give the method a parameter of each value")
+            return bad()
+    if s_enum(w, st):
+        string8 en = s_short(w, s_tdecl(w, st))
+        err(w, b, g, 1201, index.hold(#format("`", mn, "`'s parameter `", pn, "` is a DadoScript `", en, "`, which has no Dado side: an enum a script declares has no number to cross as, and a trait is the script's")), index.hold(#format("declare `", en, "` as an `enum` in a Dado file of the package, which crosses both ways, or build the `", en, "` inside the script")))
+        return bad()
+    ref []string8 path
+    u32 ms = st
+    u32 mg = v.ty
+    string8 why = h_miss(w, st, v.ty, &path, &ms, &mg)
+    if #len(why) > 0:
+        string8 head = index.hold(#format("`", mn, "`'s parameter `", pn, "`"))
+        if w.hfield: head = index.hold(#format("`", mn, "`"))
+        h_refuse(w, b, g, head, st, v.ty, path[:], ms, mg, why)
+        return bad()
+    if s_fn(w, st):
+        fnv_bind(w, w.t.resolve(v.ty))
+        return v
+    if s_kind(w, st) == 1: return h_cross_run(w, b, g, v)
+    if s_kind(w, st) == 2 && seam_kind(w, v.ty, false) == SK_MAP:
+        // By its address: what the script writes comes back, its table may move.
+        seam_maps(w)
+        for nm in ["mix_string", "mix_float", "refused_back"]: _ = seam_rt(w, nm)
+        u32 pt = w.t.ptr_of(v.ty)
+        u32 t = temp(w, b, pt, g)
+        _ = ir.op(&b.f, ir.O_ADDR, 0, pt, g, t, spill(w, b, v, g))
+        return value(t, pt)
+    if s_tup(w, st):
+        if seam_kind(w, v.ty, false) == SK_TUP: return v
+        err(w, b, g, 1, "this crossing is outside the slice the port builds so far")
+        return bad()
+    if s_class_of_ty(w, st) != NONE: return v
+    if !sc:
+        err(w, b, g, 1, "this crossing is outside the slice the port builds so far")
+        return bad()
+    if want == u32(types.P_I64) && int_prim(w, v.ty) == types.P_U64:
+        u32 t = temp(w, b, want, g)
+        _ = ir.op(&b.f, ir.O_CONV, ir.CV_WRAP, want, g, t, v.opd)
+        return value(t, want)
+    u32 vr = w.t.resolve(v.ty)
+    if st == w.sstr && (vr == types.STRING16 || vr == types.STRING32 || vr == types.CSTRING): return v
+    return coerce(w, b, v, want, g)
+
+// Dado value `v` (written `g`) handed to a script's union or `distinct`
+// type `st`: a Dado union as itself, a script's union as the member it
+// crosses into, a `distinct` type as its own, erased.
+private Val h_cross_shared(^World w, ^Body b, u32 g, u32 st, Val v, string8 mn, string8 pn):
+    string8 head = index.hold(#format("`", mn, "`'s parameter `", pn, "`"))
+    u32 sd = s_tdecl(w, st)
+    if union_of(w, st) != NONE && sd != NONE:
+        if s_umember(w, st, v.ty) >= 0: return v
+        ref []string8 ms
+        for m in w.t.list(union_of(w, st)):
+            ms = #append(ms, index.hold(#format("`", shown(w, m), "`")))
+        string8 sn = s_short(w, sd)
+        err(w, b, g, 1201, index.hold(#format(head, " is a DadoScript `", sn, "`, and this is `", shown(w, v.ty), "`: a script's union takes a value crossing into one member, ", strings.join(ms[:], ", "))), index.hold(#format("pass a Dado value that crosses into ", h_article(sn), " `", sn, "`: a value of one of its members' types")))
+        return bad()
+    if union_of(w, st) != NONE:
+        if s_dunion(w, v.ty) != NONE && s_dview(w, v.ty) == st: return v
+        err(w, b, g, 504, index.hold(#format(head, " is ", shown(w, s_dado_of(w, st)), ", and this is ", shown(w, v.ty))))
+        return bad()
+    u32 vd = s_ddist(w, v.ty)
+    if vd == NONE || w.t.a[vd] != w.t.a[w.t.resolve(st)]:
+        err(w, b, g, 504, index.hold(#format(head, " is ", shown(w, s_dado_of(w, st)), ", and this is ", shown(w, v.ty))))
+        return bad()
+    u32 se = s_erase(w, st)
+    u32 want = types.STRING8
+    if se == u32(types.P_INT): want = u32(types.P_I64)
+    if se == u32(types.P_FLOAT): want = u32(types.P_F64)
+    if se == u32(types.P_BOOL): want = u32(types.P_BOOL)
+    Val ev = value(v.opd, s_erase(w, v.ty))
+    if want == u32(types.P_I64) && int_prim(w, ev.ty) == types.P_U64:
+        u32 t = temp(w, b, want, g)
+        _ = ir.op(&b.f, ir.O_CONV, ir.CV_WRAP, want, g, t, ev.opd)
+        return value(t, want)
+    return coerce(w, b, ev, want, g)
+
+// Rust's crossing rule: what script type `s` takes from Dado.
+private string8 h_rule(^World w, u32 s):
+    string8 ds = shown(w, s)
+    if s == u32(types.P_INT): return "an `int` takes an integer of any width, a `u64` by its bits"
+    if s == u32(types.P_FLOAT): return "a `float` takes an `f32` or an `f64`"
+    if s == u32(types.P_BOOL): return "a `bool` takes a `bool`"
+    if s == w.sstr: return "a `string` takes a copy of a `string8` or a `ref([]char8)`"
+    if s == u32(types.P_U8): return "a `byte` takes a `u8` or a `char8`"
+    u32 r = w.t.resolve(s)
+    if s_kind(w, s) == 1: return index.hold(#format("a `", ds, "` takes a Dado slice, a `ref([]T)` or an array whose elements cross into `", shown(w, w.t.a[r]), "`"))
+    if s_kind(w, s) == 2: return index.hold(#format("a `", ds, "` takes a Dado map whose keys cross into `", shown(w, w.t.a[r]), "` and values into `", shown(w, w.t.b[r]), "`"))
+    if s_tup(w, s):
+        []u32 ss = w.t.slots(s)
+        if h_fixed(w, s): return index.hold(#format("a `", ds, "` takes a Dado array or shape of ", #len(ss), " slots, each crossing into `", shown(w, ss[0]), "`"))
+        return index.hold(#format("a tuple `", ds, "` takes a Dado tuple of ", #len(ss), " slots, each crossing into its own"))
+    if s_fn(w, s): return index.hold(#format(h_article(ds), " `", ds, "` takes a Dado function of that shape"))
+    u32 ci = s_class_of_ty(w, s)
+    if ci != NONE: return index.hold(#format("an instance of `", h_cname(w, ci), "` takes a handle typed `", name_of(w, w.p.pkgs[w.decls[w.classes[ci].decl].pkg].name), ".", h_cname(w, ci), "` — one `#script_new` answered, or one a script handed Dado"))
+    return ""
+
+bool h_fixed(^World w, u32 s):
+    []u32 ss = w.t.slots(s)
+    if #len(ss) < 2: return false
+    for x in ss:
+        if w.t.resolve(x) != w.t.resolve(ss[0]): return false
+    return true
+
+// The element of Dado `r` that crosses as a script array's: a slice's, a
+// `ref([]T)`'s (not Dado's own string), a homogeneous array's; NONE.
+private u32 h_elem(^World w, u32 r):
+    if r == NONE: return NONE
+    if w.t.tag[r] == types.T_SLICE: return w.t.a[r]
+    if w.t.tag[r] == types.T_REF && w.t.tag[w.t.resolve(w.t.a[r])] == types.T_SLICE:
+        u32 e = w.t.a[w.t.resolve(w.t.a[r])]
+        if w.t.resolve(e) == u32(types.P_CHAR8): return NONE
+        return e
+    if s_tup(w, r) && h_fixed(w, r): return w.t.slots(r)[0]
+    return NONE
+
+// Where Dado `got` fails to cross into script `st` (Rust's
+// `mismatch_at`): why, with the path to the part and the part's types;
+// "" when it crosses.
+private string8 h_miss(^World w, u32 st, u32 got, ^ref []string8 path, ^u32 ms, ^u32 mg):
+    u32 r = w.t.resolve(got)
+    ms^ = st
+    mg^ = got
+    string8 rule = h_rule(w, st)
+    if s_kind(w, st) == 2:
+        if r == NONE || w.t.tag[r] != types.T_MAP: return index.hold(#format("it is not a map, and ", rule))
+        u32 sr = w.t.resolve(st)
+        path^ = #append(path^, "key")
+        string8 x = h_miss(w, w.t.a[sr], w.t.a[r], path, ms, mg)
+        if #len(x) > 0: return x
+        path^[#len(path^) - 1] = "value"
+        x = h_miss(w, w.t.b[sr], w.t.b[r], path, ms, mg)
+        if #len(x) == 0: #truncate(path^, #len(path^) - 1)
+        return x
+    if s_kind(w, st) == 1:
+        u32 e = h_elem(w, r)
+        if e == NONE: return index.hold(#format("it is not a slice, a `ref([]T)` or an array, and ", rule))
+        path^ = #append(path^, "element")
+        string8 x = h_miss(w, w.t.a[w.t.resolve(st)], e, path, ms, mg)
+        if #len(x) == 0: #truncate(path^, #len(path^) - 1)
+        return x
+    if (s_tup(w, st) || s_kind(w, st) == 1) && r != NONE && w.t.tag[r] == types.T_SOA && s_soa_lane(w, r) != NONE: return "no lane may hold a container"
+    if s_tup(w, st):
+        []u32 ss = w.t.slots(st)
+        if !s_tup(w, r) || r == types.STRING8: return index.hold(#format(rule, ", and this is no tuple"))
+        []u32 gs = w.t.slots(r)
+        if #len(gs) != #len(ss): return index.hold(#format(rule, ", and this has ", #len(gs)))
+        for i in 0..<#len(ss):
+            path^ = #append(path^, index.hold(#format("slot ", i)))
+            string8 x = h_miss(w, ss[i], gs[i], path, ms, mg)
+            if #len(x) > 0: return x
+            #truncate(path^, #len(path^) - 1)
+        return ""
+    if s_fn(w, st): return "" if r != NONE && w.t.tag[r] == types.T_FUNC && fnv_sty(w, r) == w.t.resolve(st) else rule
+    if st == u32(types.P_U8) && (r == u32(types.P_U8) || r == u32(types.P_CHAR8)): return ""
+    if st == w.sstr && r == w.t.ref_of(w.t.slice_of(u32(types.P_CHAR8))): return ""
+    if st == w.sstr && !w.hfield && (r == types.STRING16 || r == types.STRING32 || r == types.CSTRING): return ""
+    string8 why = ""
+    if crosses(w, got, st, &why): return ""
+    return rule
+
+// A Dado spelling of what script type `s` takes, for a repair.
+private string8 h_dspell(^World w, u32 s):
+    if s == u32(types.P_INT): return "i64"
+    if s == u32(types.P_FLOAT): return "f64"
+    if s == w.sstr: return "string8"
+    if s == u32(types.P_U8): return "u8"
+    u32 r = w.t.resolve(s)
+    if s_kind(w, s) == 1: return index.hold(#format("[]", h_dspell(w, w.t.a[r])))
+    if s_kind(w, s) == 2: return index.hold(#format("{", h_dspell(w, w.t.a[r]), ": ", h_dspell(w, w.t.b[r]), "}"))
+    if s_tup(w, s):
+        []u32 ss = w.t.slots(s)
+        if h_fixed(w, s): return index.hold(#format("[", #len(ss), "]", h_dspell(w, ss[0])))
+        ref []string8 xs
+        for x in ss: xs = #append(xs, h_dspell(w, x))
+        return index.hold(#format("(", strings.join(xs[:], ", "), ")"))
+    u32 ci = s_class_of_ty(w, s)
+    if ci != NONE: return index.hold(#format(name_of(w, w.p.pkgs[w.decls[w.classes[ci].decl].pkg].name), ".", h_cname(w, ci)))
+    if s_fn(w, s):
+        u32 r = w.t.resolve(s)
+        ref []string8 xs
+        for p in w.t.params(r): xs = #append(xs, h_dspell(w, p))
+        string8 rt = "void" if w.t.resolve(w.t.a[r]) == u32(types.P_VOID) else h_dspell(w, w.t.a[r])
+        return index.hold(#format(rt, "(", strings.join(xs[:], ", "), ")"))
+    return shown(w, s)
+
+private string8 h_example(^World w, u32 s):
+    string8 d = index.hold(#format("`", h_dspell(w, s), "`"))
+    if s_kind(w, s) == 1: return index.hold(#format("a slice or an array of `", h_dspell(w, w.t.a[w.t.resolve(s)]), "`"))
+    if s_kind(w, s) == 2: return index.hold(#format("a map ", d))
+    if s_tup(w, s) && h_fixed(w, s): return index.hold(#format("an array ", d))
+    if s_tup(w, s): return index.hold(#format("a tuple ", d))
+    if s_fn(w, s): return index.hold(#format("a Dado function ", d, " the program names as a value"))
+    return d
+
+string8 h_article(string8 s):
+    if #len(s) > 1 && (s[0] == 'u' || s[0] == 'U') && s[1] >= '0' && s[1] <= '9': return "a"
+    if #len(s) > 0 && strings.contains("aeiouAEIOU", s[0..<1]): return "an"
+    return "a"
+
+// What to write so Dado `got` crosses as scalar `s` (`x` written).
+private string8 h_repair(^World w, u32 s, u32 got, string8 x):
+    u32 gr = w.t.resolve(got)
+    if s == w.sstr && (gr == types.STRING16 || gr == types.STRING32 || gr == types.CSTRING): return "write it through a method whose `string` parameter takes it, which transcodes a `string16`, `string32` or `cstring`"
+    u32 r = w.t.resolve(got)
+    if s == u32(types.P_INT) && is_float(w, r): return index.hold(#format("convert it, dropping the fraction: `i64(", x, ")`"))
+    if s == u32(types.P_INT) && is_char(w, r): return index.hold(#format("a character crosses as its number: `i64(", x, ")`"))
+    if s == u32(types.P_FLOAT) && int_prim(w, r) != types.PRIMS: return index.hold(#format("convert it: `f64(", x, ")`"))
+    if s == u32(types.P_BOOL) && int_prim(w, r) != types.PRIMS: return index.hold(#format("say which values are true: `", x, " != 0`"))
+    u32 ci = s_class_of_ty(w, s)
+    if ci != NONE: return index.hold(#format("pass a `", h_dspell(w, s), "` handle: one `#script_new` answered for the class, or one a script handed Dado"))
+    return index.hold(#format("pass a value that crosses into a DadoScript `", shown(w, s), "`"))
+
+private bool h_is_scalar(^World w, u32 s):
+    return s == w.sstr || s_kind(w, s) == 0 && !s_tup(w, s) && !s_fn(w, s)
+
+// ERR1201: Dado `got` handed to script `st` (`head` names the parameter),
+// at the part `h_miss` found.
+private void h_refuse(^World w, ^Body b, u32 g, string8 head, u32 st, u32 got, []string8 path, u32 ms, u32 mg, string8 why):
+    string8 x = src(w, b, g)
+    string8 ds = shown(w, st)
+    if #len(path) == 0 && s_class_of_ty(w, st) != NONE:
+        string8 cn = s_short(w, w.classes[s_class_of_ty(w, st)].decl)
+        err(w, b, g, 1201, index.hold(#format(head, " is a DadoScript `", cn, "`, and this is ", s_cshown(w, got), ", which does not cross into one: ", why)), index.hold(#format("pass a `", s_cshown(w, st), "` handle: one `#script_new` answered for the class, or one a script handed Dado")))
+        return
+    if #len(path) == 0 && h_is_scalar(w, st):
+        err(w, b, g, 1201, index.hold(#format(head, " is a DadoScript `", ds, "`, and this is ", named(w, got), ", which does not cross into one: ", h_rule(w, st))), h_repair(w, st, got, x))
+        return
+    if #len(path) == 0:
+        err(w, b, g, 1201, index.hold(#format(head, " is a DadoScript `", ds, "`, and this is `", shown(w, got), "`: ", why)), index.hold(#format("pass a Dado value that crosses into ", h_article(ds), " `", ds, "`: ", h_example(w, st))))
+        return
+    string8 pl = index.hold(#format("its ", path[0]))
+    for p in path[1..<#len(path)]:
+        pl = index.hold(#format("the ", p, " of ", pl))
+    string8 mds = shown(w, ms)
+    string8 er = index.hold(#format("each element ", h_example(w, ms)))
+    if h_is_scalar(w, ms):
+        string8 one = h_repair(w, ms, mg, "x")
+        er = index.hold(#format("each element `x` made so: ", one))
+        if strings.starts_with(one, "pass "): er = index.hold(#format("each element ", h_article(mds), " `", h_dspell(w, ms), "`"))
+    err(w, b, g, 1201, index.hold(#format(head, " is a DadoScript `", ds, "`, and this is `", shown(w, got), "`, and ", pl, ", `", shown(w, mg), "`, does not cross into ", h_article(mds), " `", mds, "`: ", why)), index.hold(#format("build one in Dado whose elements cross — ", er, " — and pass that")))
+
+
+// `g.m(args…)` through a handle of class `ci`: pushes, then a run.
+Val host_member(^World w, ^Body b, u32 n, u32 cn, Val base, u32 ci):
+    u32 m = s_method_in(w, ci, w.p.sym(b.file, cn))
+    syntax.Ast a = tree(w, b)
+    for g in call_args(w, b, n):
+        if a.tag[g] == syntax.E_ARG && a.main[g] != NONE:
+            string8 an = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]
+            err_tok(w, b, g, 1218, index.hold(#format("`", spell(w, b, cn), "` is a method of `", h_cname(w, ci), "` called through its handle, which takes its arguments in order, so `", an, ":` names nothing here")), index.hold(#format("drop `", an, ":` and pass the arguments in order; a script's sinks are scoped after the call, `", src(w, b, cn), "(…) using out: …, err: …`, or set on its VM, `#script_vm(out: …, err: …)`")))
+            return bad()
+    if m == NONE:
+        string8 bs = a_base(w, b, cn)
+        if h_member(w, b, cn, ci, bs, true): return bad()
+    if m == NONE:
+        string8 cl = name_of(w, w.decls[w.classes[ci].decl].name)
+        string8 en = index.hold(strings.clone(w.p.spell(b.file, cn)))
+        err(w, b, n, 1204, index.hold(#format("`", cl, "` has no method `", en, "`: it ", h_has(w, ci))), index.hold(#format("name one of `", cl, "`'s methods, or declare `", en, "` in the class")))
+        return bad()
+    if (w.p.files[w.decls[m].file].a.a[w.decls[m].node] & syntax.F_ASYNC) != 0:
+        string8 an = index.hold(#format(h_cname(w, ci), ".", name_of(w, w.decls[m].name)))
+        if h_web(w, b, n, 2, an): return bad()
+    u32 h = spill(w, b, base, cn)
+    b.scall = n
+    w.entries = #append(w.entries, m)
+    if !h_pushes(w, b, n, h, ci, m, 0, name_of(w, w.decls[m].name)): return bad()
+    u32 ft = resolve(w, m)
+    if ft == NONE: return bad()
+    u32 rt = w.t.a[ft]
+    syntax.Ast ma = w.p.files[w.decls[m].file].a
+    string8 rcl = h_const_len(w, m, ma.list(ma.b[w.decls[m].node])[0])
+    if #len(rcl) > 0:
+        err(w, b, n, 1201, index.hold(#format("`", name_of(w, w.decls[w.classes[ci].decl].name), ".", name_of(w, w.decls[m].name), "` answers a DadoScript `", rcl, "`, and a fixed array whose length is a constant does not cross yet")), index.hold(#format("write the array's length as a number in the method's signature, `", shown(w, rt), "`, and the method answers Dado a fixed array")))
+        return bad()
+    string8 k = ""
+    u32 dt = u32(types.P_VOID)
+    if union_of(w, rt) != NONE && s_tdecl(w, rt) != NONE:
+        err(w, b, n, 1201, index.hold(#format("`", h_cname(w, ci), ".", name_of(w, w.decls[m].name), "` answers a union the script declares, which Dado has no type for")), "answer a value of one member's type, or declare the union in a Dado file and name that in the signature: a Dado union crosses both ways")
+        return bad()
+    rt = s_erase(w, rt)
+    if union_of(w, rt) != NONE && rt_pkg(w) == NONE:
+        b.untyped_sw = true
+        return bad()
+    if rt == u32(types.P_INT):
+        k = "_int"
+        dt = u32(types.P_I64)
+    else if rt == u32(types.P_FLOAT):
+        k = "_float"
+        dt = u32(types.P_F64)
+    else if rt == u32(types.P_BOOL):
+        k = "_bool"
+        dt = u32(types.P_BOOL)
+    else if rt == w.sstr:
+        k = "_string"
+        dt = w.t.ref_of(w.t.slice_of(u32(types.P_CHAR8)))
+    else if s_class_of_ty(w, rt) != NONE:
+        k = "_instance"
+        dt = rt
+    else if rt != u32(types.P_VOID) && h_run_ans(w, rt, true) == NONE:
+        if s_fn(w, rt): err(w, b, n, 1201, index.hold(#format("`", h_cname(w, ci), ".", name_of(w, w.decls[m].name), "` answers a function, which Dado keeps only through a `(proc, rawptr data)` pair it takes")), "pass the script's function to a Dado function taking a `(proc, rawptr data)` pair, or answer what Dado needs of a call of it")
+        else if s_kind(w, rt) == 2: err(w, b, n, 1201, index.hold(#format("`", h_cname(w, ci), ".", name_of(w, w.decls[m].name), "` answers a DadoScript `", shown(w, rt), "`, and a map crosses only when its key is an `int`, a `bool` or a `string` and its value crosses")), "give the script a method that answers what Dado needs of the map — an array of its keys and one of its values (`[]K`, `[]V`), or one value — and call that")
+        else if s_enum(w, rt): err(w, b, n, 1219, index.hold(#format("`", h_cname(w, ci), ".", name_of(w, w.decls[m].name), "` answers a DadoScript `", s_short(w, s_tdecl(w, rt)), "`, which does not cross into Dado", "\x1f`Mood` is a DadoScript type with no Dado side — an enum, a trait, or a class Dado cannot name — and only scalars, arrays and tuples of them, and instances of classes cross")), index.hold(#format("give `", h_cname(w, ci), "` a method that answers what Dado needs of it as values that cross, and run that")))
+        else: err(w, b, n, 1, "this answer is outside the slice the port builds so far")
+        return bad()
+    bool tried = n == b.tried
+    []u32 pall = w.t.params(ft)
+    if h_runs(w, pall[1..<#len(pall)], rt):
+        for p in pall[1..<#len(pall)]:
+            if s_class_of_ty(w, p) != NONE:
+                err(w, b, n, 1219, "this run hands an instance across beside an array or a tuple, and a run that crosses a container does not carry an instance yet", "make two runs: one that crosses the instance, one that crosses the container")
+                return bad()
+    if h_runs(w, pall[1..<#len(pall)], rt): return h_run_helper(w, b, n, h, ci, name_of(w, w.decls[m].name), pall[1..<#len(pall)], rt, tried, false)
+    string8 fname = index.hold(#format("run", k, "" if tried else "_or_quit"))
+    if k == "_instance":
+        [3]Val vi = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, name_of(w, w.decls[m].name)), h_cstr(w, b, n, name_of(w, w.decls[w.classes[s_class_of_ty(w, rt)].decl].name))]
+        Val r = h_call(w, b, n, fname, vi[:], dt, tried)
+        if r.ty != NONE: r.ty = rt
+        return r
+    [2]Val vs = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, name_of(w, w.decls[m].name))]
+    return h_call(w, b, n, fname, vs[:], dt, tried)
+
+// `g.sig.emit(…)` from Dado: the values pushed (`ps`: the signal's script
+// types), then a run of the instance's `$emit_sig`.
+Val host_emit(^World w, ^Body b, u32 n, u32 h, string8 sn, []u32 ps, []u32 vals):
+    for i in 0..<#len(vals):
+        u32 vt = w.untyped
+        if !ir.is_const(vals[i]): vt = b.f.place_ty[vals[i]]
+        Val v = value(vals[i], vt)
+        if ps[i] == u32(types.P_INT) && vt != u32(types.P_I64):
+            u32 t = temp(w, b, u32(types.P_I64), n)
+            _ = ir.op(&b.f, ir.O_CONV, ir.CV_WIDEN if int_prim(w, vt) != types.P_U64 else ir.CV_WRAP, u32(types.P_I64), n, t, vals[i])
+            v = value(t, u32(types.P_I64))
+        if ps[i] == u32(types.P_FLOAT) && vt != u32(types.P_F64):
+            u32 t = temp(w, b, u32(types.P_F64), n)
+            _ = ir.op(&b.f, ir.O_CONV, ir.CV_FLOAT_WIDTH, u32(types.P_F64), n, t, vals[i])
+            v = value(t, u32(types.P_F64))
+        if ps[i] == w.sstr && w.t.resolve(vt) != types.STRING8: v = coerce(w, b, v, types.STRING8, n)
+        string8 pn = "push_int"
+        if ps[i] == u32(types.P_FLOAT): pn = "push_float"
+        if ps[i] == u32(types.P_BOOL): pn = "push_bool"
+        if ps[i] == w.sstr: pn = "push_string"
+        [2]Val pv = [value(h, u32(types.P_RAWPTR)), v]
+        _ = h_call(w, b, n, pn, pv[:], u32(types.P_VOID), false)
+    return host_run(w, b, n, h, index.hold(#format("$emit_", sn)))
+
+// `v` pushed onto handle `h` by `core:script`'s `pn`.
+void host_push(^World w, ^Body b, u32 n, u32 h, Val v, string8 pn):
+    [2]Val pv = [value(h, u32(types.P_RAWPTR)), v]
+    _ = h_call(w, b, n, pn, pv[:], u32(types.P_VOID), false)
+
+// A run of the instance's method `e`, taking what was pushed.
+Val host_run(^World w, ^Body b, u32 n, u32 h, string8 e):
+    [2]Val vs = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, e)]
+    _ = h_call(w, b, n, "run_or_quit", vs[:], u32(types.P_VOID), false)
+    return value(NONE, u32(types.P_VOID))
+
+private const [7]string8 CV_DOES = ("stops the script running on a VM", "pauses the script running on a VM", "resumes a paused VM", "asks whether a run is in progress on a VM", "asks whether a VM is paused", "delivers the messages waiting for a VM's channel handlers", "swaps new code in under a class a VM has loaded, keeping its instances and their fields")
+private const [7]string8 CV_NAME = ("stop", "pause", "resume", "is_running", "is_paused", "pump", "reload")
+private const [7]string8 CV_RT = ("stop_engine", "pause_engine", "resume_engine", "engine_running", "engine_paused", "pump_engine", "reload_engine")
+
+// The VM-wide verbs: `#script_stop`, `_pause`, `_resume`, `_is_running`,
+// `_is_paused`, `_pump`, `_reload`.
+Val host_control(^World w, ^Body b, u32 n, u8 m):
+    syntax.Ast a = tree(w, b)
+    []u32 args = call_args(w, b, n)
+    i64 k = i64(m - B_SCRIPT_STOP)
+    string8 sp = index.hold(#format("#script_", CV_NAME[k]))
+    string8 does = CV_DOES[k]
+    bool named_ = false
+    for g in args:
+        if a.tag[g] != syntax.E_ARG || a.main[g] == NONE: continue
+        named_ = true
+        string8 nm = index.hold(strings.clone(w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]))
+        if nm == "out" || nm == "err": err_tok(w, b, g, 602, index.hold(#format("`", sp, "` runs no script code, so it takes no sinks: `", nm, ":` names one of a VM's, given to the `#script_vm` that makes it")), index.hold(#format("drop `", nm, ":`, and give it to the `#script_vm` whose output it is")))
+        else: err_tok(w, b, g, 602, index.hold(#format("`", sp, "` has no parameter `", nm, "`: it takes its arguments in order")), index.hold(#format("drop `", nm, ":`")))
+    if named_:
+        h_rest(w, b, n, 0)
+        return bad()
+    i64 most = 2 if m == B_SCRIPT_STOP else 3 if m == B_SCRIPT_RELOAD else 1
+    if #len(args) == 0:
+        string8 wr = index.hold(#format("write `", sp, "(vm)`"))
+        if m == B_SCRIPT_STOP: wr = index.hold(#format("write `", sp, "(vm, 100)` to give the script 100 milliseconds to stop by itself, or `", sp, "(vm, 0)` to force it at once"))
+        if m == B_SCRIPT_RELOAD: wr = index.hold(#format("write `", sp, "(vm, Goblin)`"))
+        err(w, b, n, 601, index.hold(#format("`", sp, "` ", does, " — it takes the VM `#script_vm` answered, and this gives none")), wr)
+        return bad()
+    if #len(args) > most:
+        string8 takes = "the VM alone"
+        string8 wr = index.hold(#format("write `", sp, "(vm)`"))
+        if m == B_SCRIPT_RELOAD:
+            takes = "the VM, the class and, after them, the directory the new code is in"
+            wr = index.hold(#format("write `", sp, "(vm, Goblin)` or `", sp, "(vm, Goblin, \"reload\")`"))
+        if m == B_SCRIPT_STOP:
+            takes = "the VM and a timeout in milliseconds"
+            wr = index.hold(#format("write `", sp, "(vm, 100)`"))
+        err(w, b, arg_value(w, b, args[most]), 601, index.hold(#format("`", sp, "` takes ", takes, "; this gives ", #len(args), " arguments")), wr)
+        for i in 0..<#len(args):
+            if m != B_SCRIPT_RELOAD || i != 1: _ = expr(w, b, arg_value(w, b, args[i]), NONE)
+        return bad()
+    string8 ex = index.hold(#format(sp, "(vm)"))
+    if m == B_SCRIPT_STOP: ex = index.hold(#format(sp, "(vm, 100)"))
+    if m == B_SCRIPT_RELOAD: ex = index.hold(#format(sp, "(vm, Goblin)"))
+    u32 vn = arg_value(w, b, args[0])
+    Val vm = h_vm_arg(w, b, vn, sp, does, ex)
+    if vm.ty == NONE:
+        h_rest(w, b, n, 2 if m == B_SCRIPT_RELOAD else 1)
+        return bad()
+    u32 rp = u32(types.P_RAWPTR)
+    if m == B_SCRIPT_STOP:
+        if #len(args) < 2:
+            string8 wv = src(w, b, vn)
+            err(w, b, n, 1215, index.hold(#format("`", sp, "` takes a timeout, and this gives none: the milliseconds the script has to stop by itself — its deferred lines run, and a `try` reaches the stop — before it is forced, which runs none of them")), index.hold(#format("write `", sp, "(", wv, ", 100)` to give it 100 milliseconds, or `", sp, "(", wv, ", 0)` to force it at once")))
+            return bad()
+        u32 tn = arg_value(w, b, args[1])
+        Val t = finish(w, b, expr(w, b, tn, u32(types.P_I64)), tn)
+        if t.ty == NONE: return bad()
+        if int_prim(w, t.ty) == types.PRIMS:
+            string8 wt = src(w, b, tn)
+            string8 rep = "give it the milliseconds as an integer: `100`, or `0` to force at once"
+            if is_float(w, t.ty): rep = index.hold(#format("give it whole milliseconds — for seconds held as a float, `i64(", wt, " * 1000.0)`"))
+            err(w, b, tn, 1215, index.hold(#format("`", sp, "`'s timeout is the milliseconds the script has to stop by itself, an integer, and `", wt, "` is ", named(w, t.ty))), rep)
+            return bad()
+        t = coerce(w, b, t, u32(types.P_I64), tn)
+        [2]Val vs = [value(vm.opd, rp), t]
+        return h_call(w, b, n, CV_RT[k], vs[:], u32(types.P_VOID), false)
+    if m == B_SCRIPT_RELOAD:
+        b.stried = n
+        return host_reload(w, b, n, vm)
+    if m == B_SCRIPT_PAUSE && h_web(w, b, n, 3, sp): return value(NONE, u32(types.P_VOID))
+    u32 ret = u32(types.P_VOID)
+    if m == B_SCRIPT_PUMP: ret = u32(types.P_I64)
+    if m == B_SCRIPT_IS_RUNNING || m == B_SCRIPT_IS_PAUSED: ret = u32(types.P_BOOL)
+    [1]Val vs = [value(vm.opd, rp)]
+    return h_call(w, b, n, CV_RT[k], vs[:], ret, false)
+
+void h_rest(^World w, ^Body b, u32 n, i64 from):
+    []u32 args = call_args(w, b, n)
+    for i in from..<#len(args):
+        _ = expr(w, b, arg_value(w, b, args[i]), NONE)
+
+// A verb's VM argument, or ERR1209 naming what to pass.
+private Val h_vm_arg(^World w, ^Body b, u32 vn, string8 sp, string8 does, string8 ex):
+    Val v = finish(w, b, expr(w, b, vn, NONE), vn)
+    if v.ty == NONE || is_vm(w, v.ty): return v
+    string8 wv = src(w, b, vn)
+    string8 what = index.hold(#format("`", sp, "` ", does, ", and `", wv, "` is ", shown(w, v.ty), ", not a VM"))
+    if s_class_of_ty(w, v.ty) != NONE: what = index.hold(#format("`", sp, "` ", does, ", and `", wv, "` is an instance of `", h_class_name(w, s_class_of_ty(w, v.ty)), "`, not a VM: a VM is the engine its instances live in, which `#script_vm` makes"))
+    string8 help = index.hold(#format("make the VM first — `try VM vm = #script_vm()` — and pass it: `", ex, "`"))
+    u32 own = lookup(w, w.p.files[b.file].pkg, w.p.names.intern("VM"))
+    if own != NONE && typeish(w.decls[own].kind): help = index.hold(#format("this package declares a type `VM` of its own, which hides the VM type `#script_vm` answers: rename that type, or hold the VM as `try auto vm = #script_vm()`, and pass it: `", ex, "`"))
+    err(w, b, vn, 1209, what, help)
+    return bad()
+
+private string8 h_class_name(^World w, u32 ci):
+    u32 d = w.classes[ci].decl
+    return index.hold(#format(name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", name_of(w, w.decls[d].name)))
+
+// `#script_reload(vm, Class[, dir])`, checked; running one is not built.
+private Val host_reload(^World w, ^Body b, u32 n, Val vm):
+    []u32 args = call_args(w, b, n)
+    string8 sp = "#script_reload"
+    if #len(args) < 2:
+        err(w, b, n, 601, "`#script_reload` swaps new code in under a class, and names none here", "name the class after the VM — `#script_reload(vm, Goblin)`, or `#script_reload(vm, npc.Goblin)` for one of the package imported as `npc`")
+        return bad()
+    u32 cd = h_class_arg(w, b, arg_value(w, b, args[1]), sp)
+    if cd == NONE:
+        h_rest(w, b, n, 2)
+        return bad()
+    if h_web(w, b, n, 0, sp):
+        h_rest(w, b, n, 2)
+        return value(NONE, u32(types.P_VOID))
+    if w.release && !w.reload:
+        err(w, b, n, 1223, "`#script_reload` swaps new code in under a running script, and this is a release build (`--release`), which carries no table of what it bound to check new code against", "build without `--release` while developing, or add `--reload` to keep reloading in this release build")
+        h_rest(w, b, n, 2)
+        return value(NONE, u32(types.P_VOID))
+    Val dir = h_c(w, b, n, "((dado_string){ 0, 0 })", types.STRING8)
+    if #len(args) > 2:
+        u32 dn = arg_value(w, b, args[2])
+        Val d = finish(w, b, expr(w, b, dn, types.STRING8), dn)
+        if d.ty == NONE: return bad()
+        dir = d
+        if w.t.resolve(d.ty) != types.STRING8:
+            err(w, b, dn, 504, index.hold(#format("`", sp, "`'s third argument is the directory the new code is in, a `string8`, and `", src(w, b, dn), "` is ", named(w, d.ty))), index.hold(#format("write the directory as a string — `", sp, "(vm, Goblin, \"reload\")` — or leave it out to read `reload/` under the working directory")))
+            return value(NONE, u32(types.P_VOID))
+    if rt_pkg(w) == NONE: return h_call(w, b, n, "reload_engine", nil, u32(types.P_VOID), true, sp)
+    w.reloads = true
+    string8 cnm = name_of(w, w.decls[cd].name)
+    string8 mod = index.hold(#format(name_of(w, w.p.pkgs[w.decls[cd].pkg].name), "/", cnm))
+    [5]Val vs = [value(spill(w, b, vm, n), u32(types.P_RAWPTR)), h_cstr(w, b, n, mod), h_cstr(w, b, n, cnm), dir, h_c(w, b, n, "dado_js__bindings", types.CSTRING)]
+    return h_call(w, b, n, "reload_engine", vs[:], u32(types.P_VOID), true, sp)
+
+// A verb's class argument, or NONE having said ERR1202.
+private u32 h_class_arg(^World w, ^Body b, u32 cn, string8 sp):
+    syntax.Ast a = tree(w, b)
+    u32 cd = NONE
+    if a.tag[cn] == syntax.E_NAME: cd = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, cn))
+    if cd != NONE && w.decls[cd].kind == K_CLASS: return cd
+    if a.tag[cn] == syntax.E_FIELD && a.tag[a.a[cn]] == syntax.E_NAME:
+        // `pkg.Class`, through an import.
+        u32 ps = w.p.sym(b.file, a.a[cn])
+        for im in w.p.pkgs[w.p.files[b.file].pkg].imports:
+            if im.file == b.file && (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == ps: cd = lookup(w, im.pkg, w.p.sym(b.file, cn))
+        if cd != NONE && w.decls[cd].kind == K_CLASS: return cd
+    if a.tag[cn] == syntax.E_FIELD:
+        err(w, b, cn, 1, "this class is outside the slice the port builds so far")
+        return NONE
+    string8 wc = src(w, b, cn)
+    string8 what = index.hold(#format("`", wc, "` names no DadoScript class: `", sp, "` names a class by its name — a `.dados` file, or a `class` block — never by a path or a value"))
+    if cd != NONE && typeish(w.decls[cd].kind): what = index.hold(#format("`", wc, "` is a Dado type, and `", sp, "` names a DadoScript class — a `.dados` file, or a `class` block — which the compiler checked and carries in the program"))
+    err(w, b, cn, 1202, what, index.hold(#format("name a class — `", sp, "(vm, Goblin)` for one of this package, with `npc.Goblin` for one of the package this file imports as `npc`")))
+    return NONE
+
+// `#script_run(g, "name", …)`, the retired form: ERR1210 when it is one.
+private bool h_retired(^World w, ^Body b, u32 n, u32 gn, u32 ci, u32 rd):
+    []u32 args = call_args(w, b, n)
+    u32 en = arg_value(w, b, args[1])
+    string8 lit = src(w, b, en)
+    string8 named_ = index.hold(strings.clone(lit[1..<#len(lit) - 1]))
+    bool retired = rd == NONE
+    if rd != NONE:
+        u32 ft = resolve(w, rd)
+        if ft == NONE: return false
+        []u32 ps = w.t.params(ft)
+        bool takes = #len(ps) - 1 == #len(args) - 1 && #len(ps) > 1 && ps[1] == w.sstr
+        retired = #len(ps) == 1 || !takes && named_ != "ready" && s_method_named(w, ci, named_) != NONE
+    if !retired: return false
+    ref []string8 rest
+    for g in args[2..<#len(args)]:
+        rest = #append(rest, src(w, b, arg_value(w, b, g)))
+    h_rest(w, b, n, 1)
+    err(w, b, en, 1210, index.hold(#format("`#script_run(s, \"", named_, "\", …)` is retired: a method of an instance is called through its handle, and `#script_run(c, ..args)` runs the instance's `ready` with `ready`'s arguments, as a program's `main` is run")), index.hold(#format("write `", src(w, b, gn), ".", named_, "(", strings.join(rest[:], ", "), ")`")))
+    return true
+
+// A verb's named arguments (Rust's `verb_sinks`): after the positional ones,
+// `out:`, `err:` and `on_error:` for `#script_vm`, each once. The count of
+// positional arguments, or -1 having refused (every value typed).
+private i64 h_sinks(^World w, ^Body b, u32 n, string8 verb):
+    syntax.Ast a = tree(w, b)
+    []u32 args = call_args(w, b, n)
+    i64 np = #len(args)
+    for i in 0..<#len(args):
+        if a.tag[args[i]] == syntax.E_ARG && a.main[args[i]] != NONE && np == #len(args): np = i
+    bool vm = verb == "#script_vm"
+    bool refused = false
+    ref []string8 seen
+    ref []u32 kept
+    for g in args[np..<#len(args)]:
+        if a.tag[g] != syntax.E_ARG || a.main[g] == NONE:
+            err(w, b, arg_value(w, b, g), 604, index.hold(#format("`", verb, "`'s arguments are positional and its sinks are named, so `out:` and `err:` come after every argument it takes by position, and this one follows a sink")), "move `out:` and `err:` to the end of the call")
+            refused = true
+            continue
+        string8 nm = index.hold(strings.clone(w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]))
+        bool known = vm && (nm == "out" || nm == "err" || nm == "on_error")
+        if !known:
+            refused = true
+            if nm == "out" || nm == "err": err_tok(w, b, g, 602, index.hold(#format("`", verb, "` takes no `", nm, ":` argument: a script's sinks are its VM's, set by the `#script_vm` that makes it, or scoped for one call with a `using` after it")), index.hold(#format("write it after the call: `", verb, "(…) using ", nm, ": …` — or give it to the VM, `#script_vm(", nm, ": …)`")))
+            else if nm == "on_error": err_tok(w, b, g, 602, index.hold(#format("`", verb, "` takes no `on_error:`: the failure policy is the VM's, set once by the `#script_vm` that makes it")), "drop `on_error:`, and give it to the `#script_vm`")
+            else if vm: err_tok(w, b, g, 602, index.hold(#format("`", verb, "` has no parameter `", nm, "`: it takes its arguments in order\x1fThe only names it takes are its sinks, `out:` — where a script's `print` and `println` write — and `err:` — where a failure's text goes — and its policy, `on_error:`")), index.hold(#format("drop `", nm, ":`, or write `out:`, `err:` or `on_error:`")))
+            else: err_tok(w, b, g, 602, index.hold(#format("`", verb, "` has no parameter `", nm, "`: it takes its arguments in order")), index.hold(#format("drop `", nm, ":`")))
+            continue
+        bool twice = false
+        for x in seen:
+            if x == nm: twice = true
+        if twice:
+            err_tok(w, b, g, 603, index.hold(#format("`", verb, "` is given `", nm, ":` twice, and a run has one")), index.hold(#format("keep one `", nm, ":`")))
+            refused = true
+            continue
+        seen = #append(seen, nm)
+        kept = #append(kept, g)
+    if !refused: return np
+    for g in args:
+        bool k = false
+        for x in kept:
+            if x == g: k = true
+        if !k: _ = expr(w, b, arg_value(w, b, g), NONE)
+    return -1
+
+// Errors said so far.
+i64 n_errors(^World w):
+    return w.d.errors()
+
+const u32 SINK_MARK = 1   // a `Commit`'s `ty`: scoped sinks, `ch`/`i` saved
+
+// A `using`'s `out:`/`err:` (Rust's `using_sinks`): names and types; with
+// the runtime, the sinks in force saved (`sv`) and these put in.
+bool using_sinks(^World w, ^Body b, u32 head, bool after, ^[2]u32 sv):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[head])
+    bool ok = true
+    ref []string8 seen
+    ref []Val vs
+    ref []string8 ns
+    for g in ks[1..<#len(ks)]:
+        string8 nm = index.hold(strings.clone(w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]))
+        bool twice = false
+        for x in seen:
+            if x == nm: twice = true
+        if nm != "out" && nm != "err":
+            string8 paren = ""
+            if after: paren = index.hold(#format(" — and if `", nm, ":` is an argument of the call around this one, the `using` read it as its own: parenthesise this call, `g((f() using …), ", nm, ": …)`"))
+            [2]string8 pool = ["out", "err"]
+            string8 near = nearest(nm, pool[:])
+            if #len(near) == 0: near = sink_near(nm)
+            string8 rep = index.hold(#format("write `out:` or `err:` in place of `", nm, ":`"))
+            if #len(near) > 0: rep = index.hold(#format("did you mean `", near, ":`? Write `using ", near, ": …`"))
+            err_tok(w, b, g, 1212, index.hold(#format("a `using` names an allocator first, by position, and then a script's sinks by name — `out:`, where its `print` and `println` write, and `err:`, where a failure's text goes — and `", nm, ":` is neither", paren)), rep)
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+            ok = false
+            continue
+        if twice:
+            err_tok(w, b, g, 1212, index.hold(#format("this `using` is given `", nm, ":` twice, and a scope has one: the second would hide the first for the whole extent")), index.hold(#format("keep one `", nm, ":`")))
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+            ok = false
+            continue
+        seen = #append(seen, nm)
+        u32 gv = arg_value(w, b, g)
+        Val v = finish(w, b, expr(w, b, gv, sink(w)), gv)
+        if v.ty == NONE:
+            ok = false
+            continue
+        if w.t.resolve(v.ty) != w.t.resolve(sink(w)):
+            err(w, b, gv, 504, index.hold(#format("a `using`'s `", nm, ":` is a `Sink` — a procedure and a pointer, `(i64(rawptr, rawptr, i64) proc, rawptr data)`, the shape `#render` writes into — and this is ", named(w, v.ty))), index.hold(#format("pass a sink: `", nm, ": io.stdout_sink()`, `", nm, ": fmt.to_bytes(&cursor)` to capture into memory, or one of your own")))
+            ok = false
+            continue
+        vs = #append(vs, value(spill(w, b, v, gv), sink(w)))
+        ns = #append(ns, nm)
+    if !ok || rt_pkg(w) == NONE: return ok
+    for i in 0..<#len(vs):
+        i64 k = 0 if ns[i] == "out" else 1
+        sv^[k] = h_call(w, b, head, index.hold(#format("scope_", ns[i])), nil, sink(w), false).opd
+        [1]Val pv = [vs[i]]
+        _ = h_call(w, b, head, index.hold(#format("scope_set_", ns[i])), pv[:], u32(types.P_VOID), false)
+    return ok
+
+// What a misnamed sink most likely meant, by what its name says.
+private string8 sink_near(string8 s):
+    ref []char8 lo = strings.to_lower(s)
+    string8 l = index.hold(lo)
+    for x in SINK_ERR:
+        if strings.contains(l, x): return "err"
+    for x in SINK_OUT:
+        if strings.contains(l, x): return "out"
+    return ""
+
+private const [3]string8 SINK_ERR = ("err", "fail", "problem")
+private const [5]string8 SINK_OUT = ("out", "sink", "log", "print", "write")
+
+// The sinks a scope saved, put back.
+void sinks_pop(^World w, ^Body b, Commit c):
+    for k in 0..<2:
+        u32 s = c.ch if k == 0 else c.i
+        if s == NONE: continue
+        [1]Val pv = [value(s, sink(w))]
+        _ = h_call(w, b, c.node, "scope_set_out" if k == 0 else "scope_set_err", pv[:], u32(types.P_VOID), false)
+
+// Sinks scoped after call `n`, which checked clean: it must be one into a
+// script (ERR1211 otherwise).
+void sinks_after(^World w, ^Body b, u32 n, u32 head):
+    syntax.Ast a = tree(w, b)
+    u32 g = a.list(a.b[head])[1]
+    string8 lab = index.hold(strings.clone(w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]))
+    u32 cn = a.list(a.b[n])[0]
+    string8 call = src(w, b, cn)
+    if a.tag[cn] == syntax.E_NAME:
+        string8 v = spell(w, b, cn)
+        if v == "#script_run" || v == "#script_new" || v == "#script_reload" || v == "#script_vm": return
+        if strings.starts_with(v, "#script_") || v == "#delete":
+            err_tok(w, b, g, 1211, index.hold(#format("`", v, "` runs no script code, so a `using ", lab, ":` after it has nothing to write: a scoped sink holds for the calls into a script — a method called through a handle, `#script_run`, `#script_new`, `#script_reload`")), index.hold(#format("drop `", lab, ":` here, and scope it over the calls whose output it is")))
+            return
+    if b.scall == n: return
+    err_tok(w, b, g, 1211, index.hold(#format("`", call, "` is not a call into a script, so a `using ", lab, ":` after it is refused\x1fA scoped sink is where a script's `print` and `println` (`out:`) or a failure's text (`err:`) go, and Dado's own output — `fmt.println` — never goes through it. After a call, the sink holds for that one call into a script")), index.hold(#format("to reach the scripts `", call, "` calls, open a suite around it — `using ", lab, ": …:` and the call indented under it; for a script's method, write the sink after that call, `c.greet(x) using ", lab, ": …`")))
+
+// `#script_vm(…) using out: …`: ERR1211.
+bool vm_scope(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u32 uh = a.list(a.b[n])[1]
+    if uh == NONE: return false
+    []u32 hk = a.list(a.b[uh])
+    if #len(hk) < 2: return false
+    u32 g = hk[1]
+    string8 lab = index.hold(strings.clone(w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]))
+    err_tok(w, b, g, 1211, index.hold(#format("`#script_vm` makes a VM and runs no script code, so a `using ", lab, ":` after it scopes nothing: a VM's own sinks are its arguments, and hold for its life")), index.hold(#format("give the sink to the VM, `#script_vm(", lab, ": …)`, or scope it over the calls into the VM's scripts, `c.greet(x) using ", lab, ": …`")))
+    return true
+
+// Whether a call with script parameters `ps` and answer `rt` carries a run.
+private bool h_runs(^World w, []u32 ps, u32 rt):
+    if w.hwide: return true
+    for p in ps:
+        if s_kind(w, p) == 1 || s_kind(w, p) == 2 || s_tup(w, p) || s_fn(w, p) || union_of(w, p) != NONE || s_denum(w, p) != NONE: return true
+    return rt != NONE && (s_kind(w, rt) == 1 || s_kind(w, rt) == 2 || s_tup(w, rt) || union_of(w, rt) != NONE || s_denum(w, rt) != NONE)
+
+// The Dado type a script's run answer `rt` arrives as (`[]int` as
+// `ref []i64`), or NONE.
+private u32 h_run_ans(^World w, u32 rt, bool ans = false):
+    u32 r = w.t.resolve(rt)
+    if union_of(w, rt) != NONE: return s_dado_of(w, rt)
+    if s_denum(w, rt) != NONE: return rt
+    if s_tup(w, rt):
+        ref []u32 xs
+        for x in w.t.slots(rt):
+            u32 d = h_part_ans(w, x, ans, false)
+            if d == NONE: return NONE
+            xs = #append(xs, d)
+        return w.t.tuple(xs[:])
+    if ans && s_kind(w, rt) == 2:
+        u32 k = h_part_ans(w, w.t.a[r], true, true)
+        u32 v = h_part_ans(w, w.t.b[r], true, false)
+        if k == NONE || v == NONE || w.t.resolve(w.t.a[r]) == u32(types.P_FLOAT): return NONE
+        seam_maps(w)
+        return w.t.map_of(k, v)
+    if s_kind(w, rt) != 1: return NONE
+    u32 e = w.t.resolve(w.t.a[r])
+    u32 de = h_part_ans(w, e, ans, false)
+    if !ans && (e == w.sstr || s_kind(w, e) != 0 || s_tup(w, e)): de = NONE
+    if de == NONE: return NONE
+    return w.t.ref_of(w.t.slice_of(de))
+
+// Script part `x` (a slot, an element, a map's key) as Dado holds it: an
+// answer's strings and inner containers Dado's own (a key's text the map's).
+private u32 h_part_ans(^World w, u32 x, bool ans, bool key):
+    u32 r = w.t.resolve(x)
+    if r == u32(types.P_BOOL): return r
+    if ans && r == u32(types.P_U8) && !key: return r
+    if is_float(w, r) && !key: return u32(types.P_F64)
+    if is_int(w, r) && !is_char(w, r) && !is_float(w, r): return u32(types.P_I64)
+    if key && r == w.sstr: return types.STRING8
+    if ans && r == w.sstr:
+        _ = seam_rt(w, "read_owned_string")
+        return w.t.ref_of(w.t.slice_of(u32(types.P_CHAR8)))
+    if !key && (s_tup(w, r) || ans && s_kind(w, r) != 0): return h_run_ans(w, r, ans)
+    return NONE
+
+// A Dado run `g` given to a script's `st`: a `[]U` or `ref []U` whose
+// elements cross, lent as a view.
+private Val h_cross_run(^World w, ^Body b, u32 g, Val v):
+    u32 r = w.t.resolve(v.ty)
+    u32 e = run_elem(w, r, true)
+    if e == NONE && s_tup(w, r):
+        // A fixed array is lent as a view of its slots.
+        u32 vt = w.t.slice_of(w.t.slots(r)[0])
+        u32 t = temp(w, b, vt, g)
+        _ = ir.op(&b.f, ir.O_VIEW, 0, vt, g, t, spill(w, b, v, g), NONE, NONE)
+        return value(t, vt)
+    if e == NONE || seam_kind(w, v.ty, true) != SK_RUN:
+        err(w, b, g, 1, "this crossing is outside the slice the port builds so far")
+        return bad()
+    if w.t.tag[r] == types.T_REF: v = coerce(w, b, v, w.t.slice_of(e), g)
+    return v
+
+
+// A call into a script carrying runs: `dado_hrun_<k>`, generated, which
+// enters the engine, builds the arguments in it, calls, and reads the
+// answer (Rust's container helper); `made`: `#script_new`'s.
+private Val h_run_helper(^World w, ^Body b, u32 n, u32 h, u32 ci, string8 entry, []u32 ps, u32 rt, bool tried, bool made, bool ready = false):
+    HRun x
+    x.ready = ready
+    x.ci = ci
+    x.entry = entry
+    x.ans = NONE
+    x.sans = NONE
+    x.tried = tried
+    x.made = made
+    ref []Val vs
+    vs = #append(vs, value(h, u32(types.P_RAWPTR)))
+    []u32 al = call_args(w, b, n)
+    i64 off = #len(al) - #len(b.hvals)
+    for i in 0..<#len(b.hvals):
+        x.srcs = #append(x.srcs, index.hold(strings.clone(src(w, b, arg_value(w, b, al[off + i])))))
+        x.tys = #append(x.tys, b.hvals[i].ty)
+        x.sts = #append(x.sts, ps[i])
+        vs = #append(vs, b.hvals[i])
+    u32 dt = u32(types.P_VOID)
+    if made:
+        dt = u32(types.P_RAWPTR)
+        x.ans = dt
+    else if rt != u32(types.P_VOID):
+        x.sans = rt
+        dt = h_run_ans(w, rt, true)
+        if dt == NONE: dt = h_scalar_ans(w, rt)
+        x.ans = dt
+    if ready:
+        dt = u32(types.P_I64)
+        x.ans = dt
+        _ = seam_rt(w, "exit_status")
+    for nm in HRUN_RT:
+        _ = seam_rt(w, nm)
+    for nm in SEAM_RUN_RT:
+        _ = seam_rt(w, nm)
+    #truncate(b.hvals, 0)
+    return h_hcall(w, b, n, x, dt, vs[:], tried, "#script_new" if made else entry)
+
+// A call of run helper `x` (answering `dt`), the arguments `vs`.
+private Val h_hcall(^World w, ^Body b, u32 n, HRun x, u32 dt, []Val vs, bool tried, string8 what):
+    i64 k = #len(w.hruns)
+    w.hruns = #append(w.hruns, x)
+    u32 dst = NONE if dt == u32(types.P_VOID) else temp(w, b, dt, n)
+    u32 code = NONE
+    if tried: code = temp(w, b, u32(types.P_I32), n)
+    u32 r = ir.fn_ref(&b.f, tstr(w, "script"), tstr(w, index.hold(#format("dado_hrun_", k))), ir.R_FAILABLE if tried else 0)
+    _ = ir.op(&b.f, ir.O_CALL, 0, dt, n, dst, r, NONE, code)
+    for v in vs:
+        ir.arg(&b.f, v.opd)
+    if tried:
+        b.stried = n
+        if !failable_call(w, b, n, what, code): return bad()
+    return value(dst, dt)
+
+// The Dado type a scalar script answer arrives as.
+private u32 h_scalar_ans(^World w, u32 rt):
+    if rt == u32(types.P_FLOAT): return u32(types.P_F64)
+    if rt == u32(types.P_BOOL): return u32(types.P_BOOL)
+    if rt == w.sstr: return w.t.ref_of(w.t.slice_of(u32(types.P_CHAR8)))
+    return u32(types.P_I64)
+
+// What a run helper calls, from `core:script`.
+const [30]string8 HRUN_RT = ("read_same_string", "mix_string", "mix_float", "refused_back", "drop_string", "read_string", "read_same_length", "lend_host", "unlend_host", "lent_changed", "lent_refused", "clear_exception", "mix", "out_of_memory", "begin_run", "begin_new", "push_value", "call_entered", "construct_entered", "answer_int", "answer_float", "answer_bool", "answer_string", "answer_of", "answer_refused", "end_run", "quit_untried", "dup_value", "give_int", "give_string")
+
+// `pkg.f(args…)` from Dado, `pkg` holding scripts and no Dado `f`: a
+// script's package function (Rust's `script_function_call`), or `done`
+// unset when no class of `pkg` declares `f`.
+Val host_fn(^World w, ^Body b, u32 n, u32 cn, u32 pk, ^bool done):
+    u32 sym = w.p.sym(b.file, cn)
+    syntax.Ast a = tree(w, b)
+    string8 q = index.hold(#format(spell(w, b, a.a[cn]), ".", spell(w, b, cn)))
+    string8 s = index.hold(strings.clone(spell(w, b, cn)))
+    ref []u32 dc
+    ref []u32 ex
+    for ci in 0..<#len(w.classes):
+        if w.decls[w.classes[ci].decl].pkg != pk: continue
+        for m in w.classes[ci].methods:
+            if w.decls[m].name != sym: continue
+            dc = #append(dc, u32(ci))
+            if vis_of(w, m) == syntax.VIS_EXPORT: ex = #append(ex, u32(ci))
+    if #len(dc) == 0: return bad()
+    done^ = true
+    []u32 args = call_args(w, b, n)
+    if #len(ex) != 1:
+        string8 k = name_of(w, w.decls[w.classes[dc[0]].decl].name)
+        string8 bq = spell(w, b, a.a[cn])
+        if #len(ex) == 0: err_tok(w, b, cn, 1226, index.hold(#format("`", q, "` names `", k, ".", s, "`, a method of a script, and Dado calls a script's function by its package only when the script publishes it: an `export` method that reaches no `self`")), index.hold(#format("write `export` on `", s, "` in `", k, "` if it reads no field and calls no other method, or make an instance and call it through its handle: `#script_new(vm, ", bq, ".", k, ")`, then `.", s, "(…)`")))
+        else:
+            ref []string8 ns
+            for ci in ex:
+                ns = #append(ns, index.hold(#format("`", name_of(w, w.decls[w.classes[ci].decl].name), ".", s, "`")))
+            string8 pn = bq
+            err_tok(w, b, cn, 1226, index.hold(#format("`", q, "` names a function of package `", pn, "`, and ", strings.join(ns[:], " and "), " publish one by that name, so the call names no one of them")), index.hold(#format("give each `export` function of package `", pn, "` a name of its own")))
+        h_rest(w, b, n, 0)
+        return bad()
+    u32 ci = ex[0]
+    u32 m = s_method_named(w, ci, s)
+    u32 ft = resolve(w, m)
+    if ft == NONE:
+        h_rest(w, b, n, 0)
+        return bad()
+    []u32 all = w.t.params(ft)
+    i64 np = #len(all) - 1
+    if #len(args) != np:
+        string8 pl = "" if np == 1 else "s"
+        err(w, b, n, 1226, index.hold(#format("`", q, "` takes ", np, " argument", pl, ", and this call gives it ", #len(args))), index.hold(#format("pass `", q, "` exactly ", np, " argument", pl)))
+        h_rest(w, b, n, 0)
+        return bad()
+    if #len(args) > 16:
+        err(w, b, n, 1221, index.hold(#format("this call of `", q, "` passes ", #len(args), " arguments, and one call from Dado into a script carries at most 16")), index.hold(#format("give `", q, "` at most 16 parameters: gather the rest into an array, a tuple or an instance")))
+        h_rest(w, b, n, 0)
+        return bad()
+    u32 rt = w.t.a[ft]
+    syntax.Ast ma = w.p.files[w.decls[m].file].a
+    []u32 mks = ma.list(ma.b[w.decls[m].node])
+    string8 wide = ""
+    for i in 1..<#len(all):
+        if wide == "" && !h_scalar(w, all[i]): wide = index.hold(#format("its parameter `", w.p.spell(w.decls[m].file, mks[5 + i]), "`"))
+    if wide == "" && rt != u32(types.P_VOID) && !h_scalar(w, rt): wide = "what it answers"
+    string8 cl = name_of(w, w.decls[w.classes[ci].decl].name)
+    if wide != "":
+        err(w, b, n, 1226, index.hold(#format("`", q, "` is a script's function, and ", wide, " is no `int`, `float`, `bool` or `string`, the four a function Dado calls by its package takes and answers")), index.hold(#format("call it through a handle, where containers and instances cross — `#script_new(vm, ", spell(w, b, a.a[cn]), ".", cl, ")`, then `.", s, "(…)` — or give the script a function over scalars")))
+        h_rest(w, b, n, 0)
+        return bad()
+    string8 mn = index.hold(#format(cl, ".", s))
+    ref []Val vs
+    vs = #append(vs, value(zero(w, u32(types.P_RAWPTR)), u32(types.P_RAWPTR)))
+    HRun x
+    x.ci = ci
+    x.entry = index.hold(strings.clone(s))
+    x.fm = m
+    x.fn_ = true
+    x.label = q
+    for i in 0..<#len(args):
+        Val v = h_cross(w, b, arg_value(w, b, args[i]), all[i + 1], mn, index.hold(strings.clone(w.p.spell(w.decls[m].file, mks[6 + i]))))
+        if v.ty == NONE: return bad()
+        if v.kind == V_LIT: v = finish(w, b, v, args[i])
+        u32 vr = w.t.resolve(v.ty)
+        if all[i + 1] == w.sstr && (vr == types.STRING16 || vr == types.STRING32 || vr == types.CSTRING):
+            u32 av = arg_value(w, b, args[i])
+            err(w, b, av, 1226, index.hold(#format("`", q, "` is a script's package function, and a `", shown(w, v.ty), "` crosses into its `string` only as a `string8`")), index.hold(#format("call `", s, "` through a handle, `#script_new(vm, ", cl, ")`, where `", src(w, b, av), "` is transcoded")))
+            return bad()
+        x.tys = #append(x.tys, v.ty)
+        x.sts = #append(x.sts, all[i + 1])
+        vs = #append(vs, v)
+    if rt_pkg(w) == NONE:
+        err(w, b, n, 1205, index.hold(#format("`", q, "` runs a script, and this compilation does not hold the DadoScript runtime, `core:script` — the loader adds it to a program that imports a package of scripts")), "build with the toolchain's collections root (`--collections=<root>`), where `core/script` lives")
+        return bad()
+    for nm in FN_RT:
+        _ = seam_rt(w, nm)
+    u32 dt = u32(types.P_VOID)
+    x.ans = NONE
+    x.sans = NONE
+    if rt != u32(types.P_VOID):
+        x.sans = rt
+        dt = h_scalar_ans(w, rt)
+        x.ans = dt
+    bool tried = n == b.tried
+    x.tried = tried
+    return h_hcall(w, b, n, x, dt, vs[:], tried, q)
+
+private bool h_scalar(^World w, u32 t):
+    return t == u32(types.P_INT) || t == u32(types.P_FLOAT) || t == u32(types.P_BOOL) || t == w.sstr
+
+// What a package function's helper calls, from `core:script`.
+const [9]string8 FN_RT = ("push_int", "push_float", "push_bool", "push_string", "call_function", "call_function_int", "call_function_float", "call_function_bool", "call_function_string")
+
+// `g.f` from Dado: a field read through a handle (`get_*_or_quit`); `done`
+// unset when the class has no field `f`.
+Val host_get(^World w, ^Body b, u32 n, Val base, ^bool done):
+    u32 ci = s_class_of_ty(w, base.ty)
+    u32 row = w.decls[w.classes[ci].decl].ty
+    []u32 sl = w.t.slots(row)
+    []u32 sn = w.t.slot_names(row)
+    string8 s = spell(w, b, n)
+    i64 fi = -1
+    for i in 0..<#len(sn):
+        if w.t.text(sn[i]) == s: fi = i
+    done^ = true
+    if fi < 0:
+        string8 bs = a_base(w, b, n)
+        _ = h_member(w, b, n, ci, bs, false)
+        return bad()
+    b.hfield = n
+    b.hclass = ci
+    u32 ft = sl[fi]
+    w.hmembers = #append(w.hmembers, (u64(w.classes[ci].decl) << 32) | u64(fi))
+    u32 h = spill(w, b, base, n)
+    string8 fs = index.hold(strings.clone(s))
+    u32 fc = s_class_of_ty(w, ft)
+    if fc != NONE:
+        [3]Val vi = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, fs), h_cstr(w, b, n, name_of(w, w.decls[w.classes[fc].decl].name))]
+        Val r = h_call(w, b, n, "get_instance_or_quit", vi[:], ft, false)
+        if r.ty != NONE: r.ty = ft
+        return r
+    string8 k = ""
+    u32 dt = NONE
+    ft = s_erase(w, ft)
+    if ft == w.sany:
+        string8 cl = name_of(w, w.decls[w.classes[ci].decl].name)
+        err_tok(w, b, n, 1219, index.hold(#format("`", cl, ".", fs, "` is a DadoScript `any`, which does not cross into Dado: an `any` holds a value whose type only the script knows, and nothing unchecked crosses into Dado")), index.hold(#format("give `", cl, "` a method that answers what Dado needs of `", fs, "` as values that cross, and call it through the handle")))
+        return bad()
+    if ft == u32(types.P_INT):
+        k = "int"
+        dt = u32(types.P_I64)
+    if ft == u32(types.P_FLOAT):
+        k = "float"
+        dt = u32(types.P_F64)
+    if ft == u32(types.P_BOOL):
+        k = "bool"
+        dt = ft
+    if ft == w.sstr:
+        k = "string"
+        dt = w.t.ref_of(w.t.slice_of(u32(types.P_CHAR8)))
+    if dt == NONE && (s_tup(w, ft) || s_kind(w, ft) == 1 || s_kind(w, ft) == 2):
+        string8 cl = name_of(w, w.decls[w.classes[ci].decl].name)
+        err_tok(w, b, n, 1219, index.hold(#format("`", cl, ".", fs, "` is a DadoScript `", shown(w, ft), "`, which does not cross into Dado: a field holding an array, a tuple, a map or a function is not reached through a handle: a run copies a container for its call, and a field is no call")), index.hold(#format("give `", cl, "` a method that answers what Dado needs of `", fs, "` as values that cross, and call it through the handle")))
+        return bad()
+    if dt == NONE:
+        err(w, b, n, 1, "this field is outside the slice the port builds so far")
+        return bad()
+    [2]Val vs = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, fs)]
+    return h_call(w, b, n, index.hold(#format("get_", k, "_or_quit")), vs[:], dt, false)
+
+private string8 h_cname(^World w, u32 ci):
+    return name_of(w, w.decls[w.classes[ci].decl].name)
+
+private string8 a_base(^World w, ^Body b, u32 n):
+    return index.hold(strings.clone(src(w, b, tree(w, b).a[n])))
+
+private string8 h_listed(ref []string8 ns):
+    if #len(ns) == 0: return "none"
+    ref []string8 q
+    for x in ns:
+        q = #append(q, index.hold(#format("`", x, "`")))
+    return index.hold(strings.join(q[:], ", "))
+
+// ERR1218 for `g.f` (field node `n`): no such member, a method read, or
+// (`called`) a field called; false when a called name is no field.
+private bool h_member(^World w, ^Body b, u32 n, u32 ci, string8 base, bool called):
+    string8 cl = h_cname(w, ci)
+    string8 s = index.hold(strings.clone(spell(w, b, n)))
+    ref []string8 fs
+    bool isf = false
+    for x in w.t.slot_names(w.decls[w.classes[ci].decl].ty):
+        fs = #append(fs, w.t.text(x))
+        if w.t.text(x) == s: isf = true
+    ref []string8 ms
+    for m in w.classes[ci].methods:
+        if name_of(w, w.decls[m].name) != "init": ms = #append(ms, name_of(w, w.decls[m].name))
+    if called:
+        if !isf: return false
+        err_tok(w, b, n, 1218, index.hold(#format("`", cl, ".", s, "` is a field, and a field is read, not called")), index.hold(#format("read it: `", base, ".", s, "`")))
+    else if s != "init" && s_method_named(w, ci, s) != NONE:
+        err_tok(w, b, n, 1218, index.hold(#format("`", cl, ".", s, "` is a method, and a method of a script's instance is called through its handle, never read as a value")), index.hold(#format("call it: `", base, ".", s, "(…)`, with its arguments")))
+    else:
+        ref []string8 pool
+        for x in fs: pool = #append(pool, x)
+        for x in ms: pool = #append(pool, x)
+        string8 near = nearest(s, pool[:])
+        string8 h = index.hold(#format("did you mean `", near, "`?"))
+        if #len(near) == 0: h = index.hold(#format("name one of `", cl, "`'s members, or declare `", s, "` in the class"))
+        err_tok(w, b, n, 1218, index.hold(#format("`", cl, "` has no field or method `", s, "`: its fields are ", h_listed(fs), ", and its methods ", h_listed(ms))), h)
+    return true
+
+// A handle's field as a place: `g.f op= v` is ERR1218 (two runs); a store
+// is not built.
+void h_put(^World w, ^Body b, u32 n, u32 pn, u32 vn, string8 op):
+    b.hfield = 0
+    _ = expr(w, b, vn, NONE)
+    if op == "=":
+        err(w, b, pn, 1, "this field store is outside the slice the port builds so far")
+        return
+    string8 ps = src(w, b, pn)
+    err(w, b, n, 1218, index.hold(#format("`", ps, "` is the field `", spell(w, b, pn), "` of a `", h_cname(w, b.hclass), "` the script holds, and a compound assignment would read it and write it in two runs of the script")), index.hold(#format("write the read and the write out: `", ps, " = ", ps, " ", op[0..<#len(op) - 1], " ", src(w, b, vn), "`")))
+
+// ERR1218 for a handle's field in a group assignment or under `&`.
+bool h_misplaced(^World w, ^Body b, u32 pn, string8 what):
+    if b.hfield != pn || pn == 0: return false
+    b.hfield = 0
+    string8 s = src(w, b, pn)
+    err(w, b, pn, 1218, index.hold(#format("`", s, "` is a field of an instance a script holds, which lives in the engine, so ", what)), index.hold(#format("read it into a local, `i64 v = ", s, "`, or write it by itself, `", s, " = v`")))
+    return true
+
+// `g.f = v` from Dado, `g` a local handle: the value pushed and stored
+// (`put_or_quit`, Rust's). Whether `pn` was one; a field it lacks, a
+// compound assignment or another base goes the read's way (ERR1218).
+bool host_put(^World w, ^Body b, u32 n, u32 pn, u32 vn, string8 op):
+    syntax.Ast a = tree(w, b)
+    if op != "=" || a.tag[pn] != syntax.E_FIELD || a.tag[a.a[pn]] != syntax.E_NAME: return false
+    u32 sl = find_local(w, b, w.p.sym(b.file, a.a[pn]), false)
+    if sl == NONE: return false
+    u32 ty = b.f.slot_ty[sl]
+    if !handle_ty(w, ty): return false
+    u32 ci = s_class_of_ty(w, ty)
+    if ci == NONE: return false
+    u32 row = w.decls[w.classes[ci].decl].ty
+    []u32 fs = w.t.slots(row)
+    []u32 sn = w.t.slot_names(row)
+    string8 s = spell(w, b, pn)
+    i64 fi = -1
+    for i in 0..<#len(sn):
+        if w.t.text(sn[i]) == s: fi = i
+    if fi < 0: return false
+    u32 ft = fs[fi]
+    if !h_scalar(w, s_erase(w, ft)): return false
+    Val bv = local_val(w, b, find_local(w, b, w.p.sym(b.file, a.a[pn]), true))
+    if bv.ty == NONE: return true
+    u32 h = spill(w, b, bv, a.a[pn])
+    string8 fname = index.hold(strings.clone(s))
+    string8 mn = index.hold(#format(name_of(w, w.decls[w.classes[ci].decl].name), ".", fname))
+    w.hfield = true
+    Val v = h_cross(w, b, vn, ft, mn, fname)
+    w.hfield = false
+    if v.ty == NONE: return true
+    string8 pn2 = "push_int"
+    u32 fe = s_erase(w, ft)
+    if fe == u32(types.P_FLOAT): pn2 = "push_float"
+    if fe == u32(types.P_BOOL): pn2 = "push_bool"
+    if fe == w.sstr: pn2 = "push_string"
+    [2]Val pv = [value(h, u32(types.P_RAWPTR)), v]
+    _ = h_call(w, b, n, pn2, pv[:], u32(types.P_VOID), false)
+    [2]Val qv = [value(h, u32(types.P_RAWPTR)), h_cstr(w, b, n, fname)]
+    _ = h_call(w, b, n, "put_or_quit", qv[:], u32(types.P_VOID), false)
+    w.hmembers = #append(w.hmembers, (u64(w.classes[ci].decl) << 32) | u64(fi))
+    return true
+
+// ERR1225: what a web build cannot do with a script.
+// `k`: 0 a reload, 1 a load by path, 2 an `async` entry, 3 a pause.
+bool h_web(^World w, ^Body b, u32 n, u8 k, string8 what):
+    if w.os != "WEB" || k == 3 && w.web_threads: return false
+    string8 csp = "A page evaluates no code from a string under a strict Content-Security-Policy, and Dado under wasm cannot wait for a fetch"
+    if k == 0: err(w, b, n, 1225, index.hold(#format("`", what, "` swaps new code in under a running script, and on the web (`#OS` is `#WEB`) there is no new code to swap in\x1f", csp)), index.hold(#format("reload while developing in a host build (drop `--target=web`), or keep the web build from reaching it: `when #OS != #WEB:` around `", what, "`")))
+    else if k == 1: err(w, b, n, 1225, index.hold(#format("`", what, "` loads a script the build never saw, and on the web (`#OS` is `#WEB`) a script's modules are the files the build writes beside the module\x1f", csp)), "make the mod a class of the program, so the build writes it with the rest, and construct it; or load mods in a host build (drop `--target=web`)")
+    else if k == 2: err(w, b, n, 1225, index.hold(#format("`", what, "` is `async`, and on the web (`#OS` is `#WEB`) Dado under wasm cannot wait for what it answers within the call\x1fWhat it answers settles only when the page runs its job queue, after the wasm module has returned")), index.hold(#format("call a method that is not `async` from Dado, and let the script await `", what, "` itself; or run this call in a host build (drop `--target=web`)")))
+    else: err(w, b, n, 1225, index.hold(#format("`", what, "` pauses a run from another thread, and this web build (`#OS` is `#WEB`) is single-threaded: there is no other thread to pause it from")), index.hold(#format("build with `--web-threads` and pause from a thread of its own, or keep the web build from reaching it: `when #OS != #WEB:` around `", what, "`")))
+    return true

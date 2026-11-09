@@ -1,0 +1,350 @@
+// Allocators: the two words, `#default`/`#heap`/`#caller` as values, a
+// verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
+package check
+
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+
+const u8 B_AL_GET = 90        // dst = the ambient
+const u8 B_AL_HEAP = 91       // dst = the heap's two words
+const u8 B_AL_PUSH = 92       // dst = the ambient, which is then args[0]
+const u8 B_AL_POP = 93        // the ambient is args[0] again
+const u8 B_AL_NEW = 94        // dst = a zeroed `ref T` from args[0], a rung (1 #default, 2 #heap, 3 #stack) or two words
+const u8 B_AL_COPY = 95       // dst = a new `ref T` or `ref []T` holding what args[0] names, from args[1]
+const u8 B_AL_FORMAT = 96     // dst = args[1..] rendered into a `ref []char8` from args[0]
+
+const string8 AL_REPAIR = "write an allocator: a value of a declaration that takes `mem.Allocator` on, the two words `(proc, data)` its `.data()` answers, or a rung — `#default`, `#return`, `#caller` or `#heap`"
+
+const [5]string8 RUNGS = ("#default", "#heap", "#caller", "#stack", "#return")
+
+// `RUNGS[k]` where a value is wanted.
+Val alloc_name(^World w, ^Body b, u32 n, i64 k):
+    u32 at = alloc_ty(w)
+    if k == 2 && exported(w, b.decl):
+        err(w, b, n, 822, index.hold(#format("`", fn_label(w, b.decl), "` is `export`, so C calls it by its symbol, and C has no `using` to have opened and no `#caller` to hand over: the caller's view is an argument a Dado call site passes, and only a direct call written in Dado passes it")), "write `#default` for the ambient C left, or take the allocator as a parameter written as the two words `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data)` — never the `Allocator` trait, which does not cross to C")
+        return bad()
+    if k == 2 && b.caller != 0: return value(ir.at(&b.f, b.caller - 1), at)
+    if (k == 4 || k == 2) && #len(b.usings) > 0: return value(b.usings[0], at)
+    if k == 3:
+        err(w, b, n, 808, "`#stack` is a lifetime **rung**, not an allocator value", "write `#stack` last on `#new(T, #stack)` or `#make([]T, N, #stack)`; where a value is wanted, write `#default` or another of the four", "The allocation is written inline where the verb is called, so there is nothing for a function pointer to carry and nothing to bind to a name. It goes last on `#new(T, #stack)`, or on `#make([]T, N, #stack)` with a count the compiler knows; every other allocating verb sizes its block at run time or reaches it through the allocator's `proc`, and neither has a compound literal to write. The other four rungs — #default, #return, #caller, #heap — are ordinary allocator values — the two words `(proc, data)` — and go anywhere one goes")
+        return bad()
+    u32 t = temp(w, b, at, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_AL_HEAP if k == 1 else B_AL_GET, at, n, t, NONE)
+    return value(t, at)
+
+// A verb's allocator argument `g`: a rung constant, or the two words.
+u32 alloc_arg(^World w, ^Body b, u32 g, string8 verb):
+    u32 vn = arg_value(w, b, g)
+    i64 r = rung(w, b, g)
+    if r == 3 && verb != "new" && verb != "make":
+        _ = alloc_name(w, b, vn, 3)
+        return NONE
+    if r != 0: return ir.konst(w.k.small(&w.t, r))
+    Val v = alloc_of(w, b, expr(w, b, vn, alloc_ty(w)), vn)
+    if v.ty == NONE: return NONE
+    if !same_shape(w, v.ty, alloc_ty(w)):
+        err(w, b, vn, 504, index.hold(#format("`", verb, "`'s last argument is the allocator to allocate from; this is ", shown(w, final_ty(w, v)), ". Leave it off to allocate from the ambient — an absent one is `#default` — or write an allocator or a rung: `#return`, `#caller`, `#heap` or `#stack`")), AL_REPAIR)
+        return NONE
+    return spill(w, b, v, vn)
+
+// The ambient this body was entered with: what a `#caller` callee is handed.
+u32 entry_ambient(^World w, ^Body b, u32 n):
+    if #len(b.usings) > 0: return b.usings[0]
+    Val v = alloc_name(w, b, n, 0)
+    return v.opd
+
+// Whether `d`'s body names `#caller`.
+bool names_caller(^World w, u32 d):
+    if d in w.caller_memo:
+        try u8 m = w.caller_memo[d] else: return false
+        return m == 1
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 n = w.decls[d].node
+    bool yes = false
+    for i in 0..<#len(w.p.files[f].t.start):
+        u32 s = w.p.files[f].t.start[i]
+        if s < a.lo[n] || s >= a.hi[n]: continue
+        if w.p.files[f].src[i64(s)..<i64(w.p.files[f].t.end[i])] == "#caller": yes = true
+    w.caller_memo[d] = 1 if yes else 0
+    return yes
+
+// `using A:` over a suite: the ambient is `A` until the suite is left.
+void using_suite(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    [2]u32 sv = [NONE, NONE]
+    []u32 hk = a.list(a.b[a.a[n]])
+    if #len(hk) > 1: _ = using_sinks(w, b, a.a[n], false, &sv)
+    bool scoped = sv[0] != NONE || sv[1] != NONE
+    u32 saved = push_using(w, b, a.a[n], "the suite it opens")
+    if saved == NONE && !scoped:
+        block(w, b, a.b[n])
+        return
+    scope_in(w, b)
+    if saved != NONE:
+        b.usings = #append(b.usings, saved)
+        b.arenas = #append(b.arenas, arena_call(w, b, a.list(a.b[a.a[n]])[0], "allocator"))
+        b.commits = #append(b.commits, Commit(saved, NONE, NONE, NONE, false, n))
+        b.defers = #append(b.defers, Defer(NONE, b.depth, false, #len(b.commits) - 1, false))
+    if scoped:
+        b.commits = #append(b.commits, Commit(sv[0], sv[1], NONE, SINK_MARK, false, n))
+        b.defers = #append(b.defers, Defer(NONE, b.depth, false, #len(b.commits) - 1, false))
+    block(w, b, a.b[n])
+    scope_out(w, b)
+    if saved != NONE:
+        #truncate(b.usings, #len(b.usings) - 1)
+        #truncate(b.arenas, #len(b.arenas) - 1)
+
+// The ambient saved and `head`'s allocator made it; NONE when reported.
+u32 push_using(^World w, ^Body b, u32 head, string8 what):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[head])
+    if #len(ks) == 0 || ks[0] == NONE: return NONE
+    Val v = alloc_of(w, b, expr(w, b, ks[0], alloc_ty(w)), ks[0])
+    if v.ty == NONE: return NONE
+    if !same_shape(w, v.ty, alloc_ty(w)):
+        err(w, b, ks[0], 810, index.hold(#format("`using` shadows the ambient allocator for ", what, ", so its subject has to **be** one; this is ", shown(w, final_ty(w, v)))), AL_REPAIR, "An allocator is two words — a `proc` and its `data`, `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data)` — or a value of a declaration that takes the `Allocator` trait on, whose `.data()` answers the two words")
+        return NONE
+    u32 x = spill(w, b, v, ks[0])
+    u32 t = temp(w, b, alloc_ty(w), head)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_AL_PUSH, alloc_ty(w), head, t, NONE)
+    ir.arg(&b.f, x)
+    return t
+
+bool alloc_trait(^World w, u32 d):
+    return d != NONE && w.decls[d].kind == K_TRAIT && name_of(w, w.decls[d].name) == "Allocator" && name_of(w, w.p.pkgs[w.decls[d].pkg].name) == "mem"
+
+// Whether `ty` is an `Allocator` trait value (or a `^` to one) or a value
+// of an implementer of `core:mem`'s `Allocator`.
+bool allocator_of(^World w, u32 ty):
+    if ty == NONE: return false
+    u32 r = w.t.resolve(ty)
+    u32 tv = w.t.a[r] if r != NONE && w.t.tag[r] == types.T_PTR else ty
+    if is_trait(w, tv) && alloc_trait(w, trait_decl(w, tv)): return true
+    u32 t = w.t.bare(ty)
+    if !(t in w.type_decl): return false
+    u32 at = NONE
+    u32 m = method(w, t, w.p.names.intern("data"), &at)
+    if m == NONE || at != NONE: return false
+    for d in 0..<u32(#len(w.decls)):
+        if alloc_trait(w, d) && implements(w, t, d): return true
+    return false
+
+// An `Allocator` value as the two words its `data()` answers.
+Val alloc_of(^World w, ^Body b, Val v, u32 n):
+    if v.ty == NONE || v.kind != V_VAL || !allocator_of(w, v.ty): return v
+    u32 r = w.t.resolve(v.ty)
+    // An implementer whose one slot is a pointer (`ArenaAllocator`) is itself.
+    u32 at0 = NONE
+    bool own = w.t.bare(v.ty) in w.type_decl && method(w, w.t.bare(v.ty), w.p.names.intern("data"), &at0) != NONE && at0 == NONE
+    if !own && r != NONE && w.t.tag[r] == types.T_PTR: v = value(ir.step(&b.f, spill(w, b, v, n), ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
+    if is_trait(w, v.ty): return trait_data(w, b, v, n)
+    u32 at = NONE
+    u32 m = method(w, w.t.bare(v.ty), w.p.names.intern("data"), &at)
+    u32 env = env_of(w, w.t.bare(v.ty))
+    u32 fty = sig(w, m, env)
+    if fty == NONE: return bad()
+    Val recv = coerce(w, b, v, w.t.params(fty)[0], n)
+    if recv.ty == NONE: return bad()
+    Val c = emit_call(w, b, n, m, fty, job(w, m, env), recv, nil, nil)
+    if c.ty == NONE: return c
+    return value(c.opd, alloc_ty(w))
+
+// The ambient restored from `saved`.
+void pop_using(^World w, ^Body b, u32 saved, u32 n):
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_AL_POP, NONE, n, NONE, NONE)
+    ir.arg(&b.f, saved)
+
+// `#new(T[, alloc])`.
+Val new_(^World w, ^Body b, u32 n):
+    []u32 args = call_args(w, b, n)
+    u32 tn = arg_value(w, b, args[0])
+    u32 ty = NONE
+    if tree(w, b).tag[tn] == syntax.E_TYPE: ty = resolve_type(w, b.file, tree(w, b).a[tn])
+    else if tree(w, b).tag[tn] == syntax.E_NAME && !type_name(w, b, tn):
+        err(w, b, tn, 504, "`new` takes a **type** first: `#new(T)`", "", "Every spelling of a type value is accepted here, because there is one reader of what a type is and every position asks it — a written type, a name, `typeof(v)`, a tuple of types, or `{K: V}`")
+        _ = expr(w, b, tn, NONE)
+    else:
+        Val c = expr(w, b, tn, NONE)
+        if c.kind == V_TYPE: ty = c.x
+        else if c.ty != NONE: err(w, b, tn, 504, "`new` takes a **type** first: `#new(T)`", "", "Every spelling of a type value is accepted here, because there is one reader of what a type is and every position asks it — a written type, a name, `typeof(v)`, a tuple of types, or `{K: V}`")
+    if ty == NONE: return bad()
+    u32 r = w.t.resolve(ty)
+    if r != NONE && w.t.tag[r] == types.T_SLICE:
+        err(w, b, tn, 504, index.hold(#format("`new` mints one of something, and a `[]T` is a **window** over storage that already exists — allocating one would allocate the two words and not the elements. `#make([]", shown(w, w.t.a[r]), ", n)` is the verb that allocates elements")))
+        return bad()
+    u32 al = ir.konst(w.k.small(&w.t, 1))
+    if #len(args) > 1: al = alloc_arg(w, b, args[1], "new")
+    if al == NONE: return bad()
+    u32 rt = w.t.ref_of(ty)
+    u32 t = temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_AL_NEW, rt, n, t, NONE)
+    ir.arg(&b.f, al)
+    if n == b.guard:
+        u32 nil_ = temp(w, b, u32(types.P_BOOL), n)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, rt, n, nil_, t, zero(w, rt))
+        guarded(w, b, n, nil_)
+    return value(t, rt)
+
+// `#copy(x[, alloc])`: a `^T` or `ref T` to a `ref T`, a run to a `ref []T`.
+Val copy_(^World w, ^Body b, u32 n, Val v, u32 asked):
+    []u32 args = call_args(w, b, n)
+    u32 vn = arg_value(w, b, args[0])
+    if v.ty == NONE: return bad()
+    v = finish(w, b, v, vn)
+    u32 r = w.t.resolve(v.ty)
+    u32 of = NONE
+    Run k = run_shape(w, v.ty)
+    if k.kind == RK_REF || k.kind == RK_SLICE: of = w.t.slice_of(k.elem)
+    else if r != NONE && (w.t.tag[r] == types.T_PTR || one_ref(w, r)): of = w.t.a[r]
+    // A copy is the caller's to write: a `const` is dropped unless asked for.
+    u32 ar = w.t.resolve(asked) if asked != NONE else NONE
+    u32 held = w.t.a[ar] if ar != NONE && w.t.tag[ar] == types.T_REF else NONE
+    u32 el = k.elem if of != NONE && w.t.tag[of] == types.T_SLICE else of
+    if of != NONE && w.t.quals(el) == 1 && !(held != NONE && same_q(w, held, of)):
+        of = w.t.slice_of(w.t.bare(el)) if el != of else w.t.bare(el)
+    if of == NONE:
+        string8 what = ", a view of bytes some other value owns, and `=` would copy only the view" if r == types.STRING8 else ", which is a value — copying one is `=`"
+        string8 help = "the owned copy of the text is `strings.clone(s)` (`import \"core:strings\"`), a new `ref []char8` on the current allocator; write it under `using a:` to choose another" if r == types.STRING8 else ""
+        err(w, b, vn, 504, index.hold(#format("`copy` duplicates an **allocation**, so it takes something that names one: a `^T`, a `[]T`, a `ref(T)` or a `ref([]T)`. This is ", shown(w, final_ty(w, v)), what)), help)
+        for g in args[1..<#len(args)]:
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+        return bad()
+    u32 x = spill(w, b, v, vn)
+    u32 al = ir.konst(w.k.small(&w.t, 1))
+    if #len(args) > 1: al = alloc_arg(w, b, args[1], "copy")
+    if al == NONE: return bad()
+    u32 rt = w.t.ref_of(of)
+    u32 t = temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_AL_COPY, rt, n, t, NONE)
+    ir.arg(&b.f, x)
+    ir.arg(&b.f, al)
+    nil_guard(w, b, n, t, rt)
+    return value(t, rt)
+
+// Under a `try … else CODE`, a create verb's nil is its failure.
+private void nil_guard(^World w, ^Body b, u32 n, u32 t, u32 rt):
+    if n != b.guard: return
+    u32 nil_ = temp(w, b, u32(types.P_BOOL), n)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, rt, n, nil_, t, zero(w, rt))
+    guarded(w, b, n, nil_)
+
+// `d`'s name as messages spell it: `f`, or `T.m` for a method.
+string8 fn_label(^World w, u32 d):
+    if w.decls[d].kind == K_METHOD: return index.hold(#format(name_of(w, w.decls[w.decls[d].block].name), ".", name_of(w, w.decls[d].name)))
+    return name_of(w, w.decls[d].name)
+
+// Whether function `d` is written `export`.
+bool exported(^World w, u32 d):
+    if d == NONE || w.decls[d].kind != K_FN: return false
+    return (w.p.files[w.decls[d].file].a.a[w.decls[d].node] & syntax.F_VIS) == syntax.VIS_EXPORT
+
+// Whether bare name `n` names a type.
+private bool type_name(^World w, ^Body b, u32 n):
+    string8 s = spell(w, b, n)
+    if find_local(w, b, w.p.sym(b.file, n), false) != NONE: return false
+    if types.prim_named(s) != types.PRIMS || s == "string8" || s == "cstring" || s == "AllocatorMode": return true
+    u8 bk = 0
+    if bound(w, w.p.sym(b.file, n), &bk) != NONE: return true
+    u32 d = bare(w, b.file, n)
+    return d != NONE && (typeish(w.decls[d].kind) || w.decls[d].kind == K_TRAIT)
+
+// `#format(args…[, alloc])`: the arguments rendered into a new `ref []char8`.
+Val format_(^World w, ^Body b, u32 n, string8 said):
+    []u32 args = call_args(w, b, n)
+    if #len(args) == 0:
+        err(w, b, n, 601, "`format` renders its arguments into an **allocation**, and this gives it nothing to render", "pass what to render: `#format(\"score: \", n)`", "`#delete` the result when you are done with it, exactly as for `#new` and `#make` — a `defer #delete(s)` on the line after is the usual shape")
+        return bad()
+    i64 last = #len(args) - 1
+    u32 al = ir.konst(w.k.small(&w.t, 1))
+    syntax.Ast a = tree(w, b)
+    ref []Val vs
+    bool ok = true
+    for i in 0..<#len(args):
+        u32 vn = arg_value(w, b, args[i])
+        bool rung_ = a.tag[vn] == syntax.E_NAME && spell(w, b, vn)[0] == '#'
+        if i == last && i > 0 && rung_:
+            al = alloc_arg(w, b, args[i], "format")
+            if al == NONE: ok = false
+            continue
+        Val v = finish(w, b, expr(w, b, vn, NONE), vn)
+        if v.ty == NONE:
+            ok = false
+            continue
+        if i == last && i > 0 && (same_shape(w, v.ty, alloc_ty(w)) || allocator_of(w, v.ty)):
+            al = spill(w, b, alloc_of(w, b, v, vn), vn)
+            continue
+        if !rendered(w, b, vn, v.ty, "#format"):
+            ok = false
+            continue
+        vs = #append(vs, value(spill(w, b, v, vn), v.ty))
+    if !ok: return bad()
+    u32 rt = w.t.ref_of(w.t.slice_of(u32(types.P_CHAR8)))
+    u32 t = temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_AL_FORMAT, rt, n, t, NONE)
+    ir.arg(&b.f, al)
+    for v in vs:
+        ir.arg(&b.f, v.opd)
+    if n == b.guard:
+        u32 nil_ = temp(w, b, u32(types.P_BOOL), n)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, rt, n, nil_, t, zero(w, rt))
+        guarded(w, b, n, nil_)
+    return value(t, rt)
+
+// Whether `ty` has a rendering; ERR0504 at `vn` when not.
+bool rendered(^World w, ^Body b, u32 vn, u32 ty, string8 verb):
+    if is_trait(w, ty):
+        err(w, b, vn, 504, index.hold(#format("`", verb, "` renders each argument, and the trait value `", name_of(w, w.decls[trait_decl(w, ty)].name), "` has no rendering: it is a view of an implementer stored somewhere else, and nothing the trait prescribes says how that implementer renders")), "render the implementer where it is stored, or give the trait a method that renders and call it on the implementer")
+        return false
+    // ERR1004 (Rust's emitter refusal): `%g` is `<stdio.h>`, which `#NONE` has not got.
+    if w.os == "NONE" && is_float(w, ty): err(w, b, vn, 1004, "a float has no rendering on a target with no C library", "render the parts you can name — a scaled integer, or the mantissa and exponent — or build for a hosted target", "`%g` is `<stdio.h>`, which C99 §4 does not give a freestanding implementation, and an ftoa written here would disagree with `%g` on a hosted build of the same program")
+    if renders(w, ty, 0): return true
+    if char_in(w, ty, 0):
+        err(w, b, vn, 1019, index.hold(#format("`", verb, "` renders each argument, and ", shown(w, ty), " has no rendering: C leaves plain `char`'s signedness to the implementation\x1fOne byte prints as `-1` on x86-64 and `255` on AArch64, and Dado has no way to choose between them\x1esay which it is — `#c.schar(ch)` or `#c.uchar(ch)` — or convert to a Dado width and render that")))
+        return false
+    u32 cu = c_union_in(w, ty, 0)
+    if cu != NONE:
+        err(w, b, vn, 1024, index.hold(#format("`", verb, "` renders each argument, and ", shown(w, ty), " has no rendering: `", shown(w, cu), "` is C's union\x1fEvery member shares one storage and nothing says which of them was written last. Rendering it would read those bytes as every member's type at once\x1eprint the member you mean — `e.code` — which is the read C itself has")))
+        return false
+    err(w, b, vn, 504, index.hold(#format("`", verb, "` renders each argument, and ", shown(w, ty), " has no rendering")))
+    return false
+
+// A `cunion` row `ty` is or holds by value, or NONE.
+private u32 c_union_in(^World w, u32 ty, i64 depth):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || depth > 16: return NONE
+    if raw_of(&w.t, r) != NONE: return r
+    if w.t.tag[r] != types.T_TUPLE: return NONE
+    for x in w.t.list(r):
+        u32 c = c_union_in(w, x, depth + 1)
+        if c != NONE: return c
+    return NONE
+
+private bool renders(^World w, u32 ty, i64 depth):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || depth > 32: return true
+    u8 g = w.t.tag[r]
+    if g == types.T_PRIM: return r != u32(types.P_VOID)
+    if g == types.T_FUNC || g == types.T_TRAIT || g == types.T_OPAQUE || g == types.T_CHANNEL: return false
+    if g == types.T_UNION && w.t.b[r] != 0: return false
+    if plain_char(w, r): return false
+    if g == types.T_REF: return !one_ref(w, r) && renders(w, w.t.a[r], depth + 1)
+    if g == types.T_SLICE: return renders(w, w.t.a[r], depth + 1)
+    if g == types.T_MAP: return renders(w, w.t.a[r], depth + 1) && renders(w, w.t.b[r], depth + 1)
+    if g == types.T_DISTINCT || g == types.T_QUAL: return renders(w, w.t.b[r], depth + 1)
+    if g == types.T_TUPLE || g == types.T_UNION:
+        for x in w.t.list(r):
+            if !renders(w, x, depth + 1): return false
+    return true
+
+// Whether `ty` holds C's plain `char` by value.
+private bool char_in(^World w, u32 ty, i64 depth):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || depth > 16: return false
+    if plain_char(w, r): return true
+    if w.t.tag[r] != types.T_TUPLE: return false
+    for x in w.t.list(r):
+        if char_in(w, x, depth + 1): return true
+    return false

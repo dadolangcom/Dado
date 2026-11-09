@@ -1,0 +1,459 @@
+// Maps `{K: V}`: the key rule, literals, reads (the value and whether it
+// was there), places (an insert of the zero), `in`, walks and the verbs.
+// Each lowers to an intrinsic over the table the C emits per `(K, V)`.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+
+const u8 B_MAP_SLOT = 60
+const u8 B_MAP_GET = 61
+const u8 B_MAP_HAS = 62
+const u8 B_MAP_REMOVE = 63
+const u8 B_MAP_FREE = 64
+const u8 B_MAP_COPY = 65
+const u8 B_MAP_MAKE = 66
+const u8 B_MAP_CAP = 67
+const u8 B_MAP_LIVE = 68
+const u8 B_MAP_KEY = 69
+const u8 B_MAP_VAL = 70
+const u8 B_MAP_WALK = 71
+const u8 B_MAP_LEN = 72
+const u8 B_SCAN = 73
+const u8 B_MAP_GEN = 74
+
+// A map walk open in a body: the place walked, its key binding's slot.
+type Walk:
+    u32 place
+    u32 key
+
+bool is_map(^World w, u32 ty):
+    u32 r = w.t.resolve(ty) if ty != NONE else NONE
+    return r != NONE && w.t.tag[r] == types.T_MAP
+
+// Why `k` cannot key a map, or "".
+string8 unkeyable(^World w, u32 k):
+    u32 r = w.t.resolve(k)
+    if r == NONE || r == w.sstr: return ""
+    u8 g = types.T_QUAL if w.t.quals(k) != 0 else w.t.tag[r]
+    string8 s = shown(w, k)
+    if g == types.T_PRIM:
+        u32 p = w.t.a[r]
+        if p == u32(types.P_F32) || p == u32(types.P_F64) || p == u32(types.P_FLOAT): return index.hold(#format("`", s, "` is not **stable**: `NaN != NaN`, so a key could be inserted and never found again — the one failure a map cannot report"))
+        if p == u32(types.P_VOID): return "`void` has no value to be a key"
+        if p == u32(types.P_RAWPTR): return "a `rawptr` compares by **address**, which is almost never the question a key is asking; where it is, `u64(p)` says so out loud"
+        return ""
+    if r == types.STRING8: return ""
+    if g == types.T_BUILTIN:
+        string8 nm = w.t.text(w.t.a[r])
+        if nm == "string16" || nm == "string32": return index.hold(#format("a map keys a string by `string8`'s bytes, and `", nm, "`'s wider units are not built into the table yet"))
+        return index.hold(#format("`", nm, "` has no `==` to key by"))
+    if g == types.T_TUPLE:
+        for x in w.t.list(r):
+            string8 why = unkeyable(w, x)
+            if #len(why) > 0: return why
+        return ""
+    if g == types.T_CSCALAR: return index.hold(#format("`", s, "` is one of C's types, so how wide it is is C's answer and not Dado's — and a map is a shape Dado lays out, so an entry it cannot size is one it cannot build. Convert the key to a Dado fixed-width type where it enters the map"))
+    if g == types.T_SLICE: return index.hold(#format("`", s, "` compares by contents, which a map does not copy into its table for a slice **yet**, so it would not be stable — key by an array, whose elements the table stores by value"))
+    if g == types.T_REF || g == types.T_MAP: return index.hold(#format("`", s, "` compares by contents, and its contents change underneath the table — a key must be **stable**"))
+    if g == types.T_PTR: return index.hold(#format("`", s, "` compares by **address**, which is almost never the question a key is asking; where it is, `u64(p)` says so out loud"))
+    if g == types.T_FUNC: return index.hold(#format("`", s, "` compares by **address**, and a key needs an equality the program can name, which a function reference has none of"))
+    if g == types.T_UNION: return index.hold(#format("`", s, "` is a union, and Dado defines no `==` between two of them"))
+    if g == types.T_OPAQUE: return index.hold(#format("`", w.t.text(w.t.a[r]), "` is an opaque foreign type, so Dado was never told what equality of one means"))
+    if g == types.T_CHANNEL: return index.hold(#format("`", s, "` is a channel, a mailbox with one address, and it is never copied into a table"))
+    if g == types.T_TRAIT: return index.hold(#format("`", s, "` is a trait value, and Dado defines no `==` between two of them — key by something the implementers hold, an id or a name"))
+    if g == types.T_TYPE: return "`type` is a compile-time value with no representation, and a map is a table that exists at run time"
+    if g == types.T_QUAL: return index.hold(#format("`", s, "` carries one of C's type qualifiers, and a map is a shape Dado lays out — the table writes its own entries, so a key it may not write is a key it cannot store. Key by the unqualified type"))
+    if g == types.T_MATRIX: return unkeyable(w, w.t.list(r)[0])
+    if g == types.T_ALIGNED: return unkeyable(w, w.t.b[r])
+    return ""
+
+// ERR0801 for each map `ty` reaches whose key cannot be one; `use`: said
+// once per map type (a type's declaration), else at every site. Each row is
+// walked once per call (a graph of mutually pointing types branched into
+// every path before: tess's half-edges, ~1 s a package), and a type found to
+// reach no refused key is remembered (`keyed_clean`).
+bool keyed_ok(^World w, u32 f, u32 base, u32 lo, u32 hi, u32 ty, string8 what, bool use, i64 depth = 0):
+    if ty == NONE: return true
+    u32 r0 = w.t.resolve(ty)
+    if r0 == NONE || r0 in g_keyed_clean: return true
+    ref []u32 seen
+    i64 said = #len(w.d.list)
+    bool site = false
+    bool ok = keyed_walk(w, f, base, lo, hi, ty, what, use, &seen, &site)
+    #delete(seen)
+    // Not remembered when an answer depended on the site (a `float` key).
+    if ok && !site && #len(w.d.list) == said: g_keyed_clean[r0] = 1
+    return ok
+
+private bool keyed_walk(^World w, u32 f, u32 base, u32 lo, u32 hi, u32 ty, string8 what, bool use, ^ref []u32 seen, ^bool site):
+    if ty == NONE: return true
+    u32 r = w.t.resolve(ty)
+    if r == NONE || r in g_keyed_clean: return true
+    for x in seen^:
+        if x == r: return true
+    seen^ = #append(seen^, r)
+    u8 g = w.t.tag[r]
+    if g == types.T_MAP:
+        string8 why = unkeyable(w, w.t.a[r])
+        if w.t.resolve(w.t.a[r]) == u32(types.P_FLOAT):
+            site^ = true
+            if ds_off(w, f, base + lo): why = ""
+        if #len(why) > 0:
+            bool first = !(r in w.keys_refused)
+            w.keys_refused[r] = 1
+            if !use || first: say(w, f, base, lo, hi, 801, index.hold(#format(what, " is keyed by `", shown(w, w.t.a[r]), "`, which cannot be a key: ", why)), "")
+            return false
+        return keyed_walk(w, f, base, lo, hi, w.t.a[r], "a map's key", use, seen, site) && keyed_walk(w, f, base, lo, hi, w.t.b[r], "a map's value", use, seen, site)
+    if g == types.T_TUPLE || g == types.T_UNION:
+        bool ok = true
+        for x in w.t.list(r):
+            if !keyed_walk(w, f, base, lo, hi, x, what, use, seen, site): ok = false
+        return ok
+    if g == types.T_PTR || g == types.T_SLICE || g == types.T_REF: return keyed_walk(w, f, base, lo, hi, w.t.a[r], what, use, seen, site)
+    if g == types.T_DISTINCT: return keyed_walk(w, f, base, lo, hi, w.t.b[r], what, use, seen, site)
+    return true
+
+// The map type an expression written as a type denotes (`{K: V}` in an
+// argument), or NONE.
+u32 map_written(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if a.tag[n] == syntax.E_TYPE: return resolve_type(w, b.file, a.a[n])
+    if a.tag[n] != syntax.E_MAP: return NONE
+    []u32 es = a.list(a.b[n])
+    if #len(es) != 1: return NONE
+    u32 e = es[0]
+    u32 k = type_named(w, b, a.a[e])
+    u32 v = type_named(w, b, a.b[e])
+    if k == NONE || v == NONE: return NONE
+    return w.t.map_of(k, v)
+
+private u32 type_named(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if a.tag[n] == syntax.E_MAP: return map_written(w, b, n)
+    if a.tag[n] != syntax.E_NAME || find_local(w, b, w.p.sym(b.file, n), false) != NONE: return NONE
+    string8 s = spell(w, b, n)
+    u8 p = types.prim_named(s)
+    if p != types.PRIMS: return u32(p)
+    if text_named(s) != NONE: return text_named(s)
+    u32 d = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, n))
+    if d != NONE && typeish(w.decls[d].kind): return resolve(w, d)
+    return NONE
+
+// `{k: v, …}` and `{}`: the zero map with each entry inserted.
+Val map_lit(^World w, ^Body b, u32 n, u32 want):
+    syntax.Ast a = tree(w, b)
+    []u32 es = a.list(a.b[n])
+    u32 wr = w.t.resolve(want) if want != NONE else NONE
+    bool wm = wr != NONE && w.t.tag[wr] == types.T_MAP
+    if #len(es) == 0:
+        if want == NONE:
+            err(w, b, n, 512, "`{}` says neither the key type nor the value type, so it is legal only where the type is written — a declaration, an argument, a return. Write `{K: V} m` and this is the zero map, which is already empty and usable")
+            return bad()
+        if !wm:
+            err(w, b, n, 504, index.hold(#format("`{}` is the empty **map**, and this position wants ", shown(w, want))))
+            return bad()
+        u32 t = temp(w, b, want, n)
+        _ = ir.op(&b.f, ir.O_SET, 0, want, n, t, zero(w, want))
+        return value(t, want)
+    u32 kt = w.t.a[wr] if wm else NONE
+    u32 vt = w.t.b[wr] if wm else NONE
+    ref []Val ks
+    ref []Val vs
+    bool ok = true
+    for e in es:
+        Val k = expr(w, b, a.a[e], kt)
+        if k.kind == V_TYPE && #len(es) == 1:
+            // `{K: V}` written where a value goes is the map type.
+            Val v = expr(w, b, a.b[e], NONE)
+            if v.ty == NONE: return bad()
+            if v.kind == V_TYPE: return Val(V_TYPE, NONE, u32(types.TYPE), w.t.map_of(k.x, v.x), 0, 0)
+        if k.ty != NONE && kt == NONE:
+            k = finish(w, b, k, a.a[e])
+            kt = k.ty
+        else if k.ty != NONE: k = coerce(w, b, k, kt, a.a[e], "the map's key type")
+        Val v = expr(w, b, a.b[e], vt)
+        if v.ty != NONE && vt == NONE:
+            v = finish(w, b, v, a.b[e])
+            vt = v.ty
+        else if v.ty != NONE: v = coerce(w, b, v, vt, a.b[e], "the map's value type")
+        if k.ty == NONE || v.ty == NONE: ok = false
+        ks = #append(ks, k)
+        vs = #append(vs, v)
+    if !ok: return bad()
+    u32 mt = want if wm && w.t.a[wr] == kt && w.t.b[wr] == vt else w.t.map_of(kt, vt)
+    if !keyed_ok(w, b.file, b.base, a.lo[n], a.hi[n], mt, "this map", wm): return bad()
+    for i in 1..<#len(es):
+        if !ir.is_const(ks[i].opd): continue
+        for j in 0..<i:
+            if ks[j].opd != ks[i].opd: continue
+            diag_dup(w, b, a.a[es[i]], a.a[es[j]])
+            break
+    u32 t = temp(w, b, mt, n)
+    _ = ir.op(&b.f, ir.O_SET, 0, mt, n, t, zero(w, mt))
+    for i in 0..<#len(es):
+        u32 p = map_slot(w, b, t, mt, ks[i].opd, a.a[es[i]])
+        _ = ir.op(&b.f, ir.O_SET, 0, vt, a.b[es[i]], p, vs[i].opd)
+    return value(t, mt)
+
+private void diag_dup(^World w, ^Body b, u32 n, u32 first):
+    diag.Place at = w.p.map.place(w.p.map.base[b.file] + tree(w, b).lo[first])
+    err(w, b, n, 612, index.hold(#format("this key is the one written at ", at.line, ":", at.col, "; a literal that writes one key twice is a typo every time, and it is the one map error catchable before the program runs")))
+
+// The value slot for key `k` in the map at place `m`, inserted when absent.
+u32 map_slot(^World w, ^Body b, u32 m, u32 mt, u32 k, u32 n):
+    u32 vt = w.t.b[w.t.resolve(mt)]
+    u32 pt = w.t.ptr_of(mt)
+    u32 q = temp(w, b, pt, n)
+    _ = ir.op(&b.f, ir.O_ADDR, 0, pt, n, q, m)
+    u32 vp = w.t.ptr_of(vt)
+    u32 t = temp(w, b, vp, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_SLOT, mt, n, t, NONE)
+    ir.arg(&b.f, q)
+    ir.arg(&b.f, k)
+    return ir.step(&b.f, t, ir.ST_DEREF, 0, vt)
+
+// `m[k]`: a place (an insert) when written, else `(V, bool)`.
+Val map_index(^World w, ^Body b, u32 n, Val base, bool writing):
+    syntax.Ast a = tree(w, b)
+    u32 bn = a.a[n]
+    u32 mt = base.ty
+    u32 r = w.t.resolve(mt)
+    u32 kt = w.t.a[r]
+    u32 vt = w.t.b[r]
+    Val k = expr(w, b, a.b[n], kt)
+    if k.ty != NONE: k = coerce(w, b, k, kt, a.b[n], "the map's key type")
+    if k.ty == NONE: return bad()
+    if !keyed_ok(w, b.file, b.base, a.lo[n], a.hi[n], mt, "this map", true): return bad()
+    if writing:
+        u32 p = spill(w, b, base, bn)
+        if param_copy(w, b, p):
+            string8 nm = w.t.text(b.f.slot_name[b.f.root[p]]) if b.f.slot_name[b.f.root[p]] != NONE else "it"
+            string8 help = index.hold(#format("take the map by pointer: write the parameter as `^{K: V}` and each use as `", nm, "^`, so the insert reaches the caller's own handle")) if a.tag[bn] == syntax.E_NAME else index.hold(#format("take the **parameter** by pointer — `^` on its type and `", nm, "^` at each use — so this map is reached through the caller's own storage"))
+            err(w, b, n, 819, index.hold(#format("this map is reached from the parameter `", nm, "`, so this insert writes this function's own copy of the table pointer")), help, "A key in a place position inserts. An insert that passes three quarters of the table's slots reallocates it: this copy is given the new table, the old one is freed, and the caller is left holding it. A map that was zero when it arrived is worse — the first insert allocates a table this copy alone can see. A map allocated inside this function is a local and may be written freely, and `delete` at either arity stays legal here because a delete leaves a tombstone and cannot reallocate")
+            return bad()
+        bool own = false
+        for wk in b.walks:
+            if wk.place == p && a.tag[a.b[n]] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, a.b[n]), false) == wk.key: own = true
+        if !own: _ = ir.op(&b.f, ir.O_MOVE, ir.MV_INSERT, NONE, n, NONE, p, n)
+        return value(map_slot(w, b, p, mt, k.opd, n), vt)
+    [2]u32 pr = [vt, u32(types.P_BOOL)]
+    u32 pt = w.t.tuple(pr[:])
+    u32 bp = spill(w, b, base, bn)
+    u32 t = temp(w, b, pt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_GET, mt, n, t, NONE)
+    ir.arg(&b.f, bp)
+    ir.arg(&b.f, k.opd)
+    if n != b.guard: return value(t, pt)
+    u32 bt = u32(types.P_BOOL)
+    u32 miss = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_UN, ir.U_NOT, bt, n, miss, ir.step(&b.f, t, ir.ST_FIELD, 1, bt))
+    guarded(w, b, n, miss)
+    return value(ir.step(&b.f, t, ir.ST_FIELD, 0, vt), vt)
+
+// A place rooted in a parameter taken by value, with no `^` on the way.
+private bool param_copy(^World w, ^Body b, u32 p):
+    if (b.f.root[p] & ir.ROOT_GLOBAL) != 0 || b.f.root[p] >= b.f.params: return false
+    for j in b.f.plo[p]..<b.f.phi[p]:
+        if b.f.step[j] == ir.ST_DEREF: return false
+    return true
+
+// `k in m`, and `x in xs` over a run (one scan).
+Val in_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    Val m = expr(w, b, a.b[n], NONE)
+    if m.ty == NONE:
+        _ = expr(w, b, a.a[n], NONE)
+        return bad()
+    m = finish(w, b, m, a.b[n])
+    u32 bt = u32(types.P_BOOL)
+    if !is_map(w, m.ty):
+        Run rk = run_shape(w, m.ty)
+        u32 mr = w.t.resolve(m.ty)
+        bool tup = mr != NONE && w.t.tag[mr] == types.T_TUPLE
+        if rk.kind == RK_NONE || rk.kind == RK_PTR || rk.kind == RK_ONE || rk.kind == RK_FIXED && !tup:
+            string8 help = ""
+            u32 held = NONE
+            if mr != NONE && (w.t.tag[mr] == types.T_PTR || w.t.tag[mr] == types.T_REF): held = w.t.resolve(w.t.a[mr])
+            string8 pv = "r" if mr != NONE && w.t.tag[mr] == types.T_REF else "p"
+            if held != NONE && w.t.tag[held] == types.T_TUPLE: help = index.hold(#format("scan what it points at, `x in ", pv, "^`"))
+            else if held != NONE: help = index.hold(#format("ask `x == ", pv, "^`"))
+            else if is_num(w, m.ty) || mr != NONE && w.t.tag[mr] == types.T_PRIM: help = "ask `==`"
+            err(w, b, a.b[n], 504, index.hold(#format("`in` asks a **map** whether a key is there, or scans a run for an element; this is ", shown(w, final_ty(w, m)))), help)
+            return bad()
+        Val lv = expr(w, b, a.a[n], rk.elem)
+        if lv.ty == NONE: return bad()
+        if rk.kind == RK_TEXT && (a.tag[a.a[n]] == syntax.E_INT || !(lv.kind == V_VAL && w.t.resolve(lv.ty) == u32(types.P_CHAR8))):
+            string8 what = "an integer literal" if lv.kind == V_LIT || a.tag[a.a[n]] == syntax.E_INT else shown(w, final_ty(w, lv))
+            err(w, b, n, 504, index.hold(#format("`in` over a `string8` scans its **bytes**, so the left side is a `char8`, and this is ", what)), "`strings.contains(s, needle)` from `core:strings` searches for a substring; `c in s` with a `char8 c` scans for a byte", "A character literal adapts to a `char8`. Whether `in` between two strings is a substring search is not decided, so it is refused")
+            return bad()
+        if union_of(w, rk.elem) != NONE:
+            err(w, b, n, 607, index.hold(#format("`==` is not defined for ", shown(w, rk.elem))))
+            return bad()
+        if lv.kind == V_VAL && !fits_type(w, lv, rk.elem):
+            err(w, b, n, 504, index.hold(#format("`in` needs its left side to be the element type; this is ", shown(w, lv.ty), ", and the elements of ", shown(w, m.ty), " are ", shown(w, rk.elem), ", and only a value-preserving widening is supplied to fit")))
+            return bad()
+        Val x = coerce(w, b, lv, rk.elem, a.a[n])
+        if x.ty == NONE: return bad()
+        u32 mp = spill(w, b, m, a.b[n])
+        u32 xp = spill(w, b, x, a.a[n])
+        u32 t = temp(w, b, bt, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_SCAN, m.ty, n, t, NONE)
+        ir.arg(&b.f, mp)
+        ir.arg(&b.f, xp)
+        return value(t, bt)
+    u32 kt = w.t.a[w.t.resolve(m.ty)]
+    Val k = coerce(w, b, expr(w, b, a.a[n], kt), kt, a.a[n], "the map's key type")
+    if k.ty == NONE || !keyed_ok(w, b.file, b.base, a.lo[n], a.hi[n], m.ty, "this map", true): return bad()
+    u32 mp = spill(w, b, m, a.b[n])
+    u32 t = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_HAS, m.ty, n, t, NONE)
+    ir.arg(&b.f, mp)
+    ir.arg(&b.f, k.opd)
+    return value(t, bt)
+
+// `for k in m`, `for k, v in m`, `for k, &v in m`: each live entry of the
+// table the walk started on; a dev build checks each step against it.
+void map_loop(^World w, ^Body b, u32 n, []u32 binds, u32 it, Val v):
+    syntax.Ast a = tree(w, b)
+    u32 mt = v.ty
+    u32 r = w.t.resolve(mt)
+    u32 kt = w.t.a[r]
+    u32 vt = w.t.b[r]
+    if !keyed_ok(w, b.file, b.base, a.lo[it], a.hi[it], mt, "this map", true): return
+    if #len(binds) == 1 && kt == vt && spell(w, b, binds[0]) != "_": err_tok(w, b, binds[0], diag.LNT + 710, index.hold(#format("`", spell(w, b, binds[0]), "` is this map's **key**, and its key and value are both ", shown(w, kt), ", so nothing says which this loop meant\x1fThis loop binds the key where the same line used to bind the value. This is a warning while you are writing and an error under `--strict`, which is what the gate builds with\x1ewrite `for _, ", spell(w, b, binds[0]), " in ...` for the value, or leave it and mean the key")))
+    if a.a[binds[0]] == 1:
+        err_tok(w, b, binds[0], 709, "a map's **key** may not be bound by address\x1fThe slot an entry sits in was chosen from the key's bytes, so writing them in place would leave the table holding an entry no probe can ever find. A map is walked key-first, so this is the key\x1ebind the value by address instead, with `for k, &v in m`")
+        return
+    u32 p = spill(w, b, v, it)
+    bool guarded = a.tag[it] == syntax.E_NAME || a.tag[it] == syntax.E_FIELD || a.tag[it] == syntax.E_DEREF
+    u32 i64t = u32(types.P_I64)
+    u32 bt = u32(types.P_BOOL)
+    u32 held = temp(w, b, mt, it)
+    _ = ir.op(&b.f, ir.O_SET, 0, mt, it, held, p)
+    u32 cap = temp(w, b, i64t, it)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_CAP, mt, it, cap, NONE)
+    ir.arg(&b.f, held)
+    u32 gen = NONE
+    if guarded:
+        gen = temp(w, b, u32(types.P_U64), it)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_GEN, mt, it, gen, NONE)
+        ir.arg(&b.f, held)
+    u32 i = temp(w, b, i64t, it)
+    _ = ir.op(&b.f, ir.O_SET, 0, i64t, it, i, ir.konst(w.k.small(&w.t, 0)))
+    u32 lp = open(w, b, ir.O_LOOP, n, NONE, true)
+    b.f.b[lp] = p
+    b.f.c[lp] = it
+    u32 c = temp(w, b, bt, it)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_GE, bt, it, c, i, cap)
+    u32 t = open(w, b, ir.O_IF, it, c, false)
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, it, NONE, 1)
+    close(w, b, t)
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    if guarded:
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_WALK, mt, n, NONE, NONE)
+        ir.arg(&b.f, p)
+        ir.arg(&b.f, held)
+        ir.arg(&b.f, gen)
+    u32 live = temp(w, b, bt, it)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_LIVE, mt, it, live, NONE)
+    ir.arg(&b.f, held)
+    ir.arg(&b.f, i)
+    u32 dead = temp(w, b, bt, it)
+    _ = ir.op(&b.f, ir.O_UN, ir.U_NOT, bt, it, dead, live)
+    u32 sk = open(w, b, ir.O_IF, it, dead, false)
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, it, NONE, 1)
+    close(w, b, sk)
+    scope_in(w, b)
+    u32 ks = NONE
+    if spell(w, b, binds[0]) != "_":
+        u32 kp = temp(w, b, kt, it)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_KEY, mt, it, kp, NONE)
+        ir.arg(&b.f, held)
+        ir.arg(&b.f, i)
+        u32 sl = declare_local(w, b, w.p.sym(b.file, binds[0]), kt, binds[0])
+        if sl != NONE:
+            _ = ir.op(&b.f, ir.O_SET, 0, kt, binds[0], ir.at(&b.f, sl), kp)
+            ks = sl
+    if #len(binds) > 1 && spell(w, b, binds[1]) != "_":
+        u32 vp = w.t.ptr_of(vt)
+        u32 q = temp(w, b, vp, it)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_VAL, mt, it, q, NONE)
+        ir.arg(&b.f, held)
+        ir.arg(&b.f, i)
+        if a.a[binds[1]] == 1: bind(w, b, binds[1], vp, q)
+        else:
+            _ = chan_bound(w, b, binds[1], vt, index.hold(#format("bind it by address — `for &", spell(w, b, binds[1]), " in …` — which reaches each element where it lives, and `#send`, `#drain` or `#len` through it")))
+            bind(w, b, binds[1], vt, ir.step(&b.f, q, ir.ST_DEREF, 0, vt))
+    for j in 0..<#len(b.locals):
+        if b.locals[j].depth == b.depth: b.locals[j].read = true
+    b.walks = #append(b.walks, Walk(p, ks))
+    block(w, b, a.b[n])
+    #truncate(b.walks, #len(b.walks) - 1)
+    scope_out(w, b)
+    close(w, b, bl)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, i64t, it, i, i, ir.konst(w.k.small(&w.t, 1)))
+    close(w, b, lp)
+
+// `#len(m)`, `#delete(m)`, `#delete(m, k)`, `#copy(m)`, `#make({K: V}, n)`.
+Val map_verb(^World w, ^Body b, u32 n, u8 m, Val v, u32 vn):
+    []u32 args = call_args(w, b, n)
+    u32 mt = v.ty
+    u32 r = w.t.resolve(mt)
+    syntax.Ast a = tree(w, b)
+    if !keyed_ok(w, b.file, b.base, a.lo[vn], a.hi[vn], mt, "this map", true): return bad()
+    u32 vp = spill(w, b, v, vn)
+    if m == B_LEN:
+        u32 t = temp(w, b, u32(types.P_I64), n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_LEN, mt, n, t, NONE)
+        ir.arg(&b.f, vp)
+        return value(t, u32(types.P_I64))
+    if m == B_COPY:
+        u32 t = temp(w, b, mt, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_COPY, mt, n, t, NONE)
+        ir.arg(&b.f, vp)
+        return value(t, mt)
+    if ir.is_const(v.opd):
+        err(w, b, vn, 606, "`delete` writes the map it is given — freeing the table leaves it the zero map — so it needs a place: a name, or a slot of one")
+        return bad()
+    u32 p = v.opd
+    if #len(args) > 1:
+        u32 kn = arg_value(w, b, args[1])
+        Val k = coerce(w, b, expr(w, b, kn, w.t.a[r]), w.t.a[r], kn, "the map's key type")
+        if k.ty == NONE: return bad()
+        _ = ir.op(&b.f, ir.O_MOVE, ir.MV_REMOVE, NONE, vn, NONE, p, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_REMOVE, mt, n, NONE, NONE)
+        ir.arg(&b.f, p)
+        ir.arg(&b.f, k.opd)
+    else:
+        _ = ir.op(&b.f, ir.O_MOVE, ir.MV_FREE, NONE, vn, NONE, p, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_FREE, mt, n, NONE, NONE)
+        ir.arg(&b.f, p)
+    return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+
+Val map_make(^World w, ^Body b, u32 n, u32 mt):
+    []u32 args = call_args(w, b, n)
+    syntax.Ast a = tree(w, b)
+    u32 tn = arg_value(w, b, args[0])
+    if !keyed_ok(w, b.file, b.base, a.lo[tn], a.hi[tn], mt, "`make`", false): return bad()
+    if #len(args) > 2 && a.tag[arg_value(w, b, args[2])] == syntax.E_NAME && spell(w, b, arg_value(w, b, args[2])) == "#stack":
+        err(w, b, arg_value(w, b, args[2]), 808, "a map's table is allocated, grown and rehashed **through the allocator's `proc`**, and `#stack` has none", index.hold(#format("write `#make(", shown(w, mt), ", n)` and let it use the ambient allocator, or name `#heap` for a table that outlives the frame")), "The block is written inline at this call, and a frame cannot be called back into. A map on this rung would be one that never grows, which is a map that never holds anything")
+        return bad()
+    u32 cn = arg_value(w, b, args[1])
+    Val c = expr(w, b, cn, u32(types.P_I64))
+    if c.ty == NONE: return bad()
+    if !is_int(w, c.ty):
+        err(w, b, cn, 504, index.hold(#format("`make`'s count is how much room to leave before the first rehash, which is an integer; this is ", shown(w, final_ty(w, c)))))
+        return bad()
+    c = coerce(w, b, c, u32(types.P_I64), cn)
+    if c.ty == NONE: return bad()
+    u32 al = alloc_arg(w, b, args[2], "make") if #len(args) > 2 else ir.konst(w.k.small(&w.t, 1))
+    if al == NONE: return bad()
+    u32 t = temp(w, b, mt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAP_MAKE, mt, n, t, NONE)
+    ir.arg(&b.f, c.opd)
+    ir.arg(&b.f, al)
+    return value(t, mt)

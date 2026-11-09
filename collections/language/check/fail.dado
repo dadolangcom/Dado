@@ -1,0 +1,616 @@
+// Failure as control flow: `fail`, `try`, the failable call, `defer`. A
+// failable call answers a code (0 succeeds) into a slot, and the branch on
+// it is written where the call is, so a place assigned keeps its value.
+package check
+
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+
+// A pending `defer`: its statement, scope, `defer fail`, and the locals it sees.
+type Defer:
+    u32 node
+    u32 depth
+    bool on_fail
+    i64 seen
+    bool bang
+
+// Runs the defers of scopes deeper than `depth`, innermost first; `pop`
+// forgets them (the scope ends), `failing` runs `defer fail`s too.
+void unwind(^World w, ^Body b, u32 depth, bool failing, bool pop = false):
+    i64 i = #len(b.defers)
+    for i > 0 && b.defers[i - 1].depth > depth:
+        i -= 1
+        Defer d = b.defers[i]
+        if d.on_fail && d.bang:
+            if pop: close(w, b, b.heads[#len(b.heads) - 1].op)
+            continue
+        if d.node == NONE && b.commits[d.seen].ty == SINK_MARK && b.commits[d.seen].lim == NONE:
+            sinks_pop(w, b, b.commits[d.seen])
+            continue
+        if d.node == NONE && b.commits[d.seen].lim == NONE:
+            pop_using(w, b, b.commits[d.seen].ch, b.commits[d.seen].node)
+            continue
+        if d.node == NONE:
+            commit(w, b, b.commits[d.seen])
+            continue
+        if d.on_fail && !failing: continue
+        ref []Local tail
+        for l in b.locals[d.seen..<#len(b.locals)]:
+            tail = #append(tail, l)
+        #truncate(b.locals, d.seen)
+        u32 dc = b.deferred
+        syntax.Ast a = tree(w, b)
+        u32 s = a.a[d.node]
+        b.deferred = a.a[s] if a.tag[s] == syntax.S_EXPR && a.tag[a.a[s]] == syntax.E_CALL else NONE
+        if d.bang: bang(w, b, i, s, failing)
+        else: stmt(w, b, s)
+        b.deferred = dc
+        #truncate(b.locals, d.seen)
+        for l in tail:
+            b.locals = #append(b.locals, l)
+        #delete(tail)
+    if pop:
+        i = #len(b.defers)
+        for i > 0 && b.defers[i - 1].depth > depth:
+            i -= 1
+        #truncate(b.defers, i)
+
+// `defer! f(…)` at an exit: made as a `try`; its failure leaves (through
+// the outer defers) unless another failure already is.
+private void bang(^World w, ^Body b, i64 i, u32 s, bool failing):
+    syntax.Ast a = tree(w, b)
+    u32 call = b.deferred
+    ref []Defer tail
+    for x in b.defers[i..<#len(b.defers)]:
+        tail = #append(tail, x)
+    #truncate(b.defers, i)
+    u32 tr = b.tried
+    u32 tg = b.trying
+    bool pa = b.passed
+    bool q = b.quiet_fail
+    b.tried = call
+    b.trying = NONE
+    b.passed = false
+    b.quiet_fail = failing
+    u32 lo = ir.count(&b.f)
+    stmt(w, b, s)
+    if !b.passed: err(w, b, call, 716, index.hold(#format("`", src(w, b, a.list(a.b[call])[0]), "` cannot fail, so a `defer!` of it has no failure to pass on. Write a plain `defer`")))
+    else:
+        for j in lo..<ir.count(&b.f):
+            if b.f.node[j] == call && b.f.op[j] == ir.O_CALL && b.f.ty_of[j] != NONE && b.f.ty_of[j] != u32(types.P_VOID): err(w, b, call, 716, index.hold(#format("this answers ", shown(w, b.f.ty_of[j]), ", and a `defer!` has no place to put a value: it runs the call for its failure alone. Defer a call that answers `!void` — wrap this one in a failable function that discards the value")))
+    b.tried = tr
+    b.trying = tg
+    b.passed = pa
+    b.quiet_fail = q
+    for x in tail:
+        b.defers = #append(b.defers, x)
+    #delete(tail)
+
+private string8 unmarked(^World w, ^Body b):
+    syntax.Ast a = w.p.files[w.decls[b.decl].file].a
+    u32 r = a.list(a.b[w.decls[b.decl].node])[0]
+    string8 rt = "void" if r == NONE else w.p.files[w.decls[b.decl].file].src[i64(a.lo[r])..<i64(a.hi[r])]
+    return index.hold(#format("!", rt, " ", name_of(w, w.decls[b.decl].name), "(…)"))
+
+private void not_failable(^World w, ^Body b, u32 lo, u32 hi, string8 what):
+    string8 nm = name_of(w, w.decls[b.decl].name)
+    say(w, b.file, b.base, lo, hi, 714, index.hold(#format(what, " the function it is written in, and `", nm, "` is not marked failable, so it has no failure to pass it as\x1emark it — `", unmarked(w, b), "` — or handle the failure where it happens, with `try … else code:`")), "")
+
+// A failable call at node `n`, its code in `code`: refused (ERR0611) unless
+// a `try` or `return` makes it; then the branch on the code.
+bool failable_call(^World w, ^Body b, u32 n, string8 callee, u32 code):
+    if n != b.tried:
+        if n == b.deferred: err(w, b, n, 611, index.hold(#format("`", callee, "` can fail, and a plain `defer` has nowhere to send its failure\x1fA `defer!` runs at every exit, and a failure it answers becomes the function's unless another is already leaving, which keeps the first code\x1ewrite `defer! ", callee, "(…)`")))
+        else: err(w, b, n, 611, index.hold(#format("`", callee, "` can fail, so it answers a code rather than a value, and there is nothing here to use or to discard\x1f`try T v = ", callee, "(…)` passes a failure on to the function it is written in\x1emake it with `try` at the start of a statement, or, from a failable function, pass it on whole with `return ", callee, "(…)`")))
+        return false
+    b.passed = true
+    u32 bt = u32(types.P_BOOL)
+    u32 c = temp(w, b, bt, n)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_NE, bt, n, c, code, ir.konst(w.k.small(&w.t, 0)))
+    u32 h = open(w, b, ir.O_IF, n, c, false)
+    failing(w, b, n, code)
+    close(w, b, h)
+    return true
+
+// What a failure inside the `try` being made does: pass `code` on, fail
+// with the `else CODE`, or run the `else` suite.
+void failing(^World w, ^Body b, u32 n, u32 code):
+    syntax.Ast a = tree(w, b)
+    u32 e = NONE if b.trying == NONE else a.b[b.trying]
+    if e == NONE && b.quiet_fail: return
+    if e == NONE: passes_on(w, b, n, code)
+    if e == NONE:
+        unwind(w, b, 0, true)
+        _ = ir.op(&b.f, ir.O_RETURN_FAIL, 1, NONE, n, NONE, code)
+    else if a.b[e] == 1:
+        u32 c = code_of(w, b, a.a[e])
+        u32 named = named_const(w, b.file, a.a[e], b)
+        if c == NONE: c = ir.konst(w.k.small(&w.t, 1))
+        unwind(w, b, 0, true)
+        u32 canon = NONE if named == NONE else alias_of(w, named)
+        if named != NONE: _ = resolve(w, named)
+        _ = ir.op(&b.f, ir.O_RETURN_FAIL, 1 if ir.is_const(c) else 0, NONE, a.a[e], NONE, c, named, canon)
+    else:
+        bool sc = b.stried == n
+        if sc: b.serr += 1
+        suite(w, b, e, code)
+        if sc: b.serr -= 1
+
+// A guarded read or create verb at `n`: `bad` (a bool place) set is the failure.
+void guarded(^World w, ^Body b, u32 n, u32 bad_):
+    b.passed = true
+    u32 h = open(w, b, ir.O_IF, n, bad_, false)
+    failing(w, b, n, ir.konst(w.k.small(&w.t, 1)))
+    close(w, b, h)
+
+// `else:` / `else code:`, the code bound; then on past the statement.
+private void suite(^World w, ^Body b, u32 e, u32 code):
+    u32 trying = b.trying
+    u32 tried = b.tried
+    u32 th = b.try_head
+    b.trying = NONE
+    b.tried = NONE
+    scope_in(w, b)
+    syntax.Ast a = tree(w, b)
+    if a.main[e] != NONE && spell(w, b, e) != "_":
+        u32 ct = u32(types.P_I32)
+        if !ir.is_const(code) && (b.f.root[code] & ir.ROOT_GLOBAL) == 0: ct = b.f.slot_ty[b.f.root[code]]
+        u32 sl = declare_local(w, b, w.p.sym(b.file, e), ct, e)
+        if sl != NONE: _ = ir.op(&b.f, ir.O_SET, 0, ct, e, ir.at(&b.f, sl), code)
+        if sl != NONE && ct != u32(types.P_I32): b.fails = #append(b.fails, sl)
+    block(w, b, a.a[e])
+    scope_out(w, b)
+    b.trying = trying
+    b.tried = tried
+    b.try_head = th
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, e, NONE, u32(#len(b.heads)) - 1 - th)
+
+// The type a failable call's code is bound as: its `E` for `E!T`, else `i32`.
+u32 code_type(^World w, u32 fty):
+    u32 e = w.t.error_of(fty)
+    return e if e != NONE else u32(types.P_I32)
+
+// `fail CODE`.
+void fail_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    // A script method fails with an `int`, failable as every one is.
+    // sub 0 a code, 2 a message, 3 an `Error`.
+    if b.ds:
+        sf_fail(w, b, n)
+        return
+    if b.ds:
+        Val sv = expr(w, b, a.a[n], u32(types.P_INT))
+        if sv.ty == NONE: return
+        u8 k = 0
+        u32 r = w.t.resolve(sv.ty)
+        if r == w.sstr: k = 2
+        else if r == w.serror: k = 3
+        else if is_num(w, r) && !is_float(w, r): sv = coerce(w, b, sv, u32(types.P_INT), a.a[n], "a failure's code is")
+        else:
+            string8 x = src(w, b, a.a[n])
+            string8 h = "write the message, `fail \"what went wrong\"`, the code, `fail 16`, or an `Error`, `fail Error(\"what went wrong\", 16)`"
+            if is_float(w, r) || r == u32(types.P_BOOL): h = index.hold(#format("a code is an `int` and a message a `string`: write `fail string(", x, ")` to say it, or `fail Error(\"…\", n)` to give the failure a code"))
+            err(w, b, a.a[n], 504, index.hold(#format("`fail` raises a message (a `string`), a code (an `int`) or an `Error`, and this is ", shown(w, sv.ty))), h)
+            return
+        if sv.ty == NONE: return
+        _ = ir.op(&b.f, ir.O_RETURN_FAIL, k, NONE, n, NONE, sv.opd)
+        return
+    if !b.failable: say(w, b.file, b.base, a.lo[n], a.hi[n], 714, index.hold(#format("`", name_of(w, w.decls[b.decl].name), "` is not marked failable, so it cannot `fail`: a failure is answered through the destination-and-code convention, which only a function whose return type carries `!` has. Mark it — `", unmarked(w, b), "` — or leave by `return`")), "")
+    u32 c = code_of(w, b, a.a[n])
+    u32 named = named_const(w, b.file, a.a[n], b)
+    if c == NONE: c = ir.konst(w.k.small(&w.t, 1))
+    unwind(w, b, 0, true)
+    u32 canon = NONE if named == NONE else alias_of(w, named)
+    if named != NONE: _ = resolve(w, named)
+    _ = ir.op(&b.f, ir.O_RETURN_FAIL, 1 if ir.is_const(c) else 0, NONE, n, NONE, c, named, canon)
+
+// The package constant expression `n` of file `f` names (NONE: none, or a
+// local shadows it); `b` NONE outside a body.
+u32 named_const(^World w, u32 f, u32 n, ^Body b):
+    syntax.Ast a = w.p.files[f].a
+    u32 pkg = w.p.files[f].pkg
+    u32 x = n
+    if a.tag[n] == syntax.E_FIELD:
+        x = a.a[n]
+        if a.tag[x] != syntax.E_NAME: return NONE
+        pkg = NONE
+        for im in w.p.pkgs[w.p.files[f].pkg].imports:
+            if im.file != f: continue
+            if (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == w.p.sym(f, x): pkg = im.pkg
+        if pkg == NONE: return NONE
+    else if a.tag[n] != syntax.E_NAME: return NONE
+    if b != nil && find_local(w, b, w.p.sym(f, x), false) != NONE: return NONE
+    u32 d = lookup(w, pkg, w.p.sym(f, n))
+    if d == NONE || w.decls[d].kind != K_CONST: return NONE
+    return d
+
+// The constant `d` is defined as, through every `const A = B` (one code
+// under two names).
+u32 alias_of(^World w, u32 d):
+    u32 x = d
+    for _ in 0..<16:
+        syntax.Ast a = w.p.files[w.decls[x].file].a
+        u32 v = a.list(a.b[w.decls[x].node])[1]
+        u32 y = NONE if v == NONE else named_const(w, w.decls[x].file, v, nil)
+        if y == NONE || y == x: return x
+        x = y
+    return x
+
+// A failure's code: an `i32` that does not fold to 0.
+private u32 code_of(^World w, ^Body b, u32 n):
+    u32 lo = ir.count(&b.f)
+    u32 i32 = u32(types.P_I32)
+    u32 et = fails_with(w, b)
+    if et != NONE: return typed_code(w, b, n, et, lo)
+    Val v = expr(w, b, n, i32)
+    if v.ty == NONE: return NONE
+    if v.kind != V_LIT && int_prim(w, v.ty) != types.P_I32:
+        err(w, b, n, 504, index.hold(#format("a failure's code is an `i32`; this is ", shown(w, final_ty(w, v)))))
+        return NONE
+    if v.kind == V_VAL && tagged(w, v.ty) && under(&w.t, v.ty) == i32: v = value(spill(w, b, v, n), i32)
+    Val c = coerce(w, b, v, i32, n)
+    if c.ty == NONE: return NONE
+    u32 k = folded(w, b, lo, c.opd)
+    if k != NONE && w.k.kind[k] == types.C_INT && w.k.w0[k] == 0 && w.k.w1[k] == 0:
+        err(w, b, n, 715, "a failure's code is never 0, because 0 is what a failable function answers when it succeeds — a caller would read this failure as a success and a destination nobody wrote. Give the failure a nonzero code")
+        return NONE
+    if k != NONE: return ir.konst(k)
+    return c.opd
+
+const string8 TRY_SHAPE = "`try` makes one failable call or map read: `try T v = f(…)`, `try v = f(…)`, `try f(…)` or `try V v = m[k] else …` — and this statement has no call or read where its value goes"
+
+// `try <stmt> [else …]`: the statement inside a BLOCK its suite leaves to.
+void try_(^World w, ^Body b, u32 n):
+    if b.ds:
+        s_try(w, b, n)
+        return
+    syntax.Ast a = tree(w, b)
+    u32 s = a.a[n]
+    u32 e = a.b[n]
+    u8 g = a.tag[s]
+    u32 v = NONE
+    bool declared = false
+    bool nothing = false
+    if g == syntax.S_LET:
+        v = a.list(a.b[s])[1]
+        declared = a.main[s] == NONE || spell(w, b, s) != "_"
+    else if g == syntax.S_ASSIGN:
+        v = a.list(a.b[s])[1]
+        if spell(w, b, s) != "=":
+            err(w, b, s, 716, index.hold(#format("`try` stores what the call answers with `=`, and `", spell(w, b, s), "` would combine it with what the place already holds. Bind it to a name first, then combine")))
+            // The call is still the one tried: nothing more is said of it.
+            poison(w, b, s)
+            return
+    else if g == syntax.S_EXPR:
+        v = a.a[s]
+        nothing = true
+    else:
+        err(w, b, s, 716, TRY_SHAPE)
+    if v != NONE && a.tag[v] != syntax.E_CALL && a.tag[v] != syntax.E_INDEX:
+        err(w, b, s, 716, TRY_SHAPE)
+        v = NONE
+    string8 verb = spell(w, b, a.list(a.b[v])[0]) if v != NONE && a.tag[v] == syntax.E_CALL && a.tag[a.list(a.b[v])[0]] == syntax.E_NAME else ""
+    bool create = verb == "#make" || verb == "#new" || verb == "#copy" || verb == "#format"
+    if v != NONE && a.tag[v] == syntax.E_INDEX && e == NONE:
+        err(w, b, v, 716, "a map read that finds no key has no failure code to pass on. Fail with one — `else CODE` — or handle the missing key in a suite — `else:`")
+        poison(w, b, s)
+        return
+    bool sending = chan_verb(w, b, v) == B_SEND
+    if sending && e == NONE:
+        err(w, b, v, 716, "a queue's `#send` that finds it full has no failure code of its own to pass on — the program names what full means", "fail with a code — `else FULL` — or handle it in a suite: `else:`, and on the next line what to do")
+        return
+    if sending && a.main[e] != NONE && a.b[e] != 1:
+        err_tok(w, b, e, 716, index.hold(#format("a full queue has no failure code, so there is nothing for `", spell(w, b, e), "` to hold. Write `else:`")))
+        return
+    if create && e == NONE:
+        err(w, b, v, 716, index.hold(#format("`", verb, "` answers nil when it cannot allocate rather than failing, so a `try` over it with no `else` checks nothing\x1fThe nil flows on past the `try`\x1efail with a code when it answers nil — `else NOMEM` — or drop the `try` and test the value against `nil`")))
+        poison(w, b, s)
+        return
+    if e != NONE && a.b[e] == 1 && !b.failable && v != NONE && (create || sending || a.tag[v] == syntax.E_INDEX): not_failable(w, b, a.lo[e], a.hi[e], "`else CODE` fails")
+    if e == NONE && v != NONE && !b.failable: not_failable(w, b, a.lo[n], a.hi[n], "`try` passes a failure on to")
+    bool coded = v != NONE && !create && !sending && a.tag[v] != syntax.E_INDEX
+    if e != NONE && a.main[e] != NONE && is_constant(w, b, e):
+        string8 c = spell(w, b, e)
+        string8 rep = index.hold(#format("To fail with `", c, "`, handle the failure — `else code:` — and write `fail ", c, "` in the suite; to pass the failure's own code on, drop the `else`")) if coded else index.hold(#format("To fail with `", c, "`, drop the colon"))
+        err_tok(w, b, e, 716, index.hold(#format("`", c, "` is a constant, and the colon after it makes `else ", c, ":` bind a new `", c, "` over it, holding the failure's code for the suite\x1ewrite another name to bind the code — `else code:`. ", rep)))
+    else if e != NONE && a.main[e] != NONE && v != NONE && a.tag[v] == syntax.E_INDEX && a.b[e] != 1: err_tok(w, b, e, 716, index.hold(#format("a map read that finds no key has no failure code, so there is nothing for `", spell(w, b, e), "` to hold. Write `else:`")))
+    if e != NONE && a.b[e] != 1 && create: err(w, b, v, 716, "a create verb answers nil rather than failing, and `try` reads that nil as a failure only beside the code to fail with — `else CODE`. To handle it here, test the value against `nil`")
+    u32 tried = b.tried
+    u32 trying = b.trying
+    u32 th = b.try_head
+    b.tried = v
+    b.trying = n
+    b.passed = false
+    u32 gd = b.guard
+    b.guard = v if v != NONE && (create || a.tag[v] == syntax.E_INDEX) else NONE
+    u32 h = open(w, b, ir.O_BLOCK, n, NONE, false)
+    b.try_head = u32(#len(b.heads)) - 1
+    u32 lo = ir.count(&b.f)
+    stmt(w, b, s)
+    bool made = b.passed
+    if nothing && made && !sending:
+        u32 last = lo
+        for i in lo..<ir.count(&b.f):
+            if b.f.node[i] == v && (b.f.op[i] == ir.O_CALL || b.f.op[i] == ir.O_CALL_INDIRECT): last = i
+        u32 rt = b.f.ty_of[last]
+        if rt != NONE && rt != u32(types.P_VOID): err(w, b, v, 716, index.hold(#format("this answers ", shown(w, rt), ", and a `try` with nothing to put it in would throw it away. Bind it — `try ", shown(w, rt), " v = …` — or assign it to a place")))
+    if v != NONE && a.tag[v] == syntax.E_INDEX && !made: err(w, b, v, 716, "`try` makes a failable call or reads a map, and this is neither: an index into anything but a map cannot fail. Write the statement without `try`")
+    if made && coded && e != NONE && a.b[e] == 1: err(w, b, e, 716, "`else CODE` does not translate one failure's code into another: a failable call's failure already has its code", "pass the code on unchanged by dropping the `else`, or choose a new one in a suite: `else code:` on this line, and `fail MY_CODE` on the next", "`else CODE` is for the shapes that fail with no code of their own — a create verb answering nil, a map read finding no key")
+    if !made && e != NONE && a.b[e] == 1 && !create:
+        err(w, b, e, 716, "`else CODE` fails with a code when a create verb — `#new`, `#make`, `#copy`, `#format` — answers nil or a map read finds no key, and this is neither: the call cannot fail. Write the statement without `try`")
+    // A call that cannot fail: its suite is checked, never run.
+    else if !made && e != NONE && a.b[e] != 1:
+        u32 f = temp(w, b, u32(types.P_BOOL), n)
+        _ = ir.op(&b.f, ir.O_SET, 0, u32(types.P_BOOL), n, f, ir.konst(w.k.boolean(&w.t, false)))
+        u32 x = open(w, b, ir.O_IF, n, f, false)
+        bool sc = b.stried != 0 && b.stried == b.tried
+        if sc: b.serr += 1
+        suite(w, b, e, ir.konst(w.k.small(&w.t, 0)))
+        if sc: b.serr -= 1
+        close(w, b, x)
+    close(w, b, h)
+    b.tried = tried
+    b.trying = trying
+    b.try_head = th
+    b.guard = gd
+    if e != NONE && a.b[e] != 1 && declared && !suite_leaves(w, b, a.a[e]):
+        err(w, b, a.a[e], 716, "this `try` declares its binding, and on failure the binding holds nothing, so the `else` suite has to leave the scope\x1fNothing may read the binding after a failure\x1eleave with `return`, `fail`, `break`, `continue` or `quit`, or assign to a name declared above to carry on with the value it holds")
+
+private bool is_constant(^World w, ^Body b, u32 e):
+    u32 sym = w.p.sym(b.file, e)
+    if find_local(w, b, sym, false) != NONE: return false
+    u32 d = lookup(w, w.p.files[b.file].pkg, sym)
+    return d != NONE && (w.decls[d].kind == K_CONST || w.decls[d].kind == K_FCONST)
+
+// Whether a suite leaves its scope on every path.
+bool suite_leaves(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if n == NONE: return false
+    u32 s = n
+    if a.tag[n] == syntax.S_BLOCK:
+        []u32 ks = a.list(a.b[n])
+        if #len(ks) == 0: return false
+        s = ks[#len(ks) - 1]
+    u8 g = a.tag[s]
+    if g == syntax.S_RETURN || g == syntax.S_FAIL || g == syntax.S_BREAK || g == syntax.S_CONTINUE || g == syntax.S_QUIT: return true
+    if g == syntax.S_IF:
+        []u32 ks = a.list(a.b[s])
+        return suite_leaves(w, b, ks[1]) && suite_leaves(w, b, ks[2])
+    if g == syntax.S_SWITCH:
+        []u32 ks = a.list(a.b[s])
+        bool shut = ks[1] != NONE && suite_leaves(w, b, ks[1])
+        for x in b.closed:
+            if x == s: shut = true
+        for c in ks[2..<#len(ks)]:
+            if c != NONE && !ends_fall(w, b, a.list(a.b[c])[0]) && !suite_leaves(w, b, a.list(a.b[c])[0]): shut = false
+        return shut
+    if g == syntax.S_EXPR && a.tag[a.a[s]] == syntax.E_CALL:
+        u32 c = a.list(a.b[a.a[s]])[0]
+        return a.tag[c] == syntax.E_NAME && spell(w, b, c) == "#panic"
+    return false
+
+// `defer <stmt>`: refused when it would leave the scope; run at each exit.
+void defer_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u32 s = a.a[n]
+    if b.ds && sa_deferred(w, b, s): return
+    // A script's `defer`: its body a lambda, the rest of the scope a guard
+    // (`O_BLOCK` sub 3, b = the lambda, c = 1 for `defer fail`) that runs it however the scope ends.
+    if b.ds && a.main[n] == NONE:
+        u32 lt = temp(w, b, u32(types.P_RAWPTR), n)
+        u32 h = ir.op(&b.f, ir.O_BLOCK, 1, NONE, n, lt, NONE, u32(#len(b.f.slot_ty)), 0)
+        b.heads = #append(b.heads, Head(h, false, NONE, false, b.depth, false))
+        scope_in(w, b)
+        stmt(w, b, s)
+        scope_out(w, b)
+        close(w, b, h)
+        b.f.ty_of[h] = u32(#len(b.f.slot_ty))
+        _ = open(w, b, ir.O_BLOCK, n, NONE, false)
+        b.f.sub[b.heads[#len(b.heads) - 1].op] = 3
+        b.f.b[b.heads[#len(b.heads) - 1].op] = lt
+        if a.b[n] != NONE: b.f.c[b.heads[#len(b.heads) - 1].op] = 1
+        b.defers = #append(b.defers, Defer(n, b.depth, true, #len(b.locals), true))
+        return
+    if a.main[n] != NONE:
+        if a.b[n] != NONE:
+            err(w, b, n, 716, "`defer!` runs at every exit and `defer fail` only when a failure is leaving, so one `defer` cannot be both", "write `defer!` for a cleanup that must run however the scope ends", "A failure a `defer!` answers while another is leaving is dropped, and the first code is kept")
+            return
+        if a.tag[s] == syntax.S_TRY:
+            u32 c = tried_call(w, b, s)
+            err(w, b, s, 716, index.hold(#format("`defer!` already makes its call the way a `try` does, so the `try` here says it twice. Write `defer! ", src(w, b, c) if c != NONE else "f(…)", "`")))
+            return
+        if a.tag[s] != syntax.S_EXPR || a.tag[a.a[s]] != syntax.E_CALL:
+            err(w, b, s, 716, "`defer!` holds one failable call made alone — `defer! flush(h)` — and this statement is not a call. Put the statements in a failable function and defer the call to it")
+            return
+        if !b.failable: err(w, b, n, 714, index.hold(#format("a `defer!` passes its call's failure on to the function it is written in, and `", name_of(w, w.decls[b.decl].name), "` is not marked failable")), index.hold(#format("mark it — `", unmarked(w, b), "` — or handle the failure where the cleanup runs: `defer try … else code:` and a suite that does not leave")))
+        b.defers = #append(b.defers, Defer(n, b.depth, false, #len(b.locals), true))
+        return
+    if a.b[n] != NONE && !b.failable && !b.ds:
+        string8 nm = name_of(w, w.decls[b.decl].name)
+        say(w, b.file, b.base, a.lo[n], a.hi[n], 714, index.hold(#format("a `defer fail` runs when `", nm, "` fails, and `", nm, "` is not marked failable, so it never does. Mark it — `", unmarked(w, b), "` — or write a plain `defer`")), "")
+    string8 what = leaving(w, b, s, 0, true)
+    if #len(what) > 0:
+        string8 help = ""
+        if a.tag[s] == syntax.S_TRY:
+            u32 c = tried_call(w, b, s)
+            string8 call = src(w, b, c) if c != NONE else "f(…)"
+            if a.b[n] != NONE: help = index.hold(#format("a cleanup that can fail is deferred with `defer! ", call, "`, which runs at every exit and makes its failure the function's unless another is already leaving; to run it only when a failure leaves, handle its failure where it runs: `defer fail try ", call, " else code:`"))
+            else: help = index.hold(#format("a cleanup that can fail is deferred with `defer! ", call, "`: it runs at every exit, and a failure it answers becomes the function's unless another is already leaving, which keeps the first code"))
+        err(w, b, s, 707, index.hold(#format("a `defer` runs *at* the scope's exit, so it cannot be ", what, ": a `defer` takes one ordinary statement, and this one would leave the scope being unwound")), help)
+        return
+    u32 at = NONE
+    what = inside(w, b, s, 0, &at)
+    if #len(what) > 0:
+        err(w, b, at, 707, index.hold(#format("a `defer` runs *at* the scope's exit, so nothing inside it can be ", what, ": this would leave the scope being unwound from inside the unwinding")))
+        return
+    b.defers = #append(b.defers, Defer(n, b.depth, a.b[n] != NONE, #len(b.locals), false))
+
+private u32 tried_call(^World w, ^Body b, u32 t):
+    syntax.Ast a = tree(w, b)
+    u32 s = a.a[t]
+    u32 v = NONE
+    if a.tag[s] == syntax.S_LET || a.tag[s] == syntax.S_ASSIGN: v = a.list(a.b[s])[1]
+    else if a.tag[s] == syntax.S_EXPR: v = a.a[s]
+    return v if v != NONE && a.tag[v] == syntax.E_CALL else NONE
+
+// What statement `s` is when it leaves (top: as a defer's own statement).
+private string8 leaving(^World w, ^Body b, u32 s, u32 loops, bool top):
+    syntax.Ast a = tree(w, b)
+    u8 g = a.tag[s]
+    if g == syntax.S_RETURN: return "`return`"
+    if g == syntax.S_FAIL: return "`fail`"
+    if g == syntax.S_DEFER: return "a second `defer`"
+    if g == syntax.S_BREAK && loops == 0: return "`break`"
+    if g == syntax.S_CONTINUE && loops == 0: return "`continue`"
+    if g == syntax.S_FALLTHROUGH && top: return "`fallthrough`"
+    if g == syntax.S_TRY && (a.b[s] == NONE || a.b[a.b[s]] == 1): return "a `try`, which passes a failure on" if top else "a `try` that passes a failure on"
+    return ""
+
+// The first statement inside `s` that leaves, at `at`.
+private string8 inside(^World w, ^Body b, u32 s, u32 loops, ^u32 at):
+    syntax.Ast a = tree(w, b)
+    if s == NONE: return ""
+    u8 g = a.tag[s]
+    ref []u32 ks
+    if g == syntax.S_BLOCK || g == syntax.S_IF: a.kids(s, &ks)
+    else if g == syntax.S_FOR: ks = #append(ks, a.b[s])
+    else if g == syntax.S_SWITCH:
+        []u32 xs = a.list(a.b[s])
+        for c in xs[2..<#len(xs)]:
+            if c != NONE: ks = #append(ks, a.list(a.b[c])[0])
+        ks = #append(ks, xs[1])
+    else if g == syntax.S_TRY && a.b[s] != NONE && a.b[a.b[s]] == 0: ks = #append(ks, a.a[a.b[s]])
+    for k in ks:
+        if k == NONE || g == syntax.S_IF && k == a.list(a.b[s])[0]: continue
+        u32 l = loops + 1 if g == syntax.S_FOR else loops
+        string8 x = leaving(w, b, k, l, false)
+        if #len(x) > 0:
+            at^ = k
+            return x
+        x = inside(w, b, k, l, at)
+        if #len(x) > 0: return x
+    return ""
+
+// -- `E!T` -----------------------------------------------------------------
+
+// The enum this body fails with (`E!T`), or NONE.
+u32 fails_with(^World w, ^Body b):
+    if !b.failable || b.f.ty == NONE: return NONE
+    return w.t.error_of(b.f.ty)
+
+// The members of enum `et`, in declaration order (keys of `w.members`).
+private []u64 members_of(^World w, u32 et, ^ref []u64 out):
+    if !(et in w.type_decl): return out^[:]
+    try u32 d = w.type_decl[et] else: return out^[:]
+    for k in w.order:
+        if u32(k >> 32) == d: out^ = #append(out^, k)
+    return out^[:]
+
+private string8 member(^World w, u32 et, u64 k):
+    return index.hold(#format(named(w, et), ".", name_of(w, u32(k & 0xFFFFFFFF))))
+
+private string8 member_help(^World w, u32 et):
+    ref []u64 ms
+    _ = members_of(w, et, &ms)
+    string8 o = ""
+    for i in 0..<#len(ms):
+        string8 sep = ", " if i > 0 else ""
+        o = index.hold(#format(o, sep, "`", member(w, et, ms[i]), "`"))
+    string8 first = ""
+    if #len(ms) > 0: first = member(w, et, ms[0])
+    return index.hold(#format("fail with a member — ", o, " — or handle the code first: `else c:`, then `fail ", first, "`"))
+
+// A code in an `E!` body: a value of `E` (ERR0724), never 0 (ERR0715),
+// a member when it folds (ERR0724).
+private u32 typed_code(^World w, ^Body b, u32 n, u32 et, u32 lo):
+    Val v = expr(w, b, n, et)
+    if v.ty == NONE: return NONE
+    u32 vt = final_ty(w, v)
+    if v.kind == V_LIT || tree(w, b).tag[n] == syntax.E_INT: vt = u32(types.P_I32)
+    if w.t.resolve(vt) != w.t.resolve(et):
+        err(w, b, n, 724, index.hold(#format("`", src(w, b, n), "` is `", named(w, vt), "`, and this function fails with `", named(w, et), "`", "\x1fA caller binds this failure as a `Why` and may switch over its members with no `else`, so it is one of them")), member_help(w, et))
+        return NONE
+    Val c = coerce(w, b, v, et, n)
+    if c.ty == NONE: return NONE
+    u32 k = folded(w, b, lo, c.opd)
+    if k == NONE || w.k.kind[k] != types.C_INT: return c.opd
+    if w.k.w0[k] == 0 && w.k.w1[k] == 0:
+        err(w, b, n, 715, "a failure's code is never 0, because 0 is what a failable function answers when it succeeds", member_help(w, et))
+        return NONE
+    ref []u64 ms
+    bool hit = false
+    for m in members_of(w, et, &ms):
+        try u32 mc = w.members[m] else: continue
+        if mc != NONE && w.k.w0[mc] == w.k.w0[k] && w.k.w1[mc] == w.k.w1[k]: hit = true
+    if !hit:
+        err(w, b, n, 724, index.hold(#format("`", src(w, b, n), "` is ", i64(w.k.w0[k]), ", and no member of `", named(w, et), "` is", "\x1fA caller binds this failure as a `Why` and may switch over its members with no `else`, so it is one of them")), member_help(w, et))
+        return NONE
+    return ir.konst(k)
+
+// ERR0725: a failure passed on from a call with another code set.
+private void passes_on(^World w, ^Body b, u32 n, u32 code):
+    u32 et = fails_with(w, b)
+    syntax.Ast a = tree(w, b)
+    if et == NONE || a.tag[n] != syntax.E_CALL: return
+    u32 ct = u32(types.P_I32)
+    if !ir.is_const(code): ct = b.f.place_ty[code]
+    if w.t.resolve(ct) == w.t.resolve(et): return
+    string8 callee = src(w, b, a.list(a.b[n])[0])
+    string8 set = "any `i32`"
+    if ct != u32(types.P_I32): set = index.hold(#format("`", named(w, ct), "`"))
+    string8 verb = "return"
+    if b.trying != NONE: verb = "try"
+    else if b.deferred == n: verb = "defer!"
+    ref []u64 ms
+    string8 first = ""
+    _ = members_of(w, et, &ms)
+    if #len(ms) > 0: first = member(w, et, ms[0])
+    err(w, b, n, 725, index.hold(#format("`", callee, "` fails with ", set, ", and `", verb, "` passes it on from `", name_of(w, w.decls[b.decl].name), "`, which fails with `", named(w, et), "`", "\x1fA caller of `passes` binds its failure as a `Why`, so a failure passed on unchecked would break that promise")), index.hold(#format("handle it where it arrives and fail with a member: `else c:`, then `fail ", first, "`")))
+
+// ERR0606: a typed failure's binding is read-only.
+bool read_only(^World w, ^Body b, u32 pn):
+    u32 sl = find_local(w, b, w.p.sym(b.file, pn), false)
+    for x in b.fails:
+        if x != sl || sl == NONE: continue
+        string8 e = named(w, b.f.slot_ty[sl])
+        err(w, b, pn, 606, index.hold(#format("`", spell(w, b, pn), "` holds the failure a `", e, "!` call answered, and is read-only", "\x1fWhat it holds is a member of `Why`, which is what lets a `switch` over it name every member and leave out the `else`")), index.hold(#format("bind a new name: `", e, " w = ", spell(w, b, pn), "`")))
+        return true
+    return false
+
+// The enum a `switch` scrutinee `s` is a typed failure binding of, or NONE.
+u32 failure_enum(^World w, ^Body b, u32 s, u32 ty):
+    if tree(w, b).tag[s] != syntax.E_NAME: return NONE
+    u32 sl = find_local(w, b, w.p.sym(b.file, s), false)
+    for x in b.fails:
+        if x == sl && sl != NONE && ty in w.type_decl: return ty
+    return NONE
+
+// A failure `switch` with no `else`: closed when it names every member,
+// else ERR0705 with the members it leaves.
+void closed_over(^World w, ^Body b, u32 n, u32 s, u32 et, []u32 seen):
+    syntax.Ast a = tree(w, b)
+    ref []u64 ms
+    ref []string8 left
+    for m in members_of(w, et, &ms):
+        try u32 mc = w.members[m] else: continue
+        if w.k.w0[mc] == 0 && w.k.w1[mc] == 0: continue
+        bool named_ = false
+        for x in seen:
+            if ir.is_const(x) && w.k.w0[x & ~ir.OPD_CONST] == w.k.w0[mc] && w.k.w1[x & ~ir.OPD_CONST] == w.k.w1[mc]: named_ = true
+        if !named_: left = #append(left, member(w, et, m))
+    if #len(left) == 0:
+        b.closed = #append(b.closed, n)
+        return
+    string8 o = ""
+    for i in 0..<#len(left):
+        string8 sep = ", " if i > 0 else ""
+        o = index.hold(#format(o, sep, "`", left[i], "`"))
+    say(w, b.file, b.base, a.lo[n], a.hi[s] + 1, 705, index.hold(#format("this `switch` over a `", named(w, et), "` failure has no `else` and leaves ", o, " unnamed", "\x1fA failure bound from a `Why!` call is one of `Why`'s members, so a `switch` naming every member needs no `else` — and one that leaves a member out has nowhere to send it")), index.hold(#format("add `case ", left[0], ":` arms or an `else:`")))
+
+// A `try`'s declared binding, refused: its uses say nothing more.
+private void poison(^World w, ^Body b, u32 s):
+    syntax.Ast a = tree(w, b)
+    if a.tag[s] != syntax.S_LET || a.main[s] == NONE || spell(w, b, s) == "_": return
+    b.locals = #append(b.locals, Local(w.p.sym(b.file, s), NONE, s, b.depth, true, NONE, NONE))

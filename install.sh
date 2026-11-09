@@ -3,7 +3,7 @@
 #
 # Downloads the release archive for this machine, checks it against the
 # release's SHA256SUMS, unpacks it into ~/dado (or --dir), and runs the
-# install.sh inside it, which runs `dadoc bootstrap`. Options:
+# install.sh inside it, which runs `dado install`. Options:
 #
 #   --dir <folder>     install there instead of ~/dado
 #   --version <x.y.z>  that release instead of the latest
@@ -11,7 +11,7 @@
 # With no --version it takes the latest stable release, and while there is none
 # (every release so far a prerelease) the newest prerelease, asked of GitHub's
 # releases API.
-#   anything else      passed on to dadoc bootstrap (e.g. --yes, --no-path)
+#   anything else      passed on to dado install (e.g. --yes, --no-path)
 #
 # With sh reading the script from a pipe, pass options as: ... | sh -s -- --dir ~/tools/dado
 set -eu

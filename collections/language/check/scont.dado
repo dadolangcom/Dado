@@ -1,0 +1,535 @@
+// DadoScript containers: `[]T` (a JS Array) and `{K: V}` (a Map), held by
+// reference; literals, indexing, stores, `for … in` and the library's
+// methods on arrays, maps and strings, as rows. IR verbs below; the JS
+// lowering is `lower/js.dado`'s.
+package check
+
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+const u8 B_SARRAY = 146       // dst = [args…]
+const u8 B_SMAP = 147         // dst = Map of (key, value) args
+const u8 B_SINDEX = 148       // dst = args[0][args[1]], checked
+const u8 B_SSTORE = 149       // args[0][args[1]] = args[2]
+const u8 B_SMETHOD = 150      // dst = args[0].(args[1])(args[2…])
+
+// What a container type is: 1 an array, 2 a map, 3 a string, 0 neither.
+u8 s_kind(^World w, u32 ty):
+    if ty == w.sstr: return 3
+    u32 r = w.t.resolve(ty)
+    if r == NONE: return 0
+    if w.t.tag[r] == types.T_SLICE: return 1
+    if w.t.tag[r] == types.T_MAP: return 2
+    return 0
+
+// A fixed array or a tuple: a value of slots.
+bool s_tup(^World w, u32 ty):
+    if ty == NONE || s_class_of_ty(w, ty) != NONE: return false
+    u32 r = w.t.resolve(s_erase(w, ty))
+    return r != NONE && (w.t.tag[r] == types.T_TUPLE || w.t.tag[r] == types.T_SOA)
+
+// The first array or map a fixed array or a tuple of `ty` holds.
+u32 s_held(^World w, u32 ty, i64 depth):
+    if depth > 32 || ty == NONE: return NONE
+    u8 k = s_kind(w, ty)
+    if depth > 0 && (k == 1 || k == 2): return ty
+    if !s_tup(w, ty): return NONE
+    for x in w.t.slots(ty):
+        u32 h = s_held(w, x, depth + 1)
+        if h != NONE: return h
+    return NONE
+
+// ERR0607 for an operator over an array or a map, or `==` over a shape
+// holding one; false when refused.
+bool s_cont_op(^World w, ^Body b, u32 n, string8 op, u32 lt, u32 rt, u32 ln, u32 rn):
+    if !sa_operator(w, b, n, op, lt, rt): return false
+    u32 fs = NONE
+    if lt == w.serror || lt == w.sloc: fs = lt
+    else if rt == w.serror || rt == w.sloc: fs = rt
+    if fs != NONE:
+        string8 h = "compare what they hold: `string(a) == string(b)`, or `a.line == b.line`"
+        if fs == w.serror: h = "compare what they hold: `a.code == b.code`, or `a.message == b.message`"
+        err(w, b, n, 607, index.hold(#format("`", op, "` is not defined for ", shown(w, fs))), h)
+        return false
+    u32 side = NONE
+    u8 lk = s_kind(w, lt)
+    u8 rk = s_kind(w, rt)
+    if lk == 1 || lk == 2: side = lt
+    else if rk == 1 || rk == 2: side = rt
+    bool eq = op == "==" || op == "!="
+    if side == NONE:
+        u32 h = s_held(w, lt, 0)
+        if h == NONE: h = s_held(w, rt, 0)
+        if h == NONE || !eq: return true
+        err(w, b, n, 607, index.hold(#format("`", op, "` compares slot by slot, and the slot `", shown(w, h), "` has no `", op, "`: an array or a map is compared neither by identity nor by contents")), "compare the other slots one by one, and what the container holds as text, `string(xs)`")
+        return false
+    string8 sh = shown(w, side)
+    if eq: err(w, b, n, 607, index.hold(#format("`", op, "` is not defined for `", sh, "`: TypeScript would compare which array or map each side is, and GDScript what they hold, so DadoScript compares neither")), index.hold(#format("compare what they hold as text, `string(", src(w, b, ln), ") ", op, " string(", src(w, b, rn), ")`, or element by element in a loop")))
+    else: err(w, b, n, 607, index.hold(#format("`", op, "` is not defined for `", sh, "`")), "an array or a map has methods and no operators: `xs.append_array(ys)` joins two arrays")
+    return false
+
+// ERR0607 for a search by `==` over elements of `et` that have none.
+bool s_searchable(^World w, ^Body b, u32 n, u32 et, string8 what):
+    string8 sh = shown(w, et)
+    if s_tup(w, et) && s_held(w, et, 0) == NONE:
+        err(w, b, n, 607, index.hold(#format(what, " does not search an array of `", sh, "` yet")), index.hold(#format("compare with `==` in a lambda: `xs.any(bool(", sh, " v): return v == x)`")))
+        return false
+    u8 k = s_kind(w, et)
+    if k != 1 && k != 2 && s_held(w, et, 0) == NONE: return true
+    err(w, b, n, 607, index.hold(#format(what, " compares elements with `==`, and `", sh, "` has none: a container is compared by identity, never by what it holds")), "compare what you mean element by element, with `any` and a lambda: `xs.any(bool([]int v): return v.len() == 0)`")
+    return false
+
+private Val s_op(^World w, ^Body b, u32 n, u8 verb, u32 ty, []u32 xs):
+    u32 t = NONE
+    if ty != u32(types.P_VOID): t = temp(w, b, ty, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, verb, ty, n, t, NONE)
+    for x in xs:
+        ir.arg(&b.f, x)
+    return value(t, ty)
+
+// `[a, b, …]`: its element type from what is wanted, else its first element.
+Val s_array(^World w, ^Body b, u32 n, u32 want):
+    syntax.Ast a = tree(w, b)
+    if s_tup(w, want): return array_lit(w, b, n, want)
+    u32 el = NONE
+    if want != NONE && s_kind(w, want) == 1: el = w.t.a[w.t.resolve(want)]
+    ref []u32 xs
+    i64 i = 0
+    for e in a.list(a.b[n]):
+        if e == NONE: continue
+        i += 1
+        Val v = expr(w, b, e, el)
+        if v.ty == NONE: return bad()
+        if el == NONE: el = final_ty(w, v)
+        v = coerce(w, b, v, el, e, index.hold(#format("element ", i, " of the array is")))
+        if v.ty == NONE: return bad()
+        xs = #append(xs, v.opd)
+    if el == NONE:
+        err(w, b, n, 504, "`[]` is an empty array, and nothing here says what it holds", "write it where its type is declared — `[]int xs = []` — or give it a first element")
+        return bad()
+    return s_op(w, b, n, B_SARRAY, w.t.slice_of(el), xs[:])
+
+// `{}` and `{k: v, …}`.
+Val s_map(^World w, ^Body b, u32 n, u32 want):
+    syntax.Ast a = tree(w, b)
+    u32 kt = NONE
+    u32 vt = NONE
+    if want != NONE && s_kind(w, want) == 2:
+        kt = w.t.a[w.t.resolve(want)]
+        vt = w.t.b[w.t.resolve(want)]
+    ref []u32 xs
+    for e in a.list(a.b[n]):
+        if e == NONE: continue
+        Val k = expr(w, b, a.a[e], kt)
+        Val v = expr(w, b, a.b[e], vt)
+        if k.ty == NONE || v.ty == NONE: return bad()
+        if kt == NONE: kt = final_ty(w, k)
+        if vt == NONE: vt = final_ty(w, v)
+        k = coerce(w, b, k, kt, a.a[e], "the map's key type is")
+        v = coerce(w, b, v, vt, a.b[e], "the map's value type is")
+        if k.ty == NONE || v.ty == NONE: return bad()
+        xs = #append(xs, k.opd)
+        xs = #append(xs, v.opd)
+    if kt == NONE:
+        err(w, b, n, 1, "this map is outside the slice the port builds so far")
+        return bad()
+    return s_op(w, b, n, B_SMAP, w.t.map_of(kt, vt), xs[:])
+
+// `c[i]`: an element, a map's value, a string's character.
+Val s_index(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    Val c = finish(w, b, expr(w, b, a.a[n], NONE), a.a[n])
+    if c.ty == NONE: return bad()
+    if s_tup(w, c.ty): return index_in(w, b, n, c, false, false)
+    if c.ty == w.sany:
+        Val k = finish(w, b, expr(w, b, a.b[n], NONE), a.b[n])
+        if k.ty == NONE: return bad()
+        if k.ty != u32(types.P_INT) && k.ty != w.sstr:
+            err(w, b, a.b[n], 504, index.hold(#format("an `any` is indexed by an `int` (an array's position) or a `string` (an object's member), and this is `", shown(w, k.ty), "`")), "index by an `int` or a `string`")
+            return bad()
+        [2]u32 ix = [spill(w, b, c, a.a[n]), k.opd]
+        return s_dyn(w, b, n, 4, NONE, ix[:])
+    u8 k = s_kind(w, c.ty)
+    if k == 0:
+        err(w, b, n, 1, "this index is outside the slice the port builds so far")
+        return bad()
+    u32 it = u32(types.P_INT)
+    u32 et = w.sstr
+    if k == 1: et = w.t.a[w.t.resolve(c.ty)]
+    if k == 2:
+        it = w.t.a[w.t.resolve(c.ty)]
+        et = w.t.b[w.t.resolve(c.ty)]
+    Val i = coerce(w, b, expr(w, b, a.b[n], it), it, a.b[n], "the index is")
+    if i.ty == NONE: return bad()
+    [2]u32 xs = [spill(w, b, c, a.a[n]), i.opd]
+    return s_op(w, b, n, B_SINDEX, et, xs[:])
+
+// `c[i] = v` and `c[i] op= v`.
+void s_store(^World w, ^Body b, u32 n, u32 pn, u32 vn, string8 op):
+    syntax.Ast a = tree(w, b)
+    Val c = finish(w, b, expr(w, b, a.a[pn], NONE), a.a[pn])
+    if c.ty == NONE: return
+    if c.ty == w.sany:
+        Val k = finish(w, b, expr(w, b, a.b[pn], NONE), a.b[pn])
+        if k.ty == NONE: return
+        if k.ty != u32(types.P_INT) && k.ty != w.sstr:
+            err(w, b, a.b[pn], 504, index.hold(#format("an `any` is indexed by an `int` (an array's position) or a `string` (an object's member), and this is `", shown(w, k.ty), "`")), "index by an `int` or a `string`")
+            return
+        s_any_store(w, b, n, c, k.opd, vn, op)
+        return
+    if s_tup(w, c.ty):
+        Val p = index_in(w, b, pn, c, false, true)
+        if p.ty == NONE: return
+        Val tv = bad()
+        if op == "=": tv = coerce(w, b, expr(w, b, vn, p.ty), p.ty, vn, "the place assigned to is")
+        else:
+            b.compound = true
+            tv = binary(w, b, n, index.hold(#format(op[0..<#len(op) - 1])), p, NONE, vn, p.ty)
+            b.compound = false
+        if tv.ty != NONE: _ = ir.op(&b.f, ir.O_SET, 0, p.ty, n, p.opd, tv.opd)
+        return
+    u8 k = s_kind(w, c.ty)
+    if k != 1 && k != 2:
+        err(w, b, pn, 1, "this store is outside the slice the port builds so far")
+        return
+    u32 it = u32(types.P_INT)
+    u32 et = w.t.a[w.t.resolve(c.ty)]
+    if k == 2:
+        it = et
+        et = w.t.b[w.t.resolve(c.ty)]
+    Val i = coerce(w, b, expr(w, b, a.b[pn], it), it, a.b[pn], "the index is")
+    if i.ty == NONE: return
+    u32 co = spill(w, b, c, a.a[pn])
+    Val v = bad()
+    if op == "=": v = coerce(w, b, expr(w, b, vn, et), et, vn, "the place assigned to is")
+    else:
+        [2]u32 rx = [co, i.opd]
+        Val cur = s_op(w, b, pn, B_SINDEX, et, rx[:])
+        b.compound = true
+        v = binary(w, b, n, index.hold(#format(op[0..<#len(op) - 1])), cur, NONE, vn, et)
+        b.compound = false
+    if v.ty == NONE: return
+    [3]u32 xs = [co, i.opd, v.opd]
+    _ = s_op(w, b, n, B_SSTORE, u32(types.P_VOID), xs[:])
+
+// `for x in c:` and `for k, v in m:`: an `O_LOOP` of sub 1 (an array), 2 (a
+// map); `dst` the first binding's place, `b` the container, `c` the second's.
+bool s_for_in(^World w, ^Body b, u32 n, []u32 binds, u32 it):
+    if sr_header(w, b, it):
+        sr_walk(w, b, n, binds, it)
+        return true
+    Val c = finish(w, b, expr(w, b, it, NONE), it)
+    if c.ty == NONE: return true
+    if c.ty == w.sany:
+        err(w, b, it, 504, "`for … in` walks a range, an array, a map or a string, and this is `any`: what it holds is known only when the script runs", index.hold(#format("convert it first: `[]any xs = ", src(w, b, it), "`, which raises if it holds no array, then `for x in xs:`")))
+        return true
+    u8 k = s_kind(w, c.ty)
+    if k == 3 && #len(binds) == 1:
+        k = 1
+        c = value(c.opd, w.t.slice_of(w.sstr))
+    if k != 1 && k != 2: return false
+    u32 r = w.t.resolve(c.ty)
+    u32 t1 = w.t.a[r]
+    u32 t2 = u32(types.P_INT)
+    if k == 2: t2 = w.t.b[r]
+    if #len(binds) > 2:
+        err(w, b, n, 1, "this loop is outside the slice the port builds so far")
+        return true
+    u32 co = spill(w, b, c, it)
+    scope_in(w, b)
+    u32 s1 = declare_local(w, b, w.p.sym(b.file, binds[0]), t1, binds[0])
+    u32 s2 = NONE
+    if #len(binds) > 1: s2 = declare_local(w, b, w.p.sym(b.file, binds[1]), t2, binds[1])
+    u32 p2 = NONE
+    if s2 != NONE: p2 = ir.at(&b.f, s2)
+    u32 lp = ir.op(&b.f, ir.O_LOOP, k, NONE, n, ir.at(&b.f, s1), NONE, co, p2)
+    b.heads = #append(b.heads, Head(lp, true, NONE, false, b.depth, false))
+    for j in 0..<#len(b.locals):
+        if b.locals[j].depth == b.depth: b.locals[j].read = true
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    block(w, b, tree(w, b).b[n])
+    close(w, b, bl)
+    close(w, b, lp)
+    scope_out(w, b)
+    return true
+
+type SRow:
+    u8 kind
+    string8 name
+    // Arguments: `E` the element (a map's value), `K` a map's key, `I` an
+    // int, `S` a string, `A` an array like the receiver; answers the same
+    // letters, `B` a bool, `Y` `[]byte`, `V` nothing, `R` the receiver's type, `L` an array
+    // of strings, `Q` an array of the keys, `W` of the values.
+    string8 args
+    char8 ret
+
+const [49]SRow SROWS = (SRow(1, "decode_utf8", "", 'S'), SRow(1, "resize", "I", 'V'), SRow(3, "replace_all", "SS", 'S'), SRow(3, "code_point_at", "I", 'I'), SRow(3, "to_int", "", 'I'), SRow(3, "to_float", "", 'F'), SRow(3, "bytes", "", 'Y'), SRow(1, "len", "", 'I'), SRow(1, "is_empty", "", 'B'), SRow(1, "append", "E", 'V'), SRow(1, "insert", "IE", 'V'), SRow(1, "fill", "E", 'V'), SRow(1, "sort", "", 'V'), SRow(1, "reverse", "", 'V'), SRow(1, "copy", "", 'R'), SRow(1, "join", "S", 'S'), SRow(1, "contains", "E", 'B'), SRow(1, "index_of", "E", 'I'), SRow(1, "last_index_of", "E", 'I'), SRow(1, "append_array", "A", 'V'), SRow(1, "remove_at", "I", 'E'), SRow(1, "pop", "", 'E'), SRow(1, "pop_front", "", 'E'), SRow(1, "front", "", 'E'), SRow(1, "back", "", 'E'), SRow(1, "clear", "", 'V'), SRow(2, "len", "", 'I'), SRow(2, "is_empty", "", 'B'), SRow(2, "has", "K", 'B'), SRow(2, "delete", "K", 'B'), SRow(2, "get", "KE", 'E'), SRow(2, "clear", "", 'V'), SRow(2, "keys", "", 'Q'), SRow(2, "values", "", 'W'), SRow(2, "copy", "", 'R'), SRow(3, "len", "", 'I'), SRow(3, "is_empty", "", 'B'), SRow(3, "contains", "S", 'B'), SRow(3, "starts_with", "S", 'B'), SRow(3, "ends_with", "S", 'B'), SRow(3, "split", "S", 'L'), SRow(3, "trim", "", 'S'), SRow(3, "trim_left", "", 'S'), SRow(3, "trim_right", "", 'S'), SRow(3, "to_upper", "", 'S'), SRow(3, "to_lower", "", 'S'), SRow(3, "index_of", "S", 'I'), SRow(3, "last_index_of", "S", 'I'), SRow(3, "repeat", "I", 'S'))
+
+private u32 s_letter(^World w, u32 cty, char8 c):
+    u32 r = w.t.resolve(cty)
+    if c == 'I': return u32(types.P_INT)
+    if c == 'F': return u32(types.P_FLOAT)
+    if c == 'B': return u32(types.P_BOOL)
+    if c == 'Y': return w.t.slice_of(u32(types.P_U8))
+    if c == 'S': return w.sstr
+    if c == 'V': return u32(types.P_VOID)
+    if c == 'R' || c == 'A': return cty
+    if c == 'L': return w.t.slice_of(w.sstr)
+    if c == 'K': return w.t.a[r]
+    if c == 'Q': return w.t.slice_of(w.t.a[r])
+    if c == 'W': return w.t.slice_of(w.t.b[r])
+    if c == 'E' && w.t.tag[r] == types.T_MAP: return w.t.b[r]
+    return w.t.a[r]
+
+// `c.m(args…)` on an array, a map or a string; `bad()` with `done` unset
+// when `c` is none of them.
+Val s_value_call(^World w, ^Body b, u32 n, u32 cn, ^bool done):
+    syntax.Ast a = tree(w, b)
+    Val c = finish(w, b, expr(w, b, a.a[cn], NONE), a.a[cn])
+    if c.ty == NONE:
+        done^ = true
+        return bad()
+    u8 k = s_kind(w, c.ty)
+    string8 m = index.hold(strings.clone(spell(w, b, cn)))
+    []u32 cks = a.list(a.b[n])
+    []u32 args = cks[2..<#len(cks)]
+    string8 base = src(w, b, a.a[cn])
+    if k == 0 && (c.ty == u32(types.P_INT) || c.ty == u32(types.P_FLOAT) || c.ty == u32(types.P_BOOL)):
+        done^ = true
+        err_tok(w, b, cn, 1305, index.hold(#format("`", shown(w, c.ty), "` has no methods: in DadoScript an array, a map and a string have methods, and a scalar has operators")), index.hold(#format("convert it first — `string(", base, ")` has the string methods")))
+        return bad()
+    if k == 1 && (m == "filter" || m == "any" || m == "all" || m == "find_if" || m == "map" || m == "reduce" || m == "sort" && #len(args) == 1):
+        done^ = true
+        return s_hof(w, b, n, c, m, args)
+    if k == 0 && s_tup(w, c.ty): k = 4
+    bool tsf = false
+    u32 tt = st_of_ty(w, c.ty, &tsf)
+    if k == 0 && tt != NONE:
+        done^ = true
+        return st_call(w, b, n, cn, tt, tsf, spill(w, b, c, a.a[cn]))
+    u32 oc = s_class_of_ty(w, c.ty)
+    u32 om = s_method_in(w, oc, w.p.sym(b.file, cn)) if k == 0 && oc != NONE else NONE
+    if om != NONE:
+        done^ = true
+        if s_hidden(w, b, cn, oc, w.decls[om].file, w.decls[om].node): return bad()
+        return s_method(w, b, n, om, spill(w, b, c, a.a[cn]))
+    if k == 0 && oc != NONE && w.t.tag[w.t.resolve(c.ty)] != types.T_PTR:
+        u32 pmt = NONE
+        i64 pfirst = 0
+        bool pfull = false
+        u32 powner = NONE
+        u32 pm = se_promoted(w, oc, w.p.sym(b.file, cn), &pmt, &pfirst, &pfull, &powner)
+        if pm != NONE:
+            done^ = true
+            return se_call(w, b, n, cn, pm, pmt, pfirst, pfull, powner, spill(w, b, c, a.a[cn]), c.ty)
+    if k == 0: return bad()
+    done^ = true
+    []u32 tsl = w.t.slots(c.ty)
+    if k == 4 && m == "len" && #len(args) == 0: return value(ir.konst(w.k.small(&w.t, #len(tsl))), u32(types.P_INT))
+    i64 row = -1
+    for i in 0..<#len(SROWS):
+        if SROWS[i].kind == k && SROWS[i].name == m && (m != "decode_utf8" || w.t.a[w.t.resolve(c.ty)] == u32(types.P_U8)): row = i
+    if row < 0:
+        ref []string8 adm
+        string8 on = "S"
+        if k == 1:
+            for x in SEQ_M:
+                adm = #append(adm, x)
+        if k == 2:
+            on = "M"
+            for x in MAP_M:
+                adm = #append(adm, x)
+        if k == 3:
+            on = "T"
+            for x in STR_M:
+                adm = #append(adm, x)
+        if k == 4:
+            on = "F"
+            adm = #append(adm, "len")
+        for x in adm:
+            if x == m:
+                err(w, b, cn, 1, "this method is outside the slice the port builds so far")
+                return bad()
+        for g in args:
+            _ = expr(w, b, a.a[g], NONE)
+        string8 help = ""
+        for sp in SSPELL:
+            if #len(help) == 0 && sp.written == m && strings.contains(sp.on, on): help = index.hold(#format("DadoScript writes it ", sp.repair))
+        if #len(help) == 0:
+            string8 near = nearest(m, adm[:])
+            if #len(near) > 0: help = index.hold(#format("did you mean `", near, "`?"))
+        if #len(help) == 0:
+            ref []string8 ls
+            for x in adm:
+                ls = #append(ls, index.hold(#format("`", x, "`")))
+            help = index.hold(#format("what DadoScript does not admit is written by hand — a loop over `", base, "` in a method of the class, or a Dado function; the methods of `", shown(w, c.ty), "` are ", strings.join(ls[:], ", ")))
+        err_tok(w, b, cn, 1305, index.hold(#format("`", shown(w, c.ty), "` has no method `", m, "`")), help)
+        return bad()
+    SRow sr = SROWS[row]
+    if k == 1 && (m == "contains" || m == "index_of" || m == "last_index_of") && !s_searchable(w, b, n, w.t.a[w.t.resolve(c.ty)], index.hold(#format("`", m, "`"))): return bad()
+    if k == 2 && m == "get" && #len(args) == 1:
+        _ = expr(w, b, a.a[args[0]], NONE)
+        string8 at = src(w, b, a.a[args[0]])
+        u32 mr = w.t.resolve(c.ty)
+        err(w, b, n, 601, index.hold(#format("`get` answers a value for every key, so it takes the value to answer when the key is missing: `", shown(w, w.t.b[mr]), " get(", shown(w, w.t.a[mr]), " k, ", shown(w, w.t.b[mr]), " default)`")), index.hold(#format("pass the default — `", base, ".get(", at, ", …)` — or read `", base, "[", at, "]`, which raises when the key is missing")))
+        return bad()
+    if #len(args) != #len(sr.args):
+        err(w, b, n, 601, index.hold(#format("`", m, "` takes ", #len(sr.args), " argument", "" if #len(sr.args) == 1 else "s", " and this call passes ", #len(args))))
+        return bad()
+    ref []u32 xs
+    xs = #append(xs, spill(w, b, c, a.a[cn]))
+    xs = #append(xs, ir.konst(w.k.str(&w.t, m)))
+    for i in 0..<#len(args):
+        u32 g = a.a[args[i]]
+        u32 pt = s_letter(w, c.ty, sr.args[i])
+        Val v = coerce(w, b, expr(w, b, g, pt), pt, g, index.hold(#format(s_arg_what(k, m, i), " is")))
+        if v.ty == NONE: return bad()
+        xs = #append(xs, v.opd)
+    return s_op(w, b, n, B_SMETHOD, s_letter(w, c.ty, sr.ret), xs[:])
+
+// `xs.any(lambda)` and the other methods taking a function: a lambda whose
+// parameters are the elements (`reduce`: the running value first).
+private Val s_hof(^World w, ^Body b, u32 n, Val c, string8 m, []u32 args):
+    syntax.Ast a = tree(w, b)
+    u32 el = w.t.a[w.t.resolve(c.ty)]
+    u32 g = a.a[args[0]]
+    if #len(args) != (2 if m == "reduce" else 1):
+        err(w, b, n, 1, "this method is outside the slice the port builds so far")
+        return bad()
+    // A lambda, or any function value.
+    ref []u32 lps
+    u32 ret = u32(types.P_VOID)
+    u32 fo = NONE
+    if a.tag[g] == syntax.E_LAMBDA:
+        []u32 ks = a.list(a.b[g])
+        for q in ks[2..<#len(ks)]:
+            u32 t = resolve_type(w, b.file, a.a[q])
+            if t == NONE: return bad()
+            lps = #append(lps, t)
+        if ks[0] != NONE: ret = resolve_type(w, b.file, ks[0])
+    else:
+        Val fv = finish(w, b, expr(w, b, g, NONE), g)
+        if fv.ty == NONE: return bad()
+        if !s_fn(w, fv.ty):
+            err(w, b, n, 1, "this method is outside the slice the port builds so far")
+            return bad()
+        fo = spill(w, b, fv, g)
+        for x in w.t.params(w.t.resolve(fv.ty)):
+            lps = #append(lps, x)
+        ret = w.t.a[w.t.resolve(fv.ty)]
+    if ret == NONE: return bad()
+    ref []u32 want
+    if m == "reduce": want = #append(want, ret)
+    want = #append(want, el)
+    if m == "sort": want = #append(want, el)
+    bool ok = #len(want) == #len(lps)
+    for i in 0..<#len(lps):
+        if ok && w.t.resolve(lps[i]) != w.t.resolve(want[i]): ok = false
+    if m != "map" && m != "reduce" && ret != u32(types.P_BOOL) || ret == u32(types.P_VOID): ok = false
+    if !ok:
+        ref []string8 hs
+        ref []string8 gs
+        [2]string8 nms = ["a", "b"]
+        for i in 0..<#len(want):
+            string8 pn = "v" if #len(want) == 1 else nms[i % 2]
+            hs = #append(hs, index.hold(#format(shown(w, want[i]), " ", pn)))
+        for x in lps:
+            gs = #append(gs, shown(w, x))
+        string8 wr = "bool"
+        if m == "map" || m == "reduce": wr = shown(w, ret)
+        string8 hd = index.hold(#format(wr, "(", strings.join(hs[:], ", "), ")"))
+        string8 lf = "function"
+        if a.tag[g] == syntax.E_LAMBDA: lf = "lambda"
+        err(w, b, g, 504, index.hold(#format("`", m, "` hands its lambda what `", hd, "` takes, and this ", lf, " is `", shown(w, ret), "(", strings.join(gs[:], ", "), ")`")), index.hold(#format("write `", hd, ": return …`")))
+        return bad()
+    ref []u32 xs
+    xs = #append(xs, spill(w, b, c, a.a[a.list(a.b[n])[0]]))
+    xs = #append(xs, ir.konst(w.k.str(&w.t, m)))
+    if fo != NONE: xs = #append(xs, fo)
+    else: xs = #append(xs, s_lambda_value(w, b, g, lps[:], ret))
+    if m == "reduce":
+        u32 ig = a.a[args[1]]
+        Val iv = coerce(w, b, expr(w, b, ig, ret), ret, ig, "the starting value is")
+        if iv.ty == NONE: return bad()
+        xs = #append(xs, iv.opd)
+    u32 rt = u32(types.P_BOOL)
+    if m == "filter": rt = c.ty
+    if m == "find_if": rt = u32(types.P_INT)
+    if m == "map": rt = w.t.slice_of(ret)
+    if m == "reduce": rt = ret
+    if m == "sort": rt = u32(types.P_VOID)
+    return s_op(w, b, n, B_SMETHOD, rt, xs[:])
+
+// Another language's spelling, or a method DadoScript chose not to have, and
+// its repair: (receivers `S` array, `M` map, `T` string, `B` bytes, `F` fixed).
+type SSpell:
+    string8 on
+    string8 written
+    string8 repair
+
+const [76]SSpell SSPELL = (SSpell("SMTF", "size", "`len()`"), SSpell("SMTF", "length", "`len()`"), SSpell("SMT", "count", "`len()` counts every element; to count some, `filter` and then `len()`"), SSpell("S", "push", "`append(v)`"), SSpell("S", "push_back", "`append(v)`"), SSpell("S", "add", "`append(v)`"), SSpell("S", "extend", "`append_array(vs)`"), SSpell("S", "concat", "`append_array(vs)` on a `copy()`"), SSpell("S", "pop_back", "`pop()`"), SSpell("S", "shift", "`pop_front()`"), SSpell("S", "unshift", "`insert(0, v)`"), SSpell("S", "push_front", "`insert(0, v)`"), SSpell("S", "remove", "`remove_at(i)`, with the position from `index_of(v)`"), SSpell("S", "erase", "`remove_at(i)`"), SSpell("S", "pop_at", "`remove_at(i)`"), SSpell("S", "splice", "`remove_at(i)` or `insert(i, v)`"), SSpell("S", "has", "`contains(v)`"), SSpell("ST", "includes", "`contains(v)`"), SSpell("ST", "find", "`index_of(v)`"), SSpell("ST", "indexOf", "`index_of(v)`"), SSpell("ST", "rfind", "`last_index_of(v)`"), SSpell("ST", "lastIndexOf", "`last_index_of(v)`"), SSpell("S", "find_custom", "`find_if(p)`"), SSpell("S", "findIndex", "`find_if(p)`"), SSpell("S", "some", "`any(p)`"), SSpell("S", "every", "`all(p)`"), SSpell("SM", "duplicate", "`copy()`"), SSpell("SM", "clone", "`copy()`"), SSpell("S", "sort_custom", "`sort(less)`"), SSpell("S", "slice", "a slice, `xs[a..<b]`, which is a new array"), SSpell("S", "at", "an index, `xs[i]`"), SSpell("S", "get", "an index, `xs[i]`"), SSpell("S", "set", "a store, `xs[i] = v`"), SSpell("M", "contains", "`has(k)`"), SSpell("M", "contains_key", "`has(k)`"), SSpell("M", "has_key", "`has(k)`"), SSpell("M", "erase", "`delete(k)`"), SSpell("M", "remove", "`delete(k)`"), SSpell("M", "set", "a store, `m[k] = v`"), SSpell("M", "put", "a store, `m[k] = v`"), SSpell("M", "insert", "a store, `m[k] = v`"), SSpell("M", "merge", "a loop: `for k, v in other: m[k] = v`"), SSpell("M", "entries", "a loop: `for k, v in m:`"), SSpell("M", "items", "a loop: `for k, v in m:`"), SSpell("T", "startsWith", "`starts_with(p)`"), SSpell("T", "begins_with", "`starts_with(p)`"), SSpell("T", "endsWith", "`ends_with(p)`"), SSpell("T", "has", "`contains(s)`"), SSpell("T", "strip", "`trim()`"), SSpell("T", "strip_edges", "`trim()`"), SSpell("T", "trimStart", "`trim_left()`"), SSpell("T", "lstrip", "`trim_left()`"), SSpell("T", "trimEnd", "`trim_right()`"), SSpell("T", "rstrip", "`trim_right()`"), SSpell("T", "toUpperCase", "`to_upper()`"), SSpell("T", "upper", "`to_upper()`"), SSpell("T", "toLowerCase", "`to_lower()`"), SSpell("T", "lower", "`to_lower()`"), SSpell("T", "replace", "`replace_all(a, b)`"), SSpell("T", "replaceAll", "`replace_all(a, b)`"), SSpell("T", "substring", "a slice, `s[a..<b]`"), SSpell("T", "substr", "a slice, `s[a..<b]`"), SSpell("T", "slice", "a slice, `s[a..<b]`"), SSpell("T", "charAt", "an index, `s[i]`"), SSpell("T", "at", "an index, `s[i]`"), SSpell("T", "chars", "a loop over the code points: `for c in s:`"), SSpell("T", "codePointAt", "`code_point_at(i)`"), SSpell("T", "unicode_at", "`code_point_at(i)`"), SSpell("T", "ord", "`code_point_at(i)`"), SSpell("T", "to_utf8_buffer", "`bytes()`"), SSpell("T", "encode", "`bytes()`"), SSpell("T", "parseInt", "`to_int()`"), SSpell("T", "parseFloat", "`to_float()`"), SSpell("T", "join", "`join(sep)` on the `[]string` of the parts: `parts.join(s)`"), SSpell("B", "get_string_from_utf8", "`decode_utf8()`"), SSpell("B", "decode", "`decode_utf8()`"))
+const [26]string8 SEQ_M = ("len", "is_empty", "append", "append_array", "insert", "pop", "pop_front", "remove_at", "clear", "resize", "front", "back", "contains", "index_of", "last_index_of", "reverse", "sort", "filter", "map", "reduce", "any", "all", "find_if", "copy", "fill", "join")
+const [9]string8 MAP_M = ("len", "is_empty", "has", "get", "delete", "clear", "keys", "values", "copy")
+const [19]string8 STR_M = ("len", "is_empty", "contains", "starts_with", "ends_with", "index_of", "last_index_of", "split", "trim", "trim_left", "trim_right", "to_upper", "to_lower", "replace_all", "repeat", "bytes", "code_point_at", "to_int", "to_float")
+
+// What argument `i` of method `m` on a `k` (1 array, 2 map, 3 string) is, in Rust's words.
+private string8 s_arg_what(u8 k, string8 m, i64 i):
+    if m == "append": return "the value appended"
+    if m == "append_array": return "the array appended"
+    if m == "insert": return "the position" if i == 0 else "the value inserted"
+    if m == "remove_at" || m == "code_point_at": return "the position"
+    if m == "resize": return "the length"
+    if m == "contains" || m == "index_of" || m == "last_index_of" || m == "starts_with" || m == "ends_with": return "the value looked for" if k == 1 else "the string looked for"
+    if m == "fill": return "the value filled"
+    if m == "join" || m == "split": return "the separator"
+    if m == "has" || m == "delete": return "the key"
+    if m == "get": return "the key" if i == 0 else "the default"
+    if m == "replace_all": return "the string replaced" if i == 0 else "the replacement"
+    if m == "repeat": return "the count"
+    return "the argument"
+
+const u8 B_SSLICE = 161    // dst = args[0][args[1] ..< args[2]], args[3] 1: `..=`, args[4] 1: a string
+
+// `xs[a..<b]` and `s[a..=b]`: a new array, or a string.
+Val s_slice(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    Val c = finish(w, b, expr(w, b, ks[0], NONE), ks[0])
+    [2]u32 bs = [ks[1], ks[2]]
+    [2]u32 bv = [ir.konst(w.k.small(&w.t, 0)), NONE]
+    bool ok = true
+    for i in 0..<2:
+        if bs[i] == NONE: continue
+        Val v = coerce(w, b, expr(w, b, bs[i], u32(types.P_INT)), u32(types.P_INT), bs[i], "a slice's bound is")
+        if v.ty == NONE: ok = false
+        else: bv[i] = v.opd
+    if c.ty == NONE || !ok: return bad()
+    string8 rk = ""
+    if a.main[n] != NONE: rk = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[n]])..<i64(w.p.files[b.file].t.end[a.main[n]])]
+    u8 k = s_kind(w, c.ty)
+    u32 rty = c.ty
+    if k != 1 && k != 3 && s_tup(w, c.ty):
+        []u32 ss = w.t.slots(c.ty)
+        bool one = #len(ss) > 0
+        for x in ss:
+            if x != ss[0]: one = false
+        if one:
+            k = 1
+            rty = w.t.slice_of(ss[0])
+    if k != 1 && k != 3:
+        string8 h = ""
+        if k == 2: h = "a map has no positions: read it by key, `m[k]`"
+        err(w, b, n, 504, index.hold(#format("only an array or a string is sliced, and this is `", shown(w, c.ty), "`")), h)
+        return bad()
+    ref []u32 xs
+    xs = #append(xs, spill(w, b, c, ks[0]))
+    xs = #append(xs, bv[0])
+    u32 hi = bv[1]
+    if hi == NONE: hi = ir.konst(w.k.small(&w.t, -1))
+    xs = #append(xs, hi)
+    xs = #append(xs, ir.konst(w.k.small(&w.t, 1 if rk == "..=" else (2 if bv[1] == NONE else 0))))
+    xs = #append(xs, ir.konst(w.k.small(&w.t, 1 if k == 3 else 0)))
+    return s_op(w, b, n, B_SSLICE, rty, xs[:])

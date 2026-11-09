@@ -9,8 +9,8 @@
 // Run: `node tools/web/bench/stop_check.mjs [rounds]`.
 import { Worker, isMainThread, workerData, parentPort } from "node:worker_threads";
 import os from "node:os";
-import * as stop from "../../../crates/dado_emit_js/src/stop.js";
-import { __dados_word, __dados_mem, __dados_poll } from "../../../crates/dado_emit_js/src/stop.js";
+import * as stop from "../../../collections/language/lower/stop.js";
+import { __dados_word, __dados_mem, __dados_poll } from "../../../collections/language/lower/stop.js";
 
 const N = 5e7;
 const FLAVOURS = [

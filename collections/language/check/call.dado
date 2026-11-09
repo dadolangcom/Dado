@@ -1,0 +1,1690 @@
+// Calls: the callee, argument placing (positional, named, `..` splats),
+// conversions `T(x)`, builtins by their row, and pack instances.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+import "core:fmt"
+
+// A function as a value: its body queued, its C name a constant.
+Val fn_value(^World w, ^Body b, Val v, u32 n):
+    if v.x == NONE && tree(w, b).tag[n] == syntax.E_NAME && spell(w, b, n)[0] == '#' && builtin(spell(w, b, n)) >= 0 && BUILTINS[builtin(spell(w, b, n))].position == POS_MARKER:
+        err(w, b, n, 417, index.hold(#format("`", spell(w, b, n), "` is a name the compiler owns and it is written **in front of a checked operand** — an index inside its brackets, or the value of a store into a bitfield; this is an expression, and it names no value of its own")))
+        return bad()
+    if v.x == NONE && tree(w, b).tag[n] == syntax.E_NAME && spell(w, b, n)[0] == '#':
+        err(w, b, n, 417, index.hold(#format("`", spell(w, b, n), "` is a name the compiler owns and it is written **with its arguments**; this is the bare name, which names no value")))
+        return bad()
+    if v.x == NONE: return v
+    if v.hi != 1 && w.decls[v.x].kind == K_FN && templated(w, v.x):
+        err(w, b, n, 504, index.hold(#format("`", src(w, b, n), "` is a template, so it has no single address to be a value of. Each call site expands it into its own function; call it, or write a function of the width you want and take that")))
+        return bad()
+    if names_caller(w, v.x):
+        string8 fname = fn_label(w, v.x)
+        err(w, b, n, 822, index.hold(#format("`", fname, "` names `#caller` in its body, so a call to it hands over the caller's view, and a call through a function value does not know to")), index.hold(#format("call `", fname, "` directly, or wrap it in a function that does not name `#caller` and take that")), "Every direct call hands the view over as a hidden argument; a callback slot, a `ThreadFn` or a `const` alias does not")
+    u32 cname = job(w, v.x, u32(v.lo) if v.hi == 1 else NONE)
+    if !b.ds && w.decls[v.x].kind == K_FN && v.hi != 1:
+        bool had = false
+        for x in w.fnvals:
+            if x == v.x: had = true
+        if !had: w.fnvals = #append(w.fnvals, v.x)
+    u32 pk = tstr(w, name_of(w, w.p.pkgs[w.decls[v.x].pkg].name))
+    return value(ir.konst(w.k.make(&w.t, types.C_FN, pk, cname, 0, 0, nil)), v.ty)
+
+// The argument nodes, `E_ARG`s, of call `n`.
+[]u32 call_args(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    return ks[2..<#len(ks)]
+
+Val call(^World w, ^Body b, u32 n, u32 want, bool effect):
+    syntax.Ast ua = tree(w, b)
+    u32 uh = ua.list(ua.b[n])[1]
+    if uh == NONE: return call_(w, b, n, want, effect)
+    i64 e0 = n_errors(w)
+    []u32 hk = ua.list(ua.b[uh])
+    bool sinks = #len(hk) > 1
+    [2]u32 sv = [NONE, NONE]
+    if sinks: _ = using_sinks(w, b, uh, true, &sv)
+    u32 saved = push_using(w, b, uh, "what this call reaches")
+    i64 nd = #len(b.defers)
+    if saved != NONE:
+        b.usings = #append(b.usings, saved)
+        b.commits = #append(b.commits, Commit(saved, NONE, NONE, NONE, false, uh))
+        b.defers = #append(b.defers, Defer(NONE, b.depth + 1, false, #len(b.commits) - 1, false))
+    Commit sc = Commit(sv[0], sv[1], NONE, SINK_MARK, false, uh)
+    bool scoped = sv[0] != NONE || sv[1] != NONE
+    if scoped:
+        b.commits = #append(b.commits, sc)
+        b.defers = #append(b.defers, Defer(NONE, b.depth + 1, false, #len(b.commits) - 1, false))
+    i64 nd2 = #len(b.defers)
+    Val v = call_(w, b, n, want, effect)
+    if #len(b.defers) == nd2: #truncate(b.defers, nd)
+    if scoped: sinks_pop(w, b, sc)
+    if saved != NONE:
+        #truncate(b.usings, #len(b.usings) - 1)
+        pop_using(w, b, saved, uh)
+    if sinks && n_errors(w) == e0: sinks_after(w, b, n, uh)
+    return v
+
+private Val call_(^World w, ^Body b, u32 n, u32 want, bool effect):
+    syntax.Ast a = tree(w, b)
+    u32 cn = a.list(a.b[n])[0]
+    []u32 args = call_args(w, b, n)
+    // `[]f64(d)` was refused as a misread conversion by the parser.
+    if a.tag[cn] == syntax.E_TYPE && (a.tag[a.a[cn]] == syntax.T_ARRAY || a.tag[a.a[cn]] == syntax.T_SLICE): return bad()
+    // `^R(A)` written where a value goes, every argument a type: the function-pointer type value.
+    if a.tag[cn] == syntax.E_TYPE && a.tag[a.a[cn]] == syntax.T_POINTER && #len(args) > 0:
+        ref []u32 ps
+        for g in args:
+            u32 gv = arg_value(w, b, g)
+            u32 pt = NONE
+            if a.tag[g] == syntax.E_ARG && a.main[g] != NONE: pt = NONE
+            else if a.tag[gv] == syntax.E_TYPE: pt = resolve_type(w, b.file, a.a[gv])
+            else if a.tag[gv] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, gv), false) == NONE && (types.prim_named(spell(w, b, gv)) != types.PRIMS || text_named(spell(w, b, gv)) != NONE): pt = expr(w, b, gv, NONE).x
+            if pt == NONE: break
+            ps = #append(ps, pt)
+        if #len(ps) == #len(args):
+            u32 rt = resolve_type(w, b.file, a.a[a.a[cn]])
+            if rt == NONE: return bad()
+            return Val(V_TYPE, NONE, u32(types.TYPE), w.t.ptr_of(w.t.func(rt, types.F_NONE, ps[:])), 0, 0)
+    if a.tag[cn] == syntax.E_NAME:
+        string8 s = spell(w, b, cn)
+        if s == "#slots":
+            err(w, b, cn, 417, SLOTS_WHERE, "spread the slots into a call with `f(..#slots(v))`, or walk them with `for name, value in #slots(v):`")
+            return bad()
+        if #len(s) > 0 && s[0] == '#': return builtin_call(w, b, n, index.hold(strings.clone(s)), index.hold(strings.clone(s)))
+        u32 sym = w.p.sym(b.file, cn)
+        u8 bk = 0
+        bool unknown = bound(w, sym, &bk) == NONE && find_local(w, b, sym, false) == NONE && types.prim_named(s) == types.PRIMS && text_named(s) == NONE && s != "cstring" && bare(w, b.file, cn) == NONE && w.amb != (u64(b.file) << 32) | u64(cn)
+        i64 rt = retired(s) if unknown else -1
+        if rt >= 0 && RETIRED[rt].status == R_REFUSED && builtin(RETIRED[rt].replacement) >= 0:
+            string8 to = RETIRED[rt].replacement
+            err(w, b, n, 805, index.hold(#format("`", s, "` is a retired spelling and `", to, "` is what replaces it")), index.hold(#format("write `", to, "`")))
+            return builtin_call(w, b, n, index.hold(strings.clone(to)), index.hold(strings.clone(s)))
+        if unknown && s == "string":
+            string8 arg = "x"
+            if #len(args) > 0: arg = src(w, b, arg_value(w, b, args[0]))
+            err(w, b, cn, 401, index.hold(#format(STRING_KIND_WHY, ", so there is nothing to convert to. A conversion names the width — `string8(", arg, ")`")))
+            for g in args:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            return bad()
+        if unknown:
+            err(w, b, cn, 405, index.hold(#format("`", s, "` is not a function this file can see; every builtin is spelled with a `#`, and everything else is reached by an import")))
+            for g in args:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            return bad()
+    Val c = bad()
+    if a.tag[cn] == syntax.E_FIELD && s_verb(spell(w, b, cn)) != 0:
+        u64 sr = s_signal_ref(w, b, a.a[cn])
+        if sr != u64(NONE): return s_signal_call(w, b, n, sr, index.hold(strings.clone(spell(w, b, cn))))
+    if a.tag[cn] == syntax.E_FIELD:
+        u32 bn = a.a[cn]
+        if a.tag[bn] == syntax.E_NAME && unknown_name(w, b, bn):
+            string8 q = spell(w, b, bn)
+            err(w, b, bn, 408, index.hold(#format("nothing named `", q, "` is in scope here\x1f`", q, ".", spell(w, b, cn), "(...)` is a qualified call, so `", q, "` has to be a package this file imports, a `foreign` block bound to that name, or a value\x1eimport the package `", q, "` names, or declare `", q, "`")))
+            for g in args:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            return bad()
+        Val base = base_expr(w, b, bn)
+        if w.watching && b.file == w.watch_file: watch_dot(w, b, cn, base)
+        if base.ty == NONE: return base
+        if !b.ds && base.kind == V_VAL && s_class_of_ty(w, base.ty) != NONE: return host_member(w, b, n, cn, base, s_class_of_ty(w, base.ty))
+        if base.kind == V_VAL && shapeless(w, b, bn, cn): return bad()
+        if base.kind == V_VAL && is_trait(w, base.ty): return trait_call(w, b, n, cn, base)
+        u32 br = w.t.resolve(base.ty)
+        u32 at = NONE
+        u32 m = method(w, base.ty, w.p.sym(b.file, cn), &at) if base.kind == V_VAL && br != NONE && one_ref(w, br) && w.t.bare(base.ty) != br else NONE
+        if m == NONE && base.kind == V_VAL && br != NONE && one_ref(w, br): base = value(ir.step(&b.f, spill(w, b, base, bn), ir.ST_DEREF, 0, w.t.a[br]), w.t.a[br])
+        if m == NONE: m = method(w, base.ty, w.p.sym(b.file, cn), &at)
+        if base.kind == V_VAL && m != NONE && hidden(w, b, m):
+            string8 tn = name_of(w, w.decls[w.decls[m].block].name)
+            string8 mn = name_of(w, w.decls[m].name)
+            string8 pn = name_of(w, w.p.pkgs[w.decls[m].pkg].name)
+            err_tok(w, b, cn, 413, index.hold(#format("`", mn, "` is a method of `", pn, ".", tn, "` that is private, so this file cannot call it")), index.hold(#format("call a method of `", tn, "` this file can see, or widen `", mn, "` where `", tn, "` declares it")))
+            for g in args:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            return bad()
+        if base.kind == V_VAL && m != NONE: return method_call(w, b, n, cn, base, m, at)
+        if base.kind == V_PKG && !b.ds && lookup(w, base.x, w.p.sym(b.file, cn)) == NONE:
+            bool hf = false
+            Val hv = host_fn(w, b, n, cn, base.x, &hf)
+            if hf: return hv
+        b.callnode = n + 1
+        c = field_of(w, b, cn, base)
+        b.callnode = 0
+        if c.ty == NONE && base.kind == V_PKG:
+            for g in args:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            return c
+    else if a.tag[cn] == syntax.E_NAME && generic_type(w, b, cn) != NONE:
+        u32 d = generic_type(w, b, cn)
+        ref []u32 tys
+        for g in args:
+            Val t = expr(w, b, arg_value(w, b, g), NONE)
+            if t.ty == NONE: return bad()
+            if t.kind != V_TYPE:
+                err(w, b, arg_value(w, b, g), 1, "this argument is outside the slice the port builds so far")
+                return bad()
+            tys = #append(tys, t.x)
+        []u32 bs = binders(w, d)
+        if #len(tys) != #len(bs):
+            err(w, b, n, 538, generic_head(w, d, #len(tys)))
+            return bad()
+        u32 it = instance(w, d, tys, b.file, n)
+        if it == NONE: return bad()
+        return Val(V_TYPE, NONE, types.TYPE, it, 0, 0)
+    else: c = expr(w, b, cn, NONE)
+    if c.ty == NONE && c.kind == V_FN && c.x != NONE:
+        for g in args:
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+    if c.ty == NONE: return c
+    if c.kind == V_TYPE: return convert(w, b, n, c.x)
+    if c.kind == V_FN: return direct(w, b, n, c.x, bad(), u32(c.lo) if c.hi == 1 else NONE)
+    u32 cr = w.t.resolve(c.ty)
+    // A pointer to a function reference calls through it, to full depth.
+    for _ in 0..<64:
+        if c.kind != V_VAL || cr == NONE || w.t.tag[cr] != types.T_PTR: break
+        u32 pt = w.t.resolve(w.t.a[cr])
+        if pt == NONE || w.t.tag[pt] != types.T_PTR && w.t.tag[pt] != types.T_FUNC: break
+        c = value(ir.step(&b.f, spill(w, b, c, cn), ir.ST_DEREF, 0, w.t.a[cr]), w.t.a[cr])
+        cr = pt
+    if c.kind == V_VAL && cr != NONE && w.t.tag[cr] == types.T_FUNC: return indirect(w, b, n, c)
+    err(w, b, cn, 405, index.hold(#format("this is ", shown(w, final_ty(w, c)), ", which is not something to call. A call needs a function or a value holding a function reference")))
+    return bad()
+
+// The generic type name `n` names, or NONE.
+private u32 generic_type(^World w, ^Body b, u32 n):
+    if find_local(w, b, w.p.sym(b.file, n), false) != NONE: return NONE
+    u32 d = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, n))
+    if d == NONE || w.decls[d].kind != K_TYPE || !templated(w, d): return NONE
+    return d
+
+// Whether name `n` denotes nothing at all here.
+private bool unknown_name(^World w, ^Body b, u32 n):
+    string8 s = spell(w, b, n)
+    u32 sym = w.p.sym(b.file, n)
+    if #len(s) == 0 || s[0] == '#' || s == "true" || s == "false" || s == "nil" || s == "self" || s == "super" || s == "Self": return false
+    if find_local(w, b, sym, false) != NONE || types.prim_named(s) != types.PRIMS || s == "string8" || s == "cstring": return false
+    if b.pack != NONE && sym == b.pack_name: return false
+    u8 bk = 0
+    if bound(w, sym, &bk) != NONE: return false
+    u32 pkg = w.p.files[b.file].pkg
+    if lookup(w, pkg, sym) != NONE: return false
+    for im in w.p.pkgs[pkg].imports:
+        if im.file != b.file: continue
+        if (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == sym: return false
+    return true
+
+u32 arg_value(^World w, ^Body b, u32 g):
+    syntax.Ast a = tree(w, b)
+    return a.a[g] if a.tag[g] == syntax.E_ARG else g
+
+// `T(x)`: integers to any integer width (wrapping), `rawptr` to and from
+// pointers.
+private Val convert(^World w, ^Body b, u32 n, u32 ty):
+    []u32 cxs = call_args(w, b, n)
+    if !b.ds && is_trait(w, ty) && #len(cxs) == 1:
+        u32 vn = arg_value(w, b, cxs[0])
+        syntax.Ast ta = tree(w, b)
+        string8 sp = src(w, b, ta.list(ta.b[n])[0])
+        err(w, b, vn, 504, index.hold(#format("`", sp, "(…)` is no conversion: a `", sp, "` is made by writing its implementer where a `", sp, "` is asked, so there is one spelling of it")), index.hold(#format("write the implementer at the destination: `", sp, " d = ", src(w, b, vn), "`")))
+        return bad()
+    if b.ds && s_denum(w, ty) != NONE: return s_enum_make(w, b, n, ty)
+    if b.ds && union_of(w, ty) != NONE && !(ty in w.type_decl):
+        // A Dado union as a script holds it.
+        []u32 us = call_args(w, b, n)
+        if #len(us) == 1: return union_make(w, b, n, ty, arg_value(w, b, us[0]))
+    if ty in w.type_decl:
+        try u32 d = w.type_decl[ty] else: return bad()
+        u32 r = w.t.resolve(ty)
+        []u32 xs = call_args(w, b, n)
+        if w.decls[d].kind == K_ENUM && #len(xs) == 0: return construct(w, b, n, ty)
+        if w.decls[d].kind == K_UNION && #len(xs) == 1: return union_make(w, b, n, ty, arg_value(w, b, xs[0]))
+        if w.decls[d].kind == K_UNION && #len(xs) > 1:
+            err(w, b, n, 601, index.hold(#format("a conversion to ", shown(w, ty), " takes the one value it holds; this gives ", #len(xs))))
+            return bad()
+        bool nm1 = #len(xs) == 1 && tree(w, b).tag[xs[0]] == syntax.E_ARG && tree(w, b).main[xs[0]] != NONE
+        if w.decls[d].kind == K_TYPE && #len(xs) > 1 && under(&w.t, ty) != NONE && w.t.tag[under(&w.t, ty)] != types.T_TUPLE && !nm1:
+            err(w, b, n, 601, index.hold(#format("a conversion to ", shown(w, ty), " takes the one value it converts; this gives ", #len(xs))))
+            return bad()
+        if (w.decls[d].kind == K_TYPE || w.decls[d].kind == K_FSTRUCT) && (#len(xs) != 1 || nm1 || r != NONE && w.t.tag[r] == types.T_TUPLE): return construct(w, b, n, ty)
+    []u32 args = call_args(w, b, n)
+    if #len(args) != 1:
+        err(w, b, n, 601, index.hold(#format("a conversion takes one value, and this call writes ", #len(args))))
+        return bad()
+    u32 vn = arg_value(w, b, args[0])
+    if in_const_init(w, b) && is_float(w, ty) && tree(w, b).tag[vn] == syntax.E_BINARY && f32_in(w, b, vn):
+        err(w, b, n, 901, "a constant is folded before the program runs, and the compiler cannot evaluate a conversion of `f32` arithmetic", "convert each `f32` constant first, `f64(E) * 3.0`, or keep the conversion in a function", "The program computes it in single precision and a constant is folded in double, so the two could differ in the last place")
+        return bad()
+    if w.t.resolve(ty) == types.CSTRING && tree(w, b).tag[vn] == syntax.E_STR: return expr(w, b, vn, ty)
+    if tree(w, b).tag[vn] == syntax.E_NAME && spell(w, b, vn) == "nil" && w.t.resolve(ty) != NONE && w.t.tag[w.t.resolve(ty)] == types.T_PTR: return value(zero(w, ty), ty)
+    // A written conversion wraps a literal on purpose: no LNT0505/0510.
+    b.wrapping = tree(w, b).tag[vn] == syntax.E_CHAR || tree(w, b).tag[vn] == syntax.E_INT || tree(w, b).tag[vn] == syntax.E_UNARY
+    u32 at0 = ir.count(&b.f)
+    u8 vg = tree(w, b).tag[vn]
+    if tagged(w, ty) && (vg == syntax.E_TUPLE || vg == syntax.E_ARRAY):
+        Val lv = expr(w, b, vn, under(&w.t, ty))
+        b.wrapping = false
+        if lv.ty == NONE: return lv
+        lv = coerce(w, b, lv, under(&w.t, ty), vn)
+        if lv.ty == NONE: return lv
+        return value(spill(w, b, lv, n), ty)
+    // A tag's conditional: its arms are the underlying number (Rust's).
+    u32 cw = under(&w.t, ty) if vg == syntax.E_COND && tagged(w, ty) else ty
+    Val v = expr(w, b, vn, cw if is_num(w, ty) && (tree(w, b).tag[vn] == syntax.E_INT || tree(w, b).tag[vn] == syntax.E_FLOAT || tree(w, b).tag[vn] == syntax.E_UNARY) else (cw if is_int(w, ty) else NONE))
+    if v.ty != NONE && (v.kind == V_LIT || v.kind == V_FLIT): v = finish(w, b, v, vn)
+    b.wrapping = false
+    if v.ty == NONE: return v
+    if v.ty == ty: return v
+    if w.t.resolve(v.ty) == w.t.resolve(ty) && (is_fstruct(&w.t, v.ty) || is_fstruct(&w.t, ty)): return coerce(w, b, v, ty, vn)
+    if w.t.resolve(v.ty) == w.t.resolve(ty) || under(&w.t, v.ty) == under(&w.t, ty) && (tagged(w, v.ty) || tagged(w, ty)): return value(spill(w, b, v, n), ty)
+    u8 kind = ir.CV_WRAP
+    u32 rp = u32(types.P_RAWPTR)
+    u32 r = w.t.resolve(ty)
+    u32 vr = w.t.resolve(v.ty)
+    // A VM is an untyped address.
+    if is_vm(w, v.ty) && r == rp || vr == rp && is_vm(w, ty): return value(spill(w, b, v, n), ty)
+    Run k = run_shape(w, v.ty)
+    bool bytes = k.kind == RK_SLICE || k.kind == RK_REF
+    if bytes: bytes = w.t.resolve(k.elem) == u32(types.P_CHAR8) || w.t.resolve(k.elem) == u32(types.P_U8)
+    bool wide = address_int(w, ty) if vr == rp else address_int(w, v.ty)
+    if (vr == rp && is_int(w, ty) || r == rp && is_int(w, v.ty)) && wide:
+        u32 t = temp(w, b, ty, n)
+        _ = ir.op(&b.f, ir.O_CONV, ir.CV_WRAP, ty, n, t, spill(w, b, v, vn))
+        return value(t, ty)
+    if (vr == rp || vr != NONE && w.t.tag[vr] == types.T_PTR) && is_int(w, ty) || r == rp && is_int(w, v.ty):
+        string8 help = "an address is a number as `u64(p)` or `i64(p)`, which hold any address; `u32(u64(p))` narrows that number, and `#c.uintptr_t(p)` is C's own spelling" if vr == rp else ""
+        err(w, b, vn, 504, index.hold(#format("a conversion changes a `distinct` tag or a numeric width; ", shown(w, v.ty), " and ", shown(w, ty), " are neither")), help)
+        return bad()
+    if is_int(w, v.ty) && is_int(w, ty): kind = ir.CV_WIDEN if widens(w, under(&w.t, v.ty), under(&w.t, ty)) else ir.CV_WRAP
+    else if is_int(w, v.ty) && is_float(w, ty): kind = ir.CV_INT_FLOAT
+    else if is_float(w, v.ty) && is_int(w, ty): kind = ir.CV_FLOAT_INT
+    else if is_float(w, v.ty) && is_float(w, ty): kind = ir.CV_FLOAT_WIDTH
+    else if c_bool(w, r) && vr == u32(types.P_BOOL) || r == u32(types.P_BOOL) && c_bool(w, vr): kind = ir.CV_WRAP
+    else if r == types.STRING8 && bytes && !lends(w, v.ty, ty): kind = ir.CV_RETAG
+    else if bytes_view(w, ty) && (vr == types.STRING8 || bytes) && !drops_ro(w, v.ty, ty): kind = ir.CV_RETAG
+    else if ty == rp && (vr == types.STRING8 || k.kind == RK_SLICE || k.kind == RK_REF): kind = ir.CV_TO_RAWPTR
+    else if r == types.CSTRING && bytes && w.t.resolve(k.elem) == u32(types.P_CHAR8): kind = ir.CV_CSTRING
+    else if r == types.STRING8 && vr == types.CSTRING: kind = ir.CV_FROM_CSTRING
+    else if r == types.CSTRING && vr != NONE && w.t.tag[vr] == types.T_PTR && c_char_ty(w, w.t.a[vr]): kind = ir.CV_FROM_RAWPTR
+    else if v.ty == rp && r != NONE && w.t.tag[r] == types.T_PTR: kind = ir.CV_FROM_RAWPTR
+    else if r == types.CSTRING && vr == u32(types.P_RAWPTR): kind = ir.CV_FROM_RAWPTR
+    else if ty == rp && vr != NONE && (w.t.tag[vr] == types.T_PTR || w.t.tag[vr] == types.T_FUNC): kind = ir.CV_TO_RAWPTR
+    else:
+        string8 help = ""
+        string8 why = ""
+        cstring_help(w, v.ty, ty, &help, &why)
+        if drops_ro(w, v.ty, ty):
+            string8 unit = "char8" if w.t.resolve(run_shape(w, ty).elem) == u32(types.P_CHAR8) else "u8"
+            help = index.hold(#format("convert to the read-only window: `type Ro: []const ", unit, "` beside the function, then `Ro(b)`"))
+            why = index.hold(#format(shown(w, v.ty), " is a read-only window, and a view conversion keeps what it promises: the result is `[]const ", unit, "`, the same bytes under the other unit's name. Dropping the `const` would write through a window that promised to only read"))
+        if vr == rp && (w.t.quals(v.ty) & 1) != 0 && r != NONE && w.t.tag[r] == types.T_PTR:
+            string8 wr = src(w, b, vn)
+            syntax.Ast ta = tree(w, b)
+            help = index.hold(#format("drop the `const` where it can be seen: `", src(w, b, ta.list(ta.b[n])[0]), "(rawptr(", wr, "))`"))
+            why = index.hold(#format("`const` is what is in the way: `", wr, "` is a `const rawptr`, C's `const void *`, and only a plain `rawptr` converts to a typed pointer, because the result could be written through. Write through the result only if the memory is the program's to write (a `qsort` comparator's is not)"))
+        if lends(w, v.ty, ty):
+            string8 to = shown(w, w.t.resolve(ty))
+            help = index.hold(#format("bind it and the lend happens: `", to, " v = <the value>`, then use `v`"))
+            why = index.hold(#format(shown(w, v.ty), " **lends** ", to, ", so this crossing needs no conversion at all. A lend only gives up authority, goes one way, and asserts nothing a compiler could check; that is why it is spelled by binding and not by a written conversion"))
+        err(w, b, vn, 504, index.hold(#format("a conversion changes a `distinct` tag or a numeric width; ", shown(w, v.ty), " and ", shown(w, ty), " are neither")), help, why)
+        return bad()
+    if kind == ir.CV_FLOAT_INT && w.t.tag[under(&w.t, ty)] == types.T_PRIM:
+        u32 c = folded(w, b, at0, v.opd)
+        if c != NONE && w.k.kind[c] == types.C_FLOAT: return saturate(w, b, n, fval(w.k.w0[c]), float_bits(w, v.ty) == 32, ty)
+    u32 t = temp(w, b, ty, n)
+    _ = ir.op(&b.f, ir.O_CONV, kind, ty, n, t, v.opd)
+    return value(t, ty)
+
+// A byte window conversion that would drop its elements' `const`.
+private bool drops_ro(^World w, u32 from, u32 to):
+    Run f = run_shape(w, from)
+    Run t = run_shape(w, to)
+    if f.kind != RK_SLICE && f.kind != RK_REF || t.kind != RK_SLICE: return false
+    return (w.t.quals(f.elem) & 1) != 0 && (w.t.quals(t.elem) & 1) == 0
+
+// R9.1: a float to integer conversion that folds, saturated as at run time;
+// WRN0527 when that moved the value.
+private Val saturate(^World w, ^Body b, u32 n, f64 v, bool single, u32 ty):
+    f64 x = f64(f32(v)) if single else v
+    u8 q = u8(w.t.a[under(&w.t, ty)])
+    u8 p = types.PRIM[q].canon
+    u8 bits = types.integer_bits(p)
+    bool sg = types.is_signed(p)
+    f64 top = 1.0
+    for _ in 0..<(bits - 1 if sg else bits):
+        top = top * 2.0
+    f64 low = 0.0 - top if sg else 0.0
+    i64 lo = -i64((u64(1) << u64(bits - 1)) - 1) - 1 if sg else 0
+    u64 hi = (u64(1) << u64(bits - 1)) - 1 if sg else (0xFFFFFFFFFFFFFFFF if bits == 64 else (u64(1) << u64(bits)) - 1)
+    string8 his = index.hold(#format(i64(hi))) if sg else index.hold(#format(hi))
+    string8 ans = ""
+    u64 r = 0
+    if x != x:
+        ans = "0"
+    else if x < low && (x <= low - 1.0 || bits == 64):
+        ans = index.hold(#format(lo))
+        r = u64(lo)
+    else if x >= top:
+        ans = his
+        r = hi
+    else:
+        r = u64(i64(x)) if sg || x < 0.0 else u64(x)
+    if #len(ans) > 0:
+        string8 why = "NaN converts to 0" if x != x else index.hold(#format("a value past the end of the range converts to that end, ", ans))
+        err(w, b, n, diag.WRN + 527, index.hold(#format("this converts ", "NaN" if x != x else debug_f64(x), " to `", types.PRIM[q].name, "`, which holds ", lo, "..=", his, ", so it saturates to ", ans)), index.hold(#format("write ", ans, " if that is what is meant, or clamp the value into range before converting it")), index.hold(#format("A float becoming an integer saturates — ", why, " — so this is ", ans, " at compile time, as it would be at run time")))
+    bool neg = sg && i64(r) < 0
+    return value(ir.konst(w.k.int(&w.t, r, -1 if neg else 0)), ty)
+
+// `x` as Rust's `{:?}` writes it: the shortest digits, `1e30`, `-1.0`.
+string8 debug_f64(f64 x):
+    [40]char8 d
+    i32 n = fmt.render_float_shortest(x, d[:])
+    ref []char8 o
+    i64 i = 0
+    for i < i64(n):
+        char8 c = d[i]
+        i += 1
+        if c == 'e':
+            o = #append(o, c)
+            if i < i64(n) && d[i] == '+': i += 1
+            else if i < i64(n) && d[i] == '-':
+                o = #append(o, '-')
+                i += 1
+            for i < i64(n) - 1 && d[i] == '0':
+                i += 1
+            continue
+        o = #append(o, c)
+    return index.hold(o)
+
+// A `[]char8` or `[]u8`: what text and byte runs retag to.
+private bool bytes_view(^World w, u32 ty):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || w.t.tag[r] != types.T_SLICE: return false
+    u32 e = w.t.resolve(w.t.a[r])
+    return e == u32(types.P_CHAR8) || e == u32(types.P_U8)
+
+// Method `name` of type `ty` (through a pointer), or NONE; `at` is the slot
+// an embedded type's method starts at, NONE for the type's own.
+u32 method(^World w, u32 ty, u32 name, ^u32 at):
+    u32 m = methods_of(w, ty, name, at)
+    if m != NONE: return m
+    u32 r = w.t.resolve(ty)
+    if r != NONE && w.t.tag[r] == types.T_PTR: return methods_of(w, w.t.a[r], name, at)
+    return NONE
+
+// Whether method `m` is private to a package or file this body is not in.
+private bool hidden(^World w, ^Body b, u32 m):
+    u32 v = w.p.files[w.decls[m].file].a.a[w.decls[m].node] & syntax.F_VIS
+    if v == syntax.VIS_FILE: return w.decls[m].file != b.file
+    return v == syntax.VIS_PACKAGE && w.decls[m].pkg != w.p.files[b.file].pkg
+
+private u32 methods_of(^World w, u32 ty, u32 name, ^u32 at):
+    u32 t = w.t.bare(ty)
+    if !(t in w.type_decl): return NONE
+    try u32 d = w.type_decl[t] else: return NONE
+    u64 key = (u64(d) << 32) | u64(name)
+    if key in w.methods:
+        try u32 m = w.methods[key] else: return NONE
+        return m
+    for e in w.embeds:
+        if e.outer != t: continue
+        u32 inner = NONE
+        u32 m = method(w, e.inner, name, &inner)
+        if m != NONE:
+            at^ = e.at
+            return m
+    return NONE
+
+// `x.m(args)`: the receiver is `x`, or `&x` for a `^self` method (a place);
+// a promoted method's receiver is the embedded slots.
+private Val method_call(^World w, ^Body b, u32 n, u32 cn, Val base, u32 m, u32 at):
+    syntax.Ast a = tree(w, b)
+    syntax.Ast ma = w.p.files[w.decls[m].file].a
+    u32 rc = ma.list(ma.b[w.decls[m].node])[3]
+    u32 env = env_of(w, base.ty)
+    u32 fty = sig(w, m, env)
+    if fty == NONE: return bad()
+    if rc == NONE: return direct(w, b, n, m, bad(), env)
+    string8 mn = name_of(w, w.decls[m].name)
+    u32 self_ = w.decls[w.decls[m].block].ty if env == NONE else sig(w, w.decls[m].block, env)
+    u32 bn = a.a[cn]
+    Val recv = base
+    u32 br = w.t.resolve(base.ty)
+    bool through = br != NONE && w.t.tag[br] == types.T_PTR
+    // A declaration over one pointer slot is the receiver itself.
+    u32 bt = w.t.bare(base.ty)
+    if through && bt in w.type_decl:
+        try u32 own = w.type_decl[bt] else: return bad()
+        if own == w.decls[m].block: through = false
+    if ma.a[rc] == 1:
+        u32 rp = base.ty if through else w.t.ptr_of(base.ty)
+        if (w.t.quals(w.t.a[w.t.resolve(rp)]) & 1) != 0:
+            err(w, b, bn, 504, index.hold(#format("the receiver is ", shown(w, w.t.ptr_of(self_)), ", and this is ", shown(w, rp))))
+            return bad()
+        if through: return direct(w, b, n, m, base, env)
+        if at != NONE:
+            string8 sn = named(w, self_)
+            string8 on = named(w, base.ty)
+            err_tok(w, b, cn, 606, index.hold(#format("`", mn, "` takes `^self`, and `", on, "` embeds `", sn, "` by splicing its slots in, so there is no `", sn, "` inside a `", on, "` for `^self` to point at")), index.hold(#format("hold `", sn, "` as a named member (`", sn, " inner`) and call `v.inner.", mn, "(…)`, or write a `^self` method in `", on, "` that does the write")))
+            return bad()
+        if ir.is_const(base.opd) || (b.f.root[base.opd] & ir.ROOT_GLOBAL) == 0 && (b.f.slot_flags[b.f.root[base.opd]] & ir.S_TEMP) != 0:
+            string8 sn = named(w, self_)
+            string8 em = embedded(w, b, bn)
+            if em != "":
+                err(w, b, bn, 606, index.hold(#format("`", mn, "` takes `^self`, a pointer to ", em, ", and there is no `", spell(w, b, bn), "` object there to point at", "\x1fEmbedding splices the slots of `Person` into `Badge` at positions of its own, laid out as its members; the member is read and written whole by copying those slots")), embedded_help(w, b, bn))
+                return bad()
+            string8 help = ""
+            if a.tag[bn] == syntax.E_COND:
+                []u32 cs = a.list(a.b[bn])
+                help = index.hold(#format("call it in each branch, on the place each names: `", src(w, b, cs[0]), ".", mn, "(…)` where `", src(w, b, cs[1]), "` holds and `", src(w, b, cs[2]), ".", mn, "(…)` where it does not — a conditional's value is a temporary, and the write would be lost with it"))
+            else:
+                ref []char8 low
+                for i in 0..<#len(sn):
+                    low = #append(low, char8(u8(sn[i]) + 32) if i == 0 && sn[i] >= 'A' && sn[i] <= 'Z' else sn[i])
+                string8 fresh = index.hold(low)
+                for find_local(w, b, w.p.names.intern(fresh), false) != NONE:
+                    fresh = index.hold(#format(fresh, "2"))
+                help = index.hold(#format("bind it first: `", sn, " ", fresh, " = ", src(w, b, bn), "`, then `", fresh, ".", mn, "(…)`"))
+            err(w, b, bn, 606, index.hold(#format("`", src(w, b, bn), "` is a value with no place, and `", mn, "` takes `^self` — a pointer to where the receiver is stored, which a temporary or a constant does not have")), help)
+            return bad()
+        if in_copied_self(w, b, base.opd):
+            err(w, b, bn, 615, index.hold(#format("`", mn, "` takes `^self`, so calling it on `self` writes `self`, ", COPY_LOST(w, b))), self_help(w, b))
+            return bad()
+        u32 r = b.f.root[base.opd]
+        if (r & ir.ROOT_GLOBAL) == 0: b.f.slot_flags[r] = b.f.slot_flags[r] | ir.S_ADDR_TAKEN
+        u32 pt = w.t.ptr_of(self_)
+        u32 t = temp(w, b, pt, bn)
+        _ = ir.op(&b.f, ir.O_ADDR, 0, pt, bn, t, base.opd)
+        return direct(w, b, n, m, value(t, pt), env)
+    if through: recv = value(ir.step(&b.f, spill(w, b, base, bn), ir.ST_DEREF, 0, w.t.a[br]), w.t.a[br])
+    if at != NONE:
+        u32 p = spill(w, b, recv, bn)
+        []u32 all = w.t.slots(recv.ty)
+        []u32 sl = w.t.slots(self_)
+        ref []u32 opds
+        for i in 0..<#len(sl):
+            opds = #append(opds, ir.step(&b.f, p, ir.ST_FIELD, at + u32(i), all[at + u32(i)]))
+        u32 t = temp(w, b, self_, bn)
+        _ = ir.op(&b.f, ir.O_MAKE, 0, self_, bn, t, NONE)
+        for x in opds:
+            ir.arg(&b.f, x)
+        recv = value(t, self_)
+    return direct(w, b, n, m, recv, env)
+
+// `T(a, b)`, `T(x: a, y: b)`: one value per slot; `T()` is `T t`'s value.
+private Val construct(^World w, ^Body b, u32 n, u32 ty):
+    syntax.Ast a = tree(w, b)
+    []u32 args = call_args(w, b, n)
+    if #len(args) == 0: return konst_val(w, b, zero(w, ty) & ~ir.OPD_CONST, ty, n)
+    u32 one = one_row(&w.t, ty)
+    if one != NONE && w.t.tag[w.t.bare(w.t.body[one])] != types.T_NAMED:
+        Val v = construct(w, b, n, w.t.body[one])
+        return v if v.ty == NONE else coerce(w, b, v, ty, n)
+    u32 r = w.t.resolve(ty)
+    if r == NONE: return bad()
+    u32 nt = ty
+    bool tag_named = w.t.tag[r] == types.T_DISTINCT && #len(args) > 1 && under(&w.t, ty) != NONE && w.t.tag[under(&w.t, ty)] == types.T_TUPLE
+    if tag_named:
+        nt = w.t.b[r]
+        r = under(&w.t, ty)
+    []u32 slots = w.t.list(r) if w.t.tag[r] == types.T_TUPLE else w.t.ids.get(r)
+    string8 sp = src(w, b, a.list(a.b[n])[0])
+    ref []string8 names
+    for x in w.t.slot_names(nt):
+        if x == NONE: continue
+        string8 xt = w.t.text(x)
+        if #len(xt) > 0: names = #append(names, xt)
+    if #len(names) != #len(slots): #truncate(names, 0)
+    ref []char8 help
+    ref []char8 listed
+    put_all(&help, "pass one value per slot, in order: `", sp, "(")
+    for k in 0..<#len(slots):
+        if k > 0: put_all(&help, ", ", "", "")
+        string8 nk = "…"
+        if #len(names) > 0: nk = names[k]
+        put_all(&help, nk, "", "")
+        if #len(names) > 0: put_all(&listed, ", " if k > 0 else "", "`", index.hold(#format(names[k], "`")))
+    put_all(&help, ")`", "", "")
+    if #len(names) > 0:
+        put_all(&help, ", or name them: `", sp, "(")
+        for k in 0..<#len(slots):
+            put_all(&help, ", " if k > 0 else "", names[k], ": …")
+        put_all(&help, ")`", "", "")
+    else: put_all(&listed, shown(w, ty), "", "")
+    string8 hs = index.hold(help)
+    if #len(args) == 1 && (a.tag[args[0]] != syntax.E_ARG || a.main[args[0]] == NONE):
+        u32 vn = arg_value(w, b, args[0])
+        Val v = expr(w, b, vn, r)
+        if v.ty == NONE: return v
+        if v.kind == V_VAL && w.t.resolve(v.ty) == r && v.ty != ty && (is_fstruct(&w.t, v.ty) || is_fstruct(&w.t, ty)): return coerce(w, b, v, ty, vn)
+        if v.kind == V_VAL && w.t.resolve(v.ty) == r: return value(spill(w, b, v, vn), ty)
+        if v.kind == V_VAL && tagged(w, v.ty) && under(&w.t, v.ty) == r: return value(spill(w, b, v, vn), ty)
+        if w.t.tag[r] != types.T_TUPLE: return coerce(w, b, v, ty, vn)
+        if v.kind == V_LIT || v.kind == V_FLIT: v = finish(w, b, v, vn)
+        ref []char8 h1
+        put_all(&h1, "`", sp, index.hold(#format("` has ", #len(slots), " slots: build it from one value per slot, `", sp, "(")))
+        for k in 0..<#len(slots):
+            string8 nk = "…"
+            if #len(names) > 0: nk = names[k]
+            put_all(&h1, ", " if k > 0 else "", nk, "")
+        put_all(&h1, ")`", "", "")
+        // A script shows a Dado declaration as its view, spelled as it writes it.
+        string8 tsh = shown(w, ty)
+        if b.ds: tsh = shown(w, s_sview(w, ty))
+        err(w, b, vn, 504, index.hold(#format("a conversion changes a `distinct` tag or a numeric width; ", shown(w, v.ty), " and ", tsh, " are neither")), index.hold(h1))
+        return bad()
+    i64 named = 0
+    for g in args:
+        if a.tag[g] == syntax.E_ARG && a.main[g] != NONE: named += 1
+    if named > 0 && !b.named:
+        b.named = true
+        b.named_at = n
+    if named > 0 && in_const_init(w, b): return bad()
+    ref []i64 order
+    for _ in slots:
+        order = #append(order, -1)
+    if named == 0 && #len(args) != #len(slots):
+        err(w, b, n, 601, index.hold(#format("`", sp, "` has ", #len(slots), " slots, ", listed, ", and this passes ", #len(args), ": a type is built from one value per slot")), hs)
+        return bad()
+    if named > 0 && named < #len(args):
+        err(w, b, n, 604, "a call is either all positional or all named; mixing them makes a positional argument's slot depend on the names beside it", hs)
+        return bad()
+    bool by_axis = named > 0 && #len(names) == 0 && #len(slots) >= 2
+    for g in args:
+        if !by_axis || a.tag[g] != syntax.E_ARG || a.main[g] == NONE: continue
+        string8 an = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]
+        if #len(an) != 1 || axis_of(an[0]) < 0 || axis_of(an[0]) >= #len(slots): by_axis = false
+    if named > 0 && #len(names) == 0 && !by_axis:
+        for g in args:
+            if a.tag[g] == syntax.E_ARG && a.main[g] != NONE:
+                err_tok(w, b, g, 602, index.hold(#format("`", sp, "`'s slots have no names to fill, so a construction passes them in order")), hs)
+                return bad()
+    bool ok = true
+    for i in 0..<#len(args):
+        if named == 0:
+            order[i] = i
+            continue
+        u32 g = args[i]
+        string8 nm = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]
+        i64 at = axis_of(nm[0]) if by_axis else -1
+        for j in 0..<#len(names):
+            if names[j] == nm: at = j
+        if at < 0:
+            string8 near = nearest(nm, names)
+            string8 h = index.hold(#format("did you mean `", near, "`?")) if #len(near) > 0 else hs
+            err_tok(w, b, g, 602, index.hold(#format("`", nm, "` names no slot of `", sp, "`, whose slots are ", listed)), h)
+            ok = false
+        else if order[at] >= 0:
+            err_tok(w, b, g, 603, index.hold(#format("slot `", nm, "` of `", sp, "` is already filled")))
+            ok = false
+        else: order[at] = i
+    if !ok: return bad()
+    ref []char8 miss
+    for k in 0..<#len(slots):
+        if order[k] < 0: put_all(&miss, ", " if #len(miss) > 0 else "", "`", index.hold(#format(names[k], "`")))
+    if #len(miss) > 0:
+        err(w, b, n, 601, index.hold(#format("`", sp, "` has ", #len(slots), " slots, ", listed, ", and this leaves ", miss, " empty: a type is built from one value per slot")), hs)
+        return bad()
+    ref []u32 opds
+    for k in 0..<#len(slots):
+        u32 vn = arg_value(w, b, args[order[k]])
+        string8 site = index.hold(#format("slot ", k, " of `", sp, "` is"))
+        if #len(names) > 0: site = index.hold(#format("slot `", names[k], "` of `", sp, "` is"))
+        Val v = coerce(w, b, expr(w, b, vn, slots[k]), slots[k], vn, site)
+        if v.ty == NONE: ok = false
+        opds = #append(opds, v.opd)
+    if !ok: return bad()
+    u32 t = temp(w, b, ty, n)
+    _ = ir.op(&b.f, ir.O_MAKE, 0, ty, n, t, NONE)
+    for x in opds:
+        ir.arg(&b.f, x)
+    return value(t, ty)
+
+private void put_all(^ref []char8 o, string8 x, string8 y, string8 z):
+    for c in x:
+        o^ = #append(o^, c)
+    for c in y:
+        o^ = #append(o^, c)
+    for c in z:
+        o^ = #append(o^, c)
+
+// Placing: each parameter's argument node (NONE: unfilled), splats spread;
+// `recv` (when its type is set) fills the receiver slot first.
+private Val direct(^World w, ^Body b, u32 n, u32 d, Val recv, u32 env = NONE):
+    if env == NONE && templated(w, d): return generic(w, b, n, d)
+    []u32 args = call_args(w, b, n)
+    syntax.Ast a = tree(w, b)
+    syntax.Ast ca = w.p.files[w.decls[d].file].a
+    []u32 ps = params(w, d)
+    u32 fty = sig(w, d, env)
+    if fty == NONE:
+        for g in args:
+            _ = expr(w, b, arg_value(w, b, g), NONE)
+        return bad()
+    []u32 all = w.t.params(fty)
+    // ERR1033: a spawn on an unthreaded web build.
+    // Said once the live set is known (analysis `web_spawns`, Rust's `web_spawn_refusals`).
+    if w.os == "WEB" && !w.web_threads && w.p.pkgs[w.decls[d].pkg].key == "core:threads" && name_of(w, w.decls[d].name) == "spawn": w.spawns = #append(w.spawns, Spawn(b.decl, b.file, b.base, tree(w, b).lo[n], tree(w, b).hi[n]))
+    // `T.m(x, …)`: the first argument is the receiver.
+    if recv.ty == NONE && w.decls[d].kind == K_METHOD && ca.list(ca.b[w.decls[d].node])[3] != NONE && #len(args) > 0 && #len(all) > 0:
+        recv = expr(w, b, arg_value(w, b, args[0]), all[0])
+        if recv.ty == NONE: return bad()
+        args = args[1..<#len(args)]
+    i64 off = 1 if recv.ty != NONE else 0
+    if off == 1: recv = coerce(w, b, recv, all[0], n)
+    if off == 1 && recv.ty == NONE: return bad()
+    []u32 pts = all[off..<#len(all)]
+    string8 fname = name_of(w, w.decls[d].name)
+    if w.decls[d].kind == K_METHOD: fname = index.hold(#format(name_of(w, w.decls[w.decls[d].block].name), ".", fname))
+    bool pack = #len(ps) > 0 && ca.tag[ps[#len(ps) - 1]] == syntax.N_PARAM_V
+    bool homog = pack && ca.tag[ca.a[ps[#len(ps) - 1]]] != syntax.T_PACK
+    u32 elem = NONE
+    if homog && #len(pts) > 0 && pts[#len(pts) - 1] != NONE: elem = w.t.a[w.t.resolve(pts[#len(pts) - 1])]
+    i64 fixed = #len(ps) - 1 if pack else #len(ps)
+    bool cvar = w.decls[d].kind == K_FFN && (ca.a[w.decls[d].node] & syntax.F_CVAR) != 0
+    bool named = false
+    bool positional = false
+    for g in args:
+        if a.tag[g] == syntax.E_ARG && a.main[g] != NONE: named = true
+        else: positional = true
+    if named && positional:
+        ref []char8 h
+        h = #append(h, ..#format("name every argument: `", fname, "("))
+        i64 k = 0
+        for g in args:
+            if k > 0: h = #append(h, ..", ")
+            if k < #len(ps): h = #append(h, ..w.p.spell(w.decls[d].file, ps[k]))
+            h = #append(h, ..": ")
+            syntax.Ast aa = tree(w, b)
+            u32 v = arg_value(w, b, g)
+            h = #append(h, ..w.p.files[b.file].src[i64(aa.lo[v])..<i64(aa.hi[v])])
+            k += 1
+        h = #append(h, ..")`")
+        err(w, b, n, 604, "a call is either all positional or all named; mixing them makes a positional argument's slot depend on the names beside it", index.hold(h))
+        return bad()
+    // Values in parameter order: opds, with their types.
+    ref []u32 filled
+    for _ in 0..<fixed:
+        filled = #append(filled, NONE)
+    ref []Val vals
+    for _ in 0..<fixed:
+        vals = #append(vals, bad())
+    ref []Val packed
+    i64 count = 0
+    bool ok = true
+    for g in args:
+        u32 vn = arg_value(w, b, g)
+        if a.tag[vn] == syntax.E_SPLAT:
+            if a.tag[g] == syntax.E_ARG && a.main[g] != NONE:
+                err(w, b, vn, 605, "`..` fills positions, so it cannot be given a name")
+                ok = false
+                continue
+            u32 sx = a.a[vn]
+            if a.tag[sx] == syntax.E_CALL && a.tag[a.list(a.b[sx])[0]] == syntax.E_NAME && spell(w, b, a.list(a.b[sx])[0]) == "#slots":
+                // `..#slots(v)` is `..v`.
+                []u32 sa = a.list(a.b[sx])
+                if #len(sa) != 3 || a.tag[sa[2]] == syntax.E_ARG && a.main[sa[2]] != NONE || a.tag[arg_value(w, b, sa[2])] == syntax.E_SPLAT:
+                    err(w, b, sx, 605, "`#slots` takes exactly one value, written without a name and not itself spliced, and names that value's slots: `f(..#slots(v))` is `f(..v)`")
+                    ok = false
+                    continue
+                sx = arg_value(w, b, sa[2])
+            Val v = expr(w, b, sx, NONE)
+            if v.ty != NONE && is_soa(w, v.ty):
+                err(w, b, vn, 605, index.hold(#format("`", shown(w, v.ty), "` is not a tuple of its elements (A5), so it has no slots to splice; a `#soa`'s slots are lanes, and one position of it is a value gathered out of every lane at once — pass `s[0]`, `s[1]`, … instead")))
+                ok = false
+                continue
+            if v.ty == NONE:
+                err(w, b, vn, 605, "`..` needs a value whose slots can be counted here; M6 types expressions and M5 knows only parameters, calls, tuples of those, and integer literals")
+                ok = false
+                continue
+            u8 rk = run_shape(w, v.ty).kind
+            if v.kind == V_LIT || v.kind == V_FLIT || v.kind == V_VAL && (tagged(w, v.ty) || matrix(w, v.ty) != NONE):
+                // A tagged value, or a literal scalar, splices as one slot.
+                if count < fixed:
+                    vals[count] = coerce(w, b, v, pts[count], vn, index.hold(#format("slot ", count, " of `", fname, "` is")))
+                    filled[count] = vn
+                else if pack: packed = #append(packed, v)
+                count += 1
+                continue
+            if v.kind == V_PACK:
+                []u32 pt = w.t.list(b.pack)
+                for j in 0..<#len(pt):
+                    Val e = value(ir.at(&b.f, b.pack_slot + u32(j)), pt[j])
+                    if count < fixed:
+                        vals[count] = coerce(w, b, e, pts[count], vn, index.hold(#format("slot ", count, " of `", fname, "` is")))
+                        filled[count] = vn
+                    else if pack: packed = #append(packed, e)
+                    count += 1
+                continue
+            if rk == RK_SLICE || rk == RK_REF || rk == RK_TEXT:
+                err(w, b, vn, 605, index.hold(#format("`", shown(w, v.ty), "` is not a tuple of its elements (A5), so it has no slots to splice; A4 counts argument slots as written, and how many elements a window has is not known until it runs — index or iterate it instead")))
+                ok = false
+                continue
+            u32 src = spill(w, b, v, vn)
+            []u32 sl = w.t.slots(v.ty)
+            for j in 0..<#len(sl):
+                Val e = value(ir.step(&b.f, src, ir.ST_FIELD, u32(j), sl[j]), sl[j])
+                if count < fixed && fs_row(w, sl[j]) != fs_row(w, pts[count]) && !fs_nominal(w, sl[j]) && !fs_nominal(w, pts[count]) && w.t.resolve(sl[j]) == w.t.resolve(pts[count]):
+                    // A spliced slot has nowhere for the crossing's rebuild.
+                    err(w, b, vn, 504, index.hold(#format("slot ", count, " of `", fname, "` is ", shown(w, pts[count]), ", and this is ", shown(w, sl[j]), ": one layout under two C spellings")), "bind the value first", "Crossing needs a slot-by-slot rebuild, which a splatted slot has nowhere to happen")
+                    ok = false
+                    count += 1
+                    continue
+                if count < fixed:
+                    vals[count] = coerce(w, b, e, pts[count], vn, index.hold(#format("slot ", count, " of `", fname, "` is")))
+                    filled[count] = vn
+                else if pack: packed = #append(packed, e)
+                count += 1
+            continue
+        i64 slot = count
+        if a.tag[g] == syntax.E_ARG && a.main[g] != NONE:
+            string8 nm = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[a.main[g]])..<i64(w.p.files[b.file].t.end[a.main[g]])]
+            slot = -1
+            for i in 0..<fixed:
+                if w.p.spell(w.decls[d].file, ps[i]) == nm && nm != "_": slot = i
+            if slot < 0 && pack && w.p.spell(w.decls[d].file, ps[#len(ps) - 1]) == nm:
+                err_tok(w, b, g, 206, index.hold(#format("`", nm, "` collects the rest of the argument list, so it is however many positions were written and not one slot a name can fill; write the pack's arguments positionally — a named call that leaves it out passes the empty window")))
+                _ = expr(w, b, vn, NONE)
+                ok = false
+                continue
+            if slot < 0:
+                err_tok(w, b, g, 602, index.hold(#format("`", nm, "` names no parameter of `", fname, "`")))
+                ok = false
+                continue
+            if filled[slot] != NONE:
+                err_tok(w, b, g, 603, index.hold(#format("slot ", slot, " of `", fname, "` is already filled")))
+                ok = false
+                continue
+        count += 1
+        if slot >= fixed:
+            if homog:
+                Val v = coerce(w, b, expr(w, b, vn, elem), elem, vn, index.hold(#format("one element of `", fname, "`'s `..` pack is")))
+                packed = #append(packed, v)
+            else if pack || cvar:
+                Val v = expr(w, b, vn, NONE)
+                if v.kind == V_FN: v = fn_value(w, b, v, vn)
+                v = finish(w, b, v, vn)
+                // Read here, before later arguments' calls (a global, before the call's).
+                if v.ty != NONE && v.kind == V_VAL && !ir.is_const(v.opd): v = pinned(w, b, v, NONE if (b.f.root[v.opd] & ir.ROOT_GLOBAL) != 0 else calls_after(w, b, args, g), vn)
+                if cvar && v.ty != NONE && ir.is_const(v.opd):
+                    u32 t = temp(w, b, v.ty, vn)
+                    _ = ir.op(&b.f, ir.O_SET, 0, v.ty, vn, t, v.opd)
+                    v = value(t, v.ty)
+                packed = #append(packed, v)
+            else:
+                _ = expr(w, b, vn, NONE)
+            continue
+        Val v = expr(w, b, vn, pts[slot])
+        if v.kind == V_FN: v = fn_value(w, b, v, vn)
+        vals[slot] = coerce(w, b, v, pts[slot], vn, index.hold(#format("slot ", slot, " of `", fname, "` is")))
+        u32 la = calls_after(w, b, args, g)
+        if la != NONE && vals[slot].ty != NONE: vals[slot] = pinned(w, b, vals[slot], la, vn)
+        filled[slot] = vn
+    i64 defaults = 0
+    for i in 0..<fixed:
+        if !ok || filled[i] != NONE || i < count && !named || ca.b[ps[i]] == NONE: continue
+        // `#location()` is the call's place, not the default's.
+        if location_default(w, w.decls[d].file, ca.b[ps[i]]):
+            vals[i] = coerce(w, b, caller_place(w, b, n), pts[i], n)
+            filled[i] = ca.b[ps[i]]
+            defaults += 1
+            continue
+        u32 bf = b.file
+        u32 bb = b.base
+        b.file = w.decls[d].file
+        b.base = 0
+        i64 from = #len(b.f.op)
+        Val v = expr(w, b, ca.b[ps[i]], pts[i])
+        vals[i] = coerce(w, b, v, pts[i], ca.b[ps[i]])
+        b.file = bf
+        b.base = bb
+        // The default's ops are this body's: at the call, not at a node of the callee's file.
+        for k in from..<#len(b.f.op):
+            b.f.node[k] = n
+        filled[i] = ca.b[ps[i]]
+        defaults += 1
+    i64 given = count + defaults if !named else 0
+    if named:
+        for x in filled:
+            if x != NONE: given += 1
+    if ok && pack && given < fixed:
+        err(w, b, n, 601, index.hold(#format("`", fname, "` writes ", fixed, " slot(s) before its `..` pack and this argument list fills ", count, "; the pack takes what is left over, including nothing, but the slots in front of it are still written")))
+        return bad()
+    if ok && (given < fixed || (!pack && !cvar && count > fixed)):
+        err(w, b, n, 601, index.hold(#format("`", fname, "` names ", fixed, " slot(s) and this argument list fills ", count, "; an argument list is counted as written (A4), so a tuple argument is one slot until `..` splices it")))
+        return bad()
+    for v in vals:
+        if v.ty == NONE: ok = false
+    for v in packed:
+        if v.ty == NONE: ok = false
+    if !ok: return bad()
+    u32 ptup = NONE
+    if homog:
+        w.pcalls = #append(w.pcalls, (u64(d) << 32) | u64(#len(packed)))
+        w.pcall_at = #append(w.pcall_at, (u64(b.file) << 32) | u64(n))
+        vals = #append(vals, run_of(w, b, n, elem, packed))
+        #truncate(packed, 0)
+    else if pack:
+        ref []u32 tys
+        for v in packed:
+            tys = #append(tys, v.ty)
+        ptup = w.t.tuple(tys)
+    if pack && !homog && fixed + #len(packed) > 127:
+        if !(d in w.capped):
+            w.capped[d] = 1
+            err(w, b, n, 904, index.hold(#format("this call would instantiate `", fname, "` with ", fixed + #len(packed), " parameters, and 127 is the most one C function definition is guaranteed to take")), "pass the elements as one slice, `[]T`, rather than as a pack, or stop the recursion growing the pack")
+        return bad()
+    w.ask_f = b.file
+    w.ask_at = a.lo[n]
+    w.ask_depth = 0
+    u32 cname = c_name(w, d) if w.decls[d].kind == K_FFN else job(w, d, env if env != NONE else ptup)
+    return emit_call(w, b, n, d, fty, cname, recv if off == 1 else bad(), vals, packed)
+
+// A `[]e` over values `vs`, in storage of the caller's: what a `..T`
+// parameter is handed.
+private Val run_of(^World w, ^Body b, u32 n, u32 e, []Val vs):
+    u32 st = w.t.slice_of(e)
+    if #len(vs) == 0:
+        u32 z = temp(w, b, st, n)
+        _ = ir.op(&b.f, ir.O_SET, 0, st, n, z, zero(w, st))
+        return value(z, st)
+    ref []u32 tys
+    for _ in vs:
+        tys = #append(tys, e)
+    u32 ty = e if #len(vs) == 1 else w.t.tuple(tys)
+    u32 t = temp(w, b, ty, n)
+    if #len(vs) == 1: _ = ir.op(&b.f, ir.O_SET, 0, ty, n, t, vs[0].opd)
+    else:
+        _ = ir.op(&b.f, ir.O_MAKE, 0, ty, n, t, NONE)
+        for v in vs:
+            ir.arg(&b.f, v.opd)
+    u32 r = b.f.root[t]
+    if #len(vs) == 1: b.f.slot_flags[r] = b.f.slot_flags[r] | ir.S_ADDR_TAKEN
+    u32 x = temp(w, b, st, n)
+    _ = ir.op(&b.f, ir.O_VIEW, 0, st, n, x, t, NONE, NONE)
+    if #len(vs) == 1: ir.arg(&b.f, ir.konst(w.k.small(&w.t, 1)))
+    return value(x, st)
+
+// A call through a function value: positional arguments, one per parameter.
+Val indirect(^World w, ^Body b, u32 n, Val c):
+    syntax.Ast a = tree(w, b)
+    []u32 args = call_args(w, b, n)
+    u32 fty = w.t.resolve(c.ty)
+    []u32 pts = w.t.params(fty)
+    string8 fname = src(w, b, a.list(a.b[n])[0])
+    ref []u32 opds
+    bool ok = true
+    for i in 0..<#len(args):
+        u32 g = args[i]
+        u32 vn = arg_value(w, b, g)
+        if a.tag[g] == syntax.E_ARG && a.main[g] != NONE:
+            err_tok(w, b, g, 602, index.hold(#format("`", spell(w, b, g), "` names no parameter of `", fname, "`")))
+            return bad()
+        if a.tag[vn] == syntax.E_SPLAT:
+            err(w, b, g, 1, "this argument is outside the slice the port builds so far")
+            return bad()
+        if i >= #len(pts):
+            _ = expr(w, b, vn, NONE)
+            continue
+        Val v = coerce(w, b, expr(w, b, vn, pts[i]), pts[i], vn, index.hold(#format("slot ", i, " of `", fname, "` is")))
+        if v.ty == NONE: ok = false
+        opds = #append(opds, v.opd)
+    if ok && #len(args) != #len(pts):
+        err(w, b, n, 601, index.hold(#format("`", fname, "` names ", #len(pts), " slot(s) and this argument list fills ", #len(args), "; an argument list is counted as written (A4), so a tuple argument is one slot until `..` splices it")))
+        return bad()
+    if !ok: return bad()
+    u32 p = spill(w, b, c, n)
+    u32 ret = w.t.a[fty]
+    bool void_ = ret == u32(types.P_VOID)
+    u32 dst = NONE if void_ else temp(w, b, ret, n)
+    u32 code = NONE if w.t.b[fty] == types.F_NONE else temp(w, b, code_type(w, fty), n)
+    _ = ir.op(&b.f, ir.O_CALL_INDIRECT, 0, ret, n, dst, p, NONE, code)
+    for x in opds:
+        ir.arg(&b.f, x)
+    if code != NONE && !failable_call(w, b, n, fname, code): return bad()
+    if void_: return Val(V_VAL, NONE, ret, NONE, 0, 0)
+    return value(dst, ret)
+
+// A `#` verb, by its row: arity from the table, then the verb's own rule.
+// `said` is the spelling written (a retired one is checked as its verb).
+private Val builtin_call(^World w, ^Body b, u32 n, string8 s, string8 said):
+    []u32 args = call_args(w, b, n)
+    if math_row(s) >= 0: return math_(w, b, n, math_row(s))
+    if s == "#names" && #len(args) == 1 && !b.ds: return names_call(w, b, n)
+    if s == "#shader_load" && !b.ds: return shader_load(w, b, n)
+    if s == "#static_assert" && !b.ds:
+        syntax.Ast sa = tree(w, b)
+        err(w, b, sa.list(sa.b[n])[0], 201, "`#static_assert` states an invariant of the **build**, so it is written at package level, outside every function", "move it to package level; a condition about values this function computes is an `#assert`, checked when the program runs", "It is folded before any function is checked")
+        return bad()
+    if s == "#copy_into" && !b.ds: return copy_into(w, b, n)
+    i64 row = builtin(s)
+    i64 rt = retired(s) if row < 0 else -1
+    if !b.ds && (s == "#default" || s == "#heap" || s == "#stack" || row < 0 && rt < 0 && s != "#script_load" && #len(s) > 1 && s[1] >= 'a' && s[1] <= 'z'):
+        syntax.Ast ba = tree(w, b)
+        u32 bcn = ba.list(ba.b[n])[0]
+        if row < 0 && rt < 0 && s != "#default" && s != "#heap" && s != "#stack": err(w, b, bcn, 405, index.hold(#format("`", s, "` is not a `#lower` name the compiler owns", "\x1fA `#lower` name would be a verb the compiler owns, and the compiler's `#lower` names are #default #stack #return #caller #heap #make #new #delete #resize #copy #format #len #size #alignof #assert #expect #breakpoint #transpose #render #append #reserve #cap #truncate #popcount #clz #ctz #bswap #add_fits #sub_fits #mul_fits #is_int #is_float #is_number #is_bool #is_char #is_string #is_slice #is_map #is_ref #is_pointer #has_eq #is_key #is_declared #mul_wide #panic #rotl #rotr #align_forward #atomic_load #atomic_store #atomic_exchange #atomic_compare_exchange #atomic_fetch_add #atomic_fetch_sub #atomic_fetch_and #atomic_fetch_or #atomic_fetch_xor #fence #soa #aos #no_bounds #slots #any #names #spell #static_assert #assert_raises #channel #send #peek #drain #shader_load #script_vm #script_run #script_new #script_stop #script_pause #script_resume #script_is_running #script_is_paused #script_pump #script_reload #script_error #trace #location #release. Nothing in the `#` namespace is reached by an import, so no `import` line makes this a function")), "call a function of the program's own, with no `#`, or one of the compiler's names, which `--explain` lists")
+        else: err(w, b, bcn, 405, index.hold(#format("`", s, "` is a name the compiler owns, and it is a **value** rather than a verb")), "write it where a value goes, not with arguments", "The compiler's `#lower` names that *are* called are the builtins, #make #new #delete #resize #copy #format #len #size #alignof #assert #expect #breakpoint #transpose #render #append #reserve #cap #truncate #popcount #clz #ctz #bswap #add_fits #sub_fits #mul_fits #LEN #mul_wide #panic #rotl #rotr #align_forward #atomic_load #atomic_store #atomic_exchange #atomic_compare_exchange #atomic_fetch_add #atomic_fetch_sub #atomic_fetch_and #atomic_fetch_or #atomic_fetch_xor #fence #names #spell #static_assert #assert_raises #channel #send #peek #drain #shader_load #script_vm #script_run #script_new #script_stop #script_pause #script_resume #script_is_running #script_is_paused #script_pump #script_reload #script_error #trace #location #release. Nothing in the `#` namespace is reached by an import, so no `import` line makes this a function")
+        return bad()
+    if rt >= 0 && RETIRED[rt].status == R_REFUSED && builtin(RETIRED[rt].replacement) >= 0:
+        string8 to = RETIRED[rt].replacement
+        err(w, b, n, 805, index.hold(#format("`", s, "` is a retired spelling and `", to, "` is what replaces it")), index.hold(#format("write `", to, "`")), RETIRED[rt].repair)
+        return builtin_call(w, b, n, index.hold(strings.clone(to)), index.hold(strings.clone(s)))
+    if s == "#script_load":
+        string8 cl = "Goblin"
+        if #len(args) > 0: cl = src(w, b, arg_value(w, b, args[0]))
+        err(w, b, n, 1210, "`#script_load` is retired: the engine is made explicitly, by `#script_vm`, and an instance in it by `#script_new` — which loads its class into the VM the first time", index.hold(#format("write `try VM vm = #script_vm()` — its allocator, `out:`, `err:` and `on_error:` go there — and then `try ", cl, " s = #script_new(vm, ", cl, ")`")))
+        h_rest(w, b, n, 1)
+        return bad()
+    u8 m = BUILTINS[row].meaning if row >= 0 else 255
+    if s == "#emit": m = B_SEND
+    if m == B_SEND || m == B_PEEK || m == B_DRAIN || m == B_RELEASE: return chan_call(w, b, n, m, said, false)
+    if m == B_SCRIPT_VM || m == B_SCRIPT_NEW || m == B_SCRIPT_RUN || m == B_SCRIPT_ERROR: return host_verb(w, b, n, m, said)
+    if m >= B_SCRIPT_STOP && m <= B_SCRIPT_RELOAD: return host_control(w, b, n, m)
+    if m == B_DELETE && #len(args) == 1 && !b.ds:
+        u32 hn = arg_value(w, b, args[0])
+        if tree(w, b).tag[hn] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, hn), false) != NONE:
+            u32 ht = b.f.slot_ty[find_local(w, b, w.p.sym(b.file, hn), false)]
+            if is_vm(w, ht) || s_class_of_ty(w, ht) != NONE: return host_delete(w, b, n, expr(w, b, hn, NONE), hn)
+        else if tree(w, b).tag[hn] == syntax.E_NAME:
+            u32 gd = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, hn))
+            if gd != NONE && w.decls[gd].kind == K_VAR:
+                u32 gt = resolve(w, gd)
+                if gt != NONE && (is_vm(w, gt) || s_class_of_ty(w, gt) != NONE): return host_delete(w, b, n, place(w, b, hn, true), hn)
+    if (m == B_LOCATION || m == B_TRACE) && !b.ds: return here_call(w, b, n, m)
+    if m == B_LEN || m == B_MAKE || m == B_APPEND || m == B_DELETE || m == B_TRUNCATE || m == B_RESIZE || m == B_COPY || m == B_RESERVE || m == B_CAP:
+        if m == B_RESIZE:
+            for g in args[1..<#len(args)]:
+                if rung(w, b, g) == 0: continue
+                string8 s = spell(w, b, arg_value(w, b, g))
+                err(w, b, arg_value(w, b, g), 807, index.hold(#format("`resize` grows or shrinks a block **where it already lives**, so it takes no allocator and there is nowhere to write `", s, "`")), index.hold(#format("drop `", s, "`; to move a block to another allocator, `copy` it there and `delete` the original")), "A rung answers *how long must this live*, and that was answered when the block was allocated — the reference carries the allocator that made it and `resize` uses that one, exactly as `delete` does. A rung — #stack, #default, #return, #caller, #heap — goes last on a verb that **creates** an allocation, where there is a lifetime still to pick")
+                return bad()
+        Builtin r = BUILTINS[row]
+        if #len(args) < i64(r.lo) || (r.hi != 255 && #len(args) > i64(r.hi)):
+            err(w, b, n, 601, arity_said(said, r, #len(args)))
+            return bad()
+        return growth(w, b, n, m)
+    if m == M_TYPE_SPELLING && #len(args) == 1:
+        u32 vn = arg_value(w, b, args[0])
+        u32 ty = NONE
+        if tree(w, b).tag[vn] == syntax.E_TYPE: ty = resolve_type(w, b.file, tree(w, b).a[vn])
+        else:
+            Val v = expr(w, b, vn, NONE)
+            if v.ty == NONE: return bad()
+            if v.kind != V_TYPE:
+                err(w, b, n, 1, "this builtin is outside the slice the port builds so far")
+                return bad()
+            ty = v.x
+        if ty == NONE: return bad()
+        return value(ir.konst(w.k.str(&w.t, shown(w, ty))), types.STRING8)
+    if m == B_FORMAT: return format_(w, b, n, said)
+    if m == B_TRANSPOSE: return transpose_(w, b, n, args, said)
+    if m == M_FOLDED_LENGTH && #len(args) == 1:
+        u32 vn = arg_value(w, b, args[0])
+        Val v = expr(w, b, vn, NONE)
+        if v.ty == NONE: return bad()
+        if v.kind == V_PACK:
+            []u32 pk = w.t.list(b.pack)
+            return Val(V_LIT, NONE, w.untyped, NONE, u64(#len(pk)), 0)
+        v = finish(w, b, v, vn)
+        Run k = run_shape(w, v.ty)
+        string8 why = ""
+        string8 shown_t = shown(w, v.ty)
+        string8 through = ""
+        if k.kind == RK_REF:
+            shown_t = index.hold(#format("[]", shown(w, k.elem)))
+            through = ", which is the view this reference lends"
+        if k.kind == RK_SLICE || k.kind == RK_REF: why = "a window's count is in the value, not in its type — it is settled when the window is taken, and nothing in `[]T` records it"
+        if k.kind == RK_TEXT: why = "a string's unit count is in the value, not in its type — a string is a pointer and a count, and the count is the second word"
+        if is_map(w, v.ty): why = "a map's count is in the value, not in its type — it changes as the table is filled, so no type could hold it"
+        if #len(why) > 0:
+            err(w, b, n, 916, index.hold(#format("`", said, "` asserts the length is in the **type**, and this is a `", shown_t, "`", through, ": ", why, ". Write `#len` instead, which asks the same question and reads the count where it lives; `", said, "` is for a fixed array, a tuple, a named shape or a matrix, where A5 makes the count part of the type")))
+            return bad()
+        if k.kind != RK_FIXED && k.kind != RK_ONE:
+            err(w, b, n, 1, "this builtin is outside the slice the port builds so far")
+            return bad()
+        if b.cwant == NONE && !b.flat: return value(ir.konst(w.k.small(&w.t, k.count)), u32(types.P_I32))
+        return Val(V_LIT, NONE, w.untyped, NONE, u64(k.count), 0)
+    if m == B_POPCOUNT || m == B_CLZ || m == B_CTZ || m == B_BSWAP || m == B_ROTL || m == B_ROTR:
+        Builtin r = BUILTINS[row]
+        if #len(args) < i64(r.lo) || #len(args) > i64(r.hi):
+            err(w, b, n, 601, arity_said(said, r, #len(args)))
+            return bad()
+        return bits_(w, b, n, m, said)
+    if m == B_MUL_WIDE:
+        Builtin r = BUILTINS[row]
+        if #len(args) != 2:
+            err(w, b, n, 601, arity_said(said, r, #len(args)))
+            return bad()
+        u32 i64t = u32(types.P_I64)
+        ref []u32 xs
+        bool ok = true
+        for g in args:
+            u32 vn = arg_value(w, b, g)
+            Val v = finish(w, b, expr(w, b, vn, i64t), vn)
+            if v.ty == NONE:
+                ok = false
+                continue
+            u8 p = int_prim(w, v.ty)
+            if p != types.P_I64:
+                string8 why = index.hold(#format("`", said, "` multiplies two 64-bit signed integers, because 64 bits is where this language runs out of room for a product and 128 is what two of them make. Nothing else has a wide product to ask for\x1epass two `i64`s"))
+                if p == types.P_U64: why = "This is the **signed** product, and the wide product of two `u64`s is a different function of the same bits — so answering both under one name would make the high half mean two things\x1econvert if the signed reading is the one wanted: `i64(n)` says so"
+                else if p != types.PRIMS && types.PRIM[p].kind != types.K_CHAR && types.integer_bits(p) < 64: why = "A product this narrow already fits a type the language has, so there is nothing for a second verb to answer: the 128-bit question only exists at the width where `*` runs out of room\x1ewiden the factors and multiply — `i64(a) * i64(b)` is exact"
+                err(w, b, vn, 504, index.hold(#format("`", said, "` multiplies two `i64`s; this is ", shown(w, v.ty), "\x1f", why)))
+                ok = false
+                continue
+            xs = #append(xs, spill(w, b, coerce(w, b, v, i64t, vn), vn))
+        if !ok: return bad()
+        [2]u32 ps = [i64t, u32(types.P_U64)]
+        u32 rt = w.t.tuple(ps[:])
+        u32 t = temp(w, b, rt, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MUL_WIDE, i64t, n, t, NONE)
+        for x in xs:
+            ir.arg(&b.f, x)
+        return value(t, rt)
+    if m == B_ADD_OVERFLOW || m == B_SUB_OVERFLOW || m == B_MUL_OVERFLOW:
+        Builtin r = BUILTINS[row]
+        if #len(args) != 2:
+            err(w, b, n, 601, arity_said(said, r, #len(args)))
+            return bad()
+        return fits_(w, b, n, m, said)
+    if m >= B_ATOMIC_LOAD && m <= B_FENCE:
+        Builtin r = BUILTINS[row]
+        if #len(args) < i64(r.lo) || #len(args) > i64(r.hi):
+            err(w, b, n, 601, arity_said(said, r, #len(args)))
+            return bad()
+        return atomic_(w, b, n, m, said)
+    if m == B_ALIGN_FORWARD && #len(args) == 2:
+        Val pv = finish(w, b, expr(w, b, arg_value(w, b, args[0]), NONE), args[0])
+        u32 at0 = ir.count(&b.f)
+        Val nv = coerce(w, b, expr(w, b, arg_value(w, b, args[1]), u32(types.P_U64)), u32(types.P_U64), arg_value(w, b, args[1]))
+        if pv.ty == NONE || nv.ty == NONE: return bad()
+        u32 nc = folded(w, b, at0, nv.opd)
+        if nc != NONE && w.k.kind[nc] == types.C_INT && (w.k.w0[nc] == 0 || (w.k.w0[nc] & (w.k.w0[nc] - 1)) != 0):
+            err(w, b, arg_value(w, b, args[1]), 816, index.hold(#format("`", said, "` rounds up with a mask, which is the alignment only when `n` is a power of two, and `", w.k.w0[nc], "` is not")), "align to a power of two — 1, 2, 4, 8, 16 and up", "The mask is `(p + (n - 1)) & ~(n - 1)`. The division that would be right for every `n` is a division on the hot path of every allocator this verb exists for, so the requirement is the rule rather than the lowering")
+            return bad()
+        u32 pt = w.t.resolve(pv.ty)
+        if pt != u32(types.P_RAWPTR):
+            err(w, b, arg_value(w, b, args[0]), 504, index.hold(#format("`", said, "` rounds up an untyped address, and its first argument is rawptr, and this is ", shown(w, pv.ty))))
+            return bad()
+        u32 px = spill(w, b, pv, n)
+        u32 t = temp(w, b, pv.ty, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_ALIGN_FORWARD, pv.ty, n, t, NONE)
+        ir.arg(&b.f, px)
+        ir.arg(&b.f, nv.opd)
+        return value(t, pv.ty)
+    if m == B_NEW:
+        Builtin r = BUILTINS[row]
+        if #len(args) < i64(r.lo) || #len(args) > i64(r.hi):
+            err(w, b, n, 601, arity_said(said, r, #len(args)))
+            return bad()
+        return new_(w, b, n)
+    if (m == B_SIZE || m == B_ALIGN_OF) && #len(args) == 1:
+        u32 vn = arg_value(w, b, args[0])
+        if tree(w, b).tag[vn] == syntax.E_UNARY && spell(w, b, vn) == "!":
+            err(w, b, vn, 504, "`size` takes a type or an **inert** place", "name the type, or bind the value first")
+            return bad()
+        if m == B_SIZE && runs_call(w, b, vn):
+            err(w, b, vn, 504, "`size` takes a type or an **inert** place\x1fIt answers from the type and never runs its operand, so a call here would be typed and then dropped without a word along with everything it did\x1ename the type, or bind the value first")
+            return bad()
+        u32 ty = NONE
+        if tree(w, b).tag[vn] == syntax.E_TYPE: ty = resolve_type(w, b.file, tree(w, b).a[vn])
+        else:
+            Val v = expr(w, b, vn, NONE)
+            ty = v.x if v.kind == V_TYPE else final_ty(w, v)
+            if v.ty == NONE: ty = NONE
+            i64 bw = bits_of(w, &b.f, v.opd) if v.kind == V_VAL else -1
+            if bw >= 0 && m == B_SIZE:
+                err(w, b, n, 1023, index.hold(#format("`", spell(w, b, vn), "` is a bitfield of ", bw, " bits, and `#size` measures an object, which a bitfield is not")), "ask `#size` of the value this member is part of", "C refuses `sizeof` and `_Alignof` of a bitfield (C99 §6.5.3.4 ¶1) because the member has no size and no address of its own, only a position inside a storage unit. The **struct** is the object C has an answer for")
+                return bad()
+        if ty == NONE: return bad()
+        u32 t = temp(w, b, u32(types.P_U64), n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, m, ty, n, t, NONE)
+        return value(t, u32(types.P_U64))
+    // ERR1004 (Rust's emitter refusal): a message builtin writes to `stderr`,
+    // which `#NONE` has not got. `#breakpoint` is checked only that far.
+    bool none_msg = w.os == "NONE" && (m == B_PANIC || m == B_BREAKPOINT)
+    string8 bare = said
+    if #len(bare) > 0 && bare[0] == '#': bare = said[1..<#len(said)]
+    if none_msg: err(w, b, n, 1004, index.hold(#format("`", bare, "` writes to a stream, and a target whose OS is `#NONE` has no C library to hold one")), "render with `format` into a buffer and hand the bytes to a sink the program supplies, or strip a claim with `--no-expect`", "The emitted C would need `<stdio.h>`, which is not in C99 §4's freestanding header set. `corpus/freestanding` is the shape of a program that renders into a buffer. `--no-expect` takes `expect` out of the emission, and out of this refusal with it; a failed `assert` traps there instead of reporting")
+    if m == B_BREAKPOINT && none_msg:
+        for g in args:
+            _ = finish(w, b, expr(w, b, arg_value(w, b, g), NONE), g)
+        return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    if m != B_RENDER && m != B_EXPECT && m != B_ASSERT && m != B_PANIC:
+        err(w, b, n, 1, "this builtin is outside the slice the port builds so far")
+        return bad()
+    u32 bt = u32(types.P_BOOL)
+    if m == B_PANIC || m == B_ASSERT:
+        Builtin pr = BUILTINS[row]
+        syntax.Ast a = tree(w, b)
+        if #len(args) < i64(pr.lo):
+            err(w, b, n, 601, arity_said(said, pr, #len(args)))
+            return bad()
+        for g in args:
+            if a.tag[g] == syntax.E_ARG && a.main[g] != NONE: err_tok(w, b, g, 602, index.hold(#format("`", said, "` is a builtin and has no parameter names to give")))
+    if m == B_PANIC:
+        ref []u32 ms
+        for i in 0..<#len(args):
+            Val x = finish(w, b, expr(w, b, arg_value(w, b, args[i]), NONE), args[i])
+            if x.ty != NONE: ms = #append(ms, spill(w, b, x, n))
+        said_op(w, b, m, n, ms)
+        _ = ir.op(&b.f, ir.O_QUIT, 1, NONE, n, NONE, ir.konst(w.k.small(&w.t, 134)))
+        return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    if m == B_ASSERT || m == B_EXPECT:
+        if m == B_EXPECT && #len(args) == 1: err(w, b, n, 610, index.hold(#format("`", said, "` takes a claim and then a message, and with no message it is exactly its claim")), "say what was expected — `#expect(q == 3, \"q was \", q)` — or use `#assert` if a failure should stop the program", "With no message it reads like a check that is not one")
+        if #len(args) == 0: return bad()
+        // `--no-assert`/`--no-expect`: checked as written, then emitted dead
+        // (`if false`); a statement goes whole, an `#expect` value keeps its claim.
+        bool strip = w.no_assert if m == B_ASSERT else w.no_expect
+        bool whole = strip && (m == B_ASSERT || n == w.stmt_call)
+        u32 dead = open(w, b, ir.O_IF, n, ir.konst(w.k.boolean(&w.t, false)), false) if whole else NONE
+        // `#assert`, `#expect`: the message is evaluated only when the claim fails.
+        u32 cn = arg_value(w, b, args[0])
+        Val c = expr(w, b, cn, bt)
+        bool ok = c.ty == bt
+        if c.ty != NONE && !ok: err(w, b, cn, 702, index.hold(#format("`", said, "` takes a claim, which is a `bool`; this is ", shown(w, final_ty(w, c)), ". Write the comparison you mean")))
+        u32 t = temp(w, b, bt, n)
+        u32 h = NONE
+        if ok:
+            _ = ir.op(&b.f, ir.O_SET, 0, bt, n, t, c.opd)
+            u32 ct = temp(w, b, bt, n)
+            _ = ir.op(&b.f, ir.O_UN, ir.U_NOT, bt, n, ct, t)
+            h = open(w, b, ir.O_IF, n, ir.konst(w.k.boolean(&w.t, false)) if strip && !whole else ct, false)
+        ref []u32 ms
+        for i in 1..<#len(args):
+            Val x = finish(w, b, expr(w, b, arg_value(w, b, args[i]), NONE), args[i])
+            if x.ty != NONE: ms = #append(ms, spill(w, b, x, n))
+        if !ok:
+            if dead != NONE: close(w, b, dead)
+            return bad()
+        said_op(w, b, m, n, ms)
+        if m == B_ASSERT: _ = ir.op(&b.f, ir.O_QUIT, 1, NONE, n, NONE, ir.konst(w.k.small(&w.t, 134)))
+        close(w, b, h)
+        if dead != NONE: close(w, b, dead)
+        if m == B_ASSERT: return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+        return value(t, bt)
+    Builtin r = BUILTINS[row]
+    if #len(args) < i64(r.lo) || (r.hi != 255 && #len(args) > i64(r.hi)):
+        err(w, b, n, 601, arity_said(said, r, #len(args)))
+        return bad()
+    Val v = finish(w, b, expr(w, b, arg_value(w, b, args[0]), NONE), args[0])
+    if v.ty != NONE && !rendered(w, b, arg_value(w, b, args[0]), v.ty, said): return bad()
+    Val k = expr(w, b, arg_value(w, b, args[1]), sink(w))
+    if v.ty == NONE || k.ty == NONE: return bad()
+    if (k.kind == V_VAL || k.kind == V_LIT) && !same_shape(w, k.ty, sink(w)):
+        err(w, b, arg_value(w, b, args[1]), 504, index.hold(#format("`", said, "` writes its bytes to a `Sink`, and this is ", shown(w, final_ty(w, k)))), "build one where the bytes should go: `Sink s = (write_to_my_buffer, nil)`", "A sink is the allocator's two-word shape with a different procedure in it — a **procedure and a pointer**, `(i64(rawptr, rawptr, i64) proc, rawptr data)` — and the procedure is handed the sink's own `data`, the bytes, and how many of them, and answers how many it took")
+        return bad()
+    k = coerce(w, b, k, sink(w), args[1])
+    if k.ty == NONE: return bad()
+    u32 i64t = u32(types.P_I64)
+    u32 t = temp(w, b, i64t, n)
+    u32 x = spill(w, b, v, n)
+    u32 y = spill(w, b, k, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_RENDER, i64t, n, t, NONE)
+    ir.arg(&b.f, x)
+    ir.arg(&b.f, y)
+    return value(t, i64t)
+
+// An allocator argument: its rung (1 `#default`, 2 `#heap`, 3 `#stack`), or 0.
+private i64 rung(^World w, ^Body b, u32 g):
+    u32 v = arg_value(w, b, g)
+    if tree(w, b).tag[v] != syntax.E_NAME: return 0
+    string8 s = spell(w, b, v)
+    if s == "#default": return 1
+    if s == "#heap": return 2
+    if s == "#stack": return 3
+    return 0
+
+// `v` as a `ref []T` place; NONE when reported.
+private u32 handle(^World w, ^Body b, u32 g, ^Run k, Val v, u8 m):
+    u32 vn = arg_value(w, b, g)
+    if v.ty == NONE: return NONE
+    k^ = run_shape(w, v.ty)
+    u32 r = w.t.resolve(v.ty)
+    bool one = r != NONE && one_ref(w, r)
+    string8 x = shown(w, final_ty(w, v))
+    if k.kind != RK_REF && m == B_DELETE && (k.kind == RK_SLICE || k.kind == RK_PTR):
+        err(w, b, vn, 504, index.hold(#format("`delete` ends an allocation, and only a reference has the authority to — this is ", x)), "delete the reference the view was taken from; `#copy(x)` allocates a new block Dado *does* own")
+        return NONE
+    if k.kind != RK_REF && m == B_TRUNCATE && (k.kind == RK_FIXED || one):
+        err(w, b, vn, 504, index.hold(#format("`#truncate` shortens a `ref([]T)` — the *many* column, which owns a block and keeps a length inside it; this is ", x)), "a `ref(T)` holds one `T` and has no length to shorten; `#make([]T, n)` mints a run, which does" if one else "a fixed array's length is in its type and cannot change: a shorter window over it is `a[0..<n]`, and `#make([]T, n)` mints a run whose length can")
+        return NONE
+    if m == B_RESIZE && (one || k.kind == RK_SLICE):
+        err(w, b, vn, 504, index.hold(#format("`#resize` takes a `ref([]T)` — the *many* column, where there is a count to change; this is ", x, ". One `T` has no count, so there is nothing for a new one to mean")))
+        return NONE
+    if k.kind != RK_REF && (m == B_APPEND || m == B_RESERVE):
+        no_capacity(w, b, vn, "#append" if m == B_APPEND else "#reserve", final_ty(w, v))
+        return NONE
+    if k.kind != RK_REF:
+        err(w, b, vn, 1, "this handle is outside the slice the port builds so far")
+        return NONE
+    return spill(w, b, v, vn)
+
+// Whether `n` calls a function of the program's (an operand never run).
+private bool runs_call(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if n == NONE: return false
+    if a.tag[n] == syntax.E_CALL:
+        u32 c = a.list(a.b[n])[0]
+        if !(a.tag[c] == syntax.E_NAME && spell(w, b, c)[0] == '#'): return true
+    ref []u32 ks
+    a.kids(n, &ks)
+    for k in ks:
+        if runs_call(w, b, k): return true
+    return false
+
+// ERR0814: only a `ref([]T)` has a capacity; which of four it is not.
+private void no_capacity(^World w, ^Body b, u32 at, string8 name, u32 t):
+    u32 r = w.t.resolve(t)
+    string8 help = "`#make([]T, n)` mints a run, which owns a block and can be grown"
+    if is_map(w, t): help = "size the map when it is made: `#make({K: V}, n)` leaves room for `n` entries before the first rehash"
+    else if run_shape(w, t).kind == RK_SLICE: help = "take the capacity from the `ref([]T)` the window was taken over"
+    else if r != NONE && w.t.tag[r] == types.T_REF: help = "`#make([]T, n)` mints the *many* column, which is the one that grows"
+    err(w, b, at, 814, index.hold(#format("`", name, "` is about a run's **capacity**, and only a `ref([]T)` has one; this is ", shown(w, t))), help)
+
+// `#len`, `#make`, `#append`, `#delete`, `#truncate`, `#resize`.
+private Val growth(^World w, ^Body b, u32 n, u8 m):
+    u32 asked = b.cwant
+    []u32 args = call_args(w, b, n)
+    u32 i64t = u32(types.P_I64)
+    if m == B_LEN:
+        u32 vn = arg_value(w, b, args[0])
+        syntax.Ast la = tree(w, b)
+        if runs_call(w, b, vn):
+            err(w, b, vn, 504, index.hold(#format("`", spell(w, b, la.list(la.b[n])[0]), "` takes an **inert** place — a name, a slot of one, or what a named pointer points at\x1fIt answers from the type and never runs its operand, so a call here would be typed and then dropped without a word along with everything it did. A constant may be named, its count being in the type written beside it\x1ebind the value first")))
+            return bad()
+        if b.vslot != 0 && tree(w, b).tag[vn] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, vn), false) == b.vslot - 1:
+            #delete(w.preach, b.decl)
+            w.pmeasured[b.decl] = 1
+        Val v = expr(w, b, vn, NONE)
+        if v.ty == NONE: return v
+        // A pack's count is its instance's arity, a literal.
+        if v.kind == V_PACK:
+            []u32 pk = w.t.list(b.pack)
+            return Val(V_LIT, NONE, w.untyped, NONE, u64(#len(pk)), 0)
+        v = finish(w, b, v, vn)
+        if is_map(w, v.ty): return map_verb(w, b, n, m, v, vn)
+        if chan_of(w, v.ty) != NONE: return chan_len(w, b, n, v, vn)
+        Run k = run_shape(w, v.ty)
+        u32 ur = under(&w.t, v.ty)
+        // A shape of mixed slots: its slot count.
+        if k.kind == RK_NONE && ur != NONE && w.t.tag[ur] == types.T_TUPLE:
+            []u32 uxs = w.t.list(ur)
+            return value(ir.konst(w.k.small(&w.t, #len(uxs))), i64t)
+        if k.kind == RK_NONE:
+            err(w, b, vn, 1, "this `#len` is outside the slice the port builds so far")
+            return bad()
+        return value(length(w, b, spill(w, b, v, vn), k, n), i64t)
+    if m == B_CAP:
+        u32 cn = arg_value(w, b, args[0])
+        Val v = finish(w, b, expr(w, b, cn, NONE), cn)
+        if v.ty == NONE: return v
+        if run_shape(w, v.ty).kind != RK_REF:
+            no_capacity(w, b, cn, "#cap", final_ty(w, v))
+            return bad()
+        u32 t = temp(w, b, i64t, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_CAP, i64t, n, t, NONE)
+        ir.arg(&b.f, spill(w, b, v, cn))
+        return value(t, i64t)
+    if m == B_MAKE:
+        u32 tn = arg_value(w, b, args[0])
+        w.inc_ok = true
+        u32 ty = map_written(w, b, tn)
+        w.inc_ok = false
+        if ty != NONE: _ = inc_refuse(w, b.file, tree(w, b).lo[tn], tree(w, b).hi[tn], ty, "`make`", b.base)
+        if ty != NONE && is_map(w, ty): return map_make(w, b, n, ty)
+        if tree(w, b).tag[tn] == syntax.E_TYPE: pass
+        else if ty == NONE:
+            Val c = expr(w, b, tn, NONE)
+            if c.kind == V_TYPE: ty = c.x
+            else: err(w, b, tn, 504, "`make` takes a **type** first: `#make([]T, n)`")
+        if ty == NONE: return bad()
+        if is_map(w, ty): return map_make(w, b, n, ty)
+        if run_shape(w, ty).kind != RK_SLICE:
+            string8 help = "write `#make([]char8, n)`, fill it, and read it as text: `string8 s = r`, or `string8(r[:])`" if ty == types.STRING8 else ""
+            err(w, b, tn, 504, index.hold(#format("`make` mints a `ref([]T)` or a `{K: V}`, and ", shown(w, ty), " is neither")), help)
+            return bad()
+        u32 cn = arg_value(w, b, args[1])
+        Val c = count_val(w, b, cn, "`make` takes how many to allocate")
+        if c.ty == NONE: return bad()
+        if #len(args) > 2 && rung(w, b, args[2]) == 3 && !ir.is_const(c.opd):
+            err(w, b, cn, 808, "`#stack` writes the run **inline at this call**, so its count has to be a number the compiler knows, and this one is not", "write a constant count, or leave the rung off and `delete` what you allocated", "C99 §6.5.2.5 is explicit that the compound literal it lowers to may not have a variable length array type, so there is no lowering here rather than a slow one")
+            return bad()
+        u32 al = alloc_arg(w, b, args[2], "make") if #len(args) > 2 else ir.konst(w.k.small(&w.t, 1))
+        if al == NONE: return bad()
+        u32 rt = w.t.ref_of(ty)
+        u32 t = temp(w, b, rt, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_MAKE, rt, n, t, NONE)
+        ir.arg(&b.f, c.opd)
+        ir.arg(&b.f, al)
+        if n == b.guard:
+            u32 bt = u32(types.P_BOOL)
+            u32 nil_ = temp(w, b, bt, n)
+            _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, rt, n, nil_, t, zero(w, rt))
+            guarded(w, b, n, nil_)
+        return value(t, rt)
+    Val hv = expr(w, b, arg_value(w, b, args[0]), NONE)
+    if is_map(w, hv.ty) && (m == B_DELETE || m == B_COPY): return map_verb(w, b, n, m, hv, arg_value(w, b, args[0]))
+    if m == B_COPY: return copy_(w, b, n, hv, asked)
+    if m == B_DELETE && #len(args) == 2 && hv.ty != NONE:
+        err(w, b, arg_value(w, b, args[1]), 504, index.hold(#format("`delete` takes a second argument only for a map, where it is the key to remove; this is ", shown(w, final_ty(w, hv)))))
+        return bad()
+    u32 hr = w.t.resolve(hv.ty)
+    if m == B_DELETE && hr != NONE && one_ref(w, hr):
+        u32 hp = spill(w, b, hv, arg_value(w, b, args[0]))
+        _ = ir.op(&b.f, ir.O_MOVE, ir.MV_FREE, NONE, arg_value(w, b, args[0]), NONE, hp, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_DELETE, NONE, n, NONE, NONE)
+        ir.arg(&b.f, hp)
+        return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    u32 an = arg_value(w, b, args[0])
+    if m == B_TRUNCATE && hv.ty != NONE && tree(w, b).tag[an] == syntax.E_CALL:
+        err(w, b, an, 606, "`#truncate` writes the length of the reference it is given, so it needs a place: a name, a slot of one, or a position in one. A call answers a temporary, and shortening one would change a length nothing can read back", "bind the run to a name first — `ref []T r = f()` — and write `#truncate(r, n)`")
+        return bad()
+    Run k
+    u32 p = handle(w, b, args[0], &k, hv, m)
+    if p == NONE: return bad()
+    if m == B_TRUNCATE && !ir.is_const(p) && (b.f.root[p] & ir.ROOT_GLOBAL) == 0 && b.f.root[p] < b.f.params:
+        bool deref = false
+        for j in b.f.plo[p]..<b.f.phi[p]:
+            if b.f.step[j] == ir.ST_DEREF: deref = true
+        if !deref:
+            string8 pn = name_of(w, w.p.sym(b.file, an)) if tree(w, b).tag[an] == syntax.E_NAME else w.t.text(b.f.slot_name[b.f.root[p]])
+            string8 th = index.hold(#format("take the reference by pointer — `^ref([]T) ", pn, "` and `#truncate(", pn, "^, n)` — to shorten the caller's run; for a shorter view in this function alone, window it: `", pn, "[0..<n]`"))
+            // Reached through a slot of the parameter: the parameter is what to take by pointer.
+            if b.f.phi[p] > b.f.plo[p]: th = index.hold(#format("take the **parameter** by pointer — `^` on its type and `", pn, "^` at each use — so this run is reached through the caller's own storage"))
+            err(w, b, an, 813, index.hold(#format("this run is reached from the parameter `", pn, "`, so `#truncate` would shorten this function's own copy of the reference")), th, "`#truncate` would shorten the copy's length and zero elements in the block the caller shares, while the caller's length stays where it was")
+            return bad()
+    u32 rt = b.f.place_ty[p]
+    if (m == B_APPEND || m == B_RESIZE || m == B_RESERVE) && asked == u32(types.P_BOOL):
+        syntax.Ast ga = tree(w, b)
+        string8 said = spell(w, b, ga.list(ga.b[n])[0])
+        err(w, b, n, 504, index.hold(#format("`", said, "` answers the run's handle, ", shown(w, rt), ", and not a `bool`: a growth no longer answers whether it worked")), index.hold(#format("a growth now traps when it cannot have its room, so there is nothing to test: write `", src(w, b, args[0]), " = ", src(w, b, n), "`; a `nil` run grows on its own")))
+        return bad()
+    u8 verb = ir.MV_FREE if m == B_DELETE else (ir.MV_APPEND if m == B_APPEND else ir.MV_RESIZE)
+    if m != B_TRUNCATE: _ = ir.op(&b.f, ir.O_MOVE, verb, NONE, arg_value(w, b, args[0]), NONE, p, n)
+    if m == B_DELETE:
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_DELETE, NONE, n, NONE, NONE)
+        ir.arg(&b.f, p)
+        return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    u32 xn = arg_value(w, b, args[1])
+    u32 x0 = ir.count(&b.f)
+    bool splat = tree(w, b).tag[xn] == syntax.E_SPLAT && m == B_APPEND
+    Val x = bad()
+    if splat:
+        x = expr(w, b, tree(w, b).a[xn], NONE)
+        if x.ty != NONE && run_shape(w, x.ty).kind == RK_NONE:
+            err(w, b, xn, 1, "this splat is outside the slice the port builds so far")
+            return bad()
+    else if m != B_APPEND:
+        x = count_val(w, b, xn, "`#truncate` takes the length to leave the run at" if m == B_TRUNCATE else ("`#resize` takes how many elements to hold" if m == B_RESIZE else "`#reserve` takes how many elements to make room for"))
+    else:
+        x = coerce(w, b, expr(w, b, xn, k.elem), k.elem, xn)
+    if x.ty == NONE: return bad()
+    u32 tc = folded(w, b, x0, x.opd) if m == B_TRUNCATE else NONE
+    if tc != NONE && w.k.kind[tc] == types.C_INT && i64(w.k.w1[tc]) < 0:
+        err(w, b, xn, 828, index.hold(#format("`#truncate` leaves a run holding `n` elements, and `", i64(w.k.w0[tc]), "` is not a length any run can have: a length is zero or more")), "write the length to keep, from `0` to `#len` of the run — `#truncate(r, 0)` empties it, and `#truncate(r, #len(r) - 1)` drops the last element")
+        return bad()
+    u32 y = spill(w, b, x, xn) if splat else x.opd
+    u32 t = NONE if m == B_TRUNCATE else temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, m, rt, n, t, NONE, NONE, 1 if splat else NONE)
+    ir.arg(&b.f, p)
+    ir.arg(&b.f, y)
+    if t == NONE: return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    b.grown = t
+    return value(t, rt)
+
+// An integer that holds any address: `u64`, `i64`, `#c.uintptr_t`, `#c.intptr_t`.
+private bool address_int(^World w, u32 ty):
+    u32 r = w.t.resolve(ty)
+    if r == u32(types.P_U64) || r == u32(types.P_I64): return true
+    return r != NONE && w.t.tag[r] == types.T_CSCALAR && (types.C_SCALARS[w.t.a[r]].name == "uintptr_t" || types.C_SCALARS[w.t.a[r]].name == "intptr_t")
+
+// The first argument after `g` that may call, or NONE.
+private u32 calls_after(^World w, ^Body b, []u32 args, u32 g):
+    bool seen = false
+    for x in args:
+        if seen && calls_in(w, b, x): return x
+        if x == g: seen = true
+    return NONE
+
+const string8 SLOTS_WHERE = "`#slots` names a value's slots, so it is written in one of two places, and this is neither"
+
+i64 axis_of(char8 c):
+    for i in 0..<4:
+        if "xyzw"[i] == c || "rgba"[i] == c: return i
+    return -1
+
+string8 arity_said(string8 said, Builtin r, i64 got):
+    string8 want = index.hold(#format(r.lo)) if r.lo == r.hi else index.hold(#format(r.lo, " or more")) if r.hi == 255 else index.hold(#format(r.lo, " or ", r.hi))
+    return index.hold(#format("`", said, "` takes ", want, " argument(s); this gives ", got))
+
+// The report of `#panic`, `#assert` or `#expect` (`m`), its message `ms`.
+private void said_op(^World w, ^Body b, u8 m, u32 n, []u32 ms):
+    _ = ir.op(&b.f, ir.O_INTRINSIC, m, NONE, n, NONE, NONE)
+    for x in ms:
+        ir.arg(&b.f, x)
+
+// The atomics and `#fence`: `dst = op(p, values…, [weak,] orders…)`, the
+// orders as constants.
+private Val atomic_(^World w, ^Body b, u32 n, u8 m, string8 said):
+    []u32 args = call_args(w, b, n)
+    ref []u32 ops
+    u32 held = NONE
+    i64 at = 0
+    if m != B_FENCE:
+        u32 pn = arg_value(w, b, args[0])
+        Val pv = finish(w, b, expr(w, b, pn, NONE), pn)
+        if pv.ty == NONE: return bad()
+        u32 pr = w.t.resolve(pv.ty)
+        if pr != NONE && w.t.tag[pr] == types.T_PTR:
+            u8 hp = int_prim(w, w.t.a[pr])
+            u32 hr = w.t.resolve(w.t.a[pr])
+            if hp == types.P_I32 || hp == types.P_U32 || hp == types.P_I64 || hp == types.P_U64 || hr == u32(types.P_RAWPTR) || handle_ty(w, w.t.a[pr]): held = w.t.a[pr]
+        if held == NONE:
+            err(w, b, pn, 817, index.hold(#format("`", said, "` takes a `^i32`, `^u32`, `^i64`, `^u64` or `^rawptr`, and this is ", shown(w, pv.ty), "\x1fAn atomic access is over an ordinary aligned location of a width every target does lock-free; a wider one becomes a `libatomic` call, which a freestanding link has not got. **Mixing atomic and non-atomic access to one location is a data race and this compiler cannot see it** — the `^` is what makes an atomic location visibly one somebody took the address of, and the discipline is yours\x1epoint it at a location of one of those five types")))
+            return bad()
+        if (w.t.resolve(held) == u32(types.P_RAWPTR) || handle_ty(w, held)) && m >= B_ATOMIC_FETCH_ADD && m <= B_ATOMIC_FETCH_XOR:
+            err(w, b, pn, 817, index.hold(#format("`", said, "` adds to, or masks, the value at a location, and this location holds a `rawptr`\x1fC would scale the operand by the size of a pointer rather than combine it with the address\x1eover an address, use `#atomic_load`, `#atomic_store`, `#atomic_exchange` or `#atomic_compare_exchange`")))
+            return bad()
+        ops = #append(ops, spill(w, b, pv, pn))
+        at = 1
+        i64 vals = 1
+        if m == B_ATOMIC_LOAD: vals = 0
+        if m == B_ATOMIC_COMPARE_EXCHANGE: vals = 2
+        for i in 0..<vals:
+            u32 vn = arg_value(w, b, args[at])
+            Val v = coerce(w, b, expr(w, b, vn, held), held, vn, index.hold(#format("`", said, "` operates on the value its location holds, and that is")))
+            if v.ty == NONE: return bad()
+            ops = #append(ops, spill(w, b, v, vn))
+            at += 1
+        if m == B_ATOMIC_COMPARE_EXCHANGE:
+            u32 wn = arg_value(w, b, args[at])
+            Val v = coerce(w, b, expr(w, b, wn, u32(types.P_BOOL)), u32(types.P_BOOL), wn, index.hold(#format("`", said, "` is told whether a spurious failure is acceptable, and that is")))
+            if v.ty == NONE: return bad()
+            ops = #append(ops, spill(w, b, v, wn))
+            at += 1
+    u32 ot = query_type(w, Q_ORDERING)
+    ref []u32 orders
+    for i in at..<#len(args):
+        u32 on = arg_value(w, b, args[i])
+        u32 x0 = ir.count(&b.f)
+        Val v = coerce(w, b, expr(w, b, on, ot), ot, on, index.hold(#format("`", said, "` is given one of the five memory orderings, and the ordering is")))
+        if v.ty == NONE: return bad()
+        u32 c = folded(w, b, x0, v.opd)
+        if c == NONE || w.k.kind[c] != types.C_INT:
+            err(w, b, on, 901, index.hold(#format("`", said, "`'s ordering is written down rather than computed: gcc and clang both need it to be a constant expression to inline the operation at all, and one they cannot see through costs the program the whole point of the verb. Write `#SEQ_CST` — or one of `#RELAXED`, `#ACQUIRE`, `#RELEASE`, `#ACQ_REL` — at the call")))
+            return bad()
+        orders = #append(orders, u32(w.k.w0[c]))
+    if m == B_ATOMIC_COMPARE_EXCHANGE && (orders[1] == 30 || orders[1] == 40):
+        string8 on = "#RELEASE" if orders[1] == 30 else "#ACQ_REL"
+        err(w, b, arg_value(w, b, args[5]), 818, index.hold(#format("a `", said, "` that fails performs no store, so there is nothing for `", on, "` to release. The failure ordering is `#RELAXED`, `#ACQUIRE` or `#SEQ_CST`")))
+        return bad()
+    for o in orders:
+        ops = #append(ops, ir.konst(w.k.small(&w.t, i64(o))))
+    u32 rt = held
+    if m == B_ATOMIC_STORE || m == B_FENCE: rt = u32(types.P_VOID)
+    if m == B_ATOMIC_COMPARE_EXCHANGE:
+        [2]u32 ps = [held, u32(types.P_BOOL)]
+        rt = w.t.tuple(ps[:])
+    u32 t = NONE
+    if rt != u32(types.P_VOID): t = temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, m, held, n, t, NONE)
+    for x in ops:
+        ir.arg(&b.f, x)
+    if t == NONE: return Val(V_VAL, NONE, u32(types.P_VOID), NONE, 0, 0)
+    return value(t, rt)
+
+// `#add_fits(a, b)` and its two siblings: `(T value, bool ok)`, `ok` when
+// the result fits.
+private Val fits_(^World w, ^Body b, u32 n, u8 m, string8 said):
+    []u32 args = call_args(w, b, n)
+    u32 an = arg_value(w, b, args[0])
+    u32 bn = arg_value(w, b, args[1])
+    Val l = bad()
+    Val r = bad()
+    syntax.Ast a = tree(w, b)
+    if a.tag[an] == syntax.E_INT && a.tag[bn] != syntax.E_INT:
+        r = finish(w, b, expr(w, b, bn, NONE), bn)
+        l = expr(w, b, an, r.ty)
+    else:
+        l = finish(w, b, expr(w, b, an, NONE), an)
+        r = expr(w, b, bn, l.ty)
+    if l.ty == NONE || r.ty == NONE: return bad()
+    if l.kind == V_LIT: l = finish(w, b, l, an)
+    u8 p = int_prim(w, l.ty)
+    if p == types.PRIMS || types.PRIM[p].kind == types.K_CHAR || is_float(w, l.ty):
+        string8 noun = "sum"
+        if m == B_SUB_OVERFLOW: noun = "difference"
+        if m == B_MUL_OVERFLOW: noun = "product"
+        string8 why = index.hold(#format("`", said, "` is about the integer widths because those are the types whose arithmetic can answer something other than the number it was asked for. Nothing else can overflow"))
+        string8 help = "pass `i8`, `i16`, `i32` or `i64`, `u8`, `u16`, `u32` or `u64`, or `byte`"
+        if is_float(w, l.ty):
+            why = "A float that overflows **is a value** — `inf`, which the type already carries and which any program can already test for — so there is nothing for a second slot to say. That is the one place C's answer is not silent, and it is why these three are about the integers"
+            help = "write the operator, and test the result for `inf`"
+        else if p != types.PRIMS && types.PRIM[p].kind == types.K_CHAR:
+            why = "A character is an **ordinal** over a code point, and the sum of two code points is not one — which is the same sentence that keeps a `char8` from being passed where a `u8` goes"
+            help = "convert, if what is wanted is arithmetic on the number underneath"
+        err(w, b, an, 504, index.hold(#format("`", said, "` answers `(T value, bool ok)` over two integers of one type; this is ", shown(w, final_ty(w, l)), "\x1f`ok` is **true when the ", noun, " fits**. ", why, "\x1e", help)))
+        return bad()
+    if r.kind == V_VAL && w.t.resolve(r.ty) != w.t.resolve(l.ty):
+        err(w, b, bn, 504, index.hold(#format("`", said, "` takes two operands of one type, and the first is ", shown(w, l.ty), ", and this is ", shown(w, r.ty))))
+        return bad()
+    r = coerce(w, b, r, l.ty, bn)
+    if r.ty == NONE: return bad()
+    [2]u32 ps = [l.ty, u32(types.P_BOOL)]
+    u32 rt = w.t.tuple(ps[:])
+    u32 t = temp(w, b, rt, n)
+    u32 x = spill(w, b, l, an)
+    u32 y = spill(w, b, r, bn)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, m, l.ty, n, t, NONE)
+    ir.arg(&b.f, x)
+    ir.arg(&b.f, y)
+    return value(t, rt)
+
+// A byte C may read as `char`: `#c.char`, `schar`, `uchar`, `u8`, `char8`.
+private bool c_char_ty(^World w, u32 t):
+    u32 r = w.t.resolve(t)
+    if r == u32(types.P_U8) || r == u32(types.P_CHAR8): return true
+    if r == NONE || w.t.tag[r] != types.T_CSCALAR: return false
+    string8 nm = types.C_SCALARS[w.t.a[r]].name
+    return nm == "char" || nm == "schar" || nm == "uchar"
+
+// The bit verbs: over the unsigned widths, `#bswap` not over `u8`.
+private Val bits_(^World w, ^Body b, u32 n, u8 m, string8 said):
+    []u32 args = call_args(w, b, n)
+    u32 vn = arg_value(w, b, args[0])
+    Val v = finish(w, b, expr(w, b, vn, NONE), vn)
+    if v.ty == NONE: return bad()
+    u8 p = int_prim(w, v.ty)
+    bool ok = p == types.P_U8 || p == types.P_U16 || p == types.P_U32 || p == types.P_U64
+    if m == B_BSWAP && p == types.P_U8: ok = false
+    if !ok:
+        string8 dom = "`u8`, `u16`, `u32` and `u64`, and `byte`, which is `u8`"
+        if m == B_BSWAP: dom = "`u16`, `u32` and `u64`"
+        string8 why = index.hold(#format("`", said, "` is about the unsigned integer widths because those are the types whose value *is* a bit pattern. Nothing else has one to ask about\x1epass one of ", dom))
+        if m == B_BSWAP && p == types.P_U8: why = index.hold(#format("A `u8` is one byte, so swapping its bytes is the identity — and unlike `#clz(0)`, which is a value a program cannot exclude, this is known from the type alone at every call. A line that reverses one byte has the wrong type or does nothing, so it is refused rather than compiled away. There is no `__builtin_bswap8` either, and for this reason\x1epass one of ", dom, ", or drop the call: swapping one byte changes nothing"))
+        else if p != types.PRIMS && types.PRIM[p].kind == types.K_CHAR: why = "A character is an **ordinal** over a code point, and the bits under it are not what the type is about — which is the same sentence that keeps a `char8` from being passed where a `u8` goes\x1econvert, if the bits are what is wanted"
+        else if p != types.PRIMS && types.is_signed(p):
+            string8 rep = index.hold(#format(said, "(u32(n))"))
+            if m == B_ROTL || m == B_ROTR: rep = index.hold(#format(said, "(u32(n), k)"))
+            why = index.hold(#format("A bit verb is a question about a **bit pattern** and a signed integer is a question about a number, so the two are not one question written twice — C99 §6.2.6.2 admits three representations of a negative value, and a reader of the call cannot tell which of them was meant\x1econvert and ask: `", rep, "` says which question it is asking"))
+        err(w, b, vn, 504, index.hold(#format("`", said, "` reads a bit pattern; this is ", shown(w, v.ty), "\x1f", why)))
+        return bad()
+    u32 x = spill(w, b, v, vn)
+    u32 y = NONE
+    if m == B_ROTL || m == B_ROTR:
+        u32 kn = arg_value(w, b, args[1])
+        Val k = expr(w, b, kn, v.ty)
+        if k.ty == NONE: return bad()
+        if k.kind == V_VAL && int_prim(w, k.ty) != int_prim(w, v.ty):
+            err(w, b, kn, 504, index.hold(#format("`", said, "` turns a pattern by a count of the pattern's own type, and the pattern is ", shown(w, v.ty), ", and this is ", shown(w, k.ty))))
+            return bad()
+        k = coerce(w, b, k, v.ty, kn)
+        if k.ty == NONE: return bad()
+        y = spill(w, b, k, kn)
+    u32 rt = v.ty
+    if m == M_FOLDED_LENGTH && #len(args) == 1:
+        u32 vn = arg_value(w, b, args[0])
+        Val v = expr(w, b, vn, NONE)
+        if v.ty == NONE: return bad()
+        if v.kind == V_PACK:
+            []u32 pk = w.t.list(b.pack)
+            return Val(V_LIT, NONE, w.untyped, NONE, u64(#len(pk)), 0)
+        v = finish(w, b, v, vn)
+        Run k = run_shape(w, v.ty)
+        string8 why = ""
+        string8 shown_t = shown(w, v.ty)
+        string8 through = ""
+        if k.kind == RK_REF:
+            shown_t = index.hold(#format("[]", shown(w, k.elem)))
+            through = ", which is the view this reference lends"
+        if k.kind == RK_SLICE || k.kind == RK_REF: why = "a window's count is in the value, not in its type — it is settled when the window is taken, and nothing in `[]T` records it"
+        if k.kind == RK_TEXT: why = "a string's unit count is in the value, not in its type — a string is a pointer and a count, and the count is the second word"
+        if is_map(w, v.ty): why = "a map's count is in the value, not in its type — it changes as the table is filled, so no type could hold it"
+        if #len(why) > 0:
+            err(w, b, n, 916, index.hold(#format("`", said, "` asserts the length is in the **type**, and this is a `", shown_t, "`", through, ": ", why, ". Write `#len` instead, which asks the same question and reads the count where it lives; `", said, "` is for a fixed array, a tuple, a named shape or a matrix, where A5 makes the count part of the type")))
+            return bad()
+        if k.kind != RK_FIXED && k.kind != RK_ONE:
+            err(w, b, n, 1, "this builtin is outside the slice the port builds so far")
+            return bad()
+        if b.cwant == NONE && !b.flat: return value(ir.konst(w.k.small(&w.t, k.count)), u32(types.P_I32))
+        return Val(V_LIT, NONE, w.untyped, NONE, u64(k.count), 0)
+    if m == B_POPCOUNT || m == B_CLZ || m == B_CTZ: rt = u32(types.P_I64)
+    u32 t = temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, m, v.ty, n, t, NONE)
+    ir.arg(&b.f, x)
+    if y != NONE: ir.arg(&b.f, y)
+    return value(t, rt)
+
+// `#c.bool`, C's `_Bool`.
+bool c_bool(^World w, u32 r):
+    return r != NONE && w.t.tag[r] == types.T_CSCALAR && types.C_SCALARS[w.t.a[r]].class == types.CS_BOOL
+
+// Whether expression `n` names an `f32` constant.
+private bool f32_in(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if a.tag[n] == syntax.E_NAME:
+        u32 d = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, n))
+        return d != NONE && w.decls[d].kind == K_CONST && resolve(w, d) != NONE && w.t.resolve(resolve(w, d)) == u32(types.P_F32)
+    ref []u32 ks
+    a.kids(n, &ks)
+    for k in ks:
+        if f32_in(w, b, k): return true
+    return false
+
+// A run's count: any integer, widened or wrapped to `i64` as Rust's; else ERR0504.
+private Val count_val(^World w, ^Body b, u32 cn, string8 what):
+    u32 i64t = u32(types.P_I64)
+    Val v = expr(w, b, cn, i64t)
+    if v.ty == NONE || v.kind == V_LIT || v.kind == V_FLIT || w.t.resolve(v.ty) == i64t: return coerce(w, b, v, i64t, cn)
+    if !is_int(w, v.ty):
+        err(w, b, cn, 504, index.hold(#format(what, ", which is an integer; this is ", shown(w, v.ty))))
+        return bad()
+    u32 t = temp(w, b, i64t, cn)
+    _ = ir.op(&b.f, ir.O_CONV, ir.CV_WIDEN if widens(w, under(&w.t, v.ty), i64t) else ir.CV_WRAP, i64t, cn, t, spill(w, b, v, cn))
+    return value(t, i64t)

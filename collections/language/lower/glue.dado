@@ -1,0 +1,724 @@
+// Runs across the seam (Rust's glue families, by copy): per Dado run type
+// a writer into a new script array (`dado_jw_`), a reader of a script's
+// array into a block for the call (`dado_jr_`), its release (`dado_jd_`) and
+// the copy back of what Dado wrote into the script's array (`dado_jf_`),
+// all over `core:script`'s glue.
+package lower
+
+import "core:strings"
+import "language:check"
+import "language:index"
+import "language:ir"
+import "language:types"
+
+type Glue:
+    ref []char8 protos
+    ref []char8 defs
+    ref []u32 done
+    bool tleft
+    // Dado enums with a writer and a reader.
+    ref []u32 enums
+    bool lend_def
+    bool take_def
+
+private void gput(^ref []char8 o, string8 s):
+    for ch in s:
+        o^ = #append(o^, ch)
+
+private u32 g_elem(^C c, u32 r):
+    return check.run_elem(c.w, r, true)
+
+// `x` (of Dado type `e`) as a new script value.
+string8 g_give(^C c, ^Glue g, u32 e, string8 x):
+    u8 k = check.seam_kind(c.w, e, false)
+    if k == check.SK_ENUM: return index.hold(#format(glue_enum(c, g, e, true), "(ctx, (int64_t)(", x, "))"))
+    if k == check.SK_FLOAT: return index.hold(#format(rtn(c, "give_float"), "(ctx, (double)(", x, "))"))
+    if k == check.SK_BOOL: return index.hold(#format(rtn(c, "give_bool"), "(ctx, ", x, ")"))
+    if k == check.SK_STR: return index.hold(#format(rtn(c, "give_string"), "(ctx, ", x, ")"))
+    if k == check.SK_WIDE: return wide_give(c, e, x)
+    if check.seam_kind(c.w, e, true) == check.SK_OWNED: return index.hold(#format(rtn(c, "give_string"), "(ctx, (dado_string){ (const char *)(", x, ").ptr, (", x, ").len })"))
+    if k == check.SK_RUN || k == check.SK_TUP || k == check.SK_MAP || k == check.SK_UNION:
+        glue_run(c, g, e)
+        return index.hold(#format("dado_jw_", c.t.resolve(e), "(ctx, ", x, ")"))
+    return index.hold(#format(rtn(c, "give_int"), "(ctx, (int64_t)(", x, "))"))
+
+// A reader of script value `e` into `p` (of Dado type `t`), setting `c`.
+private string8 g_read(^C c, ^Glue g, u32 t, string8 p):
+    u8 k = check.seam_kind(c.w, t, false)
+    if k == check.SK_ENUM: return index.hold(#format("{ int64_t x = 0; c = ", glue_enum(c, g, t, false), "(&x, ctx, e, fn, what, path, depth + 1); if (c == 0) { ", p, " = (", ty(c, t), ")x; } }"))
+    if k == check.SK_RUN || k == check.SK_TUP || k == check.SK_MAP || k == check.SK_UNION:
+        glue_run(c, g, t)
+        return index.hold(#format("c = dado_jr_", c.t.resolve(t), "(ctx, e, &", p, ", fn, what, path, depth + 1, tk);"))
+    if k == check.SK_WIDE: return wide_read(c, t, p, "ctx, e, fn, what, path, depth + 1", "dado_jtake_wide(tk, ")
+    string8 rf = "read_int"
+    string8 tmp = "int64_t"
+    if k == check.SK_FLOAT:
+        rf = "read_float"
+        tmp = "double"
+    if k == check.SK_BOOL:
+        rf = "read_bool"
+        tmp = ty(c, u32(types.P_BOOL))
+    if check.seam_kind(c.w, t, true) == check.SK_OWNED:
+        return index.hold(#format("{ ", ty(c, t), " x = {0}; c = ", rtn(c, "read_owned_string"), "(&x, ctx, e, fn, what, path, depth + 1); if (c == 0) { ", p, " = x; } }"))
+    if k == check.SK_STR:
+        rf = "read_string"
+        tmp = ty(c, types.STRING8)
+    // A string is a struct: no cast (C refuses one to its own type).
+    string8 cast = ""
+    if k != check.SK_STR: cast = index.hold(#format("(", ty(c, t), ")"))
+    // Zeroed: gcc -O2 cannot see the reader sets it when it answers 0.
+    string8 rd = index.hold(#format("{ ", tmp, " x = ", "{0}" if k == check.SK_STR else "0", "; c = ", rtn(c, rf), "(&x, ctx, e, fn, what, path, depth + 1); if (c == 0) { ", p, " = ", cast, "x; } }"))
+    if k == check.SK_STR: rd = index.hold(#format(rd, " if (c == 0) { dado_jtake_str(tk, ", p, "); }"))
+    return rd
+
+// A fixed array's or a tuple's writer and reader: a script array of its slots.
+private void glue_tup(^C c, ^Glue g, u32 r):
+    string8 ct = ty(c, r)
+    []u32 ss = c.t.slots(r)
+    ref []char8 w_
+    ref []char8 rd
+    ref []char8 bk
+    for i in 0..<#len(ss):
+        string8 mb = member(c, r, u32(i))
+        string8 sl = index.hold(#format("v", mb))
+        string8 dst = index.hold(#format("out->", mb[1..<#len(mb)]))
+        gput(&w_, index.hold(#format("    if (", rtn(c, "put"), "(ctx, a, ", i, ", ", g_give(c, g, ss[i], sl), ") != 0) { return JS_EXCEPTION; }\n")))
+        u8 sk = check.seam_kind(c.w, ss[i], false)
+        if sk == check.SK_RUN || sk == check.SK_TUP: gput(&bk, index.hold(#format("    c = ", rtn(c, "element"), "(&e, ctx, arr, ", i, ");\n    if (c != 0) { return c; }\n    c = dado_jf_", c.t.resolve(ss[i]), "(ctx, e, ", sl, ");\n    ", rtn(c, "free_value"), "(ctx, e);\n    if (c != 0) { return c; }\n")))
+        gput(&rd, index.hold(#format("    c = ", rtn(c, "element"), "(&e, ctx, v, ", i, ");\n    if (c != 0) { return c; }\n    path[depth] = ", i, ";\n    ", g_read(c, g, ss[i], dst), "\n    ", rtn(c, "free_value"), "(ctx, e);\n    if (c != 0) { return c; }\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue dado_jw_", r, "(JSContext *ctx, ", ct, " v) {\n    JSValue a = ", rtn(c, "new_array"), "(ctx);\n", index.hold(w_), "    return a;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jf_", r, "(JSContext *ctx, JSValue arr, ", ct, " v) {\n    (void)ctx; (void)arr; (void)v;\n    JSValue e; int32_t c = 0; (void)e;\n", index.hold(bk), "    return c;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jr_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk) {\n    (void)ctx; (void)v; (void)out; (void)fn; (void)what; (void)path; (void)depth; (void)tk;\n    JSValue e;\n    int32_t c = ", rtn(c, "read_exactly"), "(ctx, v, ", #len(ss), ", fn, what, path, depth);\n    if (c != 0) { return c; }\n", index.hold(rd), "    return 0;\n}\n")))
+
+// A `#soa`'s glue: its shape `[N]P`'s, each element gathered out of the
+// lanes or scattered into them.
+private void glue_soa(^C c, ^Glue g, u32 r):
+    u32 sr = c.t.resolve(c.t.a[r])
+    glue_run(c, g, sr)
+    string8 ct = ty(c, r)
+    string8 st = ty(c, sr)
+    string8 gat = soa_moves(c, r, "v.", "t", true)
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue dado_jw_", r, "(JSContext *ctx, ", ct, " v) {\n    ", st, " t;\n", gat, "    return dado_jw_", sr, "(ctx, t);\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jf_", r, "(JSContext *ctx, JSValue arr, ", ct, " v) {\n    (void)ctx; (void)arr; (void)v;\n    ", st, " t;\n", gat, "    return dado_jf_", sr, "(ctx, arr, t);\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jr_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk) {\n    (void)ctx; (void)v; (void)out; (void)fn; (void)what; (void)path; (void)depth; (void)tk;\n    ", st, " t;\n    int32_t c = dado_jr_", sr, "(ctx, v, &t, fn, what, path, depth, tk);\n    if (c != 0) { return c; }\n", soa_moves(c, r, "out->", "t", false), "    return 0;\n}\n")))
+
+// The statements moving `#soa` row `r`'s lanes (at `v`) into shape `t`
+// (`gather`), or back.
+private string8 soa_moves(^C c, u32 r, string8 v, string8 t, bool gather):
+    u32 sr = c.t.resolve(c.t.a[r])
+    []u32 els = c.t.slots(sr)
+    u32 er = c.t.resolve(els[0])
+    u32 le = NONE
+    i64 k = 0
+    bool uni = c.t.uniform(er, &le, &k)
+    bool tup = er != NONE && c.t.tag[er] == types.T_TUPLE
+    ref []char8 o
+    for i in 0..<#len(els):
+        string8 mi = member(c, sr, u32(i))
+        ref []string8 ls
+        ref []string8 ms
+        if tup:
+            []u32 lx = c.t.list(er)
+            for j in 0..<#len(lx):
+                string8 ln = index.hold(#format("s", j, "[", i, "]"))
+                if uni: ln = index.hold(#format("s[", j, "][", i, "]"))
+                ls = #append(ls, ln)
+                ms = #append(ms, member(c, er, u32(j)))
+        else:
+            ls = #append(ls, index.hold(#format("s0[", i, "]")))
+            ms = #append(ms, "")
+        for j in 0..<#len(ls):
+            string8 sp = index.hold(#format(t, mi, ms[j]))
+            string8 lp = index.hold(#format(v, ls[j]))
+            if gather: gput(&o, index.hold(#format("    ", sp, " = ", lp, ";\n")))
+            else: gput(&o, index.hold(#format("    ", lp, " = ", sp, ";\n")))
+    return index.hold(o)
+
+// A Dado union's glue: the script's pair `[member, payload]`.
+private void glue_union(^C c, ^Glue g, u32 r):
+    string8 ct = ty(c, r)
+    []u32 ms = c.t.list(r)
+    ref []char8 wr
+    ref []char8 rd
+    for i in 0..<#len(ms):
+        string8 mv = index.hold(#format("v.u.m", i))
+        gput(&wr, index.hold(#format("    case ", i, ": x = ", g_give(c, g, ms[i], mv), "; break;\n")))
+        string8 mo = index.hold(#format("out->u.m", i))
+        gput(&rd, index.hold(#format("    case ", i, ": out->tag = ", i, "; ", g_read(c, g, ms[i], mo), " break;\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue dado_jw_", r, "(JSContext *ctx, ", ct, " v) {\n    JSValue a = ", rtn(c, "new_array"), "(ctx);\n    JSValue x = JS_UNDEFINED;\n    if (", rtn(c, "put"), "(ctx, a, 0, ", rtn(c, "give_int"), "(ctx, (int64_t)v.tag)) != 0) { return JS_EXCEPTION; }\n    switch (v.tag) {\n", index.hold(wr), "    default: break;\n    }\n    if (", rtn(c, "put"), "(ctx, a, 1, x) != 0) { return JS_EXCEPTION; }\n    return a;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jf_", r, "(JSContext *ctx, JSValue arr, ", ct, " v) {\n    (void)ctx; (void)arr; (void)v;\n    (void)ctx; (void)arr; (void)v;\n    return 0;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jr_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk) {\n    (void)ctx; (void)v; (void)out; (void)fn; (void)what; (void)path; (void)depth; (void)tk;\n    JSValue e;\n    int64_t k = 0;\n    int32_t c = ", rtn(c, "read_exactly"), "(ctx, v, 2, fn, what, path, depth);\n    if (c != 0) { return c; }\n    c = ", rtn(c, "element"), "(&e, ctx, v, 0);\n    if (c != 0) { return c; }\n    path[depth] = 0;\n    c = ", rtn(c, "read_int"), "(&k, ctx, e, fn, what, path, depth + 1);\n    ", rtn(c, "free_value"), "(ctx, e);\n    if (c != 0) { return c; }\n    c = ", rtn(c, "element"), "(&e, ctx, v, 1);\n    if (c != 0) { return c; }\n    path[depth] = 1;\n    switch (k) {\n", index.hold(rd), "    default: break;\n    }\n    ", rtn(c, "free_value"), "(ctx, e);\n    return c;\n}\n")))
+
+// Dado enum `t`'s writer (`want`: its name) or reader (`dado_jer_`): a
+// value crosses as the name of the member declared first with it, else as
+// its number; a name reads back as its value.
+string8 glue_enum(^C c, ^Glue g, u32 t, bool want):
+    u32 d = check.s_denum(c.w, t)
+    string8 wn = index.hold(#format("dado_jen_", d))
+    string8 rn = index.hold(#format("dado_jer_", d))
+    bool had = false
+    for x in g.enums:
+        if x == d: had = true
+    if !had:
+        g.enums = #append(g.enums, d)
+        ref []char8 ws
+        ref []char8 rs
+        ref []i64 seen
+        for key in c.w.order:
+            if u32(key >> 32) != d: continue
+            try u32 k = c.w.members[key] else: continue
+            if k == NONE: continue
+            i64 v = i64(c.w.k.w0[k])
+            string8 nm = check.name_of(c.w, u32(key & 0xFFFFFFFF))
+            gput(&rs, index.hold(#format("        if (s.len == ", #len(nm), " && dado_jename(s, \"", nm, "\")) { *out = ", v, "; }\n")))
+            bool dup = false
+            for q in seen:
+                if q == v: dup = true
+            if dup: continue
+            seen = #append(seen, v)
+            gput(&ws, index.hold(#format("    if (v == ", v, ") { return ", rtn(c, "give_string"), "(ctx, (dado_string){ .ptr = \"", nm, "\", .len = ", #len(nm), " }); }\n")))
+        if #len(g.enums) == 1: gput(&g.protos, "static DADO_SYMBOL(unused) int dado_jename(dado_string s, const char *n) { for (int64_t i = 0; i < s.len; i++) { if (((const char *)s.ptr)[i] != n[i]) { return 0; } } return 1; }\n")
+        gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) JSValue ", wn, "(JSContext *ctx, int64_t v);\nstatic DADO_SYMBOL(unused) int32_t ", rn, "(int64_t *out, JSContext *ctx, JSValue e, const char *fn, const char *what, int64_t *path, int32_t depth);\n")))
+        gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue ", wn, "(JSContext *ctx, int64_t v) {\n", index.hold(ws), "    return ", rtn(c, "give_int"), "(ctx, v);\n}\n")))
+        gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t ", rn, "(int64_t *out, JSContext *ctx, JSValue e, const char *fn, const char *what, int64_t *path, int32_t depth) {\n    if (JS_IsString(e)) {\n        ", ty(c, types.STRING8), " s;\n        int32_t c = ", rtn(c, "read_string"), "(&s, ctx, e, fn, what, path, depth);\n        if (c != 0) { return c; }\n        *out = 0;\n", index.hold(rs), "        ", rtn(c, "drop_string"), "(ctx, s);\n        return 0;\n    }\n    return ", rtn(c, "read_int"), "(out, ctx, e, fn, what, path, depth);\n}\n")))
+    return wn if want else rn
+
+// Everything run type `t` needs, written once.
+void glue_run(^C c, ^Glue g, u32 t):
+    u32 r = c.t.resolve(t)
+    for x in g.done:
+        if x == r: return
+    g.done = #append(g.done, r)
+    if !g.take_def:
+        g.take_def = true
+        string8 wd = ""
+        if check.seam_c(c.w, "drop_units") != NONE: wd = index.hold(#format("    for (int64_t i = 0; i < t->nw; i++) { dado_jwide x = t->wides[i]; if (x.k == 1) { ", rtn(c, "drop_units"), "(ctx, x.p); } else if (x.k == 2) { ", rtn(c, "drop_points"), "(ctx, x.p, x.n); } else { ", rtn(c, "drop_cstring"), "(ctx, x.p); } }\n"))
+        gput(&g.protos, index.hold(#format(TAKE_C, "static DADO_SYMBOL(unused) void dado_jtake_end(JSContext *ctx, dado_jtake *t) {\n    for (int64_t i = 0; i < t->ns; i++) { ", rtn(c, "drop_string"), "(ctx, t->strs[i]); }\n", wd, "    for (int64_t i = 0; i < t->nb; i++) { ", rtn(c, "unscratch"), "(ctx, t->blocks[i], t->sizes[i]); }\n    free(t->strs); free(t->wides); free(t->blocks); free(t->sizes);\n}\n")))
+    string8 ct0 = ty(c, r)
+    gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) JSValue dado_jw_", r, "(JSContext *ctx, ", ct0, " v);\nstatic DADO_SYMBOL(unused) int32_t dado_jr_", r, "(JSContext *ctx, JSValue v, ", ct0, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk);\n")))
+    gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jf_", r, "(JSContext *ctx, JSValue arr, ", ct0, " v);\n")))
+    if c.t.tag[r] == types.T_SOA:
+        glue_soa(c, g, r)
+        return
+    if c.t.tag[r] == types.T_UNION:
+        glue_union(c, g, r)
+        return
+    if check.s_tup(c.w, r):
+        glue_tup(c, g, r)
+        return
+    if c.t.tag[r] == types.T_MAP:
+        glue_map(c, g, r)
+        return
+    u32 e = g_elem(c, r)
+    u8 k = check.seam_kind(c.w, e, false)
+    string8 ct = ty(c, r)
+    string8 et = ty(c, e)
+    string8 el = index.hold(#format("((", et, " *)v.ptr)[i]"))
+    string8 give = g_give(c, g, e, el)
+    // The writer.
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue dado_jw_", r, "(JSContext *ctx, ", ct, " v) {\n    JSValue a = ", rtn(c, "new_array"), "(ctx);\n    for (int64_t i = 0; i < v.len; i++) {\n        if (", rtn(c, "put"), "(ctx, a, i, ", give, ") != 0) { return JS_EXCEPTION; }\n    }\n    return a;\n}\n")))
+    // The reader.
+    string8 rd = g_read(c, g, e, "p[i]")
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jr_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk) {\n    (void)ctx; (void)v; (void)out; (void)fn; (void)what; (void)path; (void)depth; (void)tk;\n    int64_t n = 0;\n    ", et, " *p = 0;\n    int32_t c = ", rtn(c, "read_length"), "(&n, ctx, v, fn, what, path, depth);\n    if (c != 0) { return c; }\n    c = ", rtn(c, "scratch"), "((void **)&p, ctx, (uint64_t)n * sizeof(", et, "));\n    if (c != 0) { return c; }\n    dado_jtake_block(tk, p, (uint64_t)n * sizeof(", et, "));\n    out->ptr = (void *)p;\n    out->len = n;\n    for (int64_t i = 0; i < n; i++) {\n        JSValue e;\n        c = ", rtn(c, "element"), "(&e, ctx, v, i);\n        if (c != 0) { return c; }\n        path[depth] = i;\n        ", rd, "\n        ", rtn(c, "free_value"), "(ctx, e);\n        if (c != 0) { return c; }\n    }\n    return 0;\n}\n")))
+    // The copy back, in place: an element run of the same length in place,
+    // one of another length replaced.
+    string8 back = index.hold(#format("c = ", rtn(c, "put_in"), "(ctx, arr, i, ", give, ");"))
+    if k == check.SK_RUN:
+        u32 er = c.t.resolve(e)
+        back = index.hold(#format("JSValue e; c = ", rtn(c, "element"), "(&e, ctx, arr, i); if (c != 0) { return c; }\n        if (", rtn(c, "array_length"), "(ctx, e) == ", el, ".len) { c = dado_jf_", er, "(ctx, e, ", el, "); ", rtn(c, "free_value"), "(ctx, e); }\n        else { ", rtn(c, "free_value"), "(ctx, e); c = ", rtn(c, "put_in"), "(ctx, arr, i, ", give, "); }"))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jf_", r, "(JSContext *ctx, JSValue arr, ", ct, " v) {\n    (void)ctx; (void)arr; (void)v;\n    for (int64_t i = 0; i < v.len; i++) {\n        int32_t c;\n        ", back, "\n        if (c != 0) { return c; }\n    }\n    return 0;\n}\n")))
+
+// A map's writer (a new `Map`), reader (built on the ambient; its keys'
+// text the map's own) and end (its table and inner maps freed); what Dado
+// writes into a script's map is not copied back.
+private void glue_map(^C c, ^Glue g, u32 r):
+    string8 m = map_ty(c, r)
+    u32 kt = c.t.a[r]
+    u32 vt = c.t.b[r]
+    string8 kc = ty(c, kt)
+    string8 ent = "t->e[i]"
+    gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) void dado_je_", r, "(", m, " *v);\n")))
+    string8 inner = ""
+    if c.t.tag[c.t.resolve(vt)] == types.T_MAP:
+        glue_run(c, g, vt)
+        inner = index.hold(#format("    if (v->t != 0) { for (int64_t i = 0; i < v->t->cap; i++) { if (v->t->e[i].state == 1) { dado_je_", c.t.resolve(vt), "(&v->t->e[i].value); } } }\n"))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue dado_jw_", r, "(JSContext *ctx, ", m, " v) {\n    JSValue a = ", rtn(c, "new_map"), "(ctx);\n    struct ", m, "__t *t = v.t;\n    if (t != 0) {\n        for (int64_t i = 0; i < t->cap; i++) {\n            if (t->e[i].state != 1) { continue; }\n            if (", rtn(c, "map_set"), "(ctx, a, ", g_give(c, g, kt, index.hold(#format(ent, ".key"))), ", ", g_give(c, g, vt, index.hold(#format(ent, ".value"))), ") != 0) { return JS_EXCEPTION; }\n        }\n    }\n    return a;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) void dado_je_", r, "(", m, " *v) {\n", inner, "    ", m, "__free(v);\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jf_", r, "(JSContext *ctx, JSValue arr, ", m, " v) {\n    (void)ctx; (void)arr; (void)v;\n    return 0;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jm_", r, "(JSContext *ctx, JSValue v, ", m, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk) {\n    (void)ctx; (void)v; (void)out; (void)fn; (void)what; (void)path; (void)depth; (void)tk;\n    JSValue e;\n    ", kc, " key;\n    ", ty(c, vt), " *at;\n    int32_t c = ", rtn(c, "read_exactly"), "(ctx, v, 2, fn, what, path, depth);\n    if (c != 0) { return c; }\n    c = ", rtn(c, "element"), "(&e, ctx, v, 0);\n    if (c != 0) { return c; }\n    path[depth] = 0;\n    ", g_read(c, g, kt, "key"), "\n    ", rtn(c, "free_value"), "(ctx, e);\n    if (c != 0) { return c; }\n    at = ", m, "__slot(out, key);\n    if (at == &", m, "__sink) { return ", rtn(c, "out_of_memory"), "(ctx); }\n    c = ", rtn(c, "element"), "(&e, ctx, v, 1);\n    if (c != 0) { return c; }\n    path[depth] = 1;\n    ", g_read(c, g, vt, "(*at)"), "\n    ", rtn(c, "free_value"), "(ctx, e);\n    return c;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jr_", r, "(JSContext *ctx, JSValue v, ", m, " *out, const char *fn, const char *what, int64_t *path, int32_t depth, dado_jtake *tk) {\n    (void)ctx; (void)v; (void)out; (void)fn; (void)what; (void)path; (void)depth; (void)tk;\n    JSValue entries, pair;\n    int64_t n = 0;\n    out->t = 0; if (out->alloc.s0 == 0) { out->alloc = dado_context; }\n    int32_t c = ", rtn(c, "map_entries"), "(&entries, ctx, v, fn, what, path, depth);\n    if (c != 0) { return c; }\n    c = ", rtn(c, "read_length"), "(&n, ctx, entries, fn, what, path, depth);\n    for (int64_t i = 0; c == 0 && i < n; i++) {\n        c = ", rtn(c, "element"), "(&pair, ctx, entries, i);\n        if (c != 0) { break; }\n        path[depth] = i;\n        c = dado_jm_", r, "(ctx, pair, out, fn, what, path, depth + 1, tk);\n        ", rtn(c, "free_value"), "(ctx, pair);\n    }\n    ", rtn(c, "free_value"), "(ctx, entries);\n    return c;\n}\n")))
+
+// How deep run type `t` nests: the length of its reader's path.
+i64 glue_depth(^C c, u32 t):
+    u32 r = c.t.resolve(t)
+    if c.t.tag[r] == types.T_MAP: return 2 + glue_depth(c, c.t.b[r])
+    if c.t.tag[r] == types.T_UNION:
+        i64 ud = 0
+        for x in c.t.list(r):
+            if glue_depth(c, x) > ud: ud = glue_depth(c, x)
+        return 1 + ud
+    u32 e = g_elem(c, r)
+    if check.s_tup(c.w, r):
+        i64 d = 0
+        for x in c.t.slots(r):
+            if glue_depth(c, x) > d: d = glue_depth(c, x)
+        return 1 + d
+    if e == NONE: return 0
+    return 1 + glue_depth(c, e)
+
+// What a thunk's readers took (blocks, strings), given back once the call
+// is over, whatever Dado stored over it (Rust's `Take`).
+private const string8 TAKE_C = "#ifndef DADO_WEB\n#include <stdlib.h>\n#endif\ntypedef struct { int32_t k; void *p; int64_t n; } dado_jwide;\ntypedef struct { void **blocks; uint64_t *sizes; int64_t nb; dado_string *strs; int64_t ns; dado_jwide *wides; int64_t nw; } dado_jtake;\nstatic DADO_SYMBOL(unused) void dado_jtake_block(dado_jtake *t, void *p, uint64_t n) {\n    if (p == 0) { return; }\n    t->blocks = (void **)realloc(t->blocks, (size_t)(t->nb + 1) * sizeof(void *));\n    t->sizes = (uint64_t *)realloc(t->sizes, (size_t)(t->nb + 1) * sizeof(uint64_t));\n    t->blocks[t->nb] = p; t->sizes[t->nb] = n; t->nb++;\n}\nstatic DADO_SYMBOL(unused) void dado_jtake_str(dado_jtake *t, dado_string s) {\n    t->strs = (dado_string *)realloc(t->strs, (size_t)(t->ns + 1) * sizeof(dado_string));\n    t->strs[t->ns++] = s;\n}\nstatic DADO_SYMBOL(unused) void dado_jtake_wide(dado_jtake *t, int32_t k, void *p, int64_t n) {\n    if (p == 0) { return; }\n    t->wides = (dado_jwide *)realloc(t->wides, (size_t)(t->nw + 1) * sizeof(dado_jwide));\n    t->wides[t->nw].k = k; t->wides[t->nw].p = p; t->wides[t->nw].n = n; t->nw++;\n}\n"
+
+// A run helper's C signature.
+private string8 hrun_sig(^C c, i64 k):
+    check.HRun x = c.w.hruns[k]
+    ref []char8 o
+    string8 ac = ""
+    if x.ans != NONE: ac = ty(c, x.ans)
+    if x.tried: gput(&o, "int32_t ")
+    else if x.ans != NONE: gput(&o, index.hold(#format(ac, " ")))
+    else: gput(&o, "void ")
+    gput(&o, index.hold(#format("dado_hrun_", k, "(")))
+    if x.tried && x.ans != NONE: gput(&o, index.hold(#format(ac, " *out, ")))
+    gput(&o, "void *s")
+    for i in 0..<#len(x.tys):
+        gput(&o, index.hold(#format(", ", ty(c, x.tys[i]), " a", i)))
+    gput(&o, ")")
+    return index.hold(o)
+
+// The run helpers' prototypes, for every unit.
+string8 hrun_protos(^C c):
+    ref []char8 o
+    for k in 0..<#len(c.w.hruns):
+        gput(&o, index.hold(#format(hrun_sig(c, k), ";\n")))
+    return index.hold(o)
+
+// Each run helper: enters the engine first and builds nothing before it
+// has, pushes each argument made in it, calls, reads the answer while
+// still entered, leaves; untried, a failure answers the zero value where
+// the VM goes on (`quit_untried`).
+string8 hrun_defs(^C c, ^Glue g):
+    ref []char8 o
+    for k in 0..<#len(c.w.hruns):
+        check.HRun x = c.w.hruns[k]
+        if x.fn_:
+            hfn_def(c, &o, k)
+            continue
+        string8 cn = check.name_of(c.w, c.w.decls[c.w.classes[x.ci].decl].name)
+        string8 pk = check.name_of(c.w, c.w.p.pkgs[c.w.decls[c.w.classes[x.ci].decl].pkg].name)
+        string8 lab = index.hold(#format(cn, ".", x.entry))
+        string8 ac = ""
+        string8 zero = ""
+        if x.made:
+            ac = "void *"
+            zero = "((void *)0)"
+        else if x.ans != NONE:
+            ac = ty(c, x.ans)
+            u32 ar = c.t.resolve(x.ans)
+            zero = index.hold(#format("(", ac, ")0"))
+            if c.t.tag[ar] == types.T_REF || c.t.tag[ar] == types.T_TUPLE || c.t.tag[ar] == types.T_MAP || c.t.tag[ar] == types.T_UNION: zero = index.hold(#format("(", ac, "){0}"))
+        gput(&o, index.hold(#format(hrun_sig(c, k), " {\n    JSContext *cx = ((void *)0);\n")))
+        if x.made: gput(&o, index.hold(#format("    int32_t code = ", rtn(c, "begin_new"), "(&cx, s, \"", pk, "/", cn, "\");\n")))
+        else: gput(&o, index.hold(#format("    int32_t code = ", rtn(c, "begin_run"), "(&cx, s);\n")))
+        if #len(ac) > 0: gput(&o, index.hold(#format("    ", ac, " answer = ", zero, ";\n")))
+        gput(&o, "    if (code == 0) {\n")
+        ref []char8 lend
+        ref []char8 lback
+        ref []char8 lfree
+        ref []i64 lq
+        ref []u32 lr
+        for i in 0..<#len(x.tys):
+            u32 st = x.sts[i]
+            string8 a = index.hold(#format("a", i))
+            string8 v = index.hold(#format(rtn(c, "give_int"), "(cx, (int64_t)(", a, "))"))
+            u32 se = check.s_erase(c.w, st)
+            if check.s_denum(c.w, st) != NONE: v = index.hold(#format(glue_enum(c, g, st, true), "(cx, (int64_t)(", a, "))"))
+            else if check.union_of(c.w, st) != NONE && check.s_tdecl(c.w, st) != NONE:
+                // A script's union: the pair of the member Dado's value crosses into.
+                i64 mi = check.s_umember(c.w, st, x.tys[i])
+                gput(&o, index.hold(#format("        JSValue p", i, " = ", rtn(c, "new_array"), "(cx);\n        (void)", rtn(c, "put"), "(cx, p", i, ", 0, ", rtn(c, "give_int"), "(cx, ", mi, "));\n        (void)", rtn(c, "put"), "(cx, p", i, ", 1, ", index.hold(strings.replace(g_give(c, g, x.tys[i], a), "(ctx,", "(cx,")), ");\n")))
+                v = index.hold(#format("p", i))
+            else if check.union_of(c.w, st) != NONE:
+                u32 ur = c.t.resolve(x.tys[i])
+                glue_run(c, g, ur)
+                v = index.hold(#format("dado_jw_", ur, "(cx, ", a, ")"))
+            st = se
+            if st == u32(types.P_FLOAT): v = index.hold(#format(rtn(c, "give_float"), "(cx, (double)(", a, "))"))
+            if st == u32(types.P_BOOL): v = index.hold(#format(rtn(c, "give_bool"), "(cx, ", a, ")"))
+            if st == c.w.sstr: v = index.hold(#format(rtn(c, "give_string"), "(cx, ", a, ")"))
+            u32 wr = c.t.resolve(x.tys[i])
+            if st == c.w.sstr && (wr == types.STRING16 || wr == types.STRING32 || wr == types.CSTRING): v = wide_give(c, wr, a, "cx")
+            u8 sk = check.s_kind(c.w, st)
+            if check.s_fn(c.w, st): v = index.hold(#format(g_fnval(c, g, c.t.resolve(x.tys[i])), "(cx, ", a, ")"))
+            if check.s_tup(c.w, st) || sk == 1 || sk == 2:
+                u32 rr = c.t.resolve(x.tys[i])
+                string8 ap = index.hold(#format("&", a))
+                // A map comes by its address: its table may move.
+                if sk == 2:
+                    rr = c.t.resolve(c.t.a[rr])
+                    ap = a
+                glue_run(c, g, rr)
+                // The run's own C type: a tag over it is another struct of one layout.
+                if sk != 2: ap = index.hold(#format("(", ty(c, rr), " *)&", a))
+                v = index.hold(#format("dado_jw_", rr, "(cx, *(", ty(c, rr), " *)", ap, ")"))
+                if sk != 2: v = index.hold(#format("dado_jw_", rr, "(cx, ", jpun(ty(c, x.tys[i]), ty(c, rr), a), ")"))
+                if glue_lend(c, g, rr):
+                    // Lent: what the script writes comes back (Rust's lend lock);
+                    // one storage passed twice is one array.
+                    string8 an = index.hold(strings.replace(index.hold(strings.replace(x.srcs[i], "\\", "\\\\")), "\"", "\\\""))
+                    string8 same = ""
+                    for q in 0..<#len(lq):
+                        if lr[q] != rr || check.s_tup(c.w, rr): continue
+                        string8 cond = index.hold(#format("a", lq[q], " == a", i))
+                        if sk == 1: cond = index.hold(#format("a", lq[q], ".ptr == a", i, ".ptr && a", lq[q], ".len == a", i, ".len"))
+                        same = index.hold(#format("if (", cond, ") { d", i, " = 1; j", i, " = ", rtn(c, "dup_value"), "(cx, j", lq[q], "); } else "))
+                    gput(&o, index.hold(#format("        JSValue j", i, "; int32_t d", i, " = 0;\n        ", same, "{ j", i, " = ", v, "; }\n        ", rtn(c, "push_value"), "(cx, ", rtn(c, "dup_value"), "(cx, j", i, "));\n        struct dado_glue_lend l", i, " = { dado_jl_", rr, ", 0, (void *)", ap, ", cx, 0, 0, 0, (void *)&j", i, ", \"", lab, "\", \"argument `", an, "`\" };\n")))
+                    if #len(lq) == 0: gput(&o, index.hold(#format("        void *lent = ", rtn(c, "lend_host"), "(cx, &l", i, ");\n")))
+                    else: gput(&o, index.hold(#format("        if (!d", i, ") { (void)", rtn(c, "lend_host"), "(cx, &l", i, "); }\n")))
+                    gput(&lend, index.hold(#format("        int32_t w", i, " = !d", i, " && (l", i, ".code == 1 || (l", i, ".code == 0 && l", i, ".settled && dado_jsum_", rr, "(", ap, ", 14695981039346656037u) != l", i, ".h));\n        if (w", i, " && code == 0) { code = ", rtn(c, "lent_changed"), "(cx, \"", lab, "\", \"", an, "\"); }\n")))
+                    gput(&lback, index.hold(#format("        if (!d", i, " && !w", i, " && JS_VALUE_GET_TAG(j", i, ") != JS_TAG_EXCEPTION) { int64_t bp[8]; int32_t c", i, " = dado_jb_", rr, "(cx, j", i, ", ", ap, ", \"", lab, "\", \"argument `", an, "`\", bp, 0); if (c", i, " != 0) { if (code == 0) { code = ", rtn(c, "lent_refused"), "(cx, \"", lab, "\", \"", an, "\", c", i, "); } else { ", rtn(c, "clear_exception"), "(cx); } } }\n")))
+                    gput(&lfree, index.hold(#format("        ", rtn(c, "free_value"), "(cx, j", i, ");\n")))
+                    lq = #append(lq, i)
+                    lr = #append(lr, rr)
+                    continue
+            gput(&o, index.hold(#format("        ", rtn(c, "push_value"), "(cx, ", v, ");\n")))
+        if x.made: gput(&o, index.hold(#format("        code = ", rtn(c, "construct_entered"), "(&answer, cx, \"", pk, "/", cn, "\", \"", jid(cn), "\");\n")))
+        else: gput(&o, index.hold(#format("        code = ", rtn(c, "call_entered"), "(s, \"", x.entry, "\");\n")))
+        if #len(lend) > 0:
+            gput(&o, index.hold(#format("        ", rtn(c, "unlend_host"), "(cx, lent);\n")))
+            gput(&o, index.hold(lend))
+            gput(&o, index.hold(lback))
+            gput(&o, index.hold(lfree))
+        if !x.made && x.ans != NONE && x.sans != NONE:
+            u32 sa = x.sans
+            string8 af = ""
+            if sa == u32(types.P_INT): af = "answer_int"
+            if sa == u32(types.P_FLOAT): af = "answer_float"
+            if sa == u32(types.P_BOOL): af = "answer_bool"
+            if sa == c.w.sstr: af = "answer_string"
+            u32 tr = c.t.resolve(x.ans)
+            if check.s_denum(c.w, sa) != NONE: gput(&o, index.hold(#format("        if (code == 0) {\n            int64_t path[1]; int64_t x = 0;\n            int32_t c = ", glue_enum(c, g, sa, false), "(&x, cx, ", rtn(c, "answer_of"), "(cx), \"", lab, "\", \"answer\", path, 0);\n            if (c != 0) { code = ", rtn(c, "answer_refused"), "(cx, c); } else { answer = (", ty(c, x.ans), ")x; }\n        }\n")))
+            else if #len(af) > 0: gput(&o, index.hold(#format("        if (code == 0) { code = ", rtn(c, af), "(&answer, cx); }\n")))
+            else if check.s_tup(c.w, tr) || c.t.tag[tr] == types.T_MAP || c.t.tag[tr] == types.T_UNION:
+                glue_run(c, g, tr)
+                gput(&o, index.hold(#format("        if (code == 0) {\n            int64_t path[", glue_depth(c, tr), "]; dado_jtake tk = {0};\n            int32_t c = dado_jr_", tr, "(cx, ", rtn(c, "answer_of"), "(cx), &answer, \"", lab, "\", \"answer\", path, 0, &tk);\n            dado_jtake_end(cx, &tk);\n            if (c != 0) { code = ", rtn(c, "answer_refused"), "(cx, c); }\n        }\n")))
+            else:
+                u32 ar = c.t.resolve(x.ans)
+                glue_owned(c, g, ar)
+                gput(&o, index.hold(#format("        if (code == 0) {\n            int64_t path[", glue_depth(c, ar), "];\n            int32_t c = dado_jo_", ar, "(cx, ", rtn(c, "answer_of"), "(cx), &answer, \"", lab, "\", \"answer\", path, 0);\n            if (c != 0) { code = ", rtn(c, "answer_refused"), "(cx, c); }\n        }\n")))
+        gput(&o, index.hold(#format("        ", rtn(c, "end_run"), "(cx);\n    }\n")))
+        if x.tried:
+            if #len(ac) > 0: gput(&o, "    if (code == 0) { *out = answer; }\n")
+            gput(&o, "    return code;\n}\n")
+        else:
+            string8 reset = ""
+            if #len(ac) > 0: reset = index.hold(#format(" answer = ", zero, ";"))
+            if x.ready: gput(&o, index.hold(#format("    if (code != 0) { answer = (int64_t)", rtn(c, "exit_status"), "(code); }\n")))
+            else: gput(&o, index.hold(#format("    if (code != 0) { ", rtn(c, "quit_untried"), "(s, \"", x.entry, "\", \"", "#script_new" if x.made else "call", "\", code);", reset, " }\n")))
+            if #len(ac) > 0: gput(&o, "    return answer;\n")
+            gput(&o, "}\n")
+    return index.hold(o)
+
+// A reader of a script's array into a new `ref []U` on the ambient
+// allocator: an answer Dado owns (scalar elements).
+void glue_owned(^C c, ^Glue g, u32 r):
+    for x in g.done:
+        if x == r + 0x80000000: return
+    g.done = #append(g.done, r + 0x80000000)
+    u32 e = g_elem(c, r)
+    u8 k = check.seam_kind(c.w, e, false)
+    string8 et = ty(c, e)
+    string8 rf = "read_int"
+    string8 tmp = "int64_t"
+    if k == check.SK_FLOAT:
+        rf = "read_float"
+        tmp = "double"
+    if k == check.SK_BOOL:
+        rf = "read_bool"
+        tmp = ty(c, u32(types.P_BOOL))
+    // A string or an inner run: Dado's own too.
+    string8 rd = index.hold(#format("c = ", rtn(c, rf), "(&x, ctx, e, fn, what, path, depth + 1)"))
+    if check.seam_kind(c.w, e, true) == check.SK_OWNED:
+        tmp = et
+        rd = index.hold(#format("c = ", rtn(c, "read_owned_string"), "(&x, ctx, e, fn, what, path, depth + 1)"))
+    else if c.t.tag[c.t.resolve(e)] == types.T_REF:
+        glue_owned(c, g, c.t.resolve(e))
+        tmp = et
+        rd = index.hold(#format("c = dado_jo_", c.t.resolve(e), "(ctx, e, &x, fn, what, path, depth + 1)"))
+    string8 cx = index.hold(#format("(", et, ")x"))
+    if tmp == et: cx = "x"
+    gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jo_", r, "(JSContext *ctx, JSValue v, dado_ref *out, const char *fn, const char *what, int64_t *path, int32_t depth);\n")))
+    // Zeroed: gcc -O2 cannot see the reader sets it when it answers 0.
+    string8 zx = "{0}" if strings.starts_with(tmp, "dado_") && !strings.contains(tmp, "*") else "0"
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jo_", r, "(JSContext *ctx, JSValue v, dado_ref *out, const char *fn, const char *what, int64_t *path, int32_t depth) {\n    int64_t n = 0;\n    int32_t c = ", rtn(c, "read_length"), "(&n, ctx, v, fn, what, path, depth);\n    if (c != 0) { return c; }\n    ", et, " *p = (", et, " *)dado_context.s0(dado_context.s1, 0, (uint64_t)(n ? n : 1) * sizeof(", et, "), DADO_MAX_ALIGN, 0, 0);\n    if (p == 0) { return ", rtn(c, "out_of_memory"), "(ctx); }\n    for (int64_t i = 0; i < n; i++) {\n        JSValue e;\n        c = ", rtn(c, "element"), "(&e, ctx, v, i);\n        if (c == 0) {\n            ", tmp, " x = ", zx, ";\n            path[depth] = i;\n            ", rd, ";\n            ", rtn(c, "free_value"), "(ctx, e);\n            p[i] = ", cx, ";\n        }\n        if (c != 0) { dado_context.s0(dado_context.s1, 2, 0, 0, p, (uint64_t)(n ? n : 1) * sizeof(", et, ")); return c; }\n    }\n    out->ptr = p;\n    out->len = n;\n    out->alloc = dado_context;\n    out->cap = (uint32_t)n;\n    return 0;\n}\n")))
+
+// A package function's helper (Rust's `dado_fn_call_`): pushes, then
+// `call_function_*`, direct or through the seam; untried, a failure ends
+// the program.
+private void hfn_def(^C c, ^ref []char8 o, i64 k):
+    check.HRun x = c.w.hruns[k]
+    string8 cn = check.name_of(c.w, c.w.decls[c.w.classes[x.ci].decl].name)
+    string8 pk = check.name_of(c.w, c.w.p.pkgs[c.w.decls[c.w.classes[x.ci].decl].pkg].name)
+    // The compiler's index for the function: its order of first call.
+    ref []u32 seen
+    for y in c.w.hruns:
+        if !y.fn_: continue
+        if y.fm == x.fm: break
+        bool had = false
+        for z in seen:
+            if z == y.fm: had = true
+        if !had: seen = #append(seen, y.fm)
+    i64 idx = #len(seen)
+    string8 ac = ""
+    string8 cf = "call_function"
+    if x.ans != NONE:
+        ac = ty(c, x.ans)
+        u32 sa = x.sans
+        if sa == u32(types.P_INT): cf = "call_function_int"
+        if sa == u32(types.P_FLOAT): cf = "call_function_float"
+        if sa == u32(types.P_BOOL): cf = "call_function_bool"
+        if sa == c.w.sstr: cf = "call_function_string"
+    gput(o, index.hold(#format(hrun_sig(c, k), " {\n    (void)s;\n")))
+    if #len(ac) > 0:
+        string8 zero = index.hold(#format("(", ac, ")0"))
+        if c.t.tag[c.t.resolve(x.ans)] == types.T_REF: zero = index.hold(#format("(", ac, "){0}"))
+        gput(o, index.hold(#format("    ", ac, " answer = ", zero, ";\n")))
+    for i in 0..<#len(x.tys):
+        u32 st = x.sts[i]
+        string8 pf = "push_int"
+        if st == u32(types.P_FLOAT): pf = "push_float"
+        if st == u32(types.P_BOOL): pf = "push_bool"
+        if st == c.w.sstr: pf = "push_string"
+        gput(o, index.hold(#format("    ", rtn(c, pf), "((void *)0, a", i, ");\n")))
+    string8 oa = "&answer, " if #len(ac) > 0 else ""
+    gput(o, index.hold(#format("    int32_t code = ", rtn(c, cf), "(", oa, "dado_js__modules, dado_js__bound, ((void *)0), ", idx, ", \"", pk, "/", cn, "\", \"", jid(cn), "\", \"", x.entry, "\", ", "1" if fn_seam(c, x.fm) else "0", ");\n")))
+    if x.tried:
+        if #len(ac) > 0: gput(o, "    if (code == 0) { *out = answer; }\n")
+        gput(o, "    return code;\n}\n")
+        return
+    gput(o, index.hold(#format("    if (code != 0) { fprintf(stderr, \"script: `", x.label, "` failed with code %lld, and no `try` was written around it, so the program ends\\n\", (long long)code); abort(); }\n")))
+    if #len(ac) > 0: gput(o, "    return answer;\n")
+    gput(o, "}\n")
+
+// Whether package function `m` reads a VM's state (Rust's
+// `reads_vm_state`): prints, calls Dado or another method, makes or reads
+// an instance.
+private bool fn_seam(^C c, u32 m):
+    for i in 0..<#len(c.w.fns):
+        if c.w.jobs[i].decl != m: continue
+        ^ir.Fn f = &c.w.fns[i]
+        for j in 0..<#len(f.op):
+            u8 op = f.op[j]
+            u8 sb = f.sub[j]
+            if op == ir.O_CALL: return true
+            if op == ir.O_INTRINSIC && (sb == check.B_PRINT || sb == check.B_PRINTLN || sb == check.B_SDADO || sb == check.B_SNEW || sb >= check.B_SIG_CONNECT && sb <= check.B_SIG_EMIT): return true
+        for p in 0..<#len(f.root):
+            for q in f.plo[p]..<f.phi[p]:
+                if f.step[q] == ir.ST_FIELD: return true
+    return false
+
+// A run of scalars lent to a script (Rust's lend lock): its fingerprint
+// (`dado_jsum_`), the copy of the script's writes back into it in place
+// (`dado_jb_`), and `settle`, which the runtime calls when the script calls
+// back into Dado; false for other runs, which are copied in alone.
+// A script's run lent Dado by a thunk (scalars): its fingerprint read from
+// the script's array (`dado_jsh_`), and `settle`: Dado's writes copied in.
+bool glue_slend(^C c, ^Glue g, u32 r):
+    u8 ek = check.seam_kind(c.w, g_elem(c, r), false)
+    if c.t.tag[r] != types.T_SLICE || ek != check.SK_INT && ek != check.SK_FLOAT && ek != check.SK_BOOL || !glue_lend(c, g, r): return false
+    for x in g.done:
+        if x == r + 0x60000000: return true
+    g.done = #append(g.done, r + 0x60000000)
+    u8 k = check.seam_kind(c.w, g_elem(c, r), false)
+    string8 rd = index.hold(#format("int64_t x = 0; c = ", rtn(c, "read_int"), "(&x, ctx, e, \"\", \"\", path, 1); h = ", rtn(c, "mix"), "(h, (uint64_t)x);"))
+    if k == check.SK_FLOAT: rd = index.hold(#format("union { double d; uint64_t u; } q; q.d = 0; c = ", rtn(c, "read_float"), "(&q.d, ctx, e, \"\", \"\", path, 1); h = ", rtn(c, "mix"), "(h, q.u);"))
+    if k == check.SK_BOOL: rd = index.hold(#format(ty(c, u32(types.P_BOOL)), " x = 0; c = ", rtn(c, "read_bool"), "(&x, ctx, e, \"\", \"\", path, 1); h = ", rtn(c, "mix"), "(h, (uint64_t)x);"))
+    string8 ct = ty(c, r)
+    gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsh_", r, "(JSContext *ctx, JSValue v);\nstatic DADO_SYMBOL(unused) void dado_js_", r, "(void *p, int32_t phase);\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsh_", r, "(JSContext *ctx, JSValue v) {\n    int64_t n = ", rtn(c, "array_length"), "(ctx, v); int64_t path[1]; uint64_t h = ", rtn(c, "mix"), "(14695981039346656037u, (uint64_t)n);\n    for (int64_t i = 0; i < n; i++) {\n        JSValue e; int32_t c = ", rtn(c, "element"), "(&e, ctx, v, i);\n        if (c != 0) { ", rtn(c, "clear_exception"), "(ctx); return h + 1; }\n        ", rd, "\n        ", rtn(c, "free_value"), "(ctx, e);\n        if (c != 0) { ", rtn(c, "clear_exception"), "(ctx); h += 1; }\n    }\n    return h;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) void dado_js_", r, "(void *p, int32_t phase) {\n    struct dado_glue_lend *l = p;\n    if (l->code != 0) { return; }\n    JSValue a = *(JSValue *)l->mirror;\n    if (phase == 0) { if (l->settled && dado_jsh_", r, "(l->ctx, a) != l->h) { l->code = 1; } return; }\n    if (phase == 1) { if (dado_jf_", r, "(l->ctx, a, *(", ct, " *)l->value) != 0) { ", rtn(c, "clear_exception"), "(l->ctx); l->code = 2; } return; }\n    l->h = dado_jsh_", r, "(l->ctx, a);\n    l->settled = 1;\n}\n")))
+    return true
+
+// Whether Dado part `t` comes back from a script's writes: a scalar, a
+// string (a view refuses a write; a `ref([]char8)` takes its new text on
+// its own allocator), and runs, shapes and maps of them.
+private bool g_lendable(^C c, u32 t):
+    u32 r = c.t.resolve(t)
+    u8 k = check.seam_kind(c.w, r, false)
+    if k == check.SK_INT || k == check.SK_FLOAT || k == check.SK_BOOL || k == check.SK_STR: return true
+    if r == c.t.ref_of(c.t.slice_of(u32(types.P_CHAR8))): return true
+    if c.t.tag[r] == types.T_MAP:
+        u8 vk = check.seam_kind(c.w, c.t.b[r], false)
+        return vk == check.SK_INT || vk == check.SK_FLOAT || vk == check.SK_BOOL || vk == check.SK_STR
+    if c.t.tag[r] == types.T_SLICE: return g_lendable(c, c.t.a[r])
+    if check.s_tup(c.w, r):
+        for x in c.t.slots(r):
+            if !g_lendable(c, x): return false
+        return true
+    return false
+
+// `h` mixed with part `p` (of Dado type `t`), for a fingerprint.
+private string8 g_sum(^C c, ^Glue g, u32 t, string8 p):
+    u32 r = c.t.resolve(t)
+    if r == c.t.ref_of(c.t.slice_of(u32(types.P_CHAR8))): return index.hold(#format(rtn(c, "mix_string"), "(h, (dado_string){ (const char *)(", p, ").ptr, (", p, ").len })"))
+    u8 k = check.seam_kind(c.w, r, false)
+    if k == check.SK_RUN || k == check.SK_TUP || k == check.SK_MAP:
+        _ = glue_lend(c, g, r)
+        return index.hold(#format("dado_jsum_", r, "(&", p, ", h)"))
+    return g_mix(c, r, p)
+
+// What the script wrote at `e` (path at `depth + 1`) back into part `p`.
+private string8 g_back(^C c, ^Glue g, u32 t, string8 p):
+    u32 r = c.t.resolve(t)
+    string8 at = "ctx, e, fn, what, path, depth + 1"
+    if r == c.t.ref_of(c.t.slice_of(u32(types.P_CHAR8))):
+        return index.hold(#format("{ dado_string t; c = ", rtn(c, "read_string"), "(&t, ", at, "); if (c == 0) { int32_t same = t.len == (int64_t)(", p, ").len; for (int64_t k = 0; same && k < t.len; k++) { same = (uint8_t)t.ptr[k] == ((uint8_t *)(", p, ").ptr)[k]; } if (!same) { dado_alloc a = (", p, ").alloc; if (a.s0 == 0) { a = dado_context; } uint8_t *b = 0; if (t.len > 0) { b = (uint8_t *)a.s0(a.s1, 0, (uint64_t)t.len, DADO_MAX_ALIGN, 0, 0); if (b == 0) { ", rtn(c, "drop_string"), "(ctx, t); return ", rtn(c, "out_of_memory"), "(ctx); } for (int64_t k = 0; k < t.len; k++) { b[k] = (uint8_t)t.ptr[k]; } } if ((", p, ").ptr != 0) { (void)(", p, ").alloc.s0((", p, ").alloc.s1, 2, 0, 0, (void *)(", p, ").ptr, (uint64_t)(", p, ").cap); } (", p, ").ptr = (void *)b; (", p, ").len = t.len; (", p, ").cap = (uint32_t)t.len; (", p, ").alloc = a; } ", rtn(c, "drop_string"), "(ctx, t); } }"))
+    u8 k = check.seam_kind(c.w, r, false)
+    if k == check.SK_STR: return index.hold(#format("c = ", rtn(c, "read_same_string"), "(ctx, e, ", p, ", fn, what, path, depth + 1);"))
+    if k == check.SK_RUN || k == check.SK_TUP || k == check.SK_MAP:
+        _ = glue_lend(c, g, r)
+        return index.hold(#format("c = dado_jb_", r, "(ctx, e, &", p, ", fn, what, path, depth + 1);"))
+    string8 rf = "read_int"
+    string8 tmp = "int64_t"
+    if k == check.SK_FLOAT:
+        rf = "read_float"
+        tmp = "double"
+    if k == check.SK_BOOL:
+        rf = "read_bool"
+        tmp = ty(c, u32(types.P_BOOL))
+    return index.hold(#format("{ ", tmp, " t; c = ", rtn(c, rf), "(&t, ", at, "); if (c == 0) { ", p, " = (", ty(c, r), ")t; } }"))
+
+// Run, shape or map `r` lent to a script (Rust's lend lock): its
+// fingerprint (`dado_jsum_`), the copy of the script's writes back in place
+// (`dado_jb_`), and `settle`, which the runtime calls when the script calls
+// back into Dado; false when it is copied in alone.
+bool glue_lend(^C c, ^Glue g, u32 r):
+    if !g_lendable(c, r) || c.t.tag[r] != types.T_MAP && c.t.tag[r] != types.T_SLICE && !check.s_tup(c.w, r): return false
+    for x in g.done:
+        if x == r + 0x40000000: return true
+    g.done = #append(g.done, r + 0x40000000)
+    if !g.lend_def:
+        g.lend_def = true
+        gput(&g.protos, "struct dado_glue_lend { void (*settle)(void *, int32_t); void *next; void *value; JSContext *ctx; uint64_t h; int32_t settled; int32_t code; void *mirror; const char *function; const char *what; };\n")
+    string8 ct = ty(c, r)
+    string8 fnv = "14695981039346656037u"
+    gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsum_", r, "(", ct, " *v, uint64_t h);\nstatic DADO_SYMBOL(unused) int32_t dado_jb_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth);\nstatic DADO_SYMBOL(unused) void dado_jl_", r, "(void *p, int32_t phase);\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) void dado_jl_", r, "(void *p, int32_t phase) {\n    struct dado_glue_lend *l = p;\n    if (l->code != 0) { return; }\n    ", ct, " *v = (", ct, " *)l->value;\n    if (phase == 0) { if (l->settled && dado_jsum_", r, "(v, ", fnv, ") != l->h) { l->code = 1; } return; }\n    if (phase == 1) { int64_t path[8]; if (dado_jb_", r, "(l->ctx, *(JSValue *)l->mirror, v, l->function, l->what, path, 0) != 0) { ", rtn(c, "clear_exception"), "(l->ctx); l->code = 2; } return; }\n    l->h = dado_jsum_", r, "(v, ", fnv, ");\n    l->settled = 1;\n}\n")))
+    if c.t.tag[r] == types.T_MAP:
+        glue_lend_map(c, g, r)
+        return true
+    if c.t.tag[r] == types.T_SOA:
+        u32 sr = c.t.resolve(c.t.a[r])
+        _ = glue_lend(c, g, sr)
+        string8 st = ty(c, sr)
+        gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsum_", r, "(", ct, " *v, uint64_t h) {\n    ", st, " t;\n", soa_moves(c, r, "v->", "t", true), "    return dado_jsum_", sr, "(&t, h);\n}\n")))
+        gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jb_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth) {\n    ", st, " t;\n", soa_moves(c, r, "out->", "t", true), "    int32_t c = dado_jb_", sr, "(ctx, v, &t, fn, what, path, depth);\n", soa_moves(c, r, "out->", "t", false), "    return c;\n}\n")))
+        return true
+    if check.s_tup(c.w, r):
+        []u32 ss = c.t.slots(r)
+        ref []char8 sm
+        ref []char8 bk
+        for i in 0..<#len(ss):
+            string8 mb = member(c, r, u32(i))
+            string8 p = index.hold(#format("out->", mb[1..<#len(mb)]))
+            string8 q = index.hold(#format("v->", mb[1..<#len(mb)]))
+            gput(&sm, index.hold(#format("    h = ", g_sum(c, g, ss[i], q), ";\n")))
+            gput(&bk, index.hold(#format("    c = ", rtn(c, "element"), "(&e, ctx, v, ", i, ");\n    if (c != 0) { return c; }\n    path[depth] = ", i, ";\n    ", g_back(c, g, ss[i], p), "\n    ", rtn(c, "free_value"), "(ctx, e);\n    if (c != 0) { return c; }\n")))
+        gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsum_", r, "(", ct, " *v, uint64_t h) {\n", index.hold(sm), "    return h;\n}\n")))
+        gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jb_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth) {\n    JSValue e;\n    int32_t c = ", rtn(c, "read_exactly"), "(ctx, v, ", #len(ss), ", fn, what, path, depth);\n    if (c != 0) { return c; }\n", index.hold(bk), "    return 0;\n}\n")))
+        return true
+    u32 e = c.t.a[r]
+    string8 el = index.hold(#format("((", ty(c, e), " *)v->ptr)[i]"))
+    string8 ol = index.hold(#format("((", ty(c, e), " *)out->ptr)[i]"))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsum_", r, "(", ct, " *v, uint64_t h) {\n    h = ", rtn(c, "mix"), "(h, (uint64_t)v->len);\n    for (int64_t i = 0; i < v->len; i++) { h = ", g_sum(c, g, e, el), "; }\n    return h;\n}\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jb_", r, "(JSContext *ctx, JSValue v, ", ct, " *out, const char *fn, const char *what, int64_t *path, int32_t depth) {\n    int32_t c = ", rtn(c, "read_same_length"), "(ctx, v, (int64_t)out->len, fn, what, path, depth);\n    if (c != 0) { return c; }\n    for (int64_t i = 0; i < out->len; i++) {\n        JSValue e;\n        c = ", rtn(c, "element"), "(&e, ctx, v, i);\n        if (c != 0) { return c; }\n        path[depth] = i;\n        ", g_back(c, g, e, ol), "\n        ", rtn(c, "free_value"), "(ctx, e);\n        if (c != 0) { return c; }\n    }\n    return 0;\n}\n")))
+    return true
+
+// A map lent to a script: its fingerprint, and the copy back of what the
+// script wrote, cleared and rebuilt in its own table while the entries fit,
+// else a new table; a map of views refuses a write.
+private void glue_lend_map(^C c, ^Glue g, u32 r):
+    string8 m = map_ty(c, r)
+    u32 kt = c.t.a[r]
+    u32 vt = c.t.b[r]
+    string8 fnv = "14695981039346656037u"
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) uint64_t dado_jsum_", r, "(", m, " *v, uint64_t h) {\n    struct ", m, "__t *t = v->t;\n    uint64_t keep = ", rtn(c, "mix"), "(h, (uint64_t)(t == 0 ? 0 : t->len)), acc = 0;\n    if (t != 0) {\n        for (int64_t i = 0; i < t->cap; i++) {\n            if (t->e[i].state != 1) { continue; }\n            h = ", fnv, ";\n            h = ", g_mix(c, kt, "t->e[i].key"), ";\n            h = ", g_mix(c, vt, "t->e[i].value"), ";\n            acc += h;\n        }\n    }\n    return ", rtn(c, "mix"), "(keep, acc);\n}\n")))
+    string8 put_back = index.hold(#format("struct ", m, "__t *d = out->t;\n        int64_t len = t.t == 0 ? 0 : t.t->len;\n        if (d != 0 && len * 4 <= d->cap * 3) {\n            for (int64_t i = 0; i < d->cap; i++) { if (d->e[i].state == 1) { ", m, "__drop(out->alloc, &d->e[i].key); } d->e[i].state = 0; }\n            d->len = 0; d->used = 0; d->gen = d->gen + 1u;\n            if (t.t != 0) {\n                for (int64_t i = 0; i < t.t->cap; i++) { int found = 0; if (t.t->e[i].state != 1) { continue; } int64_t at = ", m, "__probe(d, t.t->e[i].key, &found); d->e[at] = t.t->e[i]; d->len++; d->used++; }\n                (void)t.alloc.s0(t.alloc.s1, 2, 0, DADO_MAX_ALIGN, (void *)t.t, 0);\n            }\n        } else { ", m, "__free(out); *out = t; }"))
+    if check.seam_kind(c.w, vt, false) == check.SK_STR: put_back = index.hold(#format("dado_je_", r, "(&t);\n        c = ", rtn(c, "refused_back"), "(ctx, fn, what, path, depth, \"a map whose values are views or own storage\");"))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_jb_", r, "(JSContext *ctx, JSValue v, ", m, " *out, const char *fn, const char *what, int64_t *path, int32_t depth) {\n    ", m, " t = { 0, out->alloc };\n    dado_jtake tk = {0};\n    int32_t c = dado_jr_", r, "(ctx, v, &t, fn, what, path, depth, &tk);\n    if (c != 0 || dado_jsum_", r, "(&t, ", fnv, ") == dado_jsum_", r, "(out, ", fnv, ")) { dado_je_", r, "(&t); }\n    else {\n        ", put_back, "\n    }\n    dado_jtake_end(ctx, &tk);\n    return c;\n}\n")))
+
+// `h` mixed with part `p` of Dado type `t`, for a fingerprint.
+private string8 g_mix(^C c, u32 t, string8 p):
+    u8 k = check.seam_kind(c.w, t, false)
+    if k == check.SK_STR: return index.hold(#format(rtn(c, "mix_string"), "(h, ", p, ")"))
+    if k == check.SK_WIDE: return wide_mix(c, t, p)
+    if k == check.SK_FLOAT: return index.hold(#format(rtn(c, "mix_float"), "(h, (double)(", p, "))"))
+    return index.hold(#format(rtn(c, "mix"), "(h, (uint64_t)(", p, "))"))
+
+// A Dado function value into a script: the JavaScript function of the
+// program's function it holds (its bound thunk), else a `TypeError`.
+string8 g_fnval(^C c, ^Glue g, u32 r):
+    string8 nm = index.hold(#format("dado_jv_", r))
+    for x in g.done:
+        if x == r + 0x20000000: return nm
+    g.done = #append(g.done, r + 0x20000000)
+    string8 sh = check.shown(c.w, r)
+    []u32 rps = c.t.params(r)
+    i64 np = #len(rps)
+    ref []char8 cs
+    for bi in 0..<#len(c.w.bound):
+        u32 d = c.w.bound[bi]
+        bool val = false
+        for x in c.w.fnvals:
+            if x == d: val = true
+        if !val || c.t.resolve(c.w.decls[d].ty) != r: continue
+        string8 pk = check.name_of(c.w, c.w.p.pkgs[c.w.decls[d].pkg].name)
+        string8 sn = check.seam_name(c.w, d)
+        string8 th = index.hold(#format("dado_glue_", pk, "_", index.hold(strings.replace(sn, "$", "_M_"))))
+        gput(&g.protos, index.hold(#format("static DADO_SYMBOL(unused) JSValue ", th, "(JSContext *ctx, JSValue this_val, int32_t argc, JSValue *argv);\n")))
+        gput(&cs, index.hold(#format("    if (fp == (", ty(c, r), ")", c.t.text(c.w.bound_c[bi]), ") { return JS_NewCFunction2(ctx, ", th, ", \"", pk, ".", sn, "\", ", np, ", JS_CFUNC_generic, 0); }\n")))
+    gput(&g.defs, index.hold(#format("static DADO_SYMBOL(unused) JSValue ", nm, "(JSContext *ctx, ", ty(c, r), " fp) {\n    if (fp == 0) { return JS_ThrowTypeError(ctx, \"a Dado `", sh, "` crossing into a script holds no function\"); }\n", index.hold(cs), "    return JS_ThrowTypeError(ctx, \"a Dado `", sh, "` crosses into a script only when it holds a function the program names as a value, and this one holds none such\");\n}\n")))
+    return nm
+
+// A wide string `x` (`string16`, `string32` or `cstring` `t`) as a new script string.
+string8 wide_give(^C c, u32 t, string8 x, string8 cx = "ctx"):
+    u32 r = c.t.resolve(t)
+    if r == types.CSTRING: return index.hold(#format(rtn(c, "give_cstring"), "(", cx, ", (void *)(", x, "))"))
+    string8 f = "give_units"
+    if r == types.STRING32: f = "give_points"
+    return index.hold(#format(rtn(c, f), "(", cx, ", (void *)(", x, ").ptr, (", x, ").len)"))
+
+// `h` mixed with wide string `x`.
+string8 wide_mix(^C c, u32 t, string8 x):
+    u32 r = c.t.resolve(t)
+    if r == types.CSTRING: return index.hold(#format(rtn(c, "mix_cstring"), "(h, (void *)(", x, "))"))
+    string8 f = "mix_units"
+    if r == types.STRING32: f = "mix_points"
+    return index.hold(#format(rtn(c, f), "(h, (void *)(", x, ").ptr, (", x, ").len)"))
+
+// Reads a script string (`at`: ctx, value, function, what, path, depth) into
+// wide `p`, setting `c`; `take` (`dado_jtake_wide(tk, `) keeps it to drop, or "".
+string8 wide_read(^C c, u32 t, string8 p, string8 at, string8 take):
+    u32 r = c.t.resolve(t)
+    if r == types.CSTRING:
+        string8 tk = ""
+        if #len(take) > 0: tk = index.hold(#format(" ", take, "3, t, 0);"))
+        return index.hold(#format("{ void *t = 0; c = ", rtn(c, "read_cstring"), "(&t, ", at, "); if (c == 0) { ", p, " = (const char *)t;", tk, " } }"))
+    string8 f = "read_units"
+    string8 u = "uint16_t"
+    string8 kn = "1"
+    if r == types.STRING32:
+        f = "read_points"
+        u = "uint32_t"
+        kn = "2"
+    string8 tk = ""
+    if #len(take) > 0: tk = index.hold(#format(" ", take, kn, ", t, n);"))
+    return index.hold(#format("{ void *t = 0; int64_t n = 0; c = ", rtn(c, f), "(&t, ", at, ", &n); if (c == 0) { ", p, " = (", ty(c, r), "){ (const ", u, " *)t, n };", tk, " } }"))
+
+// Gives back wide `x` a read borrowed.
+string8 wide_drop(^C c, u32 t, string8 x):
+    u32 r = c.t.resolve(t)
+    if r == types.CSTRING: return index.hold(#format("if ((", x, ") != 0) { ", rtn(c, "drop_cstring"), "(ctx, (void *)(", x, ")); }"))
+    if r == types.STRING32: return index.hold(#format("if ((", x, ").ptr != 0) { ", rtn(c, "drop_points"), "(ctx, (void *)(", x, ").ptr, (", x, ").len); }"))
+    return index.hold(#format("if ((", x, ").ptr != 0) { ", rtn(c, "drop_units"), "(ctx, (void *)(", x, ").ptr); }"))

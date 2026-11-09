@@ -1,0 +1,2085 @@
+// DadoScript as dialect deltas of the shared rules: a class is a declaration
+// (K_CLASS, a named row of its fields, held by reference), its methods are
+// K_METHODs taking `^Class self`, bare names reach fields and methods. What
+// is not built yet is ERR0001, outside the slice.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:os/fs"
+import "core:strings"
+
+const u8 K_CLASS = 15
+
+type SClass:
+    u32 decl
+    u32 file
+    // The node whose list holds the members: the file's root or a `class` block.
+    u32 node
+    ref []u32 fields
+    // Types embedded (`sembed.dado`), in written order.
+    ref []SEmbed embs
+    ref []u32 methods
+    ref []u32 gens
+    // `using`'s traits taken on, and the defaults given.
+    ref []u32 usings
+    ref []u32 traits
+    ref []u32 given
+    ref []u32 signals
+    // `foreign "x.js":` blocks; the JavaScript modules its file reaches.
+    ref []u32 jsb
+    ref []u32 jsm
+    u32 init
+    // `extends`: the header's name node, then the class (NONE: `Script`;
+    // NONE - 1: not yet resolved).
+    u32 pnode
+    u32 parent
+    // `using`: the first trait's name node.
+    u32 unode
+
+const [5]string8 S_BUILTINS = ("print", "println", "string", "int", "float")
+
+bool ds_file(^World w, u32 f):
+    syntax.Ast a = w.p.files[f].a
+    return a.a[a.root] == 1
+
+// Whether node `n` of file `f` is DadoScript: a `.dados` file, or inside a
+// `class` block.
+bool ds_at(^World w, u32 f, u32 n):
+    if ds_file(w, f): return true
+    syntax.Ast a = w.p.files[f].a
+    for c in w.classes:
+        if c.file == f && c.node != a.root && a.lo[n] >= a.lo[c.node] && a.hi[n] <= a.hi[c.node]: return true
+    return false
+
+// Whether offset `at` of file `f` is DadoScript.
+bool ds_off(^World w, u32 f, u32 at):
+    if ds_file(w, f): return true
+    for c in w.classes:
+        if c.file == f && c.node != w.p.files[f].a.root && at >= w.p.files[f].a.lo[c.node] && at < w.p.files[f].a.hi[c.node]: return true
+    return false
+
+private void s_outside(^World w, u32 f, u32 n, string8 what):
+    w.d.phase = diag.PH_INTERFACE
+    say_tok(w, f, 0, n, 1, index.hold(#format("this ", what, " is outside the slice the port builds so far")), "")
+
+// A `.dados` file's class: named by its header, else its basename.
+void s_declare(^World w, u32 pkg, u32 f):
+    syntax.Ast a = w.p.files[f].a
+    []u32 ks = a.list(a.b[a.root])
+    u32 hd = ks[2]
+    u32 name = NONE
+    if hd != NONE:
+        name = w.p.sym(f, hd)
+        []u32 hs = a.list(a.b[hd])
+        if hs[0] != NONE && a.tag[hs[0]] != syntax.T_NAME && a.tag[hs[0]] != syntax.E_NAME: s_outside(w, f, hd, "class's parent or trait")
+    else:
+        string8 p = w.p.files[f].path
+        i64 s = #len(p)
+        for s > 0 && p[s - 1] != '/': s -= 1
+        string8 base = p[s..<#len(p) - 6]
+        if !s_ident(base):
+            w.d.phase = diag.PH_INTERFACE
+            say(w, f, 0, 0, 1, 1303, index.hold(#format("`", base, ".dados` has no header, so its class would be named by its basename, and `", base, "` is not an identifier")), "name the class on the file's first line — `class Goblin` — or rename the file to an identifier, `goblin.dados`")
+            return
+        name = w.p.names.intern(index.hold(strings.clone(base)))
+    u32 pn = NONE
+    u32 un = NONE
+    if hd != NONE:
+        []u32 hl = a.list(a.b[hd])
+        pn = hl[0]
+        if #len(hl) > 1: un = hl[1]
+    s_class(w, pkg, f, name, hd, a.root, pn, un, 3, "")
+
+// A `class` block in a `.dado` file: `[extends, using…, items…]`.
+void s_declare_block(^World w, u32 pkg, u32 f, u32 n, string8 outer = ""):
+    syntax.Ast a = w.p.files[f].a
+    []u32 ks = a.list(a.b[n])
+    i64 at = 1
+    u32 un = NONE
+    for at < #len(ks) && ks[at] != NONE && (a.tag[ks[at]] == syntax.T_NAME || a.tag[ks[at]] == syntax.T_PATH || a.tag[ks[at]] == syntax.E_NAME):
+        if un == NONE: un = ks[at]
+        at += 1
+    u32 nm = w.p.sym(f, n)
+    if #len(outer) > 0: nm = w.p.names.intern(index.hold(#format(outer, ".", w.p.spell(f, n))))
+    s_class(w, pkg, f, nm, n, n, ks[0], un, at, "")
+
+// Class `name` (header `hd`, NONE when written by its basename), its
+// members `node`'s list from `from`.
+private void s_class(^World w, u32 pkg, u32 f, u32 name, u32 hd, u32 node, u32 pn, u32 un, i64 from, string8 outer):
+    syntax.Ast a = w.p.files[f].a
+    []u32 ks = a.list(a.b[node])
+    u32 cd = u32(#len(w.decls))
+    u64 key = (u64(pkg) << 32) | u64(name)
+    if key in w.by_name:
+        try u32 was = w.by_name[key] else: return
+        if w.decls[was].kind != K_CLASS || hd == NONE:
+            s_outside(w, f, hd if hd != NONE else a.root, "class's name")
+            return
+        syntax.Ast wa = w.p.files[w.decls[was].file].a
+        diag.Place pl = w.p.map.place(w.p.map.base[w.decls[was].file] + w.p.files[w.decls[was].file].t.start[wa.main[w.decls[was].node]])
+        w.d.phase = diag.PH_INTERFACE
+        string8 qn = name_of(w, name)
+        if #len(outer) > 0: qn = index.hold(#format(outer, ".", qn))
+        say_tok(w, f, 0, hd, 402, index.hold(#format("a class `", qn, "` is already declared in package `", name_of(w, w.p.pkgs[pkg].name), "`, at ", pl.line, ":", pl.col, "; a class name is declared once in its package")), "rename one of the two")
+        return
+    w.by_name[key] = cd
+    w.decls = #append(w.decls, Decl(name, K_CLASS, pkg, f, hd if hd != NONE else a.root, NONE, 0, NONE, false, NONE))
+    SClass c
+    c.decl = cd
+    c.file = f
+    c.node = node
+    c.init = NONE
+    c.pnode = pn
+    c.parent = NONE - 1
+    c.unode = un
+    if hd != NONE && hd != node:
+        []u32 hl = a.list(a.b[hd])
+        for x in hl[1..<#len(hl)]:
+            if x != NONE: c.usings = #append(c.usings, x)
+    else if a.tag[node] == syntax.N_CLASS:
+        for x in ks[1..<from]:
+            if x != NONE: c.usings = #append(c.usings, x)
+    u32 ci = u32(#len(w.classes))
+    w.class_of[cd] = ci
+    w.classes = #append(w.classes, c)
+    ref []u32 inner
+    ref []u32 todo
+    for n in ks[from..<#len(ks)]:
+        todo = #append(todo, n)
+    i64 ti = 0
+    for ti < #len(todo):
+        u32 n = todo[ti]
+        ti += 1
+        if n == NONE: continue
+        u8 g = a.tag[n]
+        if g == syntax.N_WHEN:
+            // The arm taken stands where the `when` does.
+            u32 arm = s_when_arm(w, f, n)
+            if arm == NONE: continue
+            []u32 xs = a.list(a.b[arm])
+            ref []u32 nt
+            for x in todo[0..<ti]:
+                nt = #append(nt, x)
+            for x in xs[(1 if a.tag[arm] == syntax.N_WHEN_ARM else 0)..<#len(xs)]:
+                nt = #append(nt, x)
+            for x in todo[ti..<#len(todo)]:
+                nt = #append(nt, x)
+            todo = nt
+            continue
+        if g == syntax.N_VAR && (a.a[n] & syntax.F_EMBED) != 0:
+            SEmbed e
+            e.node = n
+            e.at = #len(c.fields)
+            e.ty = NONE
+            c.embs = #append(c.embs, e)
+        else if g == syntax.N_VAR: c.fields = #append(c.fields, n)
+        else if g == syntax.N_FN:
+            _ = sa_refused(w, f, n, s_generic(w, f, n))
+            u64 mk = (u64(cd) << 32) | u64(w.p.sym(f, n))
+            if mk in w.methods:
+                s_outside(w, f, n, "second method of one name")
+                continue
+            w.methods[mk] = u32(#len(w.decls))
+            if s_generic(w, f, n): c.gens = #append(c.gens, u32(#len(w.decls)))
+            else: c.methods = #append(c.methods, u32(#len(w.decls)))
+            if w.p.spell(f, n) == "init": c.init = u32(#len(w.decls))
+            w.decls = #append(w.decls, Decl(w.p.sym(f, n), K_METHOD, pkg, f, n, cd, 0, NONE, (a.a[n] & syntax.F_VIS) == syntax.VIS_FILE, NONE))
+        else if g == syntax.N_SIGNAL: c.signals = #append(c.signals, n)
+        else if g == syntax.N_CLASS: inner = #append(inner, n)
+        else if g == syntax.N_TYPE && (a.a[n] & syntax.F_CONTRACT) == 0: _ = add(w, pkg, f, n, K_TYPE, NONE)
+        else if g == syntax.N_ENUM: _ = add(w, pkg, f, n, K_ENUM, NONE)
+        else if g == syntax.N_UNION: _ = add(w, pkg, f, n, K_UNION, NONE)
+        else if g == syntax.N_TRAIT:
+            u32 td = add(w, pkg, f, n, K_TRAIT, NONE)
+            if td != NONE: st_register(w, ci, td)
+        else if g == syntax.N_IMPORT && js_path(w.p.spell(f, n)): js_import(w, f, n, &c)
+        else if g == syntax.N_IMPORT: pass
+        else if g == syntax.N_FOREIGN && js_path(w.p.spell(f, n)):
+            c.jsb = #append(c.jsb, n)
+            js_import(w, f, n, &c)
+        else: s_outside(w, f, n, "class member")
+    s_members(w, f, &c)
+    w.classes[ci] = c
+    for n in inner:
+        s_declare_block(w, pkg, f, n, name_of(w, name))
+
+// `Class.Name` of a class member `d`.
+string8 s_qual(^World w, u32 d):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 n = w.decls[d].node
+    u32 best = NONE
+    for c in w.classes:
+        if c.file == f && a.lo[n] >= a.lo[c.node] && a.hi[n] <= a.hi[c.node]: best = c.decl
+    if best == NONE: return name_of(w, w.decls[d].name)
+    return index.hold(#format(name_of(w, w.decls[best].name), ".", name_of(w, w.decls[d].name)))
+
+// A script's enum: closed, its members their names (JS strings).
+void s_enum_body(^World w, u32 d, u32 ty):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    w.t.define(ty, w.sstr, nil)
+    []u32 ms = a.list(a.b[w.decls[d].node])
+    for m in ms[1..<#len(ms)]:
+        if m == NONE || a.tag[m] != syntax.N_ENUM_MEMBER: continue
+        u64 key = (u64(d) << 32) | u64(w.p.sym(f, m))
+        if key in w.members:
+            say_tok(w, f, 0, m, 409, index.hold(#format("`", name_of(w, w.decls[d].name), "` already has a member `", w.p.spell(f, m), "`")), "rename one of the two")
+            continue
+        w.members[key] = w.k.str(&w.t, index.hold(strings.clone(w.p.spell(f, m))))
+        w.order = #append(w.order, key)
+
+// A class's name without its outer classes.
+string8 s_short(^World w, u32 d):
+    string8 s = name_of(w, w.decls[d].name)
+    i64 i = #len(s)
+    for i > 0 && s[i - 1] != '.': i -= 1
+    return s[i..<#len(s)]
+
+// Name `n` of file `f` as an inner class of a class around it, or NONE.
+u32 s_inner(^World w, u32 f, u32 n, u32 pkg):
+    syntax.Ast a = w.p.files[f].a
+    u32 best = NONE
+    for c in w.classes:
+        if c.file == f && a.lo[n] >= a.lo[c.node] && a.hi[n] <= a.hi[c.node]:
+            u32 d = lookup(w, pkg, w.p.names.intern(index.hold(#format(name_of(w, w.decls[c.decl].name), ".", w.p.spell(f, n)))))
+            if d != NONE: best = d
+    return best
+
+// `Class.T`, a type written in class `cd`: its declaration, or NONE.
+u32 s_member_type(^World w, u32 cd, u32 sym):
+    if w.decls[cd].kind != K_CLASS: return NONE
+    u32 md = lookup(w, w.decls[cd].pkg, sym)
+    if md == NONE || md == cd || !typeish(w.decls[md].kind) && w.decls[md].kind != K_TRAIT: return NONE
+    if s_qual(w, md) != index.hold(#format(name_of(w, w.decls[cd].name), ".", name_of(w, sym))): return NONE
+    return md
+
+// Whether `ty` is a script's enum.
+bool s_enum(^World w, u32 ty):
+    if ty == NONE || !(ty in w.type_decl): return false
+    try u32 d = w.type_decl[ty] else: return false
+    return w.decls[d].kind == K_ENUM && w.t.body[ty] == w.sstr
+
+// Its first member.
+u32 s_enum_zero(^World w, u32 ty):
+    try u32 d = w.type_decl[ty] else: return NONE
+    for key in w.order:
+        if u32(key >> 32) != d: continue
+        try u32 c = w.members[key] else: return NONE
+        return ir.konst(c)
+    return NONE
+
+// A script enum's members in order, but those in `seen` (konsts).
+ref []string8 s_enum_names(^World w, u32 d, []u32 seen):
+    ref []string8 out
+    for key in w.order:
+        if u32(key >> 32) != d: continue
+        try u32 c = w.members[key] else: continue
+        bool named = false
+        for x in seen:
+            if x == ir.konst(c): named = true
+        if !named: out = #append(out, name_of(w, u32(key & 0xFFFFFFFF)))
+    return out
+
+string8 s_ticked(ref []string8 xs):
+    ref []string8 t
+    for x in xs:
+        t = #append(t, index.hold(#format("`", x, "`")))
+    return index.hold(strings.join(t[:], ", "))
+
+// ERR0410: `Mood.Happy`.
+Val s_no_member(^World w, ^Body b, u32 n, u32 d):
+    string8 s = spell(w, b, n)
+    string8 q = s_qual(w, d)
+    ref []string8 ms = s_enum_names(w, d, nil)
+    string8 help = nearest(s, ms[:])
+    if #len(help) > 0: help = index.hold(#format("did you mean `", help, "`?"))
+    else: help = index.hold(#format("add `", s, "` to `", q, "`'s members"))
+    err_tok(w, b, n, 410, index.hold(#format("`", q, "` has no member `", s, "`: its members are ", s_ticked(ms))), help)
+    return bad()
+
+// What a script's `switch` is over: 1 its enum, 2 `int` or `string`, 3 refused.
+u8 s_switch_on(^World w, ^Body b, u32 at, u32 ty):
+    if s_enum(w, ty): return 1
+    if s_denum(w, ty) != NONE: return 4
+    if ty == u32(types.P_INT) || ty == w.sstr: return 2
+    err(w, b, at, 504, index.hold(#format("a `switch` takes an enum, an `int`, a `string` or a union, and this is `", shown(w, ty), "`")), "write an `if`/`else` chain")
+    return 3
+
+void s_case_wrong(^World w, ^Body b, u32 vn, u32 ty, u32 got):
+    try u32 d = w.type_decl[ty] else: return
+    ref []string8 ms = s_enum_names(w, d, nil)
+    string8 q = s_qual(w, d)
+    err(w, b, vn, 504, index.hold(#format("this `switch` is over `", q, "`, so each `case` names one of its members, and this is `", shown(w, got), "`")), index.hold(#format("name a member: `case ", name_of(w, w.decls[d].name), ".", ms[0], ":`")))
+
+// LNT0731 over a script's enum, `else` or not.
+void s_unnamed(^World w, ^Body b, u32 n, u32 ty, []u32 seen):
+    try u32 d = w.type_decl[ty] else: return
+    ref []string8 ms = s_enum_names(w, d, seen)
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    if #len(ms) == 0 && #len(seen) > 0 && ks[1] == NONE:
+        // Every member named: the path past the arms is none a value takes.
+        b.closed = #append(b.closed, n)
+        _ = ir.op(&b.f, ir.O_RETURN_FAIL, 2, NONE, n, NONE, ir.konst(w.k.str(&w.t, "no member of the enum")))
+    if #len(ms) == 0 || #len(seen) == 0: return
+    string8 sh = name_of(w, w.decls[d].name)
+    string8 routed = "routed into the `else` with nothing said" if ks[1] != NONE else "passed over with nothing run and nothing said"
+    string8 first = src(w, b, a.list(a.b[ks[2]])[1])
+    say(w, b.file, b.base, a.lo[n], a.hi[ks[0]] + 1, diag.LNT + 731, index.hold(#format("this `switch` is over `", s_qual(w, d), "`, and its arms leave ", s_ticked(ms), " unnamed — so ", "it is" if #len(ms) == 1 else "they are", " ", routed, ", which is also where a member added tomorrow would go. Name each in an arm — `case ", sh, ".", ms[0], ":` — even one that does nothing (`pass`), or add it to the list of an arm whose body is already right: `case ", first, ", ", sh, ".", ms[0], ":` is one arm over both")), "")
+
+// ERR0402: a field, a method and a signal share the class's names.
+private void s_members(^World w, u32 f, ^SClass c):
+    ref []u32 all
+    for x in c.fields:
+        all = #append(all, x)
+    for x in c.methods:
+        all = #append(all, w.decls[x].node)
+    for x in c.signals:
+        all = #append(all, x)
+    for i in 0..<#len(all):
+        for j in 0..<i:
+            if w.p.sym(f, all[i]) != w.p.sym(f, all[j]): continue
+            if w.p.files[f].a.tag[all[i]] != syntax.N_SIGNAL && w.p.files[f].a.tag[all[j]] != syntax.N_SIGNAL: continue
+            u32 later = all[j]
+            if w.p.files[f].a.lo[all[i]] > w.p.files[f].a.lo[all[j]]: later = all[i]
+            string8 nm = w.p.spell(f, later)
+            w.d.phase = diag.PH_INTERFACE
+            say_tok(w, f, 0, later, 402, index.hold(#format("`", nm, "` is already a member of `", name_of(w, w.decls[c.decl].name), "`: a class's fields, methods and signals share one set of names")), "rename one of the two")
+            break
+
+private bool s_ident(string8 s):
+    if #len(s) == 0 || s[0] >= '0' && s[0] <= '9': return false
+    for c in s:
+        if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'): return false
+    return true
+
+// Whether a method's signature binds a type (`$T`): generic methods are not built.
+private bool s_generic(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u32 lo = a.lo[n]
+    []u32 ks = a.list(a.b[n])
+    u32 hi = a.hi[n]
+    if ks[5] != NONE: hi = a.lo[ks[5]]
+    for i in lo..<hi:
+        if w.p.files[f].src[i64(i)] == '$': return true
+    return false
+
+// The class `ci` extends (NONE: `Script`), ERR1310 for a Dado type or a cycle.
+u32 s_parent(^World w, u32 ci):
+    if w.classes[ci].parent != NONE - 1: return w.classes[ci].parent
+    w.classes[ci].parent = NONE
+    SClass c = w.classes[ci]
+    if c.pnode == NONE: return NONE
+    string8 pn = w.p.spell(c.file, c.pnode)
+    if pn == "Script": return NONE
+    string8 cn = name_of(w, w.decls[c.decl].name)
+    u32 pd = s_inner(w, c.file, c.pnode, w.decls[c.decl].pkg)
+    if pd == NONE: pd = lookup(w, w.decls[c.decl].pkg, w.p.sym(c.file, c.pnode))
+    if pd == NONE || !(pd in w.class_of):
+        w.d.phase = diag.PH_INTERFACE
+        if pd != NONE && typeish(w.decls[pd].kind): say_tok(w, c.file, 0, c.pnode, 1310, index.hold(#format("`", cn, "` extends `", pn, "`, a Dado type: a script class extends a script class or `Script`, and a base Dado provides for scripts to extend is not built yet")), index.hold(#format("leave `extends` off — `", cn, "` then extends `Script` — and call the package's Dado functions from its methods for what `", pn, "` would have given it")))
+        else if pd == NONE: say_tok(w, c.file, 0, c.pnode, 401, index.hold(#format("`", cn, "` extends `", pn, "`, which names no class")), "name a script class — `extends Goblin`, or `extends npc.Goblin` for one of an imported package — or `Script`")
+        else: s_outside(w, c.file, c.pnode, "class's parent or trait")
+        return NONE
+    try u32 pc = w.class_of[pd] else: return NONE
+    // A cycle: said once, at the first class of it declared.
+    ref []u32 chain
+    chain = #append(chain, ci)
+    u32 at = pc
+    for _ in 0..<64:
+        if at == ci:
+            u32 first = ci
+            for x in chain:
+                if w.decls[w.classes[x].decl].file < w.decls[w.classes[first].decl].file: first = x
+            if first == ci:
+                ref []char8 path
+                path = #append(path, ..#format("`", cn, "`"))
+                for x in chain[1..<#len(chain)]:
+                    path = #append(path, ..#format(" extends `", name_of(w, w.decls[w.classes[x].decl].name), "`"))
+                w.d.phase = diag.PH_INTERFACE
+                say_tok(w, c.file, 0, c.pnode, 1310, index.hold(#format(path, " extends `", cn, "` again: a class cannot be its own ancestor, since constructing one would construct its parent first, forever")), index.hold(#format("end the chain: one of these extends `Script` — leave its `extends` off — or holds the other in a field instead, `", pn, " part = ", cn, "(…)`")))
+            return NONE
+        chain = #append(chain, at)
+        SClass ac = w.classes[at]
+        if ac.pnode == NONE || w.p.spell(ac.file, ac.pnode) == "Script": break
+        u32 ad = lookup(w, w.decls[ac.decl].pkg, w.p.sym(ac.file, ac.pnode))
+        if ad == NONE || !(ad in w.class_of): break
+        try at = w.class_of[ad] else: break
+    w.classes[ci].parent = pc
+    return pc
+
+// Every field of class `ci`, inherited ones first: (file, node) pairs.
+// An embedded slot's node is its embedding line.
+void s_all_fields(^World w, u32 ci, ^ref []u32 files, ^ref []u32 nodes):
+    for x in s_fields_of(w, ci):
+        files^ = #append(files^, x.file)
+        nodes^ = #append(nodes^, x.node)
+
+// The class's row: its fields, by name, as one named shape.
+u32 s_class_row(^World w, u32 d):
+    u32 t = w.t.named(index.hold(strings.clone(pkg_key(w, w.decls[d].pkg))), name_of(w, w.decls[d].name))
+    w.decls[d].ty = t
+    w.decls[d].state = 2
+    w.type_decl[t] = d
+    try u32 ci = w.class_of[d] else: return t
+    ref []u32 tys
+    ref []u32 names
+    for x in s_fields_of(w, ci):
+        syntax.Ast a = w.p.files[x.file].a
+        u32 ft = se_field_ty(w, x)
+        if x.emb < 0: ft = resolve_type(w, x.file, a.list(a.b[x.node])[0])
+        if ft == NONE:
+            ft = u32(types.P_INT)
+            w.sfailed[(u64(x.file) << 32) | u64(x.node)] = 1
+        tys = #append(tys, ft)
+        names = #append(names, w.t.str(name_of(w, x.sym)))
+    w.t.define(t, w.t.tuple(tys[:]), names[:])
+    js_declare(w, ci)
+    return t
+
+// A script's own type names; NONE-1 when `s` is none of them.
+u32 s_type_name(^World w, u32 f, u32 n):
+    string8 s = w.p.spell(f, n)
+    if s == "int": return u32(types.P_INT)
+    if s == "float": return u32(types.P_FLOAT)
+    if s == "bool": return u32(types.P_BOOL)
+    if s == "void": return u32(types.P_VOID)
+    if s == "byte": return u32(types.P_U8)
+    if s == "string": return w.sstr
+    if s == "any": return w.sany
+    if s == "Location" && lookup(w, w.p.files[f].pkg, w.p.sym(f, n)) == NONE: return w.sloc
+    if s == "Error" && lookup(w, w.p.files[f].pkg, w.p.sym(f, n)) == NONE: return w.serror
+    return NONE - 1
+
+private SClass s_cls(^World w, ^Body b):
+    return w.classes[b.cls]
+
+private string8 s_cname(^World w, ^Body b):
+    return name_of(w, w.decls[w.classes[b.cls].decl].name)
+
+// The field `sym` of the body's class: its index, or -1.
+i64 s_field_ix(^World w, ^Body b, u32 sym):
+    if b.cls == NONE: return -1
+    ref []SField fl = s_fields_of(w, b.cls)
+    i64 i = #len(fl)
+    for i > 0:
+        i -= 1
+        if fl[i].sym == sym: return i
+    return -1
+
+Val s_self(^World w, ^Body b, u32 n):
+    u32 sl = find_local(w, b, w.p.names.intern("self"), true)
+    if sl == NONE: return bad()
+    return local_val(w, b, sl)
+
+// A field read or written through `self`, with the initializer order rule.
+Val s_field_use(^World w, ^Body b, u32 n, u32 sym, i64 i):
+    if b.above != NONE && i >= i64(b.above):
+        ref []SField fl = s_fields_of(w, b.cls)
+        string8 nm = name_of(w, sym)
+        string8 at = name_of(w, fl[b.above].sym)
+        err_tok(w, b, n, 408, index.hold(#format("`", nm, "` is a field of `", s_cname(w, b), "` declared at or below `", at, "`, and a field's initializer reads only the fields above it: they are set in order, so `", nm, "` has no value yet")), index.hold(#format("declare `", nm, "` above `", at, "`, or set `", at, "` in `init`")))
+        return bad()
+    Val sv = s_self(w, b, n)
+    if sv.ty == NONE: return bad()
+    []u32 slots = w.t.slots(sv.ty)
+    if i >= #len(slots): return bad()
+    return value(ir.step(&b.f, spill(w, b, sv, n), ir.ST_FIELD, u32(i), slots[i]), slots[i])
+
+private ref []string8 s_values(^World w, ^Body b):
+    ref []string8 pool
+    for l in b.locals:
+        pool = #append(pool, name_of(w, l.name))
+    for x in s_fields_of(w, b.cls):
+        pool = #append(pool, name_of(w, x.sym))
+    return pool
+
+// Constant `d`'s value itself where `v` set it into a temporary (a tuple).
+private Val s_tconst(^World w, u32 d, Val v):
+    if v.ty == NONE || d == NONE || w.decls[d].kind != K_CONST || w.decls[d].value == NONE || w.k.kind[w.decls[d].value] != types.C_TUPLE: return v
+    return value(ir.konst(w.decls[d].value), v.ty)
+
+// A package constant, read as the script type it crosses to (bad: another).
+private Val s_konst(^World w, Val cv):
+    if cv.ty == NONE || !ir.is_const(cv.opd): return bad()
+    if s_denum(w, cv.ty) != NONE: return s_eknst(w, cv, cv.ty)
+    if s_ddist(w, cv.ty) != NONE:
+        Val dv = s_konst(w, value(cv.opd, s_erase(w, cv.ty)))
+        if dv.ty != NONE: dv.ty = s_dview(w, cv.ty)
+        return dv
+    u32 k = cv.opd & ~ir.OPD_CONST
+    if w.k.kind[k] == types.C_FLOAT: return value(ir.konst(fconst(w, fval(w.k.w0[k]), u32(types.P_FLOAT))), u32(types.P_FLOAT))
+    if w.k.kind[k] == types.C_INT && is_char(w, cv.ty) && w.t.resolve(cv.ty) != u32(types.P_CHAR8):
+        // A `char16` or `char32` is a one-character `string`.
+        return value(ir.konst(w.k.str(&w.t, utf8_of(u32(w.k.w0[k])))), w.sstr)
+    if w.k.kind[k] == types.C_INT && is_int(w, cv.ty): return value(ir.konst(w.k.int(&w.t, w.k.w0[k], i64(w.k.w1[k]))), u32(types.P_INT))
+    if w.k.kind[k] == types.C_BOOL: return value(cv.opd, u32(types.P_BOOL))
+    if w.k.kind[k] == types.C_STR && w.k.b[k] == 1:
+        // A `cstring` reads to its first NUL.
+        string8 tx = w.t.text(w.k.a[k])
+        i64 z = strings.index_of(tx, '\0')
+        if z >= 0: return value(ir.konst(w.k.str(&w.t, index.hold(strings.clone(tx[0..<z])))), w.sstr)
+    if w.k.kind[k] == types.C_STR: return value(ir.konst(w.k.str(&w.t, index.hold(strings.clone(w.t.text(w.k.a[k]))))), w.sstr)
+    if w.k.kind[k] == types.C_TUPLE && s_tup(w, cv.ty):
+        // A declared shape is the script's view of it; an array or tuple its slots' script types.
+        if cv.ty in w.type_decl: return value(cv.opd, s_dview(w, cv.ty))
+        return value(cv.opd, s_sview(w, cv.ty))
+    return bad()
+
+// ERR0413: member `mn` of file `mf`, of class `oc`, private beyond here.
+bool s_hidden(^World w, ^Body b, u32 n, u32 oc, u32 mf, u32 mn):
+    u32 v = w.p.files[mf].a.a[mn] & syntax.F_VIS
+    bool here = w.p.files[mf].pkg == w.p.files[b.file].pkg
+    if v != syntax.VIS_PACKAGE && v != syntax.VIS_FILE || here && (v == syntax.VIS_PACKAGE || mf == b.file): return false
+    string8 r = "`private`, so only its own package sees it"
+    string8 h = "leave it unmarked — public — or reach it through a public method of its class"
+    if v == syntax.VIS_FILE:
+        r = "`private \"file\"`, so only its own file sees it"
+        h = "mark it `private` — the package's — or leave it unmarked, so this file can reach it"
+    err_tok(w, b, n, 413, index.hold(#format("`", name_of(w, w.decls[w.classes[oc].decl].name), ".", w.p.spell(mf, mn), "` is ", r)), h)
+    return true
+
+// ERR0309: built-in `s` that a dot import also makes bare.
+private bool s_bare_clash(^World w, ^Body b, u32 n, string8 s):
+    ref []string8 qs
+    ref []string8 ims
+    for im in w.p.pkgs[w.p.files[b.file].pkg].imports:
+        if im.file != b.file || !im.dot: continue
+        u32 d = lookup(w, im.pkg, w.p.sym(b.file, n))
+        if d == NONE || w.decls[d].private: continue
+        qs = #append(qs, index.hold(#format("`", name_of(w, w.p.pkgs[im.pkg].name), ".", s, "`")))
+        ims = #append(ims, index.hold(#format("`", w.p.files[b.file].src[i64(tree(w, b).lo[im.node])..<i64(tree(w, b).hi[im.node])], "`")))
+    if #len(qs) == 0: return false
+    string8 q = either(qs[:])
+    qs = #append(qs, index.hold(#format("DadoScript's built-in `", s, "`")))
+    err(w, b, n, 309, index.hold(#format("`", s, "` could mean ", either(qs[:]), ": a bare name means one thing, so it is refused rather than resolved by precedence")), index.hold(#format("the built-in `", s, "` has no other spelling: to mean it, drop the `.` from ", strings.join(ims[:], " and "), "; to mean the imported one, write ", q)))
+    return true
+
+// A bare name in a script body.
+Val s_name(^World w, ^Body b, u32 n):
+    string8 s = spell(w, b, n)
+    u32 sym = w.p.sym(b.file, n)
+    if s == "true" || s == "false": return value(ir.konst(w.k.boolean(&w.t, s == "true")), u32(types.P_BOOL))
+    u32 sl = find_local(w, b, sym, true)
+    if sl != NONE: return local_val(w, b, sl)
+    if poisoned(w, b, sym): return bad()
+    i64 fi = s_field_ix(w, b, sym)
+    if fi >= 0: return s_field_use(w, b, n, sym, fi)
+    i64 ef = 0
+    bool efull = false
+    u32 et = se_member(w, b.cls, sym, &ef, &efull)
+    if et != NONE: return se_read(w, b, n, et, ef, efull, NONE, NONE)
+    if s_signal(w, b.cls, sym) != NONE: return s_not_a_value(w, b, n, sym)
+    u32 d = lookup(w, w.p.files[b.file].pkg, sym)
+    if d != NONE && (typeish(w.decls[d].kind) || w.decls[d].kind == K_CLASS): return Val(V_TYPE, NONE, u32(types.TYPE), s_dview(w, resolve(w, d)), 0, 0)
+    if d != NONE && w.decls[d].kind == K_CONST:
+        Val cv = s_konst(w, s_tconst(w, d, finish(w, b, name(w, b, n), n)))
+        if cv.ty != NONE && s_tup(w, cv.ty): return value(spill(w, b, cv, n), cv.ty)
+        if cv.ty != NONE: return cv
+    for im in w.p.pkgs[w.p.files[b.file].pkg].imports:
+        if im.file == b.file && (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == sym: return Val(V_PKG, NONE, types.TYPE, im.pkg, 0, 0)
+    // A JavaScript module's namespace, an `any` (kind 7).
+    if js_key(b.file, sym, 0) in w.jsns:
+        try u32 jm = w.jsns[js_key(b.file, sym, 0)] else: return bad()
+        return s_dyn(w, b, n, 7, jm, nil)
+    if s == "globalThis": return s_dyn(w, b, n, 0, NONE, nil)
+    if s != "self" && s != "super" && s_method_of(w, b, sym) != NONE:
+        Val sv = s_self(w, b, n)
+        if sv.ty == NONE: return bad()
+        return s_method_val(w, b, n, sv.opd, s_method_of(w, b, sym))
+    if s == "self": return s_self(w, b, n)
+    if s == "super": return sc_value(w, b, n, n)
+    if d != NONE:
+        err(w, b, n, 1, "this name is outside the slice the port builds so far")
+        return bad()
+    ref []string8 pool = s_values(w, b)
+    string8 near = nearest(s, pool[:])
+    string8 c = s_cname(w, b)
+    string8 help = index.hold(#format("declare it before this line — `int ", s, " = 0` — or as a field of `", c, "`"))
+    if s == "null" || s == "undefined": help = index.hold(#format("a script has no `", s, "` and cannot yet ask an `any` whether it holds nothing: have the JavaScript side answer a typed stand-in, such as an empty array"))
+    if #len(near) > 0: help = index.hold(#format("did you mean `", near, "`?"))
+    err(w, b, n, 408, index.hold(#format("`", s, "` is not a local, a parameter or a field of `", c, "`")), help)
+    return bad()
+
+u32 s_method_of(^World w, ^Body b, u32 sym):
+    if b.cls == NONE: return NONE
+    return s_method_in(w, b.cls, sym)
+
+// Method `sym` of class `ci` or its ancestors, or NONE.
+u32 s_method_in(^World w, u32 ci, u32 sym):
+    u32 at = ci
+    for _ in 0..<64:
+        if at == NONE: return NONE
+        u64 mk = (u64(w.classes[at].decl) << 32) | u64(sym)
+        if mk in w.methods:
+            try u32 m = w.methods[mk] else: return NONE
+            return m
+        at = s_parent(w, at)
+    return NONE
+
+// `self.x` and `obj.x`.
+Val s_field(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u32 q = a.a[n]
+    u32 sym = w.p.sym(b.file, n)
+    if a.tag[q] == syntax.E_NAME && spell(w, b, q) == "super" && find_local(w, b, w.p.sym(b.file, q), false) == NONE: return sc_value(w, b, n, n)
+    if b.strait1 != 0 && a.tag[q] == syntax.E_NAME && spell(w, b, q) == "self": return st_field(w, b, n, b.strait1 - 1, true)
+    if a.tag[q] == syntax.E_NAME && spell(w, b, q) == "self":
+        i64 fi = s_field_ix(w, b, sym)
+        if fi >= 0: return s_field_use(w, b, n, sym, fi)
+        i64 ef = 0
+        bool efull = false
+        u32 et = se_member(w, b.cls, sym, &ef, &efull)
+        if et != NONE: return se_read(w, b, n, et, ef, efull, NONE, NONE)
+        if s_signal(w, b.cls, sym) != NONE: return s_not_a_value(w, b, n, sym)
+        if s_method_of(w, b, sym) != NONE:
+            Val sv = s_self(w, b, n)
+            if sv.ty == NONE: return bad()
+            return s_method_val(w, b, n, sv.opd, s_method_of(w, b, sym))
+        SClass c = s_cls(w, b)
+        ref []string8 fs
+        ref []string8 pool
+        for fn in c.fields:
+            fs = #append(fs, index.hold(#format("`", w.p.spell(c.file, fn), "`")))
+            pool = #append(pool, w.p.spell(c.file, fn))
+        string8 cn = s_cname(w, b)
+        string8 s = spell(w, b, n)
+        string8 help = index.hold(#format("the fields of `", cn, "` are ", strings.join(fs[:], ", ")))
+        if #len(fs) == 0: help = index.hold(#format("`", cn, "` declares no fields; declare one: `int ", s, " = 0`"))
+        string8 near = nearest(s, pool[:])
+        if #len(near) > 0: help = index.hold(#format("did you mean `", near, "`?"))
+        err_tok(w, b, n, 410, index.hold(#format("`", cn, "` has no field `", s, "`")), help)
+        return bad()
+    if s_signal_ref(w, b, n) != u64(NONE): return s_not_a_value(w, b, n, sym)
+    if s_is_platform(w, b, b.file, q): return s_pval(w, s_platform(w, b.file, n, spell(w, b, n), false, 0))
+    // A field of another instance.
+    Val ov = expr(w, b, q, NONE)
+    if ov.kind == V_PKG:
+        Val pv = field_of(w, b, n, ov)
+        Val kv = s_konst(w, s_tconst(w, lookup(w, ov.x, sym), pv))
+        if kv.ty != NONE && s_tup(w, kv.ty): return value(spill(w, b, kv, n), kv.ty)
+        if kv.ty != NONE || pv.ty == NONE || pv.kind != V_VAL: return kv if kv.ty != NONE else pv
+        err(w, b, n, 1, "this constant is outside the slice the port builds so far")
+        return bad()
+    if ov.kind == V_TYPE:
+        Val fv = field_of(w, b, n, ov)
+        if fv.ty != NONE && s_denum(w, ov.x) != NONE: return s_eknst(w, fv, ov.x)
+        return fv
+    ov = finish(w, b, ov, q)
+    if ov.ty == NONE: return bad()
+    if s_tup(w, ov.ty): return field_of(w, b, n, ov)
+    if ov.ty == w.sany:
+        [2]u32 mx = [spill(w, b, ov, q), ir.konst(w.k.str(&w.t, index.hold(strings.clone(spell(w, b, n)))))]
+        return s_dyn(w, b, n, 1, NONE, mx[:])
+    bool tsf = false
+    u32 tt = st_of_ty(w, ov.ty, &tsf)
+    if tt != NONE: return st_field(w, b, n, tt, tsf)
+    u32 oc = s_class_of_ty(w, ov.ty)
+    if oc != NONE && w.t.tag[w.t.resolve(ov.ty)] != types.T_PTR:
+        ref []SField fl = s_fields_of(w, oc)
+        i64 fi = #len(fl)
+        for fi > 0:
+            fi -= 1
+            if fl[fi].sym == sym:
+                if s_hidden(w, b, n, oc, fl[fi].file, fl[fi].node): return bad()
+                []u32 sl = w.t.slots(ov.ty)
+                return value(ir.step(&b.f, spill(w, b, ov, q), ir.ST_FIELD, u32(fi), sl[fi]), sl[fi])
+        i64 ef = 0
+        bool efull = false
+        u32 et = se_member(w, oc, sym, &ef, &efull)
+        if et != NONE: return se_read(w, b, n, et, ef, efull, spill(w, b, ov, q), ov.ty)
+        u32 om = s_method_in(w, oc, sym)
+        if om != NONE: return s_method_val(w, b, n, spill(w, b, ov, q), om)
+    u32 ft = s_fail_field(w, b, n, ov.ty)
+    if ft != NONE:
+        if ft == S_REFUSED: return bad()
+        u32 t = temp(w, b, ft, n)
+        _ = ir.op(&b.f, ir.O_INTRINSIC, B_SPROP, ft, n, t, NONE)
+        ir.arg(&b.f, spill(w, b, ov, q))
+        string8 fnm = index.hold(strings.clone(spell(w, b, n)))
+        ir.arg(&b.f, ir.konst(w.k.str(&w.t, fnm)))
+        return value(t, ft)
+    err(w, b, n, 1, "this field is outside the slice the port builds so far")
+    return bad()
+
+const u8 B_SPROP = 154    // dst = args[0].(args[1]), an `Error`'s or a `Location`'s
+private const u32 S_REFUSED = 0xFFFFFFFE
+
+private const [4]string8 ERR_FIELDS = ("message", "code", "location", "trace")
+private const [4]string8 LOC_FIELDS = ("file", "line", "column", "function")
+
+// The type of field `n` of an `Error` or a `Location` (`S_REFUSED`:
+// refused), or NONE when `ty` is neither.
+private u32 s_fail_field(^World w, ^Body b, u32 n, u32 ty):
+    u32 r = w.t.resolve(ty)
+    bool e = r == w.serror
+    if !e && r != w.sloc: return NONE
+    string8 s = spell(w, b, n)
+    string8 tn = "Error" if e else "Location"
+    []const string8 fs = ERR_FIELDS[:] if e else LOC_FIELDS[:]
+    for i in 0..<4:
+        if fs[i] != s: continue
+        if w.sstore:
+            string8 mk = "Location()"
+            if e: mk = "Error(\"what went wrong\", 16)"
+            err(w, b, n, 504, index.hold(#format("`", src(w, b, tree(w, b).a[n]), ".", s, "` is read-only: ", h_article(tn), " `", tn, "` is made whole and never changes after, so what was raised, and where, stays what it was")), index.hold(#format("make a new one — `", mk, "` — and keep that")))
+            return S_REFUSED
+        if e && i == 0 || !e && (i == 0 || i == 3): return w.sstr
+        if e && i == 2: return w.sloc
+        if e && i == 3: return w.t.slice_of(w.sloc)
+        return u32(types.P_INT)
+    ref []string8 ls
+    ref []string8 pool
+    for f in fs:
+        ls = #append(ls, index.hold(#format("`", f, "`")))
+        pool = #append(pool, f)
+    string8 help = index.hold(#format("an `", tn, "`'s fields are ", strings.join(ls[:], ", ")))
+    string8 near = nearest(s, pool[:])
+    if #len(near) > 0: help = index.hold(#format("did you mean `", near, "`?"))
+    err_tok(w, b, n, 410, index.hold(#format("an `", tn, "` has no field `", s, "`")), help)
+    return S_REFUSED
+
+// A script's `try S else e:`: the statement in a JS `try`, the suite its
+// `catch`, `e` the `Error` (O_BLOCK sub 4, then sub 5, a = e's place).
+void s_try(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u32 s = a.a[n]
+    u32 e = a.b[n]
+    bool tried = sf_tried(w, b, s)
+    i64 ops = ir.count(&b.f)
+    if e == NONE || a.b[e] == 1:
+        stmt(w, b, s)
+        if !tried && !sf_left(w, b, ops): sf_untried(w, b, s)
+        if e != NONE:
+            string8 x = src(w, b, a.a[e])
+            err(w, b, e, 716, index.hold(#format("`else ", x, "` would replace the failure with another, and a `try` either handles a failure in a suite or passes it on as it is")), index.hold(#format("handle it — `else e:` on this line — and raise what you mean on the next: `fail ", x, "`; to pass the failure on unchanged, drop the `else`")))
+            _ = expr(w, b, a.a[e], NONE)
+        return
+    if tried && a.tag[s] == syntax.S_LET && !suite_leaves(w, b, a.a[e]): err(w, b, a.a[e], 716, "this `try` declares its name, and on failure the name holds nothing, so the `else` suite has to leave the scope before anything can read it", "end the suite with `return`, `fail`, `break` or `continue`; or declare the name above with a value and `try` an assignment to it, so the suite may carry on with what it held")
+    u32 h = open(w, b, ir.O_BLOCK, n, NONE, false)
+    b.f.sub[h] = 4
+    stmt(w, b, s)
+    close(w, b, h)
+    if !tried && !sf_left(w, b, ops): sf_untried(w, b, s)
+    scope_in(w, b)
+    u32 ep = NONE
+    if a.main[e] != NONE && spell(w, b, e) != "_":
+        u32 sl = declare_local(w, b, w.p.sym(b.file, e), w.serror, e)
+        if sl != NONE: ep = ir.at(&b.f, sl)
+    u32 c = open(w, b, ir.O_BLOCK, e, NONE, false)
+    b.f.sub[c] = 5
+    b.f.b[c] = ep
+    block(w, b, a.a[e])
+    close(w, b, c)
+    scope_out(w, b)
+
+// A place: a local, or a field of `self`.
+Val s_place(^World w, ^Body b, u32 n, bool read):
+    syntax.Ast a = tree(w, b)
+    if a.tag[n] == syntax.E_FIELD: return s_field(w, b, n)
+    u32 sym = w.p.sym(b.file, n)
+    u32 sl = find_local(w, b, sym, read)
+    if sl != NONE: return local_val(w, b, sl)
+    if poisoned(w, b, sym): return bad()
+    return s_name(w, b, n)
+
+// A call in a script body.
+Val s_call(^World w, ^Body b, u32 n, u32 want):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    u32 c = ks[0]
+    []u32 args = ks[2..<#len(ks)]
+    if a.tag[c] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, c), false) == NONE:
+        u32 td = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, c))
+        if td != NONE && typeish(w.decls[td].kind) && w.decls[td].kind != K_CLASS && !s_enum(w, resolve(w, td)):
+            bool vdone = false
+            Val vv = s_view_make(w, b, n, td, &vdone)
+            if vdone: return vv
+            return call(w, b, n, want, false)
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && spell(w, b, a.a[c]) == "Script" && spell(w, b, c) == "load" && find_local(w, b, w.p.sym(b.file, a.a[c]), false) == NONE: return sf_load(w, b, n)
+    for g in args:
+        if g != NONE && a.main[g] != NONE:
+            err(w, b, g, 1, "this named argument is outside the slice the port builds so far")
+            return bad()
+    if b.strait1 != 0:
+        u32 stt = b.strait1 - 1
+        bool known = false
+        for x in st_methods(w, stt):
+            if w.decls[x].name == w.p.sym(b.file, c): known = true
+        bool on_self = a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && spell(w, b, a.a[c]) == "self"
+        if on_self || a.tag[c] == syntax.E_NAME && known && find_local(w, b, w.p.sym(b.file, c), false) == NONE:
+            Val sv = s_self(w, b, n)
+            if sv.ty == NONE: return bad()
+            return st_call(w, b, n, c, stt, true, sv.opd)
+    if a.tag[c] == syntax.E_FIELD && spell(w, b, c) == "names":
+        bool nd = false
+        Val nv = sr_names(w, b, n, c, &nd)
+        if nd: return nv
+    if a.tag[c] == syntax.E_NAME && spell(w, b, c) == "super" && find_local(w, b, w.p.sym(b.file, c), false) == NONE: return sc_call(w, b, n, NONE)
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && spell(w, b, a.a[c]) == "super" && find_local(w, b, w.p.sym(b.file, a.a[c]), false) == NONE: return sc_call(w, b, n, c)
+    if a.tag[c] == syntax.E_NAME:
+        string8 s = spell(w, b, c)
+        u32 sym = w.p.sym(b.file, c)
+        if find_local(w, b, sym, false) == NONE && s_field_ix(w, b, sym) < 0:
+            u32 m = s_method_of(w, b, sym)
+            if m != NONE: return s_method(w, b, n, m)
+            u32 pmt = NONE
+            i64 pfirst = 0
+            bool pfull = false
+            u32 powner = NONE
+            u32 pm = se_promoted(w, b.cls, sym, &pmt, &pfirst, &pfull, &powner)
+            if pm != NONE: return se_call(w, b, n, c, pm, pmt, pfirst, pfull, powner, NONE, NONE)
+            string8 thr = ""
+            string8 sro = ""
+            if s == "slots": sro = sr_other(w, b, &thr)
+            if s == "slots" && #len(sro) == 0: return sr_elsewhere(w, b, n)
+            if (s == "print" || s == "println") && s_bare_clash(w, b, c, index.hold(strings.clone(s))): return bad()
+            if s == "print" || s == "println": return s_print(w, b, n)
+            u64 jk = (u64(w.classes[b.cls].decl) << 32) | u64(sym)
+            if jk in w.sjs:
+                try u32 jf = w.sjs[jk] else: return bad()
+                return s_js_call(w, b, n, jf)
+            if s == "receive": return s_receive(w, b, n)
+            if s == "connect":
+                err(w, b, c, 805, "`connect` is a retired spelling and `receive` is what replaces it", "write `receive`")
+                return bad()
+            if s == "Error" && lookup(w, w.p.files[b.file].pkg, sym) == NONE: return sf_error(w, b, n)
+            if s == "Location" && #len(args) == 0 && lookup(w, w.p.files[b.file].pkg, sym) == NONE: return sf_here(w, b, n)
+            if s == "Location" && lookup(w, w.p.files[b.file].pkg, sym) == NONE: return sf_location(w, b, n)
+            if s == "Location" && #len(args) == 1:
+                Val lv = s_to_location(w, b, finish(w, b, expr(w, b, a.a[args[0]], NONE), a.a[args[0]]), a.a[args[0]])
+                if lv.ty == NONE: err(w, b, n, 1, "this conversion is outside the slice the port builds so far")
+                return lv
+            if s == "string" || s == "int" || s == "float": return s_convert(w, b, n, 0 if s == "string" else (1 if s == "int" else 2))
+            u32 kd = bare(w, b.file, c)
+            if kd != NONE && w.decls[kd].kind == K_CLASS: return s_construct(w, b, n, kd)
+            if kd != NONE && w.decls[kd].kind == K_FN && !ds_at(w, w.decls[kd].file, w.decls[kd].node): return s_dado_call(w, b, n, kd)
+            if lookup(w, w.p.files[b.file].pkg, sym) != NONE:
+                err(w, b, n, 1, "this call is outside the slice the port builds so far")
+                return bad()
+            // The math globals, shadowed by any declaration above.
+            i64 mk = math_global(s)
+            if mk >= 0: return math_(w, b, n, mk)
+            ref []string8 pool
+            for md in s_cls(w, b).methods:
+                pool = #append(pool, name_of(w, w.decls[md].name))
+            for x in S_BUILTINS:
+                pool = #append(pool, x)
+            for sc in w.classes:
+                if w.decls[sc.decl].pkg == w.p.files[b.file].pkg: pool = #append(pool, s_short(w, sc.decl))
+            string8 near = nearest(s, pool[:])
+            string8 help = index.hold(#format("declare it in `", s_cname(w, b), "`: `void ", s, "(…):`"))
+            if s == "bool": help = "a script reads an `any` as a `bool` by declaring one: `bool b = x`, then use `b`"
+            if #len(near) > 0: help = index.hold(#format("did you mean `", near, "`?"))
+            for g in args:
+                _ = expr(w, b, arg_value(w, b, g), NONE)
+            err(w, b, c, 405, index.hold(#format("`", s, "` is not a method of `", s_cname(w, b), "` or one of DadoScript's built-ins — `print`, `println`, `string`, `int`, `float`")), help)
+            return bad()
+    if a.tag[c] == syntax.E_FIELD && s_is_platform(w, b, b.file, a.a[c]):
+        for g in args:
+            _ = expr(w, b, a.a[g], NONE)
+        return s_pval(w, s_platform(w, b.file, n, spell(w, b, c), true, #len(args)))
+    if a.tag[c] == syntax.E_FIELD && s_verb(spell(w, b, c)) != 0:
+        u64 r = s_signal_ref(w, b, a.a[c])
+        if r != u64(NONE): return s_signal_call(w, b, n, r, index.hold(strings.clone(spell(w, b, c))))
+    // `ns.f(…)` typed by a `foreign` block over the namespace's module.
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && s_dyn_callee(w, b, c) == 2 && find_local(w, b, w.p.sym(b.file, a.a[c]), false) == NONE:
+        u64 nk = js_key(b.file, w.p.sym(b.file, a.a[c]), 0)
+        u64 fk = (u64(w.classes[b.cls].decl) << 32) | u64(w.p.sym(b.file, c))
+        if nk in w.jsns && fk in w.sjs:
+            try u32 nm = w.jsns[nk] else: return bad()
+            try u32 jf = w.sjs[fk] else: return bad()
+            u32 fm = NONE
+            if js_key(b.file, jf, 1) in w.jsns:
+                try fm = w.jsns[js_key(b.file, jf, 1)] else: pass
+            if fm == nm: return s_js_call(w, b, n, jf)
+    u32 dk = s_dyn_callee(w, b, c)
+    if dk != NONE:
+        Val cv = finish(w, b, expr(w, b, a.a[c] if dk == 2 else c, NONE), c)
+        if cv.ty == NONE: return bad()
+        ref []u32 dx
+        dx = #append(dx, spill(w, b, cv, c))
+        if dk == 2: dx = #append(dx, ir.konst(w.k.str(&w.t, index.hold(strings.clone(spell(w, b, c))))))
+        for g in args:
+            if a.main[g] != NONE:
+                err(w, b, g, 1, "this named argument is outside the slice the port builds so far")
+                return bad()
+            Val av = finish(w, b, expr(w, b, a.a[g], NONE), a.a[g])
+            if av.ty == NONE: return bad()
+            dx = #append(dx, av.opd)
+        return s_dyn(w, b, n, u32(dk), u32(#len(dx)), dx[:])
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && spell(w, b, a.a[c]) == "self":
+        u32 m = s_method_of(w, b, w.p.sym(b.file, c))
+        if m != NONE: return s_method(w, b, n, m)
+        u32 pmt = NONE
+        i64 pfirst = 0
+        bool pfull = false
+        u32 powner = NONE
+        u32 pm = se_promoted(w, b.cls, w.p.sym(b.file, c), &pmt, &pfirst, &pfull, &powner)
+        if pm != NONE && s_field_ix(w, b, w.p.sym(b.file, c)) < 0: return se_call(w, b, n, c, pm, pmt, pfirst, pfull, powner, NONE, NONE)
+    if a.tag[c] == syntax.E_NAME || a.tag[c] == syntax.E_CALL || a.tag[c] == syntax.E_INDEX || a.tag[c] == syntax.E_LAMBDA || a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && spell(w, b, a.a[c]) == "self" && s_field_ix(w, b, w.p.sym(b.file, c)) >= 0:
+        Val cv = finish(w, b, expr(w, b, c, NONE), c)
+        if cv.ty == NONE: return bad()
+        u32 cr = w.t.resolve(cv.ty)
+        if cr != NONE && w.t.tag[cr] == types.T_FUNC: return indirect(w, b, n, cv)
+        string8 x = src(w, b, c)
+        string8 fh = index.hold(#format("call a method, `m(…)`, or a value of function type — declare one as `void(int) ", x, "` and give it a lambda or a method"))
+        if cv.ty == w.sany: fh = index.hold(#format("an `any` is called through a name: bind it first, `any f = ", x, "`, then call `f(…)`"))
+        err(w, b, c, 405, index.hold(#format("`", x, "` is ", shown(w, cv.ty), ", which is no function, so there is nothing to call")), fh)
+        return bad()
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, a.a[c]), false) == NONE:
+        // `pkg.f(…)`: a Dado function of an imported package.
+        u32 qd = decl_named(w, b.file, c)
+        if qd != NONE && w.decls[qd].kind == K_FN && !ds_at(w, w.decls[qd].file, w.decls[qd].node): return s_dado_call(w, b, n, qd)
+        if qd != NONE && w.decls[qd].kind == K_CLASS: return s_construct(w, b, n, qd)
+        if qd != NONE && typeish(w.decls[qd].kind) && !s_enum(w, resolve(w, qd)): return call(w, b, n, want, false)
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_FIELD:
+        // `pkg.Class.Inner(…)`.
+        ref []u32 eps = s_epath(w, b.file, c)
+        u32 xd = NONE
+        if #len(eps) > 0 && find_local(w, b, eps[0], false) == NONE: xd = s_path_decl(w, b.file, eps[:])
+        if xd != NONE && w.decls[xd].kind == K_CLASS: return s_construct(w, b, n, xd)
+    if a.tag[c] == syntax.E_FIELD && a.tag[a.a[c]] == syntax.E_NAME:
+        u32 cd = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, a.a[c]))
+        if cd != NONE && s_member_type(w, cd, w.p.sym(b.file, c)) != NONE: return call(w, b, n, want, false)
+    if a.tag[c] == syntax.E_FIELD:
+        bool done = false
+        Val vc = s_value_call(w, b, n, c, &done)
+        if done: return vc
+    err(w, b, n, 1, "this call is outside the slice the port builds so far")
+    return bad()
+
+// `any`'s dynamic verbs (`B_SANY`, `b` the kind): 0 `globalThis`, 1 a
+// member, 2 a call through a member, 3 a call of the value, 4 an index, 5 a
+// value leaving it, checked (`c` the target's type).
+const u8 B_SANY = 156
+
+Val s_dyn(^World w, ^Body b, u32 n, u32 kind, u32 c, []u32 xs):
+    u32 rty = c if kind == 5 else w.sany
+    u32 t = temp(w, b, rty, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_SANY, rty, n, t, NONE, kind, c)
+    for x in xs:
+        ir.arg(&b.f, x)
+    return value(t, rty)
+
+// A callee reached through an `any`: 2 `a.m`, 3 `f` (an `any` local or
+// field), else NONE.
+private u32 s_dyn_callee(^World w, ^Body b, u32 c):
+    syntax.Ast a = tree(w, b)
+    if a.tag[c] == syntax.E_FIELD:
+        // The root of `x.a[i].f(…)…`: `globalThis` or an `any` local.
+        u32 r = a.a[c]
+        for a.tag[r] == syntax.E_FIELD || a.tag[r] == syntax.E_INDEX || a.tag[r] == syntax.E_CALL:
+            r = a.a[r] if a.tag[r] != syntax.E_CALL else a.list(a.b[r])[0]
+        if a.tag[r] != syntax.E_NAME: return NONE
+        // `self.f.m(…)` with `f` an `any` field.
+        if spell(w, b, r) == "self":
+            u32 x = c
+            for a.a[x] != r && (a.tag[x] == syntax.E_FIELD || a.tag[x] == syntax.E_INDEX || a.tag[x] == syntax.E_CALL):
+                x = a.a[x] if a.tag[x] != syntax.E_CALL else a.list(a.b[x])[0]
+            if a.tag[x] == syntax.E_FIELD && x != c && s_any_field(w, b, w.p.sym(b.file, x)): return 2
+        u32 sl = find_local(w, b, w.p.sym(b.file, r), false)
+        if sl != NONE && b.f.slot_ty[sl] == w.sany: return 2
+        if sl == NONE && s_any_field(w, b, w.p.sym(b.file, r)): return 2
+        if sl == NONE && (spell(w, b, r) == "globalThis" || js_key(b.file, w.p.sym(b.file, r), 0) in w.jsns) && s_field_ix(w, b, w.p.sym(b.file, r)) < 0: return 2
+        return NONE
+    if a.tag[c] != syntax.E_NAME: return NONE
+    u32 sl = find_local(w, b, w.p.sym(b.file, c), false)
+    if sl != NONE && b.f.slot_ty[sl] == w.sany: return 3
+    if sl == NONE && s_any_field(w, b, w.p.sym(b.file, c)): return 3
+    return NONE
+
+// Whether `sym` is a field of this class typed `any`.
+private bool s_any_field(^World w, ^Body b, u32 sym):
+    i64 fi = s_field_ix(w, b, sym)
+    if fi < 0: return false
+    Val sv = s_self(w, b, NONE)
+    if sv.ty == NONE: return false
+    []u32 slots = w.t.slots(sv.ty)
+    return fi < #len(slots) && slots[fi] == w.sany
+
+// `a.name = v` and `a[k] = v` through an `any` (kind 6).
+void s_any_store(^World w, ^Body b, u32 n, Val base, u32 key, u32 vn, string8 op):
+    if op != "=":
+        [2]u32 rx = [spill(w, b, base, n), key]
+        Val cur = s_dyn(w, b, n, 4, NONE, rx[:])
+        b.compound = true
+        _ = binary(w, b, n, index.hold(#format(op[0..<#len(op) - 1])), cur, NONE, vn, w.sany)
+        b.compound = false
+        return
+    Val v = coerce(w, b, expr(w, b, vn, w.sany), w.sany, vn)
+    if v.ty == NONE: return
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_SANY, u32(types.P_VOID), n, NONE, NONE, 6, NONE)
+    ir.arg(&b.f, spill(w, b, base, n))
+    ir.arg(&b.f, key)
+    ir.arg(&b.f, v.opd)
+
+// Whether field `c`'s base reaches back to `globalThis` or an `any` local.
+bool s_dyn_root(^World w, ^Body b, u32 c):
+    return s_dyn_callee(w, b, c) == 2
+
+// ERR0607 for an operator over an `any`; false when refused.
+bool s_any_op(^World w, ^Body b, u32 n, string8 op, Val l, Val r, u32 ln, u32 rn):
+    if s_fn(w, l.ty) || s_fn(w, r.ty):
+        err(w, b, n, 607, index.hold(#format("`", op, "` does not compare functions: a method read as a value is a new function each time, so two functions are never known to be one")), "compare what the functions answer, or keep a value saying which one is held — an `int` or a `string` beside it")
+        return false
+    u32 on = ln
+    if l.ty != w.sany:
+        if r.ty != w.sany: return true
+        on = rn
+    string8 x = src(w, b, on)
+    syntax.Ast a = tree(w, b)
+    if b.compound && a.tag[n] == syntax.S_ASSIGN: x = src(w, b, a.list(a.b[n])[0])
+    if b.compound:
+        err(w, b, n, 607, index.hold(#format("`", op, "=` is not defined for `any`: what an `any` holds is known only when the script runs, so DadoScript converts it before computing with it")), index.hold(#format("convert, compute, and store: `", x, " = int(", x, ") ", op, " …`, which raises if it holds no `int`")))
+        return false
+    string8 help = index.hold(#format("convert it first: `int(", x, ")`, which raises if it holds no `int`"))
+    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "<" || op == "<=" || op == ">" || op == ">=": help = index.hold(#format("convert it first — `int(", x, ")` or `float(", x, ")`, which raise if it holds no such number — or `string(", x, ")` to join it as text"))
+    if op == "==" || op == "!=": help = index.hold(#format("convert it first, to the type you expect it to hold: `string s = ", x, "`, `int n = ", x, "` — each raises if it holds something else"))
+    if op == "&&" || op == "||": help = index.hold(#format("convert it first: `bool b = ", x, "`, which raises if it holds no `bool`"))
+    err(w, b, n, 607, index.hold(#format("`", op, "` is not defined for `any`: what an `any` holds is known only when the script runs, so DadoScript converts it — checking it — before computing with it")), help)
+    return false
+
+// `Class(args…)`: an instance, its `init` given the arguments.
+private Val s_construct(^World w, ^Body b, u32 n, u32 cd):
+    u32 cty = resolve(w, cd)
+    u32 ci = s_class_of_ty(w, cty)
+    if ci == NONE: return bad()
+    u32 m = s_method_in(w, ci, w.p.names.intern("init"))
+    ref []u32 opds
+    if m == NONE:
+        syntax.Ast a = tree(w, b)
+        []u32 cks = a.list(a.b[n])
+        if #len(cks) > 2:
+            string8 cn = s_short(w, cd)
+            err(w, b, n, 601, index.hold(#format("`", cn, "` takes 0 arguments and this call passes ", #len(cks) - 2)), index.hold(#format("pass one value for each: `", cn, "()`")))
+            return bad()
+    else if !s_args(w, b, n, m, s_short(w, cd), &opds): return bad()
+    u32 t = temp(w, b, cty, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_SNEW, cty, n, t, NONE)
+    for o in opds:
+        ir.arg(&b.f, o)
+    return value(t, cty)
+
+// The arguments of a call of method `m` (named `mn` in messages), checked
+// and appended to `opds`.
+bool s_args(^World w, ^Body b, u32 n, u32 m, string8 mn, ^ref []u32 opds):
+    u32 ft = resolve(w, m)
+    if ft == NONE: return false
+    ref []u32 ps = s_mparams(w, ft)
+    u32 mf = w.decls[m].file
+    syntax.Ast ma = w.p.files[mf].a
+    []u32 mks = ma.list(ma.b[w.decls[m].node])
+    return s_args_of(w, b, n, ps[:], mf, mks[6..<#len(mks)], mn, opds)
+
+// A method type's parameters past `self`, copied.
+ref []u32 s_mparams(^World w, u32 ft):
+    ref []u32 ps
+    []u32 all = w.t.params(ft)
+    if #len(all) == 0: return ps
+    for x in all[1..<#len(all)]:
+        ps = #append(ps, x)
+    return ps
+
+// Arguments against parameter types `ps`, named by nodes `qs` of file `mf`.
+bool s_args_of(^World w, ^Body b, u32 n, []u32 ps, u32 mf, []u32 qs, string8 mn, ^ref []u32 opds):
+    syntax.Ast a = tree(w, b)
+    []u32 cks = a.list(a.b[n])
+    []u32 args = cks[2..<#len(cks)]
+    i64 need = #len(ps)
+    syntax.Ast ma = w.p.files[mf].a
+    for need > #len(args) && need > 0 && ma.b[qs[need - 1]] != NONE:
+        need -= 1
+    if #len(args) < need || #len(args) > #len(ps):
+        ref []string8 names
+        for q in qs:
+            names = #append(names, w.p.spell(mf, q))
+        string8 an = "argument" if #len(ps) == 1 else "arguments"
+        err(w, b, n, 601, index.hold(#format("`", mn, "` takes ", #len(ps), " ", an, " and this call passes ", #len(args))), index.hold(#format("pass one value for each: `", mn, "(", strings.join(names[:], ", "), ")`")))
+        return false
+    bool ok = true
+    for i in 0..<#len(args):
+        u32 g = a.a[args[i]]
+        Val v = coerce(w, b, expr(w, b, g, ps[i]), ps[i], g, index.hold(#format("the parameter `", w.p.spell(mf, qs[i]), "` of `", mn, "` is")))
+        if v.ty == NONE: ok = false
+        else: opds^ = #append(opds^, v.opd)
+    for i in #len(args)..<#len(ps):
+        if !ok: break
+        Val v = sf_default(w, b, n, mf, qs[i], ps[i])
+        if v.ty == NONE: ok = false
+        else: opds^ = #append(opds^, v.opd)
+    return ok
+
+// Method `m` called on `inst` (NONE: `self`).
+Val s_method(^World w, ^Body b, u32 n, u32 m, u32 inst = NONE):
+    if templated(w, m):
+        syntax.Ast a = tree(w, b)
+        u32 c = a.list(a.b[n])[0]
+        if inst == NONE && w.decls[m].block == w.classes[b.cls].decl: return sg_call(w, b, n, m)
+        return sg_elsewhere(w, b, n, c, m)
+    u32 ft = resolve(w, m)
+    if ft == NONE: return bad()
+    string8 mn = name_of(w, w.decls[m].name)
+    ref []u32 opds
+    if inst == NONE:
+        Val sv = s_self(w, b, n)
+        if sv.ty == NONE: return bad()
+        inst = sv.opd
+    opds = #append(opds, inst)
+    if !s_args(w, b, n, m, mn, &opds): return bad()
+    u32 rt = w.t.a[ft]
+    u32 t = NONE
+    if rt != u32(types.P_VOID): t = temp(w, b, rt, n)
+    u32 r = ir.fn_ref(&b.f, b.f.pkg, tstr(w, mn), 0)
+    _ = ir.op(&b.f, ir.O_CALL, 0, rt, n, t, r)
+    for o in opds:
+        ir.arg(&b.f, o)
+    return value(t, rt)
+
+private Val s_print(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 cks = a.list(a.b[n])
+    []u32 args = cks[2..<#len(cks)]
+    ref []u32 opds
+    for g in args:
+        Val v = finish(w, b, expr(w, b, a.a[g], NONE), a.a[g])
+        string8 vb = "print"
+        if spell(w, b, cks[0]) == "println": vb = "println"
+        if v.ty != NONE && s_class_of_ty(w, v.ty) == NONE && !sa_printed(w, b, a.a[g], v.ty, vb): continue
+        if v.ty != NONE: opds = #append(opds, v.opd)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_PRINT if spell(w, b, cks[0]) == "print" else B_PRINTLN, u32(types.P_VOID), n, NONE, NONE)
+    for o in opds:
+        ir.arg(&b.f, o)
+    return value(NONE, u32(types.P_VOID))
+
+// `string(x)`, `int(x)`, `float(x)`.
+private Val s_convert(^World w, ^Body b, u32 n, u8 k):
+    syntax.Ast a = tree(w, b)
+    []u32 cks = a.list(a.b[n])
+    []u32 args = cks[2..<#len(cks)]
+    if #len(args) != 1:
+        err(w, b, n, 1, "this conversion is outside the slice the port builds so far")
+        return bad()
+    u32 g = a.a[args[0]]
+    Val v = finish(w, b, expr(w, b, g, NONE), g)
+    if v.ty == NONE: return bad()
+    u32 to = w.sstr if k == 0 else (u32(types.P_INT) if k == 1 else u32(types.P_FLOAT))
+    if v.ty == w.sany && k != 0:
+        [1]u32 lv = [v.opd]
+        return s_dyn(w, b, n, 5, to, lv[:])
+    if k == 1 && s_denum(w, v.ty) != NONE: return s_enum_int(w, b, n, v)
+    if k == 1 && s_enum(w, v.ty):
+        string8 q = s_qual(w, s_tdecl(w, v.ty))
+        err(w, b, g, 504, index.hold(#format("`int(x)` reads a number, and `", q, "` is a script's enum, whose members are names with no number behind them")), index.hold(#format("write the number each member stands for where it is needed — a `switch` over `", q, "` — or declare the enum in Dado, where its members have values")))
+        return bad()
+    bool scalar = is_num(w, v.ty) || v.ty == u32(types.P_BOOL) || v.ty == w.sstr || v.ty == w.sany || k == 0 && (s_enum(w, v.ty) || !s_fn(w, v.ty))
+    if !scalar || k != 0 && !is_num(w, v.ty):
+        err(w, b, n, 1, "this conversion is outside the slice the port builds so far")
+        return bad()
+    u32 t = temp(w, b, to, n)
+    _ = ir.op(&b.f, ir.O_CONV, ir.CV_WIDEN, to, n, t, v.opd)
+    return value(t, to)
+
+// `+`, `==`, `!=` over strings; any other operator is refused.
+Val s_string_op(^World w, ^Body b, u32 n, string8 op, Val l, Val r, u32 ln, u32 rn):
+    bool ls = l.ty == w.sstr
+    bool rs = r.ty == w.sstr
+    if ls != rs:
+        u32 on = rn if ls else ln
+        Val ov = r if ls else l
+        u32 ot = final_ty(w, ov)
+        string8 help = ""
+        if is_num(w, ot) || ot == u32(types.P_BOOL): help = index.hold(#format("DadoScript never makes a string of a value by itself: write `string(", src(w, b, on), ")`"))
+        err(w, b, n, 504, index.hold(#format("`", op, "` needs both sides to be one type; these are ", shown(w, final_ty(w, l)), " and ", shown(w, final_ty(w, r)))), help)
+        return bad()
+    if op == "+" && ls:
+        u32 t = temp(w, b, w.sstr, n)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, w.sstr, n, t, l.opd, r.opd)
+        return value(t, w.sstr)
+    if op == "==" || op == "!=":
+        u32 t = temp(w, b, u32(types.P_BOOL), n)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ if op == "==" else ir.B_NE, u32(types.P_BOOL), n, t, l.opd, r.opd)
+        return value(t, u32(types.P_BOOL))
+    err(w, b, n, 607, index.hold(#format("`", op, "` is not defined for ", shown(w, l.ty))), "strings join with `+` and compare with `==` and `!=`")
+    return bad()
+
+// The help a script's mismatch gives: the conversion it never makes itself.
+string8 s_conv_help(^World w, ^Body b, u32 want, u32 got, u32 at):
+    if at == NONE: return ""
+    if s_fn(w, want) || s_fn(w, got): return s_fn_help(w, b, want, got, at)
+    string8 x = src(w, b, at)
+    bool wi = is_int(w, want) && !is_float(w, want)
+    bool gi = is_int(w, got) && !is_float(w, got)
+    if wi && is_float(w, got): return index.hold(#format("`int(", x, ")` drops the fraction, toward zero; DadoScript never does that by itself"))
+    if is_float(w, want) && gi: return index.hold(#format("`float(", x, ")` makes a float of it; DadoScript never does that by itself"))
+    if want == w.sstr && (is_num(w, got) || got == u32(types.P_BOOL)): return index.hold(#format("DadoScript never makes a string of a value by itself: write `string(", x, ")`"))
+    if wi && got == w.sstr: return index.hold(#format("read the integer the text spells: `", x, ".to_int()`, which raises when it spells none"))
+    if is_float(w, want) && got == w.sstr: return index.hold(#format("read the number the text spells: `", x, ".to_float()`, which raises when it spells none"))
+    return ""
+
+// The class's field initializers, in order, each reading the fields above it.
+void s_fields(^World w, ^Body b):
+    SClass c = s_cls(w, b)
+    syntax.Ast a = w.p.files[c.file].a
+    u32 row = resolve(w, c.decl)
+    []u32 all_fts = w.t.slots(row)
+    ref []SField own
+    for x in s_fields_of(w, b.cls):
+        if x.cls == b.cls: own = #append(own, x)
+    i64 base = #len(all_fts) - #len(own)
+    []u32 fts = all_fts[base..<#len(all_fts)]
+    for i in 0..<#len(own):
+        []u32 ks = a.list(a.b[own[i].node])
+        u32 fx = NONE
+        if own[i].emb >= 0 || ks[1] == NONE:
+            if fts[i] == w.sstr: fx = ir.konst(w.k.str(&w.t, ""))
+            else if own[i].emb >= 0 && st_no_zero(w, fts[i]): continue
+            else if st_no_zero(w, fts[i]):
+                st_needs(w, c.file, own[i].node, fts[i])
+                continue
+            else if fts[i] == u32(types.P_INT) || fts[i] == u32(types.P_FLOAT) || fts[i] == u32(types.P_BOOL) || fts[i] == u32(types.P_U8) || s_tup(w, fts[i]) || s_enum(w, fts[i]) || union_of(w, fts[i]) != NONE || s_kind(w, fts[i]) == 1 || s_kind(w, fts[i]) == 2: fx = zero(w, fts[i])
+            else: continue
+        else:
+            if ((u64(c.file) << 32) | u64(own[i].node)) in w.sfailed: continue
+            b.above = u32(base + i)
+            Val v = coerce(w, b, expr(w, b, ks[1], fts[i]), fts[i], ks[1], "the field's type is")
+            b.above = NONE
+            if v.ty == NONE: continue
+            fx = v.opd
+        Val fp = s_field_use(w, b, own[i].node, own[i].sym, base + i)
+        if fp.ty != NONE: _ = ir.op(&b.f, ir.O_SET, 0, fts[i], own[i].node, fp.opd, fx)
+    b.above = NONE
+
+// ERR1304: `init` and `ready`'s fixed signatures.
+void s_hooks(^World w, u32 d):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 n = w.decls[d].node
+    string8 s = name_of(w, w.decls[d].name)
+    u32 ft = resolve(w, d)
+    if ft == NONE: return
+    u32 rt = w.t.a[ft]
+    w.d.phase = diag.PH_INTERFACE
+    u32 rn = a.list(a.b[n])[0]
+    if s == "init" && rt != u32(types.P_VOID):
+        say(w, f, 0, a.lo[rn], a.hi[rn], 1304, "`init` runs once per instance, when the class name is called to make one, and what it would return has nowhere to go — the call answers the instance", "write `void init(…)`")
+    if s == "ready" && rt != u32(types.P_VOID) && rt != u32(types.P_INT):
+        []u32 ks = a.list(a.b[n])
+        string8 ps = ""
+        if #len(ks) > 6: ps = w.p.files[f].src[i64(a.lo[ks[6]])..<i64(a.hi[ks[#len(ks) - 1]])]
+        say(w, f, 0, a.lo[rn], a.hi[rn], 1304, "`ready` is the entry `#script_run` runs, as a program's `main` is run, so it answers an `int` status or nothing", index.hold(#format("write `int ready(", ps, ")` or `void ready(", ps, ")`, and answer anything else through a field or another method")))
+    []u32 rks = a.list(a.b[n])
+    if s == "reloaded" && (rt != u32(types.P_VOID) || #len(rks) > 6):
+        u32 at = rks[6] if #len(rks) > 6 else rn
+        say(w, f, 0, a.lo[at], a.hi[at], 1304, "`reloaded` is what each instance a handle holds runs after `#script_reload` swaps new code in, called with nothing and answering to no one, so it takes no arguments and answers nothing", "write `void reloaded()`")
+
+// -- signals
+
+// IR verbs over a signal: args are the instance, then the receiver or the values.
+const u8 B_SIG_CONNECT = 140
+const u8 B_SIG_DISCONNECT = 141
+const u8 B_SIG_EMIT = 142
+const u8 B_PRINT = 143
+const u8 B_PRINTLN = 144
+const u8 B_SNEW = 151
+
+private u8 s_verb(string8 s):
+    if s == "connect": return B_SIG_CONNECT
+    if s == "disconnect": return B_SIG_DISCONNECT
+    if s == "emit": return B_SIG_EMIT
+    return 0
+
+// Signal `sym` of class `ci`: its node, or NONE.
+u32 s_signal(^World w, u32 ci, u32 sym):
+    if ci == NONE: return NONE
+    SClass c = w.classes[ci]
+    for sg in c.signals:
+        if w.p.sym(c.file, sg) == sym: return sg
+    return NONE
+
+// The class a value of type `ty` is an instance of, or NONE.
+u32 s_class_of_ty(^World w, u32 ty):
+    if ty == NONE: return NONE
+    u32 t = ty
+    u32 r = w.t.resolve(t)
+    if r != NONE && w.t.tag[r] == types.T_PTR: t = w.t.a[r]
+    if !(t in w.type_decl): return NONE
+    try u32 d = w.type_decl[t] else: return NONE
+    if !(d in w.class_of): return NONE
+    try u32 ci = w.class_of[d] else: return NONE
+    return ci
+
+// The signal's parameter types, as script types.
+private ref []u32 s_sig_params(^World w, u32 ci, u32 sg):
+    SClass c = w.classes[ci]
+    syntax.Ast a = w.p.files[c.file].a
+    ref []u32 ps
+    for q in a.list(a.b[sg]):
+        u32 t = resolve_type(w, c.file, a.a[q])
+        ps = #append(ps, t if t != NONE else u32(types.P_INT))
+    return ps
+
+private string8 s_sig_list(^World w, u32 ci, u32 sg):
+    SClass c = w.classes[ci]
+    syntax.Ast a = w.p.files[c.file].a
+    ref []string8 xs
+    for q in a.list(a.b[sg]):
+        xs = #append(xs, w.p.files[c.file].src[i64(a.lo[q])..<i64(a.hi[q])])
+    return index.hold(#format("(", strings.join(xs[:], ", "), ")"))
+
+private string8 s_ty_list(^World w, []u32 ts):
+    ref []string8 xs
+    for t in ts:
+        xs = #append(xs, named(w, t))
+    return index.hold(#format("(", strings.join(xs[:], ", "), ")"))
+
+// ERR1362: a signal named anywhere but as `.connect`/`.disconnect`/`.emit`'s receiver.
+Val s_not_a_value(^World w, ^Body b, u32 n, u32 sym):
+    err(w, b, n, 1362, index.hold(#format("`", name_of(w, sym), "` is a signal, and a signal is not a value: it is named only as the receiver of `.connect`, `.disconnect` or `.emit`")), index.hold(#format("connect a receiver — `", name_of(w, sym), ".connect(f)` — or emit it — `", name_of(w, sym), ".emit(…)`")))
+    return bad()
+
+// The instance and signal a verb's receiver `x` names (script and Dado
+// forms: `died`, `self.died`, `g.died`), without checking `x`; NONE when none.
+u64 s_signal_ref(^World w, ^Body b, u32 x):
+    syntax.Ast a = tree(w, b)
+    u32 sym = w.p.sym(b.file, x)
+    if b.ds && a.tag[x] == syntax.E_NAME && find_local(w, b, sym, false) == NONE && s_field_ix(w, b, sym) < 0:
+        u32 sg = s_signal(w, b.cls, sym)
+        if sg != NONE: return (u64(b.cls) << 32) | u64(sg)
+        return u64(NONE)
+    if a.tag[x] != syntax.E_FIELD || a.tag[a.a[x]] != syntax.E_NAME: return u64(NONE)
+    u32 bs = w.p.sym(b.file, a.a[x])
+    u32 sl = find_local(w, b, bs, false)
+    if sl == NONE: return u64(NONE)
+    u32 ci = s_class_of_ty(w, b.f.slot_ty[sl])
+    u32 sg = s_signal(w, ci, sym)
+    if sg == NONE: return u64(NONE)
+    return (u64(ci) << 32) | u64(sg)
+
+// `died.connect(f)`, `died.disconnect(f)`, `died.emit(…)`, either dialect.
+Val s_signal_call(^World w, ^Body b, u32 n, u64 ref_, string8 verb):
+    syntax.Ast a = tree(w, b)
+    u32 ci = u32(ref_ >> 32)
+    u32 sg = u32(ref_ & 0xFFFFFFFF)
+    []u32 cks = a.list(a.b[n])
+    u32 cal = cks[0]
+    u32 x = a.a[cal]
+    Val inst = bad()
+    if a.tag[x] == syntax.E_FIELD: inst = expr(w, b, a.a[x], NONE)
+    else: inst = s_self(w, b, x)
+    if inst.ty == NONE: return bad()
+    ref []u32 ps = s_sig_params(w, ci, sg)
+    string8 sn = name_of(w, w.p.sym(w.classes[ci].file, sg))
+    []u32 args = cks[2..<#len(cks)]
+    u8 vb = s_verb(verb)
+    ref []u32 ops
+    ops = #append(ops, spill(w, b, inst, n))
+    ops = #append(ops, ir.konst(w.k.str(&w.t, sn)))
+    if vb == B_SIG_EMIT:
+        if #len(args) > 16 && !b.ds:
+            err(w, b, n, 1221, index.hold(#format("this emit carries ", #len(args), " values into the script, and one call from Dado into a script carries at most 16")))
+            return bad()
+        if #len(args) != #len(ps):
+            err(w, b, n, 1360, index.hold(#format("`", sn, "` is ", s_sig_list(w, ci, sg), ", and this emit passes ", #len(args), " value", "" if #len(args) == 1 else "s")), "pass one value for each of the signal's parameters")
+            return bad()
+        for i in 0..<#len(args):
+            u32 g = a.a[args[i]]
+            u32 want = NONE
+            if b.ds: want = ps[i]
+            Val v = expr(w, b, g, want)
+            if b.ds: v = coerce(w, b, v, ps[i], g, index.hold(#format("the parameter `", s_param_name(w, ci, sg, i), "` of the signal `", sn, "` is")))
+            else: v = s_cross_in(w, b, v, ps[i], g, ci, sg, sn, i)
+            if v.ty == NONE: return bad()
+            ops = #append(ops, spill(w, b, v, g))
+    else:
+        if !s_receiver(w, b, n, ci, sg, args, &ops): return bad()
+    // From Dado, an emit is a run of the instance's `$emit_` method, and a
+    // function connected is a run of `$connect_sig$f` (`$disconnect_…`).
+    if vb == B_SIG_EMIT && !b.ds: return host_emit(w, b, n, ops[0], sn, ps[:], ops[2..<#len(ops)])
+    if !b.ds && #len(ops) >= 3 && rt_pkg(w) != NONE: return host_connect(w, b, n, ops[0], ci, sg, u32(w.k.w0[ops[2] & ~ir.OPD_CONST]), vb == B_SIG_CONNECT, ops[3] if #len(ops) == 4 else NONE)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, vb, u32(types.P_VOID), n, NONE, NONE)
+    for o in ops:
+        ir.arg(&b.f, o)
+    return value(NONE, u32(types.P_VOID))
+
+// A Dado value given to a script parameter of type `st`.
+private string8 s_param_name(^World w, u32 ci, u32 sg, i64 i):
+    SClass c = w.classes[ci]
+    []u32 qs = w.p.files[c.file].a.list(w.p.files[c.file].a.b[sg])
+    return w.p.spell(c.file, qs[i])
+
+private Val s_cross_in(^World w, ^Body b, Val v, u32 st, u32 g, u32 ci, u32 sg, string8 sn, i64 i):
+    Val f = finish(w, b, v, g)
+    if f.ty == NONE: return bad()
+    string8 why = ""
+    if crosses(w, f.ty, st, &why): return f
+    err(w, b, g, 504, index.hold(#format("the parameter `", s_param_name(w, ci, sg, i), "` of the signal `", sn, "` is ", shown(w, st), ", and ", named(w, f.ty), " does not cross to it", why)))
+    return bad()
+
+// The receiver of a connect or disconnect; false when refused.
+private bool s_receiver(^World w, ^Body b, u32 n, u32 ci, u32 sg, []u32 args, ^ref []u32 ops):
+    syntax.Ast a = tree(w, b)
+    string8 sn = name_of(w, w.p.sym(w.classes[ci].file, sg))
+    string8 sl = s_sig_list(w, ci, sg)
+    ref []u32 ps = s_sig_params(w, ci, sg)
+    if #len(args) == 0 || #len(args) > 2 || #len(args) == 2 && b.ds:
+        err(w, b, n, 1360, index.hold(#format("a connection names one receiver of `", sn, "` ", sl, "; this passes ", #len(args), " values")), "pass the receiver: a method, a lambda or a function")
+        return false
+    u32 g = a.a[args[0]]
+    u32 ft = NONE
+    string8 what = src(w, b, g)
+    u32 bound_ = NONE
+    if b.ds && a.tag[g] == syntax.E_LAMBDA: return s_lambda(w, b, g, ci, sg, ops)
+    if b.ds:
+        u32 m = NONE
+        u32 inst = NONE
+        if a.tag[g] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, g), false) == NONE: m = s_method_of(w, b, w.p.sym(b.file, g))
+        if a.tag[g] == syntax.E_FIELD && a.tag[a.a[g]] == syntax.E_NAME:
+            u32 bs = w.p.sym(b.file, a.a[g])
+            u32 lsl = find_local(w, b, bs, false)
+            u32 oc = NONE
+            if lsl != NONE: oc = s_class_of_ty(w, b.f.slot_ty[lsl])
+            if oc != NONE:
+                u64 mk = (u64(w.classes[oc].decl) << 32) | u64(w.p.sym(b.file, g))
+                if mk in w.methods:
+                    try m = w.methods[mk] else: pass
+                Val iv = expr(w, b, a.a[g], NONE)
+                if iv.ty != NONE: inst = spill(w, b, iv, g)
+        if m == NONE:
+            err(w, b, g, 1360, index.hold(#format("`", what, "` is not a method of a class or a lambda, so it cannot receive `", sn, "`")), "connect a method — `hit`, `self.hit`, `g.hit` — or a lambda")
+            return false
+        ft = resolve(w, m)
+        if inst == NONE:
+            Val sv = s_self(w, b, g)
+            inst = sv.opd
+        ops^ = #append(ops^, inst)
+        if ft == NONE: return false
+        []u32 all = w.t.params(ft)
+        if !s_match(w, b, g, what, sn, sl, all[1..<#len(all)], ps[:], w.t.a[ft], true): return false
+        ops^ = #append(ops^, ir.konst(w.k.str(&w.t, name_of(w, w.decls[m].name))))
+        return true
+    // Dado: a function, or a method bound to a pointer.
+    Val fv = expr(w, b, g, NONE)
+    if fv.ty == NONE: return false
+    if fv.kind == V_FN && fv.x != NONE:
+        u32 d = fv.x
+        ft = resolve(w, d)
+        if ft == NONE: return false
+        []u32 all = w.t.params(ft)
+        bool method = w.decls[d].kind == K_METHOD
+        if method != (#len(args) == 2):
+            err(w, b, n, 1360, index.hold(#format("`", what, "` is ", "a method, called through a pointer the connection passes beside it — `", sn, ".connect(", what, ", p)`" if method else "a function, and a connection names one alone", "")), "")
+            return false
+        []u32 rest = all
+        if method: rest = all[1..<#len(all)]
+        if method:
+            u32 pn = a.a[args[1]]
+            Val pv = finish(w, b, expr(w, b, pn, all[0]), pn)
+            if pv.ty == NONE: return false
+            if w.t.resolve(pv.ty) != w.t.resolve(all[0]):
+                err(w, b, pn, 1363, index.hold(#format("`", what, "` takes its `^self` as ", named(w, all[0]), ", and this pointer is ", named(w, pv.ty))), index.hold(#format("pass a ", named(w, all[0]), ": `&` of the value the method is bound to")))
+                return false
+            bound_ = spill(w, b, pv, pn)
+        if !s_match(w, b, g, what, sn, sl, rest, ps[:], w.t.a[ft], false): return false
+        ops^ = #append(ops^, ir.konst(w.k.small(&w.t, i64(d))))
+        if bound_ != NONE: ops^ = #append(ops^, bound_)
+        return true
+    err(w, b, g, 1360, index.hold(#format("`", what, "` is not a function, so it cannot receive `", sn, "`")), "connect a package-level function, or a method with the pointer it is bound to")
+    return false
+
+// The receiver's parameters against the signal's: count, then each crossing.
+private bool s_match(^World w, ^Body b, u32 g, string8 what, string8 sn, string8 sl, []u32 rps, []u32 ps, u32 ret, bool script):
+    if ret != u32(types.P_VOID):
+        err(w, b, g, 1361, index.hold(#format("`", what, "` answers ", shown(w, ret), ", and an emit answers nothing, so a receiver of `", sn, "` answers nothing")), "connect a `void` method or function, and keep what it would answer in a field")
+        return false
+    bool same = #len(rps) == #len(ps)
+    string8 why = ""
+    i64 bad_at = -1
+    if same:
+        for i in 0..<#len(ps):
+            bool ok = false
+            if script: ok = rps[i] == ps[i]
+            else: ok = crosses(w, rps[i], ps[i], &why)
+            if !ok && bad_at < 0: bad_at = i
+    if same && bad_at < 0: return true
+    if !script && same && #len(why) > 0:
+        err(w, b, g, 1206, index.hold(#format("a script cannot call `", what, "`: its parameter ", bad_at, " is ", named(w, rps[bad_at]), why)), "")
+        return false
+    err(w, b, g, 1360, index.hold(#format("`", what, "` takes ", s_ty_list(w, rps), ", and `", sn, "` passes ", sl)), "a receiver takes the signal's parameters, in order")
+    return false
+
+// A lambda receiver: its parameters are the signal's; its body is checked here.
+private bool s_lambda(^World w, ^Body b, u32 g, u32 ci, u32 sg, ^ref []u32 ops):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[g])
+    ref []u32 lps
+    for q in ks[2..<#len(ks)]:
+        u32 t = resolve_type(w, b.file, a.a[q])
+        if t == NONE: return false
+        lps = #append(lps, t)
+    u32 ret = u32(types.P_VOID)
+    if ks[0] != NONE: ret = resolve_type(w, b.file, ks[0])
+    ref []u32 ps = s_sig_params(w, ci, sg)
+    string8 sn = name_of(w, w.p.sym(w.classes[ci].file, sg))
+    if !s_match(w, b, g, "this lambda", sn, s_sig_list(w, ci, sg), lps[:], ps[:], ret, true): return false
+    ops^ = #append(ops^, s_lambda_value(w, b, g, lps[:], ret))
+    return true
+
+// `Platform`: its members and `os()` are strings fixed when the script is
+// compiled. `x` the member or method; "" refused (reported at f's lo..hi).
+string8 s_platform(^World w, u32 f, u32 n, string8 x, bool call, i64 nargs):
+    syntax.Ast a = w.p.files[f].a
+    string8 hx = index.hold(#format("#", x))
+    if call && x == "os" && nargs == 0: hx = index.hold(#format("#", w.os))
+    for m in MEMBERS:
+        if m.name != hx || m.query > Q_ARCH || x != "os" && call: continue
+        if m.dados == DS_SPELLED:
+            if m.name == "#UNKNOWN_OS": return "\"unknown\""
+            return index.hold(#format("\"", strings.to_lower(m.name[1..<#len(m.name)]), "\""))
+    string8 msg = ""
+    string8 help = ""
+    u32 lo = a.lo[n]
+    u32 hi = a.hi[n]
+    if !call:
+        lo = w.p.files[f].t.start[a.main[n]]
+        hi = w.p.files[f].t.end[a.main[n]]
+    u16 code = 410
+    string8 aw = "the CPU architecture is the target's machinery, and a script branches on the operating system or the web, never on the instruction set"
+    if call:
+        code = 405
+        msg = index.hold(#format("`Platform` has no method `", x, "`: its one method is `os()`"))
+        help = "ask `Platform.os()`, and compare it with a member such as `Platform.LINUX`"
+        if x == "os":
+            code = 601
+            msg = index.hold(#format("`Platform.os()` takes no arguments, and this call passes ", nargs))
+            help = "write `Platform.os()`"
+        if x == "arch":
+            code = 1301
+            msg = index.hold(#format("`Platform.arch()` is not DadoScript: ", aw))
+            help = "ask `#ARCH` in Dado — `when #ARCH == #AARCH64:` — and give the script a Dado function that answers what it needs to know"
+    else:
+        ref []string8 ls
+        ref []string8 pool
+        for m in MEMBERS:
+            if m.query != Q_OS || m.dados != DS_SPELLED: continue
+            ls = #append(ls, index.hold(#format("`Platform.", m.name[1..<#len(m.name)], "`")))
+            pool = #append(pool, m.name[1..<#len(m.name)])
+            if m.name == hx: code = 0
+        for m in MEMBERS:
+            if m.name == hx && m.query == Q_ARCH:
+                code = 1301
+                msg = index.hold(#format("`Platform.", x, "` is not DadoScript: ", aw))
+                help = index.hold(#format("ask `#ARCH == ", hx, "` in Dado, and give the script a Dado function that answers what it needs to know"))
+        if x == "WASI" || x == "EMSCRIPTEN" || x == "NONE":
+            code = 1301
+            msg = index.hold(#format("`Platform.", x, "` is not DadoScript: WASI and Emscripten are toolchains, not hosts a script runs on: a host there answers `Platform.UNKNOWN_OS`, and a script on the web asks `Platform.WEB`"))
+            help = "compare `Platform.os()` with `Platform.UNKNOWN_OS` or `Platform.WEB`"
+        if code == 1301:
+            lo = a.lo[n]
+            hi = a.hi[n]
+        else:
+            msg = index.hold(#format("`Platform` has no member `", x, "`"))
+            help = nearest(x, pool[:])
+            if #len(help) > 0: help = index.hold(#format("did you mean `", help, "`?"))
+            else: help = index.hold(#format("the members are ", strings.join(ls[:], ", "), ", and `Platform.os()` answers one"))
+    say(w, f, 0, lo, hi, code, msg, help)
+    return ""
+
+private Val s_pval(^World w, string8 v):
+    if v == "": return bad()
+    return value(ir.konst(w.k.str(&w.t, v[1..<#len(v) - 1])), w.sstr)
+
+// Whether `n` names `Platform` (nothing of the script's own takes the name).
+bool s_is_platform(^World w, ^Body b, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    if n == NONE || a.tag[n] != syntax.E_NAME || w.p.spell(f, n) != "Platform" || lookup(w, w.p.files[f].pkg, w.p.sym(f, n)) != NONE: return false
+    return b == nil || find_local(w, b, w.p.sym(f, n), false) == NONE && s_field_ix(w, b, w.p.sym(f, n)) < 0
+
+// A script's `when` condition, folded: "T"/"F", a literal's text, or ""
+// refused (ERR0906, the `Platform` refusals).
+string8 s_fold(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    string8 sp = w.p.spell(f, n)
+    if g == syntax.E_INT || g == syntax.E_FLOAT || g == syntax.E_STR: return sp
+    if g == syntax.E_NAME && (sp == "true" || sp == "false"): return "T" if sp == "true" else "F"
+    if g == syntax.E_FIELD && s_is_platform(w, nil, f, a.a[n]): return s_platform(w, f, n, sp, false, 0)
+    string8 what = "this expression"
+    if g == syntax.E_NAME: what = index.hold(#format("`", sp, "`"))
+    if g == syntax.E_CALL:
+        []u32 ks = a.list(a.b[n])
+        if a.tag[ks[0]] == syntax.E_FIELD && s_is_platform(w, nil, f, a.a[ks[0]]):
+            string8 x = w.p.spell(f, ks[0])
+            if x == "os" || x == "arch": return s_platform(w, f, n, x, true, #len(ks) - 2)
+        what = "a call's answer"
+    if g == syntax.E_UNARY && sp == "!":
+        string8 x = s_fold(w, f, a.a[n])
+        if x == "T" || x == "F": return "F" if x == "T" else "T"
+        return ""
+    if g == syntax.E_BINARY:
+        string8 l = s_fold(w, f, a.a[n])
+        if l == "": return ""
+        string8 r = s_fold(w, f, a.b[n])
+        if r == "": return ""
+        if sp == "==" || sp == "!=": return "T" if (l == r) == (sp == "==") else "F"
+        if sp == "&&": return "T" if l == "T" && r == "T" else "F"
+        if sp == "||": return "T" if l == "T" || r == "T" else "F"
+    say(w, f, 0, a.lo[n], a.hi[n], 906, index.hold(#format("a script's `when` is folded when the script is compiled, and ", what, " is known only when the script runs: a `when` folds literals, `Platform.os()` and the `Platform` members")), "branch with `if`, which decides when the script runs")
+    return ""
+
+// The arm a script's `when` takes (NONE: none, or refused).
+u32 s_when_arm(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    for arm in a.list(a.b[n]):
+        if arm == NONE: continue
+        u8 g = a.tag[arm]
+        if g != syntax.N_WHEN_ARM && g != syntax.S_WHEN_ARM: return arm
+        u32 c = a.a[arm] if g == syntax.S_WHEN_ARM else a.list(a.b[arm])[0]
+        if sg_asks(w, f, c):
+            u32 at = NONE
+            string8 why = ""
+            i8 r = sg_pred(w, f, c, &at, &why)
+            if r < 0:
+                say(w, f, 0, a.lo[at], a.hi[at], 906, why, "ask `when T is int:`, `when T has ==:` or `when T is scalar:`")
+                return NONE
+            if r == 1: return arm
+            continue
+        string8 v = s_fold(w, f, c)
+        if v == "": return NONE
+        if v == "T": return arm
+    return NONE
+
+// A call of a `foreign "x.js"` function (`B_SJS`: a its name as JS writes
+// it); what it answers is checked as it leaves.
+private Val s_js_call(^World w, ^Body b, u32 n, u32 m):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[m])
+    []u32 qs = ks[3..<#len(ks)]
+    string8 fnm = index.hold(strings.clone(w.p.spell(b.file, m)))
+    ref []u32 pts
+    ref []u32 qv
+    []u32 cks = a.list(a.b[n])
+    i64 na = #len(cks) - 2
+    for i in 0..<#len(qs):
+        u32 et = resolve_type(w, b.file, a.a[qs[i]])
+        if et == NONE: return bad()
+        // `..T xs`: each argument past the fixed ones a `T`.
+        i64 times = 1
+        if a.tag[qs[i]] == syntax.N_PARAM_V: times = na - i64(i)
+        for _ in 0..<times:
+            pts = #append(pts, et)
+            qv = #append(qv, qs[i])
+    ref []u32 opds
+    if !s_args_of(w, b, n, pts[:], b.file, qv[:], fnm, &opds): return bad()
+    u32 rt = u32(types.P_VOID) if ks[0] == NONE else resolve_type(w, b.file, ks[0])
+    if rt == NONE: return bad()
+    try u32 jm = w.jsns[js_key(b.file, m, 1)] else: return bad()
+    u32 t = NONE if rt == u32(types.P_VOID) else temp(w, b, rt, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_SJS, rt, n, t, ir.konst(w.k.str(&w.t, index.hold(#format("js$", jm, ".", fnm)))))
+    for o in opds:
+        ir.arg(&b.f, o)
+    return value(t, rt)
+
+const u8 B_SJS = 157
+
+// Closures: a lambda as a value, a method read as one (bound to its
+// instance), a function written where a `Location` goes.
+bool s_fn(^World w, u32 ty):
+    u32 r = w.t.resolve(ty)
+    return r != NONE && w.t.tag[r] == types.T_FUNC
+
+Val s_lambda_expr(^World w, ^Body b, u32 g, u32 want):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[g])
+    ref []u32 lps
+    for q in ks[2..<#len(ks)]:
+        u32 t = resolve_type(w, b.file, a.a[q])
+        if t == NONE: return bad()
+        lps = #append(lps, t)
+    u32 ret = u32(types.P_VOID)
+    if ks[0] != NONE: ret = resolve_type(w, b.file, ks[0])
+    if ret == NONE: return bad()
+    u32 lt = s_lambda_value(w, b, g, lps[:], ret)
+    if a.a[g] != NONE: ret = sa_type(w, ret)
+    return value(lt, w.t.func(ret, types.F_NONE, lps[:]))
+
+Val s_method_val(^World w, ^Body b, u32 n, u32 inst, u32 m):
+    if name_of(w, w.decls[m].name) == "init":
+        string8 cn = s_short(w, w.decls[m].block)
+        err(w, b, n, 504, "`init` runs once, as an instance is made, so it is no value to hold", index.hold(#format("construct one, `", cn, "(…)`, or hold a lambda that does: `", cn, "(): return ", cn, "(…)`")))
+        return bad()
+    u32 mt = resolve(w, m)
+    if mt == NONE: return bad()
+    ref []u32 ps = s_mparams(w, mt)
+    u32 ft = w.t.func(w.t.a[mt], types.F_NONE, ps[:])
+    u32 t = temp(w, b, ft, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_SPROP, ft, n, t, NONE, NONE, 1)
+    ir.arg(&b.f, inst)
+    ir.arg(&b.f, ir.konst(w.k.str(&w.t, name_of(w, w.decls[m].name))))
+    return value(t, ft)
+
+// A function where a `Location` is written: where it begins (`B_SLOC`:
+// file, line, column, name); NONE type when `v` is none.
+Val s_to_location(^World w, ^Body b, Val v, u32 at):
+    syntax.Ast a = tree(w, b)
+    if !s_fn(w, v.ty): return bad()
+    if a.tag[at] == syntax.E_LAMBDA: return s_located(w, b, at, b.file, a.lo[at], "")
+    u32 m = NONE
+    if a.tag[at] == syntax.E_NAME || a.tag[at] == syntax.E_FIELD && spell(w, b, a.a[at]) == "self": m = s_method_of(w, b, w.p.sym(b.file, at))
+    if m == NONE: return bad()
+    u32 mf = w.decls[m].file
+    return s_located(w, b, at, mf, w.p.files[mf].a.lo[w.decls[m].node], s_mpath(w, m))
+
+Val s_located(^World w, ^Body b, u32 n, u32 f, u32 at, string8 fname):
+    diag.Place pl = w.p.map.place(w.p.map.base[f] + at)
+    u32 t = temp(w, b, w.sloc, n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_SLOC, w.sloc, n, t, NONE)
+    ir.arg(&b.f, ir.konst(w.k.str(&w.t, w.p.files[f].path)))
+    ir.arg(&b.f, ir.konst(w.k.small(&w.t, pl.line)))
+    ir.arg(&b.f, ir.konst(w.k.small(&w.t, pl.col)))
+    ir.arg(&b.f, ir.konst(w.k.str(&w.t, fname)))
+    return value(t, w.sloc)
+
+const u8 B_SLOC = 158
+
+// The help where a function meets another type.
+string8 s_fn_help(^World w, ^Body b, u32 want, u32 got, u32 at):
+    if s_fn(w, want):
+        ref []string8 ps
+        [6]string8 nms = ["a", "b", "c", "d", "e", "f"]
+        []u32 pts = w.t.params(w.t.resolve(want))
+        for i in 0..<#len(pts):
+            ps = #append(ps, index.hold(#format(shown(w, pts[i]), " ", nms[i % 6])))
+        string8 sh = index.hold(#format(shown(w, w.t.a[w.t.resolve(want)]), "(", strings.join(ps[:], ", "), ")"))
+        if s_fn(w, got): return index.hold(#format("a function's type is what it answers and what it takes, and both must match: write `", sh, ": return …`, or name a method of that type"))
+        return index.hold(#format("a value of `", shown(w, want), "` is a function: write a lambda, `", sh, ": return …`, or a method's name"))
+    if want == w.sany: return index.hold(#format("an `any` holds no function: keep it in a local of its own type, `", shown(w, got), " f = ", src(w, b, at), "`"))
+    return index.hold(#format("`", src(w, b, at), "` is a function: call it, `", src(w, b, at), "(…)`, to use what it answers"))
+
+// A lambda's value: `O_BLOCK` sub 1, its body checked over `lps`.
+u32 s_lambda_value(^World w, ^Body b, u32 g, []u32 lps, u32 ret):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[g])
+    u32 ob = b.ret
+    b.ret = ret
+    bool oin = b.sinside
+    b.sinside = a.a[g] != NONE
+    b.slambda += 1
+    // `O_BLOCK` sub 1: a lambda, `dst` its value; b, c: its first parameter
+    // slot and how many; `ty`: the slot past its own.
+    u32 lt = temp(w, b, u32(types.P_RAWPTR), g)
+    u32 first = u32(#len(b.f.slot_ty))
+    u32 h = ir.op(&b.f, ir.O_BLOCK, 1, NONE, g, lt, NONE, first, u32(#len(ks) - 2))
+    b.heads = #append(b.heads, Head(h, false, NONE, false, b.depth, false))
+    scope_in(w, b)
+    for i in 2..<#len(ks):
+        u32 q = ks[i]
+        _ = declare_local(w, b, w.p.sym(b.file, q), lps[i - 2], q)
+        // A parameter is not a local LNT0412 asks about (Rust's).
+        b.locals[#len(b.locals) - 1].read = true
+    block(w, b, ks[1], false)
+    scope_out(w, b)
+    close(w, b, h)
+    b.f.ty_of[h] = u32(#len(b.f.slot_ty))
+    if b.sinside: b.f.facts[h] = 1
+    b.ret = ob
+    b.sinside = oin
+    b.slambda -= 1
+    return lt
+
+// The one crossing relation between a Dado type and a script type (either
+// direction): a script `int` is any Dado integer, `float` either float,
+// `string` any string width, `bool` itself, a class's handle itself. `why`
+// names the part that does not cross.
+bool crosses(^World w, u32 dado, u32 script, ^string8 why):
+    u32 d = w.t.resolve(dado)
+    if d == NONE: return false
+    if script == u32(types.P_INT):
+        if is_int(w, d) && !is_float(w, d) && int_prim(w, d) != types.PRIMS && types.PRIM[int_prim(w, d)].kind != types.K_CHAR: return true
+    else if script == u32(types.P_FLOAT):
+        if is_float(w, d): return true
+    else if script == u32(types.P_BOOL):
+        if d == u32(types.P_BOOL): return true
+    else if script == w.sstr:
+        if d == types.STRING8 || d == w.sstr: return true
+    else if w.t.resolve(script) == d: return true
+    if w.t.tag[d] == types.T_PTR || d == u32(types.P_RAWPTR) || w.t.tag[d] == types.T_REF: why^ = ", an address, which a script never holds"
+    return false
+
+// ── JavaScript modules a script reaches ─────────────────────────────────────
+
+bool js_path(string8 sp):
+    return strings.ends_with(sp, ".js\"") || strings.ends_with(sp, ".mjs\"")
+
+u64 js_key(u32 f, u32 x, u64 tag):
+    return (u64(f) << 33) | (u64(x) << 1) | tag
+
+// `stem` as an identifier: `three_module` for `three.module`.
+private string8 js_ident(string8 stem):
+    ref []char8 o
+    for ch in stem:
+        o = #append(o, ch if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' else '_')
+    if #len(o) == 0 || o[0] >= '0' && o[0] <= '9': return index.hold(#format("_", index.hold(o)))
+    return index.hold(o)
+
+// A file as a module's name shows it: from the main package's directory.
+private string8 js_shown(^World w, string8 at):
+    string8 d = w.p.pkgs[0].dir
+    if strings.starts_with(at, d) && #len(at) > #len(d) && at[#len(d)] == '/': return at[#len(d) + 1..<#len(at)]
+    string8 r = w.p.root
+    if strings.starts_with(at, r) && #len(at) > #len(r) + 1:
+        string8 rest = at[#len(r) + 1..<#len(at)]
+        i64 sl = strings.index_of(rest, '/')
+        if sl > 0: return index.hold(#format(rest[0..<sl], ":", rest[sl + 1..<#len(rest)]))
+    return at
+
+// A script's `import "x.js"` or `foreign "x.js":` (node `n` of file `f`):
+// the module loaded with every module it imports (ERR1320, ERR0303).
+private void js_import(^World w, u32 f, u32 n, ^SClass c):
+    syntax.Ast a = w.p.files[f].a
+    ^syntax.Tokens t = &w.p.files[f].t
+    ref []char8 wr
+    syntax.string_value(w.p.spell(f, n), &wr)
+    string8 p = index.hold(wr)
+    u32 lo = t.start[a.main[n]]
+    u32 hi = t.end[a.main[n]]
+    string8 fl = p[strings.last_index_of(p, '/') + 1..<#len(p)]
+    string8 stem = fl[0..<strings.last_index_of(fl, '.')]
+    string8 bind = js_ident(stem)
+    bool imp = a.tag[n] == syntax.N_IMPORT
+    if imp && a.a[n] != NONE: bind = index.hold(strings.clone(w.p.files[f].src[i64(t.start[a.a[n]])..<i64(t.end[a.a[n]])]))
+    if imp && a.b[n] != NONE:
+        say(w, f, 0, t.start[a.b[n]], t.end[a.b[n]], 1320, index.hold(#format("`", p, "` is a JavaScript module, whose members are `any` and named by no declaration, so `import .` has no names to make bare")), index.hold(#format("import it qualified and write its members through the namespace: `import \"", p, "\"`, then `", bind, ".f(…)`")))
+        return
+    if imp && a.a[n] == NONE && bind != stem:
+        say(w, f, 0, lo, hi, 1320, index.hold(#format("`", p, "` would bind its namespace under its file's name, `", stem, "`, which is no identifier a script can write")), index.hold(#format("name the namespace with an alias: `import ", bind, " \"", p, "\"`")))
+        return
+    i64 cl = strings.index_of(p, ':')
+    i64 sl = strings.index_of(p, '/')
+    string8 at = index.clean(index.hold(#format(w.p.pkgs[w.p.files[f].pkg].dir, "/", p)))
+    string8 msg = "a path with no `<collection>:` prefix is a file's path from the directory of the script that writes it"
+    if cl >= 0 && (sl < 0 || cl < sl):
+        at = index.hold(#format(w.p.root, "/", p[0..<cl], "/", p[cl + 1..<#len(p)]))
+        msg = index.hold(#format("collection `", p[0..<cl], "` holds no `", p[cl + 1..<#len(p)], "`"))
+    if !fs.is_file(at):
+        say(w, f, 0, lo, hi, 303, index.hold(#format("`", p, "` names no JavaScript file: ", msg)), index.hold(#format("put `", fl, "` where the path says, or write the path it has from this script's directory — `./", fl, "` when it sits beside the script")))
+        return
+    u32 m = js_load(w, at, f, lo, hi)
+    if m == NONE: return
+    bool had = false
+    for x in c.jsm:
+        if x == m: had = true
+    if !had: c.jsm = #append(c.jsm, m)
+    if imp: w.jsns[js_key(f, w.p.names.intern(bind), 0)] = m
+    else: w.jsns[js_key(f, n, 1)] = m
+
+// Module `at`, loaded once with its imports (named `js:<shown>`, its
+// specifiers rewritten to those names); NONE when refused, at the script's
+// path `lo..hi` of file `f`.
+private u32 js_load(^World w, string8 at, u32 f, u32 lo, u32 hi):
+    for i in 0..<#len(w.jsp):
+        if w.jsp[i] == at: return NONE if #len(w.jss[i]) == 0 else u32(i)
+    u32 me = u32(#len(w.jsp))
+    string8 shown = js_shown(w, at)
+    w.jsp = #append(w.jsp, at)
+    w.jsn = #append(w.jsn, index.hold(#format("js:", shown)))
+    w.jss = #append(w.jss, "?")
+    ref []char8 text
+    try text = fs.read_file(at) else:
+        say(w, f, 0, lo, hi, 303, index.hold(#format("`", shown, "` cannot be read as JavaScript text")), "a JavaScript module is UTF-8 text; save it as such, or point the path at the module's source")
+        w.jss[me] = ""
+        return NONE
+    string8 s = index.hold(text)
+    ref []char8 o
+    i64 last = 0
+    bool ok = true
+    // `.`'s files clean to bare names.
+    i64 ds = strings.last_index_of(at, '/')
+    string8 dir = "."
+    if ds >= 0: dir = at[0..<ds]
+    for sp in js_specs(s):
+        i64 a0 = i64(sp >> 32)
+        i64 a1 = i64(sp & 0xFFFFFFFF)
+        string8 v = s[a0..<a1]
+        // The program's published exports: a name the loader holds, kept as written.
+        if v == "dados:exports":
+            js_exports(w)
+            continue
+        if !strings.starts_with(v, "./") && !strings.starts_with(v, "../"):
+            say(w, f, 0, lo, hi, 1320, index.hold(#format("`", shown, "` imports `", v, "`, which is no path relative to it")), index.hold(#format("copy the module `", v, "` names beside `", shown, "` and import it by its relative path, `./", v[strings.last_index_of(v, '/') + 1..<#len(v)], ".js`, in `", shown, "`")), "The JavaScript a script reaches is embedded in the program, so each module it imports is a file found from the importing one, and a package manager's name is not built")
+            ok = false
+            continue
+        string8 tp = index.clean(index.hold(#format(dir, "/", v)))
+        if !fs.is_file(tp):
+            say(w, f, 0, lo, hi, 303, index.hold(#format("`", shown, "` imports `", v, "`, and there is no such file beside it: a relative specifier is a file's path from the importing module, extension included")), index.hold(#format("write the specifier as the file's path from `", shown, "`, `.js` included, or put the file there")))
+            ok = false
+            continue
+        u32 tm = js_load(w, tp, f, lo, hi)
+        if tm == NONE:
+            ok = false
+            continue
+        o = #append(o, ..s[last..<a0])
+        o = #append(o, ..w.jsn[tm])
+        last = a1
+    if !ok:
+        w.jss[me] = ""
+        return NONE
+    string8 body = s[last..<#len(s)]
+    i64 e = #len(body)
+    for e > 0 && (body[e - 1] == '\n' || body[e - 1] == '\r'): e -= 1
+    o = #append(o, ..body[0..<e])
+    w.jss[me] = index.hold(#format("// module \"", w.jsn[me], "\": the JavaScript module `", shown, "`, embedded by dadoc.\n", index.hold(o), "\n"))
+    return me
+
+// `dados:exports` natively: no instance, so both are `null` (Rust's NATIVE_EXPORTS).
+private void js_exports(^World w):
+    for x in w.jsn:
+        if x == "dados:exports": return
+    w.jsp = #append(w.jsp, "dados:exports")
+    w.jsn = #append(w.jsn, "dados:exports")
+    w.jss = #append(w.jss, "// module \"dados:exports\": the program's wasm exports, which a native build has none of.\nexport const exports = null;\nexport const memory = null;\n")
+
+// Whether class `ci` (or a parent) has a field named `sym`.
+private bool s_field_in(^World w, u32 ci, u32 sym):
+    for x in s_fields_of(w, ci):
+        if x.sym == sym: return true
+    return false
+
+// A class's `foreign "x.js":` functions, declared when they cross (ERR1320,
+// ERR0406); each function node's module kept by `js_key(f, m, 1)`.
+private void js_declare(^World w, u32 ci):
+    SClass c = w.classes[ci]
+    u32 f = c.file
+    syntax.Ast a = w.p.files[f].a
+    string8 cn = name_of(w, w.decls[c.decl].name)
+    w.d.phase = diag.PH_INTERFACE
+    ref []u32 seen
+    for x in c.jsb:
+        if !(js_key(f, x, 1) in w.jsns): continue
+        try u32 jm = w.jsns[js_key(f, x, 1)] else: continue
+        string8 hd = w.p.spell(f, x)
+        []u32 ks = a.list(a.b[x])
+        if #len(ks) > 0 && ks[0] != NONE && a.tag[ks[0]] != syntax.N_F_FN:
+            string8 bn = w.p.spell(f, ks[0])
+            say_tok(w, f, 0, ks[0], 1320, index.hold(#format("a `foreign ", hd, ":` block binds no name: its functions are called by their own names in the class")), index.hold(#format("delete `", bn, "`, and to reach the module through a name as well, import it: `import ", bn, " ", hd, "`, through which the declared functions are typed too")))
+            continue
+        for m in ks:
+            if m == NONE || a.tag[m] != syntax.N_F_FN: continue
+            string8 nm = w.p.spell(f, m)
+            if s_method_in(w, ci, w.p.sym(f, m)) != NONE || s_field_in(w, ci, w.p.sym(f, m)):
+                say_tok(w, f, 0, m, 1320, index.hold(#format("`", cn, "` already has a member `", nm, "`, and a declared JavaScript function is called by its bare name in the class, so `", nm, "(…)` would name two things")), index.hold(#format("rename the member of `", cn, "`, or call the function through its module's namespace — `import lib ", hd, "`, then `lib.", nm, "(…)` — and declare nothing here")))
+                continue
+            u32 dup = NONE
+            for y in seen:
+                if w.p.spell(f, y) == nm: dup = y
+            if dup != NONE:
+                try u32 om = w.jsns[js_key(f, dup, 1)] else: continue
+                say_tok(w, f, 0, m, 406, index.hold(#format("`", nm, "` is already declared by the `foreign` block over `", w.jsn[om][3..<#len(w.jsn[om])], "`")), "declare it once; two modules' functions of one name are told apart through their namespaces, `import a \"a.js\"` and `a.f(…)`")
+                continue
+            []u32 fk = a.list(a.b[m])
+            bool ok = true
+            for q in fk[3..<#len(fk)]:
+                if !js_crosses(w, f, a.a[q], "a parameter"): ok = false
+            if fk[0] != NONE && !js_crosses(w, f, fk[0], "an answer"): ok = false
+            if !ok: continue
+            seen = #append(seen, m)
+            w.jsns[js_key(f, m, 1)] = jm
+            w.sjs[(u64(c.decl) << 32) | u64(w.p.sym(f, m))] = m
+
+// Whether written type `tn` of file `f` crosses a JavaScript declaration
+// (scalars, `any`, arrays and maps of them); ERR1320 when not.
+private bool js_crosses(^World w, u32 f, u32 tn, string8 what):
+    u32 t = resolve_type(w, f, tn)
+    if t == NONE: return false
+    ref []u32 todo
+    todo = #append(todo, t)
+    bool ok = true
+    for #len(todo) > 0:
+        u32 x = todo[#len(todo) - 1]
+        #truncate(todo, #len(todo) - 1)
+        u32 r = w.t.resolve(x)
+        u8 k = s_kind(w, x)
+        if k == 1 || k == 2:
+            todo = #append(todo, w.t.a[r])
+            if k == 2: todo = #append(todo, w.t.b[r])
+        else if !(x == w.sany || x == w.sstr || x == u32(types.P_INT) || x == u32(types.P_FLOAT) || x == u32(types.P_BOOL) || x == u32(types.P_U8) || x == u32(types.P_VOID) && what != "a parameter"): ok = false
+    if ok: return true
+    syntax.Ast a = w.p.files[f].a
+    string8 sh = w.p.files[f].src[i64(a.lo[tn])..<i64(a.hi[tn])]
+    string8 h = "declare it `any`: an instance of a class enters an `any` as it is"
+    if what != "a parameter": h = index.hold(#format("declare it `any`, and convert where the script uses the answer — an `any` leaves into a class's type checked, `", sh, " x = a`"))
+    say(w, f, 0, a.lo[tn], a.hi[tn], 1320, index.hold(#format(what, " of a `foreign \"x.js\":` function is `", sh, "`, which JavaScript cannot hand a script: a declaration crosses the scalars, `any`, and arrays and maps of them")), h)
+    return false
+
+// The static import specifiers of JavaScript text `s`: each value's
+// (start << 32 | end), quotes excluded.
+private ref []u64 js_specs(string8 s):
+    ref []u64 out
+    i64 n = #len(s)
+    i64 i = 0
+    i64 since = -1   // tokens since `import`/`export` (-1: none)
+    bool imp = false
+    bool from = false
+    for i < n:
+        char8 ch = s[i]
+        if ch == '/' && i + 1 < n && s[i + 1] == '/':
+            for i < n && s[i] != '\n': i += 1
+            continue
+        if ch == '/' && i + 1 < n && s[i + 1] == '*':
+            i += 2
+            for i + 1 < n && !(s[i] == '*' && s[i + 1] == '/'): i += 1
+            i += 2
+            continue
+        if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r':
+            i += 1
+            continue
+        if ch == '"' || ch == '\'' || ch == '`':
+            i64 lo = i + 1
+            i += 1
+            for i < n && s[i] != ch:
+                if s[i] == '\\': i += 1
+                i += 1
+            if ch != '`' && (from || imp && since == 0): out = #append(out, (u64(lo) << 32) | u64(i))
+            i += 1
+            since = -1
+            from = false
+            continue
+        if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch == '_' || ch == '$' || ch >= '0' && ch <= '9':
+            i64 lo = i
+            for i < n && (s[i] >= 'a' && s[i] <= 'z' || s[i] >= 'A' && s[i] <= 'Z' || s[i] == '_' || s[i] == '$' || s[i] >= '0' && s[i] <= '9'): i += 1
+            string8 wd = s[lo..<i]
+            if wd == "import" || wd == "export":
+                since = 0
+                imp = wd == "import"
+                from = false
+            else if since >= 0:
+                from = wd == "from"
+                since += 1
+            continue
+        if since >= 0 && (ch == '{' || ch == '}' || ch == ',' || ch == '*'): since += 1
+        else: since = -1
+        i += 1
+    return out
+
+// Code point `c` as UTF-8.
+string8 utf8_of(u32 c):
+    ref []char8 o
+    if c < 0x80: o = #append(o, char8(c))
+    else if c < 0x800:
+        o = #append(o, char8(0xC0 | (c >> 6)))
+        o = #append(o, char8(0x80 | (c & 63)))
+    else if c < 0x10000:
+        o = #append(o, char8(0xE0 | (c >> 12)))
+        o = #append(o, char8(0x80 | ((c >> 6) & 63)))
+        o = #append(o, char8(0x80 | (c & 63)))
+    else:
+        o = #append(o, char8(0xF0 | (c >> 18)))
+        o = #append(o, char8(0x80 | ((c >> 12) & 63)))
+        o = #append(o, char8(0x80 | ((c >> 6) & 63)))
+        o = #append(o, char8(0x80 | (c & 63)))
+    return index.hold(o)

@@ -1,0 +1,676 @@
+// textDocument/documentSymbol: dadoc's declarations and the outline over
+// one parse.
+package main
+
+import "core:json"
+import "language:syntax"
+import "language:types"
+
+const u32 NONE = 0xFFFFFFFF
+private const u8 K_CLASS = 5
+private const u8 K_METHOD = 6
+private const u8 K_FIELD = 8
+private const u8 K_ENUM = 10
+private const u8 K_TRAIT = 11
+private const u8 K_FUNCTION = 12
+private const u8 K_STATE = 13
+private const u8 K_CONST = 14
+private const u8 K_MEMBER = 22
+private const u8 K_STRUCT = 23
+private const u8 K_EVENT = 24
+
+// One symbol per row; names and details are runs of `text`.
+type Outline:
+    string8 src
+    ^syntax.Tokens t
+    ^syntax.Ast a
+    bool in_class
+    // Inside a `when` arm this target does not select: no checked values.
+    bool dead
+    ref []u8 kind
+    ref []u32 lo
+    ref []u32 hi
+    ref []u32 sel_lo
+    ref []u32 sel_hi
+    ref []u32 sig_lo
+    ref []u32 sig_hi
+    ref []u32 body_lo
+    ref []u32 body_hi
+    // name, owner prefix, detail: offsets into text.
+    ref []u32 name
+    ref []u32 detail
+    ref []i64 parent
+    // A fact (slot or member) rather than a declaration: its owner's row.
+    ref []i64 fact_of
+    ref []char8 text
+
+    string8 str(^self, u32 at):
+        i64 a = i64(at)
+        i64 e = a
+        for self.text[e] != '\x00': e += 1
+        return string8(self.text[a..<e])
+
+    u32 keep(^self, string8 s):
+        u32 at = u32(#len(self.text))
+        self.text = #append(self.text, ..s)
+        self.text = #append(self.text, '\x00')
+        return at
+
+private bool word_byte(char8 c):
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || u8(c) >= 0x80
+
+// `name` as a whole word in src[from..<to], not on a commented line and not
+// inside `skip` (pairs); NONE when absent.
+private u32 find_word(string8 src, string8 name, u32 from, u32 to, []u32 skip):
+    if #len(name) == 0: return NONE
+    i64 end = i64(to) if i64(to) < #len(src) else #len(src)
+    i64 at = i64(from) if from < u32(end) else end
+    for at + #len(name) <= end:
+        if src[at..<at + #len(name)] != name:
+            at += 1
+            continue
+        i64 e = at + #len(name)
+        bool ok = (at == 0 || !word_byte(src[at - 1])) && (e >= #len(src) || !word_byte(src[e]))
+        i64 k = 0
+        for k + 1 < #len(skip):
+            if u32(at) >= skip[k] && u32(at) < skip[k + 1]: ok = false
+            k += 2
+        i64 ls = at
+        for ls > 0 && src[ls - 1] != '\n': ls -= 1
+        for i in ls..<at:
+            if i + 1 < at && src[i] == '/' && src[i + 1] == '/': ok = false
+        if ok: return u32(at)
+        at = e
+    return NONE
+
+// Collapses whitespace runs to one space, trimmed (`collapse`).
+private void collapse(^ref []char8 out, string8 s):
+    bool gap = false
+    for c in s:
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r':
+            gap = #len(out^) > 0
+            continue
+        if gap: out^ = #append(out^, ' ')
+        gap = false
+        out^ = #append(out^, c)
+
+private string8 rtrim(string8 s, char8 c):
+    i64 b = #len(s)
+    for b > 0 && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n' || s[b - 1] == '\r' || s[b - 1] == c):
+        b -= 1
+    return s[0..<b]
+
+// A span with trailing comment lines and whitespace dropped (`trimmed`).
+private u32 trimmed_end(string8 src, u32 lo, u32 hi):
+    i64 keep = i64(hi)
+    for:
+        i64 h = keep
+        for h > i64(lo) && (src[h - 1] == ' ' || src[h - 1] == '\t' || src[h - 1] == '\r' || src[h - 1] == '\n'):
+            h -= 1
+        i64 ls = h
+        for ls > i64(lo) && src[ls - 1] != '\n': ls -= 1
+        i64 f = ls
+        for f < h && (src[f] == ' ' || src[f] == '\t'): f += 1
+        if ls > i64(lo) && f + 1 < h && src[f] == '/' && src[f + 1] == '/':
+            keep = ls
+            continue
+        return u32(h)
+    return hi
+
+// The end, past a `)` that follows it across whitespace (`closed`).
+private u32 closed_end(string8 src, u32 hi):
+    i64 i = i64(hi)
+    for i < #len(src) && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n'): i += 1
+    if i < #len(src) && src[i] == ')': return u32(i + 1)
+    return hi
+
+// The head before the first `:` at depth 0 (after the parameters), or NONE.
+private u32 head_end(string8 src, u32 lo, u32 limit, bool after_params):
+    i64 depth = 0
+    bool seen = !after_params
+    i64 i = i64(lo)
+    i64 end = i64(limit) if i64(limit) < #len(src) else #len(src)
+    for i < end:
+        char8 c = src[i]
+        if c == '"' || c == '\'':
+            i += 1
+            for i < end && src[i] != c:
+                if src[i] == '\\': i += 1
+                i += 1
+        else if c == '/' && i + 1 < end && src[i + 1] == '/':
+            for i < end && src[i] != '\n': i += 1
+        else if c == '(' || c == '[' || c == '{': depth += 1
+        else if c == ')' || c == ']' || c == '}':
+            depth -= 1
+            if depth == 0 && c == ')': seen = true
+        else if c == ':' && depth == 0 && seen: return u32(i)
+        i += 1
+    return NONE
+
+private u8 kind_of(string8 k):
+    if k == "method": return K_METHOD
+    if k == "const": return K_CONST
+    if k == "state": return K_STATE
+    if k == "type" || k == "union": return K_STRUCT
+    if k == "enum": return K_ENUM
+    if k == "trait": return K_TRAIT
+    if k == "channel": return K_EVENT
+    if k == "slot": return K_FIELD
+    if k == "class": return K_CLASS
+    return K_FUNCTION
+
+// One declaration (`Writer::decl`); answers its row.
+private i64 decl(^Outline o, string8 kind, string8 name, u32 lo, u32 hi, u32 sig_lo, u32 sig_hi, u32 body_lo, u32 body_hi):
+    string8 src = o.src
+    u32 wend = closed_end(src, trimmed_end(src, lo, hi))
+    bool one_line = true
+    for i in i64(lo)..<i64(wend):
+        if src[i] == '\n': one_line = false
+    bool fnlike = kind == "function" || kind == "method"
+    u32 sl = sig_lo
+    u32 sh = sig_hi
+    u32 bl = body_lo
+    u32 bh = body_hi
+    if body_lo != NONE && !fnlike:
+        if one_line:
+            sl = lo
+            sh = wend
+            bl = NONE
+        else:
+            u32 h = head_end(src, sig_lo, body_lo, false)
+            if h != NONE: sh = h
+    if bl != NONE: bh = trimmed_end(src, bl, bh)
+    ref []char8 sig
+    collapse(&sig, src[i64(sl)..<i64(sh)])
+    string8 sg = sig
+    string8 st = rtrim(sg, ':')
+    o.kind = #append(o.kind, kind_of(kind))
+    o.lo = #append(o.lo, lo)
+    o.hi = #append(o.hi, wend)
+    o.sig_lo = #append(o.sig_lo, sl)
+    o.sig_hi = #append(o.sig_hi, sh)
+    o.body_lo = #append(o.body_lo, bl)
+    o.body_hi = #append(o.body_hi, bh)
+    o.name = #append(o.name, o.keep(name))
+    o.detail = #append(o.detail, o.keep(st))
+    o.parent = #append(o.parent, -1)
+    o.fact_of = #append(o.fact_of, -1)
+    o.sel_lo = #append(o.sel_lo, 0)
+    o.sel_hi = #append(o.sel_hi, 0)
+    #delete(sig)
+    return #len(o.kind) - 1
+
+private void fact(^Outline o, i64 owner, u8 kind, string8 name, string8 detail):
+    o.kind = #append(o.kind, kind)
+    o.lo = #append(o.lo, 0)
+    o.hi = #append(o.hi, 0)
+    o.sig_lo = #append(o.sig_lo, 0)
+    o.sig_hi = #append(o.sig_hi, 0)
+    o.body_lo = #append(o.body_lo, NONE)
+    o.body_hi = #append(o.body_hi, NONE)
+    o.name = #append(o.name, o.keep(name))
+    o.detail = #append(o.detail, o.keep(detail))
+    o.parent = #append(o.parent, owner)
+    o.fact_of = #append(o.fact_of, owner)
+    o.sel_lo = #append(o.sel_lo, NONE)
+    o.sel_hi = #append(o.sel_hi, NONE)
+
+private string8 tok(^Outline o, u32 t):
+    return o.src[i64(o.t.start[t])..<i64(o.t.end[t])]
+
+private void function(^Outline o, u32 f, string8 kind, string8 name):
+    u32 lo = o.a.lo[f]
+    u32 hi = o.a.hi[f]
+    u32 b = o.a.list(o.a.b[f])[5]
+    u32 sh = hi
+    u32 bl = NONE
+    u32 bh = NONE
+    if b != NONE && o.a.hi[b] > o.a.lo[b]:
+        bl = o.a.lo[b]
+        bh = o.a.hi[b]
+        sh = head_end(o.src, lo, bl, true)
+        if sh == NONE: sh = bl
+    _ = decl(o, kind, name, lo, hi, lo, sh, bl, bh)
+
+// A declaration whose body opens at node `first` (or has none).
+private i64 bodied(^Outline o, string8 kind, string8 name, u32 n, u32 first):
+    u32 lo = o.a.lo[n]
+    u32 hi = o.a.hi[n]
+    if first == NONE: return decl(o, kind, name, lo, hi, lo, hi, NONE, NONE)
+    return decl(o, kind, name, lo, hi, lo, o.a.lo[first], o.a.lo[first], hi)
+
+private void slots(^Outline o, i64 owner, []u32 ms):
+    for m in ms:
+        ref []char8 ty
+        u32 t = o.a.list(o.a.b[m])[0]
+        collapse(&ty, o.src[i64(o.a.lo[t])..<i64(o.a.hi[t])])
+        string8 y = ty
+        fact(o, owner, K_FIELD, tok(o, o.a.main[m]) if o.a.main[m] != NONE else "_", y)
+        #delete(ty)
+
+private void type_decl(^Outline o, u32 n):
+    []u32 k = o.a.list(o.a.b[n])
+    u32 body = k[2]
+    string8 name = tok(o, o.a.main[n])
+    i64 row = 0
+    if o.a.tag[body] == syntax.N_ALIAS:
+        row = decl(o, "type", name, o.a.lo[n], o.a.hi[n], o.a.lo[n], o.a.hi[n], NONE, NONE)
+    else:
+        row = decl(o, "type", name, o.a.lo[n], o.a.hi[n], o.a.lo[n], o.a.lo[body], o.a.lo[body], o.a.hi[body])
+        slots(o, row, o.a.list(o.a.b[body]))
+    for i in 3..<#len(k):
+        if o.a.tag[k[i]] != syntax.N_FN: continue
+        ref []char8 q
+        syntax.put(&q, name)
+        syntax.put(&q, ".")
+        syntax.put(&q, tok(o, o.a.main[k[i]]))
+        string8 qs = q
+        function(o, k[i], "method", qs)
+        #delete(q)
+
+// An enum member's value where it is plain arithmetic on literals and earlier
+// members (the checker's fact otherwise; "-" here).
+private bool eval(^Outline o, u32 e, []i64 vals, []u32 names, ^i64 out):
+    ^syntax.Ast a = o.a
+    switch a.tag[e]:
+        case syntax.E_INT:
+            out^ = i64(a.a[e]) | (i64(a.b[e]) << 32)
+            return true
+        case syntax.E_NAME:
+            for i in 0..<#len(names):
+                if tok(o, names[i]) == tok(o, a.main[e]):
+                    out^ = vals[i]
+                    return true
+            return false
+        case syntax.E_UNARY:
+            i64 x = 0
+            if !eval(o, a.a[e], vals, names, &x): return false
+            u8 op = o.t.tag[a.main[e]]
+            if op == syntax.MINUS: out^ = -x
+            else if op == syntax.TILDE: out^ = ~x
+            else: return false
+            return true
+        case syntax.E_BINARY:
+            i64 x = 0
+            i64 y = 0
+            if !eval(o, a.a[e], vals, names, &x) || !eval(o, a.b[e], vals, names, &y): return false
+            switch o.t.tag[a.main[e]]:
+                case syntax.PLUS: out^ = x + y
+                case syntax.MINUS: out^ = x - y
+                case syntax.STAR: out^ = x * y
+                case syntax.SHL: out^ = x << y
+                case syntax.SHR: out^ = x >> y
+                case syntax.PIPE: out^ = x | y
+                case syntax.AMP: out^ = x & y
+                case syntax.TILDE: out^ = x ~ y
+                else: return false
+            return true
+        else: return false
+    return false
+
+private bool tuple_text(^Outline o, u32 e, []i64 vals, []u32 names, ^ref []char8 out):
+    out^ = #append(out^, '(')
+    []u32 k = o.a.list(o.a.b[e])
+    for i in 0..<#len(k):
+        if i > 0: syntax.put(out, ", ")
+        i64 x = 0
+        if !eval(o, k[i], vals, names, &x): return false
+        put_int(out, x)
+    out^ = #append(out^, ')')
+    return true
+
+private void enum_decl(^Outline o, u32 n, bool fgn):
+    []u32 k = o.a.list(o.a.b[n])
+    i64 from = 2 if fgn else 1
+    u32 first = k[from] if #len(k) > from else NONE
+    i64 row = bodied(o, "enum", tok(o, o.a.main[n]), n, first)
+    ref []i64 vals
+    ref []u32 names
+    i64 next = 0
+    bool known = true
+    for i in from..<#len(k):
+        u32 m = k[i]
+        ref []char8 v
+        if fgn: syntax.put(&v, "-")
+        else if !o.dead && o.a.a[m] != NONE && o.a.tag[o.a.a[m]] == syntax.E_TUPLE:
+            known = false
+            if !tuple_text(o, o.a.a[m], vals, names, &v):
+                #truncate(v, 0)
+                syntax.put(&v, "-")
+        else:
+            if o.dead: known = false
+            else if o.a.a[m] != NONE: known = eval(o, o.a.a[m], vals, names, &next)
+            if known: put_int(&v, next)
+            else: syntax.put(&v, "-")
+            vals = #append(vals, next)
+            names = #append(names, o.a.main[m])
+            next += 1
+        string8 vs = v
+        fact(o, row, K_MEMBER, tok(o, o.a.main[m]), vs)
+        #delete(v)
+    #delete(vals)
+    #delete(names)
+
+private void items(^Outline o, []u32 k, i64 from):
+    for i in from..<#len(k):
+        u32 n = k[i]
+        if n == NONE: continue
+        ^syntax.Ast a = o.a
+        []u32 kk = a.extra[0..<0]
+        if syntax.SHAPES[a.tag[n]] == syntax.S_L: kk = a.list(a.b[n])
+        switch a.tag[n]:
+            case syntax.N_FN: function(o, n, "method" if o.in_class else "function", tok(o, a.main[n]))
+            case syntax.N_TYPE: type_decl(o, n)
+            case syntax.N_TRAIT:
+                u32 first = NONE
+                for m in kk:
+                    if a.tag[m] == syntax.N_FN && first == NONE: first = m
+                _ = bodied(o, "trait", tok(o, a.main[n]), n, first)
+            case syntax.N_UNION:
+                i64 row = bodied(o, "union", tok(o, a.main[n]), n, kk[1] if #len(kk) > 1 else NONE)
+                slots(o, row, kk[1..<#len(kk)])
+            case syntax.N_ENUM: enum_decl(o, n, false)
+            case syntax.N_F_ENUM: enum_decl(o, n, true)
+            case syntax.N_CONST, syntax.N_F_CONST: _ = decl(o, "const", tok(o, a.main[n]), a.lo[n], a.hi[n], a.lo[n], a.hi[n], NONE, NONE)
+            case syntax.N_VAR, syntax.N_F_VAR:
+                string8 kind = "slot" if o.in_class else "state"
+                if a.tag[n] == syntax.N_F_VAR: kind = "state"
+                else if a.tag[kk[0]] == syntax.T_CHANNEL: kind = "channel"
+                _ = decl(o, kind, tok(o, a.main[n]), a.lo[n], a.hi[n], a.lo[n], a.hi[n], NONE, NONE)
+            case syntax.N_F_FN, syntax.N_F_OPAQUE:
+                _ = decl(o, "function" if a.tag[n] == syntax.N_F_FN else "type", tok(o, a.main[n]), a.lo[n], a.hi[n], a.lo[n], a.hi[n], NONE, NONE)
+            case syntax.N_FOREIGN: items(o, kk, 1)
+            case syntax.N_WHEN:
+                bool outer = o.dead
+                bool taken = false
+                for arm in kk:
+                    if arm == NONE: continue
+                    []u32 ak = a.list(a.b[arm])
+                    bool arm_when = a.tag[arm] == syntax.N_WHEN_ARM
+                    i8 l = live(o, ak[0]) if arm_when else 1
+                    o.dead = outer || taken || l == 0
+                    if l == 1: taken = true
+                    items(o, ak, 1 if arm_when else 0)
+                o.dead = outer
+            case syntax.N_CLASS:
+                i64 f = 1
+                for f < #len(kk) && a.tag[kk[f]] >= syntax.T_NAME && a.tag[kk[f]] <= syntax.T_CHANNEL: f += 1
+                _ = bodied(o, "class", tok(o, a.main[n]), n, kk[f] if f < #len(kk) else NONE)
+            else: continue
+
+private bool before(^Outline o, i64 x, i64 y):
+    if o.lo[x] != o.lo[y]: return o.lo[x] < o.lo[y]
+    return o.hi[x] > o.hi[y]
+
+private string8 bare(string8 s):
+    i64 i = #len(s)
+    for i > 0 && s[i - 1] != '.': i -= 1
+    return s[i..<#len(s)]
+
+private const [9]string8 SAID = ("private", "public", "const", "@const", "type", "enum", "distinct", "union", "trait")
+
+// The signature without its name and declaring words, at most 80 columns.
+private u32 detail_of(^Outline o, string8 sig, string8 name):
+    ref []char8 one
+    u32 at = find_word(sig, name, 0, u32(#len(sig)), o.lo[0..<0])
+    if at == NONE: syntax.put(&one, sig)
+    else:
+        string8 b = rtrim(sig[0..<i64(at)], ' ')
+        string8 a = sig[i64(at) + #len(name)..<#len(sig)]
+        i64 j = 0
+        for j < #len(a) && a[j] == ' ': j += 1
+        a = a[j..<#len(a)]
+        syntax.put(&one, b)
+        if !(#len(a) > 0 && a[0] == '(') && #len(b) > 0 && #len(a) > 0: syntax.put(&one, " ")
+        syntax.put(&one, a)
+    string8 w = one
+    i64 i = 0
+    for i < #len(w) && w[i] == ' ': i += 1
+    bool more = true
+    for more:
+        more = false
+        for word in SAID:
+            i64 e = i + #len(word)
+            if e <= #len(w) && w[i..<e] == word && (e == #len(w) || w[e] == ' '):
+                i = e
+                for i < #len(w) && w[i] == ' ': i += 1
+                more = true
+                break
+    for i < #len(w) && (w[i] == ':' || w[i] == ' '): i += 1
+    string8 d = rtrim(w[i..<#len(w)], ' ')
+    i64 chars = 0
+    i64 cut = #len(d)
+    for x in 0..<#len(d):
+        if (u8(d[x]) & 0xC0) != 0x80:
+            if chars == 79: cut = x
+            chars += 1
+    ref []char8 out
+    if chars <= 80: syntax.put(&out, d)
+    else:
+        syntax.put(&out, d[0..<cut])
+        syntax.put(&out, "…")
+    string8 os = out
+    u32 r = o.keep(os)
+    #delete(out)
+    #delete(one)
+    return r
+
+// The document's symbols, as documentSymbol's result.
+void symbols(^json.Writer w, string8 uri, string8 src):
+    types.Interner names = syntax.names()
+    syntax.Tokens t = syntax.lex(src)
+    syntax.intern(&t, src, &names)
+    bool dados = #len(uri) > 6 && uri[#len(uri) - 6..<#len(uri)] == ".dados"
+    syntax.Ast a = syntax.parse(src, &t, dados)
+    Outline o
+    o.src = src
+    o.t = &t
+    o.a = &a
+    []u32 rk = a.list(a.b[a.root])
+    o.in_class = rk[2] != NONE
+    i64 from = 3
+    for from < #len(rk) && a.tag[rk[from]] == syntax.N_IMPORT: from += 1
+    items(&o, rk, from)
+    i64 nd = #len(o.kind)
+    ref []i64 order
+    for i in 0..<nd:
+        if o.fact_of[i] >= 0: continue
+        i64 j = #len(order)
+        order = #append(order, i)
+        for j > 0 && before(&o, i, order[j - 1]):
+            order[j] = order[j - 1]
+            j -= 1
+        order[j] = i
+    ref []i64 stack
+    for i in order:
+        for #len(stack) > 0 && o.lo[i] >= o.hi[stack[#len(stack) - 1]]: #truncate(stack, #len(stack) - 1)
+        if #len(stack) > 0: o.parent[i] = stack[#len(stack) - 1]
+        stack = #append(stack, i)
+        string8 full = o.str(o.name[i])
+        string8 b = bare(full)
+        u32 sl = find_word(src, b, o.sig_lo[i], o.sig_hi[i], o.lo[0..<0])
+        u32 sh = sl + u32(#len(b))
+        if sl == NONE:
+            sl = o.sig_lo[i]
+            sh = o.sig_hi[i]
+        o.sel_lo[i] = clamp(sl, o.lo[i], o.hi[i])
+        o.sel_hi[i] = clamp(sh, o.lo[i], o.hi[i])
+        string8 sig = o.str(o.detail[i])
+        o.detail[i] = detail_of(&o, sig, b)
+    for i in order:
+        if o.kind[i] == K_STRUCT || o.kind[i] == K_ENUM: fact_children(&o, i)
+    w.array()
+    if o.in_class:
+        u32 h = rk[2]
+        string8 cname = tok(&o, a.main[h])
+        w.object()
+        w.key("name")
+        w.text(cname)
+        w.key("kind")
+        w.int(i64(K_CLASS))
+        Lines ls = lines(src)
+        w.key("range")
+        range(w, &ls, 0, u32(#len(src)))
+        u32 sl = find_word(src, cname, 0, u32(#len(src)), o.lo[0..<0])
+        u32 sh = sl + u32(#len(cname))
+        if sl == NONE:
+            sl = 0
+            sh = 0
+            for i64(sh) < #len(src) && src[i64(sh)] != '\n': sh += 1
+        w.key("selectionRange")
+        range(w, &ls, sl, sh)
+        w.key("children")
+        emit(w, &o, &ls, -1)
+        u32 ext = a.list(a.b[h])[0]
+        if ext != NONE:
+            ref []char8 d
+            syntax.put(&d, "extends ")
+            collapse(&d, src[i64(a.lo[ext])..<i64(a.hi[ext])])
+            w.key("detail")
+            w.text(d)
+            #delete(d)
+        w.end_object()
+        #delete(ls.starts)
+    else:
+        Lines ls = lines(src)
+        emit_list(w, &o, &ls, -1)
+        #delete(ls.starts)
+    w.end_array()
+    #delete(order)
+    #delete(stack)
+    free(&o)
+    a.free()
+    t.free()
+    names.free()
+
+private void emit(^json.Writer w, ^Outline o, ^Lines ls, i64 p):
+    w.array()
+    emit_list(w, o, ls, p)
+    w.end_array()
+
+// The children of `p` by where their range starts, facts first on a tie.
+private void emit_list(^json.Writer w, ^Outline o, ^Lines ls, i64 p):
+    ref []i64 kids
+    for i in 0..<#len(o.kind):
+        if o.parent[i] != p || (o.fact_of[i] >= 0 && o.sel_lo[i] == NONE): continue
+        i64 j = #len(kids)
+        kids = #append(kids, i)
+        for j > 0 && o.lo[i] < o.lo[kids[j - 1]]:
+            kids[j] = kids[j - 1]
+            j -= 1
+        kids[j] = i
+    for k in kids:
+        w.object()
+        w.key("name")
+        string8 full = o.str(o.name[k])
+        if p >= 0 && o.fact_of[k] < 0:
+            string8 pn = o.str(o.name[p])
+            if #len(full) > #len(pn) && full[0..<#len(pn)] == pn && full[#len(pn)] == '.': full = full[#len(pn) + 1..<#len(full)]
+        w.text(full)
+        w.key("kind")
+        w.int(i64(o.kind[k]))
+        w.key("range")
+        range(w, ls, o.lo[k], o.hi[k])
+        w.key("selectionRange")
+        range(w, ls, o.sel_lo[k], o.sel_hi[k])
+        w.key("children")
+        emit(w, o, ls, k)
+        string8 d = o.str(o.detail[k])
+        if #len(d) > 0:
+            w.key("detail")
+            w.text(d)
+        w.end_object()
+    #delete(kids)
+
+private u32 clamp(u32 x, u32 lo, u32 hi):
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+
+// Places the slots and members of declaration `d` (`fact_children`).
+private void fact_children(^Outline o, i64 d):
+    u32 from = o.sel_hi[d]
+    u32 to = o.hi[d]
+    if o.body_lo[d] != NONE:
+        from = o.body_lo[d]
+        to = o.body_hi[d]
+    ref []u32 nested
+    for i in 0..<#len(o.kind):
+        if o.parent[i] == d && o.fact_of[i] < 0:
+            nested = #append(nested, o.lo[i])
+            nested = #append(nested, o.hi[i])
+    u32 after = from
+    string8 src = o.src
+    for i in 0..<#len(o.kind):
+        if o.fact_of[i] != d: continue
+        string8 nm = o.str(o.name[i])
+        u32 s = find_word(src, nm, after, to, nested)
+        if s == NONE: s = find_word(src, nm, from, to, nested)
+        if s == NONE: continue
+        u32 e = s + u32(#len(nm))
+        after = e
+        i64 ls = i64(s)
+        for ls > 0 && src[ls - 1] != '\n': ls -= 1
+        i64 le = i64(s)
+        for le < #len(src) && src[le] != '\n': le += 1
+        i64 a = ls
+        for a < le && (src[a] == ' ' || src[a] == '\t'): a += 1
+        i64 b = le
+        for b > a && (src[b - 1] == ' ' || src[b - 1] == '\t' || src[b - 1] == '\r'): b -= 1
+        u32 rl = s
+        u32 rh = e
+        if u32(a) >= o.lo[d] && u32(b) <= o.hi[d] && u32(a) >= from:
+            rl = u32(a)
+            rh = u32(b)
+        o.lo[i] = rl if rl < s else s
+        o.hi[i] = rh if rh > e else e
+        o.sel_lo[i] = s
+        o.sel_hi[i] = e
+    #delete(nested)
+
+private void free(^Outline o):
+    #delete(o.kind)
+    #delete(o.lo)
+    #delete(o.hi)
+    #delete(o.sel_lo)
+    #delete(o.sel_hi)
+    #delete(o.sig_lo)
+    #delete(o.sig_hi)
+    #delete(o.body_lo)
+    #delete(o.body_hi)
+    #delete(o.name)
+    #delete(o.detail)
+    #delete(o.parent)
+    #delete(o.fact_of)
+    #delete(o.text)
+
+private void put_int(^ref []char8 out, i64 x):
+    if x < 0: out^ = #append(out^, '-')
+    syntax.put_num(out, -x if x < 0 else x)
+
+private string8 host():
+    when #OS == #LINUX:
+        return "#LINUX"
+    else when #OS == #DARWIN: return "#DARWIN"
+    else when #OS == #WINDOWS: return "#WINDOWS"
+    else: return ""
+
+// Whether this target selects a `when` arm on `#OS`: 1, 0, or -1 (unknown).
+private i8 live(^Outline o, u32 e):
+    ^syntax.Ast a = o.a
+    if a.tag[e] == syntax.E_UNARY && o.t.tag[a.main[e]] == syntax.BANG:
+        i8 x = live(o, a.a[e])
+        return x if x < 0 else 1 - x
+    if a.tag[e] != syntax.E_BINARY: return -1
+    u8 op = o.t.tag[a.main[e]]
+    if op == syntax.AMP_AMP || op == syntax.PIPE_PIPE:
+        i8 x = live(o, a.a[e])
+        i8 y = live(o, a.b[e])
+        if op == syntax.AMP_AMP && (x == 0 || y == 0): return 0
+        if op == syntax.PIPE_PIPE && (x == 1 || y == 1): return 1
+        return -1 if x < 0 || y < 0 else x
+    if (op != syntax.EQ_EQ && op != syntax.BANG_EQ) || a.tag[a.a[e]] != syntax.E_NAME || a.tag[a.b[e]] != syntax.E_NAME: return -1
+    string8 h = host()
+    if tok(o, a.main[a.a[e]]) != "#OS" || #len(h) == 0: return -1
+    bool same = tok(o, a.main[a.b[e]]) == h
+    return 1 if same == (op == syntax.EQ_EQ) else 0

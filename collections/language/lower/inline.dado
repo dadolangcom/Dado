@@ -1,0 +1,667 @@
+// The web's inline crossings: a script's call of a Dado function whose values the site
+// converts is the wasm function itself (or its C shim), called from the slot
+// its module cached at start-up; the rest keep the thunk. `o7` adds enums and
+// literal string answers. A function reaching back into a script keeps the
+// thunk; one that can `#send` reads the any-channel bit after the call.
+package lower
+
+import "core:strings"
+import "language:check"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+
+// `--pass=o7=off` (or `--passes=off`) clears it.
+bool g_o7 = true
+
+const i64 I_MAX_LITERALS = 256
+
+type IPlan:
+    ref []string8 key   // per bound function: `pkg/name`
+    ref []i32 slot      // its slot, -1 on the thunk
+    ref []bool shim
+    ref []bool caller
+    ref []bool sends
+    ref []i64 lit_at    // its literal answers: `lits[lit_at..<lit_to]`
+    ref []i64 lit_to
+    ref []string8 lits
+    ref []string8 args  // literal string arguments, numbered (`__dados_L`)
+    i32 count
+    bool encodes        // a `string8` parameter: `dados_room`
+    bool owned          // a new string answered: `dados_drop`
+
+// The canonical prim of scalar `t` (`distinct` taken off), or P_VOID.
+private u8 iprim(^check.World w, u32 t):
+    u32 r = w.t.resolve(t)
+    for r != NONE:
+        if w.t.tag[r] != types.T_DISTINCT: break
+        r = w.t.resolve(w.t.b[r])
+    if r == NONE: return types.P_VOID
+    if w.t.tag[r] != types.T_PRIM: return types.P_VOID
+    return types.PRIM[w.t.a[r]].canon
+
+private bool iwide(u8 p):
+    return p == types.P_I64 || p == types.P_U64
+
+// An enum crossing as its value (`o7`): a backing of 32 bits or fewer, ASCII names.
+private bool i_interns(^check.World w, u32 t):
+    if !g_o7: return false
+    u8 p = iprim(w, t)
+    if p != types.P_I8 && p != types.P_U8 && p != types.P_I16 && p != types.P_U16 && p != types.P_I32 && p != types.P_U32: return false
+    u32 d = check.s_denum(w, t)
+    if d == NONE: return false
+    for key in w.order:
+        if u32(key >> 32) != d: continue
+        string8 nm = check.name_of(w, u32(key & 0xFFFFFFFF))
+        for ch in nm:
+            if u8(ch) >= 0x80: return false
+    return true
+
+// Whether a parameter (`ret`: the answer) crosses inline.
+private bool i_kind_ok(^check.World w, u32 t, bool ret):
+    if ret && t == u32(types.P_VOID): return true
+    u8 k = check.seam_kind(w, t, ret)
+    if k == check.SK_ENUM: return i_interns(w, t)
+    if k == check.SK_STR || k == check.SK_C32 || k == check.SK_C16 || k == check.SK_BOOL: return true
+    if ret && k == check.SK_OWNED: return true
+    if k == check.SK_INT || k == check.SK_FLOAT:
+        u8 p = iprim(w, t)
+        return p != types.P_VOID && p != types.P_RAWPTR
+    return false
+
+// What function `fi`'s closure reaches, as bits: 4 back into a script (a
+// script verb, `core:script`, a call to what is not Dado's), 2 a call
+// through a value, 1 a `#send`. A trait's dispatch reaches its arms.
+private i32 i_walk(^check.World w, ^{u32: u32} by_name, ^{u32: u32} disp, u32 fi):
+    u32 sp = check.rt_pkg(w)
+    ref []bool seen
+    for _ in w.fns:
+        seen = #append(seen, false)
+    ref []u32 work
+    work = #append(work, fi)
+    i64 at = 0
+    i32 bits = 0
+    for at < #len(work):
+        u32 x = work[at]
+        at += 1
+        if seen[x]: continue
+        seen[x] = true
+        if w.decls[w.jobs[x].decl].pkg == sp: return 4
+        ^ir.Fn f = &w.fns[x]
+        for k in 0..<ir.count(f):
+            u8 o = f.op[k]
+            if o == ir.O_CALL_INDIRECT: bits = bits | 2
+            if o == ir.O_INTRINSIC:
+                u8 s = f.sub[k]
+                if s == check.B_SEND || s == check.B_CH_SEND: bits = bits | 1
+                if s >= check.B_SCRIPT_VM && s <= check.B_SCRIPT_ERROR || s >= check.B_SIG_CONNECT: return 4
+            if o != ir.O_CALL: continue
+            u32 r = f.a[k]
+            if (f.ref_flags[r] & ir.R_FOREIGN) != 0: continue
+            u32 nm = f.ref_name[r]
+            if nm in disp^:
+                try u32 di = disp^[nm] else: return 4
+                for arm in w.dispatches[di].arms:
+                    if !(arm.cname in by_name^): return 4
+                    try u32 ac = by_name^[arm.cname] else: return 4
+                    work = #append(work, ac)
+                continue
+            if !(nm in by_name^): return 4
+            try u32 c = by_name^[nm] else: return 4
+            work = #append(work, c)
+    return bits
+
+// What a call through a value may reach (Rust's `crossing_reach`): back into
+// a script when a script's function can cross into Dado, else what the
+// functions named as values reach.
+private i32 i_through(^check.World w, ^{u32: u32} by_name, ^{u32: u32} disp):
+    for d in w.bound:
+        for q in w.t.params(w.decls[d].ty):
+            if check.seam_kind(w, q, false) == check.SK_CB: return 4
+    u32 sp = check.rt_pkg(w)
+    ref []u32 taken
+    for i in 0..<#len(w.fns):
+        ^ir.Fn f = &w.fns[i]
+        for k in 0..<ir.count(f):
+            for x in [f.a[k], f.b[k], f.c[k]]:
+                i_taken(w, x, by_name, &taken)
+        for x in f.args:
+            i_taken(w, x, by_name, &taken)
+    i32 bits = 0
+    for t in taken:
+        if w.decls[w.jobs[t].decl].pkg == sp: continue
+        bits = bits | (i_walk(w, by_name, disp, t) & 5)
+    return bits
+
+private void i_taken(^check.World w, u32 x, ^{u32: u32} by_name, ^ref []u32 taken):
+    if x == NONE: return
+    if !ir.is_const(x): return
+    u32 k = x & ~ir.OPD_CONST
+    if w.k.kind[k] != types.C_FN: return
+    u32 nm = w.k.b[k]
+    if !(nm in by_name^): return
+    try u32 c = by_name^[nm] else: return
+    for y in taken^:
+        if y == c: return
+    taken^ = #append(taken^, c)
+
+// Function `fi`'s literal answers (`o7`): every `return` a string literal.
+private ref []string8 i_literals(^check.World w, u32 fi):
+    ref []string8 out
+    ^ir.Fn f = &w.fns[fi]
+    for k in 0..<ir.count(f):
+        u8 o = f.op[k]
+        if o == ir.O_C_INLINE:
+            #truncate(out, 0)
+            return out
+        if o != ir.O_RETURN: continue
+        u32 x = f.a[k]
+        bool lit = ir.is_const(x)
+        if lit: lit = w.k.kind[x & ~ir.OPD_CONST] == types.C_STR
+        if !lit:
+            #truncate(out, 0)
+            return out
+        string8 t = w.t.text(w.k.a[x & ~ir.OPD_CONST])
+        bool have = false
+        for y in out:
+            if y == t: have = true
+        if !have: out = #append(out, t)
+    if #len(out) > I_MAX_LITERALS: #truncate(out, 0)
+    return out
+
+// The bound function a site's `pkg/name` calls, or -1.
+i64 i_bound(^IPlan p, string8 key):
+    for i in 0..<#len(p.key):
+        if p.key[i] == key: return i
+    return -1
+
+// The plan: which bound functions cross inline, at which slot, how.
+IPlan inline_plan(^check.World w):
+    IPlan p
+    if w.os != "WEB": return p
+    {u32: u32} by_name
+    for i in 0..<#len(w.fns):
+        by_name[w.fns[i].name] = u32(i)
+    {u32: u32} disp
+    for i in 0..<#len(w.dispatches):
+        disp[w.dispatches[i].name] = u32(i)
+    i32 through = i_through(w, &by_name, &disp)
+    for bi in 0..<#len(w.bound):
+        u32 d = w.bound[bi]
+        string8 pk = check.name_of(w, w.p.pkgs[w.decls[d].pkg].name)
+        p.key = #append(p.key, index.hold(#format(pk, "/", check.seam_name(w, d))))
+        u32 fty = w.decls[d].ty
+        []u32 ps = w.t.params(fty)
+        u32 rt = w.t.a[fty]
+        bool fl = w.t.b[fty] != types.F_NONE
+        u32 bc = w.bound_c[bi]
+        bool ok = bc in by_name
+        if w.decls[d].kind != check.K_FN: ok = false
+        for q in ps:
+            if !i_kind_ok(w, q, false): ok = false
+        if !i_kind_ok(w, rt, true): ok = false
+        u32 fi = NONE
+        if ok:
+            try fi = by_name[bc] else: ok = false
+        i32 reach = 0
+        if ok:
+            i32 bits = i_walk(w, &by_name, &disp, fi)
+            if (bits & 2) != 0: bits = bits | through
+            if (bits & 4) != 0: ok = false
+            if (bits & 1) != 0: reach = 1
+        p.lit_at = #append(p.lit_at, #len(p.lits))
+        bool shim = false
+        bool caller = false
+        if ok:
+            caller = check.names_caller(w, d)
+            shim = fl || caller
+            u8 rk = check.seam_kind(w, rt, true)
+            if rk == check.SK_STR || rk == check.SK_OWNED: shim = true
+            if rk == check.SK_INT:
+                if iwide(iprim(w, rt)): shim = true
+            if rk == check.SK_OWNED: p.owned = true
+            for q in ps:
+                u8 k = check.seam_kind(w, q, false)
+                if k == check.SK_STR:
+                    shim = true
+                    p.encodes = true
+                if k == check.SK_INT:
+                    if iwide(iprim(w, q)): shim = true
+            if g_o7 && rk == check.SK_STR:
+                for t in i_literals(w, fi):
+                    p.lits = #append(p.lits, t)
+            p.slot = #append(p.slot, p.count)
+            p.count += 1
+        else: p.slot = #append(p.slot, -1)
+        p.lit_to = #append(p.lit_to, #len(p.lits))
+        p.shim = #append(p.shim, shim)
+        p.caller = #append(p.caller, caller)
+        p.sends = #append(p.sends, ok && reach == 1)
+    if p.count == 0: return p
+    // Literal string arguments, numbered over every site.
+    for fi in 0..<#len(w.fns):
+        ^ir.Fn f = &w.fns[fi]
+        if f.dialect != ir.D_SCRIPT: continue
+        for k in 0..<ir.count(f):
+            if f.op[k] != ir.O_INTRINSIC: continue
+            if f.sub[k] != check.B_SDADO: continue
+            i64 bi = i_bound(&p, index.hold(#format(w.t.text(f.ref_pkg[f.a[k]]), "/", w.t.text(f.ref_name[f.a[k]]))))
+            if bi < 0: continue
+            if p.slot[bi] < 0: continue
+            []u32 ps = w.t.params(w.decls[w.bound[bi]].ty)
+            []u32 xs = ir.args(f, k)
+            for q in 0..<#len(xs):
+                if q >= #len(ps): break
+                if !i_is_lit(w, xs[q], ps[q]): continue
+                string8 t = w.t.text(w.k.a[xs[q] & ~ir.OPD_CONST])
+                bool have = false
+                for y in p.args:
+                    if y == t: have = true
+                if !have: p.args = #append(p.args, t)
+    return p
+
+// Whether operand `x` is a literal string passed for `string8` parameter `t`.
+private bool i_is_lit(^check.World w, u32 x, u32 t):
+    if !ir.is_const(x): return false
+    if w.k.kind[x & ~ir.OPD_CONST] != types.C_STR: return false
+    return check.seam_kind(w, t, false) == check.SK_STR
+
+// The literal argument's number.
+private i64 i_arg_no(^IPlan p, string8 t):
+    for i in 0..<#len(p.args):
+        if p.args[i] == t: return i
+    return -1
+
+// ── C ──
+
+// `t`'s bytes as a C initializer, `nul` adding the terminator.
+private string8 i_bytes(string8 t, bool nul):
+    ref []char8 o
+    for i in 0..<#len(t):
+        if i > 0: o = #append(o, ..", ")
+        o = #append(o, ..#format(u8(t[i])))
+    if nul:
+        if #len(t) > 0: o = #append(o, ..", ")
+        o = #append(o, '0')
+    return index.hold(o)
+
+// The shims, `dados_bound[]`, the glue header and its exports (Rust's
+// `script_inline`).
+string8 inline_c(^C c):
+    ^check.World w = c.w
+    IPlan p = inline_plan(w)
+    if p.count == 0: return ""
+    ref []char8 o
+    ref []char8 shims
+    ref []string8 slots
+    put(&o, "/* The web's inline crossings: a shim beside each bound function whose signature is not flat 32-bit scalars, and `dados_bound[]`, whose entries are the functions' table slots. */\nstatic _Alignas(8) uint8_t dado_rt__dados_scratch[16384];\nstruct dado_rt__dados_glue_t { int32_t version; int32_t count; const void *bound; void *scratch; int32_t scratch_bytes; const void *flags; const void *literals; int32_t literal_count; int32_t answer[2]; double answer_float; };\nstatic struct dado_rt__dados_glue_t dado_rt__dados_glue;\n")
+    if p.owned: put(&o, "static void (*dado_rt__dados_pending)(void);\n")
+    for bi in 0..<#len(w.bound):
+        if p.slot[bi] < 0: continue
+        string8 cn = index.hold(strings.clone(c.t.text(w.bound_c[bi])))
+        if p.shim[bi]:
+            string8 nm = index.hold(#format("dado_inline_", cn))
+            i_shim(c, &p, i64(bi), cn, nm, &shims)
+            slots = #append(slots, nm)
+        else: slots = #append(slots, cn)
+    put(&o, index.hold(shims))
+    ref []string8 rows
+    for s in slots:
+        rows = #append(rows, index.hold(#format("(dado_rt__dados_fn)", s)))
+    put(&o, index.hold(#format("typedef void (*dado_rt__dados_fn)(void);\nstatic dado_rt__dados_fn const dados_bound[", #len(slots), "] = { ", index.hold(strings.join(rows[:], ", ")), " };\n")))
+    string8 table = "((void *)0)"
+    if #len(p.args) > 0:
+        ref []string8 ls
+        for i in 0..<#len(p.args):
+            string8 t = p.args[i]
+            put(&o, index.hold(#format("static const unsigned char dado_rt__dados_literal", i, "[", #len(t) + 1, "] = { ", i_bytes(t, true), " };\n")))
+            ls = #append(ls, index.hold(#format("dado_rt__dados_literal", i)))
+        put(&o, index.hold(#format("static const unsigned char *const dado_rt__dados_literals[", #len(p.args), "] = { ", index.hold(strings.join(ls[:], ", ")), " };\n")))
+        table = "dado_rt__dados_literals"
+    string8 flags = "(const void *)&dado_rt__flags" if #len(w.recv) > 0 else "((void *)0)"
+    put(&o, index.hold(#format("DADO_WASM_EXPORT(\"dados_glue\") const struct dado_rt__dados_glue_t *dado_rt__dados_glue_address(void);\nconst struct dado_rt__dados_glue_t *dado_rt__dados_glue_address(void) {\n    dado_rt__dados_glue.version = 1;\n    dado_rt__dados_glue.count = ", p.count, ";\n    dado_rt__dados_glue.bound = dados_bound;\n    dado_rt__dados_glue.scratch = dado_rt__dados_scratch;\n    dado_rt__dados_glue.scratch_bytes = 16384;\n    dado_rt__dados_glue.flags = ", flags, ";\n    dado_rt__dados_glue.literals = ", table, ";\n    dado_rt__dados_glue.literal_count = ", #len(p.args), ";\n    return &dado_rt__dados_glue;\n}\n")))
+    put(&o, index.hold(#format("DADO_WASM_EXPORT(\"dados_settle\") void dado_rt__dados_settle(JSContext *ctx);\nvoid dado_rt__dados_settle(JSContext *ctx) { ", rtn(c, "inline_entered"), "(ctx); }\nDADO_WASM_EXPORT(\"dados_channels\") int32_t dado_rt__dados_channels(JSContext *ctx);\nint32_t dado_rt__dados_channels(JSContext *ctx) { return ", rtn(c, "inline_left"), "(ctx); }\n")))
+    if p.encodes: put(&o, "DADO_WASM_EXPORT(\"dados_room\") void *dado_rt__dados_room(int32_t bytes);\nvoid *dado_rt__dados_room(int32_t bytes) { return bytes > 0 ? malloc((size_t)bytes) : ((void *)0); }\nDADO_WASM_EXPORT(\"dados_unroom\") void dado_rt__dados_unroom(void *block);\nvoid dado_rt__dados_unroom(void *block) { free(block); }\n")
+    if p.owned: put(&o, "DADO_WASM_EXPORT(\"dados_drop\") void dado_rt__dados_drop(void);\nvoid dado_rt__dados_drop(void) { if (dado_rt__dados_pending != 0) { void (*d)(void) = dado_rt__dados_pending; dado_rt__dados_pending = 0; d(); } }\n")
+    return index.hold(o)
+
+// One bound function's shim: its arguments from wasm's, the call, its answer
+// into the glue's words (Rust's `inline_shim`).
+private void i_shim(^C c, ^IPlan p, i64 bi, string8 cn, string8 nm, ^ref []char8 out):
+    ^check.World w = c.w
+    u32 d = w.bound[bi]
+    u32 fty = w.decls[d].ty
+    []u32 ps = c.t.params(fty)
+    u32 rt = c.t.a[fty]
+    bool fl = c.t.b[fty] != types.F_NONE
+    ref []string8 params
+    ref []string8 args
+    for i in 0..<#len(ps):
+        u32 pt_ = ps[i]
+        u8 k = check.seam_kind(w, pt_, false)
+        string8 pt = ty(c, pt_)
+        if k == check.SK_STR:
+            params = #append(params, index.hold(#format("int32_t p", i, ", int32_t n", i)))
+            args = #append(args, index.hold(#format("(", ty(c, types.STRING8), "){ (const char *)(uintptr_t)(uint32_t)p", i, ", (int64_t)n", i, " }")))
+        else if k == check.SK_INT && iwide(iprim(w, pt_)):
+            params = #append(params, index.hold(#format("int32_t lo", i, ", int32_t hi", i)))
+            args = #append(args, index.hold(#format("(", pt, ")(((uint64_t)(uint32_t)hi", i, " << 32) | (uint64_t)(uint32_t)lo", i, ")")))
+        else if k == check.SK_C32:
+            params = #append(params, index.hold(#format("uint32_t a", i)))
+            args = #append(args, index.hold(#format("(", pt, ")a", i)))
+        else if k == check.SK_C16:
+            params = #append(params, index.hold(#format("uint16_t a", i)))
+            args = #append(args, index.hold(#format("(", pt, ")a", i)))
+        else:
+            params = #append(params, index.hold(#format(pt, " a", i)))
+            args = #append(args, index.hold(#format("a", i)))
+    if p.caller[bi]: args = #append(args, jpun("dado_alloc", ty(c, check.alloc_ty(w)), "dado_context"))
+    if #len(params) == 0: params = #append(params, "void")
+    string8 call = index.hold(strings.join(args[:], ", "))
+    bool void_ = rt == u32(types.P_VOID)
+    string8 rc = "void"
+    if !void_: rc = ty(c, rt)
+    u8 rk = check.seam_kind(w, rt, true)
+    bool wide = false
+    if rk == check.SK_INT: wide = iwide(iprim(w, rt))
+    bool strs = rk == check.SK_STR || rk == check.SK_OWNED
+    ref []string8 store
+    if wide:
+        store = #append(store, "dado_rt__dados_glue.answer[0] = (int32_t)(uint32_t)(uint64_t)r;")
+        store = #append(store, "dado_rt__dados_glue.answer[1] = (int32_t)(uint32_t)((uint64_t)r >> 32);")
+    else if strs:
+        store = #append(store, "dado_rt__dados_glue.answer[0] = (int32_t)(uintptr_t)(r).ptr;")
+        store = #append(store, "dado_rt__dados_glue.answer[1] = (int32_t)(r).len;")
+    else if rk == check.SK_FLOAT: store = #append(store, "dado_rt__dados_glue.answer_float = (double)r;")
+    else if !void_: store = #append(store, "dado_rt__dados_glue.answer[0] = (int32_t)r;")
+    if rk == check.SK_OWNED:
+        put(out, index.hold(#format("static ", rc, " ", nm, "__kept;\nstatic void ", nm, "__drop(void) { dado_delete((dado_ref *)&", nm, "__kept, 1); }\n")))
+        store = #append(store, index.hold(#format(nm, "__kept = r;")))
+        store = #append(store, index.hold(#format("dado_rt__dados_pending = ", nm, "__drop;")))
+    // The literal answers, each by its index (`o7`).
+    ref []string8 hits
+    for q in p.lit_at[bi]..<p.lit_to[bi]:
+        string8 t = p.lits[q]
+        i64 k = q - p.lit_at[bi]
+        if #len(t) == 0:
+            hits = #append(hits, "r.len == 0")
+            continue
+        put(out, index.hold(#format("static const unsigned char ", nm, "__literal", k, "[", #len(t), "] = { ", i_bytes(t, false), " };\n")))
+        hits = #append(hits, index.hold(#format("r.len == ", #len(t), " && memcmp(r.ptr, ", nm, "__literal", k, ", ", #len(t), ") == 0")))
+    bool flat = !fl && !void_ && !wide && !strs
+    string8 sr = "void"
+    if fl: sr = "int32_t"
+    else if flat: sr = rc
+    else if #len(hits) > 0 || wide: sr = "int32_t"
+    ref []char8 b
+    if fl:
+        string8 ca = call
+        if !void_:
+            put(&b, index.hold(#format("    ", rc, " r;\n")))
+            ca = index.hold(#format("&r", ", " if #len(call) > 0 else "", call))
+        put(&b, index.hold(#format("    int32_t code = ", cn, "(", ca, ");\n")))
+        if !void_:
+            ref []string8 then
+            for k in 0..<#len(hits):
+                then = #append(then, index.hold(#format("if (", hits[k], ") { dado_rt__dados_glue.answer[0] = ", k, "; dado_rt__dados_glue.answer[1] = -1; return 0; }")))
+            for s in store:
+                then = #append(then, s)
+            put(&b, index.hold(#format("    if (code == 0) { ", index.hold(strings.join(then[:], " ")), " }\n")))
+        put(&b, "    return code;\n")
+    else if flat: put(&b, index.hold(#format("    return ", cn, "(", call, ");\n")))
+    else if !void_:
+        put(&b, index.hold(#format("    ", rc, " r = ", cn, "(", call, ");\n")))
+        for k in 0..<#len(hits):
+            put(&b, index.hold(#format("    if (", hits[k], ") { return ", k, "; }\n")))
+        for s in store:
+            put(&b, index.hold(#format("    ", s, "\n")))
+        if wide: put(&b, "    return dado_rt__dados_glue.answer[0];\n")
+        else if #len(hits) > 0: put(&b, "    return -1;\n")
+    else: put(&b, index.hold(#format("    ", cn, "(", call, ");\n")))
+    put(out, index.hold(#format("static ", sr, " ", nm, "(", index.hold(strings.join(params[:], ", ")), ") {\n", index.hold(b), "}\n")))
+
+// ── JavaScript ──
+
+private const [8]string8 I_STASH = ("__dados_stash1", "__dados_stash2", "__dados_stash3", "__dados_stash4", "__dados_stash5", "__dados_stash6", "__dados_stash7", "__dados_stash8")
+
+// A helper of `dados/web.js`, imported once.
+private string8 ih(^J j, string8 n):
+    web_use(&j.prints, n)
+    return n
+
+// An argument read twice without effect: a name or a number.
+private bool isimple(string8 s):
+    if #len(s) == 0: return false
+    for ch in s:
+        bool ok = ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '$'
+        if !ok: return false
+    return true
+
+// The release form of an integer's narrowing into prim `p`.
+private string8 inarrow(u8 p):
+    if p == types.P_I8: return "__dados_i8"
+    if p == types.P_U8 || p == types.P_CHAR8 || p == types.P_BYTE: return "__dados_u8"
+    if p == types.P_I16: return "__dados_i16"
+    if p == types.P_U16: return "__dados_u16"
+    return "__dados_n32"
+
+// Enum `t`'s table: its members' names to values (`names`), else values to
+// the name each crosses as (the member declared first with it).
+private string8 itable(^J j, u32 t, bool names):
+    ^check.World w = j.w
+    u32 d = check.s_denum(w, t)
+    string8 pk = check.name_of(w, w.p.pkgs[w.decls[d].pkg].name)
+    ref []char8 id
+    for ch in pk:
+        bool al = ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
+        if al: id = #append(id, ch)
+        else: id = #append(id, '_')
+    string8 n = index.hold(#format("enum$", "names$" if names else "values$", index.hold(id), "$", check.name_of(w, w.decls[d].name)))
+    for x in j.itab_n:
+        if x == n: return n
+    ref []string8 pairs
+    ref []i64 seen
+    for key in w.order:
+        if u32(key >> 32) != d: continue
+        try u32 k = w.members[key] else: continue
+        if k == NONE: continue
+        i64 v = i64(w.k.w0[k])
+        string8 nm = jstr(check.name_of(w, u32(key & 0xFFFFFFFF)))
+        if names:
+            pairs = #append(pairs, index.hold(#format("[", nm, ", ", v, "]")))
+            continue
+        bool dup = false
+        for q in seen:
+            if q == v: dup = true
+        if dup: continue
+        seen = #append(seen, v)
+        pairs = #append(pairs, index.hold(#format("[", v, ", ", nm, "]")))
+    j.itab_n = #append(j.itab_n, n)
+    j.itab_v = #append(j.itab_v, index.hold(#format("new Map([", index.hold(strings.join(pairs[:], ", ")), "])")))
+    return n
+
+// An argument of kind `k`, prim `p`, as the wasm parameters it becomes.
+private string8 iconv(^J j, u8 k, u8 p, string8 x):
+    if k == check.SK_BOOL: return x
+    if k == check.SK_FLOAT: return index.hold(#format(ih(j, "__dados_f"), "(", x, ")"))
+    if iwide(p): return index.hold(#format(ih(j, "__dados_lo"), "(", x, "), ", ih(j, "__dados_hi"), "(", x, ")"))
+    return index.hold(#format(ih(j, inarrow(p)), "(", x, ")"))
+
+// The call `c` answered as the script's (Rust's `answered`).
+private string8 ianswer(^J j, i64 bi, string8 c, string8 label):
+    ^check.World w = j.w
+    u32 fty = w.decls[w.bound[bi]].ty
+    u32 rt = w.t.a[fty]
+    bool fl = w.t.b[fty] != types.F_NONE
+    string8 lab = jstr(label)
+    if j.ip.lit_to[bi] > j.ip.lit_at[bi]:
+        i32 s = j.ip.slot[bi]
+        string8 tn = index.hold(#format("__dados_I", s))
+        string8 bn = index.hold(#format("__dados_B", s))
+        bool have = false
+        for x in j.itab_n:
+            if x == tn: have = true
+        if !have:
+            ref []string8 ts
+            ref []string8 bs
+            for q in j.ip.lit_at[bi]..<j.ip.lit_to[bi]:
+                ts = #append(ts, jstr(j.ip.lits[q]))
+                bs = #append(bs, index.hold(#format(#len(j.ip.lits[q]))))
+            j.itab_n = #append(j.itab_n, tn)
+            j.itab_v = #append(j.itab_v, index.hold(#format("[", index.hold(strings.join(ts[:], ", ")), "]")))
+            j.itab_n = #append(j.itab_n, bn)
+            j.itab_v = #append(j.itab_v, index.hold(#format("[", index.hold(strings.join(bs[:], ", ")), "]")))
+        if fl: return index.hold(#format(ih(j, "__dados_okl"), "(", c, ", ", lab, ", ", tn, ", ", bn, ")"))
+        return index.hold(#format(ih(j, "__dados_lit"), "(", c, ", ", tn, ", ", bn, ")"))
+    if rt == u32(types.P_VOID):
+        if fl: return index.hold(#format(ih(j, "__dados_ok"), "(", c, ", ", lab, ")"))
+        return c
+    u8 rk = check.seam_kind(w, rt, true)
+    u8 p = iprim(w, rt)
+    if rk == check.SK_ENUM:
+        string8 tb = itable(j, rt, false)
+        if fl:
+            string8 h = "__dados_okeu" if p == types.P_U32 else "__dados_oke"
+            return index.hold(#format(ih(j, h), "(", c, ", ", lab, ", ", tb, ")"))
+        if p == types.P_U32: return index.hold(#format(ih(j, "__dados_eout"), "(", tb, ", ", c, " >>> 0)"))
+        return index.hold(#format(ih(j, "__dados_eout"), "(", tb, ", ", c, ")"))
+    if fl:
+        string8 h = "__dados_oki"
+        if rk == check.SK_INT && iwide(p): h = "__dados_okj"
+        else if rk == check.SK_INT && p == types.P_U32: h = "__dados_oku"
+        else if rk == check.SK_FLOAT: h = "__dados_okf"
+        else if rk == check.SK_BOOL: h = "__dados_okb"
+        else if rk == check.SK_C32: h = "__dados_okc32"
+        else if rk == check.SK_C16: h = "__dados_okc16"
+        else if rk == check.SK_STR: h = "__dados_oks"
+        else if rk == check.SK_OWNED: h = "__dados_oko"
+        return index.hold(#format(ih(j, h), "(", c, ", ", lab, ")"))
+    if rk == check.SK_FLOAT: return c
+    if rk == check.SK_INT:
+        if iwide(p): return index.hold(#format(ih(j, "__dados_j"), "(", c, ")"))
+        if p == types.P_U32: return index.hold(#format("(", c, " >>> 0)"))
+        return c
+    if rk == check.SK_BOOL: return index.hold(#format("(", c, " !== 0)"))
+    if rk == check.SK_C32: return index.hold(#format(ih(j, "__dados_c32"), "(", c, ")"))
+    if rk == check.SK_C16: return index.hold(#format(ih(j, "__dados_c16"), "(", c, ")"))
+    if rk == check.SK_STR: return index.hold(#format("(", c, ", ", ih(j, "__dados_out8"), "())"))
+    return index.hold(#format("(", c, ", ", ih(j, "__dados_own8"), "())"))
+
+// A script's call of a Dado function (op `i` of `f`) written inline at its
+// site (Rust's `web_seam_call`), or "" when it keeps the thunk.
+string8 inline_site(^J j, ^ir.Fn f, u32 i):
+    ^check.World w = j.w
+    u32 r = f.a[i]
+    string8 fnm = index.hold(strings.clone(w.t.text(f.ref_name[r])))
+    string8 pk = index.hold(strings.clone(w.t.text(f.ref_pkg[r])))
+    i64 bi = i_bound(&j.ip, index.hold(#format(pk, "/", fnm)))
+    if bi < 0: return ""
+    i32 slot = j.ip.slot[bi]
+    if slot < 0: return ""
+    u32 d = w.bound[bi]
+    []u32 ps = w.t.params(w.decls[d].ty)
+    []u32 xs = ir.args(f, i)
+    if #len(ps) != #len(xs): return ""
+    string8 local = index.hold(#format("dadoi$", fnm))
+    string8 link = index.hold(#format(local, " = f[", slot, "];"))
+    bool linked = false
+    for x in j.ilink:
+        if x == link: linked = true
+    if !linked:
+        j.ilink = #append(j.ilink, link)
+        j.ilocal = #append(j.ilocal, local)
+    string8 label = index.hold(#format(pk, ".", check.seam_name(w, d)))
+    // Each argument's text, kind and prim; literals pre-encoded (`__dados_L`).
+    ref []string8 texts
+    ref []u8 ks
+    ref []u8 pr
+    ref []i64 lit
+    bool enums = false
+    bool stash = false
+    for q in 0..<#len(xs):
+        u32 pq = ps[q]
+        u32 xq = xs[q]
+        u8 k = check.seam_kind(w, pq, false)
+        u8 p = iprim(w, pq)
+        ks = #append(ks, k)
+        pr = #append(pr, p)
+        if k == check.SK_ENUM: enums = true
+        if i_is_lit(w, xq, pq):
+            lit = #append(lit, i_arg_no(&j.ip, w.t.text(w.k.a[xq & ~ir.OPD_CONST])))
+            texts = #append(texts, "")
+            continue
+        lit = #append(lit, -1)
+        string8 t = index.hold(strings.clone(jt(j, f, xq)))
+        texts = #append(texts, t)
+        if k == check.SK_STR || k == check.SK_C32 || k == check.SK_C16 || k == check.SK_ENUM: stash = true
+        if k == check.SK_INT && iwide(p) && !isimple(t): stash = true
+    ref []string8 stashed
+    ref []string8 checks
+    ref []string8 wargs
+    i64 lit_bytes = 0
+    for q in 0..<#len(xs):
+        u8 k = ks[q]
+        i64 n = lit[q]
+        if n >= 0:
+            i64 len = #len(j.ip.args[n])
+            wargs = #append(wargs, index.hold(#format(ih(j, "__dados_L"), "[", n, "], ", len)))
+            if enums: checks = #append(checks, index.hold(#format(ih(j, "__dados_C"), ".bytes_in += ", len)))
+            else: lit_bytes += len
+            continue
+        if !stash:
+            wargs = #append(wargs, iconv(j, k, pr[q], texts[q]))
+            continue
+        i64 s = #len(stashed)
+        stashed = #append(stashed, texts[q])
+        string8 v = index.hold(#format(ih(j, "__dados_a"), "[", s, "]"))
+        if k == check.SK_STR:
+            checks = #append(checks, index.hold(#format(ih(j, "__dados_in8"), "(", s, ")")))
+            wargs = #append(wargs, index.hold(#format(ih(j, "__dados_p"), "[", s, "], ", ih(j, "__dados_n"), "[", s, "]")))
+        else if k == check.SK_C32 || k == check.SK_C16:
+            string8 h = "__dados_ch32" if k == check.SK_C32 else "__dados_ch16"
+            checks = #append(checks, index.hold(#format(ih(j, h), "(", s, ", ", jstr(label), ", ", jstr(i_pname(w, d, q, #len(ps))), ")")))
+            wargs = #append(wargs, index.hold(#format(ih(j, "__dados_p"), "[", s, "]")))
+        else if k == check.SK_ENUM:
+            string8 tb = itable(j, ps[q], true)
+            checks = #append(checks, index.hold(#format(ih(j, "__dados_ein"), "(", s, ", ", tb, ", ", jstr(label), ", ", jstr(i_pname(w, d, q, #len(ps))), ")")))
+            wargs = #append(wargs, index.hold(#format(ih(j, inarrow(pr[q])), "(", v, ")")))
+        else: wargs = #append(wargs, iconv(j, k, pr[q], v))
+    string8 called = index.hold(#format(local, "(", index.hold(strings.join(wargs[:], ", ")), ")"))
+    ref []string8 parts
+    if #len(stashed) > 0:
+        string8 h = "__dados_stashn"
+        if #len(stashed) <= 8: h = I_STASH[#len(stashed) - 1]
+        parts = #append(parts, index.hold(#format(ih(j, h), "(", index.hold(strings.join(stashed[:], ", ")), ")")))
+    bool sends = j.ip.sends[bi]
+    if sends: parts = #append(parts, index.hold(#format("(", ih(j, "__dados_held"), " !== 0 || ", ih(j, "__dados_C"), " === ", ih(j, "__dados_none"), ") && ", ih(j, "__dados_settle"), "()")))
+    else: parts = #append(parts, index.hold(#format(ih(j, "__dados_held"), " !== 0 && ", ih(j, "__dados_settle"), "()")))
+    parts = #append(parts, index.hold(#format(ih(j, "__dados_C"), ".calls++")))
+    if lit_bytes > 0: parts = #append(parts, index.hold(#format("__dados_C.bytes_in += ", lit_bytes)))
+    for x in checks:
+        parts = #append(parts, x)
+    string8 ans = ianswer(j, bi, called, label)
+    if sends: ans = index.hold(#format(ih(j, "__dados_sig"), "(", ans, ")"))
+    parts = #append(parts, ans)
+    return index.hold(#format("((", index.hold(strings.join(parts[:], ", ")), "))"))
+
+// Parameter `q`'s name, as the thunk names it.
+private string8 i_pname(^check.World w, u32 d, i64 q, i64 np):
+    u32 df = w.decls[d].file
+    syntax.Ast da = w.p.files[df].a
+    []u32 dks = da.list(da.b[w.decls[d].node])
+    i64 qi = 6 + q - (np - (#len(dks) - 6))
+    if qi < 6: return "self"
+    return index.hold(strings.clone(w.p.spell(df, dks[qi])))
+
+// The module's head lines for its inline sites: the tables, each function's
+// local, and `__dados_link`, which `__dados_attach` calls with the slots.
+ref []string8 inline_head(^J j):
+    ref []string8 o
+    for i in 0..<#len(j.itab_n):
+        o = #append(o, index.hold(#format("const ", j.itab_n[i], " = ", j.itab_v[i], ";")))
+    if #len(j.ilink) == 0: return o
+    for x in j.ilocal:
+        o = #append(o, index.hold(#format("let ", x, ";")))
+    o = #append(o, index.hold(#format("export function __dados_link(f) { ", index.hold(strings.join(j.ilink[:], " ")), " }")))
+    return o

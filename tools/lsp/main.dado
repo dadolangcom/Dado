@@ -1,0 +1,397 @@
+// The Dado language server over language:syntax and language:fmt: formatting,
+// document symbols and folding ranges in process; the checker's diagnostics,
+// hover and definition from the compiler (`compiler.dado`, `query.dado`). JSON-RPC
+// over stdio; full-text sync. An edit owes its diagnostics, paid once 300 ms
+// pass with no message (Rust's `IDLE`); opening and saving pay at once.
+package main
+
+import "core:io"
+import "core:json"
+import "core:os"
+import "core:os/fs"
+import "language:fmt"
+import "language:syntax"
+
+type Server:
+    ref [](ref []char8) uris
+    ref [](ref []char8) texts
+    ref []i64 versions
+    ref []bool dirty
+    bool down
+    // The compiler (`compiler.dado`): the configured path, the workspace
+    // root, whether it was looked for, and `dado.showWarnings`.
+    ref []char8 configured
+    ref []char8 root
+    bool looked
+    Compiler comp
+    bool show_warnings
+
+    i64 find(^self, string8 uri):
+        for i in 0..<#len(self.uris):
+            string8 u = self.uris[i]
+            if u == uri: return i
+        return -1
+
+    void put(^self, string8 uri, string8 text, i64 version):
+        i64 i = self.find(uri)
+        if i < 0:
+            self.uris = #append(self.uris, copy(uri))
+            self.texts = #append(self.texts, copy(text))
+            self.versions = #append(self.versions, version)
+            self.dirty = #append(self.dirty, false)
+            return
+        #delete(self.texts[i])
+        self.texts[i] = copy(text)
+        self.versions[i] = version
+
+    void drop(^self, string8 uri):
+        i64 i = self.find(uri)
+        if i < 0: return
+        #delete(self.uris[i])
+        #delete(self.texts[i])
+        i64 last = #len(self.uris) - 1
+        self.uris[i] = self.uris[last]
+        self.texts[i] = self.texts[last]
+        self.versions[i] = self.versions[last]
+        self.dirty[i] = self.dirty[last]
+        #truncate(self.dirty, last)
+        #truncate(self.uris, last)
+        #truncate(self.texts, last)
+        #truncate(self.versions, last)
+
+private ref []char8 copy(string8 s):
+    ref []char8 o
+    syntax.put(&o, s)
+    return o
+
+i32 main(i32 argc, ^rawptr argv):
+    []string8 args = os.args(argc, argv)
+    if #len(args) > 1 && args[1] == "--version":
+        ref []char8 v = #format("dado-lsp ", #DADO_VERSION, "\n")
+        _ = io.write_bytes(io.stdout(), v)
+        #delete(v)
+        return 0
+    Server s
+    In inp
+    for !s.down:
+        ref []char8 body
+        if !message(&s, &inp, &body): return 1
+        string8 b = body
+        handle(&s, b)
+        #delete(body)
+    return 0
+
+// The milliseconds the typing has to stop before an owed check is paid.
+private const i32 IDLE = 300
+
+private foreign "./wait.h":
+    i32 lsp_wait(i32 ms)
+    i64 lsp_read(rawptr buf, i64 n)
+
+// Bytes read from stdin and not yet taken.
+private type In:
+    ref []char8 buf
+    i64 at
+
+// The next message's body; owed checks paid when the input goes quiet. False
+// at the input's end.
+private bool message(^Server s, ^In inp, ^ref []char8 body):
+    for:
+        string8 all = inp.buf
+        string8 have = all[inp.at..<#len(all)]
+        i64 h = 0
+        for h + 3 < #len(have) && have[h..<h + 4] != "\r\n\r\n": h += 1
+        if h + 3 < #len(have):
+            i64 n = -1
+            string8 head = have[0..<h]
+            i64 k = 0
+            for k < #len(head):
+                i64 e = k
+                for e < #len(head) && head[e] != '\n': e += 1
+                string8 l = head[k..<e]
+                if #len(l) > 15 && l[0..<15] == "Content-Length:":
+                    n = 0
+                    for c in l[15..<#len(l)]:
+                        if c >= '0' && c <= '9': n = n * 10 + i64(u8(c) - u8('0'))
+                k = e + 1
+            if n < 0:
+                inp.at += h + 4
+                continue
+            if h + 4 + n <= #len(have):
+                body^ = #append(body^, ..have[h + 4..<h + 4 + n])
+                inp.at += h + 4 + n
+                return true
+        if inp.at > 0:
+            ref []char8 rest
+            rest = #append(rest, ..all[inp.at..<#len(all)])
+            #delete(inp.buf)
+            inp.buf = rest
+            inp.at = 0
+        bool owed = false
+        for d in s.dirty:
+            if d: owed = true
+        if owed && lsp_wait(IDLE) == 0:
+            pay(s)
+            continue
+        [65536]char8 chunk
+        i64 got = lsp_read(rawptr(&chunk[0]), 65536)
+        if got <= 0: return false
+        inp.buf = #append(inp.buf, ..chunk[0..<got])
+    return false
+
+// Every owed check, paid.
+private void pay(^Server s):
+    for i in 0..<#len(s.uris):
+        if !s.dirty[i]: continue
+        s.dirty[i] = false
+        string8 u = s.uris[i]
+        publish(s, u)
+
+private void send(^json.Writer w):
+    try ref []char8 text = w.finish() else:
+        return
+    ref []char8 head
+    syntax.put(&head, "Content-Length: ")
+    syntax.put_num(&head, #len(text))
+    syntax.put(&head, "\r\n\r\n")
+    _ = io.write_bytes(io.stdout(), head)
+    _ = io.write_bytes(io.stdout(), text)
+    _ = io.flush(io.stdout())
+    #delete(head)
+    #delete(text)
+
+// A reply's head, `{"jsonrpc":"2.0","id":…,"result":` left open for the result.
+private json.Writer reply(json.Value id):
+    json.Writer w = json.writer()
+    w.object()
+    w.key("jsonrpc")
+    w.text("2.0")
+    w.key("id")
+    w.value(id)
+    w.key("result")
+    return w
+
+private void done(^json.Writer w):
+    w.end_object()
+    send(w)
+
+// `v.k`, or `v` itself when it has none (so a missing path reads as "").
+private json.Value member(json.Value v, string8 k):
+    try json.Value x = v.get(k) else:
+        return v
+    return x
+
+private json.Value id_of(json.Value v):
+    return member(v, "id")
+
+private json.Value last(json.Value v):
+    try json.Value x = v.at(v.len() - 1) else:
+        return v
+    return x
+
+private i64 number(json.Value v):
+    try i64 n = v.int() else:
+        return -1
+    return n
+
+private string8 text_at(json.Value v, string8 a, string8 b, string8 c):
+    json.Value x = member(v, a)
+    if #len(b) > 0: x = member(x, b)
+    if #len(c) > 0: x = member(x, c)
+    try string8 t = x.text() else:
+        return ""
+    return t
+
+private void handle(^Server s, string8 body):
+    try json.Document doc = json.parse_text(body) else:
+        return
+    json.Value root = doc.root()
+    string8 method = text_at(root, "method", "", "")
+    bool request = root.has("id")
+    json.Value params = member(root, "params")
+    string8 uri = text_at(params, "textDocument", "uri", "")
+    if method == "initialize":
+        string8 ru = text_at(params, "rootUri", "", "")
+        if #len(ru) > 0: s.root = path_of(ru)
+        else: syntax.put(&s.root, text_at(params, "rootPath", "", ""))
+        syntax.put(&s.configured, text_at(params, "initializationOptions", "compilerPath", ""))
+        s.show_warnings = flag_on(member(member(params, "initializationOptions"), "showWarnings"))
+        json.Writer w = reply(id_of(root))
+        w.object()
+        w.key("capabilities")
+        w.object()
+        w.key("textDocumentSync")
+        w.int(1)
+        w.key("documentFormattingProvider")
+        w.boolean(true)
+        w.key("documentSymbolProvider")
+        w.boolean(true)
+        w.key("foldingRangeProvider")
+        w.boolean(true)
+        w.key("hoverProvider")
+        w.boolean(true)
+        w.key("definitionProvider")
+        w.boolean(true)
+        w.end_object()
+        w.key("serverInfo")
+        w.object()
+        w.key("name")
+        w.text("dado-lsp")
+        w.end_object()
+        w.end_object()
+        done(&w)
+    else if method == "shutdown":
+        json.Writer w = reply(id_of(root))
+        w.null()
+        done(&w)
+    else if method == "exit": s.down = true
+    else if method == "textDocument/didOpen":
+        s.put(uri, text_at(params, "textDocument", "text", ""), number(member(member(params, "textDocument"), "version")))
+        s.dirty[s.find(uri)] = false
+        publish(s, uri)
+    else if method == "textDocument/didChange":
+        // Owed, not paid: a keystroke publishes nothing.
+        json.Value ch = member(params, "contentChanges")
+        i64 version = number(member(member(params, "textDocument"), "version"))
+        if ch.len() > 0: s.put(uri, text_at(last(ch), "text", "", ""), version)
+        i64 i = s.find(uri)
+        if i >= 0:
+            if ch.len() == 0: s.versions[i] = version
+            s.dirty[i] = true
+    else if method == "textDocument/didSave":
+        i64 i = s.find(uri)
+        if i >= 0: s.dirty[i] = false
+        publish(s, uri)
+    else if method == "textDocument/didClose": s.drop(uri)
+    else if request:
+        json.Writer w = reply(id_of(root))
+        ref []char8 disk
+        i64 i = s.find(uri)
+        string8 text = ""
+        bool known = i >= 0
+        if known: text = s.texts[i]
+        else if #len(uri) > 0:
+            ref []char8 path = path_of(uri)
+            string8 p = path
+            try disk = fs.read_file(p) else:
+                disk = #make([]char8, 0)
+            known = #len(disk) > 0
+            text = disk
+            #delete(path)
+        if !known: w.null()
+        else if method == "textDocument/formatting": formatting(&w, uri, text)
+        else if method == "textDocument/documentSymbol": symbols(&w, uri, text)
+        else if method == "textDocument/foldingRange": folding(&w, uri, text)
+        else if method == "textDocument/hover" || method == "textDocument/definition":
+            json.Value pos = member(params, "position")
+            u32 at = offset_of(text, number(member(pos, "line")), number(member(pos, "character")))
+            ref []char8 path = path_of(uri)
+            string8 ps = path
+            if method == "textDocument/hover": hover(s, &w, ps, text, at)
+            else: definition(s, &w, ps, text, at)
+            #delete(path)
+        else: w.null()
+        done(&w)
+        #delete(disk)
+    doc.destroy()
+
+// `file:///a%20b` as `/a b`.
+private ref []char8 path_of(string8 uri):
+    ref []char8 out
+    i64 i = 7 if #len(uri) > 7 && uri[0..<7] == "file://" else 0
+    for i < #len(uri):
+        char8 c = uri[i]
+        if c == '%' && i + 2 < #len(uri) && hexval(uri[i + 1]) >= 0 && hexval(uri[i + 2]) >= 0:
+            out = #append(out, char8(u8(hexval(uri[i + 1]) * 16 + hexval(uri[i + 2]))))
+            i += 3
+            continue
+        out = #append(out, c)
+        i += 1
+    return out
+
+private i32 hexval(char8 c):
+    if c >= '0' && c <= '9': return i32(u8(c) - u8('0'))
+    if c >= 'a' && c <= 'f': return i32(u8(c) - u8('a')) + 10
+    if c >= 'A' && c <= 'F': return i32(u8(c) - u8('A')) + 10
+    return -1
+
+// One whole-document edit, `[]` when nothing changes, null when it does not format.
+private void formatting(^json.Writer w, string8 uri, string8 text):
+    ref []char8 path = path_of(uri)
+    string8 p = path
+    ref []char8 where
+    ref []char8 why
+    fmt.Style st = fmt.style_for(p, &where, &why)
+    ref []char8 out
+    ref []char8 err
+    if st.line > 0 || fmt.format_text(p, text, &st, &out, &err) != 0: w.null()
+    else:
+        w.array()
+        string8 o = out
+        if o != text:
+            Lines ls = lines(text)
+            w.object()
+            w.key("range")
+            range(w, &ls, 0, u32(#len(text)))
+            w.key("newText")
+            w.text(o)
+            w.end_object()
+            #delete(ls.starts)
+        w.end_array()
+    #delete(path)
+    #delete(where)
+    #delete(why)
+    #delete(out)
+    #delete(err)
+
+// The syntax errors of `uri` as a publishDiagnostics notification.
+private void publish(^Server s, string8 uri):
+    i64 i = s.find(uri)
+    if i < 0: return
+    string8 src = s.texts[i]
+    ref []char8 path = path_of(uri)
+    string8 p = path
+    ref []char8 out
+    bool have = compiler_of(s)
+    if have:
+        [1]string8 q = ["--emit=explained"]
+        out = ask(&s.comp, q[:], p, src)
+    Lines ls = lines(src)
+    json.Writer w = json.writer()
+    w.object()
+    w.key("jsonrpc")
+    w.text("2.0")
+    w.key("method")
+    w.text("textDocument/publishDiagnostics")
+    w.key("params")
+    w.object()
+    w.key("uri")
+    w.text(uri)
+    w.key("diagnostics")
+    w.array()
+    if have:
+        string8 o = out
+        explained_diagnostics(&w, &ls, o, src, p, s.show_warnings)
+    else: whole_file_error(&w, &ls, MISSING)
+    w.end_array()
+    if s.versions[i] >= 0:
+        w.key("version")
+        w.int(s.versions[i])
+    w.end_object()
+    w.end_object()
+    send(&w)
+    #delete(ls.starts)
+    #delete(out)
+    #delete(path)
+
+private bool flag_on(json.Value v):
+    try bool on = v.boolean() else: return false
+    return on
+
+// The compiler, looked for once (and again while it is missing).
+bool compiler_of(^Server s):
+    if !s.comp.found:
+        string8 c = s.configured
+        string8 r = s.root
+        s.comp = find_compiler(c, r)
+    return s.comp.found

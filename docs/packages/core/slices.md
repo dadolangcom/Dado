@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.8 -->
-<!-- commit 6c56ce20508a (dirty) -->
+<!-- dadoc 1.0.0-rc.9 -->
+<!-- self-hosted (tools/dadoc) -->
 # core:slices
 
 core:slices — ordering, searching and rearranging a run of anything.
@@ -94,7 +94,7 @@ slice, and nothing here checks it — it is the one thing a caller owes.
 
 ## Declarations
 
-74 declarations, 57 public.
+73 declarations, 56 public.
 
 * `type Gap($T)` — A gap buffer of `T`. The block is `[0, #len(block))`; the gap is…
 * `Error!void Gap.init(^self, i64 cap)` — Keep `#default` as the gap's allocator and take a block of `cap`
@@ -116,7 +116,6 @@ slice, and nothing here checks it — it is the one thing a caller owes.
 * `void reverse([]$T xs)` — Reverse in place.
 * `void rotate([]$T xs, i64 n)` — Rotate left by `n`, so the element at `n` becomes the first. A negative `n`
 * `void fill([]$T xs, T v)` — Set every element to `v`.
-* `i64 copy_into([]const $T from, []T into)` — Copy `from` into `into`, and answer how many elements moved — the shorter of…
 * `ref []T clone([]const $T xs)` — A copy of `xs` in a new run on the ambient allocator (a `using` block…
 * `i64 chunk_count([]const $T xs, i64 size)` — How many pieces `chunk` cuts `xs` into at `size` elements each, the last…
 * `[]T chunk([]$T xs, i64 size, i64 i)` — The `i`th piece of `size` elements: `xs[i·size ..< (i+1)·size]`, cut…

@@ -1,0 +1,1295 @@
+// `dado test` over many packages: one queue, `-j` workers, and test programs
+// linked into shared binaries where they can be.
+//
+// **One queue.** Every package's listing, transpiles, unit compiles, links
+// and runs are jobs of one `Pool`; a job's end queues what waited on it, so
+// no phase waits for another to finish everywhere. Results are said in
+// package order, then manifest order, whatever `-j` is.
+//
+// **Batches.** A program that can share a binary is partially linked
+// (`cc -r`), its `main` renamed `dado_test_<id>` and every other global made
+// local (`objcopy`), so two packages' runtimes never meet. A batch (the
+// packages of one directory, split four ways by name: `batch_key`) links its
+// parts with a runner (`runner_c`) that forks a child per test, so each test
+// is still its own process and a crash ends only its child. Tests a runner
+// did not report are run again one process each.
+//
+// Not batched, still queued: a test wanting a non-zero status,
+// `--sanitize=thread`, `--release` (LTO), the web, Windows, macOS, `#NONE`,
+// exports, the script engine, and compilers other than gcc and clang.
+package driver
+
+import "core:fmt"
+import "core:hash"
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+private const i32 J_LIST = 0
+private const i32 J_TRANSPILE = 1
+private const i32 J_COMPILE = 2
+private const i32 J_LINK = 3
+private const i32 J_PART = 4
+private const i32 J_LOCAL = 5
+private const i32 J_BATCH = 6
+private const i32 J_RUN = 7
+private const i32 J_CHUNK = 8
+
+type TestPackage:
+    Plan p
+    string8 named            // as the command line wrote it
+    string8 cache
+    string8 dadoc_id
+    bool caching
+    i64 mark
+    ref []TestEntry tests
+    i64 filtered
+    i64 other_slices
+    i64 first                // its runs, `first..<first + n`
+    i64 n
+    i64 batch
+    bool listed
+    i64 passed
+    i64 failed
+    i64 sanitized_runs
+    i64 longest              // its longest test last time, in ms
+
+type TestBatch:
+    string8 bin
+    string8 cache
+    string8 lkey
+    ref []i64 members        // its programs: a group's first test, or a test alone
+    ref []i64 entries        // those whose part is in the binary, in a fixed order
+    i64 unlisted             // its packages not yet listed
+    bool linked
+
+// The tests one runner runs, and where it writes what they said.
+type TestChunk:
+    i64 batch
+    string8 dir
+    ref []i64 tests
+
+type Suite:
+    ref []TestPackage pkgs
+    ref []TestRun runs
+    ref []TestBatch batches
+    ref []TestChunk chunks
+    ref []UnitTask tasks
+    ref []string8 t_source
+    ref []string8 t_own
+    ref []string8 t_book
+    ref []string8 t_object
+    ref []string8 t_tmp
+    ref []bool t_ok
+    ref []bool t_done
+    ref []Ran t_said
+    ref []i64 t_next         // the next task waiting on this one's compile
+    {string8: i64} compiling // a book, by the task compiling it
+    Pool q
+    ref []i32 kind
+    ref []i64 of
+    i32 jobs
+    bool web
+    bool lto
+    Compiler cc
+    string8 cc_id
+    string8 cfg
+    string8 objcopy
+    bool san_ready
+    bool sanitized
+    ref []string8 san_c
+    ref []string8 san_l
+    string8 engine_dir
+    string8 web_cc
+    string8 web_node
+    i64 pid
+    {string8: i64} times     // `<package>\t<test>`, by how long it ran last
+
+// What is nearer a result goes first, then what leads to the longest test
+// (`test-times`), so a long test starts early.
+private const string8 PRIORITY = "8 5 4 7 6 6 7 9 9"
+
+private void queue_job(^Suite s, Command c, i32 kind, i64 of, bool keep, bool excl, i64 weight = 0):
+    ref []string8 ps = words_of(PRIORITY)
+    (i64 pr, bool _) = decimal(ps[kind])
+    i64 w = weight if weight < 99999 else 99999
+    _ = pool_add(&s.q, c, keep, excl, i32(pr * 100000 + w))
+    s.kind = #append(s.kind, kind)
+    s.of = #append(s.of, of)
+
+// Every directory under `dir` (written `shown`) holding an `@test` file, in
+// name order. Hidden directories, `build`, `target` and `node_modules` are
+// not looked in.
+private void tested_dirs(string8 dir, string8 shown, ^ref []string8 out):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return
+    ref []string8 subs = #make([]string8, 0)
+    bool has = false
+    for e in l.entries:
+        string8 n = txt(#format(e.path))
+        if e.is_dir:
+            if strings.starts_with(n, ".") || n == "build" || n == "target" || n == "node_modules": continue
+            subs = #append(subs, n)
+        else if !has && strings.ends_with(n, ".dado") && is_test_file(join2(dir, n)):
+            has = true
+    if has: out^ = #append(out^, shown)
+    sort_bytes(subs[:])
+    for n in subs:
+        tested_dirs(join2(dir, n), n if shown == "." else join2(shown, n), out)
+
+// The packages `dado test` was given, or every one under here.
+ref []Plan test_plans(^Options o, string8 cwd):
+    ref []string8 names = #make([]string8, 0)
+    if #len(o.pkg) > 0: names = #append(names, o.pkg)
+    for m in o.more_pkgs:
+        names = #append(names, m)
+    if #len(names) == 0:
+        tested_dirs(cwd, ".", &names)
+        if #len(names) == 0: die("no package given, and no @test file under this directory. Try: dado test corpus/tour")
+    ref []Plan plans = #make([]Plan, 0)
+    string8 target = ""
+    for n in names:
+        Plan p = plan_for(o, n, cwd, target)
+        target = p.target_flag
+        plans = #append(plans, p)
+    return plans
+
+// Which batch a package's programs link in: its directory, and its name's
+// hash in four.
+private string8 batch_key(^Plan p):
+    u64 h = hash.xxh64_text(0, path.base(p.pkg_abs))
+    return txt(#format(dir_of(p.pkg_abs), "#", h % u64(4)))
+
+i32 test_packages(ref []Plan plans, ^Options o):
+    if #len(o.strip) > 0:
+        ref []char8 j = strings.join(o.strip[:], " ")
+        die(txt(#format("`dado test` will not strip claims: a test build with its assertions\n  removed tests nothing. Drop ", txt(j), ".")))
+    i64 shard_k = 0
+    i64 shard_n = 0
+    if #len(g_shard) > 0:
+        (i64 k, i64 n, bool sok) = parse_shard(g_shard)
+        if !sok:
+            die(txt(#format("--shard takes <k>/<n> with 1 <= k <= n, not `", g_shard, "`")))
+        shard_k = k
+        shard_n = n
+    (string8 jobs_env, bool _) = env("DADO_JOBS")
+    (i32 jobs, bool jok) = jobs_of(g_jobs, jobs_env, os.cpu_count())
+    if !jok:
+        if #len(g_jobs) > 0: die(txt(#format("-j takes a number of jobs, 1 or more, not `", g_jobs, "`")))
+        die(txt(#format("DADO_JOBS takes a number of jobs, 1 or more, not `", jobs_env, "`")))
+
+    Suite s
+    s.pkgs = #make([]TestPackage, 0)
+    s.runs = #make([]TestRun, 0)
+    s.batches = #make([]TestBatch, 0)
+    s.chunks = #make([]TestChunk, 0)
+    s.tasks = #make([]UnitTask, 0)
+    s.t_source = #make([]string8, 0)
+    s.t_own = #make([]string8, 0)
+    s.t_book = #make([]string8, 0)
+    s.t_object = #make([]string8, 0)
+    s.t_tmp = #make([]string8, 0)
+    s.t_ok = #make([]bool, 0)
+    s.t_done = #make([]bool, 0)
+    s.t_said = #make([]Ran, 0)
+    s.t_next = #make([]i64, 0)
+    s.compiling = {}
+    s.kind = #make([]i32, 0)
+    s.of = #make([]i64, 0)
+    s.san_c = #make([]string8, 0)
+    s.san_l = #make([]string8, 0)
+    s.jobs = jobs
+    s.pid = os.pid()
+    s.web = targets_web()
+    s.cc = no_compiler("")
+    if !s.web: s.cc = need(run_compiler(o, false))
+    // Which build a binary is, in its name, so two configurations of one
+    // package never overwrite each other's between the link and the run.
+    s.cfg = "web"
+    if !s.web:
+        s.cfg = path.base(s.cc.words[0])
+        if o.sanitize && o.sanitize_kind == "thread":
+            s.cfg = txt(#format(s.cfg, ".tsan"))
+        else if o.sanitize && s.cc.zig:
+            s.cfg = txt(#format(s.cfg, ".ubsan"))
+        else if o.sanitize:
+            s.cfg = txt(#format(s.cfg, ".asan"))
+    ref []string8 lto_on = lto_words(o, cc_family(s.cc))
+    s.lto = #len(lto_on) > 0 && !s.web
+    s.objcopy = ""
+    if !s.web && !s.lto && !(o.sanitize && o.sanitize_kind == "thread") && (cc_family(s.cc) == "gcc" || cc_family(s.cc) == "clang"):
+        s.objcopy = on_path("objcopy")
+        if #len(s.objcopy) == 0: s.objcopy = on_path("llvm-objcopy")
+    ref []Command none = #make([]Command, 0)
+    s.q = pool_of(none[:], jobs, true)
+
+    {string8: string8} ids = {}
+    {string8: i64} batch_at = {}
+    for p in plans:
+        try fs.make_dirs(p.build_dir) else: pass
+        TestPackage pk
+        pk.p = p
+        pk.named = p.written
+        pk.tests = #make([]TestEntry, 0)
+        pk.cache = join2(p.build_dir, ".dado-cache")
+        // Once per cache: what `emit_key` calls this `dadoc`. A digest that
+        // cannot be taken turns the emit cache off rather than keying it on
+        // nothing.
+        if !(pk.cache in ids): ids[pk.cache] = dadoc_identity(p.dadoc, pk.cache)
+        (string8 id, bool _) = ids[pk.cache]
+        pk.dadoc_id = id
+        pk.caching = #len(id) > 0
+        try fs.make_dirs(join2(pk.cache, "units")) else: pass
+        pk.mark = fs_now(join2(pk.cache, "units"))
+        string8 key = batch_key(&pk.p)
+        if !(key in batch_at):
+            TestBatch b
+            b.bin = join2(p.build_dir, txt(#format("tests.", hash.xxh64_text(0, key), ".", s.cfg)))
+            b.cache = pk.cache
+            b.lkey = ""
+            b.members = #make([]i64, 0)
+            b.entries = #make([]i64, 0)
+            b.unlisted = 0
+            b.linked = false
+            batch_at[key] = i64(#len(s.batches))
+            s.batches = #append(s.batches, b)
+        (i64 bi, bool _) = batch_at[key]
+        pk.batch = bi
+        s.batches[bi].unlisted += 1
+        pk.filtered = 0
+        pk.other_slices = 0
+        pk.first = 0
+        pk.n = 0
+        pk.listed = false
+        pk.passed = 0
+        pk.failed = 0
+        pk.sanitized_runs = 0
+        s.pkgs = #append(s.pkgs, pk)
+    s.times = {}
+    {string8: bool} read_times = {}
+    for pk in s.pkgs:
+        if pk.cache in read_times: continue
+        read_times[pk.cache] = true
+        for l in lines_of(read_or_empty(join2(pk.cache, "test-times"))):
+            (string8 ms, string8 key, bool tab) = strings.split_first(l, "\t")
+            (i64 n, bool nok) = decimal(ms)
+            if tab && nok: s.times[key] = n
+    // A batch whose longest test is longest listed first, its packages
+    // together: its runs wait for every one of them.
+    ref []i64 blong = #make([]i64, 0)
+    for _ in s.batches:
+        blong = #append(blong, i64(0))
+    for i in 0..<#len(s.pkgs):
+        s.pkgs[i].longest = longest_known(&s, s.pkgs[i].p.pkg_abs)
+        i64 bi = s.pkgs[i].batch
+        if s.pkgs[i].longest > blong[bi]: blong[bi] = s.pkgs[i].longest
+    ref []i64 order = #make([]i64, 0)
+    for i in 0..<#len(s.pkgs):
+        i64 k = i64(#len(order))
+        order = #append(order, i64(i))
+        for k > 0 && listed_before(&s, blong[:], i64(i), order[k - 1]):
+            order[k] = order[k - 1]
+            order[k - 1] = i64(i)
+            k -= 1
+    for i in order:
+        Command gc = dadoc_command(&s.pkgs[i].p, o, true, false)
+        add(&gc, "--emit=test-groups")
+        add(&gc, s.pkgs[i].p.pkg_abs)
+        queue_job(&s, gc, J_LIST, i, true, false)
+
+    bool many = #len(s.pkgs) > 1
+    i64 sp = 0
+    i64 sr = 0
+    for:
+        show_ready(&s, o, &sp, &sr, shard_k, shard_n, many)
+        if pool_done(&s.q): break
+        for j in pool_step(&s.q):
+            Ran ran = s.q.ran[j]
+            i32 k = s.kind[j]
+            i64 x = s.of[j]
+            if k == J_LIST: list_ended(&s, o, x, ran, shard_k, shard_n)
+            else if k == J_TRANSPILE: transpile_ended(&s, o, x, ran)
+            else if k == J_COMPILE: compile_ended(&s, o, x, ran)
+            else if k == J_LINK: link_ended(&s, o, x, ran)
+            else if k == J_PART: part_ended(&s, o, x, ran)
+            else if k == J_LOCAL: local_ended(&s, o, x, ran)
+            else if k == J_BATCH: batch_ended(&s, o, x, ran)
+            else if k == J_RUN: run_ended(&s, x, ran)
+            else if k == J_CHUNK: chunk_ended(&s, o, x, ran)
+            pool_fill(&s.q)
+    drop_c()
+    // Nothing is left to start: whatever has not ended did not run.
+    for i in 0..<#len(s.runs):
+        if s.runs[i].done: continue
+        s.runs[i].failure = DID_NOT_START
+        s.runs[i].unstarted = "not run"
+        s.runs[i].done = true
+    show_ready(&s, o, &sp, &sr, shard_k, shard_n, many)
+    for i in 0..<#len(s.t_object):
+        if strings.contains(path.base(s.t_object[i]), "unkeyed."): remove_if_there(s.t_object[i])
+    {string8: bool} swept = {}
+    for pk in s.pkgs:
+        if pk.cache in swept: continue
+        swept[pk.cache] = true
+        sweep_units(pk.cache, s.t_object[:])
+
+    save_times(&s)
+    i64 passed = 0
+    i64 failed = 0
+    i64 sanitized_runs = 0
+    for pk in s.pkgs:
+        passed += pk.passed
+        failed += pk.failed
+        sanitized_runs += pk.sanitized_runs
+    if many:
+        if passed + failed == 0: die("the packages hold no selected test")
+        string8 marker = sanitizer_marker(sanitized_runs, o.sanitize_kind, s.web || ubsan_only(s.cc))
+        fmt.println(txt(#format(#len(s.pkgs), " packages: ", summary_line(passed, failed, 0, 0, 0, 0, marker))))
+    if failed > 0: return 1
+    return 0
+
+// How long each test ran, kept in each cache's `test-times` with what it
+// held of tests not run now.
+private void save_times(^Suite s):
+    {string8: bool} done = {}
+    for pk in s.pkgs:
+        if pk.cache in done: continue
+        done[pk.cache] = true
+        string8 file = join2(pk.cache, "test-times")
+        {string8: bool} ran = {}
+        strings.Builder b = strings.builder(4096)
+        for r in s.runs:
+            if r.ms < 0 || s.pkgs[r.pkg].cache != pk.cache: continue
+            string8 key = time_key(s.pkgs[r.pkg].p.pkg_abs, r.name)
+            ran[key] = true
+            strings.append(&b, txt(#format(r.ms, "\t", key, "\n")))
+        for l in lines_of(read_or_empty(file)):
+            (string8 _, string8 key, bool tab) = strings.split_first(l, "\t")
+            if tab && !(key in ran):
+                strings.append(&b, l)
+                strings.append(&b, "\n")
+        replace_quietly(file, txt(strings.finish(&b)))
+
+// The longest a test of the package at `dir` ran last time, by its files.
+private i64 longest_known(^Suite s, string8 dir):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return 0
+    i64 longest = 0
+    for e in l.entries:
+        (i64 n, bool known) = s.times[time_key(dir, test_name(e.path))]
+        if known && n > longest: longest = n
+    return longest
+
+private bool listed_before(^Suite s, []i64 blong, i64 a, i64 b):
+    i64 ba = s.pkgs[a].batch
+    i64 bb = s.pkgs[b].batch
+    if blong[ba] != blong[bb]: return blong[ba] > blong[bb]
+    if ba != bb: return ba < bb
+    return a < b
+
+private string8 time_key(string8 pkg, string8 name):
+    return txt(#format(pkg, "\t", name))
+
+// Every result that can be said in order, said; a package's summary after
+// its last.
+private void show_ready(^Suite s, ^Options o, ^i64 sp, ^i64 sr, i64 shard_k, i64 shard_n, bool many):
+    for sp^ < i64(#len(s.pkgs)):
+        ^TestPackage pk = &s.pkgs[sp^]
+        if !pk.listed: return
+        for sr^ < pk.n:
+            ^TestRun r = &s.runs[pk.first + sr^]
+            if !r.done: return
+            say_result(r, &pk.passed, &pk.failed, s.cc, s.san_c[:], s.san_l[:], s.sanitized)
+            sr^ += 1
+        package_summary(s, o, pk, shard_k, shard_n, many)
+        sp^ += 1
+        sr^ = 0
+
+private void package_summary(^Suite s, ^Options o, ^TestPackage pk, i64 shard_k, i64 shard_n, bool many):
+    i64 total = i64(#len(pk.tests))
+    if pk.passed + pk.failed == 0:
+        if many: return
+        string8 matching = ""
+        if #len(g_filter) > 0: matching = txt(#format(" matching '", g_filter, "'"))
+        if shard_n > 0:
+            die(txt(#format("--shard ", shard_k, "/", shard_n, " of ", pk.named, " selects no test", matching, " (", total, " in the package)")))
+        // A filter that selects nothing tested nothing, and an exit of 0
+        // would pass a gate whose test was renamed. Only a run that asked
+        // for no selection may find no tests and succeed: a package with no
+        // `@test` file (`dado package` tests every library it releases).
+        if #len(pk.p.test_file) > 0:
+            die(txt(#format(pk.p.test_file, " is not an @test file of the package ", dir_of(pk.p.test_file), matching, " (", total, " tests in the package)")))
+        if #len(g_filter) > 0:
+            die(txt(#format("--filter '", g_filter, "' selects no test of ", pk.named, " (", total, " in the package)")))
+        note(txt(#format("no @test files in ", pk.named)))
+        return
+    // The web has UBSan alone: no AddressSanitizer runtime for wasm.
+    string8 marker = sanitizer_marker(pk.sanitized_runs, o.sanitize_kind, s.web || ubsan_only(s.cc))
+    string8 line = summary_line(pk.passed, pk.failed, pk.filtered, shard_k, shard_n, pk.other_slices, marker)
+    if many: line = txt(#format(pk.named, ": ", line))
+    fmt.println(line)
+
+// ── listing and transpiling ─────────────────────────────────────────────────
+
+// The tests and the groups they build in (`--emit=test-groups`); from a
+// `dadoc` that has no groups, the tests alone, each built by itself.
+private void list_ended(^Suite s, ^Options o, i64 pi, Ran ran, i64 shard_k, i64 shard_n):
+    ^TestPackage pk = &s.pkgs[pi]
+    string8 text = txt(ran.out)
+    if ran.status != 0:
+        Command tc = dadoc_command(&pk.p, o, true, false)
+        add(&tc, "--emit=tests")
+        add(&tc, pk.p.pkg_abs)
+        Captured c = capture(tc, false)
+        if !c.started || c.status != 0:
+            die(txt(#format("cannot read the tests of ", pk.p.pkg_abs)))
+        text = txt(c.out)
+    (ref []TestEntry tests, bool tok, string8 twhy) = parse_tests(text)
+    if !tok: die(twhy)
+    pk.tests = tests
+    pk.first = i64(#len(s.runs))
+    i64 index = 0 - 1
+    for t in tests:
+        string8 name = test_name(t.path)
+        index += 1
+        if !in_slice(index, shard_k, shard_n):
+            pk.other_slices += 1
+            continue
+        if #len(pk.p.test_file) > 0 && clean_path(t.path) != clean_path(pk.p.test_file):
+            pk.filtered += 1
+            continue
+        if #len(g_filter) > 0 && !strings.contains(name, g_filter):
+            pk.filtered += 1
+            continue
+        TestRun r
+        r.t = t
+        r.name = name
+        r.label = name
+        r.out = #make([]char8, 0)
+        r.err = #make([]char8, 0)
+        r.printed = ""
+        r.failed_cmd = ""
+        r.failure = NOT_FAILED
+        r.done = false
+        r.lead = 0 - 1
+        r.selector = ""
+        r.pkg = pi
+        r.first_task = 0
+        r.n_tasks = 0
+        r.pending = 0
+        r.k = new_link()
+        r.os = ""
+        r.lkey = ""
+        r.stage = 0
+        r.part = ""
+        r.entry = ""
+        r.at = 0
+        r.ms = 0 - 1
+        (i64 was, bool _) = s.times[time_key(pk.p.pkg_abs, name)]
+        r.was = was
+        s.runs = #append(s.runs, r)
+    pk.n = i64(#len(s.runs)) - pk.first
+
+    // **One program per group of test files** (`dadoc --emit=test-groups`):
+    // the package and every test file of a group checked, emitted and linked
+    // once, its C `main` running the test its argument names. Files whose
+    // package-level names meet are in different groups; the web builds one
+    // module per test.
+    if !s.web:
+        ref []TestEntry selected = #make([]TestEntry, 0)
+        for i in pk.first..<(pk.first + pk.n):
+            selected = #append(selected, s.runs[i].t)
+        (ref []i64 group, ref []i64 member) = program_groups(selected[:])
+        for k in 0..<#len(group):
+            i64 i = pk.first + i64(k)
+            if group[k] >= 0:
+                s.runs[i].lead = pk.first + group[k]
+                s.runs[i].selector = txt(#format(member[k]))
+        for i in pk.first..<(pk.first + pk.n):
+            if s.runs[i].lead != i: continue
+            ref []string8 paths = #make([]string8, 0)
+            for j in i..<(pk.first + pk.n):
+                if s.runs[j].lead == i: paths = #append(paths, s.runs[j].t.path)
+            s.runs[i].label = txt(#format(s.runs[i].name, "+", #len(paths) - 1))
+            string8 g_c = test_c_path(pk.p.build_dir, pk.p.stem, s.runs[i].label, s.cfg)
+            set_transpile(&s.runs[i], transpile_of(&pk.p, o, paths[:]), g_c, pk.caching, pk.cache, pk.dadoc_id, tests[:], paths[:])
+    try fs.make_dirs(dir_of(test_c_path(pk.p.build_dir, pk.p.stem, "x", s.cfg))) else: pass
+    for i in pk.first..<(pk.first + pk.n):
+        if s.runs[i].lead < 0: own_transpile(s, o, i)
+    pk.listed = true
+    ref []i64 progs = #make([]i64, 0)
+    for i in pk.first..<(pk.first + pk.n):
+        if !built_by_lead(&s.runs[i], i): progs = #append(progs, i)
+    i64 bi = pk.batch
+    for i in progs:
+        s.batches[bi].members = #append(s.batches[bi].members, i)
+    // One thread apiece for `dadoc` when transpiles share the cores; its own
+    // default when it runs alone. Never part of the slot or its key.
+    bool one_thread = s.jobs > 1 && (#len(s.pkgs) > 1 || #len(progs) > 1)
+    for i in progs:
+        start_transpile(s, o, i, one_thread)
+    s.batches[bi].unlisted -= 1
+    try_batch(s, o, bi)
+
+// **One transpile per program for every pass that asks the same question**
+// (`emit_slot`): test `i`'s, alone.
+private void own_transpile(^Suite s, ^Options o, i64 i):
+    ^TestPackage pk = &s.pkgs[s.runs[i].pkg]
+    ref []string8 one = #make([]string8, 0)
+    one = #append(one, s.runs[i].t.path)
+    string8 t_c = test_c_path(pk.p.build_dir, pk.p.stem, s.runs[i].name, s.cfg)
+    set_transpile(&s.runs[i], transpile_of(&pk.p, o, one[:]), t_c, pk.caching, pk.cache, pk.dadoc_id, pk.tests[:], one[:])
+
+private void start_transpile(^Suite s, ^Options o, i64 i, bool one_thread):
+    ^TestRun r = &s.runs[i]
+    if r.fresh:
+        lay_out(s, o, i)
+        return
+    try fs.make_dirs(r.slot) else: pass
+    // A mark taken before `dadoc` reads anything: a `.dado` file in the
+    // loaded set newer than it was edited *while* this run read it, so the C
+    // may be the old text's and must not be stored under the new text's key.
+    r.started = join2(r.slot, txt(#format("started.", s.pid)))
+    write_quietly(r.started, "")
+    (i64 mark, bool marked) = file_mtime(r.started)
+    r.mark = mark
+    r.marked = marked
+    Command x = r.x
+    add(&x, "-o")
+    add(&x, txt(#format(join2(r.slot, "prog.c"), ".", s.pid)))
+    add_log(&x, o)
+    add(&x, txt(#format("--build-manifest=", join2(r.slot, "build"), ".", s.pid)))
+    add(&x, txt(#format("--implementations=", join2(r.slot, "impl.c"), ".", s.pid)))
+    add(&x, txt(#format("--split-out=", join2(r.slot, "units"), ".", s.pid)))
+    if s.web: add(&x, txt(#format("--scripts-out=", join2(r.slot, "scripts"), ".", s.pid)))
+    if one_thread: add(&x, "--threads=1")
+    // Under `--log` one at a time, since each appends to the one file.
+    queue_job(s, x, J_TRANSPILE, i, true, #len(o.log) > 0, s.pkgs[r.pkg].longest)
+
+private void transpile_ended(^Suite s, ^Options o, i64 i, Ran ran):
+    ^TestRun r = &s.runs[i]
+    keep_said(r, ran)
+    ^TestPackage pk = &s.pkgs[r.pkg]
+    settle_slot(r, ran.status == 0, pk.caching, pk.dadoc_id, s.pid)
+    // **A group that did not compile is built a file at a time**, so each
+    // file's own diagnostics are said against it and the files that compile
+    // still run. What the group's transpile said is not shown: it is said
+    // again, by the file it is about.
+    if r.failure == DID_NOT_COMPILE && r.lead == i:
+        if verbose(): note("  a group of test files did not compile together: building them one at a time")
+        ref []i64 again = #make([]i64, 0)
+        for j in i..<(pk.first + pk.n):
+            if s.runs[j].lead != i: continue
+            build_alone(&s.runs[j])
+            again = #append(again, j)
+        for j in again:
+            if j != i: s.batches[pk.batch].members = #append(s.batches[pk.batch].members, j)
+        for j in again:
+            own_transpile(s, o, j)
+            start_transpile(s, o, j, s.jobs > 1)
+        return
+    if r.failure != NOT_FAILED:
+        program_failed(s, o, i)
+        return
+    lay_out(s, o, i)
+
+// Program `i`'s transpile run again: its slot's C was dropped and an object
+// it needs is gone, or --keep-c wants the C (P10j).
+private void again_transpile(^Suite s, ^Options o, i64 i):
+    s.runs[i].fresh = false
+    start_transpile(s, o, i, s.jobs > 1)
+
+// Program `i` cannot run: it and the tests it holds are said as it failed.
+private void program_failed(^Suite s, ^Options o, i64 i):
+    ^TestRun r = &s.runs[i]
+    r.done = true
+    r.stage = 2
+    ^TestPackage pk = &s.pkgs[r.pkg]
+    for j in (i + 1)..<(pk.first + pk.n):
+        if s.runs[j].lead != i: continue
+        s.runs[j].failure = r.failure
+        s.runs[j].done = true
+    try_batch(s, o, pk.batch)
+
+// ── each program's build, laid out ──────────────────────────────────────────
+
+private void lay_out(^Suite s, ^Options o, i64 i):
+    ^TestRun r = &s.runs[i]
+    ^TestPackage pk = &s.pkgs[r.pkg]
+    ^Plan p = &pk.p
+    string8 slot_c = join2(r.slot, "prog.c")
+    string8 slot_build = join2(r.slot, "build")
+    string8 slot_impl = join2(r.slot, "impl.c")
+    string8 slot_units = join2(r.slot, "units")
+    // Where a person looks for the C, with --keep-c; the build reads the
+    // slot. Without it the slot's C goes once cc has run (P10j).
+    if o.keep_c && !is_file(slot_c):
+        again_transpile(s, o, i)
+        return
+    if o.keep_c && (!r.fresh || !is_file(r.t_c)):
+        string8 t_c_tmp = txt(#format(r.t_c, ".", s.pid))
+        try fs.copy_file(slot_c, t_c_tmp) else code:
+            die(txt(#format("cannot copy ", slot_c, " to ", r.t_c, ": ", os.message(code))))
+            return
+        move_or_die(t_c_tmp, r.t_c)
+    try ref []char8 mtext = fs.read_file(slot_build) else code:
+        die(txt(#format("cannot read the build manifest ", slot_build, ": ", os.message(code))))
+        return
+    (Manifest m, bool mok, string8 mwhy) = parse_manifest(txt(mtext))
+    if !mok: die(mwhy)
+    r.os = m.os
+
+    if m.os == "#NONE":
+        string8 from = ""
+        (string8 dt, bool dset) = env("DADO_TARGET")
+        if dset:
+            from = txt(#format("DADO_TARGET=", dt))
+        else:
+            from = txt(#format("`", s.cc.name, " -dumpmachine`"))
+        die(txt(#format("`dado test` cannot run a freestanding build.\n\n  The resolved target's `#OS` is `#NONE`, which is the assertion that there\n  is no operating system and no libc here — so there is nothing on this\n  machine to start the test with, and a test's result *is* its exit status.\n  Linking it against this host's libc anyway would report a tick for a\n  hosted run.\n\n  The target came from ", from, ".\n  Run the tests for the machine you are on, and use `dado build` for the\n  freestanding one — it compiles and stops at the object file.")))
+    if #len(m.engine) > 0: engine_refusals(m.engine, m.os)
+
+    // The units, in link order, and the implementation unit after them.
+    ref []string8 units = #make([]string8, 0)
+    for uname in words_of(read_or_empty(join2(slot_units, "units"))):
+        units = #append(units, join2(slot_units, uname))
+    // A slot whose C was dropped (P10j) keeps the implementation unit in
+    // `owns` only: without it the link lacks the single-header library (P18).
+    if is_file(slot_impl): units = #append(units, slot_impl)
+    else:
+        (string8 ih, string8 _) = owned(read_or_empty(join2(slot_units, "owns")), slot_impl)
+        if #len(ih) > 0: units = #append(units, slot_impl)
+
+    ref []string8 includes = include_words(m.includes[:])
+    ref []string8 libs = #make([]string8, 0)
+    for l in o.libs:
+        libs = #append(libs, l)
+    for l in m.links:
+        libs = #append(libs, l)
+
+    // A web test: a module, run under node, under C's UBSan alone when
+    // sanitized (`web_compile_flags`). Its units go through `web_module`,
+    // one test at a time: a different compiler for a different target.
+    if m.os == "#WEB":
+        r.web = true
+        if #len(libs) > 0:
+            ref []char8 lj = strings.join(libs[:], " ")
+            die(txt(#format("a web build cannot link native libraries, and this test's build asks for: ", txt(lj))))
+        if #len(s.web_cc) == 0: s.web_cc = web_compiler(o.cc)
+        if #len(s.web_node) == 0: s.web_node = web_node_program(o.cmd)
+        string8 wasm = txt(#format(p.build_dir, "/", p.stem, ".", r.label, ".wasm"))
+        (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+        for w in words_of(user_cflags):
+            includes = #append(includes, w)
+        g_units = units
+        g_units_cache = pk.cache
+        bool wok = web_module(s.web_cc, o, r.t_c if o.keep_c else slot_c, m.sources[:], m.flags[:], includes[:], wasm)
+        g_units = #make([]string8, 0)
+        if !wok:
+            r.failure = WASM_DID_NOT_BUILD
+            program_failed(s, o, i)
+            return
+        if o.sanitize: pk.sanitized_runs += 1
+        string8 scripts_name = txt(#format(path.base(wasm[0..<#len(wasm) - 5]), ".scripts"))
+        try fs.write_file(txt(#format(wasm, ".build")), web_manifest(txt(mtext), scripts_name)) else code:
+            die(txt(#format("cannot write ", wasm, ".build: ", os.message(code))))
+            return
+        string8 beside = wasm[0..<#len(wasm) - 5]
+        string8 scripts_dir = txt(#format(beside, ".scripts"))
+        remove_tree_quietly(scripts_dir)
+        string8 t_scripts = join2(r.slot, "scripts")
+        if is_dir(t_scripts): copy_tree(t_scripts, scripts_dir)
+        Command nr = command(s.web_node)
+        add(&nr, join3(root(), "tools", join2("web", "load.mjs")))
+        add(&nr, wasm)
+        r.run = nr
+        r.bin = wasm
+        r.stage = 2
+        r.done = false
+        queue_job(s, nr, J_RUN, i, true, false, r.was)
+        try_batch(s, o, pk.batch)
+        return
+
+    if !s.san_ready:
+        (ref []string8 sc, ref []string8 sl, bool son) = configure_sanitizers(s.cc, o.sanitize, o.sanitize_kind)
+        s.san_c = sc
+        s.san_l = sl
+        s.sanitized = son
+        s.san_ready = true
+
+    if #len(m.engine) > 0:
+        if #len(s.engine_dir) == 0:
+            s.engine_dir = engine_archive(s.cc, p.target_flag, s.san_c[:])
+        if #len(s.engine_dir) == 0:
+            r.failure = ENGINE_DID_NOT_BUILD
+            program_failed(s, o, i)
+            return
+        includes = #append(includes, txt(#format("-I", s.engine_dir)))
+        libs = #append(libs, join2(s.engine_dir, "libquickjs.a"))
+        libs = #append(libs, "-lm")
+
+    string8 brew = brew_prefix()
+    if #len(brew) > 0 && is_dir(join2(brew, "include")):
+        includes = #append(includes, txt(#format("-I", join2(brew, "include"))))
+    (string8 user_cflags, bool _) = env("DADO_CFLAGS")
+    for w in words_of(user_cflags):
+        includes = #append(includes, w)
+    ref []string8 all_libs = #make([]string8, 0)
+    if #len(brew) > 0 && is_dir(join2(brew, "lib")):
+        all_libs = #append(all_libs, txt(#format("-L", join2(brew, "lib"))))
+    for l in libs:
+        all_libs = #append(all_libs, l)
+
+    r.bin = txt(#format(p.build_dir, "/", p.stem, ".", r.label, ".", s.cfg))
+    Link k = new_link()
+    k.cc = command_of(s.cc.words[:]).words
+    k.base = words_of(setting("CFLAGS_BASE"))
+    k.interop = words_of(setting("CFLAGS_INTEROP"))
+    if o.werror: k.werror = words_of(setting("CFLAGS_WERROR"))
+    k.opt = opt_words(o, s.cc.zig)
+    for w in lto_words(o, cc_family(s.cc), m.os):
+        k.opt = #append(k.opt, w)
+    k.extra = m.flags
+    k.san_c = s.san_c
+    k.includes = includes
+    k.c_file = slot_c
+    k.sources = m.sources
+    k.out = r.bin
+    k.libs = all_libs
+    k.exports = export_flags(m.os, m.exports[:], s.cc.zig)
+    k.san_l = s.san_l
+    (string8 user_ldflags, bool _) = env("DADO_LDFLAGS")
+    k.ldflags = words_of(user_ldflags)
+    r.k = k
+    if !batchable(s, i, &m): r.stage = 2
+
+    if #len(s.cc_id) == 0: s.cc_id = compiler_identity(s.cc)
+    UnitTask ut
+    ut.cc_id = s.cc_id
+    ut.includes = includes
+    ut.owner = i
+    // A release build's units keep their symbols to the program, as `dado
+    // build`'s do; the manifest's own C keeps its visibility.
+    ut.flags = compile_flags(&k)
+    if o.release && m.os != "#WINDOWS": add(&ut.flags, "-fvisibility=hidden")
+    ut.moved = true
+    // The slot's C dropped by an earlier run: each unit's object by what
+    // `owns` kept, or the transpile again when one is gone.
+    string8 owns_text = ""
+    if #len(units) > 0 && !is_file(units[0]):
+        owns_text = read_or_empty(join2(slot_units, "owns"))
+        string8 base = unit_base(ut.cc_id, ut.flags.words[:], ut.includes[:])
+        string8 udir = join2(pk.cache, "units")
+        bool all = #len(owns_text) > 0
+        for u in units:
+            if !all: break
+            (string8 h, string8 named) = owned(owns_text, u)
+            if #len(h) == 0:
+                all = false
+                break
+            UnitFound g = find_unit(udir, base, named, h, pk.mark)
+            if #len(g.object) == 0: all = false
+        if !all:
+            again_transpile(s, o, i)
+            return
+    if !o.keep_c: trash_slot(slot_c, units[:])
+    r.from_owns = #len(owns_text) > 0
+    i64 from = i64(#len(s.tasks))
+    for u in units:
+        ut.unit = u
+        ut.own_kept = ""
+        ut.named_kept = ""
+        if #len(owns_text) > 0:
+            (string8 h, string8 named) = owned(owns_text, u)
+            ut.own_kept = h
+            ut.named_kept = named
+        add_task(s, ut)
+    UnitTask st = ut
+    st.flags = compile_flags(&k)
+    st.moved = false
+    for src in m.sources:
+        st.unit = src
+        add_task(s, st)
+    i64 n = i64(#len(s.tasks)) - from
+    s.runs[i].first_task = from
+    s.runs[i].n_tasks = n
+    // One held until every task is asked, so a cache hit never ends it early.
+    s.runs[i].pending = n + 1
+    // Each large text read in an arena of its own, emptied after.
+    arena.Arena scratch = arena.over(libc.allocator())
+    string8 dir = join2(pk.cache, "units")
+    for t in from..<(from + n):
+        resolve_task(s, o, t, dir, pk.mark, &scratch)
+    arena.destroy(&scratch)
+    s.runs[i].pending -= 1
+    if s.runs[i].pending == 0: objects_ready(s, o, i)
+    if s.runs[i].stage == 2: try_batch(s, o, pk.batch)
+
+// Whether program `i` can share a binary (the header's list).
+private bool batchable(^Suite s, i64 i, ^Manifest m):
+    if #len(s.objcopy) == 0 || #len(m.exports) > 0 || #len(m.engine) > 0: return false
+    if m.os == "#WINDOWS" || m.os == "#DARWIN" || m.os == "#WEB" || m.os == "#NONE": return false
+    ^TestPackage pk = &s.pkgs[s.runs[i].pkg]
+    for j in i..<(pk.first + pk.n):
+        if (j == i || s.runs[j].lead == i) && s.runs[j].t.status != 0: return false
+    return true
+
+private void add_task(^Suite s, UnitTask t):
+    s.tasks = #append(s.tasks, t)
+    s.t_source = #append(s.t_source, t.unit)
+    s.t_own = #append(s.t_own, "")
+    s.t_book = #append(s.t_book, "")
+    s.t_object = #append(s.t_object, "")
+    s.t_tmp = #append(s.t_tmp, "")
+    s.t_ok = #append(s.t_ok, false)
+    s.t_done = #append(s.t_done, false)
+    Ran r
+    r.status = 0
+    r.out = #make([]char8, 0)
+    r.err = #make([]char8, 0)
+    r.ms = 0
+    s.t_said = #append(s.t_said, r)
+    s.t_next = #append(s.t_next, 0 - 1)
+
+// **A unit is compiled at most once for what it holds**, into the build's
+// shared object cache (`<build>/.dado-cache/units/<key>.o`, `dado build`'s
+// too), from a name made of what it holds (`content_name`), whichever test or
+// package asked first. The key is `dado build`'s (`find_unit`): the unit's
+// bytes, the compiler, every flag, the `-I` list and every header the compile
+// read. Task `t` answered from the cache, from a compile already asked, or by
+// a compile queued now.
+private void resolve_task(^Suite s, ^Options o, i64 t, string8 dir, i64 mark, ^arena.Arena scratch):
+    string8 named = s.tasks[t].unit
+    string8 own = ""
+    if #len(s.tasks[t].own_kept) > 0:
+        named = s.tasks[t].named_kept
+        own = s.tasks[t].own_kept
+    else if s.tasks[t].moved:
+        string8 hashed = ""
+        string8 held = ""
+        using arena.allocator(scratch):
+            (string8 nm, string8 h) = content_name(dir, s.tasks[t].unit, mark)
+            hashed = nm
+            held = h
+        named = txt(#format(hashed))
+        own = txt(#format(held))
+        arena.reset(scratch)
+        if !o.keep_c && named != s.tasks[t].unit: c_trash(named)
+    s.t_source[t] = named
+    s.t_own[t] = own
+    string8 base = unit_base(s.tasks[t].cc_id, s.tasks[t].flags.words[:], s.tasks[t].includes[:])
+    UnitFound g
+    using arena.allocator(scratch):
+        g = find_unit(dir, base, named, own, mark)
+    string8 book = txt(#format(g.book))
+    string8 object = txt(#format(g.object))
+    arena.reset(scratch)
+    s.t_book[t] = book
+    if #len(object) > 0:
+        mark_used(object, book)
+        task_ended(s, o, t, object, true)
+        return
+    if #len(book) > 0 && book in s.compiling:
+        (i64 h, bool _) = s.compiling[book]
+        if s.t_done[h]:
+            task_ended(s, o, t, s.t_object[h], s.t_ok[h])
+            return
+        s.t_next[t] = s.t_next[h]
+        s.t_next[h] = t
+        return
+    if #len(book) > 0: s.compiling[book] = t
+    string8 tmp = join2(dir, txt(#format("unit.", s.pid, ".", t, ".o.tmp")))
+    s.t_tmp[t] = tmp
+    Command c = command_of(s.tasks[t].flags.words[:])
+    add_all(&c, s.tasks[t].includes[:])
+    add(&c, "-c")
+    add(&c, named)
+    add(&c, "-o")
+    add(&c, tmp)
+    add_all(&c, depfile_words(tmp))
+    respond(&c, s.tasks[t].flags.args_from, txt(#format(tmp, ".args")))
+    queue_job(s, c, J_COMPILE, t, true, false, s.pkgs[s.runs[s.tasks[t].owner].pkg].longest)
+
+// Task `t` has its object, or will not: its program goes on after its last.
+private void task_ended(^Suite s, ^Options o, i64 t, string8 object, bool ok):
+    s.t_object[t] = object
+    s.t_ok[t] = ok && #len(object) > 0 && is_file(object)
+    s.t_done[t] = true
+    i64 owner = s.tasks[t].owner
+    s.runs[owner].pending -= 1
+    if s.runs[owner].pending == 0: objects_ready(s, o, owner)
+
+private void compile_ended(^Suite s, ^Options o, i64 t, Ran ran):
+    s.t_said[t] = ran
+    ^TestPackage pk = &s.pkgs[s.runs[s.tasks[t].owner].pkg]
+    string8 dir = join2(pk.cache, "units")
+    string8 tmp = s.t_tmp[t]
+    string8 depfile = txt(#format(tmp, ".d"))
+    // No key: compiled for this build alone, under its place in the list.
+    string8 obj = join2(dir, txt(#format("unkeyed.", s.pid, ".", t, ".o")))
+    bool built = ran.status == 0
+    string8 keyed = ""
+    if built:
+        arena.Arena scratch = arena.over(libc.allocator())
+        string8 k = ""
+        using arena.allocator(&scratch):
+            k = book_unit(s.t_book[t], depfile, s.t_source[t], #len(s.t_own[t]) > 0 && s.t_source[t] != s.tasks[t].unit, pk.mark)
+        keyed = txt(#format(k))
+        arena.destroy(&scratch)
+        if #len(keyed) > 0: obj = keyed
+        try fs.rename(tmp, obj) else:
+            built = false
+    remove_quietly(depfile)
+    if !built:
+        remove_quietly(tmp)
+        s.t_said[t].status = 1
+    else if #len(keyed) > 0:
+        mark_used(obj, s.t_book[t])
+    i64 w = t
+    for w >= 0:
+        i64 next = s.t_next[w]
+        task_ended(s, o, w, obj, built)
+        w = next
+
+// ── links ───────────────────────────────────────────────────────────────────
+
+// Every unit of program `i` has its object: a part for its batch, or its own
+// link.
+private void objects_ready(^Suite s, ^Options o, i64 i):
+    ^TestRun r = &s.runs[i]
+    i64 from = r.first_task
+    bool ok = r.n_tasks > 0
+    for t in from..<(from + r.n_tasks):
+        keep_said(r, s.t_said[t])
+        if !s.t_ok[t]: ok = false
+        if !s.t_ok[t] && #len(r.failed_cmd) == 0:
+            string8 fc = s.t_said[t].cmd
+            r.failed_cmd = fc
+    if !ok:
+        r.failure = C_DID_NOT_BUILD
+        program_failed(s, o, i)
+        return
+    // Each unit's digest and name kept, so its C can go (P10j).
+    if !o.keep_c && !r.from_owns && r.caching:
+        ref []string8 us = #make([]string8, 0)
+        ref []string8 hs = #make([]string8, 0)
+        ref []string8 ns = #make([]string8, 0)
+        for t in from..<(from + r.n_tasks):
+            if !s.tasks[t].moved: continue
+            us = #append(us, s.tasks[t].unit)
+            hs = #append(hs, s.t_own[t])
+            ns = #append(ns, s.t_source[t])
+        write_owns(join3(r.slot, "units", "owns"), us[:], hs[:], ns[:])
+    r.k.c_file = s.t_object[from]
+    ref []string8 rest = #make([]string8, 0)
+    for t in (from + 1)..<(from + r.n_tasks):
+        rest = #append(rest, s.t_object[t])
+    r.k.sources = rest
+    r.k.link_opt = link_opt_words(r.k.opt[:], s.cc.zig)
+    // The link compiles no C of its own, as `dado build`'s: a warning gcc's
+    // or clang's optimisation across files finds there is said, and the test
+    // is not refused for it.
+    r.k.werror = #make([]string8, 0)
+    if r.stage == 2:
+        link_alone(s, o, i)
+        return
+    // **The part**: the objects as one, `main` renamed for the runner and
+    // every other global made local, recorded as a link is.
+    r.part = txt(#format(r.bin, ".part.o"))
+    r.entry = txt(#format("dado_test_", hash.xxh64_text(0, r.bin)))
+    Command pc = command_of(s.cc.words[:])
+    add(&pc, "-r")
+    add(&pc, "-nostdlib")
+    add(&pc, r.k.c_file)
+    add_all(&pc, r.k.sources[:])
+    add(&pc, "-o")
+    add(&pc, r.part)
+    respond(&pc, i64(#len(s.cc.words)), txt(#format(r.part, ".args")))
+    string8 cache = s.pkgs[r.pkg].cache
+    r.lkey = link_key(pc, txt(#format(s.cc_id, " ", r.entry)))
+    if link_current(cache, r.part, r.lkey):
+        r.stage = 1
+        try_batch(s, o, s.pkgs[r.pkg].batch)
+        return
+    link_done(cache, r.part, "")
+    queue_job(s, pc, J_PART, i, true, false, s.pkgs[r.pkg].longest)
+
+private void part_ended(^Suite s, ^Options o, i64 i, Ran ran):
+    ^TestRun r = &s.runs[i]
+    if ran.status != 0:
+        r.stage = 2
+        link_alone(s, o, i)
+        try_batch(s, o, s.pkgs[r.pkg].batch)
+        return
+    Command c = command(s.objcopy)
+    add(&c, txt(#format("--redefine-sym=main=", r.entry)))
+    add(&c, txt(#format("--keep-global-symbol=", r.entry)))
+    add(&c, r.part)
+    queue_job(s, c, J_LOCAL, i, true, false, s.pkgs[r.pkg].longest)
+
+private void local_ended(^Suite s, ^Options o, i64 i, Ran ran):
+    ^TestRun r = &s.runs[i]
+    if ran.status != 0:
+        r.stage = 2
+        link_alone(s, o, i)
+    else:
+        link_done(s.pkgs[r.pkg].cache, r.part, r.lkey)
+        r.stage = 1
+    try_batch(s, o, s.pkgs[r.pkg].batch)
+
+// Program `i` linked by itself, unless no object moved since the last link
+// into its binary, which nothing has written since (`link_key`).
+private void link_alone(^Suite s, ^Options o, i64 i):
+    ^TestRun r = &s.runs[i]
+    r.stage = 2
+    Link k = r.k
+    if #len(k.freestanding) == 0:
+        string8 ub = join2(s.pkgs[r.pkg].cache, "unbuffered.c")
+        if read_or_empty(ub) != UNBUFFERED_C: replace_quietly(ub, UNBUFFERED_C)
+        if !o.keep_c: c_trash(ub)
+        ref []string8 srcs = #make([]string8, 0)
+        for x in r.k.sources:
+            srcs = #append(srcs, x)
+        srcs = #append(srcs, ub)
+        k.sources = srcs
+    Command lc = link_command(&k)
+    r.lkey = link_key(lc, s.cc_id)
+    string8 cache = s.pkgs[r.pkg].cache
+    if link_current(cache, r.bin, r.lkey):
+        program_ready(s, o, i)
+        return
+    link_done(cache, r.bin, "")
+    // A release link with link-time optimisation uses every core itself.
+    queue_job(s, lc, J_LINK, i, true, s.lto, s.pkgs[r.pkg].longest)
+
+private void link_ended(^Suite s, ^Options o, i64 i, Ran ran):
+    ^TestRun r = &s.runs[i]
+    keep_said(r, ran)
+    if ran.status != 0:
+        r.failed_cmd = ran.cmd
+        r.failure = C_DID_NOT_BUILD
+        program_failed(s, o, i)
+        return
+    link_done(s.pkgs[r.pkg].cache, r.bin, r.lkey)
+    program_ready(s, o, i)
+
+// Program `i`'s own binary is there: each of its tests queued, a process each.
+private void program_ready(^Suite s, ^Options o, i64 i):
+    ^TestPackage pk = &s.pkgs[s.runs[i].pkg]
+    (string8 runner, bool _) = env("DADO_RUNNER")
+    for j in i..<(pk.first + pk.n):
+        if j != i && s.runs[j].lead != i: continue
+        ^TestRun r = &s.runs[j]
+        if j != i:
+            r.bin = s.runs[i].bin
+            r.os = s.runs[i].os
+        if s.sanitized: pk.sanitized_runs += 1
+        ref []string8 rw = words_of(runner)
+        Command rc = command_of(rw[:])
+        add(&rc, r.bin)
+        if #len(r.selector) > 0: add(&rc, r.selector)
+        r.run = rc
+        queue_job(s, rc, J_RUN, j, true, false, r.was)
+
+// ── batches ─────────────────────────────────────────────────────────────────
+
+// Batch `b` linked once every package of it is listed and every program of
+// it has its part or has left.
+private void try_batch(^Suite s, ^Options o, i64 b):
+    ^TestBatch bt = &s.batches[b]
+    if bt.linked || bt.unlisted > 0: return
+    for m in bt.members:
+        if s.runs[m].stage == 0: return
+    bt.linked = true
+    // In package order, then the package's own, whatever ended first.
+    ref []i64 order = #make([]i64, 0)
+    for m in bt.members:
+        if s.runs[m].stage != 1: continue
+        i64 at = i64(#len(order))
+        order = #append(order, m)
+        for at > 0 && entry_before(s, order[at], order[at - 1]):
+            i64 x = order[at - 1]
+            order[at - 1] = order[at]
+            order[at] = x
+            at -= 1
+    bt.entries = order
+    if #len(order) == 0: return
+    if #len(order) == 1:
+        link_alone(s, o, order[0])
+        return
+    ref []string8 names = #make([]string8, 0)
+    for k in 0..<#len(order):
+        s.runs[order[k]].at = i64(k)
+        names = #append(names, s.runs[order[k]].entry)
+    string8 c_file = txt(#format(bt.bin, ".c"))
+    string8 text = runner_c(names[:])
+    if read_or_empty(c_file) != text: replace_quietly(c_file, text)
+    if !o.keep_c: c_trash(c_file)
+    Link k = s.runs[order[0]].k
+    k.c_file = c_file
+    k.out = bt.bin
+    k.includes = #make([]string8, 0)
+    k.exports = #make([]string8, 0)
+    ref []string8 parts = #make([]string8, 0)
+    ref []string8 libs = #make([]string8, 0)
+    ref []string8 extra = #make([]string8, 0)
+    for m in order:
+        parts = #append(parts, s.runs[m].part)
+        for l in s.runs[m].k.libs:
+            if !word_in(libs[:], l): libs = #append(libs, l)
+        for f in s.runs[m].k.extra:
+            if !word_in(extra[:], f): extra = #append(extra, f)
+    k.sources = parts
+    k.libs = libs
+    k.extra = extra
+    Command lc = link_command(&k)
+    bt.lkey = link_key(lc, s.cc_id)
+    if link_current(bt.cache, bt.bin, bt.lkey):
+        batch_ready(s, o, b)
+        return
+    link_done(bt.cache, bt.bin, "")
+    queue_job(s, lc, J_BATCH, b, true, false)
+
+private bool word_in([]string8 xs, string8 x):
+    for y in xs:
+        if y == x: return true
+    return false
+
+private bool entry_before(^Suite s, i64 a, i64 b):
+    i64 pa = s.runs[a].pkg
+    i64 pb = s.runs[b].pkg
+    if pa != pb: return pa < pb
+    return a < b
+
+// A batch that does not link has each program linked by itself.
+private void batch_ended(^Suite s, ^Options o, i64 b, Ran ran):
+    ^TestBatch bt = &s.batches[b]
+    if ran.status != 0:
+        if verbose(): note("  a batch of test programs did not link together: linking them one at a time")
+        for m in bt.entries:
+            link_alone(s, o, m)
+        return
+    link_done(bt.cache, bt.bin, bt.lkey)
+    batch_ready(s, o, b)
+
+// The batch's tests, in order, queued in at most `jobs` runners.
+private void batch_ready(^Suite s, ^Options o, i64 b):
+    ref []i64 tests = #make([]i64, 0)
+    string8 bin = s.batches[b].bin
+    for m in s.batches[b].entries:
+        ^TestPackage pk = &s.pkgs[s.runs[m].pkg]
+        for j in m..<(pk.first + pk.n):
+            if j != m && s.runs[j].lead != m: continue
+            s.runs[j].bin = bin
+            s.runs[j].os = s.runs[m].os
+            s.runs[j].at = s.runs[m].at
+            if s.sanitized: pk.sanitized_runs += 1
+            tests = #append(tests, j)
+    // Longest first (`test-times`), each to the runner with least to do.
+    for x in 1..<#len(tests):
+        i64 at = i64(x)
+        for at > 0 && s.runs[tests[at]].was > s.runs[tests[at - 1]].was:
+            i64 y = tests[at - 1]
+            tests[at - 1] = tests[at]
+            tests[at] = y
+            at -= 1
+    i64 n = i64(#len(tests)) if i64(#len(tests)) < i64(s.jobs) else i64(s.jobs)
+    ref []i64 load = #make([]i64, 0)
+    i64 first = i64(#len(s.chunks))
+    (string8 runner, bool _) = env("DADO_RUNNER")
+    for k in 0..<n:
+        TestChunk c
+        c.batch = b
+        c.dir = txt(#format(bin, ".run.", s.pid, ".", #len(s.chunks)))
+        c.tests = #make([]i64, 0)
+        s.chunks = #append(s.chunks, c)
+        load = #append(load, i64(0))
+    for t in tests:
+        i64 least = 0
+        for k in 1..<n:
+            if load[k] < load[least]: least = k
+        load[least] += s.runs[t].was + 1
+        s.chunks[first + least].tests = #append(s.chunks[first + least].tests, t)
+    for k in 0..<n:
+        ^TestChunk c = &s.chunks[first + k]
+        remove_tree_quietly(c.dir)
+        try fs.make_dirs(c.dir) else: pass
+        ref []string8 rw = words_of(runner)
+        Command rc = command_of(rw[:])
+        add(&rc, bin)
+        add(&rc, c.dir)
+        for t in c.tests:
+            add(&rc, txt(#format(s.runs[t].at)))
+            add(&rc, s.runs[t].selector if #len(s.runs[t].selector) > 0 else "-")
+        queue_job(s, rc, J_CHUNK, first + k, true, false, s.runs[c.tests[0]].was)
+
+// ── runs ────────────────────────────────────────────────────────────────────
+
+private void run_ended(^Suite s, i64 i, Ran ran):
+    ^TestRun r = &s.runs[i]
+    r.status = ran.status
+    r.ms = ran.ms
+    r.said = txt(ran.err)
+    r.printed = txt(ran.out)
+    (string8 runner, bool _) = env("DADO_RUNNER")
+    if !r.web:
+        ref []string8 rw = words_of(runner)
+        r.unstarted = exec_failure(r.bin) if r.status == 127 && #len(rw) == 0 else ""
+        if #len(r.unstarted) > 0: r.failure = DID_NOT_START
+        r.status = as_posix_status(r.status, r.os)
+    r.done = true
+
+// A runner's `<k> <status>` lines read; a test it did not report (it died)
+// run again by itself, `<bin> - <entry> <selector>`.
+private void chunk_ended(^Suite s, ^Options o, i64 c, Ran ran):
+    ref []bool got = #make([]bool, 0)
+    for _ in s.chunks[c].tests:
+        got = #append(got, false)
+    for l in lines_of(txt(ran.out)):
+        ref []string8 w = words_of(l)
+        if #len(w) != 3: continue
+        (i64 k, bool kok) = decimal(w[0])
+        (i64 st, bool sok) = decimal(w[1])
+        (i64 ms, bool mok) = decimal(w[2])
+        if !kok || !sok || !mok || k >= i64(#len(got)): continue
+        got[k] = true
+        ^TestRun r = &s.runs[s.chunks[c].tests[k]]
+        r.status = i32(st)
+        r.ms = ms
+        r.said = read_or_empty(join2(s.chunks[c].dir, txt(#format(k, ".err"))))
+        r.printed = read_or_empty(join2(s.chunks[c].dir, txt(#format(k, ".out"))))
+        r.done = true
+    (string8 runner, bool _) = env("DADO_RUNNER")
+    for k in 0..<#len(got):
+        if got[k]: continue
+        i64 j = s.chunks[c].tests[k]
+        ^TestRun r = &s.runs[j]
+        ref []string8 rw = words_of(runner)
+        Command rc = command_of(rw[:])
+        add(&rc, r.bin)
+        add(&rc, "-")
+        add(&rc, txt(#format(r.at)))
+        add(&rc, r.selector if #len(r.selector) > 0 else "-")
+        r.run = rc
+        queue_job(s, rc, J_RUN, j, true, false, r.was)
+    remove_tree_quietly(s.chunks[c].dir)
+
+// Linked into a test's own program: its standard output unbuffered, so a
+// crash loses none of what it printed.
+private const string8 UNBUFFERED_C = "// dado test: unbuffered standard output (suite.dado).\n#include <stdio.h>\n#if defined(__GNUC__) || defined(__clang__) || defined(__TINYC__)\n__attribute__((constructor)) static void dado_unbuffered(void) { setvbuf(stdout, 0, _IONBF, 0); }\n#endif\n"
+
+// The C of a batch's runner, calling `entries` by their place.
+string8 runner_c([]string8 entries):
+    strings.Builder b = strings.builder(2048)
+    strings.append(&b, "// dado test: a batch's runner (suite.dado).\n#define _GNU_SOURCE\n#include <fcntl.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>\n\n")
+    for e in entries:
+        strings.append(&b, txt(#format("int ", e, "(int, char **);\n")))
+    strings.append(&b, "\nstatic int dado_call(char *self, const char *e, char *sel) {\n\tchar *v[3] = { self, sel, 0 };\n\tint n = 2;\n\tif (strcmp(sel, \"-\") == 0) { v[1] = 0; n = 1; }\n\tswitch (atoi(e)) {\n")
+    for k in 0..<#len(entries):
+        strings.append(&b, txt(#format("\tcase ", k, ": return ", entries[k], "(n, v);\n")))
+    strings.append(&b, "\t}\n\treturn 2;\n}\n\n")
+    strings.append(&b, "int main(int argc, char **argv) {\n\tif (argc == 4 && strcmp(argv[1], \"-\") == 0) {\n\t\tsetvbuf(stdout, 0, _IONBF, 0);\n\t\treturn dado_call(argv[0], argv[2], argv[3]);\n\t}\n\tfor (int i = 2; i + 1 < argc; i += 2) {\n\t\tint k = (i - 2) / 2, st = 0;\n\t\tchar err[4096], out[4096];\n\t\tsnprintf(err, sizeof err, \"%s/%d.err\", argv[1], k);\n\t\tsnprintf(out, sizeof out, \"%s/%d.out\", argv[1], k);\n\t\tstruct timespec t0, t1;\n\t\tclock_gettime(CLOCK_MONOTONIC, &t0);\n\t\tfflush(stdout);\n\t\tpid_t pid = fork();\n\t\tif (pid == 0) {\n\t\t\tint fe = open(err, O_WRONLY | O_CREAT | O_TRUNC, 0644), fo = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);\n\t\t\tif (fe < 0 || fo < 0) _exit(127);\n\t\t\tdup2(fo, 1);\n\t\t\tdup2(fe, 2);\n\t\t\tclose(fe);\n\t\t\tclose(fo);\n\t\t\tsetvbuf(stdout, 0, _IONBF, 0);\n\t\t\texit(dado_call(argv[0], argv[i], argv[i + 1]));\n\t\t}\n\t\tif (pid < 0 || waitpid(pid, &st, 0) < 0) return 3;\n\t\tclock_gettime(CLOCK_MONOTONIC, &t1);\n\t\tprintf(\"%d %d %ld\\n\", k, WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st), (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));\n\t}\n\treturn 0;\n}\n")
+    return txt(strings.finish(&b))

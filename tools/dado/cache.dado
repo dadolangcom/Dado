@@ -13,10 +13,8 @@
 //     the build manifest (`build`), the units (`units/`, `--split-out`) and
 //     the implementation unit (`impl.c`, when `dadoc` split one out), reused
 //     while `key` matches. See `emit_key`.
-//   * `transpile/` — `dadoc`'s own (`--transpile-cache`), by its command line
-//     and the bytes of what it read: `dado build`'s and `dadoc launch`'s.
-//     A test's is its `emit/` slot alone, which answers the same question
-//     without starting `dadoc`, so its C is kept once.
+//   * `emit/` serves `dado build` too (`front_end`, engine.dado), and
+//     `digests` keeps each source's stat and hash between runs.
 //   * `units/` — one object per C file per compiler per flag set per set of
 //     headers it read, shared by `dado build` and every test
 //     (`unit_objects`, `task_objects`). The run happens every time: a test's
@@ -30,6 +28,7 @@ package driver
 
 import "core:hash"
 import "core:io"
+import "core:mem/libc"
 import "core:os"
 import "core:os/fs"
 import "core:os/proc"
@@ -100,8 +99,34 @@ string8 file_digest(string8 p):
     string8 h = content_digest(p)
     if #len(h) == 0: return ""
     ref []char8 own_p = #format(p)
+    if !(p in g_digests): g_digest_paths = #append(g_digest_paths, txt(own_p))
     g_digests[txt(own_p)] = txt(#format(trusted_stat(p, time.unix_nanos()), " ", h))
+    g_digests_moved = true
     return h
+
+private bool g_digests_moved
+private ref []string8 g_digest_paths
+
+// `file_digest`'s answers kept between runs in the file at `p`, one
+// `<path>\t<trusted stat> <digest>` line each: a build whose sources did not
+// move reads their stats, not their bytes.
+void load_digests(string8 p):
+    for l in lines_of(read_or_empty(p)):
+        (string8 path, string8 kept, bool ok) = strings.split_first(l, "\t")
+        if !ok || path in g_digests: continue
+        ref []char8 own_p = #format(path)
+        ref []char8 own_k = #format(kept)
+        g_digests[txt(own_p)] = txt(own_k)
+        g_digest_paths = #append(g_digest_paths, txt(own_p))
+
+void save_digests(string8 p):
+    if !g_digests_moved: return
+    strings.Builder b = strings.builder(16384)
+    for path in g_digest_paths:
+        (string8 kept, bool _) = g_digests[path]
+        strings.append(&b, txt(#format(path, "\t", kept, "\n")))
+    replace_quietly(p, strings.text(b))
+    g_digests_moved = false
 
 // An item that is large, by its length and its xxHash64: one SHA-256 over a
 // megabyte took a third of a second in the driver as `dadoc launch` builds
@@ -137,7 +162,7 @@ void put_unsaid(^Digest d, string8 text, string8 unsaid):
 // `put_large`, since a test's packages are megabytes of source and its emit
 // key is taken on every run (a
 // `.dados` script is a source of the package like any `.dado`) and each
-// `*.c` file's name — `dadoc` reads those names and never those bodies.
+// `*.c` and `*.dadogl` file's name — `dadoc` reads those names and never those bodies.
 //
 // `skip` names files, by path, the compilation is known not to read: a
 // package's `@test` files other than the ones it holds, as `dadoc
@@ -157,7 +182,7 @@ void put_dir(^Digest d, string8 dir, []string8 skip = nil):
     for e in l.entries:
         string8 n = e.path
         if #len(unread) > 0 && is_source(n) && in_names(n, unread[:]): continue
-        if is_source(n) || strings.ends_with(n, ".c"):
+        if is_source(n) || strings.ends_with(n, ".c") || strings.ends_with(n, ".dadogl"):
             ref []char8 own = #format(n)
             names = #append(names, txt(own))
     l.destroy()
@@ -223,12 +248,19 @@ string8 slot_name([]string8 args):
 // The `include` directories of a build manifest, in order: each line's text
 // after `include `, exactly as written.
 ref []string8 included_dirs(string8 manifest):
+    return manifest_lines(manifest, "include ")
+
+// `input` lines: other files the front end read (the new one's `runtime.js`).
+ref []string8 input_files(string8 manifest):
+    return manifest_lines(manifest, "input ")
+
+private ref []string8 manifest_lines(string8 manifest, string8 kind):
     ref []string8 out = #make([]string8, 0)
     string8 rest = manifest
     for #len(rest) > 0:
         (string8 l, string8 tail, bool more) = strings.line(rest)
-        if strings.starts_with(l, "include ") && #len(l) > 8:
-            out = #append(out, l[8..<#len(l)])
+        if strings.starts_with(l, kind) && #len(l) > #len(kind):
+            out = #append(out, l[#len(kind)..<#len(l)])
         if !more: break
         rest = tail
     return out
@@ -261,14 +293,17 @@ string8 emit_key(string8 dadoc_id, []string8 args, string8 manifest, []string8 s
         if set: put_text(&d, txt(#format(name, "=", v)))
     for dir in included_dirs(manifest):
         put_dir(&d, dir, skip)
+    for f in input_files(manifest):
+        put_text(&d, txt(#format("<", f)))
+        put_file_large(&d, f)
     return finish_digest(&d)
 
 // Whether `slot` already holds this argument list's answer for the sources
-// as they are now.
+// as they are now. Its C may be dropped (P10j): callers ask for it or `owns`.
 bool emit_fresh(string8 slot, string8 dadoc_id, []string8 args, []string8 skip = nil):
     if #len(dadoc_id) == 0: return false
     string8 key_file = join2(slot, "key")
-    if !is_file(key_file) || !is_file(join2(slot, "prog.c")) || !is_file(join2(slot, "build")):
+    if !is_file(key_file) || !is_file(join2(slot, "build")):
         return false
     try ref []char8 manifest = fs.read_file(join2(slot, "build")) else:
         return false
@@ -280,6 +315,10 @@ bool emit_fresh(string8 slot, string8 dadoc_id, []string8 args, []string8 skip =
 // changed after `mark` (nanoseconds), or cannot be asked: then the C may be
 // the old text's, and must not be stored under the new text's key.
 bool sources_moved(string8 manifest, i64 mark):
+    for f in input_files(manifest):
+        try i64 t = fs.mtime(f) else:
+            return true
+        if t > mark: return true
     for dir in included_dirs(manifest):
         if !is_dir(dir): continue
         try fs.Listing l = fs.read_dir(dir) else:
@@ -412,6 +451,28 @@ private string8 abs_path(string8 p):
     if path.is_abs(p): return p
     return join2(here(), p)
 
+// `content_digest` of a header, once a run for its path and stat: the units
+// of one build read the same few dozen. Kept on the C heap, past any scratch
+// arena a caller resets.
+private {string8: string8} g_heads
+private bool g_heads_made
+
+string8 header_digest(string8 p):
+    string8 now = stat_of(p)
+    if #len(now) == 0: return ""
+    using libc.allocator():
+        if !g_heads_made:
+            g_heads = {}
+            g_heads_made = true
+        string8 key = txt(#format(p, " ", now))
+        if key in g_heads:
+            (string8 kept, bool _) = g_heads[key]
+            return kept
+        string8 h = content_digest(p)
+        if #len(h) > 0: g_heads[key] = h
+        return h
+    return ""
+
 // A file's length and xxHash64, as `put_large` frames them; "" when it
 // cannot be read.
 string8 content_digest(string8 p):
@@ -421,7 +482,7 @@ string8 content_digest(string8 p):
 
 // A file's length and last write, the two things a change of its bytes
 // moves; "" when it cannot be asked.
-private string8 stat_of(string8 p):
+string8 stat_of(string8 p):
     try fs.FileInfo i = fs.info(p) else:
         return ""
     return txt(#format(i.size, ":", i.mtime))
@@ -432,7 +493,7 @@ private string8 stat_of(string8 p):
 // newer one is hashed: a file system that keeps whole seconds, or a write in
 // the same tick, could change it again with the same length and time. `-`
 // when it is not trusted.
-private string8 trusted_stat(string8 p, i64 mark):
+string8 trusted_stat(string8 p, i64 mark):
     try fs.FileInfo i = fs.info(p) else:
         return "-"
     i64 settled = i64(2) * 1000000000
@@ -534,7 +595,7 @@ string8 booked_object(string8 book, i64 mark):
         if #len(now) == 0: return ""
         string8 sig_now = sig
         if sig == "-" || sig != now:
-            if content_digest(p) != was: return ""
+            if header_digest(p) != was: return ""
             sig_now = trusted_stat(p, mark)
             if sig_now != sig: moved = true
         put_text(&k, p)
@@ -576,7 +637,7 @@ string8 book_unit(string8 book, string8 depfile, string8 unit, bool named, i64 m
         try fs.FileInfo i = fs.info(p) else:
             return ""
         if i.mtime >= mark: return ""
-        string8 h = content_digest(p)
+        string8 h = header_digest(p)
         if #len(h) == 0: return ""
         put_text(&k, p)
         put_text(&k, h)
@@ -634,6 +695,7 @@ ref []i32 run_all([]Command commands, i32 jobs):
     ref []proc.Child running = #make([]proc.Child, 0)
     ref []i64 slot = #make([]i64, 0)
     i64 waited = 0
+    ref []string8 written = #make([]string8, 0)
     for i in 0..<#len(commands):
         status = #append(status, 127)
         if i64(#len(running)) - waited >= i64(jobs):
@@ -643,12 +705,20 @@ ref []i32 run_all([]Command commands, i32 jobs):
         if verbose(): note(txt(#format("  $ ", shown(c))))
         _ = io.flush(io.stdout())
         _ = io.flush(io.stderr())
-        try proc.Child child = proc.spawn(c.words[:]) else:
+        (Command f, string8 why) = fitted(c)
+        if #len(why) == 0 && #len(f.words) > proc.ARG_CAP: why = too_long(f)
+        if #len(why) > 0:
+            warn(why)
+            continue
+        if long_command(c): written = #append(written, c.args_file)
+        try proc.Child child = proc.spawn(f.words[:]) else:
             continue
         running = #append(running, child)
         slot = #append(slot, i64(i))
     for k in waited..<i64(#len(running)):
         status[slot[k]] = wait_status(running[k])
+    for w in written:
+        remove_quietly(w)
     return status
 
 private i32 wait_status(proc.Child c):
@@ -692,6 +762,7 @@ void mark_used(string8 object, string8 book):
         add(&c, "-o")
         add(&c, tmp)
         add_all(&c, depfile_words(tmp))
+        respond(&c, j.flags.args_from, txt(#format(tmp, ".args")))
         compiles = #append(compiles, c)
         compiled = #append(compiled, i64(i))
         tmps = #append(tmps, tmp)
@@ -813,3 +884,49 @@ void sweep_units(string8 cache, []string8 used):
             remove_quietly(p)
             remove_quietly(stamp)
     l.destroy()
+
+// ── a slot's C dropped (P10j) ───────────────────────────────────────────────
+
+// After a slot's units compiled: each unit's digest and the path its object
+// is keyed by (`find_unit`), a line `<digest>\t<unit>\t<key path>` per unit
+// into `owns`, so the slot's C can go and its objects still be found.
+void write_owns(string8 owns, []string8 units, []string8 digests, []string8 keys):
+    strings.Builder b = strings.builder(128 * #len(units) + 1)
+    for i in 0..<#len(units):
+        if #len(digests[i]) == 0 || #len(keys[i]) == 0: return
+        strings.append(&b, txt(#format(digests[i], "\t", units[i], "\t", keys[i], "\n")))
+    replace_quietly(owns, strings.text(b))
+
+// `dado build`'s: a unit is keyed by its own path and `own_digest`.
+void record_owns(string8 cache, []string8 units, string8 owns):
+    string8 dir = join2(cache, "units")
+    i64 mark = fs_now(dir)
+    ref []string8 ds = #make([]string8, 0)
+    for u in units:
+        ds = #append(ds, own_digest(dir, u, mark))
+    write_owns(owns, units, ds[:], units)
+
+// What `owns` says of `unit`: its digest and key path; "" when it is not listed.
+(string8 digest, string8 key) owned(string8 owns_text, string8 unit):
+    for l in strings.split(owns_text, "\n"):
+        (string8 h, string8 rest, bool f1) = strings.split_first(l, "\t")
+        (string8 u, string8 k, bool f2) = strings.split_first(rest, "\t")
+        if f1 && f2 && u == unit: return (h, k)
+    return ("", "")
+
+// A dropped slot's objects for `units`, by `owns`, under build-wide `base`
+// (`unit_base`): every one found, or false and the front end runs again.
+(ref []string8 objects, bool ok) owned_objects(string8 cache, string8 base, []string8 units, string8 owns):
+    ref []string8 objects = #make([]string8, 0)
+    string8 dir = join2(cache, "units")
+    i64 mark = fs_now(dir)
+    string8 text = read_or_empty(owns)
+    if #len(text) == 0: return (objects, false)
+    for u in units:
+        (string8 h, string8 k) = owned(text, u)
+        if #len(h) == 0: return (objects, false)
+        UnitFound f = find_unit(dir, base, k, h, mark)
+        if #len(f.object) == 0: return (objects, false)
+        mark_used(f.object, f.book)
+        objects = #append(objects, f.object)
+    return (objects, true)

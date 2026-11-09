@@ -1,0 +1,197 @@
+// `dado bootstrap`: the pinned C compilers, into this toolchain. zig from
+// `ZIG_PIN` (downloaded, its size and SHA-256 held to the pin, unpacked), tcc
+// from the fork in `tools/tcc` (built with a C compiler here, no download).
+// They go in `toolchain_dir()`: `zig/<version>`, `tcc/<key>`.
+package driver
+
+import "core:fmt"
+import "core:hash"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "core:strings/parse"
+
+i32 bootstrap_command(string8 which):
+    if which == "" || which == "zig": ensure_zig()
+    if which == "" || which == "tcc": ensure_tcc()
+    return 0
+
+private void said(string8 line):
+    fmt.eprintln("bootstrap: ", line)
+
+// Where the pinned zig is installed.
+string8 zig_home(string8 version):
+    return join3(toolchain_dir(), "zig", version)
+
+private string8 toolchain_cache():
+    return join2(toolchain_dir(), "cache")
+
+// The pin's archive for this host: its file name, SHA-256 and size.
+(string8 file, string8 sha, i64 size) zig_archive(string8 pin, string8 host):
+    for l in lines_of(pin):
+        ref []string8 w = words_of(l)
+        if #len(w) == 5 && w[0] == "zig" && w[1] == host:
+            try i64 n = parse.to_i64(w[4]) else:
+                return ("", "", 0)
+            return (w[2], txt(strings.to_lower(w[3])), n)
+    return ("", "", 0)
+
+// This host as `ZIG_PIN` names hosts: `aarch64-linux`, `x86_64-macos`, ….
+string8 zig_host():
+    string8 os_name = "linux"
+    if this_os() == "#DARWIN": os_name = "macos"
+    if this_os() == "#WINDOWS": os_name = "windows"
+    return txt(#format(this_arch(), "-", os_name))
+
+// The pinned zig, for `dado install`: in place already, linked from PATH, or
+// downloaded.
+void ensure_pinned_zig():
+    ensure_zig()
+
+private void ensure_zig():
+    string8 pin = read_or_empty(join2(root(), "ZIG_PIN"))
+    string8 version = pinned_zig(pin)
+    string8 home = zig_home(version)
+    string8 zig = join2(home, exe_name("zig"))
+    if zig_says(zig, version):
+        said(txt(#format("zig ", version, ": ", zig)))
+        return
+    // An install takes a zig on PATH that is exactly the pinned one, linked
+    // (not on Windows): its folder, as `zig env` names where it really is.
+    if g_layout.kind == "install" && this_os() != "#WINDOWS":
+        string8 found = pinned_zig_dir(version)
+        if #len(found) > 0:
+            try fs.make_dirs(dir_of(home)) else: pass
+            remove_quietly(home)
+            try fs.make_symlink(found, home) else: pass
+            if zig_says(zig, version):
+                said(txt(#format("zig ", version, ": the one on PATH (", found, ")")))
+                return
+    string8 host = zig_host()
+    (string8 file, string8 sha, i64 size) = zig_archive(pin, host)
+    if #len(file) == 0: die(txt(#format("zig ", version, " has no archive pinned for this host (", host, ")")))
+    (string8 base, bool set) = env("DADO_ZIG_BASE")
+    if !set || #len(base) == 0: base = setting("ZIG_DOWNLOAD_BASE")
+    string8 url = txt(#format(strings.trim_suffix(base, "/"), "/", version, "/", file))
+    string8 cache = toolchain_cache()
+    try fs.make_dirs(cache) else: pass
+    string8 download = join2(cache, file)
+    if file_sha256(download) != sha:
+        said(txt(#format("downloading zig ", version, " for ", host, " (", size / 1000000, " MB)")))
+        Command c = command("curl")
+        add_all(&c, words_of("-fL --retry 2 --silent --show-error -o"))
+        add(&c, download)
+        add(&c, url)
+        if run(c) != 0: die(txt(#format("the zig download failed: ", url)))
+    string8 got = file_sha256(download)
+    i64 has = 0
+    try fs.FileInfo i = fs.info(download) else:
+        die(txt(#format("cannot read ", download)))
+        return
+    has = i.size
+    if got != sha || has != size:
+        remove_quietly(download)
+        die(txt(#format("the zig archive from ", url, " is not the pinned one, and was deleted:\n  SHA-256 ", got, " (", has, " bytes)\n  wanted  ", sha, " (", size, " bytes)")))
+    string8 staging = txt(#format(home, ".unpack-", os.pid()))
+    try fs.make_dirs(staging) else: pass
+    Command x = command("tar")
+    add(&x, "-xf")
+    add(&x, download)
+    add(&x, "-C")
+    add(&x, staging)
+    if run(x) != 0: die(txt(#format("`tar` could not unpack ", download)))
+    try fs.Listing l = fs.read_dir(staging) else:
+        die("the zig archive was empty")
+        return
+    if #len(l.entries) == 0: die("the zig archive was empty")
+    string8 top = join2(staging, l.entries[0].path)
+    remove_tree_quietly(home)
+    move_or_die(top, home)
+    remove_tree_quietly(staging)
+    if !zig_says(zig, version): die(txt(#format(zig, " does not say it is zig ", version)))
+    said(txt(#format("zig ", version, ": ", zig)))
+
+// The folder of the zig on PATH, when it is `version`: where `zig env`'s
+// `zig_exe` says it is, links followed; "" otherwise.
+private string8 pinned_zig_dir(string8 version):
+    string8 z = on_path(exe_name("zig"))
+    if #len(z) == 0 || !zig_says(z, version): return ""
+    Command e = command(z)
+    add(&e, "env")
+    Captured r = capture(e, true)
+    if !r.started: return ""
+    string8 out = txt(r.out)
+    i64 at = strings.find(out, "zig_exe")
+    if at < 0: return ""
+    string8 rest = out[at..<#len(out)]
+    i64 q = strings.index_of(rest, '"')
+    if q < 0: return ""
+    string8 tail = rest[q + 1..<#len(rest)]
+    i64 end = strings.index_of(tail, '"')
+    if end <= 0: return ""
+    return dir_of(tail[0..<end])
+
+private bool zig_says(string8 zig, string8 version):
+    if !fs.is_executable(zig): return false
+    Command v = command(zig)
+    add(&v, "version")
+    return first_line(v, true) == version
+
+// A file's SHA-256 as hex: `sha256sum` or `shasum` when there is one (an
+// archive is tens of megabytes), else `core:hash`; "" when it cannot be read.
+string8 file_sha256(string8 p):
+    if !is_file(p): return ""
+    for tool in ["sha256sum", "shasum"]:
+        string8 found = on_path(tool)
+        if #len(found) == 0: continue
+        Command c = command(tool)
+        if tool == "shasum": add_all(&c, words_of("-a 256"))
+        add(&c, p)
+        string8 line = first_line(c, true)
+        (string8 h, string8 _, bool _) = strings.field(line)
+        if #len(h) == 64: return txt(strings.to_lower(h))
+    try ref []u8 bytes = fs.read_bytes(p) else:
+        return ""
+    hash.Sha256 s = hash.sha256_init()
+    s.update(bytes[:])
+    return txt(hash.hex(s.finish()))
+
+// The fork of tcc in `tools/tcc` (pristine upstream source and its patch
+// series), built by its `build.sh` into `tcc_home()` with the first C
+// compiler found here, or the pinned zig's. The script keys the build by the
+// content of the source, the patches and itself, so a second run is a hit.
+private void ensure_tcc():
+    string8 script = join2(tcc_dir(), "build.sh")
+    if !is_file(script): die(txt(#format("no tcc fork at ", tcc_dir(), ": the checkout is incomplete")))
+    string8 key = tcc_key()
+    if #len(key) == 0: die(txt(#format(script, " --print-key gave no key")))
+    string8 tcc = join3(tcc_home(), "bin", exe_name("tcc"))
+    if tcc_says(tcc, key):
+        said(txt(#format("tcc ", key, ": ", tcc)))
+        return
+    if this_os() == "#WINDOWS": die("tcc is for dev builds on Linux and macOS; this is Windows")
+    string8 cc = ""
+    for f in c_compilers():
+        if #len(cc) == 0: cc = shown(command_of(f.words[:]))
+    if #len(cc) == 0:
+        Compiler z = compiler("zig", true)
+        if z.found: cc = shown(command_of(z.words[:]))
+    if #len(cc) == 0: die("no C compiler here to build tcc with: install gcc or clang, or run `dado bootstrap zig` first")
+    said(txt(#format("building tcc ", key, " from ", tcc_dir(), " with ", cc)))
+    Command s = command("sh")
+    add(&s, script)
+    add(&s, "--cc")
+    add(&s, cc)
+    add(&s, "--into")
+    add(&s, join2(toolchain_dir(), "tcc"))
+    if run(s) != 0: die(txt(#format("tcc did not build: ", shown(s), " says why")))
+    if !tcc_says(tcc, key): die(txt(#format(tcc, " does not say it is the fork's build ", key)))
+    said(txt(#format("tcc ", key, ": ", tcc)))
+
+// Whether `tcc -v` names the fork's build `key` (`dado@<key>`, which
+// `build.sh` writes where upstream's version names its git commit).
+private bool tcc_says(string8 tcc, string8 key):
+    if !fs.is_executable(tcc): return false
+    Command v = command(tcc)
+    add(&v, "-v")
+    return strings.contains(first_line(v, true), txt(#format("dado@", key)))

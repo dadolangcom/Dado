@@ -1,0 +1,2560 @@
+// The compilation as the jobs see it: the loaded program, the interners,
+// the declarations each package's interface job lists (on demand, `when`
+// arms decided as they are met), and the bodies queued for their jobs.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+const u32 NONE = 0xFFFFFFFF
+
+const u8 K_FN = 0
+const u8 K_FFN = 1
+const u8 K_FCONST = 2
+const u8 K_FTYPE = 3
+const u8 K_TYPE = 4
+const u8 K_ENUM = 5
+const u8 K_CONST = 6
+const u8 K_VAR = 7
+const u8 K_METHOD = 8
+const u8 K_OTHER = 9
+const u8 K_FSTRUCT = 10
+const u8 K_FVAR = 11
+const u8 K_TRAIT = 12
+// A bound `foreign` block (`foreign sys "stdio.h":`): its items are `sys.x`.
+const u8 K_FBIND = 13
+const u8 K_UNION = 14
+const u32 BOUND_PKG = 0x80000000
+
+// `ty` is a function's FUNC row, a constant's type, a type's own row; a
+// method's `block` is its type's declaration.
+type Decl:
+    u32 name
+    u8 kind
+    u32 pkg
+    u32 file
+    u32 node
+    u32 block
+    u8 state
+    u32 ty
+    bool private
+    // A constant's or variable's value (a ConstId).
+    u32 value
+
+// A body to check: a declaration, the instance it is over (`instance.dado`;
+// a pack's tuple of argument types; NONE) and its C name.
+type Job:
+    u32 decl
+    u32 env
+    u32 cname
+    // An instance's provenance: the call in ordinary source that asked
+    // first (file, offset), the clause its errors carry, and how many
+    // rounds it is built out of the instance asking.
+    u32 of
+    u32 at
+    string8 note
+    u32 depth
+
+type World:
+    index.Program p
+    // The `^Body` being checked (`typeof` reads its names), or nil.
+    rawptr body
+    types.Types t
+    types.Consts k
+    diag.Diags d
+    string8 os
+    string8 arch
+    string8 endian
+    // `--target`'s triple, `#TRIPLE` ("" without one).
+    string8 triple
+    // `--web-threads`: a `#WEB` build is threaded.
+    bool web_threads
+    // The tier's switches, zero a dev build's: `--release`,
+    // `--reload`, Dado's run-time checks and the narrowing warning dropped,
+    // `--no-assert`, `--no-expect`.
+    bool release
+    bool reload
+    bool no_sanitize
+    bool no_narrowing
+    bool no_assert
+    bool no_expect
+    // `--ubsan-handlers`: `#WEB` and `#NONE` define C's UBSan handlers.
+    bool ubsan
+    // `--library`: no entry point to be missing (ERR0301).
+    bool library
+    // `--emit=js-package`, `--js-library`: no Dado host runs the scripts (ERR1341).
+    bool js_package
+    // `threads.spawn` calls on an unthreaded web build: ERR1033 where live.
+    ref []Spawn spawns
+    // `--emit=check`: every library body is checked too, its own findings
+    // dropped, so the analysis sees them (Rust's provenance walks them all).
+    bool all_bodies
+    // Its first job (the rest are its own).
+    i64 quiet_from
+    ref []string8 def_keys   // `-D NAME=value`, in order
+    // A `@const` whose `-D` integer wrapped: the value as written, for `when`.
+    {u32: u32} def_raw
+    u32 def_unwrapped
+    ref []string8 def_vals
+    ref []u64 body_consts    // a body's `@const`s seen: file << 32 | node
+    {u64: u32} body_cvals    // a body `@const`'s folded value (`--emit=constants`)
+    ref []u32 s_made         // classes a checked Dado body makes an instance of (`#script_new`)
+    bool testing         // a `@test` build (`--test=`): `test()` is the entry
+    // The call statement `S_EXPR` is checking (a stripped `#expect` there goes whole).
+    u32 stmt_call
+    ref []Decl decls
+    ref []u8 declared
+    {u64: u32} by_name
+    // (type declaration, name) to method or enum member (its ConstId); a
+    // type's row to its declaration.
+    {u64: u32} methods
+    {u64: u32} members
+    {u32: u32} type_decl
+    {u64: u32} jobs_by
+    ref []Job jobs
+    ref []ir.Fn fns
+    u32 any
+    u32 sink
+    // Dado's `Location` (`trace.dado`), named on first mention.
+    u32 dloc
+    u32 amode
+    {u32: u8} caller_memo
+    {u32: u8} capped
+    // Matrix products, by (file, node).
+    {u64: u8} mprod
+    // Where a written `#channel` stands (ERR0528): 1 a statement, 2 a tuple, 3 a union's member.
+    u8 chan_at
+    u32 chan_union
+    u32 alloc
+    u32 untyped
+    u32 ufloat
+    // Package variables reached, and enum members in declaration order.
+    ref []u32 globals
+    // Errors a body's analysis still runs past (ERR0824 within a `#send`).
+    i64 soft
+    ref []u64 order
+    ref []char8 buf
+    ref []Embed embeds
+    // The `foreign` blocks a reached declaration is in: file, node.
+    ref []u64 reached
+    // Who reached each: an index into `reached`, the job (NONE: an interface).
+    ref []u32 rkey
+    ref []u32 rjob
+    u32 job_now
+    // The last name ERR0309 refused (file << 32 | node): nothing more is said of it.
+    u64 amb
+    // The bodies `analysis.prune` keeps (empty: all).
+    ref []bool live
+    // Resolving a `foreign` declaration's types (C's qualifiers allowed).
+    bool in_foreign
+    bool under_ptr
+    // A foreign type's C member names, by (type, slot), where `@c` renames.
+    {u64: u32} cmember
+    // A foreign struct's bitfield widths, keyed as `cmember`.
+    {u64: u32} cwidth
+    // Slots of a header's struct written as a C array (`[1]i32 a`) whose Dado type is not one.
+    {u64: u32} carray
+    // Slots written as a C array of one-element arrays (`[3][1]i32 col`), keyed as `carray`.
+    {u64: u32} cinner
+    // `[_]T`: a header struct's tail (type: view << 32 | C name, and its
+    // element), and objects declared so (decl: element).
+    {u32: u64} ftail
+    {u32: u32} ftail_el
+    {u32: u32} fflex
+    // Package variables' `@align(n)`.
+    {u32: u64} galign
+    // What the `foreign` clauses put on the cc line: flags, then links.
+    ref []string8 cc_flags
+    ref []string8 cc_links
+    // The block each flag and link came from.
+    ref []u64 flag_key
+    ref []u64 link_key
+    // Templates (`instance.dado`): binders by declaration, the instance being
+    // resolved (`env` over `envd`'s binders), signatures and type instances.
+    {u32: u64} bspan
+    ref []u32 bsym
+    ref []u8 bkind
+    u32 env
+    u32 envd
+    {u64: u32} sigs
+    {u32: u32} inst_env
+    // The body being checked's provenance (an instance's), and the call
+    // asking for the next instance.
+    string8 note
+    u32 of
+    u32 at
+    u32 self_ty
+    // The type instance asking for the next (its body, or a method's
+    // receiver), and their rounds, parents and the place first written.
+    u32 asking
+    u32 cur
+    bool in_tbody
+    // Traits: (trait << 32 | implementer) pairs, each default method's
+    // `using` (file << 32 | node), traits already said to reach themselves.
+    ref []u64 impls
+    {u32: u64} dflt_using
+    {u32: u8} cycled
+    string8 bind_param
+    u32 bind_call
+    {u32: u32} idepth
+    {u32: u32} iparent
+    {u32: u64} iorigin
+    u32 ask_depth
+    // `..T` packs: the slots each body reads (decl: count << 32 | node),
+    // bodies that measure theirs, and each call's (decl, count), (file, node).
+    {u32: u64} preach
+    {u32: u8} pmeasured
+    ref []u64 pcalls
+    ref []u64 pcall_at
+    u32 ask_f
+    u32 ask_at
+    // Body `const`s in scope, for array lengths: (name << 32 | ConstId), depth.
+    ref []u64 lconst
+    ref []u32 lconst_depth
+    // Map types whose key was refused (ERR0801 said once at a use).
+    {u32: u8} keys_refused
+    // Type instances a `where` refused, said once.
+    {u64: u8} where_said
+    // Trait values: implementer numbers, trait methods as declarations, dispatches.
+    {u32: u32} impl_no
+    {u64: u32} tmethods
+    // A `#static_assert` folding; the package-level ones, found as declared.
+    bool asserting
+    // A header's named member lists (`c_named_list`): distinct rows that fit their shape.
+    {u32: u8} cnl
+    // Header structs with bits or a flexible tail: no Dado shape to be one type with.
+    {u32: u8} fnominal
+    // An anonymous member: (type << 32 | slot) to (file << 32 | its member list node).
+    {u64: u64} anon
+    // A header struct's anonymous union rows: C reaches their members by name.
+    {u32: u8} canon_u
+    // ERR0001 said once for an exported failable function type (per signature).
+    bool said_export
+    // Folding a package variable: a window of a package array is a constant.
+    bool fold_win
+    // How deep `resolve_type` is (`auto` alone is a binding's whole type).
+    i64 tdepth
+    // Type values evaluated so far (ERR0912's bound).
+    i64 tevals
+    // An `@incomplete` type held by value is said where it is held (`inc_refuse`).
+    bool inc_ok
+    // A host call passing a wide string (`h_pushes`): it runs entered.
+    bool hwide
+    // A script field written (`h_cross`): a wide string does not transcode there.
+    bool hfield
+    ref []u64 sasserts
+    // `where` clauses refused where declared; the last refusal `wv` met.
+    {u32: u8} where_bad
+    u32 wr_at
+    u16 wr_code
+    string8 wr_msg
+    string8 wr_help
+    ref []Dispatch dispatches
+    // ERR0922 said once per (template, shape).
+    {u64: u8} shape_said
+    {u32: u8} nominal
+    // DadoScript: classes (`script.dado`), by declaration; its `string`.
+    ref []SClass classes
+    ref []SGLab sglabs
+    ref []STrait straits
+    // `async T` both ways, and the value an `await` waits on (file << 32 | node).
+    {u32: u32} sasync_ty
+    {u32: u32} sasync_in
+    u64 sawaiting
+    {u32: u8} simplicit
+    // A script place being stored (`s_place`).
+    bool sstore
+    // Script fields whose type was refused (file << 32 | node).
+    {u64: u8} sfailed
+    {u32: u32} class_of
+    u32 sstr
+    u32 sany
+    u32 vm
+    u32 serror    // a script's `Error`
+    u32 sloc      // a script's `Location`
+    {u64: u32} sjs    // (class decl, name): a `foreign "x.js"` function
+    // JavaScript modules: identity, name, source ("": refused); a module by
+    // (file, binding) of an import, or (file, node) of a `foreign` block.
+    ref []string8 jsp
+    ref []string8 jsn
+    ref []string8 jss
+    {u64: u32} jsns
+    ref []u32 fnvals   // Dado functions a Dado body names as a value
+    ref []u32 fnvt     // Dado function types whose values cross into a script
+    // Dado functions scripts call (`seam.dado`), the C names kept live for
+    // their thunks, and each run-time narrowing's place.
+    ref []u32 bound
+    ref []u32 bound_c
+    // Each script call of a Dado function: the class, the function, `file:line`.
+    ref []u32 bsite_cls
+    ref []u32 bsite_fn
+    ref []string8 bsite_at
+    ref []u32 seam_roots
+    ref []HRun hruns       // Dado's calls into a script that carry runs
+    // `#script_reload`: one is lowered; the methods and fields Dado reaches
+    // through a handle (its manifest).
+    bool reloads
+    // A script loads another by its path (`Script.load`): `dados:mods` embedded.
+    bool sloads
+    ref []u32 entries
+    ref []u64 hmembers
+    // Pairs a bound function keeps (`d << 32 | i`), and the escape check's memo.
+    ref []u64 cb_kept
+    {u64: u32} cb_memo
+    // Channels scripts `receive`, by row.
+    ref []u32 recv
+    ref []string8 seam_rt_names
+    ref []u32 seam_rt_c
+    ref []string8 narrows
+    // Dado functions connected to a signal from Dado: class, signal, function.
+    ref []u32 sd_class
+    ref []u32 sd_sig
+    ref []u32 sd_fn
+    // `--define=`/`--hover=` (tools/dadoc/query.dado, Rust's `Watch`): the
+    // bindings in scope over the smallest region holding byte `watch_at` of
+    // file `watch_file`, and the `.` access whose member is there.
+    bool watching
+    u32 watch_file
+    u32 watch_at
+    u32 watch_len
+    u32 watch_pend           // the node the next scope covers, plus one
+    bool watch_dotted
+    u32 watch_dot            // the access node
+    Val watch_base           // what its base is
+
+// The watch's scope regions by depth (lo << 32 | hi + 1, 0: none) and the
+// bindings kept, and the types whose maps' keys were all found keyable
+// (`keyed_ok`): package storage, so neither grows the world's block.
+ref []u64 g_watch_reg
+ref []WLocal g_watch_names
+{u32: u8} g_keyed_clean
+
+// One binding a watched scope holds: kind 0 local, 1 parameter, 2 const.
+type WLocal:
+    u32 name
+    u32 node
+    u32 ty
+    u8 kind
+
+// `dadoc query` (tools/dadoc/inspect.dado): many watched bytes of the file
+// at once, each keeping what the single watch keeps for its one byte; the
+// bindings are `g_wp_names[nlo..<nhi]`. Package storage, as the above.
+type WPoint:
+    u32 at
+    u32 len
+    u32 nlo
+    u32 nhi
+    bool dotted
+    u32 dot
+    Val base
+
+ref []WPoint g_watch_pts
+ref []WLocal g_wp_names
+// `dadoc query peek`: every scope overlapping `g_wr_lo..<g_wr_hi` (when
+// `g_wr_on`), its bindings kept in `g_wr_names`.
+bool g_wr_on
+u32 g_wr_lo
+u32 g_wr_hi
+ref []WLocal g_wr_names
+
+// A call from Dado into a script carrying runs (Rust's container helper):
+// `dado_hrun_<k>`, its arguments after the handle by Dado and script type.
+type HRun:
+    u32 ci
+    string8 entry
+    ref []u32 tys
+    ref []u32 sts
+    u32 ans
+    u32 sans
+    bool tried
+    bool made
+    // `#script_run`'s `ready`: a failure is its exit status.
+    bool ready
+    // A package function's call: its method, `pkg.f`.
+    bool fn_
+    u32 fm
+    string8 label
+    // Each argument as written.
+    ref []string8 srcs
+
+World world(^index.Program p, string8 os = "UNKNOWN_OS", string8 arch = "UNKNOWN_ARCH", string8 endian = "UNKNOWN_ENDIAN"):
+    World w
+    w.p = p^
+    w.t = types.new_types()
+    w.os = os
+    w.arch = arch
+    w.endian = endian
+    w.any = w.t.builtin("#any")
+    w.untyped = w.t.builtin("untyped integer")
+    w.ufloat = w.t.builtin("untyped float")
+    w.sstr = w.t.builtin("string")
+    w.sany = w.t.builtin("any")
+    w.vm = w.t.builtin("VM")
+    w.serror = w.t.builtin("Error")
+    w.sloc = w.t.builtin("Location")
+    w.sink = NONE
+    w.dloc = NONE
+    w.amode = NONE
+    w.alloc = NONE
+    w.env = NONE
+    w.envd = NONE
+    w.of = NONE
+    w.self_ty = NONE
+    w.asking = NONE
+    w.cur = NONE
+    w.job_now = NONE
+    w.stmt_call = NONE
+    for _ in p.pkgs:
+        w.declared = #append(w.declared, 0)
+    return w
+
+// `s` as a type-table string, through a held copy (the table may move).
+u32 tstr(^World w, string8 s):
+    string8 c = index.hold(strings.clone(s))
+    return w.t.str(c)
+
+// A held copy: views into the tables do not survive their growth.
+string8 name_of(^World w, u32 sym):
+    if sym == NONE: return ""
+    return index.hold(strings.clone(w.p.names.key(sym)))
+
+// A type as messages spell it.
+string8 shown(^World w, u32 ty):
+    #truncate(w.buf, 0)
+    if ty == w.untyped: return "int"
+    if ty == w.ufloat: return "float"
+    if s_enum(w, ty): return named(w, ty)
+    if ty != NONE && w.t.tag[ty] == types.T_DISTINCT && strings.starts_with(w.t.text(w.t.a[ty]), "#."):
+        string8 q = w.t.text(w.t.a[ty])
+        return index.hold(#format("distinct ", q, ": i32"))
+    types.display(&w.t, ty, &w.buf)
+    return index.hold(#copy(w.buf[:]))
+
+// A type by its declared name, as most messages spell it.
+string8 named(^World w, u32 ty):
+    #truncate(w.buf, 0)
+    types.display(&w.t, ty, &w.buf, true)
+    return index.hold(#copy(w.buf[:]))
+
+// The declaration `name` of package `pkg`, or NONE; the interface job runs
+// the first time a package is asked.
+// Whether `ty` reaches itself through pointers alone, with no C name.
+bool nameless(^World w, u32 ty):
+    u32 sp = w.t.resolve(ty)
+    for _ in 0..<64:
+        if sp == NONE || w.t.tag[sp] != types.T_PTR: return false
+        if w.t.a[sp] == ty: return true
+        sp = w.t.resolve(w.t.a[sp])
+    return false
+
+u32 lookup(^World w, u32 pkg, u32 name):
+    if (pkg & BOUND_PKG) == 0: declare(w, pkg)
+    u64 key = (u64(pkg) << 32) | u64(name)
+    if key in w.by_name:
+        try u32 d = w.by_name[key] else: return NONE
+        return d
+    return NONE
+
+// Name `n` of file `f`: this package's declaration, or the one a dot import
+// makes bare (ERR0309 when it could be two).
+u32 bare(^World w, u32 f, u32 n):
+    u32 sym = w.p.sym(f, n)
+    u32 pkg = w.p.files[f].pkg
+    u32 own = s_inner(w, f, n, pkg)
+    if own != NONE: return own
+    own = lookup(w, pkg, sym)
+    if own != NONE && w.decls[own].file == f: return own
+    ref []u32 ds
+    ref []string8 qs
+    ref []string8 ims
+    string8 s = w.p.spell(f, n)
+    for im in w.p.pkgs[pkg].imports:
+        if im.file != f || !im.dot: continue
+        u32 d = lookup(w, im.pkg, sym)
+        if d == NONE || w.decls[d].private: continue
+        ds = #append(ds, d)
+        qs = #append(qs, index.hold(#format("`", name_of(w, w.p.pkgs[im.pkg].name), ".", s, "`")))
+        syntax.Ast a = w.p.files[f].a
+        ims = #append(ims, index.hold(#format("`", w.p.files[f].src[i64(a.lo[im.node])..<i64(a.hi[im.node])], "`")))
+    if #len(ds) == 0: return own
+    if #len(ds) == 1 && own == NONE: return ds[0]
+    string8 both = either(qs[:])
+    ref []string8 all
+    for q in qs:
+        all = #append(all, q)
+    if own != NONE: all = #append(all, index.hold(#format("this package's own `", s, "`")))
+    string8 help = index.hold(#format("write the one meant in full: ", both))
+    if own != NONE: help = index.hold(#format("this package's own `", s, "` has no other spelling: to mean it, drop the `.` from ", strings.join(ims[:], " and "), "; to mean the imported one, write ", both))
+    w.amb = (u64(f) << 32) | u64(n)
+    say(w, f, 0, w.p.files[f].a.lo[n], w.p.files[f].a.hi[n], 309, index.hold(#format("`", s, "` could mean ", either(all[:]), ": a bare name means one thing, so it is refused rather than resolved by precedence")), help)
+    return NONE
+
+string8 either([]string8 xs):
+    ref []char8 o
+    for i in 0..<#len(xs):
+        if i > 0: o = #append(o, ..(" or " if i == #len(xs) - 1 else ", "))
+        o = #append(o, ..xs[i])
+    return index.hold(o)
+
+// ERR0310: a declaration of a file that a dot import of it already names.
+void dot_clashes(^World w, u32 pkg):
+    for im in w.p.pkgs[pkg].imports:
+        if !im.dot: continue
+        syntax.Ast a = w.p.files[im.file].a
+        bool ds = a.a[a.root] == 1
+        // A script's members: its methods and fields.
+        ref []u32 ns
+        for d in 0..<#len(w.decls):
+            if w.decls[d].file == im.file && w.decls[d].pkg == pkg && (w.decls[d].kind != K_METHOD || ds): ns = #append(ns, w.decls[d].node)
+        for c in w.classes:
+            if c.file != im.file: continue
+            for fn in c.fields: ns = #append(ns, fn)
+        for nd in ns:
+            u32 x = lookup(w, im.pkg, w.p.sym(im.file, nd))
+            if x == NONE || w.decls[x].private: continue
+            string8 it = w.p.files[im.file].src[i64(a.lo[im.node])..<i64(a.hi[im.node])]
+            string8 pn = name_of(w, w.p.pkgs[im.pkg].name)
+            string8 dn = w.p.spell(im.file, nd)
+            string8 what = "a member of this class" if ds && a.tag[nd] != syntax.N_CLASS else "a declaration of this file"
+            say_tok(w, im.file, 0, nd, 310, index.hold(#format("`", dn, "` is ", what, ", and `", it, "` already makes `", pn, ".", dn, "` bare here: a bare name means one thing, so the declaration is refused rather than shadowing the import")), index.hold(#format("rename `", dn, "`, or import `", pn, "` qualified — `", strings.replace(it, ". ", ""), "` — and write `", pn, ".", dn, "` where the package's is meant")))
+
+// The interface job's listing: every item, `when` arms decided.
+void declare(^World w, u32 pkg):
+    if w.declared[pkg] != 0: return
+    w.declared[pkg] = 1
+    for f in w.p.pkgs[pkg].flo..<w.p.pkgs[pkg].fhi:
+        syntax.Ast a = w.p.files[f].a
+        if a.a[a.root] == 1:
+            s_declare(w, pkg, f)
+            continue
+        items(w, pkg, f, a.list(a.b[a.root]), NONE)
+
+private void items(^World w, u32 pkg, u32 f, []u32 ns, u32 block):
+    syntax.Ast a = w.p.files[f].a
+    for n in ns:
+        if n == NONE: continue
+        u8 g = a.tag[n]
+        if g == syntax.N_TYPE && (a.a[n] & syntax.F_CONTRACT) != 0: _ = add(w, pkg, f, n, K_TYPE, block)
+        else if g == syntax.N_FN && (w.p.spell(f, n) == "typeof" || w.p.spell(f, n) == "shapeof"):
+            w.d.phase = diag.PH_INTERFACE
+            say_tok(w, f, 0, n, 414, index.hold(#format("`", w.p.spell(f, n), "` is a reserved global name written in a type position; the parser reads it there before any scope is consulted, so this declaration could never be reached")), "")
+        else if g == syntax.N_FN: _ = add(w, pkg, f, n, K_FN, block)
+        else if g == syntax.N_TYPE:
+            u32 t = add(w, pkg, f, n, K_TYPE, block)
+            if t == NONE: continue
+            []u32 ms = a.list(a.b[n])
+            for m in ms[3..<#len(ms)]:
+                if m == NONE || a.tag[m] != syntax.N_FN: continue
+                u64 key = (u64(t) << 32) | u64(w.p.sym(f, m))
+                if key in w.methods:
+                    w.d.phase = diag.PH_INTERFACE
+                    try u32 first = w.methods[key] else: continue
+                    diag.Place pl = w.p.map.place(w.p.map.base[f] + w.p.files[f].t.start[a.main[w.decls[first].node]])
+                    say_tok(w, f, 0, m, 406, index.hold(#format("`", w.p.spell(f, n), "` already has a method `", w.p.spell(f, m), "` at ", pl.line, ":", pl.col, "; a call names one method, so two of a name would make `v.", w.p.spell(f, m), "()` ambiguous")), index.hold(#format("rename one of the two `", w.p.spell(f, m), "` methods")))
+                    continue
+                if !placed(w, f, n, m): continue
+                w.methods[key] = u32(#len(w.decls))
+                w.decls = #append(w.decls, Decl(w.p.sym(f, m), K_METHOD, pkg, f, m, t, 0, NONE, false, NONE))
+        else if g == syntax.N_ENUM: _ = add(w, pkg, f, n, K_ENUM, block)
+        else if g == syntax.N_UNION: _ = add(w, pkg, f, n, K_UNION, block)
+        else if g == syntax.N_CONST: _ = add(w, pkg, f, n, K_CONST, block)
+        else if g == syntax.N_VAR: _ = add(w, pkg, f, n, K_VAR, block)
+        else if g == syntax.N_FOREIGN:
+            if (a.a[n] & syntax.F_VIS) == syntax.VIS_EXPORT:
+                w.d.phase = diag.PH_INTERFACE
+                say(w, f, 0, a.lo[n], w.p.files[f].t.end[a.main[n]] + 1, 1005, "`export` is legal on a function and on a `const` alias of one, and not on a `foreign` block", "drop `export`", "every name in one is C's already, so there is nothing for Dado to promise")
+            if strings.ends_with(w.p.spell(f, n), ".js\""):
+                w.d.phase = diag.PH_DIALECT
+                say_tok(w, f, 0, n, 1302, index.hold(#format("`foreign ", w.p.spell(f, n), ":` is DadoScript, not Dado")), "a Dado `foreign` block declares C from a header: name a `.h` file, or move the block into a `.dados` file or a `class` block, where `foreign \"x.js\":` declares JavaScript")
+                continue
+            u32 into = pkg
+            for m in a.list(a.b[n]):
+                if m == NONE: continue
+                u8 h = a.tag[m]
+                if h == syntax.N_WORD:
+                    // Blocks bound to one name share it, across the package's files.
+                    u32 was = NONE
+                    u64 bk = (u64(pkg) << 32) | u64(w.p.sym(f, m))
+                    if bk in w.by_name:
+                        try was = w.by_name[bk] else: pass
+                    if was != NONE && w.decls[was].kind == K_FBIND:
+                        into = BOUND_PKG | was
+                        continue
+                    u32 bd = add(w, pkg, f, m, K_FBIND, n)
+                    if bd == NONE: break
+                    into = BOUND_PKG | bd
+                else if h == syntax.N_F_FN: _ = add(w, into, f, m, K_FFN, n)
+                else if h == syntax.N_F_CONST: _ = add(w, into, f, m, K_FCONST, n)
+                else if h == syntax.N_F_OPAQUE: _ = add(w, into, f, m, K_FTYPE, n)
+                else if h == syntax.N_TYPE: _ = add(w, into, f, m, K_FSTRUCT, n)
+                else if h == syntax.N_F_VAR: _ = add(w, into, f, m, K_FVAR, n)
+                else if h == syntax.N_F_ENUM: _ = add(w, into, f, m, K_ENUM, n)
+                else if h == syntax.N_UNION && (a.a[m] & syntax.F_RAW) != 0: _ = add(w, into, f, m, K_UNION, n)
+                else if h == syntax.N_UNION && (a.a[m] & syntax.F_RAW) == 0:
+                    w.d.phase = diag.PH_INTERFACE
+                    say(w, f, 0, a.lo[m], a.hi[m], 1024, index.hold(#format("a `foreign` block restates what C provides, and C's union carries no discriminant — write `cunion ", w.p.spell(f, m), ":`, whose members are read and written by name with no guard. Dado's `union` stays discriminated and stays native")), "")
+                else if h != syntax.N_CLAUSE:
+                    w.d.phase = diag.PH_INTERFACE
+                    say(w, f, 0, a.lo[m], a.hi[m], 1, "this foreign declaration is outside the slice the port builds so far", "")
+        else if g == syntax.N_WHEN:
+            ref []u32 cs
+            for arm in a.list(a.b[n]):
+                if arm != NONE && a.tag[arm] != syntax.N_WHEN_ELSE: cs = #append(cs, a.list(a.b[arm])[0])
+            unenumerated_os(w, f, 0, cs[:])
+            for arm in a.list(a.b[n]):
+                if arm == NONE: continue
+                []u32 ks = a.list(a.b[arm])
+                if a.tag[arm] == syntax.N_WHEN_ELSE:
+                    items(w, pkg, f, ks, block)
+                    break
+                if holds(w, f, 0, ks[0]):
+                    items(w, pkg, f, ks[1..<#len(ks)], block)
+                    break
+        else if g == syntax.N_TRAIT: _ = add(w, pkg, f, n, K_TRAIT, block)
+        else if g == syntax.N_STATIC_ASSERT && !ds_file(w, f): w.sasserts = #append(w.sasserts, (u64(f) << 32) | u64(n))
+        else if g == syntax.N_CLASS: s_declare_block(w, pkg, f, n)
+        else if g == syntax.N_UNION: _ = add(w, pkg, f, n, K_OTHER, block)
+
+bool valued(u8 k):
+    return k == K_FN || k == K_CONST || k == K_VAR || k == K_FVAR
+
+// Whether a declaration kind names a type.
+bool typeish(u8 k):
+    return k == K_CLASS || k == K_TYPE || k == K_FTYPE || k == K_ENUM || k == K_FSTRUCT || k == K_UNION
+
+// A C array: Dado's `[N]T`, which C passes and names differently.
+bool c_array(^World w, u32 ty):
+    if ty == NONE: return false
+    u32 r = w.t.resolve(ty)
+    if r == NONE: return false
+    if w.t.tag[r] == types.T_PTR: return c_array(w, w.t.a[r])
+    return w.t.tag[r] == types.T_TUPLE && !is_fstruct(&w.t, ty)
+
+// Whether array type `ty`'s element is itself an array in Dado (`[3][2]T`, not `[3][1]T`).
+private bool inner_c_array(^World w, u32 ty):
+    u32 e = NONE
+    i64 n = 0
+    if !w.t.uniform(w.t.resolve(ty), &e, &n): return false
+    return c_array(w, e)
+
+bool foreign_kind(u8 k):
+    return k == K_FTYPE || k == K_FFN || k == K_FCONST || k == K_FSTRUCT || k == K_FVAR
+
+// Whether `ty` is (a name for) a `foreign` type the header declares.
+bool is_fstruct(^types.Types t, u32 ty):
+    u32 x = ty
+    for _ in 0..<64:
+        if x != NONE && x < u32(t.count()) && t.tag[x] == types.T_QUAL:
+            x = t.b[x]
+            continue
+        if x == NONE || x >= u32(t.count()) || t.tag[x] != types.T_NAMED: return false
+        if t.text(t.a[x]) == "#c": return true
+        x = t.body[x]
+    return false
+
+// `@align(n)`'s n (ERR1026); 0 when refused.
+u64 align_n(^World w, u32 f, u32 an):
+    syntax.Ast a = w.p.files[f].a
+    u32 v = a.a[an]
+    i64 n = -1
+    if a.tag[v] == syntax.E_INT && a.b[v] == 0: n = i64(a.a[v])
+    else if a.tag[v] == syntax.E_NAME || a.tag[v] == syntax.E_FIELD && a.a[v] != NONE && a.tag[a.a[v]] == syntax.E_NAME:
+        u32 d = lookup(w, w.p.files[f].pkg, w.p.sym(f, v)) if a.tag[v] == syntax.E_NAME else imported_decl(w, f, a.a[v], v)
+        if d != NONE && w.decls[d].kind == K_CONST && resolve(w, d) != NONE && w.decls[d].value != NONE && w.k.kind[w.decls[d].value] == types.C_INT: n = i64(w.k.w0[w.decls[d].value])
+    if n < 0:
+        say(w, f, 0, a.lo[v], a.hi[v], 1026, "`@align(n)` takes a compile-time integer: a literal, or a constant naming one", "write a literal or a constant — `@align(mem.MAX_ALIGN)` is as good as `@align(16)`", "It states where an object's storage begins, and the linker places that storage before the program runs. That is the same rule an array's length obeys")
+        return 0
+    if n == 0 || n > 4096 || (n & (n - 1)) != 0:
+        say(w, f, 0, a.lo[v], a.hi[v], 1026, index.hold(#format("`@align(", w.p.files[f].src[i64(a.lo[v])..<i64(a.hi[v])], ")` is not an alignment, which is a power of two — 1, 2, 4, 8, 16 and up — no larger than 4096")), "", "An alignment is the modulus an address is required to be zero under, and C11 admits no other")
+        return 0
+    return u64(n)
+
+// The header struct of one slot `ty` names (A2 makes it its slot in Dado,
+// C keeps the struct), or NONE.
+u32 one_row(^types.Types t, u32 ty):
+    u32 x = ty
+    for _ in 0..<64:
+        if x == NONE || x >= u32(t.count()) || t.tag[x] != types.T_QUAL: break
+        x = t.b[x]
+    if x == NONE || x >= u32(t.count()) || t.tag[x] != types.T_NAMED || t.text(t.a[x]) != "#c": return NONE
+    []u32 ns = t.slot_names(x)
+    return x if #len(ns) == 1 else NONE
+
+// Slot `i`'s type of `ty`, a one-slot header struct's its body.
+u32 slot_ty(^types.Types t, u32 ty, u32 i):
+    u32 x = one_row(t, ty)
+    if x != NONE: return t.body[x]
+    return t.slots(ty)[i]
+
+// The new declaration, or NONE when it is not listed (a duplicate).
+private u32 add(^World w, u32 into, u32 f, u32 n, u8 kind, u32 block):
+    syntax.Ast a = w.p.files[f].a
+    u32 name = w.p.sym(f, n)
+    if name == NONE: return NONE
+    u32 vis = a.a[n] & syntax.F_VIS
+    if foreign_kind(kind) || kind == K_FBIND: vis = a.a[block] & syntax.F_VIS
+    u64 key = (u64(into) << 32) | u64(name)
+    u32 pkg = into if (into & BOUND_PKG) == 0 else w.decls[into & ~BOUND_PKG].pkg
+    if kind == K_TYPE || kind == K_UNION || kind == K_ENUM || kind == K_TRAIT || kind == K_FTYPE:
+        string8 tw = "type"
+        if kind == K_UNION: tw = "union"
+        if kind == K_ENUM: tw = "enum"
+        if kind == K_TRAIT: tw = "trait"
+        u8 door = 0 if vis == syntax.VIS_FILE || vis == syntax.VIS_PACKAGE else 1
+        if kind == K_ENUM: door = 2
+        if kind == K_TRAIT: door = 3
+        u64 sp = name_span(w, f, n)
+        if builtin_tname(w, f, u32(sp >> 32), u32(sp & 0xFFFFFFFF), "", name_of(w, name), tw, door, pkg): return NONE
+    u32 id = u32(#len(w.decls))
+    w.decls = #append(w.decls, Decl(name, kind, pkg, f, n, block, 0, NONE, vis == syntax.VIS_FILE, NONE))
+    if key in w.by_name:
+        try u32 first = w.by_name[key] else: return NONE
+        w.d.phase = diag.PH_INTERFACE
+        if c_typeish(w, id) && c_typeish(w, first):
+            // A C type declared twice: a bodiless `type` may stand beside a
+            // struct or union body (C's forward declaration), which wins.
+            bool nb = kind == K_FTYPE
+            bool fb = w.decls[first].kind == K_FTYPE
+            string8 cn = index.hold(strings.clone(w.t.text(c_name(w, id))))
+            string8 dn = name_of(w, name)
+            if nb && fb: say_tok(w, f, 0, n, 1003, index.hold(#format("`", dn, "` declares the C type `", cn, "` a second time, and neither declaration has a body; a bodiless `type` is admitted twice only as the forward declaration of a struct or union that is defined")), "")
+            else if (nb || fb) && c_aggregate(w, first if nb else id):
+                if fb: w.by_name[key] = id
+                return id if fb else NONE
+            else if nb || fb: say_tok(w, f, 0, n, 1003, index.hold(#format("`", dn, "` declares the C type `", cn, "` twice, once with no body; a bodiless declaration is admitted beside a struct or union body, which C can forward-declare, and this type's body is an enum or a scalar, which C cannot")), "")
+            else: say_tok(w, f, 0, n, 1003, index.hold(#format("`", dn, "` gives the C type `", cn, "` a second body; a C type has one body, and the only declaration that may stand beside it is a bodiless `type`")), "")
+            return NONE
+        if kind == K_FN && w.decls[first].kind == K_FFN:
+            // Rust declares functions before foreign blocks: the foreign one is the second.
+            say_tok(w, w.decls[first].file, 0, w.decls[first].node, 406, index.hold(#format("`", name_of(w, name), "` is already declared in package `", name_of(w, w.p.pkgs[pkg].name), "`; a call names one function, so two of a name would make the call ambiguous")), "")
+        else if kind == K_FFN && w.decls[first].kind == K_FN || kind == K_FN && w.decls[first].kind == K_FN:
+            say_tok(w, f, 0, n, 406, index.hold(#format("`", name_of(w, name), "` is already declared in package `", name_of(w, w.p.pkgs[pkg].name), "`; a call names one function, so two of a name would make the call ambiguous")), "")
+        else if typeish(kind) && w.decls[first].kind == K_TRAIT:
+            say_tok(w, f, 0, n, 402, index.hold(#format("`", name_of(w, name), "` already names a trait in package `", name_of(w, w.p.pkgs[pkg].name), "`, and a trait is in the type namespace: one name is one of them")), index.hold(#format("rename the type or the trait — `", name_of(w, name), "Data`")))
+        else if typeish(kind) && typeish(w.decls[first].kind) && ds_at(w, f, n):
+            say_tok(w, f, 0, n, 402, index.hold(#format("`", s_qual(w, id), "` is already declared in package `", name_of(w, w.p.pkgs[pkg].name), "`: a class's inner classes, types, unions, traits and enums share one set of names")), "rename one of the two")
+        else if typeish(kind) && typeish(w.decls[first].kind):
+            say_tok(w, f, 0, n, 402, index.hold(#format("`", name_of(w, name), "` is already declared in package `", name_of(w, w.p.pkgs[pkg].name), "`")), "")
+        else if typeish(w.decls[first].kind) && valued(kind):
+            say_tok(w, f, 0, n, 409, index.hold(#format("`", name_of(w, name), "` already names a type in package `", name_of(w, w.p.pkgs[pkg].name), "`; a call on a type name is a conversion, so one name cannot be both")), "")
+        else if valued(kind) && valued(w.decls[first].kind):
+            say_tok(w, f, 0, n, 409, index.hold(#format("`", name_of(w, name), "` already names a value of package `", name_of(w, w.p.pkgs[pkg].name), "`; one package has one namespace")), "")
+        return NONE
+    w.by_name[key] = id
+    if kind == K_FTYPE:
+        // Two Dado names for one C type (a bound block's and the package's).
+        string8 cn = w.t.text(c_name(w, id))
+        for i in 0..<id:
+            if w.decls[i].kind != K_FTYPE || w.t.text(c_name(w, i)) != cn: continue
+            w.d.phase = diag.PH_INTERFACE
+            say_tok(w, f, 0, n, 1003, index.hold(#format("`", fbound_name(w, id), "` and `", fbound_name(w, i), "` are two Dado names for the one C type `", cn, "`; the emitted C uses the C name, so it cannot tell them apart")), "")
+            break
+    return id
+
+// A `foreign` declaration's name, through its bound block's (`other.Handle`).
+string8 fbound_name(^World w, u32 d):
+    u32 bl = w.decls[d].block
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    if bl == NONE || a.tag[bl] != syntax.N_FOREIGN: return name_of(w, w.decls[d].name)
+    for m in a.list(a.b[bl]):
+        if m != NONE && a.tag[m] == syntax.N_WORD: return index.hold(#format(w.p.spell(w.decls[d].file, m), ".", name_of(w, w.decls[d].name)))
+    return name_of(w, w.decls[d].name)
+
+// A diagnostic over `lo..hi` of file `f`, relative to `base`.
+void say(^World w, u32 f, u32 base, u32 lo, u32 hi, u16 code, string8 msg, string8 help, string8 why = ""):
+    w.d.file = f
+    w.d.base = base
+    string8 m = msg
+    if #len(w.note) > 0 && code < diag.LNT:
+        i64 i = 0
+        for i < #len(m) && m[i] != '\x1f' && m[i] != '\x1e':
+            i += 1
+        m = index.hold(#format(m[0..<i], w.note, m[i..<#len(m)]))
+    w.d.add(code, lo - base, hi - base, m, help, why)
+
+// The same over node `n`'s main token.
+// ERR0414/WRN0420: a type-namespace name the language spells in type
+// position. `door`: 0 nothing reaches it (refused: true), 1 another package,
+// 2 its members, 3 `using`/`^`.
+bool builtin_tname(^World w, u32 f, u32 lo, u32 hi, string8 pre, string8 name, string8 what, u8 door, u32 pkg = NONE, u8 phase = diag.PH_INTERFACE):
+    string8 meaning = ""
+    if types.prim_named(name) < types.PRIMS: meaning = "a primitive type"
+    else if name == "int" || name == "float" || name == "scalar" || name == "number": meaning = "a numeric category"
+    else if name == "string": meaning = "a string literal's kind"
+    else if name == "string8" || name == "string16" || name == "string32": meaning = "a string type"
+    if #len(meaning) == 0: return false
+    char8 c0 = name[0]
+    if c0 >= 'a' && c0 <= 'z': c0 = char8(u8(c0) - 32)
+    string8 cap = index.hold(#format(pre, c0, name[1..<#len(name)]))
+    string8 head = index.hold(#format("`", name, "` is ", meaning, " wherever a type is written"))
+    string8 help = index.hold(#format("name it something else — `", cap, "`"))
+    string8 why = index.hold(#format("a written type is answered by that spelling before any scope is consulted, so `", name, "` written as a type never reaches a declaration of it"))
+    u8 ph = w.d.phase
+    w.d.phase = phase
+    if door == 0: say(w, f, 0, lo, hi, 414, index.hold(#format(head, ", so this ", what, " `", pre, name, "` could never be named")), help, why)
+    else if door == 1: say(w, f, 0, lo, hi, diag.WRN + 420, index.hold(#format(head, "; only another package reaches this ", what, ", as `", name_of(w, w.p.pkgs[pkg].name), ".", name, "`")), help, why)
+    else if door == 2: say(w, f, 0, lo, hi, diag.WRN + 420, index.hold(#format(head, "; only this ", what, "'s members reach it, written after `", name, ".`")), help, why)
+    else: say(w, f, 0, lo, hi, diag.WRN + 420, index.hold(#format(head, "; only `using ", name, "` and `^", name, "` reach this ", what, ", and `^", name, "` then means the ", what)), help, why)
+    w.d.phase = ph
+    return door == 0
+
+// A token's span, a leading `$` left off.
+u64 name_span(^World w, u32 f, u32 n):
+    u32 k = w.p.files[f].a.main[n]
+    u32 lo = w.p.files[f].t.start[k]
+    u32 hi = w.p.files[f].t.end[k]
+    if lo < hi && w.p.files[f].src[i64(lo)] == '$': lo += 1
+    return (u64(lo) << 32) | u64(hi)
+
+// What passes after `w.d.list[from]` said inside a body only `all_bodies`
+// checked: dropped.
+void drop_quiet(^World w, i64 from):
+    if !w.all_bodies || w.quiet_from >= #len(w.fns): return
+    i64 keep = from
+    for j in from..<#len(w.d.list):
+        diag.Diag d = w.d.list[j]
+        u32 at = d.base + d.start
+        bool quiet = false
+        for i in w.quiet_from..<#len(w.fns):
+            syntax.Ast a = w.p.files[w.fns[i].file].a
+            if w.fns[i].file == d.file && at >= a.lo[w.fns[i].item] && at < a.hi[w.fns[i].item]: quiet = true
+        if quiet: continue
+        w.d.list[keep] = d
+        keep += 1
+    #truncate(w.d.list, keep)
+
+void say_tok(^World w, u32 f, u32 base, u32 n, u16 code, string8 msg, string8 help, string8 why = ""):
+    u32 k = w.p.files[f].a.main[n]
+    if k == NONE: say(w, f, base, w.p.files[f].a.lo[n], w.p.files[f].a.hi[n], code, msg, help, why)
+    else: say(w, f, base, w.p.files[f].t.start[k], w.p.files[f].t.end[k], code, msg, help, why)
+
+// A declaration's signature, resolved once; a cycle answers what is known
+// (a type's own row, its body not yet set).
+u32 resolve(^World w, u32 d):
+    if w.decls[d].state != 0: return w.decls[d].ty
+    w.decls[d].state = 1
+    u32 f = w.decls[d].file
+    u32 n = w.decls[d].node
+    syntax.Ast a = w.p.files[f].a
+    u8 k = w.decls[d].kind
+    u32 ty = NONE
+    bool outer = w.in_foreign
+    w.in_foreign = foreign_kind(k)
+    u32 env = w.env
+    u32 envd = w.envd
+    u32 st = w.self_ty
+    // A package variable's type is its package's interface: its C is written
+    // whenever the package lives, so the headers it reaches stay with it.
+    u32 jn = w.job_now
+    if k == K_VAR: w.job_now = NONE
+    w.env = NONE
+    w.envd = NONE
+    w.self_ty = NONE
+    if templated(w, d): ty = NONE
+    else if k == K_FN || k == K_FFN || k == K_METHOD: ty = fn_type(w, d)
+    else if k == K_FVAR && flex(w, f, a.a[n]):
+        if a.tag[a.b[a.a[n]]] == syntax.T_ARRAY: say(w, f, 0, a.lo[a.a[n]], a.hi[a.a[n]], 1022, flex_dims(name_of(w, w.decls[d].name)), "")
+        else: ty = resolve_type(w, f, a.b[a.a[n]])
+        if ty != NONE: w.fflex[d] = ty
+    else if k == K_FCONST || k == K_FVAR:
+        ty = resolve_type(w, f, a.a[n])
+        if ty != NONE && k == K_FVAR && w.t.resolve(ty) != NONE && w.t.tag[w.t.resolve(ty)] == types.T_PTR && c_array(w, ty):
+            say(w, f, 0, a.lo[n], a.hi[n], 1, "this foreign constant is outside the slice the port builds so far", "")
+            ty = NONE
+    else if k == K_FSTRUCT:
+        ty = w.t.named("#c", index.hold(strings.clone(w.t.text(c_name(w, d)))))
+        w.decls[d].ty = ty
+        w.type_decl[ty] = d
+        w.t.ftag[ty] = tstr(w, index.hold(#format(name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", name_of(w, w.decls[d].name))))
+        u32 cnn = a.list(a.b[n])[0]
+        if cnn != NONE && a.main[cnn] != NONE && strings.starts_with(w.t.text(c_name(w, d)), "union "):
+            say(w, f, 0, a.lo[cnn], a.hi[cnn], 1024, index.hold(#format("`", w.p.files[f].src[i64(a.lo[cnn])..<i64(a.hi[cnn])], "` names a C **union**, and a `type` body says its members are laid out one after another")), index.hold(#format("write `cunion ", name_of(w, w.decls[d].name), ": (…)` instead")), "One after another is what the emitted layout assertions would check, and what C would refuse. A `cunion`'s members share one storage, are read and written by name, and are checked against the header by a union's own assertions")
+        type_body(w, d, ty)
+    else if k == K_FTYPE:
+        ty = w.t.opaque(index.hold(strings.clone(w.t.text(c_name(w, d)))))
+    else if k == K_ENUM && a.tag[n] == syntax.N_F_ENUM:
+        ty = w.t.named("#c", index.hold(strings.clone(w.t.text(c_name(w, d)))))
+        w.decls[d].ty = ty
+        reach_foreign(w, f, w.decls[d].block)
+        if ty in w.type_decl:
+            u32 o = d
+            try o = w.type_decl[ty] else: pass
+            u32 hi = d if d > o else o
+            u32 lo = o if d > o else d
+            w.type_decl[ty] = lo
+            say_tok(w, w.decls[hi].file, 0, w.decls[hi].node, 1003, index.hold(#format("`", name_of(w, w.decls[hi].name), "` and `", name_of(w, w.decls[lo].name), "` are two Dado names for the one C type `", w.t.text(c_name(w, d)), "`; the emitted C uses the C name, so it cannot tell them apart")), "")
+        else: w.type_decl[ty] = d
+        fenum_body(w, d, ty)
+    else if k == K_UNION && w.decls[d].block != NONE && a.tag[w.decls[d].block] == syntax.N_FOREIGN:
+        ty = w.t.named("#c", index.hold(strings.clone(w.t.text(c_name(w, d)))))
+        w.decls[d].ty = ty
+        w.type_decl[ty] = d
+        reach_foreign(w, f, w.decls[d].block)
+        union_body(w, d, ty)
+    else if k == K_TYPE || k == K_ENUM || k == K_UNION:
+        bool sd = ds_at(w, f, n)
+        bool se = k == K_ENUM && sd
+        ty = w.t.named(name_of(w, w.p.pkgs[w.decls[d].pkg].name), s_qual(w, d) if sd else name_of(w, w.decls[d].name))
+        w.decls[d].ty = ty
+        w.type_decl[ty] = d
+        if se: s_enum_body(w, d, ty)
+        else if k == K_ENUM: enum_body(w, d, ty)
+        else if k == K_UNION: union_body(w, d, ty)
+        else:
+            type_body(w, d, ty)
+            conform(w, d, ty)
+    else if k == K_CONST || k == K_VAR:
+        ty = global_type(w, d)
+    else if k == K_CLASS: ty = s_class_row(w, d)
+    else if k == K_TRAIT && st_of_decl(w, d) != NONE: ty = w.straits[st_of_decl(w, d)].ty
+    else if k == K_TRAIT:
+        trait_head(w, d)
+        string8 pn = name_of(w, w.p.pkgs[w.decls[d].pkg].name) if w.p.pkgs[w.decls[d].pkg].name != NONE else "main"
+        ty = w.t.make(types.T_TRAIT, tstr(w, index.hold(#format(pn, ".", name_of(w, w.decls[d].name)))), 0, nil)
+        w.type_decl[ty] = d
+    w.in_foreign = outer
+    w.job_now = jn
+    w.env = env
+    w.envd = envd
+    w.self_ty = st
+    w.decls[d].ty = ty
+    w.decls[d].state = 2
+    return ty
+
+// ERR0206: a pack is the last parameter, with no default.
+private void pack_order(^World w, u32 f, []u32 ps):
+    syntax.Ast a = w.p.files[f].a
+    u32 pack = NONE
+    for q in ps:
+        if q == NONE: continue
+        if pack != NONE:
+            string8 why = "; no argument list says where the first pack stops and the second starts, so there is nothing to decide it by" if a.tag[q] == syntax.N_PARAM_V else "; a positional call fills slots left to right, so no argument could ever reach it"
+            say(w, f, 0, a.lo[q], a.hi[q], 206, index.hold(#format("`", w.p.spell(f, pack), "` collects the rest of the argument list, so nothing can follow it — `", w.p.spell(f, q), "` does", why)), "")
+            return
+        if a.tag[q] != syntax.N_PARAM_V: continue
+        if a.b[q] != NONE: say(w, f, 0, a.lo[q], a.hi[q], 206, index.hold(#format("`", w.p.spell(f, q), "` collects the rest of the argument list, and a call that writes nothing for it already passes the empty window — so a default has nothing to default to; delete the `= ...`")), "")
+        pack = q
+
+// A function's or method's FUNC row, under the current instance.
+u32 fn_type(^World w, u32 d):
+    u32 f = w.decls[d].file
+    u32 n = w.decls[d].node
+    syntax.Ast a = w.p.files[f].a
+    u8 k = w.decls[d].kind
+    bool outer = w.in_foreign
+    w.in_foreign = foreign_kind(k)
+    []u32 ks = a.list(a.b[n])
+    i64 first = 3 if k == K_FFN else 6
+    if k != K_FFN: pack_order(w, f, ks[first..<#len(ks)])
+    u32 st = w.self_ty
+    if k == K_METHOD:
+        w.self_ty = resolve(w, w.decls[d].block)
+        if st_of_decl(w, w.decls[d].block) != NONE: w.self_ty = w.straits[st_of_decl(w, w.decls[d].block)].self_ty
+        if w.envd == w.decls[d].block: w.self_ty = sig(w, w.envd, w.env)
+    bool sk = k == K_METHOD && (w.decls[w.decls[d].block].kind == K_CLASS || st_of_decl(w, w.decls[d].block) != NONE)
+    u32 ret = u32(types.P_VOID)
+    bool io = w.inc_ok
+    w.inc_ok = true
+    if ks[0] != NONE: ret = resolve_type(w, f, ks[0])
+    w.inc_ok = io
+    if ks[0] != NONE && ret != NONE && w.decls[d].state == 1: _ = inc_refuse(w, f, a.lo[ks[0]], a.hi[ks[0]], ret, "a return type")
+    if ks[0] != NONE && ret != NONE && w.decls[d].state == 1 && k == K_FN: _ = contract_refused(w, f, 0, a.lo[ks[0]], a.hi[ks[0]], ret, "a return type")
+    if sk && (a.a[n] & syntax.F_ASYNC) != 0 && w.p.spell(f, n) != "init" && ret != NONE && !(a.tag[ks[0]] == syntax.T_NAME && w.p.spell(f, ks[0]) == "Self"): ret = sa_type(w, ret)
+    u32 fl = types.F_PLAIN if (a.a[n] & syntax.F_FAILABLE) != 0 else types.F_NONE
+    // `!Box(T) f(…)`: the mark the parser gave a generic head is the function's.
+    u32 et = NONE
+    if ks[0] != NONE && a.tag[ks[0]] == syntax.T_FN && instance_head(w, f, ks[0]):
+        if (a.a[ks[0]] & syntax.F_FAILABLE) != 0: fl = types.F_PLAIN
+        u32 en = a.list(a.b[ks[0]])[1]
+        if en != NONE:
+            et = resolve_type(w, f, en)
+            if et == NONE || !failure_type(w, d, f, en, et, false): ret = NONE
+            fl = types.F_TYPED
+    if fl != types.F_NONE && ks[1] != NONE:
+        et = resolve_type(w, f, ks[1])
+        if et == NONE || !failure_type(w, d, f, ks[1], et, k == K_FFN): ret = NONE
+        fl = types.F_TYPED
+    if k == K_FFN && c_array(w, ret):
+        say(w, f, 0, a.lo[ks[0]], a.hi[ks[0]], 1, "this foreign result is outside the slice the port builds so far", "")
+        ret = NONE
+    ref []u32 ps
+    bool bad = false
+    if et != NONE: ps = #append(ps, et)
+    if k == K_METHOD && (ks[3] != NONE || sk):
+        u32 self_ = w.self_ty
+        if self_ == NONE: bad = true
+        bool by_ptr = ks[3] == NONE || a.a[ks[3]] == 1 || sk
+        ps = #append(ps, w.t.ptr_of(self_) if by_ptr && !bad else self_)
+    u32 dflt = NONE
+    w.said_export = false
+    for i in first..<#len(ks):
+        u32 q = ks[i]
+        if q == NONE || kind_at(&a, ks[first..<#len(ks)], i - first): continue
+        if a.tag[q] == syntax.N_PARAM && a.b[q] != NONE: dflt = q
+        else if a.tag[q] == syntax.N_PARAM && dflt != NONE && k == K_FN && w.decls[d].state == 1:
+            say(w, f, 0, a.lo[q], a.hi[q], 601, index.hold(#format("`", w.p.spell(f, q), "` has no default and `", w.p.spell(f, dflt), "` before it does; defaults are trailing-only, because a positional call fills slots left to right and could not say which one it skipped")), "")
+        if k == K_FFN && a.tag[q] == syntax.N_PARAM_V:
+            say(w, f, 0, a.lo[q], a.hi[q], 1009, index.hold(#format("`", w.p.spell(f, q), "` is a Dado variadic and this signature crosses to C\x1fA pack is a `[]T` header the caller builds, and no C header ever declared a parameter of one. `...` is C's own spelling, and this is where it goes\x1ewrite `...` if the function C declares is variadic, and otherwise the fixed arguments it is called with")), "")
+            bad = true
+        w.inc_ok = true
+        u32 pt = w.any if a.tag[q] == syntax.N_PARAM_V else resolve_type(w, f, a.a[q])
+        w.inc_ok = io
+        if pt != NONE && a.tag[q] == syntax.N_PARAM && a.a[q] != NONE && w.decls[d].state == 1: _ = inc_refuse(w, f, a.lo[q], a.hi[q], pt, "a parameter")
+        if pt != NONE && a.tag[q] == syntax.N_PARAM && a.a[q] != NONE && w.decls[d].state == 1 && k == K_FN: _ = contract_refused(w, f, 0, a.lo[q], a.hi[q], pt, "a parameter")
+        if a.tag[q] == syntax.N_PARAM && k == K_FN && w.decls[d].state == 1: detached(w, f, a.a[q], "")
+        if a.tag[q] == syntax.N_PARAM_V && a.tag[a.a[q]] != syntax.T_PACK:
+            pt = resolve_type(w, f, a.a[q])
+            if pt != NONE: pt = w.t.slice_of(pt)
+        if a.tag[q] == syntax.N_PARAM && a.a[q] == NONE:
+            if #len(ps) > 0: pt = ps[#len(ps) - 1]
+            else:
+                string8 pn = w.p.spell(f, q)
+                say_tok(w, f, 0, q, 401, index.hold(#format("`", pn, "` writes no type, and the grouping shorthand takes the type of the parameter before it — this is the first, so there is none to take; write `", pn, "`'s type")), "")
+        if pt != NONE && holds_kind(w, pt, 0):
+            say(w, f, 0, a.lo[q], a.hi[q], 507, KIND_HELD("parameter"), "")
+            pt = NONE
+        if pt == NONE: bad = true
+        bool exp = k == K_FN && (a.a[n] & syntax.F_VIS) == syntax.VIS_EXPORT
+        u32 tv = pt
+        if pt != NONE && w.t.resolve(pt) != NONE && w.t.tag[w.t.resolve(pt)] == types.T_SLICE: tv = w.t.a[w.t.resolve(pt)]
+        if pt != NONE && (k == K_FFN || exp) && is_trait(w, tv):
+            string8 im = some_implementer(w, trait_decl(w, tv))
+            string8 msg = index.hold(#format("parameter ", #len(ps), " of `", name_of(w, w.decls[d].name), "` is `", shown(w, pt), "`, which ", "a `foreign` function" if k == K_FFN else "an exported function", " cannot take"))
+            string8 help = index.hold(#format("cross with the implementer's own type (`^", im, "`) instead"))
+            if k == K_FFN: say(w, f, 0, a.lo[q], a.hi[q], 1006, msg, help)
+            else: say_tok(w, f, 0, n, 1006, msg, help)
+            bad = true
+        if pt != NONE && (k == K_FFN || exp) && w.t.resolve(pt) != NONE && w.t.tag[w.t.resolve(pt)] == types.T_REF:
+            u32 h = w.t.a[w.t.resolve(pt)]
+            string8 lent = shown(w, h) if w.t.resolve(h) != NONE && w.t.tag[w.t.resolve(h)] == types.T_SLICE else index.hold(#format("^", shown(w, h)))
+            string8 msg = index.hold(#format("parameter ", #len(ps), " of `", fbound_name(w, d), "` is `", shown(w, pt), "`, which ", "a `foreign` function" if k == K_FFN else "an exported function", " cannot take"))
+            string8 help = index.hold(#format("lend `", lent, "` instead — a view crosses, and the capability stays here"))
+            string8 why = "a reference controls a lifetime, and a lifetime is not something C can be handed. That refusal is what keeps a reference's layout the compiler's own, so a slot can be added to it later without breaking an ABI anybody depends on"
+            if k == K_FFN: say(w, f, 0, a.lo[q], a.hi[q], 1006, msg, help, why)
+            else: say_tok(w, f, 0, n, 1006, msg, help, why)
+            bad = true
+        if pt != NONE && exp && is_soa(w, pt):
+            say_tok(w, f, 0, n, 1006, index.hold(#format("parameter ", #len(ps), " of `", name_of(w, w.decls[d].name), "` is `", shown(w, pt), "`, which an exported function cannot take")), "hand C the element type, or a `^T` and a count", "a `#soa` shape is laid out as one run per slot, so a caller handed one would be reading a shape whose bytes are not where a C array's are — and that is true however the shape is named")
+            bad = true
+        u32 pfr = w.t.resolve(pt) if pt != NONE else NONE
+        if k == K_FFN && pfr != NONE && w.t.tag[pfr] == types.T_FUNC && w.t.b[pfr] != types.F_NONE:
+            say(w, f, 0, a.lo[q], a.hi[q], 1030, index.hold(#format("parameter ", #len(ps), " of `", fbound_name(w, d), "` is `", shown(w, pt), "`, which names a failable function type, and a `foreign` signature never names one")), "hand C a plain function reference, written in Dado, that decides what a failure means", "C would call through it by its own conventions, which the compiler cannot check against the `?` promise, and the header has no mark on a function pointer to ask for")
+            bad = true
+        if exp && pfr != NONE && w.t.tag[pfr] == types.T_FUNC && w.t.b[pfr] != types.F_NONE && !w.said_export && w.decls[d].state == 1:
+            say_tok(w, f, 0, n, 1, index.hold(#format("`", name_of(w, w.decls[d].name), "` takes or returns a failable function type, and exporting one is not built")), "take a plain function reference, or export the failable functions themselves", "The emitted header marks a failable function's prototype and has no mark for a function pointer, so a binding read back from it would see a plain reference taking a pointer")
+            w.said_export = true
+            bad = true
+        if k == K_FFN && c_array(w, pt):
+            say(w, f, 0, a.lo[q], a.hi[q], 1, "this foreign parameter is outside the slice the port builds so far", "")
+            bad = true
+        ps = #append(ps, pt)
+    w.in_foreign = outer
+    w.self_ty = st
+    return NONE if bad || ret == NONE else w.t.func(ret, fl, ps)
+
+// Whether written `R(…)` names a generic type's instance.
+bool instance_head(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u32 h = a.list(a.b[n])[0]
+    if h == NONE || a.tag[h] != syntax.T_NAME && a.tag[h] != syntax.T_PATH: return false
+    u32 d = lookup(w, w.p.files[f].pkg, w.p.sym(f, h)) if a.tag[h] == syntax.T_NAME else using_decl(w, f, h)
+    return d != NONE && w.decls[d].kind == K_TYPE && templated(w, d)
+
+// A spliced (embedded) member: `outer` holds `inner`'s slots from `at`.
+type Embed:
+    u32 outer
+    u32 inner
+    u32 at
+
+// A `type`'s body: an alias, or members (one member is its own slot, A2;
+// an unnamed one splices its type's slots in). ERR0501, ERR0507.
+private void type_body(^World w, u32 d, u32 ty):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 n = w.decls[d].node
+    u32 body = a.list(a.b[n])[2]
+    string8 nm = s_qual(w, d)
+    u32 shape = NONE
+    ref []u32 names
+    if body == NONE: shape = w.t.tuple(nil)
+    else if a.tag[body] == syntax.N_ALIAS:
+        bool io = w.inc_ok
+        w.inc_ok = true
+        shape = resolve_type(w, f, a.a[body])
+        w.inc_ok = io
+        u32 sr = w.t.resolve(shape) if shape != NONE else NONE
+        if w.decls[d].kind == K_FSTRUCT && sr == u32(types.P_VOID):
+            say(w, f, 0, a.lo[n], a.hi[n], 1001, index.hold(#format("`", nm, "` restates `void`, which is the absence of a value and has no width to claim; an opaque `type ", nm, "` is how a C type Dado knows nothing about is declared")), "")
+            shape = NONE
+        else if w.decls[d].kind == K_FSTRUCT && sr != NONE && w.t.tag[sr] != types.T_PRIM && w.t.tag[sr] != types.T_CSCALAR && fs_row(w, shape) == NONE:
+            say(w, f, 0, a.lo[n], a.hi[n], 1001, index.hold(#format("`", nm, "` aliases ", shown(w, shape), ", which is neither a member list nor a primitive, so there is nothing the C compiler could be asked to check\x1fA transparent foreign type declares what C has for it: a member list when the C type is a struct, or a **primitive** when it is a scalar typedef\x1erestate it as the primitive C's typedef is — `i64` for a `time_t`, `u64` for a handle — or as its member list")), "")
+            shape = NONE
+        // `type Hound: Dog` names Dog's slots as Dog does.
+        u32 x = shape
+        for _ in 0..<64:
+            if x == NONE || x >= u32(w.t.count()) || w.t.tag[x] != types.T_NAMED: break
+            []u32 xn = w.t.slot_names(x)
+            if #len(xn) > 0: break
+            x = w.t.body[x]
+        if x != NONE && x < u32(w.t.count()) && w.t.tag[x] == types.T_NAMED:
+            for sn in w.t.slot_names(x):
+                names = #append(names, sn)
+    else if a.tag[body] == syntax.N_MEMBERS:
+        ref []u32 slots
+        ref []u32 from
+        bool ok = true
+        bool fs = w.decls[d].kind == K_FSTRUCT
+        ref []string8 cnames
+        ref []string8 vnames
+        u32 last = NONE
+        for m in a.list(a.b[body]):
+            if m != NONE: last = m
+        ref []u32 seen_nm
+        for m in a.list(a.b[body]):
+            if m == NONE: continue
+            []u32 mk = a.list(a.b[m])
+            u32 mt = NONE
+            if a.main[m] == NONE && a.tag[mk[0]] == syntax.T_TUPLE:
+                // An anonymous member: C11's, lifting its members' names.
+                if !anon_member(w, ty, f, mk[0], fs, nm, &slots, &names, &from, &seen_nm): ok = false
+                continue
+            if fs && a.main[m] != NONE && a.tag[mk[0]] == syntax.T_TUPLE && a.a[mk[0]] == 1:
+                say(w, f, 0, a.lo[m], a.hi[m], 1024, index.hold(#format("`cunion (…)` written as a member of `", nm, "` is C11's **anonymous** union, so `", w.p.spell(f, m), "` names something C did not")), "declare the union with `cunion <name>: (…)` and write it as an ordinary member", "It has no name, and C reaches its members through `nu_named` itself")
+                ok = false
+                continue
+            if a.main[m] != NONE && !anon_seen(w, f, m, nm, &seen_nm):
+                ok = false
+                continue
+            if fs && flex(w, f, mk[0]):
+                if m != last:
+                    say(w, f, 0, a.lo[m], a.hi[m], 1022, index.hold(#format("`[_]T` is an array whose length is not in the type, so it is the **last** member of `", nm, "` and C has no offset for anything written after it. Move it to the end, or give this member the count the header states")), "")
+                    ok = false
+                    continue
+                if a.tag[a.b[mk[0]]] == syntax.T_ARRAY:
+                    say(w, f, 0, a.lo[m], a.hi[m], 1022, flex_dims(nm), "")
+                    ok = false
+                    continue
+                u32 et = resolve_type(w, f, a.b[mk[0]])
+                if et == NONE || !c_member(w, d, m, &cnames, &vnames):
+                    ok = false
+                    continue
+                u32 cn = tstr(w, w.p.spell(f, m))
+                if mk[1] != NONE && a.main[mk[1]] != NONE:
+                    ref []char8 cv
+                    u32 st = a.main[mk[1]]
+                    syntax.string_value(w.p.files[f].src[i64(w.p.files[f].t.start[st])..<i64(w.p.files[f].t.end[st])], &cv)
+                    cn = tstr(w, index.hold(cv))
+                w.ftail[ty] = (u64(tstr(w, w.p.spell(f, m))) << 32) | u64(cn)
+                w.fnominal[ty] = 1
+                w.ftail_el[ty] = et
+                continue
+            if mk[2] != NONE && !fs:
+                say(w, f, 0, a.lo[mk[2]], a.hi[mk[2]], 1023, "`: W` gives a member the width in bits C lays it out in, and only a member list restating C inside a `foreign` block carries one", "drop the `: W`, or restate the C declaration inside a `foreign` block")
+                ok = false
+                continue
+            if fs && mk[2] != NONE && c_char(w, f, mk[0]):
+                say(w, f, 0, a.lo[mk[2]], a.hi[mk[2]], 1023, index.hold(#format("a width says how many bits C spends on a member, and `", w.p.files[f].src[i64(a.lo[mk[0]])..<i64(a.hi[mk[0]])], "` is not a type C lays out in bits")), index.hold(#format("declare a bitfield of `", nm, "` with an integer or a `bool`")))
+                ok = false
+                continue
+            if a.tag[mk[0]] == syntax.T_CHANNEL: mt = chan_type(w, d, f, mk[0], index.hold(#format(name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", nm, ".", w.p.spell(f, m))))
+            else if fs && a.main[m] != NONE && a.tag[mk[0]] == syntax.T_TUPLE && a.a[mk[0]] == 0: mt = c_named_list(w, f, mk[0], index.hold(#format(name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", nm, ".", w.p.spell(f, m))))
+            else:
+                // An `@incomplete` slot is said where the shape is held.
+                bool io2 = w.inc_ok
+                w.inc_ok = !fs
+                mt = resolve_type(w, f, mk[0])
+                w.inc_ok = io2
+            if mt == NONE:
+                ok = false
+                continue
+            if w.t.bare(mt) in w.ftail:
+                string8 inner = w.p.files[f].src[i64(a.lo[mk[0]])..<i64(a.hi[mk[0]])]
+                say(w, f, 0, a.lo[m], a.hi[m], 1022, index.hold(#format("`", inner, "` ends in a flexible array member, so C refuses it as a member of another struct")), index.hold(#format("hold it as `^", inner, "`", " — the pointer is how a flexible-array struct is reached at all" if fs else "")), index.hold(#format("Its `sizeof` is the header, and whatever `", nm, "` declared after it would be laid out on top of the tail")))
+                ok = false
+                continue
+            if fs && mk[2] != NONE:
+                w.fnominal[ty] = 1
+                i64 bw = bitfield(w, f, m, mt, nm)
+                if bw < 0:
+                    ok = false
+                    continue
+                if a.main[m] == NONE || w.p.spell(f, m) == "_": continue
+                w.cwidth[(u64(ty) << 32) | u64(#len(slots))] = u32(bw)
+            if fs && a.main[m] == NONE:
+                say(w, f, 0, a.lo[m], a.hi[m], 1001, "every slot of a transparent foreign type is named, because the emitted C reaches it by the name the header gave it; embedding has no C spelling", "")
+                ok = false
+                continue
+            if fs && !c_member(w, d, m, &cnames, &vnames):
+                ok = false
+                continue
+            if fs && mk[3] != NONE:
+                say(w, f, 0, a.lo[mk[3]], a.hi[mk[3]], 1026, "`@align(n)` on a member of a transparent `foreign` type, whose layout is the C header's\x1f`@align(n)` states where an object's storage begins, and the storage of a transparent `foreign` type is laid out the way the C header laid it out — so the alignment is the header's to state and Dado's to restate at most", "declare the member without it; where the alignment matters, give the storage a Dado declaration of its own and put the attribute there")
+                ok = false
+                continue
+            if fs && a.tag[mk[0]] == syntax.T_ARRAY && !c_array(w, mt): w.carray[(u64(ty) << 32) | u64(#len(slots))] = 1
+            if fs && a.tag[mk[0]] == syntax.T_ARRAY && a.tag[a.b[mk[0]]] == syntax.T_ARRAY && c_array(w, mt) && !inner_c_array(w, mt): w.cinner[(u64(ty) << 32) | u64(#len(slots))] = 1
+            if !fs && mk[3] != NONE:
+                u64 al = align_n(w, f, mk[3])
+                if al == 0:
+                    ok = false
+                    continue
+                mt = w.t.make(types.T_ALIGNED, u32(al), mt, nil)
+            if fs && mk[1] != NONE && a.main[mk[1]] != NONE:
+                ref []char8 cv
+                u32 st = a.main[mk[1]]
+                syntax.string_value(w.p.files[f].src[i64(w.p.files[f].t.start[st])..<i64(w.p.files[f].t.end[st])], &cv)
+                w.cmember[(u64(ty) << 32) | u64(#len(slots))] = tstr(w, index.hold(cv))
+            if a.main[m] != NONE:
+                slots = #append(slots, mt)
+                names = #append(names, tstr(w, w.p.spell(f, m)))
+                from = #append(from, NONE)
+                continue
+            w.embeds = #append(w.embeds, Embed(ty, mt, u32(#len(slots))))
+            []u32 sn = w.t.slot_names(mt)
+            []u32 ss = w.t.slots(mt)
+            for i in 0..<#len(ss):
+                slots = #append(slots, ss[i])
+                names = #append(names, sn[i] if i < #len(sn) else tstr(w, ""))
+                from = #append(from, mt)
+        for i in 0..<#len(names):
+            for j in 0..<i:
+                if names[i] != names[j] || from[i] == NONE || from[j] == NONE || from[i] == from[j] || w.t.text(names[i]) == "": continue
+                bool own = false
+                for k in 0..<#len(names):
+                    if names[k] == names[i] && from[k] == NONE: own = true
+                if own: continue
+                string8 sl = w.t.text(names[i])
+                say_tok(w, f, 0, n, 407, index.hold(#format("`", named(w, from[j]), "` and `", named(w, from[i]), "` are both embedded in `", nm, "` and both contribute `", sl, "`, so the unqualified name has no winner")), index.hold(#format("rename one of the contributing slots, name `", sl, "` on `", nm, "` itself so it wins outright, or embed only one of the two")))
+        if ok && fs && #len(slots) == 0:
+            say(w, f, 0, a.lo[n], a.hi[n], 1001, index.hold(#format("`", nm, "` declares no slots, and C has no empty struct")), "")
+            return
+        if ok && #len(slots) == 0:
+            say(w, f, 0, a.lo[body], a.hi[body], 506, "a shape with no slots has no value to hold, and no representation to give one; `void` is how a function returns nothing", "")
+            return
+        if ok: shape = slots[0] if #len(slots) == 1 else w.t.tuple(slots)
+        if shape != NONE && leaves(w, shape) > 1048576:
+            say(w, f, 0, a.lo[body], a.hi[body], 526, index.hold(#format("this shape holds ", leaves(w, shape), " slots, and 1048576 is the most one shape may have")), "hold the big part behind a pointer, or split it across a call")
+            return
+    if shape != NONE && (a.a[n] & syntax.F_DISTINCT) != 0: shape = w.t.distinct_of(index.hold(#format(name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", nm)), shape)
+    ref []u32 seen
+    if shape != NONE && shape != ty && unbroken(w, shape, ty, &seen):
+        // Rust's `report_pointer_cycle`: pointers and wrappers back to itself, no struct between.
+        ref []u32 ms
+        if body != NONE && a.tag[body] == syntax.N_MEMBERS:
+            for m in a.list(a.b[body]):
+                if m != NONE: ms = #append(ms, m)
+        string8 msg = ""
+        string8 help = ""
+        if #len(ms) == 1:
+            u32 st = a.list(a.b[ms[0]])[0]
+            string8 sty = w.p.files[f].src[i64(a.lo[st])..<i64(a.hi[st])]
+            string8 wr = sty
+            if a.main[ms[0]] != NONE: wr = index.hold(#format(sty, " ", w.p.spell(f, ms[0])))
+            msg = index.hold(#format("`", nm, "` has one slot, so it is `", sty, "` and reaches itself with no tuple in the way, so it has no C name"))
+            help = index.hold(#format("give `", nm, "` a second slot, so it is a struct a pointer can point at: `type ", nm, ": (i32 count, ", wr, ")`"))
+        else:
+            string8 sty = named(w, shape)
+            if body != NONE && a.tag[body] == syntax.N_ALIAS: sty = w.p.files[f].src[i64(a.lo[a.a[body]])..<i64(a.hi[a.a[body]])]
+            msg = index.hold(#format("`", nm, "` is `", sty, "` and reaches itself with no tuple in the way, so it has no C name"))
+            help = index.hold(#format("make `", nm, "` a tuple with a second slot, so it is a struct a pointer can point at: `type ", nm, ": (i32 count, ", sty, " next)`"))
+        say_tok(w, f, 0, n, 507, msg, help)
+        w.t.define(ty, shape, names)
+        return
+    if shape == ty:
+        say_tok(w, f, 0, n, 501, index.hold(#format("`", nm, "` resolves only to itself")), "")
+        return
+    if shape != NONE && holds_self(w, shape, ty, 0):
+        if ty in w.iorigin:
+            try u64 o = w.iorigin[ty] else: return
+            u32 of = u32(o >> 32)
+            u32 on = u32(o & 0xFFFFFFFF)
+            string8 g = binder_use(w, d)
+            say(w, of, 0, w.p.files[of].a.lo[on], w.p.files[of].a.hi[on], 507, index.hold(#format("`", named(w, ty), "` holds itself through a slot, with no pointer in the way, so C has no struct to write and no size to give one: a pointer is what bounds a recursion, in a generic body as in any other")), index.hold(#format("hold the next one behind a pointer in `", nm, "`'s body — `^", g, "` for one, `ref []", g, "` for many — as `type List($T): (T head, ^List(T) tail)` does")))
+            return
+        string8 h = index.hold(#format("a script holds no pointer: make `", nm, "` a class, which is held by reference"))
+        if !ds_at(w, f, n): h = index.hold(#format("hold the next one behind a pointer — `^", nm, "` or `ref ", nm, "` in the slot, or `ref []", nm, "` for a run, as `type Node: (i32, ^Node)` does"))
+        say_tok(w, f, 0, n, 507, index.hold(#format("`", nm, "` holds itself through a slot, with no pointer in the way, so C has no struct to write and no size to give one: a pointer is what bounds a recursion")), h)
+        return
+    if shape != NONE: w.t.define(ty, shape, names)
+    if shape != NONE && body != NONE && a.tag[body] == syntax.N_MEMBERS: collisions(w, d, ty, names)
+
+const [37]string8 C_KEYWORDS = ("auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while", "_Bool", "_Complex", "_Imaginary")
+
+// A foreign type's member `m` by its C name: ERR1014 (a C keyword), ERR1018
+// (two slots, one C member).
+private bool c_member(^World w, u32 d, u32 m, ^ref []string8 cnames, ^ref []string8 vnames):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 cn = a.list(a.b[m])[1]
+    string8 vn = w.p.spell(f, m)
+    string8 c = vn
+    u32 st = NONE
+    if cn != NONE && a.main[cn] != NONE:
+        st = a.main[cn]
+        ref []char8 v
+        syntax.string_value(w.p.files[f].src[i64(w.p.files[f].t.start[st])..<i64(w.p.files[f].t.end[st])], &v)
+        c = index.hold(v)
+    string8 tn = name_of(w, w.decls[d].name)
+    for k in C_KEYWORDS:
+        if k != c: continue
+        string8 why = index.hold(#format("C99 §6.4.1 reserves the keyword, and the emitted `offsetof(", tn, ", ", c, ")` would be a syntax error in a line nobody typed. A member C cannot name is one Dado cannot restate"))
+        if st != NONE: say(w, f, 0, w.p.files[f].t.start[st], w.p.files[f].t.end[st], 1014, index.hold(#format("`@c(\"", c, "\")` names the C member this slot is, and C reserves `", c, "` as a keyword, so no header has a member of that name")), "declare the type opaque", why)
+        else: say_tok(w, f, 0, m, 1014, index.hold(#format("this slot reaches C by its written name, and C reserves `", c, "` as a keyword, so no header declares a member `", c, "`")), index.hold(#format("give the slot the name the header really uses, or declare the type opaque; `@c(\"", c, "\")` is refused for the same reason")), why)
+        return false
+    for i in 0..<#len(cnames^):
+        if cnames^[i] != c || vnames^[i] == vn: continue
+        string8 msg = index.hold(#format("`", vnames^[i], "` and `", vn, "` are two slots of `", tn, "` and both name the C member `", c, "`\x1fThe emitted C reaches a slot by the name the header gave it, so it cannot tell them apart — and a header cannot have declared `", c, "` twice either\x1erestate one slot per member of the header"))
+        if cn != NONE: say(w, f, 0, a.lo[cn], a.hi[cn], 1018, msg, "")
+        else: say(w, f, 0, a.lo[m], a.hi[m], 1018, msg, "")
+        return false
+    cnames^ = #append(cnames^, c)
+    vnames^ = #append(vnames^, vn)
+    return true
+
+// The methods written in type declaration `d`'s body.
+private []u32 own_methods(^World w, u32 d):
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    []u32 ms = a.list(a.b[w.decls[d].node])
+    return ms[3..<#len(ms)]
+
+u32 method_named(^World w, u32 d, string8 s):
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    for m in own_methods(w, d):
+        if m != NONE && a.tag[m] == syntax.N_FN && w.p.spell(w.decls[d].file, m) == s: return m
+    return NONE
+
+// ERR0534 / ERR0407: a method named like a slot, or brought by two embeds.
+private void collisions(^World w, u32 d, u32 ty, []u32 names):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    string8 nm = name_of(w, w.decls[d].name)
+    for m in own_methods(w, d):
+        if m == NONE || a.tag[m] != syntax.N_FN: continue
+        string8 s = w.p.spell(f, m)
+        for x in names:
+            if w.t.text(x) == s: say_tok(w, f, 0, m, 534, index.hold(#format("`", s, "` is a slot of `", nm, "` and a method of it, and `v.", s, "` has to answer exactly one of them")), index.hold(#format("rename one — the slot, or the method (`", s, "_of`, `get_", s, "`)")))
+    ref []u32 ins
+    for e in w.embeds:
+        if e.outer == ty && e.inner in w.type_decl:
+            try u32 x = w.type_decl[e.inner] else: continue
+            ins = #append(ins, x)
+    for i in 0..<#len(ins):
+        string8 inm = name_of(w, w.decls[ins[i]].name)
+        ref []string8 bi = brought(w, ins[i])
+        for s in bi:
+            for j in i + 1..<#len(ins):
+                ref []string8 bj = brought(w, ins[j])
+                bool both = false
+                for t in bj:
+                    if t == s: both = true
+                #delete(bj)
+                if !both: continue
+                string8 jnm = name_of(w, w.decls[ins[j]].name)
+                say_tok(w, f, 0, w.decls[d].node, 407, index.hold(#format("`", nm, "` embeds `", inm, "` and `", jnm, "`, and both bring a method `", s, "`, so `v.", s, "()` would have two answers")), index.hold(#format("hold one of them as a named member (`", jnm, " inner`) so its methods are reached through it, or rename one of the two `", s, "` methods")))
+            if member_named(w, d, s) != NONE: say_tok(w, f, 0, w.decls[d].node, 407, index.hold(#format("`", nm, "` embeds `", inm, "`, which brings a method `", s, "`, and `", s, "` is also a slot of `", nm, "`, so `v.", s, "` would name two things")), index.hold(#format("rename the slot `", s, "`, or hold `", inm, "` as a named member (`", inm, " inner`) so its methods are reached through it")))
+            u32 own = method_named(w, d, s)
+            if own != NONE: say_tok(w, f, 0, own, 534, index.hold(#format("`", nm, "` embeds `", inm, "`, which brings a method `", s, "`, and writes a method `", s, "` of its own; an own method hides nothing, so `v.", s, "()` would have two answers")), index.hold(#format("rename `", nm, ".", s, "`, or hold `", inm, "` as a named member (`", inm, " inner`) so its method is reached as `v.inner.", s, "()`")))
+
+// The methods declaration `d` brings: its own, then its defaults.
+private ref []string8 brought(^World w, u32 d):
+    ref []string8 out
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    for m in own_methods(w, d):
+        if m != NONE && a.tag[m] == syntax.N_FN: out = #append(out, w.p.spell(w.decls[d].file, m))
+    for k in 0..<#len(w.decls):
+        if w.decls[k].kind != K_METHOD || w.decls[k].block != d || w.decls[k].value == NONE: continue
+        try u32 m = w.methods[(u64(d) << 32) | u64(w.decls[k].name)] else: continue
+        if m == u32(k): out = #append(out, name_of(w, w.decls[k].name))
+    return out
+
+private u32 member_named(^World w, u32 d, string8 s):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    for m in a.list(a.b[a.list(a.b[w.decls[d].node])[2]]):
+        if m != NONE && a.main[m] != NONE && w.p.spell(f, m) == s: return m
+    return NONE
+
+// Whether `x` holds `ty` by value, through tuples and declared names.
+private bool holds_self(^World w, u32 x, u32 ty, i64 depth):
+    if x == ty: return true
+    if x == NONE || depth > 64: return false
+    u8 g = w.t.tag[x]
+    if g == types.T_NAMED: return holds_self(w, w.t.body[x], ty, depth + 1)
+    if g != types.T_TUPLE: return false
+    for e in w.t.list(x):
+        if holds_self(w, e, ty, depth + 1): return true
+    return false
+
+// The parameter nodes of a function declaration.
+[]u32 params(^World w, u32 d):
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    []u32 ks = a.list(a.b[w.decls[d].node])
+    return ks[3..<#len(ks)] if w.decls[d].kind == K_FFN else ks[6..<#len(ks)]
+
+// The `Sink` shape, named on first mention.
+// Whether package variable `d` is written `@thread_local`.
+bool thread_local(^World w, u32 d):
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    ref []u32 ks
+    a.kids(w.decls[d].node, &ks)
+    for k in ks:
+        if k != NONE && a.tag[k] == syntax.N_THREAD_LOCAL: return true
+    return false
+
+// `AllocatorMode`: `i32` under a name (structural), members 0 to 3.
+u32 amode(^World w):
+    if w.amode != NONE: return w.amode
+    w.amode = w.t.named("", "AllocatorMode")
+    w.t.define(w.amode, u32(types.P_I32), nil)
+    return w.amode
+
+const [4]string8 MODES = ("Alloc", "Resize", "Free", "FreeAll")
+
+// The allocator shape, `(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data)`.
+u32 alloc_ty(^World w):
+    if w.alloc != NONE: return w.alloc
+    u32 r = w.t.prim(types.P_RAWPTR)
+    u32 u = w.t.prim(types.P_U64)
+    [6]u32 ps = [r, amode(w), u, u, r, u]
+    [2]u32 sl = [w.t.func(r, types.F_NONE, ps[:]), r]
+    w.alloc = w.t.tuple(sl[:])
+    return w.alloc
+
+u32 sink(^World w):
+    if w.sink != NONE: return w.sink
+    u32 r = w.t.prim(types.P_RAWPTR)
+    u32 i = w.t.prim(types.P_I64)
+    [3]u32 ps = [r, r, i]
+    u32 proc = w.t.func(i, types.F_NONE, ps[:])
+    [2]u32 sl = [proc, r]
+    u32 s = w.t.named("", "Sink")
+    [2]u32 ns = [tstr(w, "proc"), tstr(w, "data")]
+    w.t.define(s, w.t.tuple(sl[:]), ns[:])
+    w.sink = s
+    return s
+
+// A written type. Unknown names are ERR0401 and answer NONE.
+u32 resolve_type(^World w, u32 f, u32 n):
+    // The depth a written type is resolved at: `auto` is refused by it.
+    w.tdepth += 1
+    u32 t = resolve_type_(w, f, n)
+    w.tdepth -= 1
+    // A written shape with no slots (`()`, `[0]T`) has no value (ERR0506).
+    if t != NONE && n != NONE && w.t.tag[t] == types.T_TUPLE && w.t.count_of(t) == 0:
+        syntax.Ast a = w.p.files[f].a
+        if a.tag[n] == syntax.T_TUPLE || a.tag[n] == syntax.T_ARRAY:
+            say(w, f, 0, a.lo[n], a.hi[n], 506, "a shape with no slots has no value to hold, and no representation to give one; `void` is how a function returns nothing", "")
+            return NONE
+    return t
+
+private u32 resolve_type_(^World w, u32 f, u32 n):
+    if n == NONE: return NONE
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    if g != syntax.T_NAME && g != syntax.T_SLICE && g != syntax.T_MAP && g != syntax.T_ARRAY && g != syntax.T_TUPLE && g != syntax.T_FN && g != syntax.T_PATH && g != syntax.T_BINDING && !(g == syntax.T_QUAL && w.p.spell(f, n) == "async") && ds_at(w, f, n):
+        say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+        return NONE
+    if g == syntax.T_BOUND:
+        string8 c = w.p.spell(f, n)
+        string8 p = "i64" if c == "int" else "f64"
+        if c != "int" && c != "float":
+            say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+            return NONE
+        say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("`", c, " $T` binds no family member: as a type, `", c, "` is `", p, "`; state the family in a `where`: `$T f(T x) where T is ", c, "`")), "")
+        return NONE
+    if g == syntax.T_KIND: return types.TYPE
+    if g == syntax.T_NAME || g == syntax.T_BINDING:
+        u8 bk = 0
+        u32 x = bound(w, w.p.sym(f, n), &bk)
+        if x != NONE && bk != BK_LEN && bk != BK_PACK: return x
+        if g != syntax.T_NAME: return NONE
+    if g == syntax.T_NAME:
+        u32 lt = local_type(w, f, w.p.sym(f, n))
+        if lt != NONE: return lt
+        if ds_at(w, f, n):
+            u32 st = s_type_name(w, f, n)
+            if st != NONE - 1: return st
+        string8 s = w.p.spell(f, n)
+        u8 p = types.prim_named(s)
+        if p != types.PRIMS: return u32(p)
+        if s == "string8": return types.STRING8
+        if s == "cstring": return types.CSTRING
+        // A package's own `Sink` (core:log's trait) is it, not the render sink.
+        if s == "Sink" && lookup(w, w.p.files[f].pkg, w.p.sym(f, n)) == NONE: return sink(w)
+        if s == "Location" && lookup(w, w.p.files[f].pkg, w.p.sym(f, n)) == NONE: return dloc(w)
+        if text_named(s) != NONE: return text_named(s)
+        if s == "Self" && w.self_ty != NONE: return w.self_ty
+        if s == "AllocatorMode": return amode(w)
+        if s == "Allocator" || s == "Context":
+            say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+            return NONE
+        u32 d = bare(w, f, n)
+        if d == NONE && w.amb == (u64(f) << 32) | u64(n): return NONE
+        if d != NONE && w.decls[d].kind == K_TRAIT: return resolve(w, d)
+        if d != NONE && typeish(w.decls[d].kind):
+            if w.decls[d].kind == K_FTYPE && !w.under_ptr && !w.inc_ok && (w.p.files[w.decls[d].file].a.b[w.decls[d].node] & syntax.F_INCOMPLETE) != 0:
+                say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+                return NONE
+            if w.decls[d].kind == K_FTYPE || w.decls[d].kind == K_FSTRUCT: reach_foreign(w, w.decls[d].file, w.decls[d].block)
+            if templated(w, d): return applied(w, f, n, d, nil)
+            if ds_at(w, f, n):
+                u32 dt = resolve(w, d)
+                string8 step = ""
+                u32 part = NONE
+                string8 rep = ""
+                string8 why = ""
+                if dt != NONE && !ds_at(w, w.decls[d].file, w.decls[d].node) && s_denum(w, dt) == NONE && s_class_of_ty(w, dt) == NONE: why = s_uncross(w, dt, false, &step, &part, &rep)
+                if #len(why) > 0:
+                    // ERR1208, said in the script pass's spelling.
+                    w.t.dspell = true
+                    string8 pt = ""
+                    if part != NONE: pt = index.hold(#format(", ", step, " a Dado `", shown(w, part), "`"))
+                    say(w, f, 0, a.lo[n], a.hi[n], 1208, index.hold(#format("`", s, "` cannot be named in a script: it is a Dado `", shown(w, dt), "`", pt, ", and ", why)), index.hold(#format("hold its values in the script's own types — scalars, arrays and tuples — or ", rep)))
+                    w.t.dspell = false
+                    return NONE
+                return s_dview(w, dt)
+            return resolve(w, d)
+        if d == NONE && s == "VM": return w.vm
+        if d == NONE && ds_at(w, f, n):
+            ref []string8 sp
+            for x in ["int", "float", "bool", "string", "void"]:
+                sp = #append(sp, x)
+            for sc in w.classes:
+                if w.decls[sc.decl].pkg == w.p.files[f].pkg: sp = #append(sp, s_short(w, sc.decl))
+            string8 sn = nearest(s, sp[:])
+            string8 sh = "DadoScript writes `int`, `float`, `bool` and `string`"
+            if #len(sn) > 0: sh = index.hold(#format("did you mean `", sn, "`?"))
+            say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("`", s, "` is not a type DadoScript has")), sh)
+            return NONE
+        if d == NONE && s == "string":
+            say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format(STRING_KIND_WHY, ". Write the width — `string8` (UTF-8, the house width), `string16` or `string32`")), "")
+            return NONE
+        if s == "auto" && d == NONE:
+            if w.tdepth <= 1: say(w, f, 0, a.lo[n], a.hi[n], 512, "`auto` is the type a value already has, so it belongs on a binding that has one", "write the type", "As a *return* type it would be return-type inference, which needs a topological order over the call graph that mutual recursion has no answer for — a signature is written once and read at every call site, so it stays written")
+            else: say(w, f, 0, a.lo[n], a.hi[n], 512, "`auto` is the whole type of a binding or nothing: there is one expression to compute it from, and a part of a type has no part of one", "")
+            return NONE
+        if s == "_":
+            say(w, f, 0, a.lo[n], a.hi[n], 401, "`_` is the discard and has no type of its own", "write a type before it: `i32 _`", "It stands alone in a destructuring pattern, where the value supplies the slot's type — `(i32 q, _) = f()`; everywhere else it is a *name* for a slot nobody reads")
+            return NONE
+        ref []string8 pool
+        for q in types.PRIM:
+            pool = #append(pool, q.name)
+        for key, x in w.by_name:
+            if u32(key >> 32) == w.p.files[f].pkg && typeish(w.decls[x].kind): pool = #append(pool, name_of(w, w.decls[x].name))
+        string8 near = nearest(s, pool)
+        string8 help = index.hold(#format("did you mean `", near, "`?")) if #len(near) > 0 else index.hold(#format("declare `", s, "`, import the package that declares it, or write a type with its width, such as `i32` or `f64`"))
+        say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("unknown type `", s, "`")), help, "Every primitive states its width. `int`, `float` and `scalar` are numeric categories, which a `where` asks about and no position declares")
+        return NONE
+    if g == syntax.T_CHANNEL:
+        string8 cw = "a type written here declares nothing for it to be named after"
+        if w.chan_at == 1: cw = "a statement in a function body declares nothing for it to be named after"
+        if w.chan_at == 2: cw = "a channel written inside a type written here — an anonymous tuple — declares nothing for it to be named after"
+        u32 hi = a.lo[n] + 8 if w.chan_at < 2 else a.hi[n]
+        if w.chan_at == 3: say(w, f, 0, a.lo[n], hi, 528, index.hold(#format("a channel is one mailbox at one address, and a member of `", name_of(w, w.decls[w.chan_union].name), "` is one of several alternatives sharing one storage — a channel there would be overwritten by the next member stored")), "declare it at package level, or as a member of a `type`, and hold a `^` to it in the union if the union must reach it")
+        else: say(w, f, 0, a.lo[n], hi, 528, index.hold(#format("a channel is one mailbox at one address, named after the declaration that holds it, and ", cw)), "declare it at package level — `#channel(8) name(i32 x)` — or as a named member of a `type`, and reach it through that declaration, or through a `^` to the type holding it")
+        return NONE
+    if g == syntax.T_TUPLE:
+        ref []u32 xs
+        u8 ca = w.chan_at
+        w.chan_at = 2
+        for m in a.list(a.b[n]):
+            if m == NONE: continue
+            u32 wd = a.list(a.b[m])[2]
+            if wd != NONE:
+                say(w, f, 0, a.lo[wd], a.hi[wd], 1023, "`: W` gives a member the width in bits C lays it out in, and only a member list restating C inside a `foreign` block carries one", "drop the `: W`, or restate the C declaration inside a `foreign` block")
+                w.chan_at = ca
+                return NONE
+            u32 e = resolve_type(w, f, a.list(a.b[m])[0])
+            if e == NONE:
+                w.chan_at = ca
+                return NONE
+            xs = #append(xs, e)
+        w.chan_at = ca
+        u32 tt = w.t.tuple(xs)
+        i64 sl = leaves(w, tt)
+        if sl > 1048576:
+            say(w, f, 0, a.lo[n], a.hi[n], 526, index.hold(#format("this shape holds ", sl, " slots, and 1048576 is the most one shape may have")), "hold the big part behind a pointer, or split it across a call")
+            return NONE
+        return tt
+    if g == syntax.T_POINTER || g == syntax.T_SLICE || g == syntax.T_REF:
+        bool up = w.under_ptr
+        w.under_ptr = g == syntax.T_POINTER || g == syntax.T_REF
+        u32 e = resolve_type(w, f, a.a[n])
+        w.under_ptr = up
+        if e == NONE: return NONE
+        if g == syntax.T_SLICE && flex_beside(w, f, a.a[n], e): return NONE
+        if g == syntax.T_POINTER && e == u32(types.P_VOID):
+            say(w, f, 0, a.lo[n], a.hi[n], 506, "`void` is how a function returns nothing, so it holds no value and there is nothing here for a `^` to point at\x1fC's `void *` is one word and one primitive, and `rawptr(p)` is the written conversion into it\x1ewrite `rawptr` for C's `void *`, and `const rawptr` for a `const void *`", "")
+            return NONE
+        if g == syntax.T_POINTER: return w.t.ptr_of(e)
+        return w.t.slice_of(e) if g == syntax.T_SLICE else w.t.ref_of(e)
+    if g == syntax.T_ARRAY: return array_type(w, f, n)
+    if g == syntax.T_MATRIX: return matrix_type(w, f, n)
+    if g == syntax.T_LAYOUT: return layout_type(w, f, n)
+    if g == syntax.T_SHAPEOF: return shape_of(w, f, n)
+    if g == syntax.T_MAP:
+        u32 k = resolve_type(w, f, a.a[n])
+        u32 v = resolve_type(w, f, a.b[n])
+        if k == NONE || v == NONE: return NONE
+        if k == w.sany:
+            u32 kn = a.a[n]
+            say(w, f, 0, a.lo[kn], a.hi[kn], 801, "`any` cannot key a map: a DadoScript map is keyed by `int`, `float`, `string` and `bool`, and what an `any` holds is known only when the script runs", "key the map by `string`, and convert each key as it goes in — `m[string(k)]`")
+            return NONE
+        u32 kr = w.t.resolve(k)
+        if ds_at(w, f, n) && k != w.sstr && kr != u32(types.P_INT) && kr != u32(types.P_FLOAT) && kr != u32(types.P_BOOL) && !s_enum(w, k) && s_denum(w, k) == NONE:
+            u32 kn = a.a[n]
+            say(w, f, 0, a.lo[kn], a.hi[kn], 801, index.hold(#format("`", shown(w, k), "` cannot key a map: a DadoScript map is keyed by `int`, `float`, `string` and `bool` — values compared by what they hold — and a container is compared by identity and can change after it is stored, so an entry could be put in and never found again")), "key the map by a `string` made from the value — `string(xs)` — or by an `int` that names it")
+            return NONE
+        return w.t.map_of(k, v)
+    if g == syntax.T_FN:
+        []u32 ks = a.list(a.b[n])
+        if ks[0] != NONE && (a.tag[ks[0]] == syntax.T_NAME || a.tag[ks[0]] == syntax.T_PATH && !ds_at(w, f, n)):
+            u32 d = lookup(w, w.p.files[f].pkg, w.p.sym(f, ks[0])) if a.tag[ks[0]] == syntax.T_NAME else using_decl(w, f, ks[0])
+            if d != NONE && w.decls[d].kind == K_TYPE && templated(w, d): return applied(w, f, n, d, ks[2..<#len(ks)])
+        bool asy = (a.a[n] & syntax.F_ASYNC) != 0 && ds_at(w, f, n)
+        if (a.a[n] & syntax.F_ASYNC) != 0 && !asy || ks[1] != NONE && (a.a[n] & syntax.F_FAILABLE) == 0:
+            say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+            return NONE
+        u32 ret = u32(types.P_VOID) if ks[0] == NONE else resolve_type(w, f, ks[0])
+        ref []u32 ps
+        if ks[1] != NONE:
+            u32 et = resolve_type(w, f, ks[1])
+            if et == NONE: return NONE
+            ps = #append(ps, et)
+        for q in ks[2..<#len(ks)]:
+            if q == NONE: continue
+            u32 pt = resolve_type(w, f, q)
+            if pt == NONE: return NONE
+            ps = #append(ps, pt)
+        if ret == NONE: return NONE
+        u32 ffl = types.F_PLAIN if (a.a[n] & syntax.F_FAILABLE) != 0 else types.F_NONE
+        if ks[1] != NONE: ffl = types.F_TYPED
+        if asy: ret = sa_type(w, ret)
+        return w.t.func(ret, ffl, ps)
+    if g == syntax.T_QUAL && w.p.spell(f, n) == "async" && ds_at(w, f, n): return sa_type(w, resolve_type(w, f, a.a[n]))
+    if g == syntax.T_QUAL:
+        string8 qs = w.p.spell(f, n)
+        u32 q = 0
+        for i in 0..<4:
+            if types.QUALS[i] == qs: q = u32(1) << u32(i)
+        u32 inner = a.a[n]
+        if q == 1 && inner != NONE && a.tag[inner] == syntax.T_SLICE:
+            string8 el = w.p.files[f].src[i64(a.lo[a.a[inner]])..<i64(a.hi[a.a[inner]])]
+            say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("`const []", el, "` is not a type: a read-only window is `[]const ", el, "`, the word on its elements")), index.hold(#format("write `[]const ", el, "`")), "In front of the brackets the word would sit on the window's two-word header, which promises nothing about the elements it reaches")
+            u32 e = resolve_type(w, f, a.a[inner])
+            return NONE if e == NONE else w.t.slice_of(w.t.qual(1, e))
+        if q == 0: return resolve_type(w, f, inner)
+        return w.t.qual(q, resolve_type(w, f, inner))
+    if g == syntax.T_PACK: return w.any
+    if g == syntax.T_PATH && (a.a[n] == NONE || w.p.files[f].src[i64(w.p.files[f].t.start[a.a[n]])..<i64(w.p.files[f].t.end[a.a[n]])] != "#c"):
+        u8 pk = 0
+        u32 bx = bound(w, w.p.sym(f, n), &pk)
+        if bx != NONE && pk == BK_TRAIT: return bx
+        if ds_at(w, f, n):
+            ref []u32 tps = s_tpath(w, f, n)
+            u32 pdd = s_path_decl(w, f, tps[:])
+            if pdd != NONE && (typeish(w.decls[pdd].kind) || st_of_decl(w, pdd) != NONE): return s_dview(w, resolve(w, pdd))
+            bool bound_ = false
+            for im in w.p.pkgs[w.p.files[f].pkg].imports:
+                u32 inm = im.name
+                if inm == NONE: inm = w.p.pkgs[im.pkg].name
+                if im.file == f && inm == tps[0]: bound_ = true
+            u32 fcd = lookup(w, w.p.files[f].pkg, tps[0])
+            if !bound_ && (fcd == NONE || w.decls[fcd].kind != K_CLASS):
+                string8 tw = index.hold(strings.clone(w.p.files[f].src[i64(a.lo[n])..<i64(a.hi[n])]))
+                string8 first = name_of(w, tps[0])
+                say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("`", tw, "` names nothing here: no import of this file binds `", first, "`, and no class of the package is named `", first, "`")), index.hold(#format("import the package that declares it — `import \"…/", first, "\"`, its path — and write `", tw, "`")))
+                return NONE
+        u32 pd = using_decl(w, f, n)
+        if pd != NONE && (w.decls[pd].kind == K_TRAIT || typeish(w.decls[pd].kind) && w.decls[pd].kind != K_FTYPE && !templated(w, pd)): return resolve(w, pd)
+        if pd != NONE && w.decls[pd].kind == K_FTYPE && (w.under_ptr || (w.p.files[w.decls[pd].file].a.b[w.decls[pd].node] & syntax.F_INCOMPLETE) == 0):
+            reach_foreign(w, w.decls[pd].file, w.decls[pd].block)
+            return resolve(w, pd)
+    if g == syntax.T_PATH:
+        u32 q = a.a[n]
+        if q != NONE && w.p.files[f].src[i64(w.p.files[f].t.start[q])..<i64(w.p.files[f].t.end[q])] == "#c":
+            string8 s = w.p.spell(f, n)
+            for i in 0..<#len(types.C_SCALARS):
+                if types.C_SCALARS[i].name == s: return w.t.make(types.T_CSCALAR, u32(i), 0, nil)
+        if q != NONE && path_miss(w, f, n): return NONE
+    say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+    return NONE
+
+// `pkg.Name` through an import that declares no such type: ERR0401.
+private bool path_miss(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u32 ps = w.p.files[f].t.sym[a.a[n]]
+    u32 ip = NONE
+    for im in w.p.pkgs[w.p.files[f].pkg].imports:
+        if im.file == f && (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == ps: ip = im.pkg
+    if ip != NONE && lookup(w, ip, w.p.sym(f, n)) != NONE: return false
+    string8 s = index.hold(strings.clone(w.p.files[f].src[i64(a.lo[n])..<i64(a.hi[n])]))
+    string8 bare_ = w.p.spell(f, n)
+    if bare_ == "cstring" || bare_ == "string8" || bare_ == "string16" || bare_ == "string32" || bare_ == "AllocatorMode" || bare_ == "Sink" || bare_ == "Location":
+        say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("unknown type `", s, "`; `", bare_, "` is not a member of any package — it is a type the compiler provides, and every file names it bare, with no import")), index.hold(#format("write `", bare_, "`")))
+        return true
+    ref []string8 pool
+    for q in types.PRIM:
+        pool = #append(pool, q.name)
+    for im in w.p.pkgs[w.p.files[f].pkg].imports:
+        if im.file != f: continue
+        string8 qn = name_of(w, im.name if im.name != NONE else w.p.pkgs[im.pkg].name)
+        for key, x in w.by_name:
+            if u32(key >> 32) == im.pkg && typeish(w.decls[x].kind): pool = #append(pool, index.hold(#format(qn, ".", name_of(w, w.decls[x].name))))
+    for key, x in w.by_name:
+        if u32(key >> 32) == w.p.files[f].pkg && typeish(w.decls[x].kind): pool = #append(pool, name_of(w, w.decls[x].name))
+    string8 near = nearest(s, pool)
+    string8 help = index.hold(#format("declare `", s, "`, import the package that declares it, or write a type with its width, such as `i32` or `f64`"))
+    if #len(near) > 0: help = index.hold(#format("did you mean `", near, "`?"))
+    say(w, f, 0, a.lo[n], a.hi[n], 401, index.hold(#format("unknown type `", s, "`")), help, "Every primitive states its width. `int`, `float` and `scalar` are numeric categories, which a `where` asks about and no position declares")
+    return true
+
+// The `foreign` clauses of every loaded file, once each: ERR1011 (one macro
+// defined two ways), ERR1031 (a flag that would reach past its package);
+// the rest are the cc line's.
+void foreign_facts(^World w):
+    ref []string8 seen
+    ref []string8 names
+    ref []string8 values
+    for f in 0..<u32(#len(w.p.files)):
+        syntax.Ast a = w.p.files[f].a
+        ref []u32 fbs
+        blocks(w, f, a.list(a.b[a.root]), &fbs)
+        for n in fbs:
+            // A block that declares nothing (`define "SOKOL_GLCORE"` in a
+            // `when` arm) is reached with its package, as Rust's is.
+            bool declares = false
+            for m in a.list(a.b[n]):
+                if m != NONE && a.tag[m] != syntax.N_CLAUSE: declares = true
+            if !declares:
+                u32 jn = w.job_now
+                w.job_now = NONE
+                reach_foreign(w, f, n)
+                w.job_now = jn
+            for m in a.list(a.b[n]):
+                if m == NONE || a.tag[m] != syntax.N_CLAUSE: continue
+                string8 word = w.p.spell(f, m)
+                u32 t = a.a[m]
+                ref []char8 v
+                syntax.string_value(w.p.files[f].src[i64(w.p.files[f].t.start[t])..<i64(w.p.files[f].t.end[t])], &v)
+                string8 text = index.hold(v)
+                string8 key = index.hold(#format(word, " ", text))
+                bool dup = false
+                for x in seen:
+                    if x == key: dup = true
+                if dup: continue
+                seen = #append(seen, key)
+                u32 lo = w.p.files[f].t.start[t]
+                u32 hi = w.p.files[f].t.end[t]
+                if word == "link":
+                    for arg in words(text):
+                        w.cc_links = #append(w.cc_links, index.hold(strings.clone(arg)))
+                        w.link_key = #append(w.link_key, (u64(f) << 32) | u64(n))
+                else if word == "define":
+                    i64 eq = strings.index_of(text, '=')
+                    string8 nm = text[0..<eq] if eq >= 0 else text
+                    string8 rep = text[eq + 1..<#len(text)] if eq >= 0 else "nothing"
+                    for i in 0..<#len(names):
+                        if names[i] == nm && values[i] != rep:
+                            w.d.phase = diag.PH_FACTS
+                            say(w, f, 0, lo, hi, 1011, index.hold(#format("`", nm, "` is defined as ", rep, " here and as ", values[i], " by another `foreign` declaration in this program; the emitted C is one translation unit, so one of the two would have to lose")), "")
+                    names = #append(names, index.hold(strings.clone(nm)))
+                    values = #append(values, index.hold(strings.clone(rep)))
+                else if word == "flags":
+                    for arg in words(text):
+                        string8 why = ""
+                        if arg == "-w" || arg == "-Werror" || arg == "-Wno-error" || arg == "-Wfatal-errors" || arg == "-Wno-fatal-errors": why = index.hold(#format("`", arg, "` names no single diagnostic, so there is no `#pragma GCC diagnostic` that scopes it to this package and it would turn the warning off for every package in the program. Name the diagnostics it covers instead"))
+                        else if (strings.starts_with(arg, "-f") || strings.starts_with(arg, "-m")) && w.p.files[f].pkg != 0: why = index.hold(#format("`", arg, "` is a codegen flag and a whole program is one translation unit, so it would reach every package here; `", name_of(w, w.p.pkgs[w.p.files[f].pkg].name), "` is not this program's root package, so it is not the one that may ask. Write it on the root package's own `foreign` declaration, or on the `cc` line"))
+                        else if strings.starts_with(arg, "-W") || strings.starts_with(arg, "-pedantic") || arg == "-no-pedantic": continue
+                        if #len(why) > 0:
+                            w.d.phase = diag.PH_FACTS
+                            say(w, f, 0, lo, hi, 1031, why, "")
+                        else:
+                            w.cc_flags = #append(w.cc_flags, index.hold(strings.clone(arg)))
+                            w.flag_key = #append(w.flag_key, (u64(f) << 32) | u64(n))
+
+// The `foreign` blocks of file `f`, through the `when` arms that hold.
+void file_blocks(^World w, u32 f, ^ref []u32 out):
+    blocks(w, f, w.p.files[f].a.list(w.p.files[f].a.b[w.p.files[f].a.root]), out)
+
+// The `foreign` blocks among items `ns`, through the `when` arms that hold.
+private void blocks(^World w, u32 f, []u32 ns, ^ref []u32 out):
+    syntax.Ast a = w.p.files[f].a
+    for n in ns:
+        if n == NONE: continue
+        if a.tag[n] == syntax.N_FOREIGN: out^ = #append(out^, n)
+        if a.tag[n] != syntax.N_WHEN || !holds_foreign(&a, n): continue
+        for arm in a.list(a.b[n]):
+            if arm == NONE: continue
+            []u32 ks = a.list(a.b[arm])
+            if a.tag[arm] == syntax.N_WHEN_ELSE:
+                blocks(w, f, ks, out)
+                break
+            if holds(w, f, 0, ks[0]):
+                blocks(w, f, ks[1..<#len(ks)], out)
+                break
+
+// Whether a `when` holds a `foreign` block in some arm.
+private bool holds_foreign(^syntax.Ast a, u32 n):
+    for arm in a.list(a.b[n]):
+        if arm == NONE: continue
+        for x in a.list(a.b[arm]):
+            if x != NONE && (a.tag[x] == syntax.N_FOREIGN || a.tag[x] == syntax.N_WHEN && holds_foreign(a, x)): return true
+    return false
+
+private ref []string8 words(string8 s):
+    ref []string8 out
+    i64 i = 0
+    for i < #len(s):
+        if s[i] == ' ' || s[i] == '\t':
+            i += 1
+            continue
+        i64 j = i
+        for j < #len(s) && s[j] != ' ' && s[j] != '\t':
+            j += 1
+        out = #append(out, s[i..<j])
+        i = j
+    return out
+
+// A foreign declaration's C name: its `@c("…")` / written string, else its name.
+u32 c_name(^World w, u32 d):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 n = w.decls[d].node
+    u32 cn = NONE
+    if a.tag[n] == syntax.N_F_FN: cn = a.list(a.b[n])[2]
+    else if a.tag[n] == syntax.N_F_OPAQUE: cn = a.a[n]
+    else if a.tag[n] == syntax.N_TYPE || a.tag[n] == syntax.N_F_ENUM || a.tag[n] == syntax.N_UNION: cn = a.list(a.b[n])[0]
+    if cn == NONE || a.main[cn] == NONE: return tstr(w, name_of(w, w.decls[d].name))
+    ref []char8 v
+    u32 t = a.main[cn]
+    syntax.string_value(w.p.files[f].src[i64(w.p.files[f].t.start[t])..<i64(w.p.files[f].t.end[t])], &v)
+    return tstr(w, index.hold(v))
+
+// Notes foreign block `n` of file `f` as reached.
+void reach_foreign(^World w, u32 f, u32 n):
+    u64 key = (u64(f) << 32) | u64(n)
+    i64 at = -1
+    for i in 0..<#len(w.reached):
+        if w.reached[i] == key: at = i
+    if at < 0:
+        at = #len(w.reached)
+        w.reached = #append(w.reached, key)
+    for j in 0..<#len(w.rkey):
+        if w.rkey[j] == u32(at) && w.rjob[j] == w.job_now: return
+    w.rkey = #append(w.rkey, u32(at))
+    w.rjob = #append(w.rjob, w.job_now)
+
+// Whether a reached `foreign` block names header `h`.
+bool reaches_header(^World w, string8 h):
+    for key in w.reached:
+        u32 f = u32(key >> 32)
+        ref []char8 v
+        syntax.string_value(w.p.spell(f, u32(key & 0xFFFFFFFF)), &v)
+        if index.hold(v) == h: return true
+    return false
+
+// What the reached `foreign` blocks put before the prelude: `define`s, then
+// the `#include`.
+string8 foreign_heads(^World w):
+    ref []char8 o
+    ref []string8 incs
+    // In source order (file, then place), as Rust's, not the order bodies
+    // reached them: a header another needs first (`<windows.h>` before
+    // `<shellapi.h>`, core:os) is written before it (P18).
+    ref []u64 keys
+    for key in w.reached:
+        keys = #append(keys, key)
+    for i in 1..<#len(keys):
+        u64 k = keys[i]
+        i64 j = i - 1
+        for j >= 0 && keys[j] > k:
+            keys[j + 1] = keys[j]
+            j -= 1
+        keys[j + 1] = k
+    for key in keys:
+        u32 f = u32(key >> 32)
+        u32 n = u32(key & 0xFFFFFFFF)
+        syntax.Ast a = w.p.files[f].a
+        for m in a.list(a.b[n]):
+            if m == NONE || a.tag[m] != syntax.N_CLAUSE: continue
+            if w.p.spell(f, m) != "define": continue
+            ref []char8 v
+            u32 t = a.a[m]
+            syntax.string_value(w.p.files[f].src[i64(w.p.files[f].t.start[t])..<i64(w.p.files[f].t.end[t])], &v)
+            string8 d = index.hold(v)
+            i64 eq = -1
+            for i in 0..<#len(d):
+                if d[i] == '=' && eq < 0: eq = i
+            if eq < 0: o = #append(o, ..#format("#define ", d, "\n"))
+            else: o = #append(o, ..#format("#define ", d[0..<eq], " ", d[eq + 1..<#len(d)], "\n"))
+        ref []char8 h
+        syntax.string_value(w.p.spell(f, n), &h)
+        string8 hs = index.hold(h)
+        bool local = strings.starts_with(hs, "./") || strings.starts_with(hs, "../")
+        // The `#WEB` runtime supplies these itself (Rust's `WEB_RUNTIME_HEADERS`).
+        if w.os == "WEB" && (hs == "math.h" || hs == "dado/web.h" || hs == "quickjs.h"): continue
+        string8 line = index.hold(#format("#include \"", hs, "\"\n")) if local else index.hold(#format("#include <", hs, ">\n"))
+        // A header two blocks name is included once: a single-header
+        // library's implementation half has no include guard.
+        bool again = false
+        for x in incs:
+            if x == line: again = true
+        if !again: o = #append(o, ..line)
+        incs = #append(incs, line)
+        string8 inc = index.hold(#format("-I", w.p.pkgs[w.p.files[f].pkg].dir))
+        bool have = false
+        for x in w.cc_flags:
+            if x == inc: have = true
+        if !have: w.cc_flags = #append(w.cc_flags, inc)
+    #delete(keys)
+    return index.hold(o)
+
+// The build manifest's facts about the C a program brings: `inline-c <file>
+// <line> <top-level|in-function>` per `@c_body` the C carries (gate step
+// 9d), `header`/`toolchain-header` per header a reached `foreign` block
+// names (9b), then `foreign-macro <C name> <macro|function>` per `foreign`
+// function of a reached block, by whether it is marked `@macro` (9d).
+string8 c_facts(^World w):
+    ref []char8 m
+    ref []bool live
+    for _ in w.p.pkgs: live = #append(live, false)
+    for i in 0..<#len(w.fns):
+        bool on = #len(w.live) == 0 || i < #len(w.live) && w.live[i]
+        if !on: continue
+        if w.jobs[i].decl != NONE: live[w.decls[w.jobs[i].decl].pkg] = true
+        ^ir.Fn f = &w.fns[i]
+        for k in 0..<ir.count(f):
+            if f.op[k] != ir.O_C_INLINE || f.sub[k] != 1: continue
+            // The line of the attribute's C, as written (`@c_body("""`).
+            syntax.Ast fa = w.p.files[f.file].a
+            u32 at = f.node[k]
+            if fa.tag[at] == syntax.S_LET && fa.list(fa.b[at])[2] != NONE: at = fa.list(fa.b[at])[2]
+            diag.Place pl = w.p.map.place(w.p.map.base[f.file] + fa.lo[at])
+            m = #append(m, ..#format("inline-c ", w.p.files[f.file].path, " ", pl.line, " in-function\n"))
+    for d in w.globals: live[w.decls[d].pkg] = true
+    for d in 0..<u32(#len(w.decls)):
+        if w.decls[d].kind != K_VAR || !live[w.decls[d].pkg]: continue
+        syntax.Ast a = w.p.files[w.decls[d].file].a
+        u32 n = w.decls[d].node
+        if a.tag[n] != syntax.N_VAR || a.list(a.b[n])[3] == NONE: continue
+        diag.Place pl = w.p.map.place(w.p.map.base[w.decls[d].file] + a.lo[n])
+        m = #append(m, ..#format("inline-c ", w.p.files[w.decls[d].file].path, " ", pl.line, " top-level\n"))
+    // The headers the reached `foreign` blocks name, once each: `header` for
+    // the program's own packages, `toolchain-header` for a collection's.
+    ref []string8 named
+    for key in w.reached:
+        u32 hf = u32(key >> 32)
+        ref []char8 hv
+        syntax.string_value(w.p.spell(hf, u32(key & 0xFFFFFFFF)), &hv)
+        string8 hs = index.hold(hv)
+        string8 kind = "toolchain-header" if index.collection_key(w.p.pkgs[w.p.files[hf].pkg].key) else "header"
+        string8 row = index.hold(#format(kind, " ", hs, "\n"))
+        bool seen = false
+        for x in named:
+            if x == row: seen = true
+        if seen: continue
+        named = #append(named, row)
+        m = #append(m, ..row)
+    #delete(named)
+    ref []u32 said
+    for d in 0..<u32(#len(w.decls)):
+        if w.decls[d].kind != K_FFN: continue
+        u64 key = (u64(w.decls[d].file) << 32) | u64(w.decls[d].block)
+        bool reached = false
+        for x in w.reached:
+            if x == key: reached = true
+        if !reached: continue
+        u32 cn = c_name(w, d)
+        bool dup = false
+        for x in said:
+            if x == cn: dup = true
+        if dup: continue
+        said = #append(said, cn)
+        bool mac = (w.p.files[w.decls[d].file].a.a[w.decls[d].node] & syntax.F_MACRO) != 0
+        m = #append(m, ..#format("foreign-macro ", w.t.text(cn), " ", "macro" if mac else "function", "\n"))
+    #delete(said)
+    #delete(live)
+    return index.hold(m)
+
+// A `threads.spawn` call: its body's declaration (NONE outside one) and where.
+type Spawn:
+    u32 decl
+    u32 file
+    u32 base
+    u32 lo
+    u32 hi
+
+type Where:
+    i64 line
+    i64 col
+
+// Where node `n` of file `f` starts (`item` is the node it is relative to).
+Where where(^World w, u32 f, u32 item, u32 n):
+    diag.Place p = w.p.map.place(w.p.map.base[f] + w.p.files[f].a.lo[n])
+    return Where(p.line, p.col)
+
+// The one name of `pool` near enough to `wrong` to offer (a third of the
+// shorter name's length in edits, or case alone), else "".
+string8 nearest(string8 wrong, []string8 pool):
+    string8 best = ""
+    i64 score = -1
+    for c in pool:
+        if c == wrong: return ""
+        if #len(c) == 0: continue
+        bool cased = #len(c) == #len(wrong)
+        for i in 0..<#len(c):
+            if cased && lower(c[i]) != lower(wrong[i]): cased = false
+        i64 d = 0 if cased else distance(wrong, c)
+        if !cased && d > (#len(wrong) if #len(wrong) < #len(c) else #len(c)) / 3: continue
+        if score < 0 || d < score || d == score && bytes_less(c, best):
+            best = c
+            score = d
+    return best
+
+private char8 lower(char8 c):
+    return c + 32 if c >= 'A' && c <= 'Z' else c
+
+bool bytes_less(string8 x, string8 y):
+    for i in 0..<#len(x):
+        if i >= #len(y): return false
+        if x[i] != y[i]: return x[i] < y[i]
+    return #len(x) < #len(y)
+
+private i64 distance(string8 x, string8 y):
+    ref []i64 prev
+    ref []i64 cur
+    for j in 0..=#len(y):
+        prev = #append(prev, j)
+        cur = #append(cur, 0)
+    for i in 0..<#len(x):
+        cur[0] = i + 1
+        for j in 0..<#len(y):
+            i64 sub = prev[j] + (0 if x[i] == y[j] else 1)
+            i64 m = prev[j + 1] + 1
+            if cur[j] + 1 < m: m = cur[j] + 1
+            cur[j + 1] = sub if sub < m else m
+        for j in 0..=#len(y):
+            prev[j] = cur[j]
+    i64 r = prev[#len(y)]
+    #delete(prev)
+    #delete(cur)
+    return r
+
+// ERR0723: what may stand in front of `!`: an `i32` enum, in a Dado function.
+private bool failure_type(^World w, u32 d, u32 f, u32 n, u32 et, bool foreign_):
+    syntax.Ast a = w.p.files[f].a
+    string8 e = named(w, et)
+    bool en = false
+    if et in w.type_decl:
+        try u32 ed = w.type_decl[et] else: return false
+        en = w.decls[ed].kind == K_ENUM
+    if foreign_: say(w, f, 0, a.lo[n], a.hi[n], 723, index.hold(#format("`", name_of(w, w.decls[d].name), "` is a `foreign` function, and its failure cannot promise to be a `", e, "`")), index.hold(#format("write `!` alone here, and wrap the call in a Dado function marked `", e, "!` that fails with a member")), "What a C function answers is not checked here, so nothing makes its code one of the enum's members")
+    else if !en: say(w, f, 0, a.lo[n], a.hi[n], 723, index.hold(#format("`", e, "` in front of `!` is `", e, "`, not an enum", "\x1fA failure is a nonzero `i32`, and the type in front of `!` says which of them: the members of one enum")), index.hold(#format("declare `enum i32 ", e, ":` with the failures as members, or write `!T` for a plain failure code")))
+    else if under(&w.t, et) != u32(types.P_I32): say(w, f, 0, a.lo[n], a.hi[n], 723, index.hold(#format("`", e, "` is backed by `", shown(w, under(&w.t, et)), "`, and a failure is an `i32`")), index.hold(#format("declare it `enum i32 ", e, ":`, or write `!T` for a plain failure code")), "A failure crosses every boundary as its `i32` code, so its enum is one of `i32`s")
+    else: return true
+    return false
+
+// ERR0533: a method takes a receiver, has no `export`, and is no wider than its type.
+private bool placed(^World w, u32 f, u32 n, u32 m):
+    syntax.Ast a = w.p.files[f].a
+    string8 tn = w.p.spell(f, n)
+    string8 mn = w.p.spell(f, m)
+    u32 ret = a.list(a.b[m])[0]
+    string8 rt = "void"
+    if ret != NONE: rt = w.p.files[f].src[i64(a.lo[ret])..<i64(a.hi[ret])]
+    u32 mv = a.a[m] & syntax.F_VIS
+    u32 tv = a.a[n] & syntax.F_VIS
+    w.d.phase = diag.PH_INTERFACE
+    if a.list(a.b[m])[3] == NONE:
+        say_tok(w, f, 0, m, 533, index.hold(#format("`", tn, ".", mn, "` takes no receiver, and every method takes the value it is called on first")), index.hold(#format("a method takes `self` or `^self` first — `", rt, " ", mn, "(self…)`; a function of no receiver is a package-level function, written outside `", tn, "`'s body")))
+        return false
+    if mv == syntax.VIS_EXPORT:
+        say_tok(w, f, 0, m, 533, index.hold(#format("`", tn, ".", mn, "` is a method, and a method has no C symbol of its own to promise: `export` names a package-level function")), index.hold(#format("drop `export` from the method, and export a package-level function that calls it — `export ", rt, " ", tn, "_", mn, "(", tn, " v): return v.", mn, "()`")))
+        return false
+    if mv != syntax.VIS_UNMARKED && vis_rank(mv) > vis_rank(tv):
+        say_tok(w, f, 0, m, 533, index.hold(#format("`", tn, "` is ", vis_word(tv), ", so its method `", mn, "` cannot be ", vis_word(mv), ": nobody who cannot name `", tn, "` has a value of it to call the method on")), index.hold(#format("widen the type or narrow the method — `", vis_word(mv), " type ", tn, "`, or `", vis_word(tv), " ", rt, " ", mn, "(…)`")))
+        return false
+    return true
+
+private u8 vis_rank(u32 v):
+    if v == syntax.VIS_FILE: return 0
+    if v == syntax.VIS_PACKAGE: return 1
+    return 2
+
+string8 vis_word(u32 v):
+    if v == syntax.VIS_PACKAGE: return "private"
+    if v == syntax.VIS_FILE: return "private \"file\""
+    if v == syntax.VIS_EXPORT: return "export"
+    return "public"
+
+// A foreign member's width `: W` (ERR1023 when C could not lay it out so); -1 when refused.
+i64 bitfield(^World w, u32 f, u32 m, u32 mt, string8 tn):
+    syntax.Ast a = w.p.files[f].a
+    []u32 mk = a.list(a.b[m])
+    u32 wn = mk[2]
+    u32 v = a.a[wn]
+    if a.tag[v] != syntax.E_INT || a.b[v] != 0:
+        say(w, f, 0, a.lo[wn], a.hi[wn], 1, "this width is outside the slice the port builds so far", "")
+        return -1
+    i64 bw = i64(a.a[v])
+    string8 s = w.p.spell(f, m) if a.main[m] != NONE else ""
+    string8 ts = w.p.files[f].src[i64(a.lo[mk[0]])..<i64(a.hi[mk[0]])]
+    u32 r = w.t.resolve(mt)
+    u32 e = NONE
+    i64 k = 0
+    string8 zero = index.hold(#format("C's zero-width field ends the current storage unit and is written with no name at all — `", ts, " : 0`"))
+    if w.t.uniform(r, &e, &k) || r != NONE && w.t.tag[r] == types.T_TUPLE:
+        say(w, f, 0, a.lo[wn], a.hi[wn], 1023, index.hold(#format("a bitfield of `", tn, "` is one object C lays out in bits, and an array is a run of them — C has no `T a[N] : W`, so a member written with dimensions carries no width")), "")
+    else if r == u32(types.P_BOOL) && bw > 1: say(w, f, 0, a.lo[wn], a.hi[wn], 1023, index.hold(#format("`bool` holds one value bit, so a `bool` member of `", tn, "` is `: 1` and nothing else — C's `_Bool` has no wider form")), "")
+    else if r != u32(types.P_BOOL) && (!is_int(w, mt) || int_prim(w, mt) == types.PRIMS):
+        say(w, f, 0, a.lo[wn], a.hi[wn], 1023, index.hold(#format("a width says how many bits C spends on a member, and `", ts, "` is not a type C lays out in bits")), index.hold(#format("declare a bitfield of `", tn, "` with an integer or a `bool`")))
+    else if r != u32(types.P_BOOL) && bw > i64(types.integer_bits(int_prim(w, mt))): say(w, f, 0, a.lo[wn], a.hi[wn], 1023, index.hold(#format("`", ts, "` is ", types.integer_bits(int_prim(w, mt)), " bits wide, so a member of `", tn, "` declared with it cannot spend ", bw, " of them")), "")
+    else if bw == 0 && s != "" && s != "_": say(w, f, 0, a.lo[m], a.hi[m], 1023, index.hold(#format("`", s, "` is a named member of `", tn, "` and a width of 0 reserves no bits, so there would be nothing to read by that name. ", zero)), "")
+    else if s == "" && bw > 0: say(w, f, 0, a.lo[m], a.hi[m], 1023, index.hold(#format("this member of `", tn, "` reserves ", bw, " bits and has no name, so nothing could read it and nothing could write it")), index.hold(#format("write unnamed padding as `_`: `", ts, " _ : ", bw, "`")), "`_` is the name an unnamed slot already has, and only C's zero-width storage-unit break is written with no name at all")
+    else if s == "_" && bw == 0: say(w, f, 0, a.lo[m], a.hi[m], 1023, index.hold(#format("`_ : 0` is two spellings at once: `_` reserves bits and `: 0` reserves none. ", zero)), "")
+    else if s == "_" && mk[1] != NONE: say(w, f, 0, a.lo[mk[1]], a.hi[mk[1]], 1023, index.hold(#format("`", w.p.files[f].src[i64(a.lo[mk[1]])..<i64(a.hi[mk[1]])], "` says what C calls this slot, and an unnamed bitfield of `", tn, "` has no C name — C gives one no name at all, which is what makes it unreadable rather than merely unread")), "")
+    else: return bw
+    return -1
+
+// A `#c` character type (`#c.char`), which resolves to nothing Dado lays out.
+private bool c_char(^World w, u32 f, u32 tn):
+    syntax.Ast a = w.p.files[f].a
+    if a.tag[tn] != syntax.T_PATH || a.a[tn] == NONE: return false
+    string8 s = w.p.spell(f, tn)
+    for c in types.C_SCALARS:
+        if c.name == s && c.class == types.CS_CHARACTER: return true
+    return s == "char"
+
+// ERR0524: names in a member list no binding views (under `[N]`, `^`, …).
+void detached(^World w, u32 f, u32 n, string8 under):
+    if n == NONE: return
+    syntax.Ast a = w.p.files[f].a
+    u8 g = a.tag[n]
+    if g == syntax.T_TUPLE:
+        for m in a.list(a.b[n]):
+            if m == NONE: continue
+            if under != "" && a.main[m] != NONE:
+                say_tok(w, f, 0, m, 524, index.hold(#format("`", w.p.spell(f, m), "` names a slot of a member list written under ", under, ", and nothing binds a view to that shape")), "declare the shape — `type Px: (…)` — and write the constructor over `Px`, or drop the names here and reach the slots by position", "A view is bound to a **name**: nothing binds one to the shape a constructor holds, so a later `.b` falls to the `xyzw`/`rgba` axes and reads whatever position the axis order picked — slot 0 for `r`, silently. A declared name carries its view through `^`, `[]`, `[N]` and `ref` alike")
+                return
+        for m in a.list(a.b[n]):
+            if m == NONE: continue
+            u32 k = a.list(a.b[m])[0]
+            // An anonymous member's names are lifted: the view binds them.
+            if under == "" && a.main[m] == NONE && k != NONE && a.tag[k] == syntax.T_TUPLE: detached(w, f, k, "")
+            else: detached(w, f, k, "another slot" if under == "" else under)
+        return
+    if g == syntax.T_ARRAY: detached(w, f, a.b[n], under if under != "" else "a `[N]`")
+    else if g == syntax.T_SLICE: detached(w, f, a.a[n], under if under != "" else "a `[]`")
+    else if g == syntax.T_POINTER: detached(w, f, a.a[n], under if under != "" else "a `^`")
+    else if g == syntax.T_REF: detached(w, f, a.a[n], under if under != "" else "a `ref`")
+    else if g == syntax.T_MAP: detached(w, f, a.b[n], under if under != "" else "a map's value")
+    else if g == syntax.T_LAYOUT: detached(w, f, a.a[n], under if under != "" else "a layout mark")
+
+// `[_]T`, C's flexible array member.
+bool flex(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    return n != NONE && a.tag[n] == syntax.T_ARRAY && a.a[n] != NONE && a.tag[a.a[n]] == syntax.E_NAME && w.p.spell(f, a.a[n]) == "_"
+
+private string8 flex_dims(string8 nm):
+    return index.hold(#format("the element of a `[_]` is written without dimensions of its own, and `", nm, "` writes one with them\x1fC's `T e[][4]` is a declaration Dado can spell and not one it can yet reach an element of — the tail is not a slot, so it carries none of the written lengths a member's rows are read through\x1ename the row with a `type` and write `[_]Row`"))
+
+// A header struct ending in `[_]T` laid out beside another (ERR1022).
+bool flex_beside(^World w, u32 f, u32 n, u32 e):
+    if !(w.t.bare(e) in w.ftail): return false
+    syntax.Ast a = w.p.files[f].a
+    string8 nm = w.p.files[f].src[i64(a.lo[n])..<i64(a.hi[n])]
+    say(w, f, 0, a.lo[n], a.hi[n], 1022, index.hold(#format("`", nm, "` ends in a flexible array member, so C refuses it wherever one value of it is laid out beside another\x1fIts `sizeof` is the header, and the next element would start on top of the tail\x1ehold it through a pointer — `^", nm, "`")), "")
+    return true
+
+// A type a `foreign` block restates.
+private bool c_typeish(^World w, u32 d):
+    u8 k = w.decls[d].kind
+    if k == K_FTYPE || k == K_FSTRUCT: return true
+    if k != K_ENUM && k != K_UNION: return false
+    u32 bl = w.decls[d].block
+    return bl != NONE && w.p.files[w.decls[d].file].a.tag[bl] == syntax.N_FOREIGN
+
+// A C struct or union body (one C can forward-declare).
+private bool c_aggregate(^World w, u32 d):
+    if w.decls[d].kind == K_UNION: return true
+    if w.decls[d].kind != K_FSTRUCT: return false
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    u32 body = a.list(a.b[w.decls[d].node])[2]
+    return body == NONE || a.tag[body] == syntax.N_MEMBERS
+
+// A header struct's member list written with a name, `(i32 x, …) inner`: a
+// distinct type tagged `pkg.struct.inner` whose slots keep the names (nested
+// named lists likewise).
+u32 c_named_list(^World w, u32 f, u32 tn, string8 tag):
+    syntax.Ast a = w.p.files[f].a
+    ref []u32 xs
+    ref []u32 ns
+    for m in a.list(a.b[tn]):
+        if m == NONE: continue
+        u32 et = a.list(a.b[m])[0]
+        u32 e = NONE
+        if a.main[m] != NONE && a.tag[et] == syntax.T_TUPLE && a.a[et] == 0: e = c_named_list(w, f, et, index.hold(#format(tag, ".", w.p.spell(f, m))))
+        else: e = resolve_type(w, f, et)
+        if e == NONE: return NONE
+        xs = #append(xs, e)
+        ns = #append(ns, tstr(w, w.p.spell(f, m) if a.main[m] != NONE else ""))
+    u32 dt = w.t.distinct_of(tag, w.t.tuple(xs[:]))
+    w.t.define(dt, w.t.body[dt], ns[:])
+    w.cnl[dt] = 1
+    return dt
+
+// `t` resolved, a header's named member list taken for its shape.
+u32 cnl_shape(^World w, u32 t):
+    u32 r = w.t.resolve(t)
+    for _ in 0..<16:
+        if r == NONE || !(r in w.cnl): return r
+        r = w.t.resolve(w.t.b[r])
+    return r
+
+// The header struct row `ty` names (through Dado names and qualifiers), or NONE.
+u32 fs_row(^World w, u32 ty):
+    u32 x = ty
+    for _ in 0..<64:
+        if x != NONE && x < u32(w.t.count()) && w.t.tag[x] == types.T_QUAL:
+            x = w.t.b[x]
+            continue
+        if x == NONE || x >= u32(w.t.count()) || w.t.tag[x] != types.T_NAMED: return NONE
+        if w.t.text(w.t.a[x]) == "#c": return x
+        x = w.t.body[x]
+    return NONE
+
+// Rust's `foreign_position_refused`: the shape of a header struct (or a
+// member list it named) whose slots a computed index or a walk cannot reach
+// in C, or NONE (`ForeignShape::computes_a_position`).
+u32 fpos_refused(^World w, u32 ty):
+    u32 x = ty
+    for x != NONE && w.t.tag[x] == types.T_QUAL:
+        x = w.t.b[x]
+    u32 cr = w.t.resolve(x)
+    if cr != NONE && cr in w.cnl: return w.t.resolve(w.t.b[cr])
+    u32 fx = fs_row(w, x)
+    if fx == NONE || !(fx in w.type_decl): return NONE
+    try u32 d = w.type_decl[fx] else: return NONE
+    if w.decls[d].kind != K_FSTRUCT: return NONE
+    u32 shape = w.t.resolve(fx)
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    u32 body = a.list(a.b[w.decls[d].node])[2]
+    if body == NONE || a.tag[body] != syntax.N_MEMBERS || fx in w.ftail: return shape
+    ref []u32 ms
+    for m in a.list(a.b[body]):
+        if m != NONE: ms = #append(ms, m)
+    if #len(ms) == 0: return shape
+    for m in ms:
+        []u32 mk = a.list(a.b[m])
+        // Bits, padding, written C names, anonymous or named member lists.
+        if mk[2] != NONE || mk[1] != NONE || a.main[m] == NONE || a.tag[mk[0]] == syntax.T_TUPLE: return shape
+    if #len(ms) == 1:
+        u32 mt = a.list(a.b[ms[0]])[0]
+        if a.tag[mt] != syntax.T_ARRAY: return shape
+        for mt != NONE && a.tag[mt] == syntax.T_ARRAY:
+            u32 ln = a.a[mt]
+            if ln != NONE && a.tag[ln] == syntax.E_INT && a.a[ln] == 1 && a.b[ln] == 0: return shape
+            mt = a.b[mt]
+        return NONE
+    for m in ms:
+        u32 mt = a.list(a.b[m])[0]
+        if a.tag[mt] == syntax.T_ARRAY: return shape
+        u32 st = resolve_type(w, w.decls[d].file, mt)
+        u32 e = NONE
+        i64 k = 0
+        if st != NONE && fpos_fields(w, st) == 0 && w.t.uniform(w.t.resolve(st), &e, &k): return shape
+    return NONE
+
+// How many named slots a header type restates (0: none, or no header type).
+private i64 fpos_fields(^World w, u32 ty):
+    u32 fx = fs_row(w, ty)
+    if fx == NONE: return 0
+    []u32 ns = w.t.slot_names(fx)
+    return #len(ns)
+
+// Rust's `foreign_window_refused`: no window over a header struct's slots
+// unless they are its one member's elements.
+u32 fwin_refused(^World w, u32 ty):
+    u32 x = ty
+    for x != NONE && w.t.tag[x] == types.T_QUAL:
+        x = w.t.b[x]
+    u32 cr = w.t.resolve(x)
+    if cr != NONE && cr in w.cnl: return w.t.resolve(w.t.b[cr])
+    u32 fx = fs_row(w, x)
+    if fx == NONE || !(fx in w.type_decl) || fpos_fields(w, fx) == 0: return NONE
+    try u32 d = w.type_decl[fx] else: return NONE
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    u32 body = a.list(a.b[w.decls[d].node])[2]
+    i64 nm = 0
+    if body != NONE && a.tag[body] == syntax.N_MEMBERS:
+        for m in a.list(a.b[body]):
+            if m != NONE: nm += 1
+    if nm == 1 && fpos_refused(w, fx) == NONE: return NONE
+    return w.t.resolve(fx)
+
+// A header struct with no Dado shape to be one type with (bits, a flexible tail).
+bool fs_nominal(^World w, u32 ty):
+    u32 fx = fs_row(w, ty)
+    return fx != NONE && fx in w.fnominal
+
+// Pointees `x` and `y` are one type spelled twice in C: a header's
+// restatement (or a named member list) and the shape it restates.
+bool two_spellings(^World w, u32 x, u32 y):
+    if fs_row(w, x) == fs_row(w, y) && !(w.t.resolve(x) in w.cnl) && !(w.t.resolve(y) in w.cnl): return false
+    if fs_nominal(w, x) || fs_nominal(w, y): return false
+    bool met = true
+    return cnl_eq(w, w.t.bare(x), w.t.bare(y), &met)
+
+// The `@incomplete` foreign type `ty` holds by value (a run's elements
+// included, not behind `^` or a one-value `ref`), or NONE.
+u32 incomplete_in(^World w, u32 ty, i64 depth):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || depth > 16: return NONE
+    u8 g = w.t.tag[r]
+    if g == types.T_OPAQUE:
+        for i in 0..<#len(w.decls):
+            if w.decls[i].kind == K_FTYPE && w.t.text(c_name(w, u32(i))) == w.t.text(w.t.a[r]) && (w.p.files[w.decls[i].file].a.b[w.decls[i].node] & syntax.F_INCOMPLETE) != 0: return u32(i)
+        return NONE
+    if g == types.T_DISTINCT: return incomplete_in(w, w.t.b[r], depth + 1)
+    if g == types.T_SLICE: return incomplete_in(w, w.t.a[r], depth + 1)
+    if g == types.T_REF:
+        u32 h = w.t.resolve(w.t.a[r])
+        if h != NONE && w.t.tag[h] == types.T_SLICE: return incomplete_in(w, w.t.a[h], depth + 1)
+        return NONE
+    if g == types.T_TUPLE:
+        for x in w.t.list(r):
+            u32 d = incomplete_in(w, x, depth + 1)
+            if d != NONE: return d
+    return NONE
+
+// ERR1002 where `what` (written `lo..hi` of file `f`) holds an `@incomplete` type by value.
+bool inc_refuse(^World w, u32 f, u32 lo, u32 hi, u32 ty, string8 what, u32 base = 0):
+    u32 d = incomplete_in(w, ty, 0)
+    if d == NONE: return false
+    string8 on = name_of(w, w.decls[d].name)
+    say(w, f, base, lo, hi, 1002, index.hold(#format("`", on, "` is declared `@incomplete`, so ", what, " holding one by value has nothing to hold")), index.hold(#format("hold it behind `^", on, "`, which is what a C library hands you anyway; if the header does define it, drop the `@incomplete`")))
+    return true
+
+// Whether `x` reaches named row `to` through names, pointers, windows, maps
+// and function types alone, never a tuple or a union (Rust's `unbroken_path`).
+bool unbroken(^World w, u32 x, u32 to, ^ref []u32 seen):
+    if x == NONE: return false
+    if x == to: return true
+    for s in seen^:
+        if s == x: return false
+    seen^ = #append(seen^, x)
+    u8 g = w.t.tag[x]
+    if g == types.T_NAMED: return unbroken(w, w.t.body[x], to, seen)
+    if g == types.T_PTR || g == types.T_REF || g == types.T_SLICE: return unbroken(w, w.t.a[x], to, seen)
+    if g == types.T_QUAL || g == types.T_ALIGNED || g == types.T_DISTINCT: return unbroken(w, w.t.b[x], to, seen)
+    if g == types.T_MAP: return unbroken(w, w.t.a[x], to, seen) || unbroken(w, w.t.b[x], to, seen)
+    if g == types.T_FUNC:
+        for p in w.t.params(x):
+            if unbroken(w, p, to, seen): return true
+        return unbroken(w, w.t.a[x], to, seen)
+    return false
+
+// ERR0404: member `m`'s name already names a slot of `nm`, lifted or not.
+private bool anon_seen(^World w, u32 f, u32 m, string8 nm, ^ref []u32 seen):
+    u32 s = w.p.sym(f, m)
+    if w.p.spell(f, m) == "_": return true
+    for x in seen^:
+        if x == s:
+            say_tok(w, f, 0, m, 404, index.hold(#format("`", w.p.spell(f, m), "` already names a slot of `", nm, "`; a view binds each name once")), "")
+            return false
+    seen^ = #append(seen^, s)
+    return true
+
+// An anonymous member list `tn` of type `ty` (named `nm`): a header's struct
+// takes its members as its own slots, flat; a header's `cunion (…)` is one
+// slot holding the union; Dado's is one slot holding the tuple. Their names
+// are found through `w.anon`.
+private bool anon_member(^World w, u32 ty, u32 f, u32 tn, bool fs, string8 nm, ^ref []u32 slots, ^ref []u32 names, ^ref []u32 from, ^ref []u32 seen):
+    syntax.Ast a = w.p.files[f].a
+    bool cu = a.a[tn] == 1
+    if cu && !fs:
+        say(w, f, 0, a.lo[tn], a.hi[tn], 1024, "`cunion (…)` is C11's anonymous union, which restates a header and belongs in a transparent `foreign` type\x1fIt is a member list C overlays and gives no name. Dado lays its own structs out; a member list with no `cunion` is C11's anonymous **struct** and is laid out one member after another", "write `cunion <name>: (…)` and hold it as an ordinary member, or drop `cunion`")
+        return false
+    if fs && !cu:
+        for mm in a.list(a.b[tn]):
+            if mm == NONE: continue
+            []u32 k = a.list(a.b[mm])
+            if a.main[mm] == NONE && a.tag[k[0]] == syntax.T_TUPLE:
+                if !anon_member(w, ty, f, k[0], fs, nm, slots, names, from, seen): return false
+                continue
+            if a.main[mm] == NONE:
+                say(w, f, 0, a.lo[k[0]], a.hi[k[0]], 1001, "every slot of a transparent foreign type is named, because the emitted C reaches it by the name the header gave it; embedding has no C spelling", "")
+                return false
+            if !anon_seen(w, f, mm, nm, seen): return false
+            u32 mt = resolve_type(w, f, k[0])
+            if mt == NONE: return false
+            slots^ = #append(slots^, mt)
+            names^ = #append(names^, tstr(w, w.p.spell(f, mm)))
+            from^ = #append(from^, NONE)
+        return true
+    ref []u32 xs
+    ref []u32 ns
+    for mm in a.list(a.b[tn]):
+        if mm == NONE: continue
+        []u32 k = a.list(a.b[mm])
+        if cu && a.main[mm] == NONE:
+            say(w, f, 0, a.lo[k[0]], a.hi[k[0]], 1001, index.hold(#format("every member of an anonymous union in `", nm, "` is named, because the emitted C reaches it by the name the header gave it and C11 lifts that name into `", nm, "`")), "")
+            return false
+        if cu && (k[2] != NONE || a.tag[k[0]] == syntax.T_ARRAY):
+            say(w, f, 0, a.lo[mm], a.hi[mm], 1024, index.hold(#format("a member of an anonymous union in `", nm, "` carries a width or a dimension, and both are laid out by the shadow struct this union is declared inside. Give the union a name and restate it as a `cunion` of its own")), "")
+            return false
+        u32 mt = NONE
+        if a.main[mm] == NONE && a.tag[k[0]] == syntax.T_TUPLE:
+            // A nested anonymous list: its names are lifted too.
+            ref []u32 inner
+            ref []u32 inames
+            ref []u32 ifrom
+            if !anon_member(w, NONE, f, k[0], fs, nm, &inner, &inames, &ifrom, seen): return false
+            mt = inner[0]
+        else:
+            if a.main[mm] != NONE && !anon_seen(w, f, mm, nm, seen): return false
+            mt = resolve_type(w, f, k[0])
+        if mt == NONE: return false
+        xs = #append(xs, mt)
+        ns = #append(ns, tstr(w, w.p.spell(f, mm) if a.main[mm] != NONE else ""))
+    if #len(xs) == 0:
+        say(w, f, 0, a.lo[tn], a.hi[tn], 506, "a shape with no slots has no value to hold, and no representation to give one; `void` is how a function returns nothing", "")
+        return false
+    u32 st = NONE
+    if cu:
+        st = w.t.make(types.T_UNION, tstr(w, index.hold(#format(nm, ".#", #len(slots^)))), 1, xs[:])
+        w.t.define(st, w.t.body[st], ns[:])
+    else: st = xs[0] if #len(xs) == 1 else w.t.tuple(xs[:])
+    if ty != NONE:
+        w.anon[(u64(ty) << 32) | u64(#len(slots^))] = (u64(f) << 32) | u64(tn)
+        if fs: w.cmember[(u64(ty) << 32) | u64(#len(slots^))] = tstr(w, "")
+    if cu: w.canon_u[st] = 1
+    slots^ = #append(slots^, st)
+    names^ = #append(names^, tstr(w, ""))
+    from^ = #append(from^, NONE)
+    return true
+
+// The slot path to `s` through type `ty`'s anonymous members, into `path`.
+bool anon_find(^World w, u32 ty, string8 s, ^ref []u32 path):
+    u32 x = w.t.bare(ty)
+    if x == NONE: return false
+    []u32 sl = w.t.slots(x)
+    for i in 0..<#len(sl):
+        u64 key = (u64(x) << 32) | u64(i)
+        if !(key in w.anon): continue
+        try u64 v = w.anon[key] else: continue
+        path^ = #append(path^, u32(i))
+        if anon_node(w, u32(v >> 32), u32(v & 0xFFFFFFFF), s, path): return true
+        #truncate(path^, #len(path^) - 1)
+    return false
+
+// The same through member list node `tn` of file `f` (nested lists recursed).
+bool anon_node(^World w, u32 f, u32 tn, string8 s, ^ref []u32 path):
+    syntax.Ast a = w.p.files[f].a
+    u32 i = 0
+    for mm in a.list(a.b[tn]):
+        if mm == NONE: continue
+        u32 k = a.list(a.b[mm])[0]
+        if a.main[mm] != NONE && w.p.spell(f, mm) == s:
+            path^ = #append(path^, i)
+            return true
+        if a.main[mm] == NONE && a.tag[k] == syntax.T_TUPLE:
+            path^ = #append(path^, i)
+            if anon_node(w, f, k, s, path): return true
+            #truncate(path^, #len(path^) - 1)
+        i += 1
+    return false
+
+// A `contract`: a `type` of function references, tagged.
+// Whether declaration `d` is one whose every slot is a function reference.
+bool contract_decl(^World w, u32 d):
+    if d == NONE || w.decls[d].kind != K_TYPE: return false
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    if (a.a[w.decls[d].node] & syntax.F_CONTRACT) == 0: return false
+    return contract_slots(w, d, false)
+
+// Every slot a function reference; ERR0520 said where one is not (`say`).
+bool contract_slots(^World w, u32 d, bool say_):
+    u32 f = w.decls[d].file
+    syntax.Ast a = w.p.files[f].a
+    u32 body = a.list(a.b[w.decls[d].node])[2]
+    if body == NONE || a.tag[body] != syntax.N_MEMBERS: return false
+    string8 cn = name_of(w, w.decls[d].name)
+    bool ok = true
+    for m in a.list(a.b[body]):
+        if m == NONE: continue
+        u32 tn = a.list(a.b[m])[0]
+        u32 st = resolve_type(w, f, tn)
+        if st == NONE:
+            ok = false
+            continue
+        if a.main[m] != NONE:
+            u32 r = w.t.resolve(st)
+            if r == NONE || w.t.tag[r] != types.T_FUNC:
+                if say_: say(w, f, 0, a.lo[tn], a.hi[tn], 520, index.hold(#format("`", cn, ".", w.p.spell(f, m), "` is ", shown(w, st), ", and a slot of a contract is a function reference\x1fA contract is the tuple of operations a member call reaches through, so a slot nothing can be called through has nothing to say\x1ewrite the signature — `Window(i32, i32) create` — or declare `", cn, "` with `type`, which is the run-time form and holds any shape")), "")
+                ok = false
+            continue
+        for x in w.t.slots(st):
+            u32 r = w.t.resolve(x)
+            if r != NONE && w.t.tag[r] == types.T_FUNC: continue
+            if say_: say(w, f, 0, a.lo[tn], a.hi[tn], 520, index.hold(#format("`", cn, "` embeds ", shown(w, st), ", which brings in a slot of ", shown(w, x), ", and a slot of a contract is a function reference\x1fAn embedded member splices its slots in\x1eembed a shape whose every slot is a function reference: another contract, or a tuple of signatures")), "")
+            ok = false
+            break
+    return ok
+
+// The contract declaration `ty` reaches, as written (`top`: `ty` itself counts).
+u32 contract_reached(^World w, u32 ty, bool top, ^ref []u32 seen):
+    if ty == NONE: return NONE
+    if top && w.t.tag[ty] == types.T_NAMED && ty in w.type_decl:
+        try u32 d = w.type_decl[ty] else: return NONE
+        if contract_decl(w, d): return d
+    for s in seen^:
+        if s == ty: return NONE
+    seen^ = #append(seen^, ty)
+    u8 g = w.t.tag[ty]
+    if g == types.T_NAMED: return contract_reached(w, w.t.body[ty], true, seen)
+    if g == types.T_TUPLE || g == types.T_UNION:
+        for x in w.t.list(ty):
+            u32 c = contract_reached(w, x, true, seen)
+            if c != NONE: return c
+        return NONE
+    if g == types.T_SLICE || g == types.T_PTR || g == types.T_REF: return contract_reached(w, w.t.a[ty], true, seen)
+    if g == types.T_DISTINCT || g == types.T_QUAL || g == types.T_ALIGNED: return contract_reached(w, w.t.b[ty], true, seen)
+    if g == types.T_MAP:
+        u32 c = contract_reached(w, w.t.a[ty], true, seen)
+        if c != NONE: return c
+        return contract_reached(w, w.t.b[ty], true, seen)
+    if g == types.T_FUNC:
+        u32 c = contract_reached(w, w.t.a[ty], true, seen)
+        if c != NONE: return c
+        for p in w.t.params(ty):
+            c = contract_reached(w, p, true, seen)
+            if c != NONE: return c
+    return NONE
+
+// ERR0921: a contract written where a value is stored (`what`, over `lo..hi`).
+bool contract_refused(^World w, u32 f, u32 base, u32 lo, u32 hi, u32 ty, string8 what):
+    ref []u32 seen
+    u32 d = contract_reached(w, ty, true, &seen)
+    if d == NONE: return false
+    string8 bare = name_of(w, w.decls[d].name)
+    string8 q = index.hold(#format(name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", bare))
+    u32 cr = w.t.resolve(resolve(w, d))
+    bool collapsed = cr != NONE && w.t.tag[cr] == types.T_FUNC
+    string8 lives = index.hold(#format("`const ", bare, " active = (…)`"))
+    string8 rt = "a real struct of function pointers"
+    string8 one = ""
+    if collapsed:
+        lives = index.hold(#format("`const ", bare, " active = an_implementation`"))
+        rt = "a function-pointer typedef"
+        one = index.hold(#format(" `", bare, "` is one operation, so it collapses and a value of it is that function rather than a tuple of them."))
+    string8 help = index.hold(#format("keep it in a `const` — ", lives, " — or, for a run-time choice, declare `", bare, "` with `type`"))
+    if resolve(w, d) == ty:
+        say(w, f, base, lo, hi, 921, index.hold(#format(what, " is the contract `", q, "`, and a contract value has no storage\x1fA contract value is compile-time known and erased: there is nothing here for the emitted C to hold and nothing for it to choose between while the program runs. A `const` is where a contract value lives, folded at each use.", one, " Declared with `type` over the same shape it is ", rt, ", the form this rule leaves alone")), help)
+    else: say(w, f, base, lo, hi, 921, index.hold(#format(what, " is ", shown(w, ty), ", which reaches the contract `", q, "` inside it\x1fA contract value is compile-time known and erased, so there is nothing in the emitted C for it to be, and a contract is not a shape another shape can carry.", one, " Declared with `type` it is the run-time form, ", rt, " that a slot, an element or a pointee can hold")), help)
+    return true

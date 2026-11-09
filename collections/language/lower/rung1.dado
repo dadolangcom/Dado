@@ -1,0 +1,364 @@
+// Rung 1 natively (Rust's `lower.rung1`, whole methods): a script method whose
+// slots are all `int`, `float` or `bool`, reading no field and calling only such
+// methods of its class (outside a hierarchy), is C too. Its module calls the C
+// first; on a fault (`fail`, a division by zero) the C answers `null` and the
+// method runs its own JavaScript from the start, which raises as it always did:
+// the C wrote nothing the script can see. Not on the web.
+package lower
+
+import "language:check"
+import "language:index"
+import "language:ir"
+import "language:types"
+
+// `--pass=lower.rung1=off` (or `lower=off`, `--passes=off`) clears it.
+bool g_rung1 = true
+
+// This build's units: per job, its unit's index (`g_u_fj[k]` is the job).
+private {u32: u32} g_units
+private ref []u32 g_u_fj
+private ref []u32 g_u_ci
+
+// Whether job `fj` lowered, and the export the module imports it by.
+bool unit_of(u32 fj):
+    return fj in g_units
+
+string8 unit_name(^check.World w, u32 fj):
+    u32 m = w.jobs[fj].decl
+    return index.hold(#format("__unit_", jid(check.name_of(w, w.decls[w.classes[u_class(w, m)].decl].name)), "_", check.name_of(w, w.decls[m].name)))
+
+private u32 u_class(^check.World w, u32 m):
+    for ci in 0..<#len(w.classes):
+        for x in w.classes[ci].methods:
+            if x == m: return u32(ci)
+    return NONE
+
+// Which methods lower: scalar shape first, then calls within the set (a fixed point).
+void rung1_plan(^check.World w):
+    for x in g_u_fj:
+        #delete(g_units, x)
+    #truncate(g_u_fj, 0)
+    #truncate(g_u_ci, 0)
+    if w.os == "WEB" || !g_rung1: return
+    ref []u32 fjs
+    ref []u32 cis
+    for ci in 0..<#len(w.classes):
+        bool hier = check.s_parent(w, u32(ci)) != NONE
+        for x in 0..<#len(w.classes):
+            if check.s_parent(w, u32(x)) == u32(ci): hier = true
+        if hier: continue
+        check.SClass sc = w.classes[ci]
+        for m in sc.methods:
+            if m == sc.init || jasync(w, m) != "": continue
+            for i in 0..<#len(w.fns):
+                if w.jobs[i].decl == m && u_shape(w, &w.fns[i], m):
+                    fjs = #append(fjs, u32(i))
+                    cis = #append(cis, u32(ci))
+    ref []bool keep
+    for _ in fjs:
+        keep = #append(keep, true)
+    bool changed = true
+    for changed:
+        changed = false
+        for k in 0..<#len(fjs):
+            if !keep[k]: continue
+            ^ir.Fn f = &w.fns[fjs[k]]
+            for i in 0..<ir.count(f):
+                if f.op[i] != ir.O_CALL: continue
+                i64 q = u_callee(w, f, i, fjs[:], cis[:], cis[k])
+                if q < 0 || !keep[q]:
+                    keep[k] = false
+                    changed = true
+                    break
+    for k in 0..<#len(fjs):
+        if !keep[k]: continue
+        g_units[fjs[k]] = u32(#len(g_u_fj))
+        g_u_fj = #append(g_u_fj, fjs[k])
+        g_u_ci = #append(g_u_ci, cis[k])
+    #delete(keep)
+    #delete(fjs)
+    #delete(cis)
+
+// The candidate op `i` calls: a method of class `ci` by name, on the receiver.
+private i64 u_callee(^check.World w, ^ir.Fn f, u32 i, []u32 fjs, []u32 cis, u32 ci):
+    string8 nm = w.t.text(f.ref_name[f.a[i]])
+    for k in 0..<#len(fjs):
+        if cis[k] == ci && check.name_of(w, w.decls[w.jobs[fjs[k]].decl].name) == nm: return k
+    return -1
+
+// A scalar of the script: `int`, `float`, `bool`.
+private bool u_scalar(^check.World w, u32 t):
+    u32 r = w.t.resolve(t)
+    return r == u32(types.P_INT) || r == u32(types.P_FLOAT) || r == u32(types.P_BOOL)
+
+// An array the C takes (a parameter only): its element's C type, else "".
+private string8 u_arr(^check.World w, u32 t):
+    u32 r = w.t.resolve(t)
+    if r == NONE || w.t.tag[r] != types.T_SLICE: return ""
+    u32 e = w.t.resolve(w.t.a[r])
+    if e == u32(types.P_U8): return "uint8_t"
+    if !u_scalar(w, e): return ""
+    return u_cty(w, e)
+
+// A whole array parameter.
+private bool u_arr_ok(^check.World w, ^ir.Fn f, u32 x):
+    if x == NONE || ir.is_const(x) || (f.root[x] & ir.ROOT_GLOBAL) != 0 || f.plo[x] != f.phi[x] || f.root[x] >= f.params: return false
+    return u_arr(w, f.slot_ty[f.root[x]]) != ""
+
+private u32 u_ty(^check.World w, ^ir.Fn f, u32 x):
+    if !ir.is_const(x): return w.t.resolve(f.place_ty[x])
+    u8 kind = w.k.kind[x & ~ir.OPD_CONST]
+    if kind == types.C_FLOAT: return u32(types.P_FLOAT)
+    if kind == types.C_BOOL: return u32(types.P_BOOL)
+    if kind == types.C_INT: return u32(types.P_INT)
+    return NONE
+
+// An operand the C reads: a scalar constant or a whole local.
+private bool u_opd_ok(^check.World w, ^ir.Fn f, u32 x):
+    if x == NONE: return false
+    if ir.is_const(x): return u_ty(w, f, x) != NONE
+    if (f.root[x] & ir.ROOT_GLOBAL) != 0 || f.plo[x] != f.phi[x] || (f.slot_flags[f.root[x]] & ir.S_RECEIVER) != 0: return false
+    return u_scalar(w, f.slot_ty[f.root[x]])
+
+private bool u_shape(^check.World w, ^ir.Fn f, u32 m):
+    if f.dialect != ir.D_SCRIPT: return false
+    u32 rt = w.t.resolve(w.t.a[w.decls[m].ty])
+    if rt != u32(types.P_VOID) && !u_scalar(w, rt): return false
+    for s in 0..<#len(f.slot_ty):
+        if (f.slot_flags[s] & ir.S_RECEIVER) == 0 && !u_scalar(w, f.slot_ty[s]) && !(s < f.params && u_arr(w, f.slot_ty[s]) != ""): return false
+    for i in 0..<ir.count(f):
+        u8 o = f.op[i]
+        bool ok = false
+        if o == ir.O_BLOCK || o == ir.O_LOOP: ok = f.sub[i] == 0
+        else if o == ir.O_IF: ok = u_opd_ok(w, f, f.a[i])
+        else if o == ir.O_BREAK || o == ir.O_CONTINUE || o == ir.O_SCOPE_END || o == ir.O_RETURN_FAIL: ok = true
+        else if o == ir.O_RETURN: ok = f.a[i] == NONE || u_opd_ok(w, f, f.a[i])
+        else if o == ir.O_SET: ok = u_opd_ok(w, f, f.dst[i]) && u_opd_ok(w, f, f.a[i])
+        else if o == ir.O_UN: ok = u_opd_ok(w, f, f.dst[i]) && u_opd_ok(w, f, f.a[i])
+        else if o == ir.O_CONV:
+            u32 a = u_ty(w, f, f.a[i])
+            u32 d = u_ty(w, f, f.dst[i])
+            ok = u_opd_ok(w, f, f.dst[i]) && u_opd_ok(w, f, f.a[i]) && (a == d || a != u32(types.P_BOOL) && d != u32(types.P_BOOL))
+        else if o == ir.O_BIN:
+            ok = u_opd_ok(w, f, f.dst[i]) && u_opd_ok(w, f, f.a[i]) && u_opd_ok(w, f, f.b[i]) && f.sub[i] <= ir.B_GE
+            u32 t = u_ty(w, f, f.a[i])
+            if t != u_ty(w, f, f.b[i]): ok = false
+            if t == u32(types.P_BOOL) && f.sub[i] != ir.B_EQ && f.sub[i] != ir.B_NE: ok = false
+            if t == u32(types.P_FLOAT) && f.sub[i] >= ir.B_AND && f.sub[i] <= ir.B_SHR: ok = false
+        else if o == ir.O_CALL:
+            []u32 xs = ir.args(f, i)
+            ok = f.sub[i] != 1 && f.c[i] == NONE && #len(xs) > 0 && (f.dst[i] == NONE || u_opd_ok(w, f, f.dst[i]))
+            if ok && (ir.is_const(xs[0]) || (f.root[xs[0]] & ir.ROOT_GLOBAL) != 0 || (f.slot_flags[f.root[xs[0]]] & ir.S_RECEIVER) == 0): ok = false
+            if ok:
+                for q in f.plo[xs[0]]..<f.phi[xs[0]]:
+                    if f.step[q] != ir.ST_DEREF: ok = false
+            for k in 1..<#len(xs):
+                if !u_opd_ok(w, f, xs[k]) && !u_arr_ok(w, f, xs[k]): ok = false
+        else if o == ir.O_INTRINSIC:
+            []u32 xs = ir.args(f, i)
+            u8 b = f.sub[i]
+            if b == check.B_SINDEX: ok = #len(xs) == 2 && u_arr_ok(w, f, xs[0]) && u_opd_ok(w, f, xs[1]) && u_ty(w, f, xs[1]) == u32(types.P_INT) && u_opd_ok(w, f, f.dst[i])
+            if b == check.B_SSTORE: ok = #len(xs) == 3 && f.dst[i] == NONE && u_arr_ok(w, f, xs[0]) && u_opd_ok(w, f, xs[1]) && u_ty(w, f, xs[1]) == u32(types.P_INT) && u_opd_ok(w, f, xs[2])
+            if b == check.B_SMETHOD: ok = #len(xs) == 2 && u_arr_ok(w, f, xs[0]) && ir.is_const(xs[1]) && w.t.text(w.k.a[xs[1] & ~ir.OPD_CONST]) == "len" && u_opd_ok(w, f, f.dst[i])
+        if !ok: return false
+    return true
+
+// ── the C ──────────────────────────────────────────────────────────────────
+
+private const string8 U_RT = "static inline int64_t dado_u_add(int64_t a, int64_t b) { return (int64_t)((uint64_t)a + (uint64_t)b); }\nstatic inline int64_t dado_u_sub(int64_t a, int64_t b) { return (int64_t)((uint64_t)a - (uint64_t)b); }\nstatic inline int64_t dado_u_mul(int64_t a, int64_t b) { return (int64_t)((uint64_t)a * (uint64_t)b); }\nstatic inline int64_t dado_u_neg(int64_t a) { return (int64_t)(0u - (uint64_t)a); }\nstatic inline int32_t dado_u_div(int64_t *r, int64_t a, int64_t b) { if (b == 0) { return 1; } *r = b == -1 ? dado_u_neg(a) : a / b; return 0; }\nstatic inline int32_t dado_u_mod(int64_t *r, int64_t a, int64_t b) { if (b == 0) { return 1; } *r = b == -1 ? 0 : a % b; return 0; }\nstatic inline int64_t dado_u_shl(int64_t a, int64_t n) { return n < 0 || n >= 64 ? 0 : (int64_t)((uint64_t)a << n); }\nstatic inline int64_t dado_u_shr(int64_t a, int64_t n) { return n < 0 || n >= 64 ? (a < 0 ? -1 : 0) : a >> n; }\nstatic inline int64_t dado_u_of_float(double x) { if (x != x) { return 0; } if (x >= 9223372036854775808.0) { return INT64_MAX; } if (x < -9223372036854775808.0) { return INT64_MIN; } return (int64_t)x; }\nstatic int32_t dado_u_take_int(JSContext *ctx, JSValue v, int64_t *o) {\n    int32_t t = JS_VALUE_GET_TAG(v);\n    if (t == JS_TAG_INT) { *o = JS_VALUE_GET_INT(v); return 0; }\n    if (t == JS_TAG_FLOAT64) { double d = JS_VALUE_GET_FLOAT64(v); if (d >= -9007199254740991.0 && d <= 9007199254740991.0 && d == (double)(int64_t)d) { *o = (int64_t)d; return 0; } return 1; }\n    if (t == JS_TAG_BIG_INT || t == JS_TAG_SHORT_BIG_INT) { return JS_ToBigInt64(ctx, o, v) != 0; }\n    return 1;\n}\nstatic int32_t dado_u_take_float(JSValue v, double *o) {\n    int32_t t = JS_VALUE_GET_TAG(v);\n    if (t == JS_TAG_FLOAT64) { *o = JS_VALUE_GET_FLOAT64(v); return 0; }\n    if (t == JS_TAG_INT) { *o = (double)JS_VALUE_GET_INT(v); return 0; }\n    return 1;\n}\nstatic JSValue dado_u_give_int(JSContext *ctx, int64_t v) {\n    if (v >= -9007199254740991LL && v <= 9007199254740991LL) { return JS_NewInt64(ctx, v); }\n    return JS_NewBigInt64(ctx, v);\n}\n"
+
+private string8 u_cty(^check.World w, u32 t):
+    string8 ae = u_arr(w, t)
+    if ae != "": return index.hold(#format("struct dado_ua_", ae))
+    u32 r = w.t.resolve(t)
+    if r == u32(types.P_INT): return "int64_t"
+    if r == u32(types.P_FLOAT): return "double"
+    if r == u32(types.P_BOOL): return "_Bool"
+    return "int32_t"
+
+private string8 u_opd(^check.World w, ^ir.Fn f, u32 x):
+    if !ir.is_const(x): return index.hold(#format("v", f.root[x]))
+    u32 k = x & ~ir.OPD_CONST
+    u8 kind = w.k.kind[k]
+    if kind == types.C_BOOL: return "1" if w.k.a[k] != 0 else "0"
+    if kind == types.C_FLOAT: return hexf(w.k.w0[k])
+    i64 v = i64(w.k.w0[k])
+    if v == -9223372036854775807 - 1: return "INT64_MIN"
+    return index.hold(#format("INT64_C(", v, ")"))
+
+// The head `break`/`continue` op `i` leaves.
+private u32 u_target(^ir.Fn f, u32 i):
+    ref []u32 heads
+    for k in 0..<i + 1:
+        for #len(heads) > 0 && i64(heads[#len(heads) - 1]) + 1 + i64(ir.span(f, heads[#len(heads) - 1])) <= i64(k):
+            #truncate(heads, #len(heads) - 1)
+        if k < i && (f.op[k] == ir.O_IF || f.op[k] == ir.O_LOOP || f.op[k] == ir.O_BLOCK): heads = #append(heads, k)
+    u32 t = heads[#len(heads) - 1 - i64(f.a[i])]
+    #delete(heads)
+    return t
+
+private void u_put(^ref []char8 o, string8 s):
+    o^ = #append(o^, ..s)
+
+private void u_close(^ref []char8 o, ^ir.Fn f, u32 h, []bool brk, []bool cnt):
+    if f.op[h] == ir.O_LOOP && cnt[h]: u_put(o, index.hold(#format("    L", h, "_next: ;\n")))
+    u_put(o, "    }\n")
+    if brk[h]: u_put(o, index.hold(#format("    L", h, "_end: ;\n")))
+
+private void u_body(^check.World w, ^ref []char8 o, u32 k):
+    ^ir.Fn f = &w.fns[g_u_fj[k]]
+    ref []bool brk
+    ref []bool cnt
+    for _ in 0..<ir.count(f):
+        brk = #append(brk, false)
+        cnt = #append(cnt, false)
+    for i in 0..<ir.count(f):
+        if f.op[i] == ir.O_BREAK: brk[u_target(f, i)] = true
+        if f.op[i] == ir.O_CONTINUE: cnt[u_target(f, i)] = true
+    for s in 0..<#len(f.slot_ty):
+        if (f.slot_flags[s] & ir.S_RECEIVER) != 0: continue
+        if s < f.params: u_put(o, index.hold(#format("    (void)v", s, ";\n")))
+        else: u_put(o, index.hold(#format("    ", u_cty(w, f.slot_ty[s]), " v", s, " = 0; (void)v", s, ";\n")))
+    ref []u32 heads
+    for i in 0..<ir.count(f):
+        for #len(heads) > 0 && i64(heads[#len(heads) - 1]) + 1 + i64(ir.span(f, heads[#len(heads) - 1])) <= i64(i):
+            u_close(o, f, heads[#len(heads) - 1], brk[:], cnt[:])
+            #truncate(heads, #len(heads) - 1)
+        if #len(heads) > 0:
+            u32 h = heads[#len(heads) - 1]
+            if f.op[h] == ir.O_IF && f.c[h] > 0 && i == h + 1 + f.b[h]: u_put(o, "    } else {\n")
+        u8 op = f.op[i]
+        string8 d = ""
+        if f.dst[i] != NONE: d = u_opd(w, f, f.dst[i])
+        string8 a = ""
+        if f.a[i] != NONE && op != ir.O_BREAK && op != ir.O_CONTINUE && op != ir.O_CALL && op != ir.O_BLOCK && op != ir.O_LOOP: a = u_opd(w, f, f.a[i])
+        if op == ir.O_IF || op == ir.O_LOOP || op == ir.O_BLOCK:
+            if op == ir.O_IF: u_put(o, index.hold(#format("    if (", a, ") {\n")))
+            else if op == ir.O_LOOP: u_put(o, "    for (;;) {\n")
+            else: u_put(o, "    {\n")
+            heads = #append(heads, i)
+        else if op == ir.O_BREAK: u_put(o, index.hold(#format("    goto L", u_target(f, i), "_end;\n")))
+        else if op == ir.O_CONTINUE: u_put(o, index.hold(#format("    goto L", u_target(f, i), "_next;\n")))
+        else if op == ir.O_RETURN && f.a[i] == NONE: u_put(o, "    return 0;\n")
+        else if op == ir.O_RETURN: u_put(o, index.hold(#format("    *dado_r = ", a, "; return 0;\n")))
+        else if op == ir.O_RETURN_FAIL: u_put(o, "    return 1;\n")
+        else if op == ir.O_SET: u_put(o, index.hold(#format("    ", d, " = ", a, ";\n")))
+        else if op == ir.O_UN:
+            u32 t = u_ty(w, f, f.a[i])
+            string8 e = index.hold(#format("!", a))
+            if f.sub[i] == ir.U_NEG && t == u32(types.P_INT): e = index.hold(#format("dado_u_neg(", a, ")"))
+            else if f.sub[i] == ir.U_NEG: e = index.hold(#format("-", a))
+            else if f.sub[i] == ir.U_BITNOT: e = index.hold(#format("~", a))
+            u_put(o, index.hold(#format("    ", d, " = ", e, ";\n")))
+        else if op == ir.O_CONV:
+            u32 from = u_ty(w, f, f.a[i])
+            u32 to = u_ty(w, f, f.dst[i])
+            string8 e = a
+            if from == u32(types.P_INT) && to == u32(types.P_FLOAT): e = index.hold(#format("(double)", a))
+            if from == u32(types.P_FLOAT) && to == u32(types.P_INT): e = index.hold(#format("dado_u_of_float(", a, ")"))
+            u_put(o, index.hold(#format("    ", d, " = ", e, ";\n")))
+        else if op == ir.O_BIN:
+            string8 b = u_opd(w, f, f.b[i])
+            u8 s = f.sub[i]
+            bool int_ = u_ty(w, f, f.a[i]) == u32(types.P_INT)
+            [16]string8 ops = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "==", "!=", "<", "<=", ">", ">="]
+            [10]string8 fns = ["add", "sub", "mul", "div", "mod", "", "", "", "shl", "shr"]
+            if int_ && (s == ir.B_DIV || s == ir.B_REM): u_put(o, index.hold(#format("    if (dado_u_", fns[s], "(&", d, ", ", a, ", ", b, ") != 0) { return 1; }\n")))
+            else if int_ && (s <= ir.B_MUL || s == ir.B_SHL || s == ir.B_SHR): u_put(o, index.hold(#format("    ", d, " = dado_u_", fns[s], "(", a, ", ", b, ");\n")))
+            else if !int_ && s == ir.B_REM: u_put(o, index.hold(#format("    ", d, " = fmod(", a, ", ", b, ");\n")))
+            else: u_put(o, index.hold(#format("    ", d, " = ", a, " ", ops[s], " ", b, ";\n")))
+        else if op == ir.O_INTRINSIC:
+            []u32 xs = ir.args(f, i)
+            string8 xa = u_opd(w, f, xs[0])
+            if f.sub[i] == check.B_SMETHOD: u_put(o, index.hold(#format("    ", d, " = ", xa, ".n;\n")))
+            else:
+                string8 xi = u_opd(w, f, xs[1])
+                u_put(o, index.hold(#format("    if (", xi, " < 0 || ", xi, " >= ", xa, ".n) { return 1; }\n")))
+                if f.sub[i] == check.B_SINDEX: u_put(o, index.hold(#format("    ", d, " = ", xa, ".p[", xi, "];\n")))
+                else: u_put(o, index.hold(#format("    ", xa, ".p[", xi, "] = ", u_opd(w, f, xs[2]), ";\n")))
+        else if op == ir.O_CALL:
+            []u32 xs = ir.args(f, i)
+            u32 q = k
+            string8 nm = w.t.text(f.ref_name[f.a[i]])
+            for x in 0..<#len(g_u_fj):
+                if g_u_ci[x] == g_u_ci[k] && check.name_of(w, w.decls[w.jobs[g_u_fj[x]].decl].name) == nm: q = u32(x)
+            ref []char8 as
+            for x in 1..<#len(xs):
+                u_put(&as, ", ")
+                u_put(&as, u_opd(w, f, xs[x]))
+            u32 rt = w.t.a[w.decls[w.jobs[g_u_fj[q]].decl].ty]
+            if f.dst[i] != NONE: u_put(o, index.hold(#format("    if (dado_u", q, "(&", d, index.hold(as), ") != 0) { return 1; }\n")))
+            else: u_put(o, index.hold(#format("    { ", u_cty(w, rt), " r; if (dado_u", q, "(&r", index.hold(as), ") != 0) { return 1; } }\n")))
+    for #len(heads) > 0:
+        u_close(o, f, heads[#len(heads) - 1], brk[:], cnt[:])
+        #truncate(heads, #len(heads) - 1)
+    #delete(brk)
+    #delete(cnt)
+
+// Every unit and its thunk; each thunk's row of `dado_js__bound` into `rows`.
+string8 rung1_c(^check.World w, ^ref []char8 rows):
+    if #len(g_u_fj) == 0: return ""
+    ref []char8 o
+    u_put(&o, U_RT)
+    // Per element type: the array's C, read from and written to a script's array.
+    [4]string8 es = ["int64_t", "double", "_Bool", "uint8_t"]
+    [4]string8 rd = ["dado_u_take_int(ctx, e, &x)", "dado_u_take_float(e, &x)", "JS_VALUE_GET_TAG(e) != JS_TAG_BOOL; x = JS_VALUE_GET_INT(e) != 0", "JS_VALUE_GET_TAG(e) != JS_TAG_INT; x = (uint8_t)JS_VALUE_GET_INT(e)"]
+    [4]string8 wr = ["dado_u_give_int(ctx, a.p[k])", "JS_NewFloat64(ctx, a.p[k])", "JS_NewBool(ctx, a.p[k])", "JS_NewInt32(ctx, a.p[k])"]
+    for q in 0..<4:
+        u_put(&o, index.hold(#format("struct dado_ua_", es[q], " { ", es[q], " *p; int64_t n; };\n")))
+        u_put(&o, index.hold(#format("static DADO_SYMBOL(unused) int32_t dado_ur_", es[q], "(JSContext *ctx, JSValue v, struct dado_ua_", es[q], " *a) {\n    int64_t n = 0;\n    if (!JS_IsArray(v) || JS_GetLength(ctx, v, &n) != 0) { return 1; }\n    a->p = (", es[q], " *)malloc((size_t)(n > 0 ? n : 1) * sizeof(", es[q], "));\n    if (a->p == 0) { return 1; }\n    a->n = n;\n    for (int64_t k = 0; k < n; k++) {\n        JSValue e = JS_GetPropertyInt64(ctx, v, k);\n        ", es[q], " x = 0;\n        int32_t bad = ", rd[q], ";\n        JS_FreeValue(ctx, e);\n        if (bad) { free(a->p); a->p = 0; return 1; }\n        a->p[k] = x;\n    }\n    return 0;\n}\n")))
+        u_put(&o, index.hold(#format("static DADO_SYMBOL(unused) void dado_uw_", es[q], "(JSContext *ctx, JSValue v, struct dado_ua_", es[q], " a) {\n    for (int64_t k = 0; k < a.n; k++) { (void)JS_SetPropertyInt64(ctx, v, k, ", wr[q], "); }\n}\n")))
+    for k in 0..<#len(g_u_fj):
+        u_put(&o, index.hold(#format("static int32_t dado_u", k, u_sig(w, u32(k)), ";\n")))
+    for k in 0..<#len(g_u_fj):
+        u_put(&o, index.hold(#format("static int32_t dado_u", k, u_sig(w, u32(k)), " {\n    (void)dado_r;\n")))
+        u_body(w, &o, u32(k))
+        u32 m = w.jobs[g_u_fj[k]].decl
+        u32 rt = w.t.resolve(w.t.a[w.decls[m].ty])
+        u_put(&o, "    return 0;\n}\n" if rt == u32(types.P_VOID) else "    return 1;\n}\n")
+        // The thunk: arguments in, the answer out, `null` for a fault.
+        ^ir.Fn f = &w.fns[g_u_fj[k]]
+        u_put(&o, index.hold(#format("static JSValue dado_ut", k, "(JSContext *ctx, JSValue this_val, int32_t argc, JSValue *argv) {\n    (void)ctx; (void)this_val; (void)argc; (void)argv;\n")))
+        ref []char8 call
+        ref []char8 frees
+        ref []char8 backs
+        ref []i32 arrs
+        i32 n = 0
+        for s in 0..<f.params:
+            if (f.slot_flags[s] & ir.S_RECEIVER) != 0: continue
+            u32 t = w.t.resolve(f.slot_ty[s])
+            string8 c = u_cty(w, t)
+            string8 ae = u_arr(w, t)
+            if ae != "":
+                // Read in; another array argument that is the same object goes to the JavaScript.
+                for q in 0..<#len(arrs):
+                    u_put(&o, index.hold(#format("    if (JS_VALUE_GET_PTR(argv[", arrs[q], "]) == JS_VALUE_GET_PTR(argv[", n, "])) { ", index.hold(frees), "return JS_NULL; }\n")))
+                u_put(&o, index.hold(#format("    ", c, " a", n, " = {0, 0};\n    if (dado_ur_", ae, "(ctx, argv[", n, "], &a", n, ") != 0) { ", index.hold(frees), "return JS_NULL; }\n")))
+                u_put(&frees, index.hold(#format("free(a", n, ".p); ")))
+                u_put(&backs, index.hold(#format("    dado_uw_", ae, "(ctx, argv[", n, "], a", n, ");\n")))
+                arrs = #append(arrs, n)
+            else if t == u32(types.P_INT): u_put(&o, index.hold(#format("    int64_t a", n, "; if (dado_u_take_int(ctx, argv[", n, "], &a", n, ") != 0) { ", index.hold(frees), "return JS_NULL; }\n")))
+            else if t == u32(types.P_FLOAT): u_put(&o, index.hold(#format("    double a", n, "; if (dado_u_take_float(argv[", n, "], &a", n, ") != 0) { ", index.hold(frees), "return JS_NULL; }\n")))
+            else: u_put(&o, index.hold(#format("    ", c, " a", n, "; if (JS_VALUE_GET_TAG(argv[", n, "]) != JS_TAG_BOOL) { ", index.hold(frees), "return JS_NULL; } a", n, " = JS_VALUE_GET_INT(argv[", n, "]) != 0;\n")))
+            u_put(&call, index.hold(#format(", a", n)))
+            n += 1
+        u_put(&o, index.hold(#format("    ", u_cty(w, rt), " r = 0;\n    if (dado_u", k, "(&r", index.hold(call), ") != 0) { ", index.hold(frees), "return JS_NULL; }\n", index.hold(backs), "    ", index.hold(frees), "\n")))
+        if rt == u32(types.P_INT): u_put(&o, "    return dado_u_give_int(ctx, r);\n}\n")
+        else if rt == u32(types.P_FLOAT): u_put(&o, "    return JS_NewFloat64(ctx, r);\n}\n")
+        else if rt == u32(types.P_BOOL): u_put(&o, "    return JS_NewBool(ctx, r);\n}\n")
+        else: u_put(&o, "    (void)r;\n    return JS_UNDEFINED;\n}\n")
+        string8 pk = check.name_of(w, w.p.pkgs[w.decls[m].pkg].name)
+        u_put(rows, index.hold(#format("    { \"dado:", pk, "\", \"", unit_name(w, g_u_fj[k]), "\", (void (*)(void))dado_ut", k, ", ", n, " },\n")))
+    return index.hold(o)
+
+// `(T *dado_r, T1 v1, …)`: the unit's answer through `dado_r`, its parameters as slots.
+private string8 u_sig(^check.World w, u32 k):
+    ^ir.Fn f = &w.fns[g_u_fj[k]]
+    u32 m = w.jobs[g_u_fj[k]].decl
+    ref []char8 s
+    u_put(&s, index.hold(#format("(", u_cty(w, w.t.a[w.decls[m].ty]), " *dado_r")))
+    for x in 0..<f.params:
+        if (f.slot_flags[x] & ir.S_RECEIVER) != 0: continue
+        u_put(&s, index.hold(#format(", ", u_cty(w, f.slot_ty[x]), " v", x)))
+    u_put(&s, ")")
+    return index.hold(s)

@@ -1,0 +1,584 @@
+// The web build's page, written beside the module: the template's
+// `<!-- dado:NAME -->` markers (importmap, preload, loader, title, base)
+// filled, `loader.js` and the modules it imports copied beside it, every
+// script held to its SHA-384 (subresource integrity), and `_headers` for a
+// threaded module. The front end refuses a bad `--html` template when it
+// checks the build, so the markers here are already well placed.
+package driver
+
+import "core:hash"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:strings"
+import "language:diag"
+
+private const string8 PAGE_ENTRY = "\n// --- The page's entry, appended by `dadoc --page` ---------------------------\n// A page's `<script type=\"module\" src=\"loader.js\">` runs the program from\n// here. A worker this file starts (a thread, or a threaded page's `main`)\n// has no document, and runs nothing here.\nif (typeof document !== \"undefined\") {\n    await runPage();\n}\n"
+private const string8 DEFAULT_PAGE = "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<!-- dado:base -->\n<!-- dado:title -->\n<!-- dado:importmap -->\n<!-- dado:preload -->\n<!-- dado:loader -->\n</head>\n<body>\n<p id=\"dado-status\">running…</p>\n<pre id=\"dado-output\"></pre>\n</body>\n</html>\n"
+private const string8 HEADERS_TEXT = "/*\n  Cross-Origin-Opener-Policy: same-origin\n  Cross-Origin-Embedder-Policy: require-corp\n"
+
+// What the page writer wrote, and what the page loads (`files`: the module
+// and its manifest, the loader and its modules, the scripts).
+type Page:
+    string8 page
+    string8 loader
+    string8 headers
+    string8 csp_hash
+    i64 files
+    i64 loader_files
+    i64 script_files
+
+// A JavaScript module the page loads: its path beside the module, the bare
+// specifier it is imported by (or ""), and its integrity.
+private type JsFile:
+    string8 path
+    string8 specifier
+    string8 integrity
+
+// The page for the module at `module` (its manifest at `<module>.build`),
+// from the template at `html` ("" for the default), with `loader` as the
+// loader's source and `base` as `<base href>` ("" for `./`).
+Page write_page(string8 module, string8 loader, string8 html, string8 base):
+    string8 template = DEFAULT_PAGE
+    if #len(html) > 0:
+        try ref []char8 t = fs.read_file(html) else:
+            die(txt(#format("cannot read the page template ", html)))
+            return pg_none()
+        template = txt(t)
+    string8 dir = dir_of(module)
+    string8 module_name = base_name(module)
+    string8 stem = strings.trim_suffix(module_name, ".wasm")
+    string8 manifest_name = txt(#format(module_name, ".build"))
+    string8 manifest = read_or_empty(join2(dir, manifest_name))
+    try ref []char8 ls = fs.read_file(loader) else:
+        die(txt(#format("cannot read the loader ", loader)))
+        return pg_none()
+    string8 loader_source = txt(ls)
+    ref []JsFile files = #make([]JsFile, 0)
+    ref []string8 siblings = loader_imports(loader_source)
+    i64 next = 0
+    for next < #len(siblings):
+        string8 s = siblings[next]
+        next += 1
+        string8 text = read_or_empty(join2(dir_of(loader), s))
+        for more in loader_imports(text):
+            if !listed_in(siblings[:], more): siblings = #append(siblings, more)
+        string8 to = join2(dir, s)
+        try fs.make_dirs(dir_of(to)) else: pass
+        try fs.write_file(to, text) else:
+            die(txt(#format("cannot write ", to)))
+        files = #append(files, js_file(s, "", text))
+    i64 scripts = 0
+    string8 registry = ""
+    for l in lines_of(manifest):
+        ref []string8 w = words_of(l)
+        if #len(w) < 2 || w[0] != "js-module": continue
+        if strings.starts_with(w[1], "/") || strings.contains(w[1], "..") || strings.contains(w[1], "\\"):
+            die(txt(#format("manifest line `", l, "` names a file outside the module's directory, which a page could not be served beside")))
+        bool seen = false
+        for f in files:
+            if f.path == w[1]: seen = true
+        if seen: continue
+        files = #append(files, js_file(w[1], w[2] if #len(w) > 2 else "", read_or_empty(join2(dir, w[1]))))
+        scripts += 1
+        (string8 head, string8 file, bool cut) = strings.split_first(w[1], "/")
+        if #len(registry) == 0 && cut && #len(head) > 0 && file == "registry.js": registry = w[1]
+    string8 loader_text = txt(#format(loader_source, PAGE_ENTRY))
+    Page pg
+    pg.loader = join2(dir, "loader.js")
+    try fs.write_file(pg.loader, loader_text) else:
+        die(txt(#format("cannot write ", pg.loader)))
+    string8 map = import_map(files[:], scripts > 0)
+    strings.Builder b = strings.builder(#len(template) + 1024)
+    string8 rest = template
+    bool mapped = false
+    for:
+        (string8 before, string8 after, bool found) = strings.split_first(rest, "<!--")
+        strings.append(&b, before)
+        if !found: break
+        (string8 body, string8 tail, bool closed) = strings.split_first(after, "-->")
+        string8 name = marker_name(body)
+        if !closed || #len(name) == 0:
+            strings.append(&b, "<!--")
+            rest = after
+            continue
+        if name == "importmap":
+            mapped = true
+            if #len(map) > 0: strings.append(&b, txt(#format("<script type=\"importmap\">\n", map, "\n</script>")))
+        else if name == "preload":
+            for i in 0..<#len(files):
+                if i > 0: strings.append(&b, "\n")
+                strings.append(&b, txt(#format("<link rel=\"modulepreload\" href=\"", escaped(url_of(files[i].path)), "\" integrity=\"", escaped(files[i].integrity), "\">")))
+        else if name == "loader":
+            strings.append(&b, txt(#format("<script type=\"module\" src=\"", escaped(url_of("loader.js")), "\" integrity=\"", escaped(integrity(loader_text)), "\" data-dado-module=\"", escaped(module_name), "\" data-dado-manifest=\"", escaped(manifest_name), "\"")))
+            if #len(registry) > 0: strings.append(&b, txt(#format(" data-dado-scripts=\"", escaped(url_of(registry)), "\"")))
+            strings.append(&b, "></script>")
+        else if name == "title":
+            strings.append(&b, txt(#format("<title>", escaped(base_name(stem)), "</title>")))
+        else if name == "base":
+            strings.append(&b, txt(#format("<base href=\"", escaped(base if #len(base) > 0 else "./"), "\">")))
+        rest = tail
+    pg.page = join2(dir, txt(#format(stem, ".html")))
+    try fs.write_file(pg.page, strings.text(b)) else:
+        die(txt(#format("cannot write ", pg.page)))
+    pg.headers = ""
+    if strings.contains(txt(#format("\n", manifest, "\n")), "\nwasm-import env memory memory\n"):
+        pg.headers = join2(dir, "_headers")
+        try fs.write_file(pg.headers, HEADERS_TEXT) else:
+            die(txt(#format("cannot write ", pg.headers)))
+    pg.csp_hash = ""
+    if mapped && #len(map) > 0: pg.csp_hash = txt(#format("'", integrity(txt(#format("\n", map, "\n"))), "'"))
+    pg.loader_files = 1 + #len(siblings)
+    pg.script_files = scripts
+    pg.files = 2 + pg.loader_files + scripts
+    return pg
+
+private Page pg_none():
+    Page p
+    return p
+
+private JsFile js_file(string8 path, string8 specifier, string8 text):
+    JsFile f
+    f.path = path
+    f.specifier = specifier
+    f.integrity = integrity(text)
+    return f
+
+// The name of a `dado:` marker comment's body, or "".
+private string8 marker_name(string8 body):
+    string8 t = strings.trim(body)
+    if !strings.starts_with(t, "dado:"): return ""
+    ref []string8 w = words_of(t[5..<#len(t)])
+    if #len(w) == 0: return ""
+    for m in ["importmap", "preload", "loader", "title", "base"]:
+        if w[0] == m: return m
+    return ""
+
+private bool listed_in([]string8 xs, string8 x):
+    for y in xs:
+        if y == x: return true
+    return false
+
+// The `./`-relative modules a loader's `import`/`export … from` lines name.
+private ref []string8 loader_imports(string8 src):
+    ref []string8 out = #make([]string8, 0)
+    for line in lines_of(src):
+        string8 t = strings.trim(line)
+        if !strings.starts_with(t, "import ") && !strings.starts_with(t, "export ") && !strings.starts_with(t, "} from "): continue
+        for q in ["\"", "'"]:
+            (string8 _, string8 after, bool found) = strings.split_first(t, txt(#format(q, "./")))
+            if !found: continue
+            (string8 p, string8 _, bool closed) = strings.split_first(after, q)
+            if closed && !strings.contains(p, "..") && !listed_in(out[:], p):
+                ref []char8 own = #format(p)
+                out = #append(out, txt(own))
+    return out
+
+private string8 import_map([]JsFile files, bool listed):
+    strings.Builder m = strings.builder(256)
+    i64 n = 0
+    for f in files:
+        if #len(f.specifier) == 0: continue
+        strings.append(&m, txt(#format(",\n" if n > 0 else "", "    ", js_string(f.specifier), ": ", js_string(url_of(f.path)))))
+        n += 1
+    if n == 0 && !listed: return ""
+    strings.Builder i = strings.builder(256)
+    for k in 0..<#len(files):
+        strings.append(&i, txt(#format(",\n" if k > 0 else "", "    ", js_string(url_of(files[k].path)), ": ", js_string(files[k].integrity))))
+    string8 imports = "{}" if n == 0 else txt(#format("{\n", strings.text(m), "\n  }"))
+    return txt(#format("{\n  \"imports\": ", imports, ",\n  \"integrity\": {\n", strings.text(i), "\n  }\n}"))
+
+private string8 url_of(string8 p):
+    strings.Builder b = strings.builder(#len(p) + 2)
+    strings.append(&b, "./")
+    for c in p:
+        u8 x = u8(c)
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' || c == '/':
+            strings.append_char(&b, c)
+        else:
+            strings.append(&b, txt(#format("%", hex2(x))))
+    return txt(strings.finish(&b))
+
+private string8 hex2(u8 x):
+    string8 digits = "0123456789ABCDEF"
+    ref []char8 out = #format(digits[i64(x >> 4)..<i64(x >> 4) + 1], digits[i64(x & 15)..<i64(x & 15) + 1])
+    return txt(out)
+
+private string8 escaped(string8 s):
+    strings.Builder b = strings.builder(#len(s))
+    for c in s:
+        if c == '&': strings.append(&b, "&amp;")
+        else if c == '<': strings.append(&b, "&lt;")
+        else if c == '>': strings.append(&b, "&gt;")
+        else if c == '"': strings.append(&b, "&quot;")
+        else if c == '\'': strings.append(&b, "&#39;")
+        else: strings.append_char(&b, c)
+    return txt(strings.finish(&b))
+
+private string8 js_string(string8 s):
+    strings.Builder b = strings.builder(#len(s) + 2)
+    strings.append(&b, "\"")
+    for c in s:
+        if c == '"': strings.append(&b, "\\\"")
+        else if c == '\\': strings.append(&b, "\\\\")
+        else if c == '<': strings.append(&b, "\\u003c")
+        else if u8(c) < 0x20: strings.append(&b, txt(#format("\\u00", hex2(u8(c)))))
+        else: strings.append_char(&b, c)
+    strings.append(&b, "\"")
+    return txt(strings.finish(&b))
+
+// `sha384-<base64>`: SHA-512 from SHA-384's initial value, cut to 48 bytes.
+string8 integrity(string8 text):
+    hash.Sha512 s = hash.sha512_init()
+    s.state[0] = 0xcbbb9d5dc1059ed8
+    s.state[1] = 0x629a292a367cd507
+    s.state[2] = 0x9159015a3070dd17
+    s.state[3] = 0x152fecd8f70e5939
+    s.state[4] = 0x67332667ffc00b31
+    s.state[5] = 0x8eb44a8768581511
+    s.state[6] = 0xdb0c2e0d64f98fa7
+    s.state[7] = 0x47b5481dbefa4fa4
+    s.update_text(text)
+    hash.Sha512Digest d = s.finish()
+    return txt(#format("sha384-", base64(d[0..<48])))
+
+private string8 base64([]u8 b):
+    string8 abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    strings.Builder out = strings.builder(#len(b) * 4 / 3 + 4)
+    i64 i = 0
+    for i < #len(b):
+        u32 n = u32(b[i]) << 16
+        if i + 1 < #len(b): n |= u32(b[i + 1]) << 8
+        if i + 2 < #len(b): n |= u32(b[i + 2])
+        for k in 0..<4:
+            if k > 1 && i + k - 1 >= #len(b):
+                strings.append(&out, "=")
+            else:
+                i64 at = i64((n >> u32(18 - 6 * k)) & 63)
+                strings.append(&out, abc[at..<at + 1])
+        i += 3
+    return txt(strings.finish(&out))
+
+// ── The template's refusals (ERR1034) ───────────────────────────────────────
+// Rust's `page::scan`: a light HTML reading (comments, tags, raw-text bodies)
+// and the marker rules. Checked before dadoc runs, so a refused template
+// stops the build; `template_check` is the seam, movable into dadoc.
+
+private const [5]string8 MARKERS = ("importmap", "preload", "loader", "title", "base")
+private const [5]string8 OUTPUTS = ("the `<script type=\"importmap\">` that maps the program's JavaScript modules to their files", "a `<link rel=\"modulepreload\">` for each of the program's JavaScript modules", "the `<script type=\"module\" src=\"loader.js\">` that loads the module and runs `main`", "the page's `<title>`", "the page's `<base href>`")
+private const [9]string8 RAW_TEXT = ("script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript")
+private const u16 PAGE_TEMPLATE = 1034
+
+// A marker found: its index in MARKERS and its comment's span.
+private type PageMark:
+    i64 m
+    u32 start
+    u32 end
+
+private type PageScan:
+    diag.Diags ds
+    ref []PageMark found
+    ref []i64 named
+    bool module
+    u32 mod_start
+    u32 mod_end
+
+// The template at `path` (named `name` in diagnostics) refused: its
+// diagnostics, rendered, then the hint, on standard error; status 1.
+void template_check(string8 path, string8 name):
+    try ref []char8 t = fs.read_file(path) else:
+        die(txt(#format("cannot read the page template `", name, "`")))
+        return
+    string8 text = txt(t)
+    PageScan sc = scan_template(text)
+    if #len(sc.ds.list) == 0: return
+    diag.Files files
+    _ = files.add(name, text)
+    ref []char8 out
+    for d in sc.ds.list:
+        diag.human_one(&out, &sc.ds, &files, d, false)
+    diag.put(&out, diag.EXPLAIN_HINT)
+    _ = io.flush(io.stdout())
+    _ = io.write_bytes(io.stderr(), out)
+    _ = io.flush(io.stderr())
+    os.quit_with(1)
+
+private i64 marker_of(string8 name):
+    for i in 0..<5:
+        if MARKERS[i] == name: return i
+    return -1
+
+private string8 spelled(i64 m):
+    return txt(#format("<!-- dado:", MARKERS[m], " -->"))
+
+private PageScan scan_template(string8 text):
+    PageScan sc
+    i64 at = 0
+    i64 templates = 0
+    i64 head_start = -1
+    i64 head_end = 0
+    for:
+        i64 lt = find_from(text, at, "<")
+        if lt < 0: break
+        string8 rest = text[lt..<#len(text)]
+        if strings.starts_with(rest, "<!--"):
+            (i64 bs, i64 be, i64 end) = comment_at(text, lt)
+            string8 body = text[bs..<be]
+            if is_marker(body):
+                note_named(&sc, body)
+                if templates > 0: raw_refusal(&sc, body, u32(lt), u32(end), "template")
+                else: take_marker(&sc, body, u32(lt), u32(end))
+            at = end
+            continue
+        if strings.starts_with(rest, "</"):
+            (string8 name, i64 end) = tag_at(text, lt + 2)
+            if name == "template" && templates > 0: templates -= 1
+            at = end
+            continue
+        if lt + 1 < #len(text) && is_alpha(text[lt + 1]):
+            (string8 name, i64 end) = tag_at(text, lt + 1)
+            if name == "head" && head_start < 0:
+                head_start = lt
+                head_end = end
+            else if name == "template":
+                templates += 1
+            else if name == "script" && !sc.module:
+                string8 ty = attribute(text[lt..<end], "type")
+                if lower(ty) == "module":
+                    sc.module = true
+                    sc.mod_start = u32(lt)
+                    sc.mod_end = u32(end)
+            if raw_text(name) || name == "plaintext":
+                i64 close = #len(text)
+                if name != "plaintext": close = find_close(text, end, name)
+                i64 c = end
+                for:
+                    i64 open = find_from(text[0..<close], c, "<!--")
+                    if open < 0: break
+                    (i64 bs, i64 be, i64 cend) = comment_at(text[0..<close], open)
+                    string8 body = text[bs..<be]
+                    if is_marker(body):
+                        note_named(&sc, body)
+                        raw_refusal(&sc, body, u32(open), u32(cend), name)
+                    c = cend
+                at = close
+            else:
+                at = end
+            continue
+        at = lt + 1
+    u32 ps = 0
+    u32 pe = 0
+    if head_start >= 0:
+        ps = u32(head_start)
+        pe = u32(head_end)
+    if !named_has(&sc, 0):
+        string8 help = txt(#format("write `", spelled(0), "` in the template's `<head>`, before any `<script type=\"module\">` and before `", spelled(2), "`"))
+        sc.ds.add(PAGE_TEMPLATE, ps, pe, txt(#format("this page template has no `", spelled(0), "`, and a web build's page cannot run without it: it is where the build writes the import map that resolves the program's JavaScript modules in a browser")), help)
+    if !named_has(&sc, 2):
+        string8 help = txt(#format("write `", spelled(2), "` in the template's `<head>`, after `", spelled(0), "`"))
+        sc.ds.add(PAGE_TEMPLATE, ps, pe, txt(#format("this page template has no `", spelled(2), "`, and a web build's page cannot run without it: it is where the build writes the `<script type=\"module\">` that loads `loader.js`, which runs the program")), help)
+    return sc
+
+private bool named_has(^PageScan sc, i64 m):
+    for x in sc.named:
+        if x == m: return true
+    return false
+
+private void note_named(^PageScan sc, string8 body):
+    (string8 name, string8 _) = marker_text(body)
+    i64 m = marker_of(name)
+    if m >= 0: sc.named = #append(sc.named, m)
+
+private void take_marker(^PageScan sc, string8 body, u32 s, u32 e):
+    (string8 name, string8 rest) = marker_text(body)
+    i64 m = marker_of(name)
+    if m < 0:
+        string8 names = "`dado:importmap`, `dado:preload`, `dado:loader`, `dado:title`, `dado:base`"
+        i64 near = nearest(name)
+        string8 help = ""
+        if near >= 0: help = txt(#format("did you mean `", spelled(near), "`?"))
+        else: help = txt(#format("write one of ", names, ", or drop `dado:` if the comment is the page's own"))
+        sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`<!-- dado:", name, " -->` names no marker: a comment starting `dado:` is the build's, and the markers are ", names)), help)
+        return
+    if #len(rest) > 0:
+        sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`<!-- dado:", name, " ", rest, " -->` holds more than a marker's name: a marker is `", spelled(m), "` and nothing else, and the build writes all of its output")), txt(#format("write `", spelled(m), "`")))
+        return
+    for f in sc.found:
+        if f.m == m:
+            sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`", spelled(m), "` is written twice, and the build writes ", OUTPUTS[m], " once")), txt(#format("delete one of the two `", spelled(m), "`")))
+            sc.ds.label(0, 0, f.start, f.end, "first written here")
+            return
+    if m == 0:
+        for f in sc.found:
+            if f.m == 1 || f.m == 2:
+                sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`", spelled(m), "` comes after `", spelled(f.m), "`, which starts loading modules, and a browser takes no import map once a module has started loading: the map would be ignored")), txt(#format("move `", spelled(m), "` above `", spelled(f.m), "`")))
+                sc.ds.label(0, 0, f.start, f.end, "modules start loading here")
+                return
+        if sc.module:
+            sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`", spelled(m), "` comes after a `<script type=\"module\">`, and a browser takes no import map once a module has started loading: the map would be ignored")), txt(#format("move `", spelled(m), "` above the first `<script type=\"module\">`")))
+            sc.ds.label(0, 0, sc.mod_start, sc.mod_end, "a module starts loading here")
+            return
+    if m == 4:
+        for f in sc.found:
+            if f.m <= 2:
+                sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`", spelled(m), "` comes after `", spelled(f.m), "`, whose URLs a browser resolves as it reads them, so the `<base href>` would not apply to them")), txt(#format("move `", spelled(m), "` to the top of the `<head>`, above `", spelled(f.m), "`")))
+                sc.ds.label(0, 0, f.start, f.end, "resolved before the base is read")
+                return
+    sc.found = #append(sc.found, PageMark(m, s, e))
+
+// A marker inside an element whose body is not markup.
+private void raw_refusal(^PageScan sc, string8 body, u32 s, u32 e, string8 element):
+    (string8 written, string8 _) = marker_text(body)
+    i64 m = marker_of(written)
+    string8 output = "its output"
+    if m >= 0: output = OUTPUTS[m]
+    string8 why = "whose content is inert: what the build wrote there would never load"
+    if element != "template": why = txt(#format("whose body is text and not markup, so ", output, " would be text there, not an element"))
+    sc.ds.add(PAGE_TEMPLATE, s, e, txt(#format("`<!-- dado:", written, " -->` is inside a `<", element, ">`, ", why)), txt(#format("move `<!-- dado:", written, " -->` out of the `<", element, ">` element, between tags in the `<head>`")))
+
+private bool is_marker(string8 body):
+    return strings.starts_with(strings.trim_left(body), "dado:")
+
+// A marker comment's name after `dado:`, and anything after it.
+private (string8 name, string8 rest) marker_text(string8 body):
+    string8 t = strings.trim_left(body)
+    string8 after = t[5..<#len(t)]
+    i64 end = 0
+    for end < #len(after) && !is_ws(after[end]):
+        end += 1
+    return (after[0..<end], strings.trim(after[end..<#len(after)]))
+
+// The marker a mistyped name most likely meant: at most two edits away.
+private i64 nearest(string8 name):
+    string8 low = lower(name)
+    i64 best = -1
+    i64 dist = 3
+    for i in 0..<5:
+        i64 d = edits(low, MARKERS[i])
+        if d < dist:
+            dist = d
+            best = i
+    return best
+
+// Levenshtein distance, a transposition one edit (bytes; names are ASCII).
+private i64 edits(string8 a, string8 b):
+    i64 w = #len(b) + 1
+    ref []i64 d = #make([]i64, (#len(a) + 1) * w)
+    for i in 0..<#len(a) + 1:
+        d[i * w] = i
+    for j in 0..<w:
+        d[j] = j
+    for i in 1..<#len(a) + 1:
+        for j in 1..<w:
+            i64 cost = 1
+            if a[i - 1] == b[j - 1]: cost = 0
+            i64 best = d[(i - 1) * w + j] + 1
+            i64 x = d[i * w + j - 1] + 1
+            if x < best: best = x
+            x = d[(i - 1) * w + j - 1] + cost
+            if x < best: best = x
+            if i > 1 && j > 1:
+                if a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]:
+                    x = d[(i - 2) * w + j - 2] + 1
+                    if x < best: best = x
+            d[i * w + j] = best
+    i64 r = d[#len(a) * w + #len(b)]
+    #delete(d)
+    return r
+
+private i64 find_from(string8 s, i64 from, string8 needle):
+    if from >= #len(s): return -1
+    i64 i = strings.find(s[from..<#len(s)], needle)
+    if i < 0: return -1
+    return from + i
+
+// The comment at `lt`: its body's range and its end (unclosed: the text's).
+private (i64 bs, i64 be, i64 end) comment_at(string8 s, i64 lt):
+    i64 start = lt + 4
+    i64 close = find_from(s, start, "-->")
+    if close < 0: return (start, #len(s), #len(s))
+    return (start, close, close + 3)
+
+// The tag whose name starts at `from`: the name lowercased, and the offset
+// past its `>` (quoted values may hold one).
+private (string8 name, i64 end) tag_at(string8 s, i64 from):
+    i64 at = from
+    for at < #len(s) && !is_ws(s[at]) && s[at] != '>' && s[at] != '/':
+        at += 1
+    string8 name = lower(s[from..<at])
+    char8 quote = '\0'
+    for at < #len(s):
+        char8 c = s[at]
+        if quote != '\0':
+            if c == quote: quote = '\0'
+        else if c == '"' || c == '\'':
+            quote = c
+        else if c == '>':
+            return (name, at + 1)
+        at += 1
+    return (name, #len(s))
+
+// Where a raw-text element's body ends: its end tag, any case, or the end.
+private i64 find_close(string8 s, i64 from, string8 name):
+    i64 at = from
+    for:
+        i64 lt = find_from(s, at, "</")
+        if lt < 0: return #len(s)
+        i64 n = lt + 2 + #len(name)
+        if n <= #len(s):
+            if lower(s[lt + 2..<n]) == name:
+                if n == #len(s): return lt
+                char8 c = s[n]
+                if is_ws(c) || c == '>' || c == '/': return lt
+        at = lt + 2
+    return #len(s)
+
+// Attribute `name`'s value in start tag `tag`, unquoted, or "".
+private string8 attribute(string8 tag, string8 name):
+    i64 at = 1
+    for at < #len(tag) && !is_ws(tag[at]) && tag[at] != '>':
+        at += 1
+    for:
+        for at < #len(tag) && (is_ws(tag[at]) || tag[at] == '/'):
+            at += 1
+        if at >= #len(tag) || tag[at] == '>': return ""
+        i64 start = at
+        for at < #len(tag) && !is_ws(tag[at]) && tag[at] != '=' && tag[at] != '>':
+            at += 1
+        string8 key = tag[start..<at]
+        for at < #len(tag) && is_ws(tag[at]):
+            at += 1
+        string8 value = ""
+        if at < #len(tag) && tag[at] == '=':
+            at += 1
+            for at < #len(tag) && is_ws(tag[at]):
+                at += 1
+            if at < #len(tag) && (tag[at] == '"' || tag[at] == '\''):
+                char8 q = tag[at]
+                i64 s = at + 1
+                i64 e = s
+                for e < #len(tag) && tag[e] != q:
+                    e += 1
+                value = tag[s..<e]
+                at = e + 1
+            else:
+                i64 s = at
+                for at < #len(tag) && !is_ws(tag[at]) && tag[at] != '>':
+                    at += 1
+                value = tag[s..<at]
+        if lower(key) == lower(name): return value
+    return ""
+
+private bool raw_text(string8 name):
+    for r in RAW_TEXT:
+        if r == name: return true
+    return false
+
+private bool is_ws(char8 c):
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0c'
+
+private bool is_alpha(char8 c):
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+
+private string8 lower(string8 s):
+    return txt(strings.to_lower(s))

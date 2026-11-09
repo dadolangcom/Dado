@@ -1,0 +1,1626 @@
+// The body job: one walk checks a body and writes its IR. Statements here,
+// expressions in `expr.dado`, calls in `call.dado`.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+type Local:
+    u32 name
+    u32 slot
+    u32 node
+    u32 depth
+    bool read
+    // A `view` statement's entry: the slot it names the slots of.
+    u32 viewed
+    // A `type X = T` statement's type.
+    u32 ty
+
+// An open body (BLOCK, LOOP, IF) and, for a loop, where `continue` goes.
+type Head:
+    u32 op
+    bool is_loop
+    u32 cont
+    bool arm
+    u32 depth
+    bool walk
+
+type Body:
+    u32 decl
+    u32 file
+    u32 base
+    u32 ret
+    ir.Fn f
+    ref []Local locals
+    ref []Head heads
+    u32 depth
+    u32 pack
+    u32 pack_name
+    u32 pack_slot
+    // A `..T` parameter's slot, plus one (0: none).
+    u32 vslot
+    bool ended
+    bool wrapping
+    bool addressing
+    // A place being built is read before a call to its right (indices, pointers).
+    bool pin
+    // The last field read was a projection of several axes (a new value).
+    bool projected
+    bool writing
+    bool compound
+    // The place being checked was reached through a `const`.
+    bool cpath
+    // What the call being checked is wanted as (`#copy` keeps a `const` asked for).
+    u32 cwant
+    // A constant array windowed here is read as its static storage.
+    u32 cglob
+    // The first construction naming its slots (ERR0901 in a constant).
+    bool named
+    u32 named_at
+    u32 grown
+    // Failure (`fail.dado`): the call a `try` or `return` may make failable,
+    // the `try` deciding what a failure does (NONE: it passes on), the head
+    // its suite leaves to, the call a plain `defer` makes, pending defers.
+    bool failable
+    u32 tried
+    // The tried call that runs a script, and how many `else`s over one
+    // enclose this point (`#script_error()` is legal there).
+    u32 stried
+    i64 serr
+    u32 scall     // the last member call made through a handle
+    u32 hfield    // the last field read through a handle, and its class
+    u32 hclass
+    ref []Val hvals   // a run call's arguments, crossed
+    u32 callnode      // the call whose callee is being read, plus one (0: none)
+    u32 trying
+    u32 try_head
+    u32 deferred
+    bool passed
+    ref []Defer defers
+    // Map walks open around the statement being checked.
+    ref []Walk walks
+    // Channel walks open around it, and the commits their exits make.
+    ref []ChWalk chans
+    ref []Commit commits
+    // `using`s open (the ambient each saved), and the `#caller` slot plus one.
+    ref []u32 usings
+    // Arenas (`using arena.allocator(&ar)`) open, and the handles each minted.
+    ref []u32 arenas
+    ref []u64 minted
+    u32 caller
+    // Slots bound to a typed failure (read-only), switches closed over one,
+    // and the `fallthrough` an arm may end with.
+    ref []u32 fails
+    ref []u32 closed
+    u32 fall_ok
+    // `fallthrough`s already refused by their `switch`.
+    ref []u32 fall_said
+    // The map read or create verb a `try` guards.
+    u32 guard
+    // A `defer!` run while a failure leaves: its own failure is dropped.
+    bool quiet_fail
+    // A `when` condition: bare names reach every package's constants.
+    bool flat
+    // Folding a `when` condition: a wrapped `-D` reads unwrapped (Rust's).
+    bool when_fold
+    // The last embedded member read whole (`b.Person`) and the type it is in.
+    u32 emb_node
+    u32 emb_outer
+    // The embedded member's base place and first slot, for a whole write.
+    u32 emb_place
+    u32 emb_at
+    // `[_]T` may be reached at node `flexat - 1` (an index's or a window's
+    // base); `flexhit - 1` reached one, named `flexname`.
+    u32 flexat
+    u32 flexhit
+    string8 flexname
+    // DadoScript: a script body, its class, the field an initializer is of.
+    bool ds
+    // The last value did not type for want of the script runtime (Rust's
+    // `None` scrutinee): a `switch` over it still walks its arms.
+    bool untyped_sw
+    u32 cls
+    // A trait default's trait, plus one (0: none).
+    u32 strait1
+    // Inside an `async` method or lambda; lambdas open.
+    bool sinside
+    u32 slambda
+    u32 above
+
+// The value of an expression: an operand and its type (NONE: already
+// reported), or what else a name denotes.
+const u8 V_VAL = 0
+const u8 V_LIT = 1
+const u8 V_TYPE = 2
+const u8 V_PKG = 3
+const u8 V_FN = 4
+const u8 V_PACK = 5
+const u8 V_C = 6
+const u8 V_NIL = 7
+const u8 V_FLIT = 8
+
+type Val:
+    u8 kind
+    u32 opd
+    u32 ty
+    u32 x
+    u64 lo
+    i64 hi
+
+Val bad():
+    return Val(V_VAL, NONE, NONE, NONE, 0, 0)
+
+Val value(u32 opd, u32 ty):
+    return Val(V_VAL, opd, ty, NONE, 0, 0)
+
+syntax.Ast tree(^World w, ^Body b):
+    return w.p.files[b.file].a
+
+void err(^World w, ^Body b, u32 n, u16 code, string8 msg, string8 help = "", string8 why = ""):
+    syntax.Ast a = tree(w, b)
+    say(w, b.file, b.base, a.lo[n], a.hi[n], code, msg, help, why)
+
+void err_tok(^World w, ^Body b, u32 n, u16 code, string8 msg, string8 help = ""):
+    say_tok(w, b.file, b.base, n, code, msg, help)
+
+string8 spell(^World w, ^Body b, u32 n):
+    return w.p.spell(b.file, n)
+
+u32 temp(^World w, ^Body b, u32 ty, u32 n):
+    return ir.at(&b.f, ir.slot(&b.f, ty, NONE, ir.S_TEMP, n))
+
+u32 open(^World w, ^Body b, u8 o, u32 n, u32 cond, bool is_loop):
+    u32 h = ir.op(&b.f, o, 0, NONE, n, NONE, cond)
+    b.heads = #append(b.heads, Head(h, is_loop, NONE, false, b.depth, false))
+    return h
+
+void close(^World w, ^Body b, u32 h):
+    ir.close(&b.f, h)
+    #truncate(b.heads, #len(b.heads) - 1)
+
+void scope_in(^World w, ^Body b):
+    b.depth += 1
+    if w.watching && w.watch_pend != 0:
+        u32 n = w.watch_pend - 1
+        w.watch_pend = 0
+        watch_region(w, b, n)
+
+// `--define=`/`--hover=`: the scope just opened covers node `n` (Rust's
+// region a scope's bindings are recorded over).
+void watch_region(^World w, ^Body b, u32 n):
+    if !w.watching || b.file != w.watch_file || n == NONE: return
+    for #len(g_watch_reg) <= i64(b.depth): g_watch_reg = #append(g_watch_reg, 0)
+    syntax.Ast a = tree(w, b)
+    g_watch_reg[b.depth] = (u64(a.lo[n]) << 32) | (u64(a.hi[n]) + 1)
+
+// The scope closing: its bindings, every enclosing one's too, kept when its
+// region is the smallest yet to hold the watched byte.
+private void watch_close(^World w, ^Body b):
+    if i64(b.depth) >= #len(g_watch_reg) || g_watch_reg[b.depth] == 0: return
+    u64 r = g_watch_reg[b.depth]
+    g_watch_reg[b.depth] = 0
+    u32 lo = u32(r >> 32)
+    u32 hi = u32(r & 0xFFFFFFFF) - 1
+    if #len(g_watch_pts) > 0: watch_many(b, lo, hi)
+    if g_wr_on && lo < g_wr_hi && hi > g_wr_lo:
+        for l in b.locals:
+            if l.node == NONE || l.slot == NONE: continue
+            u16 fl = b.f.slot_flags[l.slot]
+            u8 k = 1 if (fl & ir.S_PARAM) != 0 else 2 if (fl & ir.S_CONST) != 0 else 0
+            g_wr_names = #append(g_wr_names, WLocal(l.name, l.node, b.f.slot_ty[l.slot], k))
+    if w.watch_at < lo || w.watch_at > hi || hi - lo > w.watch_len: return
+    w.watch_len = hi - lo
+    #truncate(g_watch_names, 0)
+    for l in b.locals:
+        if l.node == NONE || l.slot == NONE: continue
+        u16 fl = b.f.slot_flags[l.slot]
+        u8 k = 1 if (fl & ir.S_PARAM) != 0 else 2 if (fl & ir.S_CONST) != 0 else 0
+        g_watch_names = #append(g_watch_names, WLocal(l.name, l.node, b.f.slot_ty[l.slot], k))
+
+// The scope `lo..=hi` closing, for each watched byte it is the smallest
+// region yet to hold.
+private void watch_many(^Body b, u32 lo, u32 hi):
+    bool any = false
+    for p in g_watch_pts:
+        if p.at >= lo && p.at <= hi && hi - lo <= p.len: any = true
+    if !any: return
+    u32 nlo = u32(#len(g_wp_names))
+    for l in b.locals:
+        if l.node == NONE || l.slot == NONE: continue
+        u16 fl = b.f.slot_flags[l.slot]
+        u8 k = 1 if (fl & ir.S_PARAM) != 0 else 2 if (fl & ir.S_CONST) != 0 else 0
+        g_wp_names = #append(g_wp_names, WLocal(l.name, l.node, b.f.slot_ty[l.slot], k))
+    u32 nhi = u32(#len(g_wp_names))
+    for i in 0..<#len(g_watch_pts):
+        WPoint p = g_watch_pts[i]
+        if p.at < lo || p.at > hi || hi - lo > p.len: continue
+        g_watch_pts[i].len = hi - lo
+        g_watch_pts[i].nlo = nlo
+        g_watch_pts[i].nhi = nhi
+
+// Ends a scope: its defers, LNT0412 for each name never read, then the
+// scope's end.
+void scope_out(^World w, ^Body b):
+    if w.watching && b.file == w.watch_file: watch_close(w, b)
+    unwind(w, b, b.depth - 1, false, true)
+    i64 i = #len(b.locals)
+    for i > 0 && b.locals[i - 1].depth == b.depth:
+        i -= 1
+    ref []u32 ended
+    for j in i..<#len(b.locals):
+        u32 sl = b.locals[j].slot
+        if sl != NONE && b.depth > 1 && (b.f.slot_flags[sl] & ir.S_ADDR_TAKEN) != 0: ended = #append(ended, sl)
+    if #len(ended) > 0:
+        _ = ir.op(&b.f, ir.O_SCOPE_END, 0, NONE, b.locals[i].node, NONE, NONE)
+        for sl in ended:
+            ir.arg(&b.f, sl)
+    for j in i..<#len(b.locals):
+        Local l = b.locals[j]
+        // A script's parse errors leave its lints (Rust checks scripts apart).
+        bool sf = w.p.files[b.file].a.a[w.p.files[b.file].a.root] == 1
+        if !l.read && l.node != NONE && (sf || #len(w.p.files[b.file].a.diags) + #len(w.p.files[b.file].t.diags) == 0):
+            err_tok(w, b, l.node, diag.LNT + 412, index.hold(#format("`", name_of(w, l.name), "` is declared and never read; name it `_` to bind it deliberately to nothing, or delete it. This is a warning while you are writing and an error under `--strict`, which is what the gate builds with")))
+    #truncate(b.locals, i)
+    i64 k = #len(w.lconst)
+    for k > 0 && w.lconst_depth[k - 1] >= b.depth:
+        k -= 1
+    #truncate(w.lconst, k)
+    #truncate(w.lconst_depth, k)
+    b.depth -= 1
+
+// A new local `name` of `ty`, declared by node `n` (its main token the name).
+u32 declare_local(^World w, ^Body b, u32 name, u32 ty, u32 n, u16 flags = ir.S_USER):
+    string8 s = name_of(w, name)
+    if #len(s) >= 5 && s[0..<5] == "dado_":
+        err_tok(w, b, n, 411, index.hold(#format("`dado_` starts every name the compiler emits, so it cannot start `", s, "`")))
+        return NONE
+    string8 kind = "const" if (flags & ir.S_CONST) != 0 else "loop binding" if tree(w, b).tag[n] == syntax.S_BIND else "local"
+    shadows(w, b, name, n, kind)
+    for l in b.locals:
+        if l.depth == b.depth && l.name == name:
+            syntax.Ast a = tree(w, b)
+            u32 at = w.p.files[b.file].t.start[a.main[l.node]]
+            diag.Place p = w.p.map.place(w.p.map.base[b.file] + at)
+            err_tok(w, b, n, 409, index.hold(#format("`", s, "` is already declared in this scope at ", p.line, ":", p.col, "; an inner block may shadow it, one scope may not redeclare it")))
+            return NONE
+    u32 sl = ir.slot(&b.f, ty, tstr(w, s), flags, n)
+    b.locals = #append(b.locals, Local(name, sl, n, b.depth, false, NONE, NONE))
+    return sl
+
+// The innermost local `name`, marked read when `read`.
+u32 find_local(^World w, ^Body b, u32 name, bool read):
+    i64 i = #len(b.locals)
+    for i > 0:
+        i -= 1
+        if b.locals[i].name == name && b.locals[i].slot != NONE:
+            if read: b.locals[i].read = true
+            return b.locals[i].slot
+    return NONE
+
+// Whether the innermost local `name` is one whose declaration failed: its
+// uses say nothing more.
+bool poisoned(^World w, ^Body b, u32 name):
+    i64 i = #len(b.locals)
+    for i > 0:
+        i -= 1
+        if b.locals[i].name == name: return b.locals[i].slot == NONE && b.locals[i].ty == NONE
+    return false
+
+// The type a `type X = T` statement in the open body binds `sym` to, or NONE.
+u32 local_type(^World w, u32 f, u32 sym):
+    if w.body == nil: return NONE
+    ^Body b = ^Body(w.body)
+    if b.file != f: return NONE
+    i64 i = #len(b.locals)
+    for i > 0:
+        i -= 1
+        if b.locals[i].name == sym: return b.locals[i].ty
+    return NONE
+
+// A suite; `own` false runs it in the scope already open (a body's top
+// level shares its parameters' scope).
+void block(^World w, ^Body b, u32 n, bool own = true):
+    syntax.Ast a = tree(w, b)
+    if n == NONE: return
+    if a.tag[n] != syntax.S_BLOCK:
+        stmt(w, b, n)
+        return
+    if own:
+        scope_in(w, b)
+        watch_region(w, b, n)
+    for s in a.list(a.b[n]):
+        if s != NONE: stmt(w, b, s)
+    if own: scope_out(w, b)
+
+void stmt(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u8 g = a.tag[n]
+    if g == syntax.S_BLOCK: block(w, b, n)
+    else if g == syntax.S_LET: let(w, b, n)
+    else if g == syntax.S_ASSIGN: assign(w, b, n)
+    else if g == syntax.S_RETURN: ret(w, b, n)
+    else if g == syntax.S_IF: if_(w, b, n)
+    else if g == syntax.S_FOR: for_(w, b, n)
+    else if g == syntax.S_BREAK || g == syntax.S_CONTINUE: jump(w, b, n, g == syntax.S_BREAK)
+    else if g == syntax.S_PASS: pass
+    else if g == syntax.S_VIEW: view_(w, b, n)
+    else if g == syntax.N_CONST: local_const(w, b, n)
+    else if g == syntax.S_SWITCH: switch_(w, b, n)
+    else if g == syntax.S_WHEN: when_stmt(w, b, n)
+    else if g == syntax.S_SUITE: using_suite(w, b, n)
+    else if g == syntax.S_QUIT:
+        Val qv = expr(w, b, a.a[n], u32(types.P_I32))
+        if qv.ty != NONE && qv.kind != V_LIT && !is_int(w, qv.ty):
+            err(w, b, a.a[n], 504, index.hold(#format("`quit` takes an exit status, which is an integer; this is ", shown(w, final_ty(w, qv)))))
+            qv = bad()
+        Val v = coerce(w, b, qv, u32(types.P_I32), a.a[n], "`quit` takes an exit status, and that is")
+        if v.ty != NONE: _ = ir.op(&b.f, ir.O_QUIT, 0, NONE, n, NONE, v.opd)
+        if w.os == "WEB" || w.os == "NONE": err(w, b, n, 1017, index.hold(#format("`quit` ends the process, and a target whose OS is `#", w.os, "` has no process to end and nobody to read the status\x1fThe emitted C would need `exit` from `<stdlib.h>`, which is not in C99 §4's freestanding header set. A freestanding program leaves its entry point by returning from it, or halts in whatever way its own target defines; there is no libc call for the compiler to lower `quit` to. A `fail` in `main` returns its code to whatever called the entry point and runs the defers, so it is not `quit`. `corpus/freestanding` is the shape of a program that does neither")), "return the status from `main`, or `fail` with it from a `!void main()`")
+    else if g == syntax.S_FAIL: fail_(w, b, n)
+    else if g == syntax.S_TRY: try_(w, b, n)
+    else if g == syntax.S_ASSERT && b.ds: sf_assert(w, b, n)
+    else if g == syntax.S_AWAIT && b.ds: sa_await(w, b, n)
+    else if g == syntax.S_DEFER: defer_(w, b, n)
+    else if g == syntax.S_FALLTHROUGH && n == b.fall_ok: pass
+    else if g == syntax.S_FALLTHROUGH:
+        bool said = false
+        for x in b.fall_said:
+            if x == n: said = true
+        if !said: err(w, b, n, 711, "`fallthrough` is only meaningful as the last statement of a `case` body, and this one is not in a `switch` at all")
+        // Refused: diverges, so nothing else is said of the path.
+        _ = ir.op(&b.f, ir.O_QUIT, 1, NONE, n, NONE, NONE)
+    else if g == syntax.S_EXPR:
+        u32 e = a.a[n]
+        if a.tag[e] == syntax.E_COND:
+            []u32 cs = a.list(a.b[e])
+            err(w, b, e, 608, "`a if c else b` is a conditional **value**, and on a line of its own the value is thrown away", index.hold(#format("to run one of two things, write the statement: `if ", src(w, b, cs[1]), ":` with the first on the line below, and `else:` with the second")), "Only a call can be written for its effect")
+            return
+        if a.tag[e] != syntax.E_CALL:
+            _ = expr(w, b, e, NONE)
+            err(w, b, e, 608, "this is evaluated and thrown away; only a call can be written for its effect")
+            return
+        if !b.ds && a.tag[a.list(a.b[e])[0]] == syntax.E_NAME && spell(w, b, a.list(a.b[e])[0]) == "#names":
+            err(w, b, e, 608, "`#names` answers a declaration's slot names and has no effect, so written on its own it is evaluated and thrown away; bind it or use it where a `string8` goes")
+            return
+        u8 cv = chan_verb(w, b, e)
+        if cv != 255:
+            _ = chan_call(w, b, e, cv, spell(w, b, a.list(a.b[e])[0]), true)
+            return
+        u32 was = w.stmt_call
+        w.stmt_call = e
+        dropped(w, b, e, expr(w, b, e, NONE, true), "by writing the growth as a statement of its own")
+        w.stmt_call = was
+        u32 ar = arena_call(w, b, e, "reset")
+        if ar == NONE: ar = arena_call(w, b, e, "destroy")
+        for x in b.minted:
+            if u32(x >> 32) == ar: _ = ir.op(&b.f, ir.O_MOVE, ir.MV_RESET, NONE, e, NONE, ir.at(&b.f, u32(x & 0xFFFFFFFF)), e)
+    else:
+        err(w, b, n, 1, "this statement is outside the slice the port builds so far")
+
+private void let(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    // `@c_body`: verbatim C above the declaration.
+    if ks[2] != NONE && !b.ds: _ = ir.op(&b.f, ir.O_C_INLINE, 1, NONE, n, NONE, tstr(w, c_text(spell(w, b, ks[2]))))
+    if a.tag[ks[0]] == syntax.T_KIND:
+        if ks[1] == NONE:
+            err(w, b, n, 914, index.hold(#format("`type ", spell(w, b, n), "` says nothing about which type. A type value has no zero for a declaration to leave it at — write `type ", spell(w, b, n), " = i32`")))
+            return
+        Val v = expr(w, b, ks[1], NONE)
+        if v.ty == NONE: return
+        if v.kind != V_TYPE:
+            err(w, b, ks[1], 913, index.hold(#format("`type ", spell(w, b, n), "` binds a **type** and this is a value. Every spelling of a type is accepted — a name, `[]i32`, `typeof(v)`, a tuple of types, `{K: V}`")))
+            return
+        u64 sp = name_span(w, b.file, n)
+        if builtin_tname(w, b.file, u32(sp >> 32), u32(sp & 0xFFFFFFFF), "", spell(w, b, n), "type", 0, NONE, diag.PH_BODY): return
+        b.locals = #append(b.locals, Local(w.p.sym(b.file, n), NONE, n, b.depth, true, NONE, v.x))
+        return
+    if a.main[n] == NONE && a.tag[ks[0]] != syntax.T_TUPLE || a.main[n] != NONE && spell(w, b, n) == "_":
+        u32 dt = resolve_type(w, b.file, ks[0])
+        if dt != NONE && a.main[n] != NONE: _ = keyed_ok(w, b.file, b.base, a.lo[ks[0]], a.hi[ks[0]], dt, "a variable", false)
+        if ks[1] != NONE && dt != NONE: dropped(w, b, ks[1], coerce(w, b, expr(w, b, ks[1], dt, true), dt, ks[1]), "by a typed `_`")
+        return
+    if a.main[n] == NONE:
+        if ks[1] == NONE:
+            err(w, b, n, 401, "`_` takes the type of the slot it faces, and this declares no value for it to face: give it a value, or write the slot's type")
+            return
+        destructure(w, b, n, ks[0], ks[1])
+        return
+    bool auto = a.tag[ks[0]] == syntax.T_NAME && spell(w, b, ks[0]) == "auto"
+    if auto && ks[1] == NONE:
+        err(w, b, ks[0], 512, "`auto` is the type a value already has, and this declares no value: write the type, or give it an initializer")
+        return
+    w.chan_at = 1
+    w.inc_ok = true
+    u32 ty = NONE if auto else resolve_type(w, b.file, ks[0])
+    w.inc_ok = false
+    w.chan_at = 0
+    if ty != NONE: _ = inc_refuse(w, b.file, a.lo[ks[0]], a.hi[ks[0]], ty, "a variable", b.base)
+    if ty != NONE && contract_refused(w, b.file, b.base, a.lo[ks[0]], a.hi[ks[0]], ty, "a variable"): ty = NONE
+    bool keyed = ty == NONE || keyed_ok(w, b.file, b.base, a.lo[ks[0]], a.hi[ks[0]], ty, "a variable", false)
+    if keyed && ty != NONE && holds_kind(w, ty, 0):
+        err(w, b, ks[0], 507, KIND_HELD("variable"))
+        if ks[1] != NONE: _ = expr(w, b, ks[1], NONE)
+        ty = NONE
+    // A refused instance declares nothing (as Rust's checker does).
+    if ty == NONE && #len(w.d.list) > 0 && w.d.list[#len(w.d.list) - 1].code == 910:
+        b.locals = #append(b.locals, Local(w.p.sym(b.file, n), NONE, NONE, b.depth, true, NONE, NONE))
+        return
+    if auto && ks[1] != NONE && undetermined(w, b, ks[1]):
+        // A literal's default is no type (Rust's `written::undetermined`).
+        string8 rep = "`i32 x = 5`, or `auto x = i32(5)`"
+        if holds_str(w, b, ks[1]): rep = index.hold(#format("`string8 ", spell(w, b, n), " = \"…\"`, or `auto ", spell(w, b, n), " = string8(\"…\")`"))
+        err(w, b, ks[1], 512, index.hold(#format("`auto` is the type a value already has, and a literal has none — only a default to fall back on, and widths are always explicit. Write the width you mean, or give the literal one: ", rep)))
+        _ = expr(w, b, ks[1], NONE)
+        b.locals = #append(b.locals, Local(w.p.sym(b.file, n), NONE, NONE, b.depth, true, NONE, NONE))
+        return
+    if ks[1] != NONE:
+        Val v = expr(w, b, ks[1], ty)
+        if auto && v.ty != NONE:
+            v = finish(w, b, v, ks[1])
+            ty = v.ty
+        if ty != NONE && v.ty != NONE:
+            u32 sl = declare_local(w, b, w.p.sym(b.file, n), ty, n)
+            if sl == NONE: return
+            if written_one(w, b.file, ks[0]): b.f.slot_flags[sl] = b.f.slot_flags[sl] | ir.S_ONE
+            u32 p = ir.at(&b.f, sl)
+            if b.ds: store(w, b, p, ty, v, ks[1], n, index.hold(#format("the local `", spell(w, b, n), "` is")))
+            else: store(w, b, p, ty, v, ks[1], n)
+            return
+    if b.ds && ks[1] == NONE: st_needs(w, b.file, n, ty)
+    u32 sl = declare_local(w, b, w.p.sym(b.file, n), ty, n)
+    if sl != NONE && written_one(w, b.file, ks[0]): b.f.slot_flags[sl] = b.f.slot_flags[sl] | ir.S_ONE
+    // A script's `any` starts undefined (Rust's).
+    if sl != NONE && ty != NONE && ks[1] == NONE && !(b.ds && ty == w.sany):
+        u32 zv = zero(w, ty)
+        if b.ds && s_denum(w, ty) != NONE: zv = s_ezero(w, ty)
+        _ = ir.op(&b.f, ir.O_SET, 0, ty, n, ir.at(&b.f, sl), zv)
+
+// A `@c_body` string's C: its quotes off, a multi-line one's first line off.
+string8 c_text(string8 s):
+    i64 n = #len(s)
+    if n >= 6 && s[0..<3] == "\"\"\"":
+        string8 x = s[3..<n - 3]
+        for i in 0..<#len(x):
+            if x[i] == '\n': return index.hold(#format(x[i + 1..<#len(x)], "\n"))
+        return x
+    if n >= 2: return index.hold(#format(s[1..<n - 1], "\n"))
+    return s
+
+// `const T N = v` in a body: a local holding the folded value.
+// The first name under `n` that is a local's storage, or NONE.
+private u32 stored_name(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if n == NONE: return NONE
+    if a.tag[n] == syntax.E_NAME:
+        u32 sl = find_local(w, b, w.p.sym(b.file, n), false)
+        return n if sl != NONE && (b.f.slot_flags[sl] & ir.S_CONST) == 0 else NONE
+    if a.tag[n] == syntax.E_FIELD: return stored_name(w, b, a.a[n])
+    ref []u32 kids
+    a.kids(n, &kids)
+    for x in kids:
+        u32 r = stored_name(w, b, x)
+        if r != NONE: return r
+    return NONE
+
+private void local_const(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    u32 ty = resolve_type(w, b.file, ks[0]) if ks[0] != NONE else NONE
+    u32 lo = ir.count(&b.f)
+    // `#len` of a window: its count is in the value.
+    []u32 lks = a.list(a.b[ks[1]]) if a.tag[ks[1]] == syntax.E_CALL else ks[0..<0]
+    if #len(lks) == 3 && a.tag[lks[0]] == syntax.E_NAME && spell(w, b, lks[0]) == "#len":
+        u32 la = lks[2]
+        if a.tag[la] == syntax.E_ARG: la = a.a[la]
+        u32 ls = find_local(w, b, w.p.sym(b.file, la), false) if a.tag[la] == syntax.E_NAME else NONE
+        if ls != NONE && run_shape(w, b.f.slot_ty[ls]).kind != RK_FIXED:
+            err(w, b, ks[1], 901, "a constant is folded before the program runs, and the compiler cannot evaluate a `len` of a slice, whose count is in the value rather than in its type — a fixed array's `len` folds and a window's cannot, at any width")
+            b.locals = #append(b.locals, Local(w.p.sym(b.file, n), NONE, NONE, b.depth, true, NONE, NONE))
+            return
+    Val v = expr(w, b, ks[1], ty)
+    v = local_override(w, b, n, ty, v)
+    if v.ty == NONE: return
+    if ty == NONE: v = finish(w, b, v, ks[1])
+    u32 sl = declare_local(w, b, w.p.sym(b.file, n), v.ty if ty == NONE else ty, n, ir.S_USER | ir.S_CONST)
+    b.locals[#len(b.locals) - 1].read = true
+    if sl != NONE: store(w, b, ir.at(&b.f, sl), b.f.slot_ty[sl], v, ks[1], n)
+    u32 k = folded(w, b, lo, ir.at(&b.f, sl)) if sl != NONE else NONE
+    u32 kr = w.t.resolve(v.ty)
+    u32 sn = stored_name(w, b, ks[1]) if k == NONE && tree(w, b).tag[ks[1]] != syntax.E_SLICE else NONE
+    string8 head = "a constant is folded before the program runs, and the compiler cannot evaluate "
+    if a.tag[ks[1]] == syntax.E_NAME && spell(w, b, ks[1]) == "nil":
+        err(w, b, ks[1], 901, index.hold(#format(head, "`nil`, which is a pointer and not a compile-time value")))
+        return
+    else if k == NONE && a.tag[ks[1]] == syntax.E_IS && sn != NONE:
+        // A union's tag, read while the program runs.
+        err(w, b, ks[1], 901, index.hold(#format(head, "`", src(w, b, ks[1]), "` — a read of the union value `", spell(w, b, sn), "`'s tag while the program runs, the one `is` that is not folded, which a `bool` variable holds and a `const` cannot")))
+    else if sn != NONE: err(w, b, sn, 901, index.hold(#format(head, "`", spell(w, b, sn), "`, which is storage rather than a constant")))
+    else if k == NONE && kr != NONE && w.t.tag[kr] == types.T_SLICE: err(w, b, ks[1], 901, index.hold(#format(head, SLICE_UNFOLDED)))
+    else if k == NONE && a.tag[ks[1]] == syntax.E_CALL && a.tag[a.list(a.b[ks[1]])[0]] == syntax.E_NAME && spell(w, b, a.list(a.b[ks[1]])[0]) == "#size": err(w, b, ks[1], 901, index.hold(#format(head, "a `size`")), "bind it where it is used instead, `u64 n = #size(T)` inside a function, whose initializer *is* that C constant expression")
+    if k != NONE:
+        if (a.a[n] & syntax.F_BUILD) != 0: w.body_cvals[(u64(b.file) << 32) | u64(n)] = k
+        ref []u32 said
+        tagless(w, b, b.f.slot_ty[sl], k, ks[1], &said)
+        #delete(said)
+        w.lconst = #append(w.lconst, (u64(w.p.sym(b.file, n)) << 32) | u64(k))
+        w.lconst_depth = #append(w.lconst_depth, b.depth)
+
+// The zero of a type, as an operand: a composite's is the empty tuple.
+u32 zero(^World w, u32 ty):
+    if s_enum(w, ty): return s_enum_zero(w, ty)
+    u32 r = under(&w.t, ty)
+    if one_row(&w.t, ty) != NONE || r != NONE && (w.t.tag[r] == types.T_TUPLE || w.t.tag[r] == types.T_SOA || w.t.tag[r] == types.T_UNION || w.t.tag[r] == types.T_CHANNEL || w.t.tag[r] == types.T_MAP || w.t.tag[r] == types.T_TRAIT || w.t.tag[r] == types.T_SLICE || w.t.tag[r] == types.T_REF || r == types.STRING8): return ir.konst(w.k.tuple(&w.t, nil))
+    if ty == u32(types.P_BOOL): return ir.konst(w.k.boolean(&w.t, false))
+    return ir.konst(w.k.small(&w.t, 0))
+
+// `p = v`, `v` converted to `ty` (ERR0504 when it does not fit).
+void store(^World w, ^Body b, u32 p, u32 ty, Val v, u32 at, u32 n, string8 site = "the declared shape is"):
+    if chan_copied(w, b, ty, v, at): return
+    Val c = coerce(w, b, v, ty, at, site)
+    if c.ty == NONE: return
+    syntax.Ast a = tree(w, b)
+    i64 bw = bits_of(w, &b.f, p)
+    bool waived = a.tag[n] == syntax.S_ASSIGN && a.a[n] != NONE
+    if waived && bw < 0: say(w, b.file, b.base, w.p.files[b.file].t.start[a.a[n]], w.p.files[b.file].t.end[a.a[n]], 1023, "`#no_bounds` takes the check off a store that has one, and this place is checked nowhere, so there is nothing here to waive", "drop `#no_bounds`", "The only store Dado checks is into a bitfield — a member of a transparent `foreign` struct declared `T name : W`, whose width is narrower than the type read out of it")
+    if bw > 0: bits_store(w, b, c, ty, bw, at, waived)
+    _ = ir.op(&b.f, ir.O_SET, 0, ty, n, p, c.opd)
+    minted(w, b, p, ty, at)
+
+// Handle `p` stored from `at` under an open arena: minted by it.
+private void minted(^World w, ^Body b, u32 p, u32 ty, u32 at):
+    if #len(b.arenas) > 0 && b.arenas[#len(b.arenas) - 1] != NONE && b.f.plo[p] == b.f.phi[p] && (b.f.root[p] & ir.ROOT_GLOBAL) == 0 && (ambient_mint(w, b, at) || tree(w, b).tag[at] == syntax.E_CALL && w.t.tag[w.t.resolve(ty)] == types.T_REF): b.minted = #append(b.minted, (u64(b.arenas[#len(b.arenas) - 1]) << 32) | u64(b.f.root[p]))
+
+private void destructure(^World w, ^Body b, u32 n, u32 tn, u32 vn):
+    syntax.Ast a = tree(w, b)
+    []u32 ms = a.list(a.b[tn])
+    ref []u32 tys
+    for m in ms:
+        u32 mt = a.list(a.b[m])[0]
+        tys = #append(tys, NONE if mt == NONE || a.tag[mt] == syntax.T_NAME && spell(w, b, mt) == "_" else resolve_type(w, b.file, mt))
+    Val v = expr(w, b, vn, NONE)
+    []u32 slots = w.t.slots(v.ty) if v.ty != NONE else w.t.ids.get(NONE)
+    bool wsl = v.ty != NONE && run_shape(w, v.ty).kind == RK_SLICE
+    if wsl:
+        err(w, b, n, 503, index.hold(#format("this names ", #len(ms), " slot(s), and ", shown(w, v.ty), " has no number of slots to name: a window's count is in the value, not in its type. Index it, or iterate it")))
+        // The names are declared, poisoned: their uses say nothing more.
+        for m in ms:
+            if a.main[m] != NONE: b.locals = #append(b.locals, Local(w.p.sym(b.file, m), NONE, NONE, b.depth, true, NONE, NONE))
+        return
+    if v.ty != NONE && (#len(slots) != #len(ms) || w.t.tag[w.t.resolve(v.ty)] != types.T_TUPLE): err(w, b, n, 503, index.hold(#format("this names ", #len(ms), " slot(s) but the value is ", shown(w, v.ty), ", which has ", #len(slots))))
+    if v.ty != NONE && (#len(slots) != #len(ms) || w.t.tag[w.t.resolve(v.ty)] != types.T_TUPLE): return
+    bool fits = v.ty != NONE
+    if fits:
+        ref []u32 want
+        for i in 0..<#len(ms):
+            want = #append(want, slots[i] if tys[i] == NONE else tys[i])
+            if tys[i] != NONE && !fits_type(w, value(NONE, slots[i]), tys[i]): fits = false
+        if !fits: err(w, b, vn, 504, index.hold(#format("the declared shape is ", shown(w, w.t.tuple(want)), ", and this is ", shown(w, v.ty))))
+    if !fits:
+        // Declared all the same, so their uses say nothing more.
+        for m in ms:
+            if a.main[m] != NONE && spell(w, b, m) != "_": b.locals = #append(b.locals, Local(w.p.sym(b.file, m), NONE, NONE, b.depth, true, NONE, NONE))
+        return
+    u32 src = spill(w, b, v, n)
+    for i in 0..<#len(ms):
+        u32 m = ms[i]
+        if a.main[m] == NONE || spell(w, b, m) == "_": continue
+        u32 sl = declare_local(w, b, w.p.sym(b.file, m), tys[i], m)
+        if sl == NONE || tys[i] == NONE: continue
+        Val e = value(ir.step(&b.f, src, ir.ST_FIELD, u32(i), slots[i]), slots[i])
+        store(w, b, ir.at(&b.f, sl), tys[i], e, m, m)
+
+// `v` as a place (a temporary when it is a constant).
+u32 spill(^World w, ^Body b, Val v, u32 n):
+    if !ir.is_const(v.opd): return v.opd
+    u32 t = temp(w, b, v.ty, n)
+    _ = ir.op(&b.f, ir.O_SET, 0, v.ty, n, t, v.opd)
+    return t
+
+private void assign(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    string8 op = spell(w, b, n)
+    u32 pn = ks[0]
+    if a.tag[pn] == syntax.E_TUPLE:
+        group(w, b, n, pn, ks[1], op)
+        return
+    if a.tag[pn] == syntax.E_NAME && read_only(w, b, pn): return
+    if a.tag[pn] == syntax.E_NAME && spell(w, b, pn) == "_" && op != "=":
+        err(w, b, pn, 408, "`_` binds nothing, so there is nothing to read")
+        return
+    if a.tag[pn] == syntax.E_NAME && spell(w, b, pn) == "_":
+        []u32 els = a.list(a.b[ks[1]]) if a.tag[ks[1]] == syntax.E_ARRAY else a.extra[0..<0]
+        if #len(els) > 0:
+            u32 e0 = els[0]
+            if a.tag[e0] == syntax.E_NAME && (types.prim_named(spell(w, b, e0)) != types.PRIMS || spell(w, b, e0) == "string8"):
+                err(w, b, ks[1], 507, KIND_HELD("discarded value"))
+                return
+        Val dv = expr(w, b, ks[1], NONE, true)
+        if dv.kind == V_TYPE:
+            not_a_value(w, b, ks[1], "`_ =` discards a **value**")
+            return
+        if dv.kind == V_LIT && (dv.hi > 0 || dv.hi < -1 || dv.hi == 0 && dv.lo > 2147483647 || dv.hi == -1 && i64(dv.lo) < -2147483648):
+            // A discarded literal meets no type and is an `i32`.
+            string8 v = decimal(dv.lo, dv.hi)
+            i64 k = i64(dv.lo & 0xFFFFFFFF)
+            if k > 2147483647: k = k - 4294967296
+            err(w, b, ks[1], diag.LNT + 505, index.hold(#format("`", v, "` does not fit `i32`, which holds -2147483648 to 2147483647, and wraps to `", k, "`")), index.hold(#format("a number that meets no type is an `i32`: write the width it needs, `i64(", v, ")`, or write `i32(", v, ")` to wrap on purpose, or a value from -2147483648 to 2147483647")))
+        if dv.kind == V_VAL && dv.ty == u32(types.P_VOID):
+            err(w, b, ks[1], 504, "`_ =` discards a value and this produces none: a `void` call is already a statement, so write it on its own")
+            return
+        dropped(w, b, ks[1], dv, "by `_ =`")
+        if dv.ty != NONE && dv.kind == V_VAL: _ = keyed_ok(w, b.file, b.base, a.lo[ks[1]], a.hi[ks[1]], dv.ty, "a discarded value", false)
+        return
+    if b.ds && a.tag[pn] == syntax.E_FIELD && s_dyn_root(w, b, pn):
+        Val bv = finish(w, b, expr(w, b, a.a[pn], NONE), a.a[pn])
+        if bv.ty == NONE: return
+        s_any_store(w, b, n, bv, ir.konst(w.k.str(&w.t, index.hold(strings.clone(spell(w, b, pn))))), ks[1], index.hold(strings.clone(op)))
+        return
+    if b.ds && a.tag[pn] == syntax.E_INDEX:
+        s_store(w, b, n, pn, ks[1], index.hold(strings.clone(op)))
+        return
+    if b.ds && se_assign(w, b, n, pn, ks[1], index.hold(strings.clone(op))): return
+    if !b.ds && op == "=" && a.tag[pn] == syntax.E_SLICE:
+        copy_assign(w, b, n, pn, ks[1])
+        return
+    if !b.ds && host_put(w, b, n, pn, ks[1], index.hold(strings.clone(op))): return
+    if op == "=" && a.tag[pn] == syntax.E_NAME: stack_kept(w, b, pn, ks[1])
+    b.pin = calls_in(w, b, ks[1])
+    b.projected = false
+    w.sstore = b.ds && a.tag[pn] == syntax.E_FIELD
+    Val p = place(w, b, pn, op != "=")
+    w.sstore = false
+    b.pin = false
+    if b.hfield == pn && pn != 0:
+        h_put(w, b, n, pn, ks[1], index.hold(strings.clone(op)))
+        return
+    if op == "=" && pn == b.emb_node && pn != 0 && p.ty != NONE:
+        // An embedded member written whole: slot by slot into the outer.
+        Val v = expr(w, b, ks[1], p.ty)
+        if v.ty == NONE: return
+        u32 t = temp(w, b, p.ty, n)
+        store(w, b, t, p.ty, v, ks[1], n, "the place assigned to is")
+        []u32 all = w.t.slots(b.emb_outer)
+        []u32 sl = w.t.slots(p.ty)
+        for i in 0..<#len(sl):
+            u32 k = b.emb_at + u32(i)
+            _ = ir.op(&b.f, ir.O_SET, 0, all[k], n, ir.step(&b.f, b.emb_place, ir.ST_FIELD, k, all[k]), ir.step(&b.f, t, ir.ST_FIELD, u32(i), sl[i]))
+        return
+    if b.projected && p.ty != NONE:
+        err(w, b, pn, 606, "a projection of several axes builds a new value, so there is nothing there to assign to — the scatter form `p.xy = q` is a separate operation and is not in the language yet. Write the axes one at a time")
+        _ = expr(w, b, ks[1], NONE)
+        return
+    if p.ty == NONE || !writable(w, b, pn, p.ty):
+        _ = expr(w, b, ks[1], NONE)
+        return
+    if op == "=":
+        Val v = expr(w, b, ks[1], p.ty)
+        u32 r = p.opd
+        if v.ty != NONE && (v.opd != b.grown || b.grown == NONE) && !ir.is_const(r) && (is_ref(w, p.ty) || is_map(w, p.ty)): _ = ir.op(&b.f, ir.O_MOVE, ir.MV_REBIND, NONE, pn, NONE, r)
+        store(w, b, p.opd, p.ty, v, ks[1], n, "the place assigned to is")
+        return
+    if w.t.resolve(p.ty) == u32(types.P_RAWPTR):
+        err(w, b, n, 607, index.hold(#format("`", op, "` is not defined for rawptr: arithmetic on a raw pointer is an expression, not an assignment. Write `p = p ", op[0..<#len(op) - 1], " n`, which says at the assignment that the pointer moved")))
+        _ = expr(w, b, ks[1], NONE)
+        return
+    b.compound = true
+    Val r = binary(w, b, n, index.hold(strings.clone(op[0..<#len(op) - 1])), p, NONE, ks[1], p.ty)
+    b.compound = false
+    if r.ty != NONE && op == "*=" && matrix(w, r.ty) != NONE && w.t.resolve(r.ty) != w.t.resolve(p.ty):
+        string8 rt = shown(w, r.ty)
+        err(w, b, n, 504, index.hold(#format("`*=` is `x = x * y` written once, so the product has to be the place's own type: ", shown(w, p.ty), " times ", shown(w, matrix_of(w, melem(w, matrix(w, p.ty)), w.t.b[matrix(w, p.ty)], w.t.b[matrix(w, r.ty)])), " is ", rt, "\x1fAn assignment cannot change what its target is, so only a square matrix multiplies in place\x1ebind the product instead, to a place of type ", rt)))
+        return
+    if r.ty != NONE: store(w, b, p.opd, p.ty, r, n, n)
+
+// A local as a value; a `^self` receiver reads as what it points at.
+Val local_val(^World w, ^Body b, u32 sl):
+    u32 p = ir.at(&b.f, sl)
+    u32 r = b.f.slot_ty[sl]
+    if (b.f.slot_flags[sl] & ir.S_RECEIVER) != 0 && r != NONE && w.t.tag[r] == types.T_PTR: return value(ir.step(&b.f, p, ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
+    return value(p, b.f.slot_ty[sl])
+
+// A `self` receiver taken by value: writes to it are lost (ERR0615).
+bool copied_self(^World w, ^Body b, u32 sl):
+    u32 r = b.f.slot_ty[sl]
+    return (b.f.slot_flags[sl] & ir.S_RECEIVER) != 0 && (r == NONE || w.t.tag[r] != types.T_PTR)
+
+bool in_copied_self(^World w, ^Body b, u32 p):
+    if (b.f.root[p] & ir.ROOT_GLOBAL) != 0 || !copied_self(w, b, b.f.root[p]): return false
+    for j in b.f.plo[p]..<b.f.phi[p]:
+        if b.f.step[j] == ir.ST_DEREF: return false
+    return true
+
+string8 COPY_LOST(^World w, ^Body b):
+    return index.hold(#format("and `self` is a copy made for this call, so the write would be lost when `", name_of(w, w.decls[b.decl].name), "` returns"))
+
+string8 self_help(^World w, ^Body b):
+    return index.hold(#format("take `^self` to write the caller's `", name_of(w, w.decls[w.decls[b.decl].block].name), "` — `^self` in `", name_of(w, w.decls[b.decl].name), "`'s parameter list"))
+
+// The source text of node `n`.
+string8 src(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    return w.p.files[b.file].src[i64(a.lo[n])..<i64(a.hi[n])]
+
+// ERR0606 for a store into a `const`: the place's own type, the path to
+// it, a `const` member inside it.
+private bool writable(^World w, ^Body b, u32 n, u32 ty):
+    string8 fix = "reach the object through something that does not say `const`, or drop the word from the declaration that does"
+    if top_const(w, ty):
+        err(w, b, n, 606, index.hold(#format("this is ", shown(w, ty), ", and a `const` is not something to write to")), fix, "The word says nothing is written through this access path, which is the one thing a top-level qualifier is checked for")
+        return false
+    if b.cpath:
+        err(w, b, n, 606, "this access path goes through a `const`, and a `const` is not something to write to", fix, "The word promises that nothing is written through it, so it refuses the write wherever the path reaches. Reading a slot of one is unaffected; it is this store that has nowhere legal to land")
+        return false
+    u32 m = const_member(w, ty, 0)
+    if m != NONE:
+        err(w, b, n, 606, index.hold(#format("this is ", shown(w, ty), ", which holds a `const` member of type ", shown(w, m), ", so it is not written as a whole")), "assign the members that are not `const` one at a time, or drop the word from the member declaration that carries it", "A `const` member at any depth makes the whole object unwritable rather than that one member, because a store here would land in the `const` too")
+        return false
+    return true
+
+// A `const` slot or member at any depth of `ty`'s shape, not behind an
+// address; NONE.
+u32 const_member(^World w, u32 ty, i64 depth):
+    u32 r = under(&w.t, ty)
+    if r == NONE || depth > 16 || w.t.tag[r] != types.T_TUPLE && w.t.tag[r] != types.T_UNION: return NONE
+    for m in w.t.list(r):
+        if top_const(w, m): return m
+        u32 x = const_member(w, m, depth + 1)
+        if x != NONE: return x
+    return NONE
+
+// A place for an assignment: a local, or a slot of one.
+Val place(^World w, ^Body b, u32 n, bool read):
+    syntax.Ast a = tree(w, b)
+    b.cpath = false
+    u8 g = a.tag[n]
+    if g == syntax.E_NAME && spell(w, b, n)[0] == '#':
+        for r in RUNGS:
+            if spell(w, b, n) == r:
+                err(w, b, n, 804, index.hold(#format("`", r, "` is immutable within a scope, so there is nothing here to assign to: it is a name the compiler owns, not storage a program holds")), "shadow it for a suite with `using`", "A nested suite shadowing it for itself is what `using` adds, and a callee can then narrow it without changing what its caller's later statements see")
+                return bad()
+        err(w, b, n, 606, "assignment needs a place: a name, a slot of one, a position in one, or a parenthesised list of those. A call's result is a value and has nowhere to live")
+        return bad()
+    if g == syntax.E_NAME:
+        u32 sl = find_local(w, b, w.p.sym(b.file, n), read)
+        if sl == NONE && poisoned(w, b, w.p.sym(b.file, n)): return bad()
+        if sl != NONE && copied_self(w, b, sl):
+            err(w, b, n, 615, index.hold(#format("this assigns to `self`, ", COPY_LOST(w, b))), self_help(w, b))
+            return bad()
+        if sl != NONE: return local_val(w, b, sl)
+        if b.ds: return s_place(w, b, n, read)
+        if b.pack != NONE && w.p.sym(b.file, n) == b.pack_name:
+            err(w, b, n, 606, "a pack is not a place")
+            return bad()
+        u32 d = bare(w, b.file, n)
+        if d != NONE && w.decls[d].kind == K_VAR && resolve(w, d) != NONE: return global(w, b, d)
+        if d != NONE && w.decls[d].kind == K_VAR: d = NONE
+        if d != NONE && (w.decls[d].kind == K_CONST || w.decls[d].kind == K_FCONST): pass
+        else if d != NONE && w.decls[d].kind == K_FVAR:
+            reach_foreign(w, w.decls[d].file, w.decls[d].block)
+            return foreign_var(w, b, d)
+        else:
+            err(w, b, n, 408, index.hold(#format("`", spell(w, b, n), "` is not a value in scope")))
+            return bad()
+    if g == syntax.E_NAME:
+        err(w, b, n, 606, "assignment needs a place: a name, a slot of one, a position in one, or a parenthesised list of those. A call's result is a value and has nowhere to live")
+        return bad()
+    if g == syntax.E_FIELD || g == syntax.E_INDEX || g == syntax.E_DEREF:
+        b.writing = g == syntax.E_INDEX
+        Val v = expr(w, b, n, NONE)
+        b.writing = false
+        if v.ty != NONE && !ir.is_const(v.opd) && in_copied_self(w, b, v.opd):
+            err(w, b, n, 615, index.hold(#format("`", src(w, b, n), "` is part of `self`, ", COPY_LOST(w, b))), self_help(w, b))
+            return bad()
+        if v.ty == NONE || !ir.is_const(v.opd): return v
+    err(w, b, n, 606, "assignment needs a place: a name, a slot of one, a position in one, or a parenthesised list of those. A call's result is a value and has nowhere to live")
+    return bad()
+
+private void group(^World w, ^Body b, u32 n, u32 pn, u32 vn, string8 op):
+    syntax.Ast a = tree(w, b)
+    []u32 ps = a.list(a.b[pn])
+    if op != "=":
+        err(w, b, n, 606, index.hold(#format("`", op, "` reads its place, applies `", op[0..<#len(op) - 1], "` and stores the answer back, and a parenthesised list of places is a target for a plain `=` only — there is no `", op[0..<#len(op) - 1], "` between two lists to spread over the elements. Write one element per line")))
+        return
+    ref []Val places
+    for p in ps:
+        if a.tag[p] == syntax.E_TUPLE:
+            err(w, b, p, 606, "a group assignment takes one level of places: this element is itself a parenthesised list, and nesting is not in the language yet. Bind the inner tuple to a name of its own and split it on the next line")
+            return
+        if a.tag[p] == syntax.E_NAME && spell(w, b, p) == "_":
+            places = #append(places, Val(V_VAL, NONE, NONE, 1, 0, 0))
+            continue
+        b.pin = calls_in(w, b, vn)
+        Val pv = place(w, b, p, false)
+        b.pin = false
+        if h_misplaced(w, b, p, "it is written by itself, `g.hp = v`, never as one place of several"): pv.ty = NONE
+        if pv.ty != NONE && !writable(w, b, p, pv.ty): pv.ty = NONE
+        places = #append(places, pv)
+        if p == b.emb_node && b.emb_node != 0:
+            err(w, b, p, 606, index.hold(#format("`", src(w, b, p), "` is an embedded member, stored whole by a plain `=` on its own line, and here it is one element of a parenthesised list of places")), index.hold(#format("assign it on its own, `", src(w, b, p), " = value`, or write its slots one at a time")))
+            return
+    ref []u32 pts
+    for pv in places:
+        if pv.ty != NONE: pts = #append(pts, w.t.bare(pv.ty))
+    u32 want = w.t.tuple(pts) if #len(pts) == #len(ps) && #len(ps) > 1 && tree(w, b).tag[vn] == syntax.E_TUPLE else NONE
+    #delete(pts)
+    Val v = expr(w, b, vn, want)
+    if v.ty == NONE: return
+    []u32 slots = w.t.slots(v.ty)
+    bool whole = w.t.tag[w.t.resolve(v.ty)] != types.T_TUPLE
+    if #len(slots) != #len(ps) || whole && #len(ps) != 1:
+        err(w, b, n, 503, index.hold(#format("this names ", #len(ps), " slot(s) but the value is ", shown(w, v.ty), ", which has ", #len(slots))))
+        return
+    u32 src = temp(w, b, v.ty, n)
+    _ = ir.op(&b.f, ir.O_SET, 0, v.ty, n, src, v.opd)
+    for i in 0..<#len(ps):
+        if places[i].ty == NONE: continue
+        Val e = value(src, v.ty) if whole else value(ir.step(&b.f, src, ir.ST_FIELD, u32(i), slots[i]), slots[i])
+        store(w, b, places[i].opd, places[i].ty, e, ps[i], n)
+        if !whole: minted(w, b, places[i].opd, places[i].ty, vn)
+
+private void ret(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u32 vn = a.a[n]
+    string8 fname = name_of(w, w.decls[b.decl].name)
+    bool void_ = b.ret == u32(types.P_VOID)
+    if vn == NONE:
+        if !void_ && b.ret != NONE: err_tok(w, b, n, 701, index.hold(#format("`", fname, "` returns ", shown(w, b.ret), ", so `return` needs a value")))
+        unwind(w, b, 0, false)
+        _ = ir.op(&b.f, ir.O_RETURN, 0, NONE, n, NONE, NONE)
+        return
+    u32 tried = b.tried
+    u32 trying = b.trying
+    if b.failable && a.tag[vn] == syntax.E_CALL:
+        b.tried = vn
+        b.trying = NONE
+    if void_ && b.failable && a.tag[vn] == syntax.E_CALL:
+        b.passed = false
+        Val v = expr(w, b, vn, NONE, true)
+        b.tried = tried
+        b.trying = trying
+        if v.ty != NONE && !b.passed: err(w, b, vn, 701, index.hold(#format("`", fname, "` returns void, so `return` takes no value")))
+        unwind(w, b, 0, false)
+        _ = ir.op(&b.f, ir.O_RETURN, 0, NONE, n, NONE, NONE)
+        return
+    if void_:
+        err(w, b, vn, 701, index.hold(#format("`", fname, "` returns void, so `return` takes no value")))
+        _ = ir.op(&b.f, ir.O_RETURN, 0, NONE, n, NONE, NONE)
+        return
+    u32 r = w.t.resolve(b.ret)
+    if b.ret != NONE && r != NONE && w.t.tag[r] == types.T_TUPLE && a.tag[vn] == syntax.E_TUPLE:
+        []u32 wl = w.t.list(r)
+        []u32 gl = a.list(a.b[vn])
+        i64 want = #len(wl)
+        i64 got = #len(gl)
+        if want != got:
+            err(w, b, vn, 701, index.hold(#format("`", fname, "` returns ", shown(w, b.ret), ", which has ", want, " slots; this `return` writes ", got)))
+            _ = ir.op(&b.f, ir.O_RETURN, 0, b.ret, n, NONE, NONE)
+            return
+    Val v = expr(w, b, vn, b.ret)
+    b.tried = tried
+    b.trying = trying
+    Val c = bad()
+    if v.ty != NONE && b.ret != NONE:
+        if b.ds && sa_returned(w, b, vn, v): pass
+        else if !(b.ds && (v.ty == w.sany || b.ret == w.sany || b.ret == w.sloc && s_fn(w, v.ty))) && !fits_type(w, v, b.ret): err(w, b, vn, 701, index.hold(#format("`", fname, "` returns ", shown(w, b.ret), ", and this is ", shown(w, final_ty(w, v)))), lent_help(w, v.ty, b.ret))
+        else: c = coerce(w, b, v, b.ret, vn)
+    if #len(b.defers) > 0 && c.ty != NONE:
+        u32 t = temp(w, b, c.ty, vn)
+        _ = ir.op(&b.f, ir.O_SET, 0, c.ty, vn, t, c.opd)
+        c.opd = t
+    unwind(w, b, 0, false)
+    _ = ir.op(&b.f, ir.O_RETURN, 0, b.ret, n, NONE, c.opd)
+
+// A returned `ref` whose view is not the one answered: what it does lend.
+private string8 lent_help(^World w, u32 ty, u32 ret):
+    string8 ro = ro_help(w, ty, ret)
+    if ro != "": return ro
+    u32 r = w.t.resolve(ty)
+    if r == NONE || w.t.tag[r] != types.T_REF || w.t.tag[w.t.resolve(w.t.a[r])] != types.T_SLICE: return ""
+    return index.hold(#format(shown(w, ty), " lends ", shown(w, w.t.a[r]), " and nothing else; answer that, or convert what it holds into ", shown(w, ret), " first"))
+
+// A condition: a `bool`, else ERR0702 naming the construct.
+u32 cond(^World w, ^Body b, u32 n, string8 what):
+    Val v = expr(w, b, n, u32(types.P_BOOL))
+    if v.ty == NONE: return NONE
+    if v.ty != u32(types.P_BOOL):
+        string8 head = index.hold(#format("an `", what, "` condition"))
+        if what == "a conditional value's condition" || what == "an assertion's condition": head = what
+        if b.ds && v.ty == w.sany:
+            err(w, b, n, 702, index.hold(#format(head, " is a `bool`, and this is `any`: DadoScript has no truthiness, and what an `any` holds is checked where it is converted")), index.hold(#format("convert it first: `bool b = ", src(w, b, n), "`, which raises if it holds no `bool`")))
+            return NONE
+        err(w, b, n, 702, index.hold(#format(head, " is a `bool`; this is ", shown(w, final_ty(w, v)), ". Write the comparison you mean")))
+        return NONE
+    return v.opd
+
+private void if_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    u32 c = cond(w, b, ks[0], "if")
+    u32 h = open(w, b, ir.O_IF, n, c, false)
+    block(w, b, ks[1])
+    if ks[2] != NONE:
+        ir.otherwise(&b.f, h)
+        block(w, b, ks[2])
+    close(w, b, h)
+
+private void jump(^World w, ^Body b, u32 n, bool brk):
+    i64 i = #len(b.heads)
+    for i > 0:
+        i -= 1
+        if b.heads[i].walk:
+            say_tok(w, b.file, b.base, n, 722, index.hold(#format("`", "break" if brk else "continue", "` here is aimed at the walk over `#slots(…)`, and that walk is not a loop in the program: its body is written out once per slot, so there is nothing to leave or to go round again")), "guard the rest of the body with an `if` instead")
+            return
+        if brk && b.heads[i].arm:
+            bool looped = false
+            for h in b.heads:
+                if h.is_loop: looped = true
+            string8 why = "A `break` here would leave the enclosing loop instead, which C, Java and Go do not do" if looped else "There is no loop here for it to leave either, and the arm needs nothing to end it"
+            string8 help = "to end the arm, delete the `break`; to leave the loop, `break` after the `switch` (set a flag in the arm) or `return` from the arm" if looped else "delete the `break`"
+            say_tok(w, b.file, b.base, n, 730, "`break` in a `switch` arm does not leave the `switch`: an arm ends where its body ends", help, index.hold(#format("`fallthrough` is how an arm continues, so there is nothing to break out of. ", why)))
+            return
+        if b.heads[i].is_loop:
+            unwind(w, b, b.heads[i].depth, false)
+            u32 depth = u32(#len(b.heads)) - 1 - u32(i)
+            if brk: _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, n, NONE, depth)
+            else:
+                // `continue` leaves the loop's body block (one inside the loop).
+                _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, n, NONE, depth - 1)
+            return
+    err_tok(w, b, n, 703, "`break` is only meaningful inside a `for`" if brk else "`continue` is only meaningful inside a `for`")
+
+// `switch x:` is a chain of IFs over `x`, evaluated once; each `case`
+// value is a constant (ERR0901), named once (ERR0706). LNT0731 for an
+// enum's members left to the `else`.
+// A `switch` over a value that did not type: its arms are still walked.
+private void switch_untyped(^World w, ^Body b, u32 n):
+    b.untyped_sw = false
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    ref []u32 opened
+    for c in ks[2..<#len(ks)]:
+        if c == NONE: continue
+        if a.main[c] != NONE: err_tok(w, b, c, 416, index.hold(#format("a `case` arm binds a name only when it narrows a union member, and the value being switched on is not a union — an arm over any other type compares a constant and leaves the value as it was, so there is nothing here for `", spell(w, b, c), "` to be")))
+        []u32 vs = a.list(a.b[c])
+        for vn in vs[1..<#len(vs)]:
+            Val k = expr(w, b, vn, NONE)
+            if k.ty == NONE || ir.is_const(k.opd): continue
+            err(w, b, vn, 901, index.hold(#format("a `case` value is a constant the compiler folds and compares against, and `", src(w, b, vn), "` is only known while the program runs\x1eto test it, write an `if` — `if ", src(w, b, ks[0]), " == ", src(w, b, vn), ":` — ahead of the `switch`, or bind it to a `const` if it is a constant")))
+        u32 h = open(w, b, ir.O_IF, c, ir.konst(w.k.boolean(&w.t, false)), false)
+        b.heads[#len(b.heads) - 1].arm = true
+        scope_in(w, b)
+        block(w, b, vs[0], false)
+        scope_out(w, b)
+        ir.otherwise(&b.f, h)
+        opened = #append(opened, h)
+    if ks[1] != NONE:
+        if #len(opened) == 0:
+            opened = #append(opened, open(w, b, ir.O_BLOCK, n, NONE, false))
+            b.heads[#len(b.heads) - 1].arm = true
+        block(w, b, ks[1])
+    else: say(w, b.file, b.base, a.lo[n], a.hi[ks[0]] + 1, 705, "a `switch` needs an `else` arm: the value being switched on cannot promise that a value is one of the arms — an enum value need not be one of its members, and only a union discriminant is closed by construction", "")
+    i64 i = #len(opened)
+    for i > 0:
+        i -= 1
+        close(w, b, opened[i])
+
+private void switch_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    b.untyped_sw = false
+    Val v = expr(w, b, ks[0], NONE)
+    if v.ty == NONE && b.untyped_sw:
+        switch_untyped(w, b, n)
+        return
+    if v.ty == NONE: return
+    v = finish(w, b, v, ks[0])
+    if union_of(w, v.ty) != NONE:
+        union_switch(w, b, n, v)
+        return
+    u32 rw = raw_of(&w.t, v.ty)
+    if rw != NONE:
+        // C's union has no tag to switch on; the arms are checked, unbound.
+        err(w, b, ks[0], 1024, index.hold(#format("a `switch` over a union takes the arm the **tag** names, and ", shown(w, v.ty), " is C's union, which carries no tag", "\x1fEvery member shares one storage and nothing says which was written last")), index.hold(#format("read the member the program knows is there — `e.", w.t.text(w.t.slot_names(rw)[0]), "` — or keep the discriminant Dado's, with a `union`")))
+        for c in ks[2..<#len(ks)]:
+            if c != NONE: block(w, b, a.list(a.b[c])[0])
+        if ks[1] != NONE: block(w, b, ks[1])
+        return
+    string8 q = spell(w, b, ks[0])
+    if a.tag[ks[0]] == syntax.E_NAME && #len(q) > 0 && q[0] == '#':
+        string8 rep = index.hold(#format("write a `when` chain on `", q, "`"))
+        if #len(ks) > 2 && ks[2] != NONE:
+            []u32 vs = a.list(a.b[ks[2]])
+            if #len(vs) > 1 && a.tag[vs[1]] == syntax.E_NAME: rep = index.hold(#format("write `when ", q, " == ", spell(w, b, vs[1]), ":` and `else when` for the rest"))
+        err(w, b, ks[0], 708, index.hold(#format("`switch ", q, ":` selects nothing: `", q, "` is known before the program runs\x1fA `switch` is a run-time construct whatever its scrutinee is — every arm is checked and every arm is emitted, including the arms this build can never take. A `when` compiles one arm and parses the others and nothing else\x1eto select code, ", rep)))
+    u8 sm = 0
+    if b.ds: sm = s_switch_on(w, b, ks[0], v.ty)
+    u32 fd = failure_enum(w, b, ks[0], v.ty)
+    if ks[1] == NONE && sm == 4:
+        string8 en = name_of(w, w.decls[s_denum(w, v.ty)].name)
+        say(w, b.file, b.base, a.lo[n], a.hi[ks[0]] + 1, 705, index.hold(#format("a `switch` over `", en, "` needs an `else` arm: `", en, "` is a Dado enum, and a value of it need not be one of its members")), "add `else:` and what a value no member names does — `pass` when nothing")
+    if ks[1] == NONE && sm == 2: say(w, b.file, b.base, a.lo[n], a.hi[ks[0]] + 1, 705, index.hold(#format("a `switch` over `", shown(w, v.ty), "` needs an `else` arm: its arms name some of the values it can hold, never all")), "add `else:` and what every other value does — `pass` when nothing")
+    if ks[1] == NONE && fd == NONE && sm == 0: say(w, b.file, b.base, a.lo[n], a.hi[ks[0]] + 1, 705, index.hold(#format("a `switch` needs an `else` arm: `", shown(w, v.ty), "` cannot promise that a value is one of the arms — an enum value need not be one of its members, and only a union discriminant is closed by construction")), "")
+    u32 p = temp(w, b, v.ty, ks[0])
+    _ = ir.op(&b.f, ir.O_SET, 0, v.ty, ks[0], p, v.opd)
+    Val x = value(p, v.ty)
+    ref []u32 seen
+    ref []u32 seen_at
+    ref []u32 opened
+    u32 bt = u32(types.P_BOOL)
+    fall_check(w, b, n, false)
+    bool ft = false
+    for c in ks[2..<#len(ks)]:
+        if c != NONE && ends_fall(w, b, a.list(a.b[c])[0]) && !fall_refused(w, b, a.list(a.b[c])[0]): ft = true
+    ref []u32 anys
+    ref []u32 arms
+    // A failure enum's switch with no `else` names every member: its last
+    // arm is what is left (Rust's), so C sees no way past the arms.
+    u32 rest = NONE
+    if ks[1] == NONE && fd != NONE:
+        for c in ks[2..<#len(ks)]:
+            if c != NONE: rest = c
+    for c in ks[2..<#len(ks)]:
+        if c == NONE: continue
+        if a.main[c] != NONE && b.ds: err_tok(w, b, c, 416, index.hold(#format("a `case` arm binds a name only when it narrows a union member, and a script's `switch` compares values, so there is nothing for `", spell(w, b, c), "` to be")), "drop the name: the value switched on is still in scope")
+        else if a.main[c] != NONE: err_tok(w, b, c, 416, index.hold(#format("a `case` arm binds a name only when it narrows a union member, and `", shown(w, v.ty), "` is not a union — an arm over any other type compares a constant and leaves the value as it was, so there is nothing here for `", spell(w, b, c), "` to be")))
+        []u32 vs = a.list(a.b[c])
+        u32 any = temp(w, b, bt, c)
+        _ = ir.op(&b.f, ir.O_SET, 0, bt, c, any, ir.konst(w.k.boolean(&w.t, false)))
+        for vn in vs[1..<#len(vs)]:
+            if sm == 3:
+                _ = expr(w, b, vn, NONE)
+                continue
+            Val k = expr(w, b, vn, NONE if sm == 1 else v.ty)
+            if k.ty == NONE: continue
+            if sm == 1 && k.ty != v.ty:
+                s_case_wrong(w, b, vn, v.ty, k.ty)
+                continue
+            k = coerce(w, b, k, v.ty, vn, "the value being switched on is")
+            if k.ty == NONE: continue
+            u32 last = ir.count(&b.f) - 1
+            if !ir.is_const(k.opd) && b.f.op[last] == ir.O_SET && b.f.dst[last] == k.opd && ir.is_const(b.f.a[last]): k.opd = b.f.a[last]
+            if !ir.is_const(k.opd):
+                err(w, b, vn, 901, index.hold(#format("a `case` value is a constant the compiler folds and compares against, and `", src(w, b, vn), "` is only known while the program runs\x1eto test it, write an `if` — `if ", src(w, b, ks[0]), " == ", src(w, b, vn), ":` — ahead of the `switch`, or bind it to a `const` if it is a constant")))
+                continue
+            i64 dup = -1
+            for i in 0..<#len(seen):
+                if seen[i] == k.opd: dup = i
+            if dup >= 0:
+                bool here = false
+                for e in vs[1..<#len(vs)]:
+                    if e == seen_at[dup]: here = true
+                Where at = where(w, b.file, 0, seen_at[dup])
+                if here: err(w, b, vn, 706, index.hold(#format("this list already names `", src(w, b, vn), "`, and naming a value twice selects nothing more: delete this one")))
+                else if sm == 1: err(w, b, vn, 706, index.hold(#format("the arm on line ", at.line, " already matches `", src(w, b, vn), "`, and a `switch` takes the first arm that matches, so this one could never run for it: delete it")))
+                else if #len(vs) > 2: err(w, b, vn, 706, index.hold(#format("the arm on line ", at.line, " already matches `", src(w, b, vn), "`, so this arm is never the one `", src(w, b, vn), "` selects\x1fA `switch` takes the first arm that matches\x1edelete it from this list, or move it here from line ", at.line, " if this arm is the one meant")))
+                else: err(w, b, vn, 706, index.hold(#format("the arm on line ", at.line, " already matches ", src(w, b, vn), ", and a `switch` takes the first arm that matches; this one could never run")))
+                continue
+            seen = #append(seen, k.opd)
+            seen_at = #append(seen_at, vn)
+            Val e = combine(w, b, vn, "==", ir.B_EQ, x, k, ks[0], vn)
+            if e.ty != NONE: _ = ir.op(&b.f, ir.O_BIN, ir.B_OR, bt, vn, any, any, e.opd)
+        if ft:
+            anys = #append(anys, any)
+            arms = #append(arms, c)
+            continue
+        if c == rest:
+            opened = #append(opened, open(w, b, ir.O_BLOCK, c, NONE, false))
+            b.heads[#len(b.heads) - 1].arm = true
+            block(w, b, vs[0])
+            continue
+        u32 h = open(w, b, ir.O_IF, c, any, false)
+        b.heads[#len(b.heads) - 1].arm = true
+        block(w, b, vs[0])
+        ir.otherwise(&b.f, h)
+        opened = #append(opened, h)
+    if ft:
+        falls(w, b, n, ks[1], anys, arms)
+        if ks[1] != NONE: unnamed(w, b, n, v.ty, seen)
+    else if ks[1] != NONE:
+        if #len(opened) == 0:
+            opened = #append(opened, open(w, b, ir.O_BLOCK, n, NONE, false))
+            b.heads[#len(b.heads) - 1].arm = true
+        block(w, b, ks[1])
+        unnamed(w, b, n, v.ty, seen)
+    if ks[1] == NONE && fd != NONE: closed_over(w, b, n, ks[0], fd, seen)
+    if sm == 1: s_unnamed(w, b, n, v.ty, seen)
+    i64 i = #len(opened)
+    for i > 0:
+        i -= 1
+        close(w, b, opened[i])
+
+// ERR0711-0713: each `fallthrough` of switch `n`'s arms that cannot fall.
+void fall_check(^World w, ^Body b, u32 n, bool over_union):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    u32 last = NONE
+    for c in ks[2..<#len(ks)]:
+        if c != NONE: last = c
+    for c in ks[2..<#len(ks)]:
+        if c != NONE: fall_walk(w, b, a.list(a.b[c])[0], a.list(a.b[c])[0], 4 if over_union else (2 if c == last else 1))
+    if ks[1] != NONE: fall_walk(w, b, ks[1], ks[1], 4 if over_union else 3)
+
+private void fall_walk(^World w, ^Body b, u32 body, u32 x, u8 kind):
+    syntax.Ast a = tree(w, b)
+    if x == NONE: return
+    u8 g = a.tag[x]
+    if g == syntax.S_SWITCH || g == syntax.E_LAMBDA: return
+    if g == syntax.S_FALLTHROUGH:
+        bool tail = x == last_stmt(w, b, body)
+        if kind == 4: err(w, b, x, 713, "`fallthrough` is not allowed in a `switch` over a union\x1fEach arm binds a narrowed member, so falling into the next one would enter a scope whose binding names a member this value does not hold", "write the shared work as a function both arms call")
+        else if !tail: err(w, b, x, 711, "`fallthrough` is only meaningful as the **last** statement of a `case` body — it hands control to the next arm, so anything written after it in this arm could never run")
+        else if kind == 2: err(w, b, x, 712, "`fallthrough` transfers to the next `case` arm, and this is the last one — there is nothing after it to fall into. An `else` is not the next arm: it is where control goes when no arm matched")
+        else if kind == 3: err(w, b, x, 712, "`fallthrough` transfers to the next `case` arm, and an `else` has none after it — it is the arm control reaches when nothing matched")
+        else: return
+        b.fall_said = #append(b.fall_said, x)
+        return
+    ref []u32 ks
+    a.kids(x, &ks)
+    for k in ks:
+        fall_walk(w, b, body, k, kind)
+
+private bool fall_refused(^World w, ^Body b, u32 s):
+    u32 x = last_stmt(w, b, s)
+    for y in b.fall_said:
+        if y == x: return true
+    return false
+
+// Whether suite `s` ends in `fallthrough`.
+bool ends_fall(^World w, ^Body b, u32 s):
+    syntax.Ast a = tree(w, b)
+    if s == NONE || a.tag[s] != syntax.S_BLOCK: return s != NONE && a.tag[s] == syntax.S_FALLTHROUGH
+    []u32 xs = a.list(a.b[s])
+    return #len(xs) > 0 && xs[#len(xs) - 1] != NONE && a.tag[xs[#len(xs) - 1]] == syntax.S_FALLTHROUGH
+
+private u32 last_stmt(^World w, ^Body b, u32 s):
+    syntax.Ast a = tree(w, b)
+    if a.tag[s] != syntax.S_BLOCK: return s
+    []u32 xs = a.list(a.b[s])
+    return xs[#len(xs) - 1]
+
+// A `switch` with a `fallthrough`: the arm taken is chosen first (`sel`),
+// then each arm runs when `sel` names it, and one that falls through names
+// the next.
+private void falls(^World w, ^Body b, u32 n, u32 els, []u32 anys, []u32 arms):
+    syntax.Ast a = tree(w, b)
+    u32 it = u32(types.P_I64)
+    u32 bt = u32(types.P_BOOL)
+    u32 sel = temp(w, b, it, n)
+    _ = ir.op(&b.f, ir.O_SET, 0, it, n, sel, ir.konst(w.k.small(&w.t, #len(arms))))
+    i64 j = #len(anys)
+    for j > 0:
+        j -= 1
+        u32 h = open(w, b, ir.O_IF, arms[j], anys[j], false)
+        _ = ir.op(&b.f, ir.O_SET, 0, it, arms[j], sel, ir.konst(w.k.small(&w.t, j)))
+        close(w, b, h)
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    for k in 0..<#len(arms) + 1:
+        u32 body = els
+        if k < #len(arms): body = a.list(a.b[arms[k]])[0]
+        if body == NONE: continue
+        u32 c = temp(w, b, bt, n)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, bt, n, c, sel, ir.konst(w.k.small(&w.t, k)))
+        u32 h = open(w, b, ir.O_IF, n, c, false)
+        b.heads[#len(b.heads) - 1].arm = true
+        u32 fo = b.fall_ok
+        bool fall = k < #len(arms) && ends_fall(w, b, body)
+        if fall: b.fall_ok = last_stmt(w, b, body)
+        block(w, b, body)
+        b.fall_ok = fo
+        if fall: _ = ir.op(&b.f, ir.O_SET, 0, it, n, sel, ir.konst(w.k.small(&w.t, k + 1)))
+        else: _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, n, NONE, 1)
+        close(w, b, h)
+    close(w, b, bl)
+
+// LNT0731: enum members a `switch` with an `else` does not name.
+private void unnamed(^World w, ^Body b, u32 n, u32 ty, []u32 seen):
+    if !(ty in w.type_decl) || s_enum(w, ty): return
+    try u32 d = w.type_decl[ty] else: return
+    if w.decls[d].kind != K_ENUM: return
+    // A header's enum: its values are C's, so nothing is said (Rust's).
+    if w.p.files[w.decls[d].file].a.tag[w.decls[d].node] == syntax.N_F_ENUM: return
+    ref []char8 listed
+    string8 first = ""
+    i64 count = 0
+    for key in w.order:
+        if u32(key >> 32) != d: continue
+        try u32 c = w.members[key] else: continue
+        bool named = false
+        u32 mk = ir.konst(c)
+        // A script holds a Dado enum's members by name.
+        if b.ds && s_denum(w, ty) != NONE: mk = s_evalue(w, ty, i64(w.k.w0[c])).opd
+        for x in seen:
+            if x == mk: named = true
+        if named: continue
+        string8 m = name_of(w, u32(key & 0xFFFFFFFF))
+        if count > 0: listed = #append(listed, ..", ")
+        listed = #append(listed, ..#format("`", m, "`"))
+        if count == 0: first = m
+        count += 1
+    if count == 0: return
+    string8 en = name_of(w, w.decls[d].name)
+    syntax.Ast a = tree(w, b)
+    say(w, b.file, b.base, a.lo[n], a.hi[a.list(a.b[n])[0]] + 1, diag.LNT + 731, index.hold(#format("this `switch` over `", en, "` leaves ", listed, " unnamed, so ", "it is" if count == 1 else "they are", " routed into the `else` with nothing said")), index.hold(#format("name ", "it" if count == 1 else "each", " in an arm — `case ", en, ".", first, ":` — or add ", "it" if count == 1 else "them", " to the list of an arm whose body is already right")))
+
+// A loop is LOOP [test] BLOCK{body} [step]; `continue` breaks the BLOCK.
+private void for_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if w.watching: w.watch_pend = n + 1
+    u32 hd = a.a[n]
+    if hd != NONE && a.tag[hd] == syntax.S_FOR_IN:
+        []u32 ks = a.list(a.b[hd])
+        u32 it = ks[#len(ks) - 1]
+        if a.tag[it] == syntax.E_RANGE:
+            range_loop(w, b, n, ks[0..<#len(ks) - 1], it)
+            return
+        u8 cv = chan_verb(w, b, it)
+        if cv == B_PEEK || cv == B_DRAIN:
+            chan_loop(w, b, n, ks[0..<#len(ks) - 1], it)
+            return
+        if a.tag[it] == syntax.E_CALL && a.tag[a.list(a.b[it])[0]] == syntax.E_NAME && spell(w, b, a.list(a.b[it])[0]) == "#slots":
+            slots_walk(w, b, n, ks[0..<#len(ks) - 1], it)
+            return
+        if a.tag[it] == syntax.E_NAME && b.pack != NONE && w.p.sym(b.file, it) == b.pack_name:
+            u32 ix = NONE
+            if #len(ks) > 2: ix = ks[1]
+            unroll(w, b, n, ks[0], ix)
+            return
+        if b.ds && s_for_in(w, b, n, ks[0..<#len(ks) - 1], it): return
+        run_loop(w, b, n, ks[0..<#len(ks) - 1], it)
+        return
+    u32 lp = open(w, b, ir.O_LOOP, n, NONE, true)
+    if hd != NONE:
+        u32 c = cond(w, b, hd, "for")
+        u32 neg = temp(w, b, u32(types.P_BOOL), hd)
+        _ = ir.op(&b.f, ir.O_UN, ir.U_NOT, u32(types.P_BOOL), hd, neg, c)
+        u32 t = open(w, b, ir.O_IF, hd, neg, false)
+        _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, hd, NONE, 1)
+        close(w, b, t)
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    block(w, b, a.b[n])
+    close(w, b, bl)
+    close(w, b, lp)
+
+private void range_loop(^World w, ^Body b, u32 n, []u32 binds, u32 r):
+    syntax.Ast a = tree(w, b)
+    bool incl = spell(w, b, r) == "..="
+    if spell(w, b, r) == "..":
+        err(w, b, r, 607, "`..` splices an argument list (A4); a range is `..<` or `..=`")
+        return
+    Val lo = expr(w, b, a.a[r], NONE)
+    Val hi = expr(w, b, a.b[r], lo.ty if lo.kind != V_LIT else NONE)
+    if lo.ty == NONE || hi.ty == NONE: return
+    u32 sl0 = sort_of(w, final_ty(w, lo))
+    u32 sh0 = sort_of(w, final_ty(w, hi))
+    if sl0 != sh0 && (sl0 > 2 || sh0 > 2):
+        err(w, b, r, 504, index.hold(#format("a range runs between two values of one type; these are ", shown(w, final_ty(w, lo)), " and ", shown(w, final_ty(w, hi)))))
+        return
+    if is_float(w, final_ty(w, lo)) && is_float(w, final_ty(w, hi)):
+        err(w, b, r, 607, index.hold(#format("a range counts, so it runs between integers; these are ", shown(w, final_ty(w, lo)))))
+        return
+    u32 ty = common(w, b, lo, hi, r, "..<")
+    if ty == NONE: return
+    if ty == w.untyped: ty = final_ty(w, hi) if final_ty(w, lo) == u32(types.P_I32) else final_ty(w, lo)
+    if !is_int(w, ty):
+        err(w, b, r, 607, index.hold(#format("a range runs over integers; this is ", shown(w, ty))))
+        return
+    lo = coerce(w, b, lo, ty, a.a[r])
+    hi = coerce(w, b, hi, ty, a.b[r])
+    u32 bt = u32(types.P_BOOL)
+    u32 i = temp(w, b, ty, r)
+    u32 end = temp(w, b, ty, r)
+    _ = ir.op(&b.f, ir.O_SET, 0, ty, r, i, lo.opd)
+    _ = ir.op(&b.f, ir.O_SET, 0, ty, r, end, hi.opd)
+    u32 idx = NONE
+    if #len(binds) > 1:
+        idx = temp(w, b, u32(types.P_I64), r)
+        _ = ir.op(&b.f, ir.O_SET, 0, u32(types.P_I64), r, idx, ir.konst(w.k.small(&w.t, 0)))
+    u32 outer = NONE
+    if incl:
+        u32 c = temp(w, b, bt, r)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_LE, bt, r, c, i, end)
+        outer = open(w, b, ir.O_IF, r, c, false)
+    u32 lp = open(w, b, ir.O_LOOP, n, NONE, true)
+    if !incl:
+        u32 c = temp(w, b, bt, r)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_GE, bt, r, c, i, end)
+        u32 t = open(w, b, ir.O_IF, r, c, false)
+        _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, r, NONE, 1)
+        close(w, b, t)
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    scope_in(w, b)
+    if a.a[binds[0]] == 1: err_tok(w, b, binds[0], 709, "a range's counter may not be bound by address: a range is a thing to count through rather than storage to walk, and the loop variable is synthesised — there is nothing for a `^` to point at")
+    bind(w, b, binds[0], ty, i)
+    // A script's counter is its variable (JS's `for (let k …)`): a store to it steps on from there.
+    u32 ks = NONE
+    if b.ds && spell(w, b, binds[0]) != "_": ks = find_local(w, b, w.p.sym(b.file, binds[0]), false)
+    if #len(binds) > 1: bind(w, b, binds[1], u32(types.P_I64), idx)
+    for j in 0..<#len(b.locals):
+        if b.locals[j].depth == b.depth: b.locals[j].read = true
+    block(w, b, a.b[n])
+    scope_out(w, b)
+    close(w, b, bl)
+    if ks != NONE: _ = ir.op(&b.f, ir.O_SET, 0, ty, r, i, ir.at(&b.f, ks))
+    if incl:
+        u32 c = temp(w, b, bt, r)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_EQ, bt, r, c, i, end)
+        u32 t = open(w, b, ir.O_IF, r, c, false)
+        _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, r, NONE, 1)
+        close(w, b, t)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, ty, r, i, i, ir.konst(w.k.small(&w.t, 1)))
+    if idx != NONE: _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, u32(types.P_I64), r, idx, idx, ir.konst(w.k.small(&w.t, 1)))
+    close(w, b, lp)
+    if outer != NONE: close(w, b, outer)
+
+void bind(^World w, ^Body b, u32 n, u32 ty, u32 from):
+    if spell(w, b, n) == "_": return
+    u32 sl = declare_local(w, b, w.p.sym(b.file, n), ty, n)
+    if sl != NONE: _ = ir.op(&b.f, ir.O_SET, 0, ty, n, ir.at(&b.f, sl), from)
+
+// `for x in pack`: the body once per element, each in a BLOCK of its own,
+// all inside one (so `break` leaves every element).
+private void unroll(^World w, ^Body b, u32 n, u32 bn, u32 ix):
+    syntax.Ast a = tree(w, b)
+    u32 all = open(w, b, ir.O_LOOP, n, NONE, true)
+    []u32 tys = w.t.list(b.pack)
+    for i in 0..<#len(tys):
+        u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+        scope_in(w, b)
+        bind(w, b, bn, tys[i], ir.at(&b.f, b.pack_slot + u32(i)))
+        // `for x, i in xs`: each copy's position, a constant.
+        if ix != NONE: bind(w, b, ix, u32(types.P_I64), ir.konst(w.k.small(&w.t, i)))
+        block(w, b, a.b[n])
+        scope_out(w, b)
+        close(w, b, bl)
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, n, NONE, 0)
+    close(w, b, all)
+
+// `for name, value in #slots(v)`: the body once per slot of a declared
+// shape, `name` a constant (ERR0722 for what has none to walk).
+private void slots_walk(^World w, ^Body b, u32 n, []u32 binds, u32 it):
+    syntax.Ast a = tree(w, b)
+    []u32 cs = a.list(a.b[it])
+    if #len(cs) != 3 || #len(binds) == 0: return
+    u32 vn = arg_value(w, b, cs[2])
+    bool inst = #len(w.note) > 0
+    u32 root = vn
+    for a.tag[root] == syntax.E_FIELD || a.tag[root] == syntax.E_DEREF:
+        root = a.a[root]
+    if a.tag[root] != syntax.E_NAME:
+        err(w, b, vn, 722, "`#slots` walks a value held in a name, or reached from one through `.` and `^` — `#slots(v)`, `#slots(v.inner)`, `#slots(p^)` — because the walk reads it once per slot, and only a place reads the same storage every time", "bind it to a name first — `auto v = …` — and walk `#slots(v)`")
+        return
+    for bn in binds:
+        if spell(w, b, bn) == spell(w, b, root):
+            err_tok(w, b, bn, 722, index.hold(#format("`", spell(w, b, bn), "` is the value being walked, and each slot's copy of the body binds `", spell(w, b, bn), "` before it reads that slot — so the read would find the binding and not the value")), "name the binding something else: `for name, value in #slots(…)`")
+            return
+    bool two = #len(binds) > 1
+    if two && a.tag[binds[0]] == syntax.S_BIND && a.a[binds[0]] == 1:
+        err_tok(w, b, binds[0], 709, index.hold(#format("`", spell(w, b, binds[0]), "` is a slot's **name**, a constant the compiler writes, and there is no storage for a `^` to point at")), "bind the value by address instead: `for name, &value in #slots(v)`")
+        return
+    Val v = expr(w, b, vn, NONE)
+    if v.ty == NONE: return
+    v = finish(w, b, v, vn)
+    string8 nm = src(w, b, vn)
+    u32 r = w.t.resolve(v.ty)
+    if r != NONE && w.t.tag[r] == types.T_PTR:
+        err(w, b, vn, 722, index.hold(#format("`", nm, "` is a pointer, ", shown(w, v.ty), ": its one slot is an address, and the slots a declaration names are those of what it points at")), index.hold(#format("walk what it points at: `for name, value in #slots(", nm, "^):`")))
+        return
+    if union_of(w, v.ty) != NONE:
+        err(w, b, vn, 722, index.hold(#format("`", nm, "` is a union, ", shown(w, v.ty), ", whose members are alternatives and not parts: one holds at a time, so walking every member would read the ones that do not")), "`switch` on it, and walk the member each arm binds")
+        return
+    if is_soa(w, v.ty):
+        err(w, b, vn, 722, index.hold(#format("`", nm, "` is ", shown(w, v.ty), ", a `#soa`: its slots are lanes, and one element of it is a value gathered out of every lane at once")), "bind one element — `auto e = s[i]` — and walk `#slots(e)`")
+        return
+    []u32 names = w.t.slot_names(v.ty)
+    []u32 slots = w.t.slots(v.ty)
+    bool tup = r != NONE && w.t.tag[r] == types.T_TUPLE
+    i64 cnt = #len(slots) if tup || #len(names) == 1 else 0
+    if #len(names) != cnt && cnt > 0 && two && spell(w, b, binds[0]) != "_" && !inst:
+        err(w, b, vn, 722, index.hold(#format("`", nm, "` is ", shown(w, v.ty), ", a shape no declaration named, so the walk has no name to bind for any of its slots")), "declare the shape with names — `type Pair: (i32 lo, i32 hi)` — and write the value with it: `Pair v = …`")
+        return
+    if cnt == 0 && !inst:
+        err(w, b, vn, 722, index.hold(#format("`", nm, "` is ", shown(w, v.ty), ", a value with no slots for a declaration to name, so this walk would write its body out zero times")), index.hold(#format("walk a value whose type a declaration wrote — `type Point: (i32 x, i32 y)`, then `Point p = …` and `#slots(p)` — or use `", nm, "` directly")))
+        return
+    u32 p = spill(w, b, v, vn)
+    u32 all = open(w, b, ir.O_BLOCK, n, NONE, false)
+    b.heads[#len(b.heads) - 1].walk = true
+    u32 vb = binds[1] if two else binds[0]
+    bool by_addr = a.tag[vb] == syntax.S_BIND && a.a[vb] == 1
+    for i in 0..<cnt:
+        u32 st = slots[i] if tup else w.t.body[w.t.bare(v.ty)]
+        u32 x = ir.step(&b.f, p, ir.ST_FIELD, u32(i), st) if tup else p
+        u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+        scope_in(w, b)
+        if two: bind(w, b, binds[0], types.STRING8, ir.konst(w.k.str(&w.t, slot_label(w, b, v, i, names))))
+        if by_addr:
+            u32 pt = w.t.ptr_of(st)
+            u32 q = temp(w, b, pt, vb)
+            _ = ir.op(&b.f, ir.O_ADDR, 0, pt, vb, q, x)
+            bind(w, b, vb, pt, q)
+        else: bind(w, b, vb, st, x)
+        block(w, b, a.b[n])
+        scope_out(w, b)
+        close(w, b, bl)
+    close(w, b, all)
+
+// Slot `i`'s name in a walk: a `view`'s, else the declared one, qualified
+// by the embedded type that gave it when another slot has it too.
+private string8 slot_label(^World w, ^Body b, Val v, i64 i, []u32 names):
+    i64 vw = #len(b.locals)
+    if !ir.is_const(v.opd) && b.f.plo[v.opd] == b.f.phi[v.opd] && (b.f.root[v.opd] & ir.ROOT_GLOBAL) == 0:
+        for vw > 0:
+            vw -= 1
+            if b.locals[vw].viewed != b.f.root[v.opd]: continue
+            syntax.Ast a = tree(w, b)
+            []u32 ns = a.list(a.b[b.locals[vw].node])
+            if i < #len(ns): return spell(w, b, ns[i])
+    if i >= #len(names): return ""
+    string8 s = w.t.text(names[i])
+    u32 bt = w.t.bare(v.ty)
+    for e in w.embeds:
+        []u32 es = w.t.slots(e.inner)
+        if e.outer != bt || i < i64(e.at) || i >= i64(e.at) + #len(es): continue
+        for j in 0..<#len(names):
+            if j != i && w.t.text(names[j]) == s: return index.hold(#format(named(w, e.inner), ".", s))
+    return s
+
+// ERR0829: a growth's answer dropped `how`.
+private void dropped(^World w, ^Body b, u32 e, Val v, string8 how):
+    syntax.Ast a = tree(w, b)
+    if b.ds && v.ty != NONE: sa_discarded(w, b, e, e, v.ty)
+    if v.ty == NONE || a.tag[e] != syntax.E_CALL: return
+    []u32 ks = a.list(a.b[e])
+    string8 verb = spell(w, b, ks[0]) if a.tag[ks[0]] == syntax.E_NAME else ""
+    if verb != "#append" && verb != "#resize" && verb != "#reserve" || #len(ks) < 3: return
+    u32 x = arg_value(w, b, ks[2])
+    u8 g = a.tag[x]
+    string8 rep = index.hold(#format("write `", src(w, b, x), " = ", src(w, b, e), "`")) if g == syntax.E_NAME || g == syntax.E_FIELD || g == syntax.E_INDEX || g == syntax.E_DEREF else index.hold(#format("bind the answer to a name — `", shown(w, v.ty), " r = ", src(w, b, e), "` — and use `r` from here on"))
+    err(w, b, e, 829, index.hold(#format("the handle `", verb, "` answers is dropped ", how, ", and the run it was handed has moved")), rep, index.hold(#format("`", verb, "` answers the grown run's handle. The run it was handed is moved into that answer, so it is stale afterwards; and when the block moved, the answer is the only handle to it")))
+
+// ERR0821: `#stack` storage assigned to a name outside the minting block,
+// or to a package variable.
+private void stack_kept(^World w, ^Body b, u32 pn, u32 vn):
+    syntax.Ast a = tree(w, b)
+    if a.tag[vn] != syntax.E_CALL: return
+    []u32 ks = a.list(a.b[vn])
+    if a.tag[ks[0]] != syntax.E_NAME || #len(ks) < 4: return
+    string8 verb = spell(w, b, ks[0])
+    u32 last = arg_value(w, b, ks[#len(ks) - 1])
+    if verb != "#new" && verb != "#make" || a.tag[last] != syntax.E_NAME || spell(w, b, last) != "#stack": return
+    u32 sym = w.p.sym(b.file, pn)
+    string8 nm = spell(w, b, pn)
+    string8 msg = ""
+    i64 i = #len(b.locals)
+    bool found = false
+    for i > 0 && !found:
+        i -= 1
+        if b.locals[i].name == sym && b.locals[i].slot != NONE: found = true
+    if found && b.locals[i].depth < b.depth: msg = index.hold(#format("this assigns storage `#stack` put in an inner block to `", nm, "`, which is declared outside that block, so `", nm, "` dangles once the block ends"))
+    else if !found:
+        u32 d = lookup(w, w.p.files[b.file].pkg, sym)
+        if d != NONE && w.decls[d].kind == K_VAR: msg = index.hold(#format("this stores storage `#stack` put on this frame into the package-level variable `", nm, "`, which outlives every frame"))
+    if #len(msg) == 0: return
+    err(w, b, pn, 821, msg, "allocate what has to outlive the block with `#new`/`#make` on the ambient allocator, or declare the binding inside the block that mints the storage")
+    w.d.label(b.file, b.base, a.lo[vn] - b.base, a.hi[vn] - b.base, "`#stack` storage minted here")
+
+// A `#make`/`#new` taking the ambient allocator.
+private bool ambient_mint(^World w, ^Body b, u32 e):
+    syntax.Ast a = tree(w, b)
+    if a.tag[e] != syntax.E_CALL: return false
+    []u32 ks = a.list(a.b[e])
+    if a.tag[ks[0]] != syntax.E_NAME: return false
+    string8 v = spell(w, b, ks[0])
+    return v == "#make" && #len(ks) <= 4 || v == "#new" && #len(ks) == 3
+
+// `arena.<fname>(&x)` of `core:mem/arena`: `x`'s name, or NONE.
+u32 arena_call(^World w, ^Body b, u32 e, string8 fname):
+    syntax.Ast a = tree(w, b)
+    if a.tag[e] != syntax.E_CALL: return NONE
+    []u32 ks = a.list(a.b[e])
+    if #len(ks) != 3 || a.tag[ks[0]] != syntax.E_FIELD || spell(w, b, ks[0]) != fname: return NONE
+    u32 base = a.a[ks[0]]
+    if a.tag[base] != syntax.E_NAME: return NONE
+    bool ok = false
+    for im in w.p.pkgs[w.p.files[b.file].pkg].imports:
+        if im.file == b.file && im.name == w.p.sym(b.file, base) && w.p.pkgs[im.pkg].key == "core:mem/arena": ok = true
+    u32 x = arg_value(w, b, ks[2])
+    if !ok || a.tag[x] != syntax.E_UNARY || spell(w, b, x) != "&" || a.tag[a.a[x]] != syntax.E_NAME: return NONE
+    return w.p.sym(b.file, a.a[x])
+
+// `view p: (a, b)`: names for `p`'s slots from here to the end of the block.
+private void view_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    string8 tn = spell(w, b, n)
+    u32 sl = find_local(w, b, w.p.sym(b.file, n), true)
+    if sl == NONE:
+        err_tok(w, b, n, 403, index.hold(#format("`", tn, "` is not a value in scope; a `view` renames the slots of an existing tuple, it does not introduce one")))
+        return
+    u32 ty = b.f.slot_ty[sl]
+    if is_soa(w, ty):
+        err(w, b, n, 525, index.hold(#format("`", tn, "` is ", shown(w, ty), ", which holds one run per slot, so a `view` has nothing here to name")), index.hold(#format("name the element's slots: `", tn, "[i].x` reads the slot the declaration named")), "A name bound over this shape would reach a position of the array under the mark — one element — while the emitted C reads the run. The vocabulary belongs to the **element**, where the element's own declaration already supplies it")
+        return
+    []u32 ns = a.list(a.b[n])
+    for x in ns:
+        _ = shadows(w, b, w.p.sym(b.file, x), x, "view name")
+    []u32 sls = w.t.slots(ty)
+    i64 have = #len(sls)
+    if #len(ns) != have:
+        err(w, b, n, 503, index.hold(#format("this view names ", #len(ns), " slot(s) but `", tn, "` is ", shown(w, ty), ", which has ", have)))
+        return
+    for i in 0..<#len(ns):
+        string8 s = spell(w, b, ns[i])
+        for j in 0..<i:
+            if s != "_" && spell(w, b, ns[j]) == s:
+                err_tok(w, b, ns[i], 404, index.hold(#format("`", s, "` already names slot ", j, " of `", tn, "`; use `_` for a slot you do not need")))
+                return
+    b.locals = #append(b.locals, Local(NONE, NONE, n, b.depth, true, sl, NONE))
+
+// ERR0404: `name` would shadow a binding of the signature being checked.
+private bool shadows(^World w, ^Body b, u32 name, u32 n, string8 kind):
+    u8 bk = 0
+    if bound(w, name, &bk) == NONE: return false
+    string8 s = name_of(w, name)
+    // The template's own rule, not the instance's: no instantiation note.
+    string8 nt = w.note
+    w.note = ""
+    err_tok(w, b, n, 404, index.hold(#format("`", s, "` is a ", kind, " of `", name_of(w, w.decls[b.decl].name), "`, and `$", s, "` is a binding of its signature, which is not shadowed", "\x1fSubstitution rewrites every use of the name, so this would not shadow the binding — the binding would replace this")), "rename one of them")
+    w.note = nt
+    return true
+
+string8 KIND_HELD(string8 what):
+    return index.hold(#format("`type` is a compile-time value and is erased before any C is written, so a ", what, " holding one has nothing to hold"))
+
+// Whether `t` holds a `type` value anywhere.
+bool holds_kind(^World w, u32 t, i64 depth):
+    u32 r = w.t.resolve(t)
+    if r == NONE || depth > 16: return false
+    if r == types.TYPE: return true
+    u8 g = w.t.tag[r]
+    if g == types.T_TUPLE:
+        for x in w.t.list(r):
+            if holds_kind(w, x, depth + 1): return true
+        return false
+    if g == types.T_SLICE || g == types.T_REF: return holds_kind(w, w.t.a[r], depth + 1)
+    if g == types.T_MAP: return holds_kind(w, w.t.a[r], depth + 1) || holds_kind(w, w.t.b[r], depth + 1)
+    return false
+
+void not_a_value(^World w, ^Body b, u32 n, string8 what):
+    err(w, b, n, 913, index.hold(#format(what, ", and this is a **type**\x1fA type value is a compile-time value with no representation, so there is nothing here to discard, walk or hold; all that can be done with one finishes during checking\x1euse it as `#size(T)`, `T == U`, `#spell(T)`, or render it in a message builtin's argument list")))
+
+// A value written with no type of its own: literals, `nil`, and arithmetic,
+// tuples, arrays and maps of only those.
+bool undetermined(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u8 g = a.tag[n]
+    if g == syntax.E_INT || g == syntax.E_FLOAT || g == syntax.E_CHAR || g == syntax.E_STR: return true
+    if g == syntax.E_NAME: return spell(w, b, n) == "nil"
+    if g == syntax.E_UNARY: return spell(w, b, n) != "&" && undetermined(w, b, a.a[n])
+    if g == syntax.E_BINARY: return undetermined(w, b, a.a[n]) && undetermined(w, b, a.b[n])
+    if g == syntax.E_TUPLE || g == syntax.E_ARRAY || g == syntax.E_MAP:
+        []u32 xs = a.list(a.b[n])
+        if g == syntax.E_MAP && #len(xs) == 0: return false
+        for x in xs:
+            if a.tag[x] == syntax.E_ENTRY:
+                if !undetermined(w, b, a.a[x]) || !undetermined(w, b, a.b[x]): return false
+            else if !undetermined(w, b, x): return false
+        return true
+    return false
+
+// Whether `n` holds a string literal anywhere a literal's type could come from.
+bool holds_str(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u8 g = a.tag[n]
+    if g == syntax.E_STR: return true
+    if g == syntax.E_UNARY: return holds_str(w, b, a.a[n])
+    if g == syntax.E_BINARY: return holds_str(w, b, a.a[n]) || holds_str(w, b, a.b[n])
+    if g == syntax.E_TUPLE || g == syntax.E_ARRAY || g == syntax.E_MAP:
+        for x in a.list(a.b[n]):
+            if a.tag[x] == syntax.E_ENTRY:
+                if holds_str(w, b, a.a[x]) || holds_str(w, b, a.b[x]): return true
+            else if holds_str(w, b, x): return true
+    return false

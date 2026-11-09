@@ -1,0 +1,714 @@
+// Runs: fixed arrays (uniform tuples), `[]T`, `ref []T`, `string8` and a
+// scalar as a run of one. `run_shape` answers what can be indexed, windowed,
+// measured and walked; the growth verbs live in `call.dado`.
+package check
+
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+const u8 RK_NONE = 0
+const u8 RK_FIXED = 1
+const u8 RK_SLICE = 2
+const u8 RK_REF = 3
+const u8 RK_TEXT = 4
+const u8 RK_ONE = 5
+const u8 RK_PTR = 6
+
+type Run:
+    u8 kind
+    u32 elem
+    i64 count
+
+Run run_shape(^World w, u32 ty):
+    u32 r = w.t.resolve(ty)
+    if r == NONE: return Run(RK_NONE, NONE, 0)
+    if types.is_text(r): return Run(RK_TEXT, u32(types.text_unit(r)), -1)
+    u8 g = w.t.tag[r]
+    if g == types.T_SOA: return run_shape(w, w.t.a[r])
+    if g == types.T_DISTINCT: return run_shape(w, w.t.b[r])
+    if g == types.T_SLICE: return Run(RK_SLICE, w.t.a[r], -1)
+    if g == types.T_PTR: return Run(RK_PTR, w.t.a[r], -1)
+    if g == types.T_REF:
+        u32 s = w.t.resolve(w.t.a[r])
+        if s != NONE && w.t.tag[s] == types.T_SLICE: return Run(RK_REF, w.t.a[s], -1)
+        return Run(RK_NONE, NONE, 0)
+    u32 e = NONE
+    i64 n = 0
+    if w.t.uniform(r, &e, &n): return Run(RK_FIXED, e, n)
+    if g == types.T_PRIM && r != u32(types.P_VOID): return Run(RK_ONE, r, 1)
+    return Run(RK_NONE, NONE, 0)
+
+// A `ref T` or `ref []T`.
+bool is_handle(^World w, u32 ty):
+    u32 r = w.t.resolve(ty)
+    return r != NONE && w.t.tag[r] == types.T_REF
+
+// A `ref T` of one `T` (not a run).
+bool one_ref(^World w, u32 r):
+    if w.t.tag[r] != types.T_REF: return false
+    u32 s = w.t.resolve(w.t.a[r])
+    return s == NONE || w.t.tag[s] != types.T_SLICE
+
+// The `ref []T` of slice type `s`, and the view it lends.
+bool is_ref(^World w, u32 ty):
+    return run_shape(w, ty).kind == RK_REF
+
+// How many slots a shape holds, through nested tuples.
+i64 leaves(^World w, u32 ty):
+    u32 r = w.t.resolve(ty)
+    if r == NONE || w.t.tag[r] != types.T_TUPLE: return 1
+    u32 e = NONE
+    i64 n = 0
+    if w.t.uniform(r, &e, &n): return n * leaves(w, e)
+    i64 s = 0
+    for x in w.t.list(r):
+        s += leaves(w, x)
+    return s
+
+// `[N]T`: a tuple of N `T`s, `[1]T` its element (A2).
+u32 array_type(^World w, u32 f, u32 n):
+    syntax.Ast a = w.p.files[f].a
+    u32 e = resolve_type(w, f, a.b[n])
+    u32 ln = a.a[n]
+    if e == NONE || flex_beside(w, f, a.b[n], e): return NONE
+    i64 count = 0
+    u8 bk = 0
+    u32 x = bound(w, w.p.sym(f, n if a.main[n] != NONE else ln), &bk) if a.main[n] != NONE || ln != NONE && a.tag[ln] == syntax.E_NAME else NONE
+    if a.main[n] != NONE && x == NONE:
+        arity_here(w, f, a.main[n])
+        return NONE
+    if x != NONE && bk == BK_LEN: count = i64(w.t.a[x])
+    else if ln != NONE && a.tag[ln] == syntax.E_NAME && w.p.spell(f, ln) == "_":
+        say(w, f, 0, a.lo[ln], a.hi[ln], 1022, "`[_]T` is C's flexible array member, which has one place: the last member of a transparent `foreign` struct\x1fAn array whose length is in neither the type nor the value has one place in C, the last member of a struct, and in Dado it is a transparent `foreign` struct's, because the length that is missing is one the header's own allocator supplied\x1ewrite the count if this shape has one, or `[]T` for a window that carries its length", "")
+        return NONE
+    else if ln != NONE && (a.tag[ln] == syntax.E_NAME || a.tag[ln] == syntax.E_FIELD && a.a[ln] != NONE && a.tag[a.a[ln]] == syntax.E_NAME):
+        u32 d = lookup(w, w.p.files[f].pkg, w.p.sym(f, ln)) if a.tag[ln] == syntax.E_NAME else imported_decl(w, f, a.a[ln], ln)
+        u32 c = NONE
+        if d != NONE && w.decls[d].kind == K_CONST && resolve(w, d) != NONE: c = w.decls[d].value
+        i64 k = #len(w.lconst) if a.tag[ln] == syntax.E_NAME else 0
+        for k > 0:
+            k -= 1
+            if u32(w.lconst[k] >> 32) == w.p.sym(f, ln):
+                c = u32(w.lconst[k] & 0xFFFFFFFF)
+                break
+        if c == NONE || w.k.kind[c] != types.C_INT:
+            say(w, f, 0, a.lo[ln], a.hi[ln], 502, "an array length is a compile-time integer — a literal, a `const` naming one, or a `#` intrinsic that folds, such as `#LEN`\x1f`[N]T` is an N-tuple, so the length is part of the type and is known before the program runs. Arithmetic is not folded here\x1ebind the arithmetic to a `const` and write the name", "")
+            return NONE
+        count = i64(w.k.w0[c])
+    else if ln != NONE && a.tag[ln] == syntax.E_CALL && a.tag[a.list(a.b[ln])[0]] == syntax.E_NAME && w.p.spell(f, a.list(a.b[ln])[0]) == "#LEN":
+        count = folded_len(w, f, ln)
+        if count < 0: return NONE
+    else if ln != NONE && a.tag[ln] != syntax.E_INT && !(a.tag[ln] == syntax.E_CALL && a.tag[a.list(a.b[ln])[0]] == syntax.E_NAME && (w.p.spell(f, a.list(a.b[ln])[0]) == "#size" || w.p.spell(f, a.list(a.b[ln])[0]) == "#alignof")):
+        say(w, f, 0, a.lo[ln], a.hi[ln], 502, "an array length is a compile-time integer — a literal, a `const` naming one, or a `#` intrinsic that folds, such as `#LEN`\x1f`[N]T` is an N-tuple, so the length is part of the type and is known before the program runs. Arithmetic is not folded here\x1ebind the arithmetic to a `const` and write the name", "")
+        return NONE
+    else if ln != NONE && a.tag[ln] == syntax.E_CALL && w.p.spell(f, a.list(a.b[ln])[0]) == "#size":
+        say(w, f, 0, a.lo[ln], a.hi[ln], 502, "an array length is part of the type, and a size is not a number this compiler has", "a run whose length is C's number is one C sizes: write `#make([]u8, #size(T))`, whose count is an ordinary expression", "`[N]T` is an N-tuple, and every slot of it is a field of a C struct this compiler writes. Dado owns the layout of the types Dado invents and C owns the layout of the types C invents, so a size is what the **C** compiler produces out of the emitted `sizeof(…)`: it is available anywhere C accepts a constant expression and nowhere in the phase that decides what `[N]T` is. Neither is binding it to a `const` the way `[10 * 100]T` would — that folds no earlier")
+        return NONE
+    else if ln != NONE && a.tag[ln] == syntax.E_CALL && w.p.spell(f, a.list(a.b[ln])[0]) == "#alignof":
+        say(w, f, 0, a.lo[ln], a.hi[ln], 502, "an array length is part of the type, and an alignment is not a number this compiler has", "a run whose length is C's number is one C sizes: write `#make([]u8, #alignof(T))`, whose count is an ordinary expression", "`[N]T` is an N-tuple, and every slot of it is a field of a C struct this compiler writes. Dado owns the layout of the types Dado invents and C owns the layout of the types C invents, so an alignment is what the **C** compiler produces out of the emitted `_Alignof(…)`: it is available anywhere C accepts a constant expression and nowhere in the phase that decides what `[N]T` is. Neither is binding it to a `const` the way `[10 * 100]T` would — that folds no earlier")
+        return NONE
+    else if ln == NONE || a.tag[ln] != syntax.E_INT || a.b[ln] != 0 || a.tag[ln] == syntax.E_NAME:
+        say(w, f, 0, a.lo[n], a.hi[n], 1, "this type is outside the slice the port builds so far", "")
+        return NONE
+    else: count = i64(a.a[ln])
+    if count > 1048576 && x != NONE:
+        say(w, f, 0, a.lo[n], a.hi[n], 526, index.hold(#format("this shape holds ", count * leaves(w, e), " slots, and 1048576 is the most one shape may have")), "hold the big part behind a pointer, or split it across a call")
+        return NONE
+    if count > 1048576:
+        say(w, f, 0, a.lo[ln], a.hi[ln], 526, index.hold(#format("array length ", count, " is not a count a tuple can have: `[N]T` is an N-tuple, so a length is a slot count, and a slot count runs from zero to 1048576")), "")
+        return NONE
+    if count == 1: return e
+    i64 slots = count * leaves(w, e)
+    if slots > 1048576:
+        say(w, f, 0, a.lo[n], a.hi[n], 526, index.hold(#format("this shape holds ", slots, " slots, and 1048576 is the most one shape may have")), "hold the big part behind a pointer, or split it across a call")
+        return NONE
+    ref []u32 xs
+    for _ in 0..<count:
+        xs = #append(xs, e)
+    u32 t = w.t.tuple(xs)
+    #delete(xs)
+    return t
+
+// A run's length as an `i64` operand.
+u32 length(^World w, ^Body b, u32 p, Run k, u32 n):
+    if k.kind == RK_FIXED || k.kind == RK_ONE: return ir.konst(w.k.small(&w.t, k.count))
+    u32 t = temp(w, b, u32(types.P_I64), n)
+    _ = ir.op(&b.f, ir.O_INTRINSIC, B_LEN, u32(types.P_I64), n, t, NONE)
+    ir.arg(&b.f, p)
+    return t
+
+// An index or bound: an integer, as an `i64` operand; NONE when reported.
+u32 position(^World w, ^Body b, u32 n, string8 what = "an index"):
+    Val v = expr(w, b, n, u32(types.P_I64))
+    if v.ty == NONE: return NONE
+    if v.kind == V_FLIT:
+        err(w, b, n, 504, index.hold(#format(what, " is an integer; this is f64")))
+        return NONE
+    if v.kind == V_LIT: v = coerce(w, b, v, u32(types.P_I64), n)
+    if v.ty == NONE: return NONE
+    if !is_int(w, v.ty) || tagged(w, v.ty) || int_prim(w, v.ty) == types.PRIMS || types.PRIM[int_prim(w, v.ty)].kind == types.K_CHAR:
+        err(w, b, n, 504, index.hold(#format(what, " is an integer; this is ", shown(w, v.ty))))
+        return NONE
+    return v.opd
+
+// `xs[i]`: a slot of a tuple by a constant, else a checked position.
+Val index_(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    bool past = b.addressing
+    bool writing = b.writing
+    b.addressing = false
+    b.writing = writing && a.tag[a.a[n]] == syntax.E_INDEX
+    u32 fa = b.flexat
+    b.flexat = a.a[n] + 1
+    Val base = through(w, b, expr(w, b, a.a[n], NONE), a.a[n])
+    b.flexat = fa
+    b.writing = false
+    if base.ty == NONE: return base
+    if b.flexhit == a.a[n] + 1 && a.main[n] == NONE:
+        err(w, b, n, 1022, index.hold(#format("`", b.flexname, "` is a flexible array member, so there is no extent for this position to be inside of\x1fThe count is in neither the type nor the value, and C's own declaration does not carry it either\x1ewrite `#no_bounds` in front of the index to say the count is yours to know, or cut a window that states it once — `[a..<b]` is a `[]", named(w, w.t.a[w.t.resolve(base.ty)]), "`")))
+        return bad()
+    bool waived = a.main[n] != NONE && marker_ok(w, b, a.main[n], "an index")
+    if is_map(w, base.ty) && waived: err(w, b, n, 815, "`#no_bounds` waives a subscript's bounds check, and a map has none to waive: `m[k]` is **total**\x1fRead, it answers `(V, bool)` — the value and whether the key was there — so an absent key is an answer and not a failure; written to, it inserts the value's zero for a key that is absent. A key is a value being asked about rather than a position in a run, so there is no bound for an index to be outside of", "drop `#no_bounds`")
+    if is_map(w, base.ty): return map_index(w, b, n, base, writing)
+    // A flexible member or extern array: a pointer whose extent C keeps.
+    if waived && b.flexhit != a.a[n] + 1:
+        Run wk = run_shape(w, base.ty)
+        if wk.kind == RK_ONE || wk.kind == RK_PTR || wk.kind == RK_NONE && !is_map(w, base.ty) && w.t.tag[under(&w.t, base.ty)] != types.T_TUPLE:
+            string8 rem = "drop the waiver: the position is `0`"
+            if wk.kind == RK_PTR && w.t.resolve(base.ty) != u32(types.P_RAWPTR): rem = "take the window you mean first — `p[0..<n]` is a `[]T`, the form that carries a length for a position to be inside of"
+            err(w, b, n, 815, index.hold(#format("`#no_bounds` waives a subscript's bounds check, and `", shown(w, base.ty), "` has one position — `0` — so there is no bound here to be loose about\x1fThe check is not a guard around this access, it is what the access *means*: without it `[k]` on a one-slot shape is position `0` for every `k`, which is not a faster program, it is a different one")), rem)
+    bool cp = b.cpath || top_const(w, base.ty) && run_shape(w, base.ty).kind != RK_PTR
+    Val v = index_in(w, b, n, base, past, writing)
+    b.cpath = cp
+    return v
+
+// The `#` name in front of a checked operand (token `m`): whether it waives
+// the check; ERR0417 when it is not one that goes there.
+bool marker_ok(^World w, ^Body b, u32 m, string8 what):
+    string8 s = w.p.files[b.file].src[i64(w.p.files[b.file].t.start[m])..<i64(w.p.files[b.file].t.end[m])]
+    u32 lo = w.p.files[b.file].t.start[m]
+    u32 hi = w.p.files[b.file].t.end[m]
+    i64 r = builtin(s)
+    if r < 0:
+        say(w, b.file, b.base, lo, hi, 417, index.hold(#format("`", s, "` is written in front of ", what, ", and the `#` namespace is the compiler's and is closed\x1fA name written here is one the compiler owns rather than one a program or a build may supply")), "write one of the names that may stand in front of a checked operand: #no_bounds")
+        return false
+    u8 p = BUILTINS[r].position
+    if p == POS_MARKER: return true
+    string8 goes = "where a value goes"
+    if p == POS_CALL: goes = "with its arguments, as a call"
+    if p == POS_SPLAT: goes = "with its argument as the operand of `..`, `f(..#slots(v))`"
+    if p == POS_PREDICATE: goes = "inside a template header's `where`, with the type it asks about"
+    if p == POS_TYPE: goes = "where a type is written, in front of the type it qualifies"
+    if p == POS_PACK: goes = "after a parameter's `..`, where the element type goes"
+    say(w, b.file, b.base, lo, hi, 417, index.hold(#format("`", s, "` is a name the compiler owns and it is written ", goes, "; this is in front of ", what, ", where the names that may be written are: #no_bounds")), "")
+    return false
+
+Val index_in(^World w, ^Body b, u32 n, Val base, bool past, bool writing):
+    syntax.Ast a = tree(w, b)
+    if base.kind == V_LIT: base = finish(w, b, base, a.a[n])
+    u32 i = a.b[n]
+    u32 r = w.t.resolve(base.ty)
+    if r != NONE && w.t.tag[r] == types.T_DISTINCT: r = under(&w.t, base.ty)
+    Run k = run_shape(w, base.ty)
+    if k.kind == RK_NONE && r != NONE: k = run_shape(w, r)
+    if b.vslot != 0 && a.tag[a.a[n]] == syntax.E_NAME && a.tag[i] == syntax.E_INT && a.b[i] == 0 && !(b.decl in w.pmeasured) && find_local(w, b, w.p.sym(b.file, a.a[n]), false) == b.vslot - 1:
+        u64 have = 0
+        if b.decl in w.preach:
+            try have = w.preach[b.decl] else: pass
+        if u64(a.a[i]) + 1 > have >> 32: w.preach[b.decl] = ((u64(a.a[i]) + 1) << 32) | u64(n)
+    if a.tag[i] == syntax.E_INT && a.b[i] == 0 && r != NONE && (w.t.tag[r] == types.T_TUPLE || k.kind == RK_ONE || w.t.tag[r] == types.T_TRAIT) && one_row(&w.t, base.ty) == NONE:
+        u32 at = a.a[i]
+        if (k.kind == RK_ONE || w.t.tag[r] == types.T_TRAIT) && at == 0: return one_elem(w, base)
+        []u32 slots = w.t.list(r)
+        if w.t.tag[r] == types.T_TUPLE && at < u32(#len(slots)):
+            u32 p = spill(w, b, base, n)
+            return value(ir.step(&b.f, p, ir.ST_FIELD, at, slots[at]), slots[at])
+    u32 at0 = ir.count(&b.f)
+    u32 x = NONE
+    if r != NONE && w.t.tag[r] == types.T_TUPLE && (k.kind == RK_FIXED || k.kind == RK_NONE):
+        x = position(w, b, i)
+        if x == NONE: return bad()
+        u32 c = folded(w, b, at0, x)
+        []u32 sl = w.t.list(r)
+        i64 cnt = #len(sl)
+        u32 fp = fpos_refused(w, base.ty) if c == NONE else NONE
+        if fp != NONE:
+            err(w, b, n, 504, index.hold(#format(shown(w, base.ty), " names its slots, because the header did, so a computed index has no spelling\x1fC reaches the slots by name\x1ewrite a position — `v[0]` — or bind through ", shown(w, fp), " first")))
+            return bad()
+        if c != NONE && (i64(w.k.w0[c]) < 0 || i64(w.k.w0[c]) >= cnt):
+            err(w, b, i, 519, index.hold(#format(shown(w, base.ty), " has ", cnt, " slot(s), so there is no slot ", i64(w.k.w0[c]))))
+            return bad()
+    if writing && k.kind == RK_TEXT:
+        err(w, b, n, 606, "a string is immutable, so a unit of one is not something to write to\x1fIts bytes are a `const char *` and it may share them with every other string of the same literal. A window over an **array** is a `[]char8` and writes through, where a window over a `string8` is another `string8`\x1ehold the text in a `[N]char8` and take a window over that")
+        return bad()
+    if k.kind == RK_NONE && r != NONE && w.t.tag[r] == types.T_TUPLE:
+        err(w, b, n, 504, index.hold(#format(shown(w, base.ty), " has slots of more than one type, so an index it does not know cannot have one result type (A5); write the position you mean")))
+        return bad()
+    if k.kind == RK_NONE:
+        err(w, b, n, 1, "this index is outside the slice the port builds so far")
+        return bad()
+    if x == NONE:
+        bool pin = b.pin
+        b.pin = false
+        if k.kind != RK_FIXED && k.kind != RK_ONE && calls_in(w, b, i): base = pinned(w, b, base, NONE, n)
+        x = position(w, b, i)
+        b.pin = pin
+    if x == NONE: return bad()
+    if b.pin: x = pinned(w, b, value(x, u32(types.P_I64)), NONE, i).opd
+    u32 p = spill(w, b, base, n)
+    if k.kind != RK_PTR && a.main[n] == NONE:
+        u32 len = length(w, b, p, k, n)
+        if past:
+            u32 t = temp(w, b, u32(types.P_I64), n)
+            _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, u32(types.P_I64), n, t, len, ir.konst(w.k.small(&w.t, 1)))
+            len = t
+        _ = ir.op(&b.f, ir.O_CHECK, ir.CK_BOUNDS, NONE, a.a[n], NONE, x, len)
+        ir.arg(&b.f, p)
+    if k.kind == RK_ONE: return one_elem(w, value(p, base.ty))
+    return value(ir.step(&b.f, p, ir.ST_INDEX, x, k.elem), k.elem)
+
+// Slot 0 of a run of one: a name for `[1]T` (`type Slots: [1]rawptr`) is the
+// array, and its element is `T` (Rust's); a `distinct` keeps its tag.
+private Val one_elem(^World w, Val v):
+    if v.ty == NONE || w.t.tag[v.ty] != types.T_NAMED: return v
+    u32 r = w.t.resolve(v.ty)
+    if r == NONE || w.t.tag[r] != types.T_PRIM || v.ty in w.t.ftag: return v
+    Val o = v
+    o.ty = r
+    return o
+
+// `xs[lo..<hi]`, `xs[:]`: a view, `string8` over text.
+Val window(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    u32 rt = ks[0]
+    for a.tag[rt] == syntax.E_INDEX:
+        rt = a.a[rt]
+    u32 cd = bare(w, b.file, rt) if a.tag[rt] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, rt), false) == NONE else NONE
+    if cd != NONE && w.decls[cd].kind == K_CONST && run_shape(w, resolve(w, cd)).kind == RK_FIXED: b.cglob = rt
+    b.cpath = false
+    u32 fa = b.flexat
+    b.flexat = ks[0] + 1
+    Val base = through(w, b, expr(w, b, ks[0], NONE), ks[0])
+    b.flexat = fa
+    b.cglob = NONE
+    if base.ty == NONE: return base
+    if b.flexhit == ks[0] + 1 && ks[2] == NONE:
+        err(w, b, n, 1022, index.hold(#format("a window over `", b.flexname, "` writes its far end, because a flexible array member has no extent to go to\x1fThe end nobody writes means *as far as the base goes*, and a flexible array member is the one base with none\x1ewrite `", b.flexname, "[a..<b]`: the length is stated once, here, and every subscript of the `[]", named(w, w.t.a[w.t.resolve(base.ty)]), "` it gives back is checked against it")))
+        return bad()
+    u32 sw = soa_whole(w, &b.f, base.opd) if base.kind == V_VAL else NONE
+    if sw != NONE:
+        err(w, b, n, 522, index.hold(#format("`", shown(w, sw), "` holds one run per slot, so the positions of one `", shown(w, base.ty), "` are each in a run of their own and a window has no run to view")), "write a position — `s[i][k]` is the place lane `k` holds — or bind the element, which copies it out, and window that", "A window is one run of memory, and an element of this layout is one value in each lane")
+        return bad()
+    Run k = run_shape(w, base.ty)
+    if b.cpath || top_const(w, base.ty) && k.kind != RK_PTR: k.elem = w.t.qual(1, k.elem)
+    u32 one = one_run(w, b, ks[0])
+    if one != NONE: k = Run(RK_FIXED, base.ty, 1)
+    if w.t.resolve(base.ty) == u32(types.P_RAWPTR):
+        err(w, b, ks[0], 504, "a `rawptr` has no element type, so there is nothing for a window over it to be a window of. Say what the bytes are first — the conversion is free: `type Bytes: ^u8`, then `Bytes p = Bytes(block)` and `p[0..<n]`")
+        return bad()
+    if k.kind == RK_PTR && ks[2] == NONE:
+        err(w, b, n, 504, index.hold(#format(shown(w, final_ty(w, base)), " carries no extent, so a window over it is written with an end — `p[..<n]`, or `p[a..<n]` to start further in. `[:]` asks for the whole of a run whose length a pointer never said")))
+        return bad()
+    if k.kind == RK_PTR:
+        u32 od = decl_of(w, w.t.bare(k.elem))
+        u32 orr = w.t.resolve(k.elem)
+        if od == NONE && orr != NONE && w.t.tag[orr] == types.T_OPAQUE:
+            for i in 0..<#len(w.decls):
+                if w.decls[i].kind == K_FTYPE && name_of(w, w.decls[i].name) == w.t.text(w.t.a[orr]): od = u32(i)
+        if od != NONE && w.decls[od].kind == K_FTYPE && (w.p.files[w.decls[od].file].a.b[w.decls[od].node] & syntax.F_INCOMPLETE) != 0:
+            string8 on = name_of(w, w.decls[od].name)
+            err(w, b, ks[0], 1002, index.hold(#format("`", on, "` is declared `@incomplete`, so a window's element holding one by value has nothing to hold", "\x1fThe C header names it and never says what is inside, and C refuses a value of one too")), index.hold(#format("hold it behind `^", on, "`, which is what a C library hands you anyway; if the header does define it, drop the `@incomplete`")))
+            return bad()
+    u32 fwr = fwin_refused(w, base.ty)
+    if fwr != NONE:
+        err(w, b, n, 504, index.hold(#format(shown(w, base.ty), " names its slots, because the header did, so a window over them has no spelling\x1fC holds them as members of their own, and a window is one run of them in memory\x1ewrite a position — `v[0]` — or take a window over a copy held as ", shown(w, fwr))))
+        return bad()
+    if k.kind == RK_NONE && w.t.tag[under(&w.t, base.ty)] == types.T_TUPLE:
+        err(w, b, ks[0], 504, index.hold(#format(shown(w, base.ty), " has slots of more than one type, so a window over a run of them has no one element type (A5); a slice's elements are all one type")))
+        return bad()
+    if k.kind == RK_NONE || k.kind == RK_ONE:
+        err(w, b, ks[0], 504, index.hold(#format("slicing windows a run of elements, and ", shown(w, final_ty(w, base)), " is not one\x1fA fixed array `[N]T`, a `[]T` and a `^T` are what can be sliced — and `[1]T` is **not** among them, because a one-slot tuple is its element, so a `[1]T` is a `T` and was never a run")), one_help(w, final_ty(w, base)))
+        return bad()
+    bool incl = a.main[n] != NONE && spell(w, b, n) == "..="
+    if a.main[n] != NONE && spell(w, b, n) == "..":
+        err(w, b, n, 607, "`..` splices an argument list (A4); a slice's bounds are written with `..<` or `..=`, and `v[:]` is how the whole of it is written")
+        return bad()
+    if k.kind == RK_FIXED && one == NONE && a.tag[ks[0]] == syntax.E_CALL:
+        err(w, b, ks[0], 606, "slicing windows storage that already exists, so it takes a place — a name, a slot of one, or a position in one. A value with no place has no region to window: bind it to a name first\x1fa value with no place where a place is needed — an assignment, an address, a `^self` receiver or a trait value (what is assigned to, addressed, written through `^self` or viewed by a trait value is a place — a name, a slot of one, or a position in one — and a temporary or a constant is none)", "", "a value with no place where a place is needed — an assignment, an address, a `^self` receiver or a trait value (what is assigned to, addressed, written through `^self` or viewed by a trait value is a place — a name, a slot of one, or a position in one — and a temporary or a constant is none)")
+        return bad()
+    if one != NONE:
+        for x in ks[1..<3]:
+            if x != NONE && a.tag[x] != syntax.E_INT:
+                string8 nm = spell(w, b, ks[0])
+                err(w, b, n, 504, index.hold(#format("`", nm, "` is declared `[1]", shown(w, base.ty), "`, a run of one, so its window is bounded by numbers; this bound is known only when the program runs")), index.hold(#format("write `", nm, "[:]` for the run of one, or a numbered bound such as `", nm, "[0..<1]`")))
+                return bad()
+    u32 lo = NONE
+    u32 hi = NONE
+    u32 at0 = ir.count(&b.f)
+    if (k.kind == RK_SLICE || k.kind == RK_TEXT || k.kind == RK_PTR) && (calls_in(w, b, ks[1]) || calls_in(w, b, ks[2])): base = pinned(w, b, base, NONE, n)
+    if ks[1] != NONE: lo = position(w, b, ks[1], "a bound")
+    if lo != NONE && ks[2] != NONE: lo = pinned(w, b, value(lo, u32(types.P_I64)), ks[2], ks[1]).opd
+    if ks[2] != NONE: hi = position(w, b, ks[2], "a bound")
+    if (ks[1] != NONE && lo == NONE) || (ks[2] != NONE && hi == NONE): return bad()
+    if k.kind == RK_FIXED && one == NONE:
+        u32 cl = folded(w, b, at0, lo)
+        u32 ch = folded(w, b, at0, hi)
+        if (lo == NONE || cl != NONE) || (hi == NONE || ch != NONE):
+            i64 l = i64(w.k.w0[cl]) if cl != NONE else 0
+            i64 h = k.count
+            if ch != NONE: h = i64(w.k.w0[ch]) + (1 if incl else 0)
+            if l < 0 || h > k.count || l > h:
+                err(w, b, n, 521, index.hold(#format(shown(w, base.ty), " has ", k.count, " slot(s), so `", l, "` to `", h, "` is not a run of them (A5): a window starts at a position that exists and ends at or before the end")))
+                return bad()
+    if incl && hi != NONE:
+        u32 h = temp(w, b, u32(types.P_I64), n)
+        _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, u32(types.P_I64), n, h, hi, ir.konst(w.k.small(&w.t, 1)))
+        hi = h
+    u32 ty = text_of(k.elem) if k.kind == RK_TEXT else w.t.slice_of(k.elem)
+    u32 p = spill(w, b, base, n)
+    if one != NONE: b.f.slot_flags[one] = b.f.slot_flags[one] | ir.S_ADDR_TAKEN
+    u32 t = temp(w, b, ty, n)
+    _ = ir.op(&b.f, ir.O_VIEW, 0, ty, n, t, p, lo, hi)
+    if one != NONE: ir.arg(&b.f, ir.konst(w.k.small(&w.t, 1)))
+    return value(t, ty)
+
+// A `^[N]T` is reached through to its array.
+private Val through(^World w, ^Body b, Val v, u32 n):
+    Run k = run_shape(w, v.ty)
+    u32 r = w.t.resolve(v.ty)
+    // `ref([N]T)`: one object, read through.
+    if v.kind == V_VAL && r != NONE && one_ref(w, r) && run_shape(w, w.t.a[r]).kind == RK_FIXED: return value(ir.step(&b.f, spill(w, b, v, n), ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
+    if v.kind != V_VAL || k.kind != RK_PTR || run_shape(w, k.elem).kind != RK_FIXED: return v
+    return value(ir.step(&b.f, spill(w, b, v, n), ir.ST_DEREF, 0, k.elem), k.elem)
+
+// `p^`: the place a pointer points at.
+Val deref(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    // `self^` of a `^self` receiver: `self` already reads as what it points at.
+    if a.tag[a.a[n]] == syntax.E_NAME && !b.ds:
+        u32 sl = find_local(w, b, w.p.sym(b.file, a.a[n]), false)
+        if sl != NONE && (b.f.slot_flags[sl] & ir.S_RECEIVER) != 0 && b.f.slot_ty[sl] != NONE && w.t.tag[b.f.slot_ty[sl]] == types.T_PTR: return expr(w, b, a.a[n], NONE)
+    Val v = expr(w, b, a.a[n], NONE)
+    if v.ty == NONE: return v
+    v = finish(w, b, v, a.a[n])
+    u32 r = w.t.resolve(v.ty)
+    b.cpath = false
+    if r != NONE && one_ref(w, r): return value(ir.step(&b.f, spill(w, b, v, n), ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
+    if r == NONE || w.t.tag[r] != types.T_PTR:
+        string8 m = "`rawptr` has no pointee, so there is nothing for `^` to read; convert it to a `^T` first" if r == u32(types.P_RAWPTR) else index.hold(#format("`^` reads through a pointer; this is ", shown(w, v.ty)))
+        err(w, b, n, 607, m, xor_meant(w, b, n, v.ty))
+        return bad()
+    return value(ir.step(&b.f, spill(w, b, v, n), ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
+
+// `x ^ y` meant as C's exclusive or.
+private string8 xor_meant(^World w, ^Body b, u32 n, u32 ty):
+    if !is_int(w, ty): return ""
+    syntax.Ast a = tree(w, b)
+    string8 src = w.p.files[b.file].src
+    string8 lhs = strings.trim(strings.trim_suffix(src[i64(a.lo[n])..<i64(a.hi[n])], "^"))
+    string8 rest = src[i64(a.hi[n])..<#len(src)]
+    i64 nl = strings.index_of(rest, '\n')
+    string8 line = strings.trim(rest[0..<nl] if nl >= 0 else rest)
+    string8 why = "`~` is Dado's exclusive or, and `^` is only ever the pointer's"
+    if #len(line) > 0 && line[0] == '=' && (#len(line) == 1 || line[1] != '='):
+        string8 rhs = strings.trim(line[1..<#len(line)])
+        bool simple = true
+        for c in rhs:
+            if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'): simple = false
+        string8 r = rhs if simple else index.hold(#format("(", rhs, ")"))
+        return index.hold(#format(why, ": write `", lhs, " = ", lhs, " ~ ", r, "`"))
+    if #len(line) == 0: return ""
+    char8 c = line[0]
+    if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '(': return index.hold(#format(why, ": write `", lhs, " ~ ", line, "`"))
+    return ""
+
+// `&x`: the address of a place; a unit of text has none.
+Val address(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    u32 x = a.a[n]
+    if a.tag[x] == syntax.E_INDEX:
+        Val base = expr(w, b, a.a[x], NONE)
+        if base.ty != NONE && types.is_text(w.t.resolve(base.ty)):
+            err(w, b, n, 606, "a string is immutable, so a unit of one has no address to hand out\x1fA `^char8` would be a way to write to it, and its bytes are a `const char *` that may be shared with every other string of the same literal\x1eread the byte (`s[i]`) into a name, or hold the text in a `[N]char8` and take the address of a position in that")
+            return bad()
+    u32 ls = find_local(w, b, w.p.sym(b.file, x), false) if a.tag[x] == syntax.E_NAME else NONE
+    u32 cd = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, x)) if a.tag[x] == syntax.E_NAME && ls == NONE else NONE
+    if ls != NONE && (b.f.slot_flags[ls] & ir.S_CONST) != 0: cd = NONE
+    if ls != NONE && (b.f.slot_flags[ls] & ir.S_CONST) != 0 || a.tag[x] != syntax.E_NAME && a.tag[x] != syntax.E_FIELD && a.tag[x] != syntax.E_INDEX && a.tag[x] != syntax.E_DEREF || cd != NONE && (w.decls[cd].kind == K_CONST || w.decls[cd].kind == K_FCONST):
+        err(w, b, x, 606, "`&` takes the address of a place — a name, a slot of one, or a position in one; a value with no place has no address")
+        return bad()
+    if a.tag[x] == syntax.E_FIELD && a.tag[a.a[x]] == syntax.E_NAME && find_local(w, b, w.p.sym(b.file, a.a[x]), false) == NONE:
+        u32 ed = lookup(w, w.p.files[b.file].pkg, w.p.sym(b.file, a.a[x]))
+        if ed != NONE && w.decls[ed].kind == K_ENUM:
+            err(w, b, x, 606, "`&` takes the address of a place — a name, a slot of one, or a position in one; a value with no place has no address")
+            return bad()
+    if a.tag[x] == syntax.E_NAME:
+        u32 sl = find_local(w, b, w.p.sym(b.file, x), false)
+        if sl != NONE && copied_self(w, b, sl):
+            err(w, b, n, 615, index.hold(#format("`&` takes the address of `self`, ", COPY_LOST(w, b))), self_help(w, b))
+            return bad()
+    b.addressing = a.tag[x] == syntax.E_INDEX
+    b.projected = false
+    Val v = place(w, b, x, true)
+    b.addressing = false
+    if h_misplaced(w, b, x, "it has no address in Dado"): return bad()
+    if v.ty == NONE: return v
+    if w.t.resolve(w.t.bare(v.ty)) in w.cnl:
+        err(w, b, n, 1025, index.hold(#format("`", shown(w, w.t.bare(v.ty)), "` is a member list the header wrote with a name, and there is no pointer to it that is both its C type and Dado's\x1fC laid the type out and named it nothing, and the type Dado declares to spell it is a second C type, which C never makes compatible with the header's. So `&` has nothing to yield here\x1etake a narrower address, or bind the value and read it by name")))
+        return bad()
+    if b.projected:
+        err(w, b, x, 606, "`&` takes the address of a place — a name, a slot of one, or a position in one; a value with no place has no address")
+        return bad()
+    i64 bw = bits_of(w, &b.f, v.opd)
+    if bw >= 0:
+        err(w, b, n, 1023, index.hold(#format("`", spell(w, b, x), "` is ", bw, " bits inside a storage unit, so there is no object for a `^` to point at")), "read the member into a name and take that name's address, which points at a copy", "C refuses `&` of a bitfield for that reason (C99 §6.5.3.2 ¶1), and so does Dado")
+        return bad()
+    u32 st = soa_whole(w, &b.f, v.opd)
+    if st != NONE:
+        err(w, b, n, 522, index.hold(#format("`", shown(w, st), "` holds one run per slot, so there is no `", shown(w, v.ty), "` anywhere for a `^` to point at")), "take the address of a **slot** — `&s[i].x` is a `^f32` into the run that slot lives in — or bind the element, which copies it out", "An element of it is one value in each of those runs")
+        return bad()
+    string8 em = embedded(w, b, x)
+    if em != "":
+        err(w, b, x, 606, index.hold(#format("`&` takes the address of ", em, ", and there is no `", spell(w, b, x), "` object there to point at", "\x1fEmbedding splices the slots of `Person` into `Badge` at positions of its own, laid out as its members; the member is read and written whole by copying those slots")), embedded_help(w, b, x))
+        return bad()
+    u32 r = b.f.root[v.opd]
+    if (r & ir.ROOT_GLOBAL) == 0: b.f.slot_flags[r] = b.f.slot_flags[r] | ir.S_ADDR_TAKEN
+    u32 pt = w.t.ptr_of(v.ty)
+    u32 t = temp(w, b, pt, n)
+    _ = ir.op(&b.f, ir.O_ADDR, 0, pt, n, t, v.opd)
+    return value(t, pt)
+
+// The slot of a local or parameter written `[1]T`, or NONE.
+private u32 one_run(^World w, ^Body b, u32 n):
+    syntax.Ast a = tree(w, b)
+    if a.tag[n] != syntax.E_NAME: return NONE
+    u32 sl = find_local(w, b, w.p.sym(b.file, n), false)
+    if sl == NONE || (b.f.slot_flags[sl] & ir.S_ONE) == 0: return NONE
+    return sl
+
+// A `[1]T` declaration keeps its run of one for windows.
+bool written_one(^World w, u32 f, u32 tn):
+    syntax.Ast a = w.p.files[f].a
+    if tn == NONE || a.tag[tn] != syntax.T_ARRAY: return false
+    u32 ln = a.a[tn]
+    return ln != NONE && a.tag[ln] == syntax.E_INT && a.a[ln] == 1 && a.b[ln] == 0
+
+// `[a, b, c]`: a fixed array; where a `[]T` is wanted, a view of one in the
+// frame.
+Val array_lit(^World w, ^Body b, u32 n, u32 want):
+    syntax.Ast a = tree(w, b)
+    []u32 ks = a.list(a.b[n])
+    Run k = run_shape(w, want) if want != NONE else Run(RK_NONE, NONE, 0)
+    u32 e = NONE
+    if k.kind == RK_FIXED && k.count == i64(#len(ks)): e = k.elem
+    if k.kind == RK_SLICE: e = k.elem
+    if #len(ks) == 1:
+        Val v = expr(w, b, ks[0], want if k.kind != RK_SLICE else NONE)
+        return v
+    ref []u32 opds
+    bool ok = true
+    bool given = e != NONE
+    ref []Val vs
+    // Typed slots first; untyped numeric literals then adapt to the first.
+    for x in ks:
+        Val v = bad()
+        if given || !numeric_lit(&a, x):
+            v = expr(w, b, x, e if given else NONE)
+            if v.ty == NONE: ok = false
+            else if given && #len(vs) > 0 && vs[0].ty != NONE:
+                // A bool or a string among numbers is no one type, whatever was declared.
+                u32 s0 = sort_of(w, final_ty(w, vs[0]))
+                u32 sx = sort_of(w, final_ty(w, v))
+                if s0 != sx && (s0 == 3 || s0 == 4 || sx == 3 || sx == 4) && s0 < 0x10000 && sx < 0x10000:
+                    err(w, b, x, 504, index.hold(#format("an array is a tuple whose slots are all one type (A5); this is ", shown(w, final_ty(w, v)), " where the first is ", shown(w, final_ty(w, vs[0])))))
+                    return bad()
+            else if !given && v.kind != V_LIT && v.kind != V_FLIT:
+                v = finish(w, b, v, x)
+                if e == NONE: e = v.ty
+                else if w.t.resolve(v.ty) != w.t.resolve(e):
+                    err(w, b, x, 504, index.hold(#format("an array is a tuple whose slots are all one type (A5); this is ", shown(w, v.ty), " where the first is ", shown(w, e))))
+                    return bad()
+        vs = #append(vs, v)
+    for i in 0..<#len(ks):
+        Val v = vs[i]
+        if !given && numeric_lit(&a, ks[i]):
+            v = expr(w, b, ks[i], e if e != NONE && is_num(w, e) else NONE)
+            if v.ty == NONE:
+                ok = false
+                continue
+        if v.ty == NONE: continue
+        if e == NONE:
+            v = finish(w, b, v, ks[i])
+            e = v.ty
+        // A matrix is its shape only whole, not as an element.
+        if v.kind == V_VAL && (matrix(w, v.ty) == NONE) != (matrix(w, e) == NONE): e = v.ty
+        v = coerce(w, b, v, e, ks[i])
+        if v.ty == NONE: ok = false
+        opds = #append(opds, v.opd)
+    if !ok || e == NONE: return bad()
+    ref []u32 tys
+    for _ in ks:
+        tys = #append(tys, e)
+    u32 ty = w.t.tuple(tys)
+    u32 t = temp(w, b, ty, n)
+    _ = ir.op(&b.f, ir.O_MAKE, 0, ty, n, t, NONE)
+    for x in opds:
+        ir.arg(&b.f, x)
+    if k.kind != RK_SLICE: return value(t, ty)
+    u32 st = w.t.slice_of(e)
+    u32 v = temp(w, b, st, n)
+    _ = ir.op(&b.f, ir.O_VIEW, 0, st, n, v, t, NONE, NONE)
+    return value(v, st)
+
+// `for x in xs`, `for x, i in xs`, `for &x in xs`: the length once, then
+// each position of the run as it is now.
+void run_loop(^World w, ^Body b, u32 n, []u32 binds, u32 it):
+    syntax.Ast a = tree(w, b)
+    Val v = expr(w, b, it, NONE)
+    if v.ty == NONE: return
+    if v.kind == V_TYPE:
+        not_a_value(w, b, it, "a `for … in` walks a **value**")
+        return
+    if v.kind == V_LIT: v = finish(w, b, v, it)
+    if is_map(w, v.ty):
+        map_loop(w, b, n, binds, it, v)
+        return
+    if chan_iterated(w, b, it, v.ty): return
+    if #len(binds) > 2:
+        err(w, b, binds[2], 503, "a `for ... in` binds a value and, optionally, an index — and nothing after that")
+        return
+    u32 fwk = fpos_refused(w, v.ty)
+    if fwk != NONE:
+        err(w, b, it, 504, index.hold(#format(shown(w, v.ty), " names its slots, because the header did, so C steps along no array member and a loop has nothing to walk. Bind through ", shown(w, fwk), " first, which is free")))
+        // The body is still checked, its binding undeclared.
+        block(w, b, a.b[n])
+        return
+    Run k = run_shape(w, v.ty)
+    if k.kind == RK_NONE && w.t.tag[under(&w.t, v.ty)] == types.T_TUPLE:
+        err(w, b, it, 504, index.hold(#format(shown(w, v.ty), " has slots of more than one type, so there is no one type for a loop variable to have (A5)")))
+        return
+    if k.kind == RK_NONE:
+        err(w, b, it, 1, "this loop is outside the slice the port builds so far")
+        return
+    u32 p = spill(w, b, v, it)
+    u32 i64t = u32(types.P_I64)
+    u32 bt = u32(types.P_BOOL)
+    u32 i = temp(w, b, i64t, it)
+    _ = ir.op(&b.f, ir.O_SET, 0, i64t, it, i, ir.konst(w.k.small(&w.t, 0)))
+    u32 lp = open(w, b, ir.O_LOOP, n, NONE, true)
+    b.f.b[lp] = p
+    b.f.c[lp] = it
+    if k.kind == RK_REF: _ = ir.op(&b.f, ir.O_CHECK, ir.CK_SENT, NONE, it, NONE, p)
+    u32 len = temp(w, b, i64t, it)
+    _ = ir.op(&b.f, ir.O_SET, 0, i64t, it, len, length(w, b, p, k, it))
+    u32 c = temp(w, b, bt, it)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_GE, bt, it, c, i, len)
+    u32 t = open(w, b, ir.O_IF, it, c, false)
+    _ = ir.op(&b.f, ir.O_BREAK, 0, NONE, it, NONE, 1)
+    close(w, b, t)
+    u32 bl = open(w, b, ir.O_BLOCK, n, NONE, false)
+    scope_in(w, b)
+    u32 x = p if k.kind == RK_ONE else ir.step(&b.f, p, ir.ST_INDEX, i, k.elem)
+    u32 bn = binds[0]
+    if #len(binds) > 1 && a.a[binds[1]] == 1: err_tok(w, b, binds[1], 709, "a loop's **index** may not be bound by address: the loop synthesises it and there is no storage anywhere for it to point at. Write it plainly — `for &v, i in xs` binds the element by address and leaves `i` a count")
+    bool by_addr = a.tag[bn] == syntax.S_BIND && a.a[bn] == 1
+    u32 sw = soa_whole(w, &b.f, p)
+    if by_addr && sw != NONE:
+        err_tok(w, b, bn, 522, index.hold(#format("this walks one `", shown(w, v.ty), "` of `", shown(w, sw), "`, which holds one run per slot, so the element is not in one piece for this loop to hand out `^`s into", "\x1f`for x in s[i]` binds a copy of each position")), "walk it by value and write back through `s[i][k]`, the place lane `k` holds, or take `&s[i][k]` for the one position you mean")
+        by_addr = false
+    if by_addr && is_soa(w, v.ty):
+        err_tok(w, b, bn, 522, index.hold(#format("`", shown(w, v.ty), "` holds one run per slot, so each step of this loop would have to hand out a `", shown(w, w.t.ptr_of(k.elem)), "` pointing at an element that is not in one piece", "\x1f`for p in s` binds a copy gathered out of the lanes")), "walk it by value and write back through `s[i].x`, or take `&s[i].x` for the one slot you mean")
+        by_addr = false
+    if by_addr && k.kind == RK_TEXT:
+        err_tok(w, b, bn, 709, "a string's units may not be bound by address\x1fA string's pointer is `const`, so a `^char8` into one would launder away the `const` and the promise that the emitted C is clean under `-Werror` would stop being true\x1etake a `[]char8` window over storage you own and walk that")
+        by_addr = false
+    if by_addr && k.kind != RK_SLICE && k.kind != RK_REF && a.tag[it] != syntax.E_NAME && a.tag[it] != syntax.E_FIELD && a.tag[it] != syntax.E_INDEX && a.tag[it] != syntax.E_DEREF:
+        err_tok(w, b, bn, 709, "this has no place to take the address of, so `&` on the binding would point into the temporary the value landed in — which C would accept and which no later read could ever see. Bind it to a name first, and walk that")
+        by_addr = false
+    if by_addr:
+        u32 pt = w.t.ptr_of(k.elem)
+        u32 q = temp(w, b, pt, bn)
+        _ = ir.op(&b.f, ir.O_ADDR, 0, pt, bn, q, x)
+        bind(w, b, bn, pt, q)
+    else:
+        _ = chan_bound(w, b, bn, k.elem, index.hold(#format("bind it by address — `for &", spell(w, b, bn), " in …` — which reaches each element where it lives, and `#send`, `#drain` or `#len` through it")))
+        bind(w, b, bn, k.elem, x)
+    if #len(binds) > 1: bind(w, b, binds[1], i64t, i)
+    for j in 0..<#len(b.locals):
+        if b.locals[j].depth == b.depth: b.locals[j].read = true
+    block(w, b, a.b[n])
+    scope_out(w, b)
+    close(w, b, bl)
+    _ = ir.op(&b.f, ir.O_BIN, ir.B_ADD, i64t, it, i, i, ir.konst(w.k.small(&w.t, 1)))
+    close(w, b, lp)
+
+private bool numeric_lit(^syntax.Ast a, u32 x):
+    if a.tag[x] == syntax.E_UNARY && (a.tag[a.a[x]] == syntax.E_INT || a.tag[a.a[x]] == syntax.E_FLOAT): return true
+    return a.tag[x] == syntax.E_INT || a.tag[x] == syntax.E_FLOAT
+
+// ERR0918: a length binder `$N` written outside a signature.
+void arity_here(^World w, u32 f, u32 tok):
+    string8 src = w.p.files[f].src
+    u32 lo = w.p.files[f].t.start[tok]
+    u32 hi = w.p.files[f].t.end[tok]
+    if src[i64(lo)] != '$' && lo > 0 && src[i64(lo) - 1] == '$': lo -= 1
+    for i64(hi) < #len(src) && (src[i64(hi)] == '_' || src[i64(hi)] >= 'a' && src[i64(hi)] <= 'z' || src[i64(hi)] >= 'A' && src[i64(hi)] <= 'Z' || src[i64(hi)] >= '0' && src[i64(hi)] <= '9'):
+        hi += 1
+    say(w, f, 0, lo, hi, 918, index.hold(#format("`", src[i64(lo)..<i64(hi)], "` **declares** an arity, which is inferred from a call's arguments, so it belongs to a signature and not here")), "write the count, or a `const` naming it; if the shape has none, take the value as a parameter and let the call say its count", "There is nothing here for it to be inferred from")
+
+// `#LEN(x)` written as an array length: its count, or -1 (reported).
+private i64 folded_len(^World w, u32 f, u32 n):
+    Body b
+    b.decl = NONE
+    b.file = f
+    b.ret = NONE
+    b.pack = NONE
+    b.pack_name = NONE
+    b.grown = NONE
+    b.f.item = n
+    b.f.file = f
+    b.cwant = NONE
+    if w.body != nil:
+        ^Body ob = ^Body(w.body)
+        if ob.file == f:
+            b.f.free()
+            return lit_count(w, ob, n)
+    i64 c = lit_count(w, &b, n)
+    b.f.free()
+    return c
+
+private i64 lit_count(^World w, ^Body b, u32 n):
+    u32 cw = b.cwant
+    b.cwant = u32(types.P_I64)
+    Val v = expr(w, b, n, u32(types.P_I64))
+    b.cwant = cw
+    if v.ty == NONE: return -1
+    if v.kind == V_LIT: return i64(v.lo)
+    return -1
+
+// `string8`, `string16`, `string32` by name, else `NONE`.
+u32 text_named(string8 s):
+    if s == "string8": return types.STRING8
+    if s == "string16": return types.STRING16
+    if s == "string32": return types.STRING32
+    return NONE
+
+// The string whose unit is `u`.
+u32 text_of(u32 u):
+    if u == u32(types.P_CHAR16): return types.STRING16
+    if u == u32(types.P_CHAR32): return types.STRING32
+    return types.STRING8
+
+// Why a written `string` is no type; each door appends its repair.
+const string8 STRING_KIND_WHY = "`string` is the kind of a string literal and not a type: a `\"…\"` has no width until it is placed"
+
+// `pkg.NAME`: the declaration an import of file `f` named by `q` binds, or NONE.
+u32 imported_decl(^World w, u32 f, u32 q, u32 n):
+    u32 ps = w.p.sym(f, q)
+    for im in w.p.pkgs[w.p.files[f].pkg].imports:
+        if im.file == f && (im.name if im.name != NONE else w.p.pkgs[im.pkg].name) == ps: return lookup(w, im.pkg, w.p.sym(f, n))
+    return NONE

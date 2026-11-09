@@ -1,0 +1,558 @@
+// Checker diagnostics, hover and definition, from the compiler's answers.
+package main
+
+import "core:json"
+import "core:os/fs"
+import "core:strings"
+import "language:syntax"
+
+// ── diagnostics ──
+
+// `lib/geom/geom.dado` as the compiler's file column spells it: `geom/geom.dado`.
+private string8 display_name(string8 path):
+    i64 a = strings.last_index_of(path, '/')
+    if a < 0: return path
+    i64 b = strings.last_index_of(path[0..<a], '/')
+    return path[b + 1..<#len(path)]
+
+private i64 severity_number(string8 w):
+    if w == "error": return 1
+    if w == "warning": return 2
+    if w == "note": return 3
+    if w == "help": return 4
+    return 3
+
+// `--emit=explained`'s lines about this file as protocol diagnostics; a
+// warning with a `WRN` code only when `show` (Rust's `shown`).
+void explained_diagnostics(^json.Writer w, ^Lines ls, string8 out, string8 text, string8 path, bool show):
+    string8 here = display_name(path)
+    u32 limit = u32(#len(text))
+    i64 i = 0
+    for i < #len(out):
+        i64 e = i
+        for e < #len(out) && out[e] != '\n': e += 1
+        string8 line = out[i..<e]
+        i = e + 1
+        ref []string8 f = strings.split(line, "\t")
+        if #len(f) < 7 || f[2] == "program" || f[3] != here:
+            #delete(f)
+            continue
+        i64 dd = strings.find(f[4], "..")
+        if dd < 0:
+            #delete(f)
+            continue
+        u32 lo = u32(digits(f[4][0..<dd]))
+        u32 hi = u32(digits(f[4][dd + 2..<#len(f[4])]))
+        if lo > limit: lo = limit
+        if hi > limit: hi = limit
+        i64 sev = severity_number(f[0])
+        if !show && sev == 2 && strings.starts_with(f[1], "WRN"):
+            #delete(f)
+            continue
+        w.object()
+        w.key("range")
+        range(w, ls, lo, hi)
+        w.key("severity")
+        w.int(sev)
+        w.key("code")
+        w.text(f[1])
+        w.key("source")
+        w.text("dado")
+        w.key("message")
+        ref []char8 m
+        syntax.put(&m, f[6])
+        if #len(f) > 7 && #len(f[7]) > 0:
+            syntax.put(&m, "\nhelp: ")
+            syntax.put(&m, f[7])
+        w.text(m)
+        #delete(m)
+        w.end_object()
+        #delete(f)
+
+// The file-wide error a missing or failing toolchain is reported as.
+void whole_file_error(^json.Writer w, ^Lines ls, string8 message):
+    w.object()
+    w.key("range")
+    range(w, ls, 0, 0)
+    w.key("severity")
+    w.int(1)
+    w.key("source")
+    w.text("dado-lsp")
+    w.key("message")
+    w.text(message)
+    w.end_object()
+
+private i64 digits(string8 s):
+    i64 n = 0
+    for c in s:
+        if c >= '0' && c <= '9': n = n * 10 + i64(u8(c) - u8('0'))
+    return n
+
+// ── positions ──
+
+// The byte `character` UTF-16 units into line `line` (Rust's `offset_of`).
+u32 offset_of(string8 text, i64 line, i64 character):
+    i64 ln = 0
+    i64 i = 0
+    for i < #len(text) && ln < line:
+        if text[i] == '\n': ln += 1
+        i += 1
+    if ln < line: return u32(#len(text))
+    i64 e = i
+    for e < #len(text) && text[e] != '\n': e += 1
+    if e > i && text[e - 1] == '\r': e -= 1
+    i64 units = 0
+    i64 k = i
+    for k < e:
+        if units >= character: return u32(k)
+        u8 b = u8(text[k])
+        i64 len = 1
+        if b >= 0xF0: len = 4
+        else if b >= 0xE0: len = 3
+        else if b >= 0xC0: len = 2
+        units += 2 if len == 4 else 1
+        k += len
+    return u32(e)
+
+// The word under `at`, a sigil it opens included, and where it ends (Rust's `word_around`).
+private string8 word_around(string8 text, u32 at0, ^u32 end_out):
+    i64 at = i64(at0)
+    if at > #len(text): at = #len(text)
+    i64 s = at
+    for s > 0 && name_byte(text[s - 1]): s -= 1
+    i64 e = at
+    if s > 0 && (text[s - 1] == '#' || text[s - 1] == '@') && !(s > 1 && name_byte(text[s - 2])): s -= 1
+    else if s == at && at < #len(text) && (text[at] == '#' || text[at] == '@'): e += 1
+    for e < #len(text) && name_byte(text[e]): e += 1
+    end_out^ = u32(e)
+    return text[s..<e]
+
+private bool name_byte(char8 c):
+    return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+
+// `/a b` as `file:///a%20b`.
+private ref []char8 uri_of(string8 path):
+    ref []char8 o
+    syntax.put(&o, "file://")
+    string8 hex = "0123456789ABCDEF"
+    for c in path:
+        if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_' || c == '~' || c == '/': o = #append(o, c)
+        else:
+            o = #append(o, '%')
+            o = #append(o, hex[i64(u8(c) >> 4)])
+            o = #append(o, hex[i64(u8(c) & 15)])
+    return o
+
+// ── hover ──
+
+// A hover over `text` at `at`, from the compiler; null when it names nothing.
+void hover(^Server s, ^json.Writer w, string8 path, string8 text, u32 at):
+    u32 end = 0
+    string8 word = word_around(text, at, &end)
+    if #len(word) == 0 || !compiler_of(s):
+        w.null()
+        return
+    u32 start = end - u32(#len(word))
+    ref []char8 qf = query_flag("--hover=", at)
+    string8 qs = qf
+    [1]string8 q = [qs]
+    ref []char8 out = ask(&s.comp, q[:], path, text)
+    #delete(qf)
+    string8 o = out
+    ref []char8 body
+    if !hover_markdown(o, &body) && !completed(s, path, text, end, word, &body):
+        w.null()
+        #delete(out)
+        return
+    Lines ls = lines(text)
+    w.object()
+    w.key("contents")
+    w.object()
+    w.key("kind")
+    w.text("markdown")
+    w.key("value")
+    w.text(body)
+    w.end_object()
+    w.key("range")
+    range(w, &ls, start, end)
+    w.end_object()
+    #delete(ls.starts)
+    #delete(body)
+    #delete(out)
+
+// Nothing from `--hover`: the completion at the word's end that holds the
+// word, as `kind \`name\`` and its detail (Rust's fallback).
+private bool completed(^Server s, string8 path, string8 text, u32 end, string8 word, ^ref []char8 body):
+    ref []char8 qf = query_flag("--complete=", end)
+    string8 qs = qf
+    [1]string8 q = [qs]
+    ref []char8 out = ask(&s.comp, q[:], path, text)
+    #delete(qf)
+    string8 o = out
+    i64 i = 0
+    for i < #len(o):
+        i64 e = i
+        for e < #len(o) && o[e] != '\n': e += 1
+        string8 line = o[i..<e]
+        i = e + 1
+        i64 sp = strings.index_of(line, ' ')
+        if sp < 0: continue
+        string8 kind = line[0..<sp]
+        ref []string8 f = strings.split(line[sp + 1..<#len(line)], "\t")
+        string8 name = f[0]
+        string8 detail = ""
+        string8 doc = ""
+        if #len(f) > 1: detail = f[1]
+        if #len(f) > 2: doc = f[2]
+        string8 last = name[strings.last_index_of(name, '.') + 1..<#len(name)]
+        if name != word && last != word:
+            #delete(f)
+            continue
+        if (kind == "intrinsic" || kind == "attribute") && #len(detail) > 0:
+            syntax.put(body, "```dado\n")
+            syntax.put(body, detail)
+            syntax.put(body, "\n```")
+        else:
+            syntax.put(body, kind)
+            syntax.put(body, " `")
+            syntax.put(body, name)
+            syntax.put(body, "`\n\n")
+            syntax.put(body, detail)
+        if #len(doc) > 0:
+            syntax.put(body, "\n\n")
+            syntax.put(body, doc)
+        #delete(f)
+        #delete(out)
+        return true
+    #delete(out)
+    return false
+
+// `--hover=120`.
+private ref []char8 query_flag(string8 flag, u32 at):
+    ref []char8 o
+    syntax.put(&o, flag)
+    syntax.put_num(&o, i64(at))
+    return o
+
+// `--hover`'s answer as Markdown: the signature in a code block, then the
+// comment read into its fields (Rust's `hover_markdown`).
+private bool hover_markdown(string8 out, ^ref []char8 body):
+    i64 nl = strings.index_of(out, '\n')
+    string8 head = out
+    string8 doc = ""
+    if nl >= 0:
+        head = out[0..<nl]
+        doc = out[nl + 1..<#len(out)]
+    i64 t1 = strings.index_of(head, '\t')
+    string8 kind = head
+    if t1 >= 0: kind = head[0..<t1]
+    if #len(kind) == 0: return false
+    string8 name = ""
+    string8 sig = ""
+    if t1 >= 0:
+        string8 rest = head[t1 + 1..<#len(head)]
+        i64 t2 = strings.index_of(rest, '\t')
+        name = rest
+        if t2 >= 0: name = rest[0..<t2]
+        if t2 >= 0: sig = rest[t2 + 1..<#len(rest)]
+    syntax.put(body, "```dado\n")
+    if #len(sig) == 0:
+        syntax.put(body, kind)
+        syntax.put(body, " ")
+        syntax.put(body, name)
+    else: syntax.put(body, sig)
+    syntax.put(body, "\n```")
+    string8 d = strings.trim_right(doc)
+    if #len(d) == 0: return true
+    syntax.put(body, "\n\n")
+    if kind == "intrinsic" || kind == "attribute": syntax.put(body, d)
+    else: comment_markdown(d, body)
+    return true
+
+// ── doc comments ──
+
+private bool blank(string8 l):
+    string8 t = strings.trim(l)
+    return #len(t) == 0
+
+private bool indented(string8 l):
+    return #len(l) > 0 && (l[0] == ' ' || l[0] == '\t')
+
+// `key: text` where key is a lowercase word: the key and the text, else "".
+private bool field_key(string8 line, ^string8 key, ^string8 text):
+    i64 colon = strings.index_of(line, ':')
+    if colon <= 0: return false
+    string8 k = line[0..<colon]
+    if !(k[0] >= 'a' && k[0] <= 'z' || k[0] == '_'): return false
+    for c in k:
+        if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_'): return false
+    string8 rest = line[colon + 1..<#len(line)]
+    if #len(rest) > 0 && rest[0] != ' ' && rest[0] != '\t': return false
+    key^ = k
+    text^ = strings.trim(rest)
+    return true
+
+private bool is_field(string8 line):
+    string8 k = ""
+    string8 t = ""
+    return field_key(line, &k, &t)
+
+private void comment_markdown(string8 doc, ^ref []char8 body):
+    ref []string8 ls
+    i64 i = 0
+    for i <= #len(doc):
+        i64 e = i
+        for e < #len(doc) && doc[e] != '\n': e += 1
+        ls = #append(ls, doc[i..<e])
+        i = e + 1
+    // `lines()` drops a last empty line after a final newline.
+    if #len(ls) > 0 && #len(doc) > 0 && doc[#len(doc) - 1] == '\n': #truncate(ls, #len(ls) - 1)
+    i64 at = -1
+    for k in 0..<#len(ls):
+        if !is_field(ls[k]) || k > 0 && !blank(ls[k - 1]): continue
+        bool rest_ok = true
+        for j in k + 1..<#len(ls):
+            if !blank(ls[j]) && !indented(ls[j]) && !is_field(ls[j]): rest_ok = false
+        if rest_ok:
+            at = k
+            break
+    i64 pe = #len(ls) if at < 0 else at
+    ref [](ref []char8) parts
+    prose(ls[0..<pe], &parts)
+    ref [](ref []char8) params
+    ref []char8 ret
+    ref []char8 fails
+    ref []char8 example
+    bool has_ret = false
+    bool has_fails = false
+    bool has_example = false
+    ref [](ref []char8) see
+    i64 k = pe
+    for k < #len(ls):
+        string8 key = ""
+        string8 text = ""
+        if !field_key(ls[k], &key, &text):
+            k += 1
+            continue
+        i64 j = k + 1
+        for j < #len(ls) && !is_field(ls[j]): j += 1
+        []string8 bodyl = ls[k + 1..<j]
+        if key == "example":
+            if !has_example:
+                has_example = true
+                dedent(bodyl, &example)
+                if #len(example) == 0: syntax.put(&example, text)
+        else if key == "see":
+            ref []char8 all
+            joined_text(text, bodyl, &all)
+            string8 a = all
+            for n in strings.split(a, ","):
+                string8 nt = strings.trim(n)
+                if #len(nt) > 0: see = #append(see, own(nt))
+            #delete(all)
+        else if key == "returns":
+            if !has_ret:
+                has_ret = true
+                joined_text(text, bodyl, &ret)
+        else if key == "fails":
+            if !has_fails:
+                has_fails = true
+                joined_text(text, bodyl, &fails)
+        else:
+            ref []char8 p
+            syntax.put(&p, "- `")
+            syntax.put(&p, key)
+            syntax.put(&p, "`: ")
+            joined_text(text, bodyl, &p)
+            params = #append(params, p)
+        k = j
+    if #len(params) > 0:
+        ref []char8 p
+        syntax.put(&p, "**Parameters**\n\n")
+        for x in 0..<#len(params):
+            if x > 0: p = #append(p, '\n')
+            string8 ps = params[x]
+            syntax.put(&p, ps)
+        parts = #append(parts, p)
+    if has_ret:
+        ref []char8 p
+        syntax.put(&p, "**Returns** ")
+        string8 r = ret
+        syntax.put(&p, r)
+        parts = #append(parts, p)
+    if has_fails:
+        ref []char8 p
+        syntax.put(&p, "**Fails** ")
+        string8 r = fails
+        syntax.put(&p, r)
+        parts = #append(parts, p)
+    if has_example:
+        ref []char8 p
+        syntax.put(&p, "**Example**\n\n```dado\n")
+        string8 r = example
+        syntax.put(&p, r)
+        syntax.put(&p, "\n```")
+        parts = #append(parts, p)
+    if #len(see) > 0:
+        ref []char8 p
+        syntax.put(&p, "**See** ")
+        for x in 0..<#len(see):
+            if x > 0: syntax.put(&p, ", ")
+            syntax.put(&p, "`")
+            string8 sx = see[x]
+            syntax.put(&p, sx)
+            syntax.put(&p, "`")
+        parts = #append(parts, p)
+    for x in 0..<#len(parts):
+        if x > 0: syntax.put(body, "\n\n")
+        string8 ps = parts[x]
+        syntax.put(body, ps)
+
+private void joined_text(string8 first, []string8 rest, ^ref []char8 out):
+    bool any = #len(out^) > 0 && false
+    if #len(first) > 0:
+        syntax.put(out, first)
+        any = true
+    for l in rest:
+        string8 t = strings.trim(l)
+        if #len(t) == 0: continue
+        if any: syntax.put(out, " ")
+        syntax.put(out, t)
+        any = true
+
+private void dedent([]string8 ls, ^ref []char8 out):
+    i64 ind = -1
+    for l in ls:
+        if blank(l): continue
+        string8 tl = strings.trim_left(l)
+        i64 n = #len(l) - #len(tl)
+        if ind < 0 || n < ind: ind = n
+    if ind < 0: ind = 0
+    i64 first = -1
+    i64 last = -1
+    for k in 0..<#len(ls):
+        if !blank(ls[k]):
+            if first < 0: first = k
+            last = k
+    if first < 0: return
+    for k in first..<last + 1:
+        if k > first: out^ = #append(out^, '\n')
+        if !blank(ls[k]): syntax.put(out, ls[k][ind..<#len(ls[k])])
+
+// The prose: the summary (its first sentence, on one line), then the rest.
+private void prose([]string8 ls0, ^ref [](ref []char8) parts):
+    i64 first = 0
+    for first < #len(ls0) && blank(ls0[first]): first += 1
+    i64 last = #len(ls0)
+    for last > first && blank(ls0[last - 1]): last -= 1
+    if first >= last: return
+    []string8 ls = ls0[first..<last]
+    i64 pe = 0
+    for pe < #len(ls) && !blank(ls[pe]): pe += 1
+    ref []char8 para
+    for k in 0..<pe:
+        if k > 0: para = #append(para, '\n')
+        syntax.put(&para, ls[k])
+    string8 p = para
+    i64 cut = sentence_end(p)
+    if cut < 0: cut = #len(p)
+    ref []char8 summary
+    for c in p[0..<cut]: summary = #append(summary, ' ' if c == '\n' else c)
+    ref []char8 rest
+    syntax.put(&rest, strings.trim_left(p[cut..<#len(p)]))
+    if pe < #len(ls):
+        ref []char8 after
+        for k in pe..<#len(ls):
+            if k > pe: after = #append(after, '\n')
+            syntax.put(&after, ls[k])
+        string8 a = after
+        if #len(rest) == 0:
+            i64 s = 0
+            for s < #len(a) && a[s] == '\n': s += 1
+            syntax.put(&rest, a[s..<#len(a)])
+        else:
+            rest = #append(rest, '\n')
+            syntax.put(&rest, a)
+    if #len(summary) > 0: parts^ = #append(parts^, summary)
+    string8 r = rest
+    string8 rt = strings.trim_right(r)
+    if #len(rt) > 0: parts^ = #append(parts^, own(rt))
+
+private i64 sentence_end(string8 t):
+    bool code = false
+    for i in 0..<#len(t):
+        char8 b = t[i]
+        if b == '`': code = !code
+        else if (b == '.' || b == '!' || b == '?') && !code:
+            if i + 1 >= #len(t) || t[i + 1] == ' ' || t[i + 1] == '\n' || t[i + 1] == '\t' || t[i + 1] == '\r': return i + 1
+    return -1
+
+// ── definition ──
+
+// Each `--define` line as a `Location` in the file it names; null for none.
+void definition(^Server s, ^json.Writer w, string8 path, string8 text, u32 at):
+    if !compiler_of(s):
+        w.null()
+        return
+    ref []char8 qf = query_flag("--define=", at)
+    string8 qs = qf
+    [1]string8 q = [qs]
+    ref []char8 out = ask(&s.comp, q[:], path, text)
+    #delete(qf)
+    string8 o = out
+    bool any = false
+    i64 i = 0
+    for i < #len(o):
+        i64 e = i
+        for e < #len(o) && o[e] != '\n': e += 1
+        string8 line = o[i..<e]
+        i = e + 1
+        ref []string8 f = strings.split(line, "\t")
+        if #len(f) < 3:
+            #delete(f)
+            continue
+        i64 dd = strings.find(f[2], "..")
+        ref []char8 decl
+        bool have = text_of(s, f[1], &decl)
+        if dd < 0 || !have:
+            #delete(f)
+            #delete(decl)
+            continue
+        string8 dt = decl
+        u32 lo = u32(digits(f[2][0..<dd]))
+        u32 hi = u32(digits(f[2][dd + 2..<#len(f[2])]))
+        if lo > u32(#len(dt)): lo = u32(#len(dt))
+        if hi > u32(#len(dt)): hi = u32(#len(dt))
+        if !any: w.array()
+        any = true
+        Lines ls = lines(dt)
+        w.object()
+        w.key("uri")
+        ref []char8 u = uri_of(f[1])
+        w.text(u)
+        #delete(u)
+        w.key("range")
+        range(w, &ls, lo, hi)
+        w.end_object()
+        #delete(ls.starts)
+        #delete(decl)
+        #delete(f)
+    if any: w.end_array()
+    else: w.null()
+    #delete(out)
+
+// A file's text: the open buffer for it, else the disk's.
+private bool text_of(^Server s, string8 path, ^ref []char8 out):
+    for i in 0..<#len(s.uris):
+        string8 u = s.uris[i]
+        ref []char8 p = path_of(u)
+        string8 ps = p
+        bool same = ps == path
+        #delete(p)
+        if same:
+            string8 t = s.texts[i]
+            syntax.put(out, t)
+            return true
+    try ref []char8 d = fs.read_file(path) else: return false
+    out^ = d
+    return true

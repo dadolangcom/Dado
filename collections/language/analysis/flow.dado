@@ -1,0 +1,210 @@
+// The forward dataflow framework over structured IR. A state is a bit set
+// (word 0 bit 0: reached); `must` bits join by intersection, the rest by
+// union. `step` is the transfer of one op that is no head and no jump; a
+// loop iterates to its fixpoint with `report` off, then runs once with it
+// on, so a client says each finding once.
+package analysis
+
+import "language:ir"
+
+type Flow:
+    ^ir.Fn f
+    i64 words
+    ref []u64 must
+    bool report
+    rawptr ctx
+    void(rawptr, ^Flow, u32, ^ref []u64) step
+    // Open heads, innermost last, and the states their breaks carry
+    // (`words` each, in order).
+    ref []u32 heads
+    ref []u64 exits
+    // Words of `exits` in use (it only grows).
+    i64 top
+    // States given back, reused by `copy`.
+    ref [](ref []u64) pool
+
+Flow flow(^ir.Fn f, i64 bits, rawptr ctx, void(rawptr, ^Flow, u32, ^ref []u64) step):
+    Flow fl
+    fl.f = f
+    fl.words = (bits + 1 + 63) / 64
+    fl.ctx = ctx
+    fl.step = step
+    fl.must = #make([]u64, fl.words)
+    return fl
+
+// Gives back everything `fl` holds.
+void done(^Flow fl):
+    for c in fl.pool:
+        #delete(c)
+    #delete(fl.pool)
+    #delete(fl.must)
+    #delete(fl.heads)
+    #delete(fl.exits)
+
+// Bit `i` of a state (fact bits start at 1).
+bool has(^ref []u64 s, i64 i):
+    i64 b = i + 1
+    return (s^[b >> 6] >> u64(b & 63)) & 1 != 0
+
+void set(^ref []u64 s, i64 i, bool on):
+    i64 b = i + 1
+    u64 m = u64(1) << u64(b & 63)
+    if on: s^[b >> 6] = s^[b >> 6] | m
+    else: s^[b >> 6] = s^[b >> 6] & ~m
+
+void must_bit(^Flow fl, i64 i):
+    set(&fl.must, i, true)
+
+bool reached(^ref []u64 s):
+    return s^[0] & 1 != 0
+
+// The entry state: reached, no fact.
+ref []u64 entry(^Flow fl):
+    ref []u64 s
+    for _ in 0..<fl.words:
+        s = #append(s, 0)
+    s[0] = 1
+    return s
+
+private ref []u64 copy(^Flow fl, ^ref []u64 s):
+    ref []u64 c
+    i64 n = #len(fl.pool)
+    if n > 0:
+        c = fl.pool[n - 1]
+        #truncate(fl.pool, n - 1)
+    else: c = #make([]u64, fl.words)
+    for i in 0..<fl.words:
+        c[i] = s^[i]
+    return c
+
+private void drop(^Flow fl, ref []u64 c):
+    fl.pool = #append(fl.pool, c)
+
+// `into` joined with `s`.
+void join(^Flow fl, ^ref []u64 into, ^ref []u64 s):
+    if !reached(s): return
+    if !reached(into):
+        for i in 0..<fl.words:
+            into^[i] = s^[i]
+        return
+    for i in 0..<fl.words:
+        u64 m = fl.must[i]
+        into^[i] = ((into^[i] | s^[i]) & ~m) | (into^[i] & s^[i] & m)
+
+private bool same(^ref []u64 a, ^ref []u64 b):
+    for i in 0..<#len(a^):
+        if a^[i] != b^[i]: return false
+    return true
+
+// The whole body from `s`; answers whether its end is reached.
+bool walk(^Flow fl, ^ref []u64 s):
+    fl.report = true
+    pass_(fl, 0, ir.count(fl.f), s)
+    return reached(s)
+
+private void pass_(^Flow fl, u32 lo, u32 hi, ^ref []u64 s):
+    ^ir.Fn f = fl.f
+    u32 i = lo
+    for i < hi && reached(s):
+        u8 o = f.op[i]
+        u32 len = ir.span(f, i)
+        if o == ir.O_IF:
+            ref []u64 e = copy(fl, s)
+            open(fl, i)
+            pass_(fl, i + 1, i + 1 + f.b[i], s)
+            pass_(fl, i + 1 + f.b[i], i + 1 + len, &e)
+            join(fl, s, &e)
+            shut(fl, s)
+            drop(fl, e)
+        else if o == ir.O_BLOCK:
+            open(fl, i)
+            pass_(fl, i + 1, i + 1 + len, s)
+            shut(fl, s)
+        else if o == ir.O_LOOP:
+            loop(fl, i, s)
+        else if o == ir.O_BREAK || o == ir.O_CONTINUE:
+            i64 t = #len(fl.heads) - 1 - i64(f.a[i])
+            if o == ir.O_BREAK && t >= 0: carry(fl, t, s)
+            s^[0] = 0
+        else:
+            fl.step(fl.ctx, fl, i, s)
+            if o == ir.O_RETURN || o == ir.O_RETURN_FAIL || o == ir.O_QUIT: s^[0] = 0
+        i += 1 + len
+
+private void open(^Flow fl, u32 h):
+    if fl.top + fl.words > #len(fl.exits):
+        i64 n = 2 * #len(fl.exits)
+        if n < fl.top + fl.words: n = fl.top + fl.words
+        fl.exits = #resize(fl.exits, n)
+    // Unreached (word 0's bit 0) is all a fresh exit needs: `carry` overwrites it whole.
+    fl.exits[fl.top] = 0
+    fl.top += fl.words
+    fl.heads = #append(fl.heads, h)
+
+// A break to head `t`: its state joins that head's exit.
+private void carry(^Flow fl, i64 t, ^ref []u64 s):
+    if !reached(s): return
+    i64 b = t * fl.words
+    if fl.exits[b] & 1 == 0:
+        for i in 0..<fl.words:
+            fl.exits[b + i] = s^[i]
+        return
+    for i in 0..<fl.words:
+        u64 m = fl.must[i]
+        u64 a = fl.exits[b + i]
+        fl.exits[b + i] = ((a | s^[i]) & ~m) | (a & s^[i] & m)
+
+// Closes the innermost head: its breaks join what falls out of it.
+private void shut(^Flow fl, ^ref []u64 s):
+    i64 t = #len(fl.heads) - 1
+    i64 b = t * fl.words
+    if fl.exits[b] & 1 != 0:
+        bool r = reached(s)
+        for i in 0..<fl.words:
+            u64 e = fl.exits[b + i]
+            u64 m = fl.must[i]
+            if !r: s^[i] = e
+            else: s^[i] = ((s^[i] | e) & ~m) | (s^[i] & e & m)
+    fl.top = b
+    #truncate(fl.heads, t)
+
+// A LOOP: the body's input is the entry joined with each end of the body,
+// to a fixpoint; then one run with the caller's `report`.
+private void loop(^Flow fl, u32 h, ^ref []u64 s):
+    ^ir.Fn f = fl.f
+    u32 len = ir.span(f, h)
+    bool report = fl.report
+    fl.report = false
+    ref []u64 start = copy(fl, s)
+    for _ in 0..<64:
+        ref []u64 x = copy(fl, &start)
+        open(fl, h)
+        pass_(fl, h + 1, h + 1 + len, &x)
+        ref []u64 next = copy(fl, &start)
+        join(fl, &next, &x)
+        bool done = same(&next, &start)
+        drop(fl, x)
+        // Under an outer fixpoint (nothing reported), the pass just made from
+        // the fixpoint's own state is the last run: its breaks are the exits.
+        // (Run again, a loop nested d deep cost (k+1)^d passes, now k^d.)
+        if done && !report:
+            drop(fl, next)
+            drop(fl, start)
+            for i in 0..<fl.words:
+                s^[i] = 0
+            shut(fl, s)
+            return
+        fl.top -= fl.words
+        #truncate(fl.heads, #len(fl.heads) - 1)
+        drop(fl, start)
+        start = next
+        if done: break
+    fl.report = report
+    open(fl, h)
+    ref []u64 x = copy(fl, &start)
+    pass_(fl, h + 1, h + 1 + len, &x)
+    drop(fl, x)
+    drop(fl, start)
+    for i in 0..<fl.words:
+        s^[i] = 0
+    shut(fl, s)

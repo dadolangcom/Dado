@@ -1,0 +1,141 @@
+// WRN0717: two named failure codes with one value reaching one function's
+// caller. A body's summary is the named codes it can fail with: its own
+// `fail`s, and what reaches each call whose failure it passes on.
+package analysis
+
+import "language:check"
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:types"
+
+type Fails:
+    ^check.World w
+    // (body << 32 | const decl) reached; (body << 32 | callee body) passed
+    // on; each constant's canonical alias.
+    {u64: bool} reach
+    {u32: u32} canon
+    ref []u64 list
+    ref []u64 passes
+    ref []bool recorded
+
+void fail_codes(^check.World w):
+    Fails s
+    s.w = w
+    codes(&s)
+
+private void codes(^Fails s):
+    ^check.World w = s.w
+    {u32: u32} by_name
+    for i in 0..<#len(w.fns):
+        by_name[w.fns[i].name] = u32(i)
+        s.recorded = #append(s.recorded, false)
+    for i in 0..<#len(w.fns):
+        ^ir.Fn f = &w.fns[i]
+        // Code slots, by root slot, to the call whose code they hold.
+        {u32: u32} from
+        for k in 0..<ir.count(f):
+            u8 o = f.op[k]
+            if (o == ir.O_CALL || o == ir.O_CALL_INDIRECT) && f.c[k] != NONE: from[f.root[f.c[k]]] = k
+            else if o == ir.O_SET && f.a[k] != NONE && !ir.is_const(f.a[k]) && (f.root[f.a[k]] & ir.ROOT_GLOBAL) == 0 && f.root[f.a[k]] in from:
+                try u32 c = from[f.root[f.a[k]]] else: continue
+                from[f.root[f.dst[k]]] = c
+            else if o == ir.O_RETURN_FAIL:
+                s.recorded[i] = true
+                if f.b[k] != NONE:
+                    _ = add(s, u32(i), f.b[k])
+                    s.canon[f.b[k]] = f.c[k]
+                if ir.is_const(f.a[k]) || !(f.root[f.a[k]] in from): continue
+                try u32 c = from[f.root[f.a[k]]] else: continue
+                if f.op[c] != ir.O_CALL || !(f.ref_name[f.a[c]] in by_name): continue
+                try u32 g = by_name[f.ref_name[f.a[c]]] else: continue
+                s.passes = #append(s.passes, (u64(i) << 32) | u64(g))
+        #delete(from)
+    Settle q = settler(w)
+    for:
+        u32 fi = next(&q)
+        if fi == NONE: break
+        if visit(s, fi): changed(&q, fi)
+    for i in 0..<#len(w.fns):
+        if s.recorded[i]: report(s, u32(i))
+
+private bool add(^Fails s, u32 fi, u32 d):
+    u64 k = (u64(fi) << 32) | u64(d)
+    if k in s.reach: return false
+    s.reach[k] = true
+    s.list = #append(s.list, k)
+    return true
+
+private bool visit(^Fails s, u32 fi):
+    bool changed = false
+    for p in s.passes:
+        if u32(p >> 32) != fi: continue
+        u32 g = u32(p & 0xFFFFFFFF)
+        i64 n = #len(s.list)
+        for j in 0..<n:
+            if u32(s.list[j] >> 32) == g && add(s, fi, u32(s.list[j] & 0xFFFFFFFF)): changed = true
+    return changed
+
+private bool meets(^Fails s, u32 fi, u32 d):
+    return ((u64(fi) << 32) | u64(d)) in s.reach
+
+private bool before(^Fails s, u32 x, u32 y):
+    ^check.World w = s.w
+    string8 px = check.name_of(w, w.p.pkgs[w.decls[x].pkg].name)
+    string8 py = check.name_of(w, w.p.pkgs[w.decls[y].pkg].name)
+    if px != py: return check.bytes_less(px, py)
+    return check.bytes_less(check.name_of(w, w.decls[x].name), check.name_of(w, w.decls[y].name))
+
+private void report(^Fails s, u32 fi):
+    ^check.World w = s.w
+    ref []u32 keys
+    for k in s.list:
+        if u32(k >> 32) != fi: continue
+        u32 d = u32(k & 0xFFFFFFFF)
+        i64 at = #len(keys)
+        keys = #append(keys, d)
+        for at > 0 && before(s, d, keys[at - 1]):
+            keys[at] = keys[at - 1]
+            at -= 1
+        keys[at] = d
+    // One code under two names is one; the rest by value.
+    ref []u32 kept
+    ref []u32 seen
+    ref []i64 vals
+    for d in keys:
+        try u32 c = s.canon[d] else: continue
+        bool dup = false
+        for x in seen:
+            if x == c: dup = true
+        if dup: continue
+        seen = #append(seen, c)
+        u32 v = w.decls[d].value
+        if v == NONE || w.k.kind[v] != types.C_INT: continue
+        kept = #append(kept, d)
+        vals = #append(vals, i64(w.k.w0[v]))
+    ref []u64 pairs
+    for i in 0..<#len(kept):
+        for j in i + 1..<#len(kept):
+            if vals[i] == vals[j]: pairs = #append(pairs, (u64(i) << 32) | u64(j))
+    // Pairs in value order, each where the two first meet.
+    for _ in 0..<#len(pairs):
+        i64 best = -1
+        for q in 0..<#len(pairs):
+            if pairs[q] == 0xFFFFFFFFFFFFFFFF: continue
+            if best < 0 || vals[i64(pairs[q] >> 32)] < vals[i64(pairs[best] >> 32)]: best = q
+        u32 a = kept[i64(pairs[best] >> 32)]
+        u32 b = kept[i64(pairs[best] & 0xFFFFFFFF)]
+        i64 v = vals[i64(pairs[best] >> 32)]
+        pairs[best] = 0xFFFFFFFFFFFFFFFF
+        bool inherited = false
+        for p in s.passes:
+            if u32(p >> 32) == fi && meets(s, u32(p & 0xFFFFFFFF), a) && meets(s, u32(p & 0xFFFFFFFF), b): inherited = true
+        if inherited: continue
+        u32 d = w.jobs[fi].decl
+        w.d.phase = diag.PH_FACTS
+        check.say_tok(w, w.decls[d].file, 0, w.decls[d].node, diag.WRN + 717, index.hold(#format("`", check.name_of(w, w.decls[d].name), "` can fail with ", spelled(w, a), " and with ", spelled(w, b), ", and both are ", v, ", so a caller that sees ", v, " cannot tell which failed\x1egive one of them a value the other does not have, or handle one where it arrives — `try … else code:` — and fail with a code of this package's own")), "")
+
+private string8 spelled(^check.World w, u32 d):
+    u32 f = w.decls[d].file
+    diag.Place p = w.p.map.place(w.p.map.base[f] + w.p.files[f].a.lo[w.decls[d].node])
+    return index.hold(#format("`", check.name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", check.name_of(w, w.decls[d].name), "` (", w.p.map.names[f], ":", p.line, ")"))

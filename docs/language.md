@@ -1,7 +1,8 @@
 <!-- The hand-written half of the language documentation.
      This file is the arc. The sections it declares as slots are filled from
-     `//@` blocks beside the code that implements each feature, by
-     `dado doc crates --ext .rs --spine docs/spine.md -o docs/language.md`.
+     the `//@` blocks in docs/language-src (written beside the first compiler's
+     code until the port moved them), by
+     `dado doc docs/language-src --ext .md --spine docs/spine.md -o docs/language.md`.
      A slot declared here that nothing fills, or a block addressed to a slot
      this file does not declare, is a refusal: nothing is written. -->
 
@@ -691,6 +692,53 @@ front of the brackets the word would sit on the window's two-word
 header, which promises its elements nothing, so it would read as
 the promise it is not; `[]const T` is the one spelling.
 
+### Copying into a run that already exists
+
+Two forms copy elements into storage that is already there; neither
+allocates. **A slice assignment copies an exact window:**
+`dst[i..<j] = src` writes every element of the window from `src`, and
+`dst[:] = src` the whole run. The lengths are the same number: when
+both are known before the program runs a mismatch is `ERR0617`, and
+otherwise it is a trap that names both lengths, on every target.
+**`#copy_into(dst, src)` copies as many as both hold** — the shorter
+of the two runs, from the start of each — and answers the count as an
+`i64`, as Go's `copy` does; a count both lengths fix is a constant.
+`core:slices` has no `copy_into`: it took `(from, into)`, the
+reverse of this order, so `slices.copy_into(a, b)` is now
+`#copy_into(b, a)`.
+
+Either side is a fixed array, a window or a `ref []T`; the destination
+is written through, so it is a place and not `[]const T` (`ERR0606`).
+The elements are moved as they are, by memory, so the source's element
+type is the destination's (`ERR0618`): a copy converts nothing, and a
+conversion is a loop you write. Text and maps are refused (`ERR0619`):
+a string is immutable and shares its bytes, and a map's entries have
+no positions. **The two runs may overlap**, as `memmove`'s may, so
+`xs[1..<n] = xs[0..<n - 1]` shifts a run up by one.
+
+A copy writes into a block and never moves it, so a view of the
+destination taken before the copy still points where it did. A view
+that was stale before the copy is as stale as a source or a
+destination as anywhere else (`WRN0803`). When the source is a call
+that may grow the destination's block, the window is taken after the
+call, so the copy lands where the block then is.
+
+```dado
+package doc_sample
+
+// Insert `v` at `at`, shifting the tail up by one; the last element falls off.
+public void insert_at([]i32 xs, i64 at, i32 v):
+    xs[at + 1..<#len(xs)] = xs[at..<#len(xs) - 1]
+    xs[at] = v
+
+public i64 head([]i32 into, []const i32 from):
+    return #copy_into(into, from)
+```
+
+DadoScript has neither form: a script's `xs[i..<j]` answers a new
+array rather than a window into storage. The Rust `dadoc` predates both
+forms and refuses them (`ERR0606`, `ERR0405`).
+
 ### Bytes and text are views of each other
 
 A `string8`, a `[]char8` and a `[]u8` are the same two words — a
@@ -726,6 +774,13 @@ convention, and nothing relies on it for safety: `#len` counts bytes,
 writes them as they are. `core:chars`' decoders answer U+FFFD for a
 malformed sequence and move on. Bytes from outside the program that
 must be text are asked first, with `chars.valid(s)`.
+
+**A string literal becomes a `cstring` where one is wanted, and then it
+holds no NUL.** A `cstring` is a pointer and a terminator with no length
+beside it, so C reads it to its first NUL: `cstring s = "a\0b"` would
+hand C `"a"` and lose the rest, and it is refused (`ERR0540`). The same
+literal fits a `string8`, a `string16` or a `string32`, whose length
+counts the NUL as one more unit of text.
 
 ### What a frame takes back
 
@@ -2020,6 +2075,9 @@ package-level declaration (`WRN0419`, a warning and never an error).
 is still the tuple it is, and another package that writes the same slots
 gets the same type — because the shape was never the package's to own.
 That is structural identity holding, not a rule about visibility.
+A shape that only `private` types declare is taken, by the compiler's
+analyses, to get its values from its own package: they may assume no
+other package made or wrote one.
 Nor does it hide what a `using` promised: a trait's methods are reached
 through the trait wherever the trait is visible, a `private` type's
 among them, and the type's other methods stay as private as it is.

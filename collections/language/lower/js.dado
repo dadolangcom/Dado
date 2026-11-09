@@ -1,0 +1,2099 @@
+// DadoScript as JavaScript: one ES module per script class, from its IR,
+// with the line table a trace reads (`__dados_lines`), as Rust's
+// `dado_emit_js` lays them out; and the C tables that carry the modules into
+// the program (`dado_js__modules`, `dado_js__bound`), which `#script_vm` hands
+// `core:script`.
+package lower
+
+import "core:fmt"
+import "core:os/fs"
+import "core:slices"
+import "core:strings"
+import "language:check"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+
+type J:
+    ^check.World w
+    u32 ci
+    u32 file
+    ref []string8 lines
+    ref []i32 dl
+    ref []i32 dc
+    ref []i32 dfn
+    ref []string8 imports
+    {u32: u32} stmt
+    i32 fn
+    string8 fname
+    ref []bool targeted
+    // Other classes this module names, imported by `class$pkg$Name`.
+    ref []u32 classes
+    // Dado functions called (`pkg/name`), and whether a narrowing is checked.
+    ref []string8 dado
+    bool narrows
+    // What it imports from `dados:mods`.
+    ref []string8 mods
+    // Dado enums it converts, each a table `enum$pkg$Name`.
+    ref []u32 enums
+    // The web's flavour: files by relative path, `print`
+    // and Dado calls through `dados/web.js`, a stop poll at each loop's head.
+    bool web
+    // A JavaScript library's flavour (`--emit=js-package`): files by relative path, `print` through `dados/io.js`.
+    bool pkg
+    string8 at
+    ref []string8 prints
+    ref []string8 stops
+    // Inline crossings (`inline.dado`): the plan, the tables, the links.
+    IPlan ip
+    ref []string8 itab_n
+    ref []string8 itab_v
+    ref []string8 ilink
+    ref []string8 ilocal
+    // A temp folded into the next op (`jfolds`): its slot (NONE: none), its
+    // expression (`g_pe`), where its own line would have gone, its reads so far.
+    u32 ps
+    // Per slot, the local a copy temp reads instead (`jfolds`), else NONE.
+    ref []u32 alias
+    i32 pl
+    i32 pc
+    i64 pd
+    i32 pu
+
+// The pending temp's expression (held; outside `J` so `jt`'s text stays unowned).
+private string8 g_pe = ""
+
+private void jline(^J j, i64 depth, string8 s, i64 l, i64 c):
+    ref []char8 o
+    for _ in 0..<depth:
+        o = #append(o, .."    ")
+    o = #append(o, ..s)
+    j.lines = #append(j.lines, index.hold(o))
+    j.dl = #append(j.dl, i32(l))
+    j.dc = #append(j.dc, i32(c) if l > 0 else 0)
+    j.dfn = #append(j.dfn, j.fn if l > 0 else -1)
+
+private string8 rt(^J j, string8 name):
+    for x in j.imports:
+        if x == name: return name
+    j.imports = #append(j.imports, name)
+    return name
+
+private bool before(string8 a, string8 b):
+    return strings.before(a, b)
+
+// Each node of the class's file to the statement it is part of.
+private void stmts(^J j, u32 n, u32 cur):
+    if n == NONE: return
+    syntax.Ast a = j.w.p.files[j.file].a
+    u8 g = a.tag[n]
+    u32 s = cur
+    if g >= syntax.S_RETURN && g <= syntax.S_ASSERT && g != syntax.S_VIEW && g != syntax.S_BIND && g != syntax.S_CASE && g != syntax.S_TRY_ELSE && g != syntax.S_WHEN_ARM: s = n
+    if g == syntax.N_VAR: s = n
+    // A `try`'s statement is placed at the `try`.
+    if cur != NONE && a.tag[cur] == syntax.S_TRY && a.a[cur] == n: s = cur
+    j.stmt[n] = s
+    ref []u32 ks
+    a.kids(n, &ks)
+    for k in ks:
+        stmts(j, k, s)
+
+// The JS text of a string's bytes.
+private string8 jstr(string8 s):
+    ref []char8 o
+    o = #append(o, '"')
+    for ch in s:
+        if ch == '"': o = #append(o, .."\\\"")
+        else if ch == '\\': o = #append(o, .."\\\\")
+        else if ch == '\n': o = #append(o, .."\\n")
+        else if ch == '\r': o = #append(o, .."\\r")
+        else if ch == '\t': o = #append(o, .."\\t")
+        else if u8(ch) < 0x20:
+            o = #append(o, .."\\x")
+            o = #append(o, "0123456789abcdef"[i64(u8(ch) >> 4)])
+            o = #append(o, "0123456789abcdef"[i64(u8(ch) & 15)])
+        else: o = #append(o, ch)
+    o = #append(o, '"')
+    return index.hold(o)
+
+// The script type of operand `x`.
+private u32 jty(^J j, ^ir.Fn f, u32 x):
+    if !ir.is_const(x): return jnorm(j, f.place_ty[x])
+    u32 k = x & ~ir.OPD_CONST
+    u8 kind = j.w.k.kind[k]
+    if kind == types.C_FLOAT: return u32(types.P_FLOAT)
+    if kind == types.C_BOOL: return u32(types.P_BOOL)
+    if kind == types.C_STR: return j.w.sstr
+    return u32(types.P_INT)
+
+// A Dado scalar a script holds (a slot of a Dado shape) as the script's own.
+private u32 jnorm(^J j, u32 t0):
+    u32 t = check.s_erase(j.w, t0)
+    u32 r = j.w.t.resolve(t)
+    if r == types.STRING8: return j.w.sstr
+    if r == NONE || j.w.t.tag[r] != types.T_PRIM || r == u32(types.P_BOOL) || check.is_char(j.w, r): return t
+    if check.is_float(j.w, r): return u32(types.P_FLOAT)
+    if check.is_int(j.w, r) && r != u32(types.P_U8): return u32(types.P_INT)
+    return t
+
+// A constant tuple with slots (not a zero).
+private bool jfull(^J j, u32 x):
+    if !ir.is_const(x): return false
+    u32 k = x & ~ir.OPD_CONST
+    if j.w.k.kind[k] != types.C_TUPLE: return false
+    []u32 xs = j.w.k.list(k)
+    return #len(xs) > 0
+
+private string8 jconst(^J j, u32 k):
+    u8 kind = j.w.k.kind[k]
+    if kind == types.C_INT:
+        i64 v = i64(j.w.k.w0[k])
+        string8 sfx = "n" if v > 9007199254740991 || v < -9007199254740991 else ""
+        if v < 0: return index.hold(#format("(", v, sfx, ")"))
+        return index.hold(#format(v, sfx))
+    if kind == types.C_BOOL: return "true" if j.w.k.a[k] != 0 else "false"
+    if kind == types.C_FLOAT:
+        u64 bits = j.w.k.w0[k]
+        f64 x = check.fval(bits)
+        if x != x: return "NaN"
+        if x > 1.7976931348623157e308: return "Infinity"
+        if x < -1.7976931348623157e308: return "(-Infinity)"
+        if bits == 0x8000000000000000: return "(-0)"
+        // The shortest text that reads back as `x`.
+        [64]char8 buf
+        i32 n = fmt.render_float_shortest(x, buf[:])
+        string8 t = index.hold(strings.clone(string8(buf[0..<i64(n)])))
+        if x < 0.0: return index.hold(#format("(", t, ")"))
+        return t
+    if kind == types.C_STR: return jstr(j.w.t.text(j.w.k.a[k]))
+    if kind == types.C_TUPLE:
+        ref []char8 o
+        o = #append(o, '[')
+        []u32 xs = j.w.k.list(k)
+        for i in 0..<#len(xs):
+            if i > 0: o = #append(o, ..", ")
+            o = #append(o, ..jconst(j, xs[i]))
+        o = #append(o, ']')
+        return index.hold(o)
+    return "undefined"
+
+// Operand `x` as JS: a constant, a local, or `this` and its fields.
+private string8 jt(^J j, ^ir.Fn f, u32 x):
+    if x == NONE: return "undefined"
+    if ir.is_const(x): return jconst(j, x & ~ir.OPD_CONST)
+    u32 r = f.root[x]
+    if r == j.ps && f.plo[x] == f.phi[x]:
+        j.pu += 1
+        return g_pe
+    if f.plo[x] == f.phi[x] && (r & ir.ROOT_GLOBAL) == 0 && i64(r) < #len(j.alias) && j.alias[r] != NONE: return index.hold(#format("v", j.alias[r]))
+    ref []char8 o
+    u32 ty = NONE
+    if (r & ir.ROOT_GLOBAL) != 0: o = #append(o, .."undefined")
+    else if (f.slot_flags[r] & ir.S_RECEIVER) != 0:
+        o = #append(o, .."this")
+        ty = f.slot_ty[r]
+    else:
+        o = #append(o, ..#format("v", r))
+        ty = f.slot_ty[r]
+    for i in f.plo[x]..<f.phi[x]:
+        u8 st = f.step[i]
+        if st == ir.ST_DEREF:
+            u32 rr = j.w.t.resolve(ty)
+            if rr != NONE && j.w.t.tag[rr] == types.T_PTR: ty = j.w.t.a[rr]
+        else if st == ir.ST_FIELD:
+            []u32 ns = j.w.t.slot_names(ty)
+            []u32 ss = j.w.t.slots(ty)
+            u32 v = f.step_val[i]
+            if check.s_class_of_ty(j.w, ty) == NONE: o = #append(o, ..#format("[", v, "]"))
+            else if v < u32(#len(ns)): o = #append(o, ..#format(".", j.w.t.text(ns[v])))
+            ty = NONE
+            if v < u32(#len(ss)): ty = ss[v]
+        else if st == ir.ST_INDEX:
+            o = #append(o, ..#format("[", jt(j, f, f.step_val[i]), "]"))
+            u32 rr = j.w.t.resolve(ty)
+            ty = NONE
+            if rr != NONE && j.w.t.tag[rr] == types.T_TUPLE: ty = j.w.t.slots(rr)[0]
+            else if rr != NONE: ty = j.w.t.a[rr]
+    return index.hold(o)
+
+// Operand `x` as a value of its own: a fixed array or a tuple copied.
+private string8 jv(^J j, ^ir.Fn f, u32 x):
+    string8 v = jt(j, f, x)
+    if ir.is_const(x) || x == NONE: return v
+    string8 c = jcopy(j, f.place_ty[x])
+    if #len(c) == 0: return v
+    return index.hold(#format(c, "(", v, ")"))
+
+// The zero value of script type `t`.
+private string8 jzero(^J j, u32 t):
+    if check.s_tup(j.w, t):
+        ref []string8 xs
+        for x in j.w.t.slots(t):
+            xs = #append(xs, jzero(j, x))
+        return index.hold(#format("[", strings.join(xs[:], ", "), "]"))
+    u8 k = check.s_kind(j.w, t)
+    if k == 1: return "[]"
+    if k == 2: return "new Map()"
+    if k == 3: return "\"\""
+    if j.w.t.resolve(t) == u32(types.P_BOOL): return "false"
+    if t == j.w.sloc: return rt(j, "__dados_nowhere")
+    if t == j.w.serror: return index.hold(#format("new ", rt(j, "__dados_Error"), "(\"\", 70, ", rt(j, "__dados_nowhere"), ")"))
+    if check.s_class_of_ty(j.w, t) != NONE: return "null"
+    u32 u = check.union_of(j.w, t)
+    if u != NONE: return index.hold(#format("[0, ", jzero(j, j.w.t.list(u)[0]), "]"))
+    return "0"
+
+// `any`'s dynamic verb `i` (`check.B_SANY`).
+private string8 jdyn(^J j, ^ir.Fn f, u32 i):
+    []u32 xs = ir.args(f, i)
+    ref []string8 as
+    for x in xs:
+        as = #append(as, jt(j, f, x))
+    u32 k = f.b[i]
+    if k == 0: return "globalThis"
+    if k == 7: return index.hold(#format("js$", f.c[i]))
+    if k == 1 || k == 4: return index.hold(#format(as[0], "[", as[1], "]"))
+    if k == 2: return index.hold(#format(as[0], "[", as[1], "](", strings.join(as[2..<#len(as)], ", "), ")"))
+    if k == 3: return index.hold(#format(as[0], "(", strings.join(as[1..<#len(as)], ", "), ")"))
+    if k == 6: return index.hold(#format(as[0], "[", as[1], "] = ", as[2]))
+    u32 mci = check.s_class_of_ty(j.w, f.c[i])
+    if j.w.sloads && mci != NONE:
+        if !jhas(j.mods[:], "__dados_from_mod"): j.mods = #append(j.mods, "__dados_from_mod")
+        return index.hold(#format("__dados_from_mod(", as[0], ", ", jshape(j, mci), ")"))
+    return index.hold(#format(rt(j, "__dados_from_any"), "(", as[0], ", ", jkind(j, f.c[i]), ")"))
+
+private bool jhas([]string8 xs, string8 x):
+    for y in xs:
+        if y == x: return true
+    return false
+
+// A class's shape for `__dados_from_mod` (Rust's `leave_into_class`): every
+// method of its chain but `init`, nearest first, `[name, arity, answer]`,
+// and every field, `[name, kind]`.
+private string8 jshape(^J j, u32 ci):
+    ref []string8 seen
+    ref []string8 ms
+    ref []string8 fs
+    u32 at = ci
+    for _ in 0..<64:
+        if at == NONE: break
+        for m in j.w.classes[at].methods:
+            string8 mn = check.name_of(j.w, j.w.decls[m].name)
+            if mn == "init" || jhas(seen[:], mn): continue
+            seen = #append(seen, mn)
+            u32 ft = j.w.decls[m].ty
+            if ft == NONE: continue
+            []u32 pps = j.w.t.params(ft)
+            i64 np = #len(pps) - 1
+            string8 ans = "null"
+            if j.w.t.a[ft] != u32(types.P_VOID): ans = jskind(j, j.w.t.a[ft])
+            ms = #append(ms, index.hold(#format("[", jstr(mn), ", ", np, ", ", ans, "]")))
+        u32 pc = j.w.classes[at].parent
+        if pc == NONE - 1: pc = NONE
+        i64 from = 0
+        if pc != NONE:
+            []u32 psl = j.w.t.slots(j.w.decls[j.w.classes[pc].decl].ty)
+            from = #len(psl)
+        u32 row = j.w.decls[j.w.classes[at].decl].ty
+        []u32 sl = j.w.t.slots(row)
+        []u32 sn = j.w.t.slot_names(row)
+        for q in from..<#len(sl):
+            if q >= #len(sn): break
+            string8 fnm = j.w.t.text(sn[q])
+            if jhas(seen[:], fnm): continue
+            seen = #append(seen, fnm)
+            fs = #append(fs, index.hold(#format("[", jstr(fnm), ", ", jskind(j, sl[q]), "]")))
+        at = pc
+    string8 nm = check.name_of(j.w, j.w.decls[j.w.classes[ci].decl].name)
+    return index.hold(#format("[\"class\", ", jclass(j, ci), ", ", jstr(nm), ", [[", strings.join(ms[:], ", "), "], [", strings.join(fs[:], ", "), "]]]"))
+
+// A kind inside a class's shape: `jkind`'s, and "any" for a type no `any`
+// checks (a function, a tuple, an enum).
+private string8 jskind(^J j, u32 t):
+    u8 k = check.s_kind(j.w, t)
+    u32 r = j.w.t.resolve(t)
+    if check.s_fn(j.w, t) || check.s_tup(j.w, t) || check.s_enum(j.w, t): return "\"any\""
+    if k == 1: return index.hold(#format("[\"[]\", ", jskind(j, j.w.t.a[r]), "]"))
+    if k == 2: return index.hold(#format("[\"{}\", ", jskind(j, j.w.t.a[r]), ", ", jskind(j, j.w.t.b[r]), "]"))
+    return jkind(j, t)
+
+// The kind `__dados_from_any` checks for script type `t`.
+private string8 jkind(^J j, u32 t):
+    u8 k = check.s_kind(j.w, t)
+    u32 r = j.w.t.resolve(t)
+    if k == 1: return index.hold(#format("[\"[]\", ", jkind(j, j.w.t.a[r]), "]"))
+    if k == 2: return index.hold(#format("[\"{}\", ", jkind(j, j.w.t.a[r]), ", ", jkind(j, j.w.t.b[r]), "]"))
+    u32 ci = check.s_class_of_ty(j.w, t)
+    if ci != NONE: return index.hold(#format("[\"class\", ", jclass(j, ci), ", ", jstr(check.name_of(j.w, j.w.decls[j.w.classes[ci].decl].name)), "]"))
+    if t == j.w.serror: return index.hold(#format("[\"class\", ", rt(j, "__dados_Error"), ", \"Error\"]"))
+    if t == j.w.sany: return "\"any\""
+    if t == j.w.sstr: return "\"string\""
+    if r == u32(types.P_U8): return "\"byte\""
+    if r == u32(types.P_FLOAT): return "\"float\""
+    if r == u32(types.P_BOOL): return "\"bool\""
+    return "\"int\""
+
+// The function copying a value of type `t`; "" when sharing it is a copy.
+private string8 jcopy(^J j, u32 t):
+    if !check.s_tup(j.w, t): return ""
+    []u32 ss = j.w.t.slots(t)
+    bool deep = false
+    for x in ss:
+        if check.s_tup(j.w, x): deep = true
+    if !deep: return "((t) => t.slice())"
+    ref []string8 xs
+    for k in 0..<#len(ss):
+        string8 c = jcopy(j, ss[k])
+        if #len(c) == 0: xs = #append(xs, index.hold(#format("t[", k, "]")))
+        else: xs = #append(xs, index.hold(#format(c, "(t[", k, "])")))
+    return index.hold(#format("((t) => [", strings.join(xs[:], ", "), "])"))
+
+private string8 int_fn(u8 s):
+    [10]string8 ns = ["add", "sub", "mul", "div", "mod", "and", "or", "xor", "shl", "shr"]
+    return index.hold(#format("__dados_int_", ns[s]))
+
+private string8 jbin(^J j, ^ir.Fn f, u32 i):
+    u8 s = f.sub[i]
+    string8 x = jt(j, f, f.a[i])
+    string8 y = jt(j, f, f.b[i])
+    u32 t = jty(j, f, f.a[i])
+    [16]string8 ops = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "===", "!==", "<", "<=", ">", ">="]
+    // A local `>>` a literal under 32: JavaScript's `>>` on an int32.
+    if t == u32(types.P_INT) && s == ir.B_SHR && jname(x) && jcount(y):
+        return index.hold(#format("(", x, " >= -2147483648 && ", x, " <= 2147483647 ? ", x, " >> ", y, " : ", rt(j, "__dados_int_shr"), "(", x, ", ", y, "))"))
+    if t == u32(types.P_INT) && s <= ir.B_SHR: return index.hold(#format(rt(j, int_fn(s)), "(", x, ", ", y, ")"))
+    return index.hold(#format("(", x, " ", ops[s], " ", y, ")"))
+
+private bool jdigits(string8 s):
+    for ch in s:
+        if ch < '0' || ch > '9': return false
+    return true
+
+// `v` and digits: a local, which reading twice runs nothing.
+private bool jname(string8 s):
+    if #len(s) < 2: return false
+    if s[0] != 'v': return false
+    return jdigits(s[1..<#len(s)])
+
+// A literal count in `0..<32`.
+private bool jcount(string8 y):
+    if #len(y) == 0 || #len(y) > 2 || !jdigits(y): return false
+    if #len(y) == 1: return true
+    i32 n = i32(y[0] - '0') * 10 + i32(y[1] - '0')
+    if y[0] == '0': return false
+    return n < 32
+
+private string8 jconv(^J j, ^ir.Fn f, u32 i):
+    string8 x = jt(j, f, f.a[i])
+    // A union is the pair `[member, payload]`.
+    if f.sub[i] == ir.CV_UNION: return index.hold(#format("[", f.b[i], ", ", x, "]"))
+    if f.sub[i] == ir.CV_TAG: return index.hold(#format(x, "[0]"))
+    if f.sub[i] == ir.CV_MEMBER && f.c[i] == 1: return index.hold(#format("(", x, "[0] === ", f.b[i], " ? ", x, "[1] : ", jzero(j, f.ty_of[i]), ")"))
+    if f.sub[i] == ir.CV_MEMBER: return index.hold(#format(x, "[1]"))
+    u32 from = check.s_erase(j.w, jty(j, f, f.a[i]))
+    u32 to = check.s_erase(j.w, f.ty_of[i])
+    if to == j.w.sstr:
+        if from == j.w.sany: return index.hold(#format(rt(j, "__dados_str_any"), "(", x, ")"))
+        if from == u32(types.P_FLOAT): return index.hold(#format(rt(j, "__dados_str_float"), "(", x, ")"))
+        if from == u32(types.P_BOOL): return index.hold(#format(rt(j, "__dados_str_bool"), "(", x, ")"))
+        if from == j.w.sstr: return x
+        if from != u32(types.P_INT) && !check.s_enum(j.w, from): return index.hold(#format(jstrf(j, from), "(", x, ")"))
+        return index.hold(#format(rt(j, "__dados_str_int"), "(", x, ")"))
+    if to == u32(types.P_INT) && from == u32(types.P_FLOAT): return index.hold(#format(rt(j, "__dados_int_of_float"), "(", x, ")"))
+    if to == u32(types.P_FLOAT) && from == u32(types.P_INT): return index.hold(#format(rt(j, "__dados_float_of_int"), "(", x, ")"))
+    return x
+
+// The runtime function that renders a value of script type `t`.
+private string8 jstrf(^J j, u32 t0):
+    if check.s_denum(j.w, t0) != NONE: return rt(j, "__dados_str_string")
+    if check.sa_inner(j.w, t0) != NONE: return rt(j, "__dados_str_any")
+    u32 t = jnorm(j, t0)
+    if t == j.w.sstr || check.s_enum(j.w, t): return rt(j, "__dados_str_string")
+    if t == u32(types.P_FLOAT): return rt(j, "__dados_str_float")
+    if t == u32(types.P_BOOL): return rt(j, "__dados_str_bool")
+    if t == j.w.serror: return rt(j, "__dados_str_error")
+    if t == j.w.sloc: return rt(j, "__dados_str_location")
+    if t == j.w.sany: return rt(j, "__dados_str_any")
+    if check.s_class_of_ty(j.w, t) != NONE: return rt(j, "__dados_str_obj")
+    u8 k = check.s_kind(j.w, t)
+    u32 r = j.w.t.resolve(t)
+    if check.s_tup(j.w, t):
+        []u32 ss = j.w.t.slots(t)
+        bool one = true
+        for x in ss:
+            if j.w.t.resolve(x) != j.w.t.resolve(ss[0]): one = false
+        if one: return index.hold(#format("((xs) => ", rt(j, "__dados_str_seq"), "(xs, ", jstrf(j, ss[0]), "))"))
+        ref []string8 fs
+        for x in ss:
+            fs = #append(fs, jstrf(j, x))
+        return index.hold(#format("((t) => ", rt(j, "__dados_str_tuple"), "(t, [", strings.join(fs[:], ", "), "]))"))
+    if k == 1: return index.hold(#format("((xs) => ", rt(j, "__dados_str_seq"), "(xs, ", jstrf(j, j.w.t.a[r]), "))"))
+    if k == 2: return index.hold(#format("((m) => ", rt(j, "__dados_str_map"), "(m, ", jstrf(j, j.w.t.a[r]), ", ", jstrf(j, j.w.t.b[r]), "))"))
+    return rt(j, "__dados_str_int")
+
+// What `print` writes of operand `x`.
+private string8 jshow(^J j, ^ir.Fn f, u32 x):
+    u32 t = jty(j, f, x)
+    string8 v = jt(j, f, x)
+    if t == j.w.sstr: return v
+    return index.hold(#format(jstrf(j, t), "(", v, ")"))
+
+// `v` stored into a slot of `et`: a byte kept modulo 256.
+private string8 jstored(^J j, u32 et, u32 x, string8 v):
+    if j.w.t.resolve(et) != u32(types.P_U8) || check.s_denum(j.w, et) != NONE: return v
+    u32 k = x & ~ir.OPD_CONST
+    if ir.is_const(x) && j.w.k.kind[k] == types.C_INT: return index.hold(#format(j.w.k.w0[k] & 255))
+    return index.hold(#format(rt(j, "__dados_byte"), "(", v, ")"))
+
+// Whether `s` is a name, a field of one, or a number: evaluating it twice is once.
+private bool jatom(string8 s):
+    if #len(s) == 0: return false
+    for i in 0..<#len(s):
+        char8 c = s[i]
+        if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$' || c == '.' || c == '-' && i == 0): return false
+    return true
+
+// A container verb.
+private string8 jcont(^J j, ^ir.Fn f, u32 i):
+    []u32 xs = ir.args(f, i)
+    ref []string8 as
+    for x in xs:
+        as = #append(as, jv(j, f, x))
+    u8 s = f.sub[i]
+    if s == check.B_SARRAY:
+        u32 et = j.w.t.a[j.w.t.resolve(f.ty_of[i])]
+        for q in 0..<#len(as):
+            as[q] = jstored(j, et, xs[q], as[q])
+        return index.hold(#format("[", strings.join(as[:], ", "), "]"))
+    if s == check.B_SMAP:
+        ref []char8 o
+        o = #append(o, .."new Map([")
+        for k in 0..<#len(as) / 2:
+            if k > 0: o = #append(o, ..", ")
+            o = #append(o, ..#format("[", as[2 * k], ", ", as[2 * k + 1], "]"))
+        o = #append(o, .."])")
+        return index.hold(o)
+    u32 ct = jty(j, f, xs[0])
+    u8 k = check.s_kind(j.w, ct)
+    // A read checked at the site when its operands are atoms and
+    // no element is nullish (an `any`'s), so `??` meets `undefined` only off the end.
+    bool inl = #len(as) >= 2 && jatom(as[0]) && jatom(as[1]) && check.s_erase(j.w, f.ty_of[i]) != j.w.sany
+    if s == check.B_SINDEX && k == 2 && inl: return index.hold(#format("(", as[0], ".get(", as[1], ") ?? ", rt(j, "__dados_m_absent"), "(", as[1], ", ", jstrf(j, j.w.t.a[j.w.t.resolve(ct)]), "))"))
+    if s == check.B_SINDEX && k == 2: return index.hold(#format(rt(j, "__dados_m_at"), "(", as[0], ", ", as[1], ", ", jstrf(j, j.w.t.a[j.w.t.resolve(ct)]), ")"))
+    if s == check.B_SINDEX && k == 3 && inl: return index.hold(#format("(", as[0], "[", as[1], "] ?? ", rt(j, "__dados_s_oob"), "(", as[0], ", ", as[1], "))"))
+    if s == check.B_SINDEX && k == 3: return index.hold(#format(rt(j, "__dados_s_at"), "(", as[0], ", ", as[1], ")"))
+    if s == check.B_SINDEX && inl: return index.hold(#format("(", as[0], "[", as[1], "] ?? ", rt(j, "__dados_a_oob"), "(", as[0], ", ", as[1], "))"))
+    if s == check.B_SINDEX: return index.hold(#format(rt(j, "__dados_a_at"), "(", as[0], ", ", as[1], ")"))
+    if s == check.B_SSTORE && k == 2: return index.hold(#format(as[0], ".set(", as[1], ", ", as[2], ")"))
+    u32 el = j.w.t.a[j.w.t.resolve(ct)]
+    if s == check.B_SSTORE && f.dst[i] == NONE && jatom(as[0]) && jatom(as[1]):
+        // Checked inline; the value is evaluated first, as the call's was.
+        string8 v = jstored(j, el, xs[2], as[2])
+        string8 ck = index.hold(#format("if (!(", as[1], " >= 0 && ", as[1], " < ", as[0], ".length)) ", rt(j, "__dados_a_oob"), "(", as[0], ", ", as[1], ")"))
+        if jatom(v): return index.hold(#format(ck, "; ", as[0], "[", as[1], "] = ", v))
+        return index.hold(#format("{ const v$ = ", v, "; ", ck, "; ", as[0], "[", as[1], "] = v$; }"))
+    if s == check.B_SSTORE: return index.hold(#format(rt(j, "__dados_a_set"), "(", as[0], ", ", as[1], ", ", jstored(j, el, xs[2], as[2]), ")"))
+    string8 m = j.w.t.text(j.w.k.a[xs[1] & ~ir.OPD_CONST])
+    string8 c = as[0]
+    ref []string8 rs
+    for x in as[2..<#len(as)]:
+        rs = #append(rs, x)
+    if k == 1 && (m == "append" || m == "fill") && #len(rs) == 1: rs[0] = jstored(j, el, xs[2], rs[0])
+    if k == 1 && m == "insert" && #len(rs) == 2: rs[1] = jstored(j, el, xs[3], rs[1])
+    string8 al = index.hold(strings.join(rs[:], ", "))
+    if m == "len" && k == 2: return index.hold(#format(c, ".size"))
+    if m == "len": return index.hold(#format(c, ".length"))
+    if m == "is_empty" && k == 2: return index.hold(#format("(", c, ".size === 0)"))
+    if m == "is_empty": return index.hold(#format("(", c, ".length === 0)"))
+    if k == 1:
+        if m == "any" || m == "all": return index.hold(#format(c, ".", "some" if m == "any" else "every", "((v) => ", rs[0], "(v))"))
+        if m == "filter" || m == "map": return index.hold(#format(c, ".", m, "((v) => ", rs[0], "(v))"))
+        if m == "reduce": return index.hold(#format(c, ".reduce((s, v) => ", rs[0], "(s, v), ", rs[1], ")"))
+        if m == "sort" && #len(rs) == 1: return index.hold(#format(rt(j, "__dados_a_sort_by"), "(", c, ", ", al, ")"))
+        if m == "append": return index.hold(#format(c, ".push(", al, ")"))
+        if m == "fill" || m == "reverse" || m == "join": return index.hold(#format(c, ".", m, "(", al, ")"))
+        if m == "copy": return index.hold(#format(c, ".slice()"))
+        if m == "resize": return index.hold(#format(rt(j, "__dados_a_resize"), "(", c, ", ", al, ", () => ", jzero(j, el), ")"))
+        return index.hold(#format(rt(j, index.hold(#format("__dados_a_", m))), "(", c, ", ", al, ")"))
+    if k == 2:
+        if m == "get": return index.hold(#format(rt(j, "__dados_m_get"), "(", c, ", ", al, ")"))
+        if m == "keys" || m == "values": return index.hold(#format("Array.from(", c, ".", m, "())"))
+        if m == "copy": return index.hold(#format("new Map(", c, ")"))
+        return index.hold(#format(c, ".", m, "(", al, ")"))
+    if m == "bytes": return index.hold(#format(rt(j, "__dados_s_bytes"), "(", c, ")"))
+    if m == "to_int" || m == "to_float": return index.hold(#format(rt(j, index.hold(#format("__dados_s_", m))), "(", c, ")"))
+    if m == "replace_all" || m == "code_point_at": return index.hold(#format(rt(j, index.hold(#format("__dados_s_", m))), "(", c, ", ", al, ")"))
+    if m == "index_of" || m == "last_index_of" || m == "repeat": return index.hold(#format(rt(j, index.hold(#format("__dados_s_", m))), "(", c, ", ", al, ")"))
+    [7]string8 from = ["contains", "starts_with", "ends_with", "trim_left", "trim_right", "to_upper", "to_lower"]
+    [7]string8 to = ["includes", "startsWith", "endsWith", "trimStart", "trimEnd", "toUpperCase", "toLowerCase"]
+    string8 jm = m
+    for q in 0..<7:
+        if from[q] == m: jm = to[q]
+    return index.hold(#format(c, ".", jm, "(", al, ")"))
+
+private u32 stmt_of(^J j, u32 n):
+    if n == NONE || !(n in j.stmt): return NONE
+    try u32 s = j.stmt[n] else: return NONE
+    return s
+
+private i64 span_end(^ir.Fn f, u32 h):
+    return i64(h) + 1 + i64(ir.span(f, h))
+
+// The head op `break`/`continue` `i` leaves.
+private u32 jtarget(^ir.Fn f, u32 i):
+    ref []u32 heads
+    for k in 0..<i:
+        for #len(heads) > 0 && span_end(f, heads[#len(heads) - 1]) <= i64(k):
+            #truncate(heads, #len(heads) - 1)
+        if f.op[k] == ir.O_IF || f.op[k] == ir.O_LOOP || f.op[k] == ir.O_BLOCK: heads = #append(heads, k)
+    for #len(heads) > 0 && span_end(f, heads[#len(heads) - 1]) <= i64(i):
+        #truncate(heads, #len(heads) - 1)
+    u32 t = heads[#len(heads) - 1 - i64(f.a[i])]
+    #delete(heads)
+    return t
+
+// The slots op `k` names: roots of its places (every field that may be one).
+void jroots(^ir.Fn f, u32 k, ^ref []u32 out):
+    #truncate(out^, 0)
+    ref []u32 xs
+    u8 o = f.op[k]
+    xs = #append(xs, f.dst[k])
+    if o != ir.O_BLOCK && o != ir.O_LOOP && o != ir.O_BREAK && o != ir.O_CONTINUE && o != ir.O_CALL && o != ir.O_C_INLINE: xs = #append(xs, f.a[k])
+    bool lens = o == ir.O_IF || o == ir.O_BLOCK && f.sub[k] == 1 || o == ir.O_RETURN_FAIL || o == ir.O_C_INLINE
+    if !lens && o != ir.O_MOVE: xs = #append(xs, f.b[k])
+    if !lens: xs = #append(xs, f.c[k])
+    for q in f.alo[k]..<f.ahi[k]:
+        if o == ir.O_SCOPE_END: out^ = #append(out^, f.args[q])
+        else: xs = #append(xs, f.args[q])
+    i64 at = 0
+    for at < #len(xs):
+        u32 x = xs[at]
+        at += 1
+        if x == NONE || ir.is_const(x) || i64(x) >= #len(f.root): continue
+        if (f.root[x] & ir.ROOT_GLOBAL) == 0: out^ = #append(out^, f.root[x])
+        for q in f.plo[x]..<f.phi[x]:
+            if f.step[q] == ir.ST_INDEX: xs = #append(xs, f.step_val[q])
+    #delete(xs)
+
+// The pending temp's own line.
+private void jflush(^J j):
+    if j.ps == NONE: return
+    jline(j, j.pd, index.hold(#format("v", j.ps, " = ", g_pe[1..<#len(g_pe) - 1], ";")), j.pl, j.pc)
+    j.ps = NONE
+
+// Whether op `i` is `dst = <expression>` with no effect but its own.
+private bool jfoldable(^ir.Fn f, u32 i):
+    u8 o = f.op[i]
+    if f.dst[i] == NONE: return false
+    if o == ir.O_BIN || o == ir.O_UN || o == ir.O_CONV || o == ir.O_SET || o == ir.O_CALL: return true
+    if o != ir.O_INTRINSIC: return false
+    u8 b = f.sub[i]
+    return b >= check.B_SARRAY && b <= check.B_SMETHOD || b >= check.B_MATH && b < check.B_MATH + 29 || b == check.B_SDADO
+
+// Per op, whether its temp is written into the next op instead: a temp
+// written once and read once, by the next op, in the same statement and block.
+private ref []bool jfolds(^J j, ^ir.Fn f, []u32 home):
+    u32 n = ir.count(f)
+    ref []bool out
+    ref []i32 uses
+    ref []u32 encl
+    ref []bool els
+    ref []u32 heads
+    ref []u32 rs
+    for _ in 0..<#len(f.slot_ty):
+        uses = #append(uses, 0)
+    for k in 0..<n:
+        out = #append(out, false)
+        jroots(f, k, &rs)
+        for r in rs:
+            uses[r] += 1
+        for #len(heads) > 0 && span_end(f, heads[#len(heads) - 1]) <= i64(k):
+            #truncate(heads, #len(heads) - 1)
+        u32 h = NONE
+        if #len(heads) > 0: h = heads[#len(heads) - 1]
+        encl = #append(encl, h)
+        els = #append(els, h != NONE && f.op[h] == ir.O_IF && f.c[h] > 0 && k == h + 1 + f.b[h])
+        if f.op[k] == ir.O_IF || f.op[k] == ir.O_LOOP || f.op[k] == ir.O_BLOCK: heads = #append(heads, k)
+    for i in 0..<n:
+        if i + 1 >= n || !jfoldable(f, i): continue
+        u32 s = jslot(f, f.dst[i])
+        if s == NONE || s < f.params || f.plo[f.dst[i]] != f.phi[f.dst[i]] || (f.slot_flags[s] & ir.S_TEMP) == 0 || home[s] != NONE || uses[s] != 2: continue
+        u32 k = i + 1
+        u8 o = f.op[k]
+        if o == ir.O_LOOP || o == ir.O_BLOCK || o == ir.O_BREAK || o == ir.O_CONTINUE || o == ir.O_IF && jslot(f, f.a[k]) != s: continue
+        if jslot(f, f.dst[k]) == s || encl[i] != encl[k] || els[k] || stmt_of(j, f.node[i]) != stmt_of(j, f.node[k]): continue
+        jroots(f, k, &rs)
+        i32 m = 0
+        for r in rs:
+            if r == s: m += 1
+        out[i] = m == 1
+    // A copy of a local into a temp read once later in the statement, the local
+    // written by nothing between and caught by no lambda: the read is the local's
+    // (JavaScript evaluates operands in order, so the copy was for C only).
+    #truncate(j.alias, 0)
+    ref []bool cap
+    for _ in 0..<#len(f.slot_ty):
+        j.alias = #append(j.alias, NONE)
+        cap = #append(cap, false)
+    for h in 0..<n:
+        if f.op[h] != ir.O_BLOCK || f.sub[h] != 1: continue
+        for q in h + 1..<u32(span_end(f, h)):
+            jroots(f, q, &rs)
+            for r in rs:
+                cap[r] = true
+    for i in 0..<n:
+        if out[i] || f.op[i] != ir.O_SET || ir.is_const(f.a[i]): continue
+        u32 s = jslot(f, f.dst[i])
+        u32 p = jslot(f, f.a[i])
+        if s == NONE || p == NONE || s < f.params || f.plo[f.dst[i]] != f.phi[f.dst[i]] || f.plo[f.a[i]] != f.phi[f.a[i]] || (f.slot_flags[s] & ir.S_TEMP) == 0 || home[s] != NONE || uses[s] != 2: continue
+        if cap[p] || cap[s] || (f.slot_flags[p] & ir.S_RECEIVER) != 0 || j.alias[p] != NONE: continue
+        u32 k = i + 1
+        bool ok = true
+        for k < n && ok:
+            u8 o = f.op[k]
+            if o == ir.O_IF || o == ir.O_LOOP || o == ir.O_BLOCK || o == ir.O_BREAK || o == ir.O_CONTINUE || o == ir.O_RETURN_FAIL || o == ir.O_ADDR || encl[k] != encl[i] || els[k] || stmt_of(j, f.node[k]) != stmt_of(j, f.node[i]):
+                ok = false
+                break
+            jroots(f, k, &rs)
+            bool reads = false
+            for r in rs:
+                if r == s: reads = true
+            if reads: break
+            if jslot(f, f.dst[k]) == p: ok = false
+            k += 1
+        if !ok || k >= n || jslot(f, f.dst[k]) == s: continue
+        if f.op[k] == ir.O_IF && jslot(f, f.a[k]) != s: continue
+        j.alias[s] = p
+    #delete(cap)
+    #delete(uses)
+    #delete(encl)
+    #delete(els)
+    #delete(heads)
+    #delete(rs)
+    return out
+
+// The slot place `x` is (NONE: none).
+private u32 jslot(^ir.Fn f, u32 x):
+    if x == NONE || ir.is_const(x) || i64(x) >= #len(f.root) || (f.root[x] & ir.ROOT_GLOBAL) != 0: return NONE
+    return f.root[x]
+
+// Per slot, the loop whose turns each get a fresh one (NONE: none): a slot a
+// lambda captures, every use inside one loop, as Rust's `let`s in JS.
+private ref []u32 jfresh(^ir.Fn f, []bool inner):
+    ref []u32 home
+    ref []bool cap
+    ref []i64 lo
+    ref []i64 hi
+    for _ in 0..<#len(f.slot_ty):
+        home = #append(home, NONE)
+        cap = #append(cap, false)
+        lo = #append(lo, -1)
+        hi = #append(hi, -1)
+    ref []u32 rs
+    for k in 0..<ir.count(f):
+        jroots(f, k, &rs)
+        for r in rs:
+            if lo[r] < 0: lo[r] = i64(k)
+            hi[r] = i64(k)
+        if f.op[k] != ir.O_BLOCK || f.sub[k] != 1: continue
+        for q in k + 1..<u32(span_end(f, k)):
+            jroots(f, q, &rs)
+            for r in rs:
+                if r < f.b[k] || r >= f.ty_of[k]: cap[r] = true
+    #delete(rs)
+    for s in f.params..<u32(#len(f.slot_ty)):
+        if !cap[s] || inner[s]: continue
+        for h in 0..<ir.count(f):
+            if f.op[h] == ir.O_LOOP && i64(h) <= lo[s] && hi[s] < span_end(f, h): home[s] = h
+        u32 h = home[s]
+        if h == NONE: continue
+        if lo[s] == i64(h) && !(f.sub[h] != 0 && (s == jslot(f, f.c[h]) || s == jslot(f, f.dst[h]))): home[s] = NONE
+    #delete(cap)
+    #delete(lo)
+    #delete(hi)
+    return home
+
+// One function's body, `d` its depth.
+private void jbody(^J j, ^ir.Fn f, i64 d):
+    #truncate(j.targeted, 0)
+    for _ in 0..<ir.count(f):
+        j.targeted = #append(j.targeted, false)
+    for i in 0..<ir.count(f):
+        if f.op[i] == ir.O_BREAK || f.op[i] == ir.O_CONTINUE: j.targeted[jtarget(f, i)] = true
+    // A lambda's slots are its own: declared inside it.
+    ref []bool inner
+    for _ in 0..<#len(f.slot_ty):
+        inner = #append(inner, false)
+    for i in 0..<ir.count(f):
+        if f.op[i] != ir.O_BLOCK || f.sub[i] != 1: continue
+        for s in f.b[i]..<f.ty_of[i]:
+            inner[s] = true
+    ref []u32 home = jfresh(f, inner[:])
+    j.ps = NONE
+    for h in 0..<ir.count(f):
+        // A walk's bindings are fresh together, in its head.
+        if f.op[h] != ir.O_LOOP || f.sub[h] != 2 || jslot(f, f.c[h]) == NONE || jslot(f, f.dst[h]) == NONE: continue
+        if home[jslot(f, f.dst[h])] != h || home[jslot(f, f.c[h])] != h:
+            home[jslot(f, f.dst[h])] = NONE
+            home[jslot(f, f.c[h])] = NONE
+    ref []char8 lets
+    for s in f.params..<u32(#len(f.slot_ty)):
+        if inner[s] || home[s] != NONE: continue
+        if #len(lets) > 0: lets = #append(lets, ..", ")
+        lets = #append(lets, ..#format("v", s))
+    // `var`: QuickJS checks a `let`'s TDZ on every read.
+    if #len(lets) > 0: jline(j, d, index.hold(#format("var ", lets, ";")), 0, 0)
+    ref []bool fold = jfolds(j, f, home[:])
+    ref []u32 heads
+    ref []check.Where hw
+    for i in 0..<ir.count(f):
+        for #len(heads) > 0 && span_end(f, heads[#len(heads) - 1]) <= i64(i):
+            jflush(j)
+            jclose(j, f, d + #len(heads) - 1, heads[#len(heads) - 1], hw[#len(hw) - 1])
+            #truncate(heads, #len(heads) - 1)
+            #truncate(hw, #len(hw) - 1)
+        if #len(heads) > 0:
+            u32 h = heads[#len(heads) - 1]
+            if f.op[h] == ir.O_IF && f.c[h] > 0 && i == h + 1 + f.b[h]:
+                jflush(j)
+                jline(j, d + #len(heads) - 1, "} else {", hw[#len(hw) - 1].line, hw[#len(hw) - 1].col)
+        u32 sn = stmt_of(j, f.node[i])
+        check.Where at = check.Where(0, 0)
+        if sn != NONE: at = check.where(j.w, f.file, f.item, sn)
+        i32 l = i32(at.line)
+        i32 c = i32(at.col)
+        i64 dd = d + #len(heads)
+        u8 o = f.op[i]
+        string8 lab = ""
+        if j.targeted[i]: lab = index.hold(#format("L", i, ": "))
+        if o == ir.O_IF || o == ir.O_LOOP || o == ir.O_BLOCK:
+            string8 hd = "{"
+            if o != ir.O_IF: jflush(j)
+            if o == ir.O_IF:
+                j.pu = 0
+                hd = index.hold(#format("if (", jt(j, f, f.a[i]), ") {"))
+                if j.ps != NONE && j.pu != 1:
+                    jflush(j)
+                    hd = index.hold(#format("if (", jt(j, f, f.a[i]), ") {"))
+                j.ps = NONE
+            if o == ir.O_LOOP: hd = "for (;;) {"
+            // A walk's head binds afresh per turn (an index walk: its index).
+            string8 lt = ""
+            u32 hs = jslot(f, f.dst[i])
+            if o == ir.O_LOOP && f.sub[i] == 1 && f.c[i] != NONE: hs = jslot(f, f.c[i])
+            if o == ir.O_LOOP && f.sub[i] != 0 && hs != NONE && home[hs] == i: lt = "let "
+            if o == ir.O_LOOP && f.sub[i] == 1 && f.c[i] == NONE: hd = index.hold(#format("for (", lt, jt(j, f, f.dst[i]), " of ", jt(j, f, f.b[i]), ") {"))
+            if o == ir.O_LOOP && f.sub[i] == 1 && f.c[i] != NONE:
+                string8 ix = jt(j, f, f.c[i])
+                hd = index.hold(#format("for (", lt, ix, " = 0; ", ix, " < ", jt(j, f, f.b[i]), ".length; ", ix, " = ", ix, " + 1) {"))
+            if o == ir.O_LOOP && f.sub[i] == 2 && f.c[i] == NONE: hd = index.hold(#format("for (", lt, jt(j, f, f.dst[i]), " of ", jt(j, f, f.b[i]), ".keys()) {"))
+            if o == ir.O_LOOP && f.sub[i] == 2 && f.c[i] != NONE: hd = index.hold(#format("for (", lt, "[", jt(j, f, f.dst[i]), ", ", jt(j, f, f.c[i]), "] of ", jt(j, f, f.b[i]), ") {"))
+            if o == ir.O_LOOP && f.sub[i] == 3: hd = index.hold(#format("for (const slot$", i, " of ", jt(j, f, f.b[i]), ".$slots()) {"))
+            if o == ir.O_LOOP && f.sub[i] == 4: hd = index.hold(#format("for (const slot$", i, " of ", rt(j, "__dados_slots"), "(", jt(j, f, f.b[i]), ")) {"))
+            if o == ir.O_BLOCK && f.sub[i] == 1:
+                ref []char8 ps
+                for s in f.b[i]..<f.b[i] + f.c[i]:
+                    if #len(ps) > 0: ps = #append(ps, ..", ")
+                    ps = #append(ps, ..#format("v", s))
+                string8 asy = ""
+                if f.facts[i] == 1: asy = "async "
+                hd = index.hold(#format(jt(j, f, f.dst[i]), " = ", asy, "(", index.hold(ps), ") => {"))
+            if o == ir.O_BLOCK && f.sub[i] == 3:
+                jline(j, dd, index.hold(#format("let failing$", i, " = false;")), l, c)
+                hd = "try {"
+            if o == ir.O_BLOCK && f.sub[i] == 4: hd = "try {"
+            if o == ir.O_BLOCK && f.sub[i] == 5: hd = index.hold(#format("catch (thrown$", i, ") {"))
+            jline(j, dd, index.hold(#format(lab, hd)), l, c)
+            if j.web && o == ir.O_LOOP:
+                web_use(&j.stops, "__dados_poll")
+                jline(j, dd + 1, "if (--tick$ < 0) tick$ = __dados_poll();", l, c)
+            if j.web && o == ir.O_BLOCK && f.sub[i] == 5: jline(j, dd + 1, web_pass(j, index.hold(#format("thrown$", i))), l, c)
+            if o == ir.O_LOOP:
+                ref []char8 fl
+                for s in f.params..<u32(#len(f.slot_ty)):
+                    if home[s] != i || #len(lt) > 0 && (s == hs || f.sub[i] == 2 && s == jslot(f, f.c[i])): continue
+                    if #len(fl) > 0: fl = #append(fl, ..", ")
+                    fl = #append(fl, ..#format("v", s))
+                if #len(fl) > 0: jline(j, dd + 1, index.hold(#format("let ", fl, ";")), l, c)
+            if o == ir.O_BLOCK && f.sub[i] == 5 && f.b[i] != NONE: jline(j, dd + 1, index.hold(#format(jt(j, f, f.b[i]), " = ", rt(j, "__dados_failure"), "(thrown$", i, ");")), l, c)
+            if o == ir.O_LOOP && f.sub[i] == 1 && f.c[i] != NONE: jline(j, dd + 1, index.hold(#format(jt(j, f, f.dst[i]), " = ", jt(j, f, f.b[i]), "[", jt(j, f, f.c[i]), "];")), l, c)
+            if o == ir.O_LOOP && f.sub[i] >= 3 && f.dst[i] != NONE: jline(j, dd + 1, index.hold(#format(lt, jt(j, f, f.dst[i]), " = slot$", i, ";")), l, c)
+            if o == ir.O_LOOP && f.sub[i] >= 3: jline(j, dd + 1, index.hold(#format(jt(j, f, f.c[i]), " = ", jt(j, f, f.b[i]), "[slot$", i, "];")), l, c)
+            if o == ir.O_BLOCK && f.sub[i] == 1:
+                ref []char8 ls
+                for s in f.b[i] + f.c[i]..<f.ty_of[i]:
+                    if #len(ls) > 0: ls = #append(ls, ..", ")
+                    ls = #append(ls, ..#format("v", s))
+                if #len(ls) > 0: jline(j, dd + 1, index.hold(#format("var ", ls, ";")), l, c)
+            heads = #append(heads, i)
+            hw = #append(hw, at)
+            continue
+        if o == ir.O_SET && f.dst[i] != NONE && f.plo[f.dst[i]] == f.phi[f.dst[i]] && jslot(f, f.dst[i]) != NONE && j.alias[jslot(f, f.dst[i])] != NONE:
+            jflush(j)
+            continue
+        j.pu = 0
+        string8 s = jstmt(j, f, i, l, c)
+        if j.ps != NONE:
+            if j.pu != 1:
+                jflush(j)
+                s = jstmt(j, f, i, l, c)
+            j.ps = NONE
+        if fold[i]:
+            string8 d0 = index.hold(#format(jt(j, f, f.dst[i]), " = "))
+            if #len(s) > #len(d0) && strings.starts_with(s, d0) && strings.ends_with(s, ";"):
+                j.ps = jslot(f, f.dst[i])
+                g_pe = index.hold(#format("(", s[#len(d0)..<#len(s) - 1], ")"))
+                j.pl = l
+                j.pc = c
+                j.pd = dd
+                continue
+        if #len(s) > 0: jline(j, dd, index.hold(#format(lab, s)), l, c)
+    jflush(j)
+    for #len(heads) > 0:
+        jclose(j, f, d + #len(heads) - 1, heads[#len(heads) - 1], hw[#len(hw) - 1])
+        #truncate(heads, #len(heads) - 1)
+        #truncate(hw, #len(hw) - 1)
+
+// Op `i` as a statement (not a head); "" for none.
+private string8 jstmt(^J j, ^ir.Fn f, u32 i, i32 l, i32 c):
+    u8 o = f.op[i]
+    string8 s = ""
+    string8 dst = ""
+    if f.dst[i] != NONE: dst = jt(j, f, f.dst[i])
+    if o == ir.O_BREAK: s = index.hold(#format("break L", jtarget(f, i), ";"))
+    else if o == ir.O_CONTINUE: s = index.hold(#format("continue L", jtarget(f, i), ";"))
+    else if o == ir.O_RETURN && f.a[i] == NONE: s = "return;"
+    else if o == ir.O_RETURN: s = index.hold(#format("return ", jv(j, f, f.a[i]), ";"))
+    else if o == ir.O_RETURN_FAIL:
+        string8 at = index.hold(#format("new ", rt(j, "__dados_Location"), "(", jstr(j.w.p.files[f.file].path), ", ", l, ", ", c, ", ", jstr(j.fname), ")"))
+        if f.sub[i] == 2: s = index.hold(#format("throw ", rt(j, "__dados_raise"), "(new ", rt(j, "__dados_Error"), "(", jt(j, f, f.a[i]), ", 70, ", at, "));"))
+        else if f.sub[i] == 3: s = index.hold(#format("throw ", rt(j, "__dados_raise"), "(", jt(j, f, f.a[i]), ");"))
+        else: s = index.hold(#format("throw ", rt(j, "__dados_failed"), "(", jt(j, f, f.a[i]), ", ", at, ");"))
+    else if o == ir.O_SET && jfull(j, f.a[i]): s = index.hold(#format(dst, " = ", jconst(j, f.a[i] & ~ir.OPD_CONST), ";"))
+    else if o == ir.O_SET && ir.is_const(f.a[i]) && (check.s_tup(j.w, f.ty_of[i]) || check.union_of(j.w, f.ty_of[i]) != NONE || f.ty_of[i] == j.w.sloc || f.ty_of[i] == j.w.serror || (check.s_kind(j.w, f.ty_of[i]) == 1 || check.s_kind(j.w, f.ty_of[i]) == 2) && j.w.k.kind[f.a[i] & ~ir.OPD_CONST] == types.C_TUPLE): s = index.hold(#format(dst, " = ", jzero(j, f.ty_of[i]), ";"))
+    else if o == ir.O_SET: s = index.hold(#format(dst, " = ", jv(j, f, f.a[i]), ";"))
+    else if o == ir.O_MAKE:
+        ref []string8 ms
+        for x in ir.args(f, i):
+            ms = #append(ms, jv(j, f, x))
+        s = index.hold(#format(dst, " = [", strings.join(ms[:], ", "), "];"))
+    else if o == ir.O_CHECK && f.sub[i] == ir.CK_BOUNDS: s = index.hold(#format(rt(j, "__dados_bounds"), "(", jt(j, f, f.a[i]), ", ", jt(j, f, f.b[i]), ");"))
+    else if o == ir.O_VIEW:
+        string8 lo = "0" if f.b[i] == NONE else jt(j, f, f.b[i])
+        string8 hi = ""
+        if f.c[i] != NONE: hi = index.hold(#format(", ", jt(j, f, f.c[i])))
+        s = index.hold(#format(dst, " = ", rt(j, "__dados_a_slice"), "(", jt(j, f, f.a[i]), ", ", lo, hi, ");"))
+    else if o == ir.O_BIN: s = index.hold(#format(dst, " = ", jbin(j, f, i), ";"))
+    else if o == ir.O_UN:
+        string8 x = jt(j, f, f.a[i])
+        string8 e = index.hold(#format("!", x))
+        if f.sub[i] == ir.U_NEG && jty(j, f, f.a[i]) == u32(types.P_INT): e = index.hold(#format(rt(j, "__dados_int_neg"), "(", x, ")"))
+        else if f.sub[i] == ir.U_NEG: e = index.hold(#format("(-", x, ")"))
+        else if f.sub[i] == ir.U_BITNOT: e = index.hold(#format(rt(j, "__dados_int_not"), "(", x, ")"))
+        s = index.hold(#format(dst, " = ", e, ";"))
+    else if o == ir.O_CONV: s = index.hold(#format(dst, " = ", jconv(j, f, i), ";"))
+    else if o == ir.O_CALL:
+        []u32 xs = ir.args(f, i)
+        ref []char8 cl
+        string8 on = "super"
+        if f.sub[i] != 1: on = jt(j, f, xs[0])
+        cl = #append(cl, ..#format(on, ".", j.w.t.text(f.ref_name[f.a[i]]), "("))
+        for k in 1..<#len(xs):
+            if k > 1: cl = #append(cl, ..", ")
+            cl = #append(cl, ..jv(j, f, xs[k]))
+        cl = #append(cl, ..");")
+        if f.dst[i] == NONE: s = index.hold(cl)
+        else: s = index.hold(#format(dst, " = ", cl))
+    else if o == ir.O_INTRINSIC && (f.sub[i] == check.B_PRINT || f.sub[i] == check.B_PRINTLN):
+        []u32 xs = ir.args(f, i)
+        ref []char8 cl
+        for k in 0..<#len(xs):
+            if k > 0: cl = #append(cl, .." + ")
+            cl = #append(cl, ..jshow(j, f, xs[k]))
+        if #len(xs) == 0: cl = #append(cl, .."\"\"")
+        string8 pn = "println("
+        if f.sub[i] == check.B_PRINT: pn = "print("
+        if j.web || j.pkg: web_use(&j.prints, pn[0..<#len(pn) - 1])
+        s = index.hold(#format(pn, cl, ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] >= check.B_SIG_CONNECT && f.sub[i] <= check.B_SIG_EMIT: s = jsig(j, f, i)
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SRECV:
+        []u32 rx = ir.args(f, i)
+        u32 cd = j.w.recv[j.w.k.w0[rx[0] & ~ir.OPD_CONST]]
+        string8 fnm = index.hold(#format("receive$", check.name_of(j.w, j.w.decls[cd].name)))
+        string8 key = index.hold(#format(check.name_of(j.w, j.w.p.pkgs[j.w.decls[cd].pkg].name), "/", fnm))
+        bool have = false
+        for x in j.dado:
+            if x == key: have = true
+        if !have: j.dado = #append(j.dado, key)
+        string8 h = jt(j, f, rx[2])
+        if j.w.k.w0[rx[1] & ~ir.OPD_CONST] == 1: h = index.hold(#format("this.", j.w.t.text(j.w.k.a[rx[2] & ~ir.OPD_CONST]), ".bind(this)"))
+        s = index.hold(#format("dado$", fnm, "(", h, ");"))
+    else if o == ir.O_INTRINSIC && (f.sub[i] == check.B_SENUM_OF || f.sub[i] == check.B_SENUM_INT):
+        []u32 ex = ir.args(f, i)
+        u32 ed = u32(j.w.k.w0[ex[0] & ~ir.OPD_CONST])
+        bool eh = false
+        for x in j.enums:
+            if x == ed: eh = true
+        if !eh: j.enums = #append(j.enums, ed)
+        string8 ef = "enum$of" if f.sub[i] == check.B_SENUM_OF else "enum$int"
+        s = index.hold(#format(dst, " = ", ef, "(", jenum(j, ed), ", ", jt(j, f, ex[1]), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SDADO:
+        string8 fnm = index.hold(strings.clone(j.w.t.text(f.ref_name[f.a[i]])))
+        string8 key = index.hold(#format(j.w.t.text(f.ref_pkg[f.a[i]]), "/", fnm))
+        bool have = false
+        for x in j.dado:
+            if x == key: have = true
+        if !have: j.dado = #append(j.dado, key)
+        string8 il = ""
+        if j.web: il = inline_site(j, f, i)
+        ref []string8 as
+        if #len(il) == 0:
+            for x in ir.args(f, i):
+                as = #append(as, jt(j, f, x))
+        string8 cl = index.hold(#format("dado$", fnm, "(", strings.join(as[:], ", "), ")"))
+        // On the web the site counts the crossing (the page's `calls`).
+        if #len(il) > 0: cl = il
+        else if j.web:
+            web_use(&j.prints, "__dados_C")
+            cl = index.hold(#format("(__dados_C.calls++, ", cl, ")"))
+        if f.dst[i] == NONE: s = index.hold(#format(cl, ";"))
+        else: s = index.hold(#format(dst, " = ", cl, ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_MAP_HAS:
+        []u32 hx = ir.args(f, i)
+        s = index.hold(#format(dst, " = ", jt(j, f, hx[0]), ".has(", jt(j, f, hx[1]), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SCAN:
+        []u32 hx = ir.args(f, i)
+        s = index.hold(#format(dst, " = ", jt(j, f, hx[0]), ".some(($x) => $x === ", jt(j, f, hx[1]), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SLOAD:
+        ref []string8 ls
+        for x in ir.args(f, i):
+            ls = #append(ls, jt(j, f, x))
+        if !jhas(j.mods[:], "__dados_load"): j.mods = #append(j.mods, "__dados_load")
+        string8 call = index.hold(#format("__dados_load(", ls[0], ", [", strings.join(ls[1..<#len(ls)], ", "), "])"))
+        if f.dst[i] == NONE: s = index.hold(#format(call, ";"))
+        else: s = index.hold(#format(dst, " = ", call, ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SANY && f.dst[i] == NONE: s = index.hold(#format(jdyn(j, f, i), ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SANY: s = index.hold(#format(dst, " = ", jdyn(j, f, i), ";"))
+    else if o == ir.O_CALL_INDIRECT || o == ir.O_INTRINSIC && (f.sub[i] == check.B_SLOC || f.sub[i] == check.B_SERR):
+        []u32 xs = ir.args(f, i)
+        ref []string8 as
+        for x in xs:
+            as = #append(as, jv(j, f, x))
+        string8 cl = index.hold(#format(jt(j, f, f.a[i]), "(", strings.join(as[:], ", "), ")"))
+        string8 ck = "__dados_Location"
+        if f.sub[i] == check.B_SERR: ck = "__dados_Error"
+        if o != ir.O_CALL_INDIRECT: cl = index.hold(#format("new ", rt(j, ck), "(", strings.join(as[:], ", "), ")"))
+        s = index.hold(#format(cl, ";"))
+        if f.dst[i] != NONE: s = index.hold(#format(dst, " = ", cl, ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SSLICE:
+        []u32 xs = ir.args(f, i)
+        string8 hp = "__dados_a_slice"
+        if j.w.k.w0[xs[4] & ~ir.OPD_CONST] == 1: hp = "__dados_s_slice"
+        u64 md = j.w.k.w0[xs[3] & ~ir.OPD_CONST]
+        string8 hs = index.hold(#format(", ", jv(j, f, xs[2])))
+        if md == 1: hs = index.hold(#format(", ", rt(j, "__dados_int_add"), "(", jv(j, f, xs[2]), ", 1)"))
+        if md == 2: hs = ""
+        s = index.hold(#format(dst, " = ", rt(j, hp), "(", jv(j, f, xs[0]), ", ", jv(j, f, xs[1]), hs, ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SAWAIT && f.dst[i] == NONE: s = index.hold(#format("await ", jv(j, f, ir.args(f, i)[0]), ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SAWAIT: s = index.hold(#format(dst, " = await ", jv(j, f, ir.args(f, i)[0]), ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SASSERT:
+        []u32 xs = ir.args(f, i)
+        string8 m = "null"
+        if #len(xs) > 2: m = jv(j, f, xs[2])
+        s = index.hold(#format("if (!", jv(j, f, xs[0]), ") throw ", rt(j, "__dados_assert"), "(", m, ", ", jv(j, f, xs[1]), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SJS:
+        ref []string8 as
+        for x in ir.args(f, i):
+            as = #append(as, jv(j, f, x))
+        string8 cl = index.hold(#format(j.w.t.text(j.w.k.a[f.a[i] & ~ir.OPD_CONST]), "(", strings.join(as[:], ", "), ")"))
+        // An `any` answer is taken as it is, `undefined` included (Rust's).
+        if f.ty_of[i] != u32(types.P_VOID) && f.ty_of[i] != j.w.sany: cl = index.hold(#format(rt(j, "__dados_from_any"), "(", cl, ", ", jkind(j, f.ty_of[i]), ")"))
+        s = index.hold(#format(cl, ";"))
+        if f.dst[i] != NONE: s = index.hold(#format(dst, " = ", cl, ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SPROP:
+        []u32 xs = ir.args(f, i)
+        s = index.hold(#format(dst, " = ", jt(j, f, xs[0]), "[", jt(j, f, xs[1]), "];"))
+        if f.c[i] == 1: s = index.hold(#format(dst, " = ", jt(j, f, xs[0]), "[", jt(j, f, xs[1]), "].bind(", jt(j, f, xs[0]), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SNARROW:
+        j.narrows = true
+        _ = rt(j, "__dados_str_float")
+        i64 site = i64(j.w.k.w0[f.b[i] & ~ir.OPD_CONST])
+        s = index.hold(#format(dst, " = __dados_narrows(", jt(j, f, f.a[i]), ", \"", check.shown(j.w, f.ty_of[i]), "\", ", site, ", ", jstr(j.w.narrows[site]), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] == check.B_SNEW:
+        ref []string8 as
+        for x in ir.args(f, i):
+            as = #append(as, jt(j, f, x))
+        s = index.hold(#format(dst, " = new ", jclass(j, check.s_class_of_ty(j.w, f.ty_of[i])), "(", strings.join(as[:], ", "), ");"))
+    else if o == ir.O_INTRINSIC && f.sub[i] >= check.B_SARRAY && f.sub[i] <= check.B_SMETHOD && f.dst[i] != NONE: s = index.hold(#format(dst, " = ", jcont(j, f, i), ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] >= check.B_SARRAY && f.sub[i] <= check.B_SMETHOD: s = index.hold(#format(jcont(j, f, i), ";"))
+    else if o == ir.O_INTRINSIC && f.sub[i] >= check.B_MATH && f.sub[i] < check.B_MATH + 29: s = index.hold(#format(dst, " = ", jmath(j, f, i), ";"))
+    return s
+
+// A head's end; a `defer`'s guard runs its lambda however the scope ends.
+private void jclose(^J j, ^ir.Fn f, i64 d, u32 h, check.Where at):
+    if f.op[h] == ir.O_BLOCK && f.sub[h] == 3:
+        string8 x = jt(j, f, f.b[h])
+        string8 th = index.hold(#format("thrown$", h))
+        string8 drop = "catch (_) {}"
+        if j.web: drop = index.hold(#format("catch (_) { ", web_pass(j, "_"), " }"))
+        if f.c[h] == 1:
+            jline(j, d, index.hold(#format("} catch (", th, ") {")), at.line, at.col)
+            if j.web: jline(j, d + 1, web_pass(j, th), at.line, at.col)
+            jline(j, d + 1, index.hold(#format("try { ", x, "(); } ", drop)), at.line, at.col)
+            jline(j, d + 1, index.hold(#format("throw thrown$", h, ";")), at.line, at.col)
+            jline(j, d, "}", at.line, at.col)
+            return
+        jline(j, d, index.hold(#format("} catch (", th, ") {")), at.line, at.col)
+        jline(j, d + 1, index.hold(#format("failing$", h, " = true;")), at.line, at.col)
+        if j.web: jline(j, d + 1, web_pass(j, th), at.line, at.col)
+        jline(j, d + 1, index.hold(#format("try { ", x, "(); } ", drop)), at.line, at.col)
+        jline(j, d + 1, index.hold(#format("throw thrown$", h, ";")), at.line, at.col)
+        jline(j, d, index.hold(#format("} finally { if (!failing$", h, ") ", x, "(); }")), at.line, at.col)
+        return
+    jline(j, d, "}", at.line, at.col)
+
+private string8 jsig(^J j, ^ir.Fn f, u32 i):
+    []u32 xs = ir.args(f, i)
+    string8 o = jt(j, f, xs[0])
+    string8 sn = jt(j, f, xs[1])
+    if f.sub[i] == check.B_SIG_EMIT:
+        ref []char8 vs
+        for k in 2..<#len(xs):
+            if k > 2: vs = #append(vs, ..", ")
+            vs = #append(vs, ..jt(j, f, xs[k]))
+        return index.hold(#format(rt(j, "__dados_sig_emit"), "(", o, ", ", sn, ", [", index.hold(vs), "]);"))
+    string8 fnm = "__dados_sig_connect"
+    if f.sub[i] == check.B_SIG_DISCONNECT: fnm = "__dados_sig_disconnect"
+    if #len(xs) == 3: return index.hold(#format(rt(j, fnm), "(", o, ", ", sn, ", null, ", jt(j, f, xs[2]), ");"))
+    return index.hold(#format(rt(j, fnm), "(", o, ", ", sn, ", ", jt(j, f, xs[2]), ", ", jt(j, f, xs[3]), ");"))
+
+private string8 jmath(^J j, ^ir.Fn f, u32 i):
+    []u32 xs = ir.args(f, i)
+    i64 k = i64(f.sub[i] - check.B_MATH)
+    check.MathRow r = check.MATH[k]
+    ref []string8 as
+    for x in xs:
+        as = #append(as, jt(j, f, x))
+    bool int_ = f.ty_of[i] == u32(types.P_INT)
+    if int_ && k == 26: return index.hold(#format(rt(j, "__dados_int_abs"), "(", as[0], ")"))
+    if int_ && k == 27: return index.hold(#format("(", as[0], " <= ", as[1], " ? ", as[0], " : ", as[1], ")"))
+    if int_ && k == 28: return index.hold(#format("(", as[0], " >= ", as[1], " ? ", as[0], " : ", as[1], ")"))
+    if r.js == "2 ** ": return index.hold(#format("(2 ** ", as[0], ")"))
+    if k == 21: return index.hold(#format("(", as[0], " * ", as[1], " + ", as[2], ")"))
+    if k == 24: return index.hold(#format(rt(j, "__dados_round"), "(", as[0], ")"))
+    return index.hold(#format(r.js, "(", strings.join(as[:], ", "), ")"))
+
+// How this module names class `ci`: its own name, else an import.
+// A class's name as a JS identifier: `A.Part` is `A$Part`.
+string8 jid(string8 s):
+    if !strings.contains(s, "."): return s
+    ref []char8 o
+    for ch in s:
+        o = #append(o, '$' if ch == '.' else ch)
+    return index.hold(o)
+
+private string8 jclass(^J j, u32 ci):
+    check.SClass c = j.w.classes[ci]
+    string8 cn = jid(check.name_of(j.w, j.w.decls[c.decl].name))
+    g_reached = #append(g_reached, ci)
+    if ci == j.ci: return cn
+    bool had = false
+    for x in j.classes:
+        if x == ci: had = true
+    if !had: j.classes = #append(j.classes, ci)
+    return index.hold(#format("(class$", check.name_of(j.w, j.w.p.pkgs[j.w.decls[c.decl].pkg].name), "$", cn, "())"))
+
+// The params of a method's IR, as JS names.
+private string8 jparams(^ir.Fn f, string8 p):
+    ref []char8 o
+    for s in 0..<f.params:
+        if (f.slot_flags[s] & ir.S_RECEIVER) != 0: continue
+        if #len(o) > 0: o = #append(o, ..", ")
+        o = #append(o, ..#format(p, s))
+    return index.hold(o)
+
+// The module of class `ci`: its text.
+string8 js_module(^check.World w, u32 ci):
+    return js_module_as(w, ci, w.os == "WEB")
+
+// `web`: the web's flavour.
+string8 js_module_as(^check.World w, u32 ci, bool web):
+    J j
+    j.ps = NONE
+    j.w = w
+    j.ci = ci
+    j.web = web
+    j.pkg = g_pkg && !web
+    if web: j.ip = inline_plan(w)
+    j.at = index.hold(#format(jmod(w, ci), ".js"))
+    check.SClass sc = w.classes[ci]
+    j.file = sc.file
+    string8 pk = check.name_of(w, w.p.pkgs[w.decls[sc.decl].pkg].name)
+    string8 cn = check.name_of(w, w.decls[sc.decl].name)
+    stmts(&j, sc.node, NONE)
+    ref []string8 fns
+    for m in sc.methods:
+        fns = #append(fns, index.hold(#format(pk, ".", cn, ".", check.name_of(w, w.decls[m].name))))
+    j.fn = -1
+    // A root class constructs: its fields (`$fields`, which a subclass
+    // extends), then `init`.
+    u32 pc = check.s_parent(w, ci)
+    string8 pim = ""
+    string8 ci_ = jid(cn)
+    if pc == NONE: jline(&j, 0, index.hold(#format("class ", ci_, " {")), 0, 0)
+    else:
+        check.SClass ps = w.classes[pc]
+        string8 ppk = check.name_of(w, w.p.pkgs[w.decls[ps.decl].pkg].name)
+        string8 ppm = check.name_of(w, w.decls[ps.decl].name)
+        string8 ppn = jid(ppm)
+        pim = index.hold(#format("import { ", ppn, "$class as class$", ppk, "$", ppn, " } from ", jstr(jspec(&j, index.hold(#format(ppk, "/", ppm)))), ";"))
+        jline(&j, 0, index.hold(#format("class ", ci_, " extends class$", ppk, "$", ppn, "() {")), 0, 0)
+    // Outside a hierarchy the constructor stores the fields itself (Rust's),
+    // so a reload's code, which has no `$fields`, still constructs.
+    bool hier = pc != NONE
+    for x in 0..<#len(w.classes):
+        if check.s_parent(w, u32(x)) == ci: hier = true
+    if pc == NONE:
+        jline(&j, 1, "constructor(...args) {", 0, 0)
+        if hier: jline(&j, 2, "this.$fields();", 0, 0)
+    i64 cj = -1
+    for i in 0..<#len(w.fns):
+        if w.jobs[i].decl == sc.decl: cj = i
+    if !hier && cj >= 0:
+        j.fname = ""
+        jbody(&j, &w.fns[cj], 2)
+        for x in 0..<#len(j.dl):
+            j.dl[x] = 0
+            j.dc[x] = 0
+            j.dfn[x] = -1
+    if pc == NONE:
+        if hier || sc.init != NONE: jline(&j, 2, "this.init(...args);", 0, 0)
+        jline(&j, 1, "}", 0, 0)
+        if hier && sc.init == NONE: jline(&j, 1, "init() {}", 0, 0)
+    if hier: jline(&j, 1, "$fields() {", 0, 0)
+    if pc != NONE: jline(&j, 2, "super.$fields();", 0, 0)
+    if hier && cj >= 0:
+        j.fname = ""
+        jbody(&j, &w.fns[cj], 2)
+        for x in 0..<#len(j.dl):
+            j.dl[x] = 0
+            j.dc[x] = 0
+            j.dfn[x] = -1
+    if hier: jline(&j, 1, "}", 0, 0)
+    for mi in 0..<#len(sc.methods):
+        u32 m = sc.methods[mi]
+        i64 fj = -1
+        for i in 0..<#len(w.fns):
+            if w.jobs[i].decl == m: fj = i
+        if fj < 0: continue
+        jline(&j, 0, "", 0, 0)
+        j.fn = -1
+        jline(&j, 1, index.hold(#format(jasync(w, m), check.name_of(w, w.decls[m].name), "(", jparams(&w.fns[fj], "v"), ") {")), 0, 0)
+        j.fn = i32(mi)
+        j.fname = fns[mi]
+        if m == sc.init && j.ci in w.simplicit: jline(&j, 2, "super.init();", 0, 0)
+        if !web && unit_of(u32(fj)):
+            // Rung 1: the C first; `null` is a fault, which the JavaScript below raises.
+            string8 un = unit_name(w, u32(fj))
+            j.dado = #append(j.dado, index.hold(#format(pk, "/", un)))
+            jline(&j, 2, index.hold(#format("const r$ = dado$", un, "(", jparams(&w.fns[fj], "v"), ");")), 0, 0)
+            jline(&j, 2, "if (r$ !== null) return r$;", 0, 0)
+        jbody(&j, &w.fns[fj], 2)
+        j.fn = -1
+        jline(&j, 1, "}", 0, 0)
+    // The slot names a walk reads.
+    ref []string8 sq
+    ref []string8 pp
+    []u32 pts = w.t.slots(w.decls[sc.decl].ty)
+    ref []check.SField sfl = check.s_fields_of(w, ci)
+    for k in 0..<#len(sfl):
+        string8 fnm = check.name_of(w, sfl[k].sym)
+        sq = #append(sq, jstr(fnm))
+        if k < #len(pts): pp = #append(pp, index.hold(#format(jstrf(&j, pts[k]), "(this.", fnm, ")")))
+    jline(&j, 0, "", 0, 0)
+    jline(&j, 1, index.hold(#format("$slots() { return [", strings.join(sq[:], ", "), "]; }")), 0, 0)
+    // How an instance prints (Rust's): `Name(part, …)`.
+    jline(&j, 1, index.hold(#format("$name() { return ", jstr(check.name_of(w, w.decls[sc.decl].name)), "; }")), 0, 0)
+    jline(&j, 1, index.hold(#format("$parts() { return [", strings.join(pp[:], ", "), "]; }")), 0, 0)
+    // The defaults the class is given, each a trait's body checked once.
+    for m in sc.given:
+        for i in 0..<#len(w.fns):
+            if w.jobs[i].decl != m: continue
+            fns = #append(fns, check.s_mpath(w, m))
+            // Its statements, from the trait's file.
+            j.file = w.decls[m].file
+            stmts(&j, w.decls[m].node, NONE)
+            jline(&j, 0, "", 0, 0)
+            j.fn = -1
+            jline(&j, 1, index.hold(#format(jasync(w, m), check.name_of(w, w.decls[m].name), "(", jparams(&w.fns[i], "v"), ") {")), 0, 0)
+            j.fn = i32(#len(fns) - 1)
+            j.fname = fns[#len(fns) - 1]
+            jbody(&j, &w.fns[i], 2)
+            j.fn = -1
+            jline(&j, 1, "}", 0, 0)
+            j.file = sc.file
+            stmts(&j, sc.node, NONE)
+    // A generic method's instances, `m$job`.
+    for m in sc.gens:
+        string8 gn = check.name_of(w, w.decls[m].name)
+        for i in 0..<#len(w.fns):
+            if w.jobs[i].decl != m: continue
+            fns = #append(fns, index.hold(#format(pk, ".", cn, ".", gn)))
+            jline(&j, 0, "", 0, 0)
+            j.fn = -1
+            jline(&j, 1, index.hold(#format(gn, "$", i, "(", jparams(&w.fns[i], "v"), ") {")), 0, 0)
+            j.fn = i32(#len(fns) - 1)
+            j.fname = fns[#len(fns) - 1]
+            jbody(&j, &w.fns[i], 2)
+            j.fn = -1
+            jline(&j, 1, "}", 0, 0)
+    // From Dado, an emit is a run of `$emit_sig`.
+    for sg in sc.signals:
+        string8 sn = w.p.spell(sc.file, sg)
+        ref []char8 ps
+        syntax.Ast sa = w.p.files[sc.file].a
+        []u32 sqs = sa.list(sa.b[sg])
+        for q in 0..<#len(sqs):
+            if q > 0: ps = #append(ps, ..", ")
+            ps = #append(ps, ..#format("a", q))
+        jline(&j, 0, "", 0, 0)
+        jline(&j, 1, index.hold(#format("$emit_", sn, "(", index.hold(ps), ") {")), 0, 0)
+        jline(&j, 2, index.hold(#format(rt(&j, "__dados_sig_emit"), "(this, ", jstr(sn), ", [", index.hold(ps), "]);")), 0, 0)
+        jline(&j, 1, "}", 0, 0)
+    for i in 0..<#len(w.sd_fn):
+        if w.sd_class[i] != ci: continue
+        string8 sn = w.p.spell(sc.file, w.sd_sig[i])
+        string8 fnm = check.seam_name(w, w.sd_fn[i])
+        bool bm = w.decls[w.sd_fn[i]].kind == check.K_METHOD
+        string8 key = index.hold(#format(check.name_of(w, w.p.pkgs[w.decls[w.sd_fn[i]].pkg].name), "/", fnm))
+        bool have = false
+        for x in j.dado:
+            if x == key: have = true
+        if !have: j.dado = #append(j.dado, key)
+        for v in ["connect", "disconnect"]:
+            jline(&j, 0, "", 0, 0)
+            jline(&j, 1, index.hold(#format("$", v, "_", sn, "$", fnm, "(", "p" if bm else "", ") {")), 0, 0)
+            jline(&j, 2, index.hold(#format(rt(&j, index.hold(#format("__dados_sig_", v))), "(this, ", jstr(sn), ", ", "p" if bm else "null", ", dado$", fnm, ", ", "true" if bm else "false", ");")), 0, 0)
+            jline(&j, 1, "}", 0, 0)
+    // `--emit=reload`: each field's initializer, for an instance the new
+    // code finds without it (Rust's `reload_initializers`, over a scratch
+    // instance filled as the constructor fills one).
+    if g_reload && cj >= 0:
+        jline(&j, 0, "", 0, 0)
+        jline(&j, 1, "$dados$fill() {", 0, 0)
+        j.fname = ""
+        jbody(&j, &w.fns[cj], 2)
+        for x in 0..<#len(j.dl):
+            j.dl[x] = 0
+            j.dc[x] = 0
+            j.dfn[x] = -1
+        jline(&j, 1, "}", 0, 0)
+        for k in 0..<#len(sfl):
+            if sfl[k].cls != ci || sfl[k].emb >= 0: continue
+            string8 fnm = check.name_of(w, sfl[k].sym)
+            jline(&j, 0, "", 0, 0)
+            jline(&j, 1, index.hold(#format("$dados$init$", fnm, "() {")), 0, 0)
+            jline(&j, 2, "const t$ = Object.assign(Object.create(Object.getPrototypeOf(this)), this);", 0, 0)
+            jline(&j, 2, "t$.$dados$fill();", 0, 0)
+            jline(&j, 2, index.hold(#format("return t$.", fnm, ";")), 0, 0)
+            jline(&j, 1, "}", 0, 0)
+    jline(&j, 0, "}", 0, 0)
+    ref []char8 o
+    _ = rt(&j, "__dados_lines")
+    slices.sort_stable(j.imports[:], before)
+    ref []char8 cim
+    cim = #append(cim, ..pim)
+    for x in j.classes:
+        if x == pc: continue
+        check.SClass xc = w.classes[x]
+        string8 xp = check.name_of(w, w.p.pkgs[w.decls[xc.decl].pkg].name)
+        string8 xm = check.name_of(w, w.decls[xc.decl].name)
+        string8 xn = jid(xm)
+        if #len(cim) > 0: cim = #append(cim, ' ')
+        cim = #append(cim, ..#format("import { ", xn, "$class as class$", xp, "$", xn, " } from ", jstr(jspec(&j, index.hold(#format(xp, "/", xm)))), ";"))
+    for m in w.classes[ci].jsm:
+        cim = #append(cim, ..#format("\nimport * as js$", m, " from ", jstr(jspec(&j, w.jsn[m])), ";"))
+    // On the classes' line: the line table counts the head's lines.
+    if #len(j.mods) > 0:
+        slices.sort_stable(j.mods[:], before)
+        ref []char8 mim
+        mim = #append(mim, ..#format("import { ", strings.join(j.mods[:], ", "), " } from ", jstr(jspec(&j, "dados:mods")), ";"))
+        if #len(cim) > 0: mim = #append(mim, ' ')
+        mim = #append(mim, ..cim)
+        cim = mim
+    o = #append(o, ..#format("// module \"", jmod(w, ci), "\"\nimport { ", strings.join(j.imports[:], ", "), " } from ", jstr(jspec(&j, "dados:runtime")), ";\n", index.hold(cim), "\n"))
+    i64 first = 4 + #len(w.classes[ci].jsm) + g_reload_lead
+    if j.pkg && #len(j.prints) > 0:
+        slices.sort_stable(j.prints[:], before)
+        o = #append(o, ..#format("import { ", strings.join(j.prints[:], ", "), " } from ", jstr(jspec(&j, "dados:io")), ";\n"))
+        first += 1
+    if j.web:
+        if #len(j.prints) > 0:
+            slices.sort_stable(j.prints[:], before)
+            o = #append(o, ..#format("import { ", strings.join(j.prints[:], ", "), " } from ", jstr(jspec(&j, "dados:web")), ";\n"))
+            first += 1
+        if #len(j.stops) > 0:
+            slices.sort_stable(j.stops[:], before)
+            o = #append(o, ..#format("import { ", strings.join(j.stops[:], ", "), " } from ", jstr(jspec(&j, "dados:stop")), ";\nlet tick$ = 0;\n"))
+            first += 2
+        if #len(j.dado) > 0 || j.narrows:
+            o = #append(o, ..#format("import { __dados_seam } from ", jstr(jspec(&j, "dados:web")), ";\n"))
+            first += 1
+    slices.sort_stable(j.dado[:], before)
+    string8 last = ""
+    for x in j.dado:
+        string8 pk = x[0..<strings.index_of(x, '/')]
+        if pk == last: continue
+        last = pk
+        string8 pre = index.hold(#format(pk, "/"))
+        ref []string8 ns
+        for y in j.dado:
+            if strings.starts_with(y, pre):
+                string8 fnm = y[#len(pre)..<#len(y)]
+                ns = #append(ns, index.hold(#format(fnm, " as dado$", fnm)))
+                if j.web:
+                    o = #append(o, ..#format("const dado$", fnm, " = __dados_seam(\"dado:", pk, "\", ", jstr(fnm), ");\n"))
+                    first += 1
+        if j.web: continue
+        o = #append(o, ..#format("import { ", strings.join(ns[:], ", "), " } from \"dado:", pk, "\";\n"))
+        first += 1
+    if j.web:
+        for x in inline_head(&j):
+            o = #append(o, ..x)
+            o = #append(o, '\n')
+            first += 1
+    if j.narrows && j.web:
+        o = #append(o, .."const dado$$narrowed = __dados_seam(\"dado:$narrowing\", \"$narrowed\");\n")
+        o = #append(o, ..NARROWS_JS[strings.index_of(NARROWS_JS, '\n') + 1..<#len(NARROWS_JS)])
+        first += i64(strings.count(NARROWS_JS, "\n"))
+    else if j.narrows:
+        o = #append(o, ..NARROWS_JS)
+        first += i64(strings.count(NARROWS_JS, "\n"))
+    if #len(j.enums) > 0:
+        o = #append(o, ..ENUM_JS)
+        first += i64(strings.count(ENUM_JS, "\n"))
+        for ed in j.enums:
+            ref []string8 ens
+            ref []string8 evs
+            for key in w.order:
+                if u32(key >> 32) != ed: continue
+                try u32 ek = w.members[key] else: continue
+                if ek == NONE: continue
+                ens = #append(ens, jstr(check.name_of(w, u32(key & 0xFFFFFFFF))))
+                evs = #append(evs, index.hold(#format(i64(w.k.w0[ek]))))
+            o = #append(o, ..#format("const ", jenum(&j, ed), " = enum$table([", strings.join(ens[:], ", "), "], [", strings.join(evs[:], ", "), "]);\n"))
+            first += 1
+    // Defined on first ask: a cycle of imports runs either way.
+    o = #append(o, ..#format("var ", ci_, "$;\nexport function ", ci_, "$class() {\n    if (", ci_, "$ === undefined) {\n"))
+    first += 3
+    for s in j.lines:
+        if #len(s) > 0: o = #append(o, .."        ")
+        o = #append(o, ..s)
+        o = #append(o, '\n')
+    o = #append(o, ..#format("        ", ci_, "$ = ", ci_, ";\n    }\n    return ", ci_, "$;\n}\nexport const ", ci_, " = ", ci_, "$class();\n"))
+    if g_reload:
+        // What `#script_reload` calls once this code checked against the build.
+        ref []string8 own
+        ref []string8 ftys
+        for k in 0..<#len(sfl):
+            if sfl[k].cls != ci || sfl[k].emb >= 0 || k >= #len(pts): continue
+            own = #append(own, jstr(check.name_of(w, sfl[k].sym)))
+            ftys = #append(ftys, index.hold(#format(check.name_of(w, sfl[k].sym), " ", mty(w, pts[k]))))
+        o = #append(o, ..#format("\n// What `#script_reload` calls once this code has checked against the build:\n// the running class takes this code's methods, each field this code declares\n// keeps its value where an instance has one and starts at its initializer where it has\n// not, and each instance a handle holds runs `reloaded()`.\nexport function $dados$reload(live, held) {\n    const next = ", ci_, ".prototype, to = live.prototype;\n    for (const key of Reflect.ownKeys(to)) {\n        if (key !== \"constructor\" && !Object.prototype.hasOwnProperty.call(next, key)) delete to[key];\n    }\n    for (const key of Reflect.ownKeys(next)) {\n        if (key !== \"constructor\") Object.defineProperty(to, key, Object.getOwnPropertyDescriptor(next, key));\n    }\n    for (const name of [", strings.join(own[:], ", "), "]) {\n        const own = (o, v) => Object.defineProperty(o, name, { value: v, writable: true, enumerable: true, configurable: true });\n        const init = \"$dados$init$\" + name;\n        Object.defineProperty(to, name, {\n            configurable: true,\n            get() { const v = this[init](); own(this, v); return v; },\n            set(v) { own(this, v); },\n        });\n    }\n    live.$dados$fields = ", jstr(index.hold(strings.join(ftys[:], "\n"))), ";\n    for (const o of held) {\n        if (o instanceof live && typeof o.reloaded === \"function\") o.reloaded();\n    }\n}\n"))
+    o = #append(o, ..#format("\n__dados_lines(", jstr(w.p.files[sc.file].path), ", ["))
+    for i in 0..<#len(fns):
+        if i > 0: o = #append(o, ..", ")
+        o = #append(o, ..jstr(fns[i]))
+    o = #append(o, .."], [")
+    i32 pl = -2
+    i32 pcol = -2
+    i32 pf = -2
+    bool any = false
+    for i in 0..<#len(j.lines):
+        if j.dl[i] == pl && j.dc[i] == pcol && j.dfn[i] == pf: continue
+        pl = j.dl[i]
+        pcol = j.dc[i]
+        pf = j.dfn[i]
+        if any: o = #append(o, ..", ")
+        any = true
+        o = #append(o, ..#format(first + i, ", ", pl, ", ", pcol, ", ", pf))
+    o = #append(o, .."]);\n")
+    return index.hold(o)
+
+// Name `x` added to `xs` once.
+private void web_use(^ref []string8 xs, string8 x):
+    for y in xs^:
+        if y == x: return
+    xs^ = #append(xs^, x)
+
+// On the web, a `catch` first throws on what no script may catch.
+private string8 web_pass(^J j, string8 thrown):
+    web_use(&j.stops, "__dados_pass")
+    return index.hold(#format("__dados_pass(", thrown, ");"))
+
+// The specifier this module imports module `name` by: on the web, its file's
+// path relative to this module's.
+private string8 jspec(^J j, string8 name):
+    if !j.web && !j.pkg: return name
+    return js_relative(j.at, js_file(name))
+
+// Where module `name` is written beside a web build (Rust's `file_of`).
+string8 js_file(string8 name):
+    if name == "dados:runtime": return "dados/runtime.js"
+    if name == "dados:mods": return "dados/mods.js"
+    if name == "dados:io": return "dados/io.js"
+    if name == "dados:web": return "dados/web.js"
+    if name == "dados:stop": return "dados/stop.js"
+    if name == "dados:exports": return "dado-exports.js"
+    if strings.starts_with(name, "js:"): return index.hold(#format("dados/js/", js_inside(name[3..<#len(name)])))
+    return index.hold(#format(name, ".js"))
+
+// A JavaScript module's path inside `dados/js/`: folded, a leading `..` `__up`.
+private string8 js_inside(string8 path):
+    ref []string8 parts
+    for p in strings.split(path, "/"):
+        if #len(p) == 0 || p == ".": continue
+        if p == ".." && #len(parts) > 0 && parts[#len(parts) - 1] != "..":
+            #truncate(parts, #len(parts) - 1)
+            continue
+        parts = #append(parts, p)
+    for k in 0..<#len(parts):
+        if parts[k] == "..": parts[k] = "__up"
+    return index.hold(strings.join(parts[:], "/"))
+
+// The specifier file `from` imports file `to` by (`./x`, `../x`).
+string8 js_relative(string8 from, string8 to):
+    ref []string8 fd = strings.split(from, "/")
+    #truncate(fd, #len(fd) - 1)
+    ref []string8 tp = strings.split(to, "/")
+    i64 common = 0
+    for common < #len(fd) && common < #len(tp) - 1 && fd[common] == tp[common]:
+        common += 1
+    ref []char8 o
+    if common == #len(fd): o = #append(o, .."./")
+    for _ in common..<#len(fd):
+        o = #append(o, .."../")
+    for k in common..<#len(tp):
+        o = #append(o, ..tp[k])
+        if k < #len(tp) - 1: o = #append(o, '/')
+    return index.hold(o)
+
+// Dado enum `d`'s table, `enum$pkg$Name`.
+private string8 jenum(^J j, u32 d):
+    return index.hold(#format("enum$", check.name_of(j.w, j.w.p.pkgs[j.w.decls[d].pkg].name), "$", check.name_of(j.w, j.w.decls[d].name)))
+
+// A Dado enum's tables: each name and number to the other.
+private const string8 ENUM_JS = "function enum$table(names, values) {\n    const t = new Map();\n    for (let i = 0; i < names.length; i++) {\n        if (!t.has(names[i])) t.set(names[i], values[i]);\n        if (!t.has(values[i])) t.set(values[i], names[i]);\n    }\n    return t;\n}\nfunction enum$of(t, v) {\n    if (typeof v === \"string\") return v;\n    const name = t.get(v);\n    return name === undefined ? v : name;\n}\nfunction enum$int(t, v) {\n    return typeof v === \"string\" ? t.get(v) : v;\n}\n"
+
+// `s` as C: a literal, or past C's 4095-character floor (`-Woverlength-strings`)
+// bytes in braces, a compound literal where `lit`.
+private void cstr(^ref []char8 o, string8 s, bool lit = true):
+    if #len(s) > 4000:
+        if lit: o^ = #append(o^, .."(const char[]){")
+        else: o^ = #append(o^, '{')
+        for k in 0..<#len(s):
+            if k % 16 == 0: o^ = #append(o^, '\n')
+            o^ = #append(o^, ..#format(" ", i32(u8(s[k])), ","))
+        o^ = #append(o^, .." 0 }")
+        return
+    o^ = #append(o^, '"')
+    for ch in s:
+        u8 b = u8(ch)
+        if ch == '"': o^ = #append(o^, .."\\\"")
+        else if ch == '\\': o^ = #append(o^, .."\\\\")
+        else if ch == '\n': o^ = #append(o^, .."\\n\"\n\"")
+        else if b < 0x20 || b >= 0x7F || ch == '?':
+            o^ = #append(o^, '\\')
+            o^ = #append(o^, "01234567"[i64(b >> 6)])
+            o^ = #append(o^, "01234567"[i64((b >> 3) & 7)])
+            o^ = #append(o^, "01234567"[i64(b & 7)])
+        else: o^ = #append(o^, ch)
+    o^ = #append(o^, '"')
+
+// The C declarations of the tables, for the header.
+const string8 JS_HEAD = "struct dado_js_row { const char *name; const char *source; };\nstruct dado_js_bound_row { const char *module; const char *name; void (*thunk)(void); int32_t arity; };\nextern const struct dado_js_row dado_js__modules[];\nextern const struct dado_js_bound_row dado_js__bound[];\nextern const char dado_js__bindings[];\nextern const void *const dado_js__channels_p;\n"
+
+// A channel scripts receive: its bit raised at every `#send`.
+const string8 RECV_HEAD = "extern uint32_t dado_rt__flags;\nextern uint64_t dado_rt__channel_bits[];\nstatic inline void dado_rt__raise(int64_t i) { __atomic_fetch_or(&dado_rt__channel_bits[i / 64], (uint64_t)1 << (i % 64), __ATOMIC_RELEASE); __atomic_fetch_or(&dado_rt__flags, 1u, __ATOMIC_RELEASE); }\n"
+
+// `--emit=reload`: the module carries what a swap needs; `g_reload_lead` is
+// the header's lines above it, for the line table.
+bool g_reload
+i64 g_reload_lead
+
+// The tables' definitions: the runtime and every class's module.
+string8 js_tables(^check.World w):
+    rung1_plan(w)
+    ref []char8 o
+    o = #append(o, .."const struct dado_js_row dado_js__modules[] = {\n    { \"dados:runtime\", ")
+    cstr(&o, asset("runtime.js"))
+    o = #append(o, .." },\n")
+    if w.sloads:
+        o = #append(o, .."    { \"dados:mods\", ")
+        cstr(&o, asset("mods.js"))
+        o = #append(o, .." },\n")
+    for ci in 0..<#len(w.classes):
+        check.SClass sc = w.classes[ci]
+        string8 pk = check.name_of(w, w.p.pkgs[w.decls[sc.decl].pkg].name)
+        string8 cn = check.name_of(w, w.decls[sc.decl].name)
+        o = #append(o, ..#format("    { \"", pk, "/", cn, "\", "))
+        cstr(&o, js_module(w, u32(ci)))
+        o = #append(o, .." },\n")
+    for m in 0..<#len(w.jsn):
+        if #len(w.jss[m]) < 2: continue
+        o = #append(o, ..#format("    { ", jstr(w.jsn[m]), ", "))
+        cstr(&o, w.jss[m])
+        o = #append(o, .." },\n")
+    o = #append(o, .."    { 0, 0 }\n};\n")
+    if w.reloads: js_manifest(w, &o)
+    return index.hold(o)
+
+// A script type as the manifest writes it: a class by `pkg.Name`.
+private string8 mty(^check.World w, u32 t):
+    u32 ci = check.s_class_of_ty(w, t)
+    if ci == NONE: return check.shown(w, t)
+    u32 d = w.classes[ci].decl
+    return index.hold(#format(check.name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", check.name_of(w, w.decls[d].name)))
+
+// What this build bound, for `#script_reload` (Rust's `dado_js__bindings`).
+private void js_manifest(^check.World w, ^ref []char8 o):
+    o^ = #append(o^, .."const char dado_js__bindings[] = ")
+    cstr(o, bindings(w), false)
+    o^ = #append(o^, ..";\n")
+
+// The manifest itself (`--emit=bindings`, `--against=`'s file).
+string8 bindings(^check.World w):
+    ref []char8 m
+    m = #append(m, .."# dadoc bindings 1\n")
+    ref []string8 fls
+    for d in w.bound:
+        u32 fty = w.decls[d].ty
+        ref []string8 ps
+        for p in w.t.params(fty):
+            ps = #append(ps, check.shown(w, p))
+        string8 rt = "void"
+        if w.t.a[fty] != u32(types.P_VOID): rt = check.shown(w, w.t.a[fty])
+        string8 fl = ""
+        if w.t.b[fty] != types.F_NONE: fl = "!"
+        string8 line = index.hold(#format("fn ", check.name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", check.seam_name(w, d), " ", fl, rt, "(", strings.join(ps[:], ", "), ")\n"))
+        // By name, as Rust's (a BTreeMap).
+        i64 at = #len(fls)
+        fls = #append(fls, line)
+        for at > 0 && strings.before(line, fls[at - 1]):
+            fls[at] = fls[at - 1]
+            fls[at - 1] = line
+            at -= 1
+    for x in fls: m = #append(m, ..x)
+    // Classes by (package, name).
+    ref []u32 cs
+    for ci in 0..<#len(w.classes):
+        string8 k = jmod(w, u32(ci))
+        i64 at = #len(cs)
+        cs = #append(cs, u32(ci))
+        for at > 0 && strings.before(k, jmod(w, cs[at - 1])):
+            cs[at] = cs[at - 1]
+            cs[at - 1] = u32(ci)
+            at -= 1
+    for ci in cs:
+        // The classes a Dado body makes an instance of (Rust's `reached`).
+        // and the ones its Dado runs a method of or reads through a handle.
+        bool made = false
+        for x in w.s_made:
+            if x == ci: made = true
+        for x in w.entries:
+            for md in w.classes[ci].methods:
+                if x == md: made = true
+        for x in w.hmembers:
+            if u32(x >> 32) == w.classes[ci].decl: made = true
+        if !made: continue
+        check.SClass sc = w.classes[ci]
+        string8 mo = jmod(w, ci)
+        m = #append(m, ..#format("class ", mo, "\n"))
+        for md in sc.methods:
+            bool e = false
+            for x in w.entries:
+                if x == md: e = true
+            u32 ft = w.decls[md].ty
+            if !e || ft == NONE: continue
+            ref []string8 ps
+            []u32 all = w.t.params(ft)
+            for p in all[1..<#len(all)]:
+                ps = #append(ps, mty(w, p))
+            string8 rt = "void"
+            if w.t.a[ft] != u32(types.P_VOID): rt = mty(w, w.t.a[ft])
+            m = #append(m, ..#format("entry ", mo, ".", check.name_of(w, w.decls[md].name), " ", rt, "(", strings.join(ps[:], ", "), ")\n"))
+        u32 row = w.decls[sc.decl].ty
+        []u32 sl = w.t.slots(row)
+        []u32 sn = w.t.slot_names(row)
+        // An embedded type's slots are not reached through a handle yet.
+        ref []check.SField fl = check.s_fields_of(w, ci)
+        for i in 0..<#len(sl):
+            if i >= #len(fl) || fl[i].cls != ci || fl[i].emb >= 0: continue
+            m = #append(m, ..#format("field ", mo, ".", w.t.text(sn[i]), " ", mty(w, sl[i]), "\n"))
+        for i in 0..<#len(sl):
+            bool mem = false
+            for x in w.hmembers:
+                if x == (u64(sc.decl) << 32) | u64(i): mem = true
+            if mem: m = #append(m, ..#format("member ", mo, ".", w.t.text(sn[i]), " ", mty(w, sl[i]), "\n"))
+    return index.hold(m)
+
+private string8 jmod(^check.World w, u32 ci):
+    u32 d = w.classes[ci].decl
+    return index.hold(#format(check.name_of(w, w.p.pkgs[w.decls[d].pkg].name), "/", check.name_of(w, w.decls[d].name)))
+
+// One C thunk per Dado function a script calls, which reads each argument
+// by its tag, and the table of them; with narrowings, the glue that counts
+// them and reports each place's first at exit's summary.
+string8 seam_glue(^C c):
+    ^check.World w = c.w
+    ref []char8 o
+    ref []char8 rows
+    Glue gl
+    for bi in 0..<#len(w.bound):
+        u32 d = w.bound[bi]
+        u32 fty = w.decls[d].ty
+        []u32 ps = c.t.params(fty)
+        u32 rt = c.t.a[fty]
+        string8 pk = check.name_of(w, w.p.pkgs[w.decls[d].pkg].name)
+        string8 nm = check.seam_name(w, d)
+        string8 g = index.hold(#format("dado_glue_", pk, "_", index.hold(strings.replace(nm, "$", "_M_"))))
+        string8 lab = index.hold(#format(pk, ".", nm))
+        u32 df = w.decls[d].file
+        syntax.Ast da = w.p.files[df].a
+        []u32 dks = da.list(da.b[w.decls[d].node])
+        string8 left = rtn(c, "typed_left")
+        string8 enter = index.hold(#format(rtn(c, "typed_entered"), "(ctx)"))
+        // A function taking a script's function enters as Rust's untyped thunk.
+        bool cbk = false
+        for p in ps:
+            if check.seam_kind(w, p, false) == check.SK_CB: cbk = true
+        if cbk:
+            if !gl.tleft: put(&o, index.hold(#format("static JSValue dado_glue_tleft(void *engine, JSContext *ctx, JSValue v) { (void)engine; return ", rtn(c, "thunk_left"), "(ctx, v); }\nstruct dado_glue_cb { JSContext *ctx; JSValue fn; };\n")))
+            gl.tleft = true
+            left = "dado_glue_tleft"
+            enter = index.hold(#format("0; ", rtn(c, "thunk_entered"), "(ctx)"))
+        string8 fail = index.hold(#format(" != 0) { return ", left, "(engine, ctx, ", rtn(c, "raised"), "()); }\n"))
+        for i in 0..<#len(ps):
+            if check.seam_kind(w, ps[i], false) == check.SK_CB: put(&o, cb_tramp(c, d, i, g, lab))
+        put(&o, index.hold(#format("static JSValue ", g, "(JSContext *ctx, JSValue this_val, int32_t argc, JSValue *argv) {\n    (void)this_val; (void)argc; (void)argv;\n    void *engine = ", enter, ";\n")))
+        ref []char8 call
+        ref []char8 drops
+        ref []char8 backs
+        ref []char8 unl
+        bool took = false
+        for i in 0..<#len(ps):
+            u8 k = check.seam_kind(w, ps[i], false)
+            i64 qi = 6 + i - (#len(ps) - (#len(dks) - 6))
+            string8 pn = "self"
+            if qi >= 6: pn = index.hold(strings.clone(w.p.spell(df, dks[qi])))
+            string8 tail = index.hold(#format("(&a", i, ", ctx, argv, ", i, ", \"", lab, "\", \"", pn, "\")", fail))
+            string8 ai = index.hold(#format("argv[", i, "]"))
+            if k == check.SK_ENUM:
+                string8 eraise = index.hold(#format("return ", left, "(engine, ctx, ", rtn(c, "raised"), "()); }\n"))
+                put(&o, index.hold(#format("    int64_t a", i, " = 0; int64_t path", i, "[1];\n    if (", glue_enum(c, &gl, ps[i], false), "(&a", i, ", ctx, argv[", i, "], \"", lab, "\", \"parameter `", pn, "`\", path", i, ", 0) != 0) { ", index.hold(strings.clone(drops)), eraise)))
+            if k == check.SK_INT: put(&o, index.hold(#format("    int64_t a", i, "; if (JS_VALUE_GET_TAG(", ai, ") == JS_TAG_INT) { a", i, " = JS_VALUE_GET_INT(", ai, "); } else if (", rtn(c, "take_int"), tail)))
+            if k == check.SK_FLOAT: put(&o, index.hold(#format("    double a", i, "; if (JS_VALUE_GET_TAG(", ai, ") == JS_TAG_FLOAT64) { a", i, " = JS_VALUE_GET_FLOAT64(", ai, "); } else if (JS_VALUE_GET_TAG(", ai, ") == JS_TAG_INT) { a", i, " = (double)JS_VALUE_GET_INT(", ai, "); } else if (", rtn(c, "take_float"), tail)))
+            if k == check.SK_BOOL: put(&o, index.hold(#format("    ", ty(c, u32(types.P_BOOL)), " a", i, "; if (", rtn(c, "take_bool"), tail)))
+            if k == check.SK_CB:
+                u8 cf = check.cb_form(w, ps[i])
+                string8 sl = index.hold(#format(g, "_cb", i))
+                if cf == 1:
+                    put(&o, index.hold(#format("    JSValue a", i, "; if (", rtn(c, "take_bare_callback"), "(&a", i, ", ctx, argv, ", i, ", \"", lab, "\", \"", pn, "\")", fail, "    struct dado_glue_cb s", i, " = ", sl, "; ", sl, ".ctx = ctx; ", sl, ".fn = a", i, ";\n")))
+                    put(&backs, index.hold(#format("    ", sl, " = s", i, ";\n")))
+                    if i > 0: put(&call, ", ")
+                    put(&call, index.hold(#format(g, "_tr", i)))
+                    continue
+                string8 kp = "1" if cb_kept(c, d, i) else "0"
+                put(&o, index.hold(#format("    void *a", i, "; if (", rtn(c, "take_callback"), "(&a", i, ", ctx, argv, ", i, ", \"", lab, "\", \"", pn, "\", ", kp, ")", fail)))
+                put(&drops, index.hold(#format("    ", rtn(c, "drop_callback"), "(ctx, a", i, ", ", kp, ");\n")))
+                if i > 0: put(&call, ", ")
+                put(&call, index.hold(#format("(", ty(c, ps[i]), "){ ", g, "_tr", i, ", a", i, " }")))
+                continue
+            if k == check.SK_INST:
+                u32 ic = check.s_class_of_ty(w, ps[i])
+                put(&o, index.hold(#format("    void *a", i, "; if (", rtn(c, "take_instance"), "(&a", i, ", ctx, argv, ", i, ", \"", lab, "\", \"", pn, "\", \"", check.name_of(w, w.decls[w.classes[ic].decl].name), "\")", fail)))
+            if k == check.SK_NONE:
+                // A bound method's `^self`, an address.
+                put(&o, index.hold(#format("    int64_t a", i, "; if (JS_VALUE_GET_TAG(", ai, ") == JS_TAG_INT) { a", i, " = JS_VALUE_GET_INT(", ai, "); } else if (", rtn(c, "take_int"), tail)))
+            if k == check.SK_RUN:
+                // A script's array, read into a block for the call; what
+                // Dado wrote is copied back into it.
+                u32 pr = c.t.resolve(ps[i])
+                glue_run(c, &gl, pr)
+                string8 raise = index.hold(#format("return ", left, "(engine, ctx, ", rtn(c, "raised"), "()); }\n"))
+                if !took:
+                    put(&o, "    dado_jtake tk = {0};\n")
+                    put(&drops, "    dado_jtake_end(ctx, &tk);\n")
+                    took = true
+                string8 rd = index.hold(#format("if (dado_jr_", pr, "(ctx, argv[", i, "], &a", i, ", \"", lab, "\", \"parameter `", pn, "`\", path", i, ", 0, &tk) != 0) { ", index.hold(strings.clone(drops)), raise))
+                // One array passed for two parameters of one run type is one storage.
+                ref []char8 same
+                for q in 0..<i:
+                    if c.t.resolve(ps[q]) == pr: put(&same, index.hold(#format("if (", rtn(c, "same_object"), "(argv[", q, "], argv[", i, "])) { d", i, " = 1; a", i, " = a", q, "; } else ")))
+                put(&o, index.hold(#format("    ", ty(c, pr), " a", i, " = {0}; int64_t path", i, "[", glue_depth(c, pr), "]; int32_t d", i, " = 0;\n    ", index.hold(same), "{ ", rd)))
+                put(&o, "    }\n")
+                if glue_slend(c, &gl, pr):
+                    // Lent: what Dado writes reaches the script at each call back; a script write meanwhile raises.
+                    put(&o, index.hold(#format("    struct dado_glue_lend s", i, " = { dado_js_", pr, ", 0, (void *)&a", i, ", ctx, 0, 0, 0, (void *)&argv[", i, "], \"", lab, "\", \"", pn, "\" };\n    void *was", i, " = ", rtn(c, "lend_script"), "(ctx, &s", i, "); (void)was", i, ";\n")))
+                    if #len(unl) == 0: put(&unl, index.hold(#format("    ", rtn(c, "unlend_script"), "(ctx, was", i, ");\n")))
+                    put(&backs, index.hold(#format("    if (s", i, ".code == 1 || (s", i, ".settled && dado_jsh_", pr, "(ctx, argv[", i, "]) != s", i, ".h)) { DROPS", "return ", left, "(engine, ctx, ", rtn(c, "lent_written"), "(ctx, \"", lab, "\", \"", pn, "\")); }\n")))
+                put(&backs, index.hold(#format("    if (!d", i, " && dado_jf_", pr, "(ctx, argv[", i, "], a", i, ") != 0) { DROPS", raise)))
+            if k == check.SK_TUP || k == check.SK_MAP || k == check.SK_UNION:
+                u32 pr = c.t.resolve(ps[i])
+                glue_run(c, &gl, pr)
+                if k == check.SK_MAP: put(&drops, index.hold(#format("    dado_je_", pr, "(&a", i, ");\n")))
+                if !took:
+                    put(&o, "    dado_jtake tk = {0};\n")
+                    put(&drops, "    dado_jtake_end(ctx, &tk);\n")
+                    took = true
+                string8 raise = index.hold(#format("return ", left, "(engine, ctx, ", rtn(c, "raised"), "()); }\n"))
+                put(&o, index.hold(#format("    ", ty(c, pr), " a", i, " = {0}; int64_t path", i, "[", glue_depth(c, pr), "];\n    if (dado_jr_", pr, "(ctx, argv[", i, "], &a", i, ", \"", lab, "\", \"parameter `", pn, "`\", path", i, ", 0, &tk) != 0) { ", index.hold(strings.clone(drops)), raise)))
+                put(&backs, index.hold(#format("    if (dado_jf_", pr, "(ctx, argv[", i, "], a", i, ") != 0) { DROPS", raise)))
+            if k == check.SK_C32 || k == check.SK_C16:
+                string8 cw = "32" if k == check.SK_C32 else "16"
+                put(&o, index.hold(#format("    uint", cw, "_t a", i, "; if (", rtn(c, index.hold(#format("take_char", cw))), tail)))
+            if k == check.SK_WIDE:
+                string8 wraise = index.hold(#format("return ", left, "(engine, ctx, ", rtn(c, "raised"), "()); }\n"))
+                string8 wat = index.hold(#format("ctx, argv[", i, "], \"", lab, "\", \"parameter `", pn, "`\", path", i, ", 0"))
+                put(&o, index.hold(#format("    ", ty(c, ps[i]), " a", i, " = {0}; int64_t path", i, "[1];\n    { int32_t c = 0; ", wide_read(c, ps[i], index.hold(#format("a", i)), wat, ""), " if (c != 0) { ", index.hold(strings.clone(drops)), wraise, " }\n")))
+                put(&drops, index.hold(#format("    ", wide_drop(c, ps[i], index.hold(#format("a", i))), "\n")))
+            if k == check.SK_STR:
+                put(&o, index.hold(#format("    ", ty(c, types.STRING8), " a", i, "; if (", rtn(c, "take_string"), tail)))
+                put(&drops, index.hold(#format("    ", rtn(c, "drop_string"), "(ctx, a", i, ");\n")))
+            if i > 0: put(&call, ", ")
+            if k == check.SK_NONE: put(&call, index.hold(#format("(", ty(c, ps[i]), ")(intptr_t)a", i)))
+            else if k == check.SK_TUP || k == check.SK_MAP || k == check.SK_UNION: put(&call, jpun(ty(c, c.t.resolve(ps[i])), ty(c, ps[i]), index.hold(#format("a", i))))
+            else if k == check.SK_WIDE: put(&call, index.hold(#format("*(", ty(c, ps[i]), " *)&a", i)))
+            else if k == check.SK_STR || k == check.SK_RUN && ty(c, ps[i]) == ty(c, c.t.resolve(ps[i])): put(&call, index.hold(#format("a", i)))
+            else: put(&call, index.hold(#format("(", ty(c, ps[i]), ")a", i)))
+        if #len(unl) > 0:
+            put(&unl, index.hold(backs))
+            backs = unl
+        // A function naming `#caller` takes the ambient the script calls under.
+        if check.names_caller(w, d):
+            if #len(call) > 0: put(&call, ", ")
+            put(&call, jpun("dado_alloc", ty(c, check.alloc_ty(w)), "dado_context"))
+        string8 cn = index.hold(strings.clone(c.t.text(w.bound_c[bi])))
+        u8 rk = check.seam_kind(w, rt, true)
+        bool fl = c.t.b[fty] != types.F_NONE
+        if fl:
+            // A failable function: its code, as the script's `Error`.
+            string8 ca = index.hold(call)
+            if rt != u32(types.P_VOID):
+                put(&o, index.hold(#format("    ", ty(c, rt), " r;\n")))
+                ca = index.hold(#format("&r", ", " if #len(call) > 0 else "", ca))
+            put(&o, index.hold(#format("    int32_t code = ", cn, "(", ca, ");\n", index.hold(strings.replace(index.hold(backs), "DROPS", index.hold(strings.clone(drops)))), "    if (code != 0) { ", index.hold(strings.clone(drops)), "return ", left, "(engine, ctx, ", rtn(c, "failed"), "(ctx, \"", lab, "\", code)); }\n")))
+        if rt == u32(types.P_VOID) && fl: put(&o, "    JSValue answer = JS_UNDEFINED;\n")
+        else if rt == u32(types.P_VOID): put(&o, index.hold(#format("    ", cn, "(", index.hold(call), ");\n", index.hold(strings.replace(index.hold(backs), "DROPS", index.hold(strings.clone(drops)))), "    JSValue answer = JS_UNDEFINED;\n")))
+        else:
+            if !fl: put(&o, index.hold(#format("    ", ty(c, rt), " r = ", cn, "(", index.hold(call), ");\n", index.hold(strings.replace(index.hold(backs), "DROPS", index.hold(strings.clone(drops)))))))
+            // An int32 answer made here (Rust's), else the tiers.
+            string8 ans = index.hold(#format("rv >= INT32_MIN && rv <= INT32_MAX ? JS_NewInt32(ctx, (int32_t)rv) : ", rtn(c, "give_int"), "(ctx, rv)"))
+            if rk == check.SK_FLOAT: ans = "JS_NewFloat64(ctx, (double)r)"
+            if rk == check.SK_BOOL: ans = "JS_NewBool(ctx, r)"
+            if rk == check.SK_STR: ans = index.hold(#format(rtn(c, "give_string"), "(ctx, r)"))
+            if rk == check.SK_WIDE: ans = wide_give(c, rt, "r")
+            if rk == check.SK_C32: ans = index.hold(#format(rtn(c, "give_char32"), "(ctx, r)"))
+            if rk == check.SK_C16: ans = index.hold(#format(rtn(c, "give_char16"), "(ctx, r)"))
+            if rk == check.SK_OWNED: ans = index.hold(#format(rtn(c, "give_owned_string"), "(ctx, r)"))
+            if rk == check.SK_ENUM: ans = index.hold(#format(glue_enum(c, &gl, rt, true), "(ctx, (int64_t)r)"))
+            if rk == check.SK_INST: ans = index.hold(#format(rtn(c, "give_instance"), "(ctx, \"", lab, "\", (void *)r)"))
+            if rk == check.SK_FNV: ans = index.hold(#format(g_fnval(c, &gl, c.t.resolve(rt)), "(ctx, r)"))
+            if rk == check.SK_RUN || rk == check.SK_TUP || rk == check.SK_MAP || rk == check.SK_UNION:
+                glue_run(c, &gl, rt)
+                ans = index.hold(#format("dado_jw_", c.t.resolve(rt), "(ctx, r)"))
+                if rk == check.SK_MAP: ans = index.hold(#format(ans, ";\n    dado_je_", c.t.resolve(rt), "(&r)"))
+                if rk == check.SK_TUP: ans = index.hold(#format("dado_jw_", c.t.resolve(rt), "(ctx, ", jpun(ty(c, rt), ty(c, c.t.resolve(rt)), "r"), ")"))
+            // Through `rv`: gcc's -Wtype-limits on a narrower `r`.
+            if strings.starts_with(ans, "rv >= "): put(&o, "    int64_t rv = (int64_t)r;\n")
+            put(&o, index.hold(#format("    JSValue answer = ", ans, ";\n")))
+        put(&o, drops)
+        put(&o, index.hold(#format("    return ", left, "(engine, ctx, answer);\n}\n")))
+        put(&rows, index.hold(#format("    { \"dado:", pk, "\", \"", nm, "\", (void (*)(void))", g, ", ", #len(ps), " },\n")))
+    if #len(w.narrows) > 0:
+        put(&o, NARROW_C)
+        put(&o, index.hold(#format("static dado_rt__narrowing dado_rt__script_narrowings[", #len(w.narrows), "] = {")))
+        for i in 0..<#len(w.narrows):
+            put(&o, index.hold(#format(" { \"", w.narrows[i], "\", 0, 0 },")))
+        put(&o, index.hold(#format(" };\nstatic JSValue dado_glue_narrowed(JSContext *ctx, JSValue this_val, int32_t argc, JSValue *argv) {\n    int64_t k = -1; const char *at; const char *text; (void)this_val; (void)argc; (void)argv;\n    if (JS_ToInt64(ctx, &k, argv[0]) != 0) { return JS_EXCEPTION; }\n    at = JS_ToCString(ctx, argv[1]);\n    text = JS_ToCString(ctx, argv[2]);\n    if (at != 0 && text != 0 && (!(k >= 0 && k < ", #len(w.narrows), " && strcmp(dado_rt__script_narrowings[k].where, at) == 0) || dado_rt__narrowing_first(&dado_rt__script_narrowings[k]))) { ", rtn(c, "narrowed"), "(ctx, text); }\n    if (at != 0) { JS_FreeCString(ctx, at); }\n    if (text != 0) { JS_FreeCString(ctx, text); }\n    return JS_UNDEFINED;\n}\n")))
+        put(&rows, "    { \"dado:$narrowing\", \"$narrowed\", (void (*)(void))dado_glue_narrowed, 3 },\n")
+    put(&o, hrun_defs(c, &gl))
+    if #len(w.recv) == 0: put(&o, "const void *const dado_js__channels_p = 0;\n")
+    else: recv_glue(c, &o, &rows)
+    put(&o, rung1_c(w, &rows))
+    if w.os == "WEB": put(&o, inline_c(c))
+    put(&o, "const struct dado_js_bound_row dado_js__bound[] = {\n")
+    put(&o, rows)
+    put(&o, "    { 0, 0, 0, 0 }\n};\n")
+    ref []char8 all
+    put(&all, index.hold(gl.protos))
+    put(&all, index.hold(gl.defs))
+    put(&all, index.hold(o))
+    return index.hold(all)
+
+// `x` (C type `from`) as C type `to`, one layout: through a union (-O2's strict aliasing).
+private string8 jpun(string8 from, string8 to, string8 x):
+    if from == to: return x
+    return index.hold(#format("((union { ", from, " f; ", to, " t; }){ .f = ", x, " }).t"))
+
+string8 rtn(^C c, string8 nm):
+    return index.hold(strings.clone(c.t.text(check.seam_c(c.w, nm))))
+
+// Each narrowing place: the first loss reported, the rest counted and
+// summed at exit (Rust's `dado_rt__narrowing`).
+private const string8 NARROW_C = "#ifndef DADO_WEB\n#include <string.h>\n#include <stdio.h>\n#include <stdlib.h>\n#endif\ntypedef struct dado_rt__narrowing { const char *where; uint64_t count; struct dado_rt__narrowing *next; } dado_rt__narrowing;\nstatic dado_rt__narrowing *dado_rt__narrowings;\nstatic int32_t dado_rt__narrowings_kept;\nstatic void dado_rt__narrowings_report(void) {\n    dado_rt__narrowing *s = __atomic_exchange_n(&dado_rt__narrowings, (dado_rt__narrowing *)0, __ATOMIC_ACQ_REL);\n    dado_rt__narrowing *order = 0;\n    while (s != 0) { dado_rt__narrowing *next = s->next; s->next = order; order = s; s = next; }\n    for (s = order; s != 0; s = s->next) { uint64_t n = __atomic_load_n(&s->count, __ATOMIC_RELAXED); if (n > 1) { fprintf(stderr, \"warning: %s: implicit narrowing changed the value: %llu times in all\\n\", s->where, (unsigned long long)n); } }\n}\nstatic int dado_rt__narrowing_first(dado_rt__narrowing *s) {\n    dado_rt__narrowing *head;\n    if (__atomic_fetch_add(&s->count, 1, __ATOMIC_RELAXED) != 0) { return 0; }\n    head = __atomic_load_n(&dado_rt__narrowings, __ATOMIC_RELAXED);\n    do { s->next = head; } while (!__atomic_compare_exchange_n(&dado_rt__narrowings, &head, s, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED));\n    if (__atomic_exchange_n(&dado_rt__narrowings_kept, 1, __ATOMIC_RELAXED) == 0) { (void)atexit(dado_rt__narrowings_report); }\n    return 1;\n}\n"
+
+
+// A dev build's check of a value narrowed into a Dado parameter (Rust's).
+private const string8 NARROWS_JS = "import { $narrowed as dado$$narrowed } from \"dado:$narrowing\";\nfunction __dados_narrows(v, w, k, at) {\n    let said;\n    if (w === \"f32\") {\n        if (!(Number.isFinite(v) && !Number.isFinite(Math.fround(v)))) return v;\n        said = \"the float \" + __dados_str_float(v) + \" does not fit in f32, and becomes \" + (v < 0 ? \"-inf\" : \"inf\");\n    } else {\n        const bits = Number(w.slice(1));\n        const signed = w[0] === \"i\";\n        if (typeof v === \"number\") {\n            if (v >= (signed ? -(2 ** (bits - 1)) : 0) && v <= (signed ? 2 ** (bits - 1) - 1 : 2 ** bits - 1)) return v;\n        }\n        const big = BigInt(v);\n        const became = signed ? BigInt.asIntN(bits, big) : BigInt.asUintN(bits, big);\n        if (became === big) return v;\n        said = \"the int \" + big + \" does not fit in \" + w + \", and wraps to \" + became;\n    }\n    dado$$narrowed(k, at, \"warning: \" + at + \": implicit narrowing changed the value: \" + said);\n    return v;\n}\n"
+
+// The channels scripts receive (Rust's): a drain each into the handler,
+// called by the runtime's watch at a safe point, the `receive` the script
+// calls, and the table `#script_vm` hands the engine.
+private void recv_glue(^C c, ^ref []char8 o, ^ref []char8 rows):
+    ^check.World w = c.w
+    i64 nr = #len(w.recv)
+    put(o, index.hold(#format("uint32_t dado_rt__flags;\nuint64_t dado_rt__channel_bits[", (nr + 63) / 64, "];\n")))
+    ref []char8 tr
+    for i in 0..<nr:
+        u32 d = w.recv[i]
+        u32 r = c.t.resolve(w.decls[d].ty)
+        string8 sn = chan_ty(c, r)
+        string8 g = global_name(c, c.t.str(check.pkg_key(w, w.decls[d].pkg)), c.t.str(check.name_of(w, w.decls[d].name)))
+        string8 q = index.hold(strings.clone(c.t.text(c.t.a[r])))
+        []u32 fs = c.t.list(r)
+        u32 cap = c.t.b[r]
+        string8 at = "s->front"
+        if cap != 0: at = index.hold(#format("s->slot[i % ", cap - 1, "].m"))
+        ref []char8 gv
+        for k in 0..<#len(fs):
+            u8 sk = check.seam_kind(w, fs[k], false)
+            string8 f = index.hold(#format(at, ".f", k))
+            string8 v = index.hold(#format(rtn(c, "give_int"), "(ctx, (int64_t)(", f, "))"))
+            if sk == check.SK_FLOAT: v = index.hold(#format(rtn(c, "give_float"), "(ctx, (double)(", f, "))"))
+            if sk == check.SK_BOOL: v = index.hold(#format(rtn(c, "give_bool"), "(ctx, ", f, ")"))
+            put(&gv, index.hold(#format("argv[", k, "] = ", v, "; ")))
+        string8 call = index.hold(#format("*n += 1; got = ", rtn(c, "deliver_one"), "(ctx, fn, ", #len(fs), ", argv, \"", q, "\");"))
+        put(o, index.hold(#format("static int32_t dado_glue_drain_", i, "(JSContext *ctx, JSValue fn, int64_t *n) {\n    ", sn, " *s = &", g, ";\n    int32_t got = 0;\n    JSValue argv[", #len(fs) + 1, "];\n")))
+        if cap != 0: put(o, index.hold(#format("    uint64_t lim = atomic_load(&s->tail), i = atomic_load(&s->head);\n    while (i != lim && got == 0) {\n        if (atomic_load_explicit(&s->slot[i % ", cap - 1, "].seq, memory_order_acquire) != i + 1) break;\n        ", index.hold(gv), "i++; atomic_store(&s->head, i);\n        ", call, "\n    }\n    if (i != lim) dado_rt__raise(", i, ");\n    return got;\n}\n")))
+        else: put(o, index.hold(#format("    dado_chl_lock(&s->lock);\n    if (s->fresh) { memcpy(&s->front, &s->cur, sizeof(s->cur)); s->fresh = 0; s->unseen = 1; }\n    int has = s->unseen;\n    s->unseen = 0;\n    atomic_store(&s->lock, 0);\n    if (has) { ", index.hold(gv), call, " }\n    return got;\n}\n")))
+        put(o, index.hold(#format("static JSValue dado_glue_receive_", i, "(JSContext *ctx, JSValue this_val, int32_t argc, JSValue *argv) {\n    (void)this_val; (void)argc; (void)argv;\n    return ", rtn(c, "receive_channel"), "(ctx, argv[0], ", i, ");\n}\n")))
+        string8 sent = "tail" if cap != 0 else "lock"
+        put(&tr, index.hold(#format("    {\"", q, "\", dado_glue_drain_", i, ", (void *)&", g, ".owner, ", i, ", (void *)&", g, ".", sent, ", ", 0 if cap != 0 else 1, "},\n")))
+        put(rows, index.hold(#format("    { \"dado:", check.name_of(w, w.p.pkgs[w.decls[d].pkg].name), "\", \"receive$", check.name_of(w, w.decls[d].name), "\", (void (*)(void))dado_glue_receive_", i, ", 1 },\n")))
+    put(o, index.hold(#format("struct dado_js__channel_row { const char *name; int32_t (*deliver)(JSContext *, JSValue, int64_t *); void *owner; int64_t index; void *sent; int64_t latest; };\nstatic const struct dado_js__channel_row dado_js__channel_rows[] = {\n", index.hold(tr), "};\nstatic const struct { void *flags; void *bits; int64_t count; const struct dado_js__channel_row *rows; } dado_js__channels = { (void *)&dado_rt__flags, (void *)dado_rt__channel_bits, ", nr, ", dado_js__channel_rows };\nconst void *const dado_js__channels_p = &dado_js__channels;\n")))
+
+// Whether Dado function `d` keeps its parameter `i` past the call.
+private bool cb_kept(^C c, u32 d, i64 i):
+    for x in c.w.cb_kept:
+        if x == (u64(d) << 32) | u64(i): return true
+    return false
+
+// The C function a script's function given for `d`'s parameter `i` is
+// called through (Rust's trampoline), and a bare one's thread-local slot.
+private string8 cb_tramp(^C c, u32 d, i64 i, string8 g, string8 lab):
+    ^check.World w = c.w
+    u32 pt = c.t.params(w.decls[d].ty)[i]
+    u8 cf = check.cb_form(w, pt)
+    u32 fr = check.cb_fn(w, pt)
+    []u32 pp = c.t.params(fr)
+    u32 rt = c.t.a[fr]
+    bool fl = c.t.b[fr] != types.F_NONE
+    bool kept = cf == 2 && cb_kept(c, d, i)
+    ref []char8 o
+    string8 sl = index.hold(#format(g, "_cb", i))
+    if cf == 1: put(&o, index.hold(#format("static _Thread_local struct dado_glue_cb ", sl, ";\n")))
+    string8 rct = "void"
+    if fl: rct = "int32_t"
+    else if rt != u32(types.P_VOID): rct = ty(c, rt)
+    ref []string8 cps
+    for k in 0..<#len(pp):
+        cps = #append(cps, index.hold(#format(ty(c, pp[k]), " p", k)))
+    put(&o, index.hold(#format("static ", rct, " ", g, "_tr", i, "(", strings.join(cps[:], ", "), ") {\n    JSContext *ctx;\n    JSValue fn;\n")))
+    string8 zero = "return;"
+    if fl: zero = "return begun;"
+    else if rt != u32(types.P_VOID): zero = "return 0;"
+    if cf == 1: put(&o, index.hold(#format("    int32_t begun = ", rtn(c, "callback_begin_bare"), "(&ctx, ", sl, ".ctx, \"", lab, "\");\n    if (begun != 0) { ", zero, " }\n    fn = ", sl, ".fn;\n")))
+    else: put(&o, index.hold(#format("    int32_t begun = ", rtn(c, "callback_begin"), "(&ctx, p0, &fn, \"", lab, "\");\n    if (begun != 0) { ", zero, " }\n")))
+    i64 from = 0
+    if cf != 1: from = 1
+    i64 n = #len(pp) - from
+    if cf == 3: n = 1
+    put(&o, index.hold(#format("    JSValue argv[", n + 1, "];\n")))
+    if cf == 3: put(&o, index.hold(#format("    argv[0] = ", rtn(c, "give_bytes"), "(ctx, p1, p2);\n")))
+    else:
+        for k in from..<#len(pp):
+            u8 sk = check.seam_kind(w, pp[k], false)
+            string8 v = index.hold(#format(rtn(c, "give_int"), "(ctx, (int64_t)(p", k, "))"))
+            if sk == check.SK_FLOAT: v = index.hold(#format(rtn(c, "give_float"), "(ctx, (double)(p", k, "))"))
+            if sk == check.SK_BOOL: v = index.hold(#format(rtn(c, "give_bool"), "(ctx, p", k, ")"))
+            if sk == check.SK_STR: v = index.hold(#format(rtn(c, "give_string"), "(ctx, p", k, ")"))
+            if sk == check.SK_C32: v = index.hold(#format(rtn(c, "give_char32"), "(ctx, p", k, ")"))
+            if sk == check.SK_C16: v = index.hold(#format(rtn(c, "give_char16"), "(ctx, p", k, ")"))
+            put(&o, index.hold(#format("    argv[", k - from, "] = ", v, ";\n")))
+    string8 owed = "0" if kept else "1"
+    put(&o, index.hold(#format("    JSValue r;\n    int32_t code = ", rtn(c, "callback_call"), "(&r, ctx, fn, ", n, ", argv, \"", lab, "\", ", owed, ");\n")))
+    if cf != 1: put(&o, index.hold(#format("    ", rtn(c, "free_value"), "(ctx, fn);\n")))
+    if rct != "void" && !fl && cf != 3: put(&o, index.hold(#format("    ", rct, " v = 0;\n")))
+    put(&o, "    if (code == 0) {\n")
+    if !fl && cf != 3 && rt != u32(types.P_VOID):
+        u8 rk = check.seam_kind(w, rt, false)
+        string8 rf = "read_int"
+        string8 tmp = "int64_t"
+        if rk == check.SK_FLOAT:
+            rf = "read_float"
+            tmp = "double"
+        put(&o, index.hold(#format("        int64_t path[1];\n        ", tmp, " got;\n        if (", rtn(c, rf), "(&got, ctx, r, \"", lab, "\", \"the answer of the script's function\", path, 0) != 0) code = ", rtn(c, "callback_failed"), "(ctx, \"", lab, "\", ", owed, ");\n        else v = (", rct, ")(got);\n")))
+    put(&o, index.hold(#format("        ", rtn(c, "free_value"), "(ctx, r);\n    }\n    ", rtn(c, "callback_end"), "(ctx);\n")))
+    if fl: put(&o, "    return code;\n}\n")
+    else if cf == 3: put(&o, "    return code == 0 ? p2 : 0;\n}\n")
+    else if rct != "void": put(&o, "    return v;\n}\n")
+    else: put(&o, "    (void)code;\n}\n")
+    return index.hold(o)
+
+// `async ` for a method declared so.
+private string8 jasync(^check.World w, u32 m):
+    syntax.Ast a = w.p.files[w.decls[m].file].a
+    if (a.a[w.decls[m].node] & syntax.F_ASYNC) != 0: return "async "
+    return ""
+
+// `--emit=script-api` (Rust's `dados::api`): package `pkg`'s public
+// classes as declarations a loaded script is compiled against.
+string8 script_api(^check.World w, u32 pkg):
+    string8 pn = check.name_of(w, w.p.pkgs[pkg].name) if w.p.pkgs[pkg].name != NONE else "main"
+    ref []char8 o
+    o = #append(o, ..#format("// The script API of package `", pn, "`, written by `dadoc --emit=script-api`:\n// its public DadoScript classes as declarations — fields, and methods' signatures —\n// for a script loaded by its path to be compiled against. Save it as a `.dado`\n// file in a directory of its own and import that directory. Never run: a\n// loaded script is handed the objects themselves, and one that constructs or\n// extends a class declared here is refused when it loads.\npackage api\n"))
+    string8 pre = index.hold(#format(pn, "."))
+    for ci in 0..<#len(w.classes):
+        check.SClass sc = w.classes[ci]
+        u32 d = sc.decl
+        if w.decls[d].pkg != pkg || !api_public(w, sc.file, cls_head(w, u32(ci))): continue
+        o = #append(o, '\n')
+        if w.decls[d].block != NONE:
+            o = #append(o, ..#format("// `", check.name_of(w, w.decls[d].name), "`: an inner class, not declared here\n"))
+            continue
+        o = #append(o, ..#format("class ", check.name_of(w, w.decls[d].name), ":\n"))
+        bool wrote = false
+        u32 row = w.decls[d].ty
+        []u32 sl = w.t.slots(row)
+        []u32 sn = w.t.slot_names(row)
+        ref []check.SField fl = check.s_fields_of(w, u32(ci))
+        for i in 0..<#len(sl):
+            if i >= #len(fl) || fl[i].cls != u32(ci) || fl[i].emb >= 0: continue
+            if !api_public(w, fl[i].file, fl[i].node): continue
+            string8 ty = unq(mty(w, sl[i]), pre)
+            if check.s_class_of_ty(w, sl[i]) != NONE: o = #append(o, ..#format("    // `", w.t.text(sn[i]), "`: a `", ty, "`, not declared here — a script has no null to start it at\n"))
+            else: o = #append(o, ..#format("    ", ty, " ", w.t.text(sn[i]), "\n"))
+            wrote = true
+        for md in sc.methods:
+            string8 mn = check.name_of(w, w.decls[md].name)
+            u32 mf = w.decls[md].file
+            if mn == "init" || !api_public(w, mf, w.decls[md].node): continue
+            u32 ft = check.resolve(w, md)
+            if ft == NONE: continue
+            syntax.Ast a = w.p.files[mf].a
+            []u32 ks = a.list(a.b[w.decls[md].node])
+            []u32 all = w.t.params(ft)
+            ref []string8 ps
+            i64 pi = 1
+            for k in 6..<#len(ks):
+                if ks[k] == NONE || pi >= #len(all): continue
+                ps = #append(ps, index.hold(#format(unq(mty(w, all[pi]), pre), " ", w.p.spell(mf, ks[k]))))
+                pi += 1
+            string8 rt = "void"
+            if w.t.a[ft] != u32(types.P_VOID): rt = unq(mty(w, w.t.a[ft]), pre)
+            o = #append(o, ..#format("    ", rt, " ", mn, "(", strings.join(ps[:], ", "), "):\n        fail 70\n"))
+            wrote = true
+        if !wrote: o = #append(o, .."    // nothing public\n    int unused\n")
+    return index.hold(o)
+
+// A class's header node: the file's `script` line, or its `class` block.
+private u32 cls_head(^check.World w, u32 ci):
+    check.SClass sc = w.classes[ci]
+    syntax.Ast a = w.p.files[sc.file].a
+    if sc.node != a.root: return sc.node
+    []u32 rs = a.list(a.b[a.root])
+    return rs[2] if #len(rs) > 2 else NONE
+
+private bool api_public(^check.World w, u32 f, u32 n):
+    if n == NONE: return true
+    syntax.Ast a = w.p.files[f].a
+    u32 v = a.a[n] & syntax.F_VIS
+    return v == syntax.VIS_UNMARKED || v == syntax.VIS_PUBLIC || v == syntax.VIS_EXPORT
+
+// `s` with every `pre` (`pkg.`) dropped.
+private string8 unq(string8 s, string8 pre):
+    ref []char8 o
+    i64 i = 0
+    for i < #len(s):
+        if i + #len(pre) <= #len(s) && s[i..<i + #len(pre)] == pre:
+            i += #len(pre)
+            continue
+        o = #append(o, s[i])
+        i += 1
+    return index.hold(o)
+
+// `--emit=reload`'s header (Rust's `reload_header`): the class, each Dado
+// function it calls with its first call's place, its methods and fields.
+string8 reload_header(^check.World w, u32 ci):
+    check.SClass sc = w.classes[ci]
+    string8 mo = jmod(w, ci)
+    ref []char8 o
+    o = #append(o, ..#format("// dados reload ", mo, " ", check.name_of(w, w.decls[sc.decl].name), "\n"))
+    // The functions it calls, by (package, name), each once.
+    ref []u32 fs
+    ref []string8 keys
+    ref []string8 places
+    for i in 0..<#len(w.bsite_cls):
+        if w.bsite_cls[i] != u32(ci): continue
+        u32 d = w.bsite_fn[i]
+        string8 k = index.hold(#format(check.name_of(w, w.p.pkgs[w.decls[d].pkg].name), ".", check.seam_name(w, d)))
+        bool seen = false
+        for x in keys:
+            if x == k: seen = true
+        if seen: continue
+        i64 at = #len(keys)
+        keys = #append(keys, k)
+        fs = #append(fs, d)
+        places = #append(places, w.bsite_at[i])
+        for at > 0 && strings.before(k, keys[at - 1]):
+            keys[at] = keys[at - 1]
+            fs[at] = fs[at - 1]
+            places[at] = places[at - 1]
+            at -= 1
+        keys[at] = k
+        fs[at] = d
+        places[at] = w.bsite_at[i]
+    for j in 0..<#len(fs):
+        o = #append(o, ..#format("// dados fn ", keys[j], " ", bound_sig(w, fs[j]), "\t", places[j], "\n"))
+    for md in sc.methods:
+        u32 ft = check.resolve(w, md)
+        if ft == NONE: continue
+        []u32 all = w.t.params(ft)
+        ref []string8 ps
+        for p in all[1..<#len(all)]:
+            ps = #append(ps, mty(w, p))
+        string8 rt = "void"
+        if w.t.a[ft] != u32(types.P_VOID): rt = mty(w, w.t.a[ft])
+        o = #append(o, ..#format("// dados method ", mo, ".", check.name_of(w, w.decls[md].name), " ", rt, "(", strings.join(ps[:], ", "), ")\n"))
+    u32 row = w.decls[sc.decl].ty
+    []u32 sl = w.t.slots(row)
+    []u32 sn = w.t.slot_names(row)
+    ref []check.SField fl = check.s_fields_of(w, ci)
+    for i in 0..<#len(sl):
+        if i >= #len(fl) || fl[i].cls != ci || fl[i].emb >= 0: continue
+        o = #append(o, ..#format("// dados field ", mo, ".", w.t.text(sn[i]), " ", mty(w, sl[i]), "\n"))
+    return index.hold(o)
+
+// A bound function's signature as the manifest writes it.
+private string8 bound_sig(^check.World w, u32 d):
+    u32 fty = w.decls[d].ty
+    ref []string8 ps
+    for p in w.t.params(fty):
+        ps = #append(ps, check.shown(w, p))
+    string8 rt = "void"
+    if w.t.a[fty] != u32(types.P_VOID): rt = check.shown(w, w.t.a[fty])
+    string8 fl = ""
+    if w.t.b[fty] != types.F_NONE: fl = "!"
+    return index.hold(#format(fl, rt, "(", strings.join(ps[:], ", "), ")"))

@@ -86,7 +86,9 @@ export function header(manifest) {
   const guard = head.guard;
   const lines = [];
   lines.push(`/* Generated from the build manifest of package \`${comment(manifest.package.root)}\` (${SCHEMA}) by its C header extension. Do not edit. */`);
-  lines.push(`/* The C surface of every Dado \`export\`, and the shapes they name, for ${comment(manifest.target.triple)}. */`);
+  // No `--target`: no triple to name.
+  const forTarget = manifest.target.triple ? `, for ${comment(manifest.target.triple)}` : "";
+  lines.push(`/* The C surface of every Dado \`export\`, and the shapes they name${forTarget}. */`);
   lines.push("");
   lines.push(`#ifndef ${guard}`);
   lines.push(`#define ${guard}`);

@@ -1,0 +1,378 @@
+// `-D NAME=value`: a `@const`'s value
+// replaced by a literal of its kind; ERR1101 (names none), ERR1102 (the kind),
+// ERR1103 (two spellings, or a bare name more than one package declares).
+package check
+
+import "core:strings"
+import "core:strings/parse"
+import "language:diag"
+import "language:index"
+import "language:syntax"
+import "language:types"
+
+private const u8 KD_NONE = 0
+private const u8 KD_INT = 1
+private const u8 KD_FLOAT = 2
+private const u8 KD_BOOL = 3
+private const u8 KD_STR = 4
+private const u8 KD_CHAR = 5
+
+private string8 kind_said(u8 k):
+    if k == KD_INT: return "an integer"
+    if k == KD_FLOAT: return "a float"
+    if k == KD_BOOL: return "`true` or `false`"
+    if k == KD_STR: return "a string"
+    return "a character"
+
+// Whether `d` is a `@const`.
+bool build_const(^World w, u32 d):
+    if w.decls[d].kind != K_CONST: return false
+    syntax.Ast a = w.p.files[w.decls[d].file].a
+    return (a.a[w.decls[d].node] & syntax.F_BUILD) != 0
+
+private string8 pkg_name(^World w, u32 p):
+    return name_of(w, w.p.pkgs[p].name) if w.p.pkgs[p].name != NONE else "main"
+
+// How many packages declare a `@const` named `nm` (with a `-D`, every
+// package is declared: a flag names any of them).
+private i64 owners(^World w, string8 nm):
+    for p in 0..<u32(#len(w.p.pkgs)):
+        declare(w, p)
+    ref []u32 ps
+    for d in 0..<u32(#len(w.decls)):
+        if !build_const(w, d) || name_of(w, w.decls[d].name) != nm: continue
+        bool seen = false
+        for p in ps:
+            if p == w.decls[d].pkg: seen = true
+        if !seen: ps = #append(ps, w.decls[d].pkg)
+    for bc in w.body_consts:
+        u32 f = u32(bc >> 32)
+        if w.p.spell(f, u32(bc & 0xFFFFFFFF)) != nm: continue
+        bool seen = false
+        for p in ps:
+            if p == w.p.files[f].pkg: seen = true
+        if !seen: ps = #append(ps, w.p.files[f].pkg)
+    return #len(ps)
+
+private i64 def_at(^World w, string8 key):
+    for i in 0..<#len(w.def_keys):
+        if w.def_keys[i] == key: return i
+    return -1
+
+// Rust's `reaching`: the qualified flag, else the bare one when one package
+// declares the name; the flag's place or -1.
+private i64 reaching(^World w, u32 d):
+    return reaching_at(w, w.decls[d].pkg, name_of(w, w.decls[d].name))
+
+private i64 reaching_at(^World w, u32 pkg, string8 nm):
+    i64 q = def_at(w, index.hold(#format(pkg_name(w, pkg), ".", nm)))
+    if q >= 0: return q
+    if owners(w, nm) != 1: return -1
+    return def_at(w, nm)
+
+// `@const` `d`'s value after the build's say: `cv` (its written value) or
+// the `-D` literal; ERR1102 when it does not fit.
+u32 overridden(^World w, u32 d, u32 ty, u32 cv):
+    if #len(w.def_keys) == 0 || !build_const(w, d): return cv
+    u8 dk = KD_NONE
+    if cv != NONE:
+        u8 ck = w.k.kind[cv]
+        if ck == types.C_INT: dk = KD_INT
+        else if ck == types.C_FLOAT: dk = KD_FLOAT
+        else if ck == types.C_BOOL: dk = KD_BOOL
+        else if ck == types.C_STR: dk = KD_STR
+    w.def_unwrapped = NONE
+    u32 out = apply(w, w.decls[d].file, w.decls[d].node, w.decls[d].pkg, ty, dk)
+    if out != NONE && w.def_unwrapped != NONE && w.def_unwrapped != out: w.def_raw[d] = w.def_unwrapped
+    return cv if out == NONE else out
+
+// A body's `@const` (node `n`): its value `v` after the build's say.
+Val local_override(^World w, ^Body b, u32 n, u32 ty, Val v):
+    syntax.Ast a = tree(w, b)
+    if (a.a[n] & syntax.F_BUILD) == 0: return v
+    w.body_consts = #append(w.body_consts, (u64(b.file) << 32) | u64(n))
+    if #len(w.def_keys) == 0 || v.ty == NONE: return v
+    u8 dk = KD_NONE
+    u32 vt = w.t.resolve(v.ty)
+    if v.kind == V_LIT: dk = KD_INT
+    else if v.kind == V_FLIT: dk = KD_FLOAT
+    else if vt == u32(types.P_BOOL): dk = KD_BOOL
+    else if vt == types.STRING8: dk = KD_STR
+    else if is_int(w, vt): dk = KD_INT
+    else if is_float(w, vt): dk = KD_FLOAT
+    u32 c = apply(w, b.file, n, w.p.files[b.file].pkg, ty, dk)
+    if c == NONE: return v
+    u32 ct = ty
+    if ct == NONE:
+        u8 ck = w.k.kind[c]
+        if ck == types.C_INT: ct = w.untyped
+        else if ck == types.C_FLOAT: ct = w.ufloat
+        else if ck == types.C_BOOL: ct = u32(types.P_BOOL)
+        else: ct = types.STRING8
+    return konst_val(w, b, c, ct, n)
+
+// The `-D` literal for `@const` node `n` of file `f` (package `pkg`), of
+// the kind its written type says, else `dk`; NONE when none reaches it or
+// it does not fit (ERR1102).
+private u32 apply(^World w, u32 f, u32 n, u32 pkg, u32 ty, u8 dk):
+    string8 nm = index.hold(strings.clone(w.p.spell(f, n)))
+    i64 at = reaching_at(w, pkg, nm)
+    if at < 0: return NONE
+    u32 cv = NONE
+    string8 key = w.def_keys[at]
+    string8 raw = w.def_vals[at]
+    syntax.Ast a = w.p.files[f].a
+    u8 ph = w.d.phase
+    w.d.phase = diag.PH_INTERFACE
+    if key != nm && owners(w, nm) == 1 && def_at(w, nm) >= 0:
+        u32 lo = anchor(w)
+        say(w, w.p.pkgs[0].flo, 0, lo, lo, 1103, index.hold(#format("`-D ", key, "=…` and `-D ", nm, "=…` name one `@const`, and a `@const` has one value per build\x1f`", key, "` is the only `@const` of that name in this compilation, so the bare spelling is the qualified one abbreviated — they are two ways of writing the same flag, not two flags\x1egive one of them")), "")
+    // The kind: off the written type, else the written value's.
+    u8 want = KD_NONE
+    []u32 ks = a.list(a.b[n])
+    if ks[0] != NONE && a.tag[ks[0]] == syntax.T_NAME:
+        string8 tn = w.p.spell(f, ks[0])
+        if tn == "i8" || tn == "i16" || tn == "i32" || tn == "i64" || tn == "u8" || tn == "u16" || tn == "u32" || tn == "u64" || tn == "byte": want = KD_INT
+        else if tn == "f32" || tn == "f64": want = KD_FLOAT
+        else if tn == "bool": want = KD_BOOL
+        else if tn == "string8": want = KD_STR
+        else if tn == "char8" || tn == "char16" || tn == "char32": want = KD_CHAR
+    if want == KD_NONE: want = dk
+    if want == KD_NONE:
+        say_tok(w, f, 0, n, 1102, index.hold(#format("`", nm, "` is not a literal, so there is nothing `-D ", nm, "=", raw, "` could replace it with; a constant is usable where a literal is and only there")), "")
+        w.d.phase = ph
+        return cv
+    string8 why = ""
+    u32 out = NONE
+    if want == KD_STR: out = w.k.str(&w.t, raw)
+    else if want == KD_BOOL:
+        if raw == "true" || raw == "false": out = w.k.boolean(&w.t, raw == "true")
+        else: why = index.hold(#format("`", raw, "` is not `true` or `false`; a `bool` override is one of those two words"))
+    else if want == KD_CHAR:
+        i64 r = one_char(raw)
+        if r < 0: why = index.hold(#format("`", raw, "` is not one character; a character override is the character itself, unquoted"))
+        else: out = w.k.small(&w.t, r)
+    else if want == KD_INT:
+        u64 lo = 0
+        i64 hi = 0
+        if !integer(raw, &lo, &hi): why = index.hold(#format("`", raw, "` is not an integer"))
+        else:
+            w.def_unwrapped = w.k.int(&w.t, lo, hi)
+            if ty != NONE: lo = fit_at(w, f, n, lo, hi, ty, &hi)
+            out = w.k.int(&w.t, lo, hi)
+    else:
+        ref []char8 cl
+        for c in raw:
+            if c != '_': cl = #append(cl, c)
+        string8 ct = index.hold(cl)
+        bool num = #len(ct) > 0
+        for c in ct:
+            if !(c >= '0' && c <= '9' || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'): num = false
+        f64 x = 0.0
+        if num:
+            try x = parse.to_f64(ct) else: num = false
+        if !num && (ct == "inf" || ct == "-inf" || ct == "+inf" || ct == "infinity" || ct == "NaN" || ct == "nan"): why = index.hold(#format("`", raw, "` is not a finite float; Dado has no literal for an infinity or a NaN, and a flag is not a way to write one"))
+        else if !num: why = index.hold(#format("`", raw, "` is not a float"))
+        else if x > 1.7976931348623157e308 || x < -1.7976931348623157e308: why = index.hold(#format("`", raw, "` is not a finite float; Dado has no literal for an infinity or a NaN, and a flag is not a way to write one"))
+        else: out = w.k.float_bits(&w.t, fbits(x))
+    if #len(why) > 0:
+        say_tok(w, f, 0, n, 1102, index.hold(#format("`-D ", nm, "=", raw, "` does not fit this `@const`, which takes ", kind_said(want), ": ", why)), "")
+        w.d.phase = ph
+        return cv
+    w.d.phase = ph
+    return out
+
+// The head of the main package's first file: where a flag's refusal points.
+private u32 anchor(^World w):
+    u32 f = w.p.pkgs[0].flo
+    syntax.Ast a = w.p.files[f].a
+    for x in a.list(a.b[a.root]):
+        if x != NONE: return a.lo[x]
+    return a.lo[a.root]
+
+private i64 one_char(string8 s):
+    if #len(s) == 0: return -1
+    u8 c = u8(s[0])
+    i64 n = 1
+    i64 v = i64(c)
+    if c >= 0xF0:
+        n = 4
+        v = i64(c & 0x07)
+    else if c >= 0xE0:
+        n = 3
+        v = i64(c & 0x0F)
+    else if c >= 0xC0:
+        n = 2
+        v = i64(c & 0x1F)
+    if #len(s) != n: return -1
+    for i in 1..<n:
+        v = (v << 6) | i64(u8(s[i]) & 0x3F)
+    return v
+
+// Rust's `integer`: `-`, `_` ignored, `0x`/`0b`/`0o`, in i128.
+private bool integer(string8 raw, ^u64 lo, ^i64 hi):
+    bool neg = #len(raw) > 0 && raw[0] == '-'
+    string8 s = raw[1..<#len(raw)] if neg else raw
+    ref []char8 cl
+    for c in s:
+        if c == '_': continue
+        cl = #append(cl, char8(u8(c) + 32) if c >= 'A' && c <= 'Z' else c)
+    string8 t = index.hold(cl)
+    u64 radix = 10
+    if strings.starts_with(t, "0x"): radix = 16
+    else if strings.starts_with(t, "0b"): radix = 2
+    else if strings.starts_with(t, "0o"): radix = 8
+    if radix != 10: t = t[2..<#len(t)]
+    if #len(t) == 0: return false
+    u64 l = 0
+    u64 h = 0
+    for c in t:
+        u64 dg = 99
+        if c >= '0' && c <= '9': dg = u64(u8(c) - u8('0'))
+        else if c >= 'a' && c <= 'f': dg = u64(u8(c) - u8('a')) + 10
+        if dg >= radix: return false
+        // (h, l) * radix + dg, in 128 bits.
+        u64 l0 = (l & 0xFFFFFFFF) * radix + dg
+        u64 l1 = (l >> 32) * radix + (l0 >> 32)
+        h = h * radix + (l1 >> 32)
+        l = (l1 << 32) | (l0 & 0xFFFFFFFF)
+        if h >= 0x8000000000000000: return false
+    if neg:
+        l = ~l + 1
+        h = ~h + (1 if l == 0 else 0)
+    lo^ = l
+    hi^ = i64(h)
+    return true
+
+// LNT0505 at the name when the literal does not fit `ty`; the value wrapped.
+private u64 fit_at(^World w, u32 f, u32 n, u64 lo, i64 hi, u32 ty, ^i64 hout):
+    u8 p = int_prim(w, ty)
+    u8 bits = types.integer_bits(p)
+    if bits == 0: return lo
+    bool signed = types.is_signed(p)
+    u64 top = 0xFFFFFFFFFFFFFFFF if bits == 64 else (u64(1) << u64(bits)) - 1
+    i64 smin = 0
+    i64 smax = 0
+    bool ok = true
+    if signed:
+        smax = i64(top >> 1)
+        smin = -smax - 1
+        if hi < 0: ok = hi == -1 && i64(lo) >= smin && i64(lo) < 0
+        else: ok = hi == 0 && lo <= u64(smax)
+    else:
+        ok = hi == 0 && lo <= top
+    u64 kept = lo & top
+    if !ok:
+        string8 low = index.hold(#format(smin)) if signed else "0"
+        string8 high = index.hold(#format(smax)) if signed else index.hold(#format(top))
+        string8 keeps = index.hold(#format(kept))
+        if signed && bits < 64 && kept > u64(smax): keeps = index.hold(#format(i64(kept) - i64(top) - 1))
+        if signed && bits == 64: keeps = index.hold(#format(i64(kept)))
+        string8 v = decimal(lo, hi)
+        string8 s = shown(w, ty)
+        say_tok(w, f, 0, n, diag.LNT + 505, index.hold(#format("`", v, "` does not fit `", s, "`, which holds ", low, " to ", high, ", and wraps to `", keeps, "`")), index.hold(#format("write `", s, "(", v, ")` to wrap on purpose, or a value from ", low, " to ", high)))
+    hout^ = 0
+    if signed && bits < 64 && (kept >> u64(bits - 1)) != 0:
+        hout^ = -1
+        return kept | ~top
+    if signed && bits == 64 && i64(kept) < 0: hout^ = -1
+    return kept
+
+// After the program: each `-D` that reaches none (ERR1101), or a bare one
+// more than one package declares (ERR1103); every reached `@const` folded.
+void defines_after(^World w):
+    if #len(w.def_keys) == 0: return
+    _ = owners(w, "")
+    unchecked_consts(w)
+    ref []bool used
+    for _ in w.def_keys:
+        used = #append(used, false)
+    for d in 0..<u32(#len(w.decls)):
+        if !build_const(w, d): continue
+        i64 at = reaching(w, d)
+        if at < 0: continue
+        used[at] = true
+        string8 nm = name_of(w, w.decls[d].name)
+        // Both spellings of one: the bare one is used too.
+        i64 bare = def_at(w, nm)
+        if bare >= 0 && owners(w, nm) == 1: used[bare] = true
+        _ = resolve(w, d)
+    for bc in w.body_consts:
+        u32 bf = u32(bc >> 32)
+        string8 bn = index.hold(strings.clone(w.p.spell(bf, u32(bc & 0xFFFFFFFF))))
+        i64 at = reaching_at(w, w.p.files[bf].pkg, bn)
+        if at >= 0: used[at] = true
+    // The `@const`s declared, `package.NAME`, sorted.
+    ref []string8 decl
+    for d in 0..<u32(#len(w.decls)):
+        if !build_const(w, d): continue
+        string8 q = index.hold(#format(pkg_name(w, w.decls[d].pkg), ".", name_of(w, w.decls[d].name)))
+        decl = sorted_in(decl, q)
+    for bc in w.body_consts:
+        u32 bf = u32(bc >> 32)
+        decl = sorted_in(decl, index.hold(#format(pkg_name(w, w.p.files[bf].pkg), ".", w.p.spell(bf, u32(bc & 0xFFFFFFFF)))))
+
+    string8 known = "this compilation declares no `@const` at all"
+    if #len(decl) > 0: known = index.hold(#format("the compilation declares ", strings.join(decl[:], " ")))
+    u8 ph = w.d.phase
+    w.d.phase = diag.PH_FACTS
+    u32 lo = anchor(w)
+    u32 f0 = w.p.pkgs[0].flo
+    // In the flags' name order (Rust's map).
+    ref []i64 order
+    for i in 0..<#len(w.def_keys):
+        i64 j = #len(order)
+        order = #append(order, i)
+        for j > 0 && strings.compare(w.def_keys[order[j - 1]], w.def_keys[i]) > 0:
+            order[j] = order[j - 1]
+            j -= 1
+        order[j] = i
+    for i in order:
+        if used[i]: continue
+        string8 nm = w.def_keys[i]
+        if owners(w, nm) <= 1: continue
+        used[i] = true
+        ref []string8 cs
+        string8 first = ""
+        string8 dn = index.hold(#format(".", nm))
+        for q in decl:
+            if strings.ends_with(q, dn) && strings.index_of(q, '.') == #len(q) - #len(nm) - 1:
+                if #len(first) == 0: first = q
+                cs = #append(cs, index.hold(#format("`", q, "`")))
+        say(w, f0, 0, lo, lo, 1103, index.hold(#format("`-D ", nm, "=…` names more than one `@const` in this compilation (", strings.join(cs[:], ", "), "), so it names none of them")), index.hold(#format("write the package: `-D ", first, "=…`")), "A bare name is the qualified spelling abbreviated, and an abbreviation is accepted only while it resolves to one declaration. Applying it to every declaration of that name is what this refusal replaces — it left the `when` folder and the checker disagreeing about the value, and an arm selected on that disagreement is one nothing else checks")
+    for i in order:
+        if used[i]: continue
+        say(w, f0, 0, lo, lo, 1101, index.hold(#format("`-D ", w.def_keys[i], "=…` names no `@const` in this compilation\x1fA `@const` declared inside an untaken `when` branch is never declared, so a `-D` targeting it lands here too\x1ename one of them: ", known)), "")
+    w.d.phase = ph
+
+// `q` put in sorted `xs`, once.
+private ref []string8 sorted_in(ref []string8 xs, string8 q):
+    ref []string8 out = xs
+    for x in out:
+        if x == q: return out
+    i64 j = #len(out)
+    out = #append(out, q)
+    for j > 0 && strings.compare(out[j - 1], q) > 0:
+        out[j] = out[j - 1]
+        j -= 1
+    out[j] = q
+    return out
+
+// The `@const`s of every declared function's body, checked or not (Rust
+// declares them all): onto `w.body_consts`.
+private void unchecked_consts(^World w):
+    {u64: u8} seen
+    for x in w.body_consts:
+        seen[x] = 1
+    for f in 0..<u32(#len(w.p.files)):
+        syntax.Ast a = w.p.files[f].a
+        for n in 0..<u32(#len(a.tag)):
+            if a.tag[n] != syntax.N_CONST || (a.a[n] & syntax.F_BUILD) == 0: continue
+            u64 key = (u64(f) << 32) | u64(n)
+            if key in seen: continue
+            for d in w.decls:
+                if d.file != f || d.kind != K_FN && d.kind != K_METHOD || d.node == n: continue
+                if a.lo[d.node] <= a.lo[n] && a.hi[n] <= a.hi[d.node]:
+                    w.body_consts = #append(w.body_consts, key)
+                    seen[key] = 1
+                    break

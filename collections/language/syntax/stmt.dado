@@ -1,0 +1,918 @@
+// Statements and blocks, a script's statements included.
+package syntax
+
+u32 block(^Parser p):
+    if p.too_deep(): return BAD
+    p.depth += 1
+    u32 b = block_inner(p)
+    p.depth -= 1
+    return b
+
+private u32 block_inner(^Parser p):
+    if p.lambda_inline > 0 && p.at(NEWLINE):
+        u32 inline = p.lambda_inline
+        p.lambda_inline = 0
+        u32 b = block_inner(p)
+        p.lambda_inline = inline
+        return b
+    i64 base = p.base()
+    if !p.at(NEWLINE):
+        u32 start = p.peek()
+        u32 s = stmt(p)
+        if s == BAD: return BAD
+        p.push(s)
+        return p.node(S_BLOCK, NONE, 0, p.seal(base), join_lo(p.st[start], p.lo(s)), join_hi(p.en[start], p.hi(s)))
+    if p.expect(NEWLINE) == BAD: return BAD
+    if !p.at(INDENT):
+        u32 t = p.peek()
+        p.begin(202, p.st[t], p.en[t])
+        p.say("expected an indented block, found ")
+        p.say_kind(p.tg[t])
+        p.seal_diag()
+        return BAD
+    u32 open = p.bump()
+    bool after_failure = false
+    for:
+        p.skip_newlines()
+        if p.at(DEDENT) || p.at(EOF): break
+        if after_failure && p.at(INDENT):
+            after_failure = false
+            p.skip_indented_region()
+            continue
+        after_failure = false
+        i64 before = p.ndiags()
+        i64 keep = p.base()
+        u32 s = stmt(p)
+        p.drop(keep)
+        if s != BAD:
+            p.push(tried_as_meant(p, s, before))
+        else:
+            if p.at(INDENT):
+                p.skip_indented_region()
+                continue
+            if !recover_statement(p, before): break
+            after_failure = true
+    u32 close = p.peek()
+    if p.at(DEDENT): _ = p.bump()
+    return p.node(S_BLOCK, open, 1, p.seal(base), join_lo(p.st[open], p.st[close]), join_hi(p.en[open], p.en[close]))
+
+u32 stmt(^Parser p):
+    p.block_ended = false
+    u8 k = p.kind(0)
+    if at_channel_head(p):
+        channel_misplaced(p, "a statement in a function body")
+        return BAD
+    if k == KW_RETURN: return return_stmt(p)
+    if k == KW_VIEW: return view_stmt(p)
+    if k == KW_FOR: return for_stmt(p)
+    if k == KW_IF: return if_stmt(p)
+    if k == KW_BREAK || k == KW_CONTINUE:
+        u32 t = p.bump()
+        _ = p.expect(NEWLINE)
+        return p.leaf(S_BREAK if k == KW_BREAK else S_CONTINUE, t)
+    if k == KW_CONST: return const_decl(p, VIS_UNMARKED, NONE)
+    if at_build_const(p):
+        u32 at = p.bump()
+        return const_decl(p, VIS_UNMARKED, at)
+    if at_when_head(p): return when_stmt(p)
+    if at_switch_head(p): return switch_stmt(p)
+    if at_defer_head(p): return defer_stmt(p)
+    if at_word_statement(p, W_PASS) || at_word_statement(p, W_FALLTHROUGH):
+        u32 w = p.word(0)
+        u32 t = p.bump()
+        _ = p.expect(NEWLINE)
+        return p.leaf(S_PASS if w == W_PASS else S_FALLTHROUGH, t)
+    if at_suite_word(p) || at_grouped_suite_word(p): return suite_stmt(p)
+    if at_operand_statement(p, W_QUIT) || at_operand_statement(p, W_FAIL) || (p.at(IDENT) && p.word(0) == W_FAIL && p.kind(1) == MINUS):
+        u32 w = p.word(0)
+        u32 kw = p.bump()
+        u32 v = expr(p)
+        if v == BAD: return BAD
+        _ = p.expect(NEWLINE)
+        return p.node(S_QUIT if w == W_QUIT else S_FAIL, kw, v, NONE, p.st[kw], join_hi(p.en[kw], p.hi(v)))
+    if at_try_head(p): return try_stmt(p)
+    if k == KW_AWAIT: return await_stmt(p)
+    if at_assert_head(p): return assert_stmt(p)
+    u32 tried = try_bracketed_declaration(p)
+    if tried != NONE: return tried
+    if at_c_body(p):
+        u32 c = c_body_attr(p)
+        if c == BAD: return BAD
+        return let_assign_or_expr(p, c)
+    return let_assign_or_expr(p, NONE)
+
+private u32 return_stmt(^Parser p):
+    u32 kw = p.bump()
+    u32 v = NONE
+    u32 hi = p.en[kw]
+    if !p.at(NEWLINE) && !p.at(EOF):
+        v = expr(p)
+        if v == BAD: return BAD
+        hi = join_hi(hi, p.hi(v))
+    _ = p.expect(NEWLINE)
+    return p.node(S_RETURN, kw, v, NONE, p.st[kw], hi)
+
+private u32 view_stmt(^Parser p):
+    u32 kw = p.bump()
+    u32 target = p.ident("the tuple a view applies to")
+    if target == BAD: return BAD
+    if p.expect(COLON) == BAD || p.expect(LPAREN) == BAD: return BAD
+    i64 base = p.base()
+    for !p.at(RPAREN) && !p.at(EOF):
+        u32 n = p.ident("a slot name")
+        if n == BAD:
+            p.drop(base)
+            return BAD
+        p.push(p.leaf(N_WORD, n))
+        if p.at(COMMA): _ = p.bump()
+        else: break
+    u32 close = p.expect(RPAREN)
+    if close == BAD:
+        p.drop(base)
+        return BAD
+    _ = p.expect(NEWLINE)
+    return p.node(S_VIEW, target, NONE, p.seal(base), p.st[kw], p.en[close])
+
+private u32 for_stmt(^Parser p):
+    u32 kw = p.bump()
+    i64 before = p.ndiags()
+    u32 header = NONE
+    if !p.at(COLON):
+        header = for_in_header(p)
+        if header == BAD: return BAD
+        if header == NONE:
+            if p.ndiags() > before: return BAD
+            header = head_expr(p)
+            if header == BAD: return BAD
+    if p.expect(COLON) == BAD: return BAD
+    u32 body = block(p)
+    if body == BAD: return BAD
+    return p.node(S_FOR, kw, header, body, p.st[kw], join_hi(p.en[kw], p.hi(body)))
+
+private u32 for_in_header(^Parser p):
+    Mark m = p.mark()
+    u32 start = p.peek()
+    i64 base = p.base()
+    for p.at(IDENT) || p.at(AMP):
+        u32 amp = NONE
+        if p.at(AMP): amp = p.bump()
+        u32 n = p.ident("a loop binding")
+        if n == BAD: break
+        u32 lo = p.st[n]
+        if amp != NONE: lo = p.st[amp]
+        p.push(p.node(S_BIND, n, 1 if amp != NONE else 0, NONE, lo, p.en[n]))
+        if p.at(COMMA): _ = p.bump()
+        else: break
+    if p.base() == base || !p.at(KW_IN):
+        p.rewind(m)
+        return NONE
+    _ = p.bump()
+    u32 it = head_expr(p)
+    if it == BAD:
+        p.drop(base)
+        return BAD
+    p.push(it)
+    return p.node(S_FOR_IN, start, NONE, p.seal(base), p.st[start], join_hi(p.en[start], p.hi(it)))
+
+u32 if_stmt(^Parser p):
+    u32 kw = p.bump()
+    u32 cond = head_expr(p)
+    if cond == BAD: return BAD
+    if p.expect(COLON) == BAD: return BAD
+    u32 then = block(p)
+    if then == BAD: return BAD
+    u32 hi = join_hi(p.en[kw], p.hi(then))
+    u32 other = NONE
+    if at_else(p):
+        p.skip_newlines()
+        _ = p.bump()
+        if p.at(KW_IF):
+            if p.too_deep(): return BAD
+            p.depth += 1
+            other = if_stmt(p)
+            p.depth -= 1
+            if other == BAD: return BAD
+        else:
+            if p.expect(COLON) == BAD: return BAD
+            other = block(p)
+            if other == BAD: return BAD
+        hi = join_hi(hi, p.hi(other))
+    i64 base = p.base()
+    p.push(cond)
+    p.push(then)
+    p.push(other)
+    return p.node(S_IF, kw, NONE, p.seal(base), p.st[kw], hi)
+
+private bool at_else(^Parser p):
+    i64 i = p.pos
+    for i <= p.last:
+        if p.tg[i] == NEWLINE:
+            i += 1
+            continue
+        return p.tg[i] == KW_ELSE
+    return false
+
+private bool at_word_statement(^Parser p, u32 w):
+    return p.at(IDENT) && p.word(0) == w && p.kind(1) == NEWLINE
+
+private bool at_operand_statement(^Parser p, u32 w):
+    if !p.at(IDENT) || p.word(0) != w: return false
+    u8 k = p.kind(1)
+    return k == IDENT || k == HASH_NAME || k == INT || k == FLOAT || k == STRING || k == CHAR
+
+private bool at_suite_word(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_USING: return false
+    u8 k = p.kind(1)
+    return k == IDENT || k == HASH_NAME
+
+private bool at_grouped_suite_word(^Parser p):
+    if !p.at(IDENT) || p.kind(1) != LPAREN || p.word(0) != W_USING: return false
+    i64 close = matching_close(p.tg, p.pos + 1)
+    if close < 0 || close + 1 > p.last: return false
+    return p.tg[close + 1] == COLON
+
+bool at_postfix_suite_word(^Parser p):
+    if at_suite_word(p): return true
+    return p.at(IDENT) && p.kind(1) == LPAREN && p.word(0) == W_USING
+
+private u32 suite_stmt(^Parser p):
+    u32 w = p.bump()
+    u32 head = using_head(p, true)
+    if head == BAD: return BAD
+    if !p.at(COLON):
+        u32 t = p.peek()
+        p.begin(208, p.st[w], join_hi(p.en[w], p.hi(head)))
+        p.say("`using` scopes a **suite**, so it needs one: write `:` here and indent the statements it governs. Found ")
+        p.say_kind(p.tg[t])
+        p.seal_diag()
+        return BAD
+    _ = p.bump()
+    u32 body = block(p)
+    if body == BAD: return BAD
+    return p.node(S_SUITE, w, head, body, p.st[w], join_hi(p.en[w], p.hi(body)))
+
+// An E_USING: the allocator, then named sinks.
+u32 using_head(^Parser p, bool suite):
+    u32 start = p.peek()
+    i64 base = p.base()
+    p.push(NONE)
+    u32 alloc = NONE
+    if !at_sink_label(p, 0):
+        alloc = head_expr(p) if suite else prefix(p)
+        if alloc == BAD:
+            p.drop(base)
+            return BAD
+        if !misnamed_first_sink(p, alloc, suite):
+            p.drop(base)
+            return recovered_head(p, suite, start)
+        p.scratch[base] = alloc
+    if alloc == NONE:
+        u32 s = using_sink(p, suite)
+        if s == BAD:
+            p.drop(base)
+            return BAD
+        p.push(s)
+    for p.at(COMMA):
+        if at_sink_label(p, 1):
+            _ = p.bump()
+            u32 s = using_sink(p, suite)
+            if s == BAD:
+                p.drop(base)
+                return BAD
+            p.push(s)
+            continue
+        if !suite: break
+        u32 at = u32(p.at_index(1))
+        bool named = p.tg[at] == IDENT && p.kind(2) == COLON
+        if named && !p.line_ends_at(3):
+            misnamed_sink(p, at)
+        else:
+            p.error_help(1212, p.st[at], p.en[at], "after `using` the allocator comes first and by itself, and only a script's sinks follow it, each named — `out:` or `err:` — so this positional subject has no place here", "write the allocator first and the sinks after it: `using a, out: log, err: problems:`")
+        p.drop(base)
+        return recovered_head(p, suite, start)
+    u32 hi = p.en[start]
+    if p.base() > base + 1: hi = p.hi(p.scratch[p.base() - 1])
+    else if alloc != NONE: hi = p.hi(alloc)
+    u32 lo = p.st[start]
+    return p.node(E_USING, NONE, NONE, p.seal(base), lo, join_hi(lo, hi))
+
+// False (reported) when the allocator is a misnamed sink.
+private bool misnamed_first_sink(^Parser p, u32 alloc, bool suite):
+    if p.tag_of(alloc) != E_NAME: return true
+    if !p.at(COLON) || p.line_ends_at(1): return true
+    bool misnamed = line_ends_in_a_colon(p) if suite else p.head_start < 0
+    if misnamed:
+        misnamed_sink(p, p.ast.main[alloc])
+        return false
+    return true
+
+private u32 recovered_head(^Parser p, bool suite, u32 start):
+    if !suite: return BAD
+    for:
+        bool colon = p.at(COLON) && p.line_ends_at(1)
+        if colon || p.line_ends_at(0): break
+        _ = p.bump()
+    return p.node(E_USING, NONE, NONE, p.seal(p.base()), p.st[start], p.en[start])
+
+private void misnamed_sink(^Parser p, u32 t):
+    p.begin(1212, p.st[t], p.en[t])
+    p.say("`")
+    p.say_tok(t)
+    p.say(":` names no sink a `using` scopes: a `using` names an allocator first, by position, and then a script's sinks by name — `out:`, where its `print` and `println` write, and `err:`, where a failure's text goes")
+    string8 s = sink_suggestion(p.text(t))
+    if #len(s) > 0:
+        p.help("did you mean `")
+        p.help(s)
+        p.help(":`? Write `using ")
+        p.help(s)
+        p.help(": …`")
+    else:
+        p.help("write `out:` or `err:` in place of `")
+        p.help_tok(t)
+        p.help(":`")
+
+private string8 sink_suggestion(string8 name):
+    if has_folded(name, "err") || has_folded(name, "fail") || has_folded(name, "problem"): return "err"
+    if has_folded(name, "out") || has_folded(name, "sink") || has_folded(name, "log") || has_folded(name, "print") || has_folded(name, "write"): return "out"
+    return ""
+
+private bool has_folded(string8 s, string8 w):
+    i64 n = #len(w)
+    for i in 0..<#len(s) - n + 1:
+        bool eq = true
+        for j in 0..<n:
+            char8 c = s[i + j]
+            if c >= 'A' && c <= 'Z': c = char8(u8(c) + 32)
+            if c != w[j]:
+                eq = false
+                break
+        if eq: return true
+    return false
+
+private bool line_ends_in_a_colon(^Parser p):
+    i64 depth = 0
+    u8 last = EOF
+    i64 n = 0
+    for:
+        if p.line_ends_at(n): break
+        u8 k = p.kind(n)
+        if opens(k): depth += 1
+        else if closes(k): depth -= 1
+        if depth == 0: last = k
+        n += 1
+    return last == COLON
+
+private u32 using_sink(^Parser p, bool suite):
+    u32 name = p.ident("a sink's name")
+    if name == BAD: return BAD
+    if p.expect(COLON) == BAD: return BAD
+    u32 v = head_expr(p) if suite else prefix(p)
+    if v == BAD: return BAD
+    return p.node(E_ARG, name, v, NONE, p.st[name], join_hi(p.en[name], p.hi(v)))
+
+private bool at_sink_label(^Parser p, i64 n):
+    u32 w = p.word(n)
+    return p.kind(n) == IDENT && (w == W_OUT || w == W_ERR) && p.kind(n + 1) == COLON && !p.line_ends_at(n + 2)
+
+private bool at_defer_head(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_DEFER: return false
+    u8 k = p.kind(1)
+    if k == IDENT || k == KW_RETURN || k == KW_IF || k == KW_FOR || k == KW_BREAK || k == KW_CONTINUE || k == KW_VIEW || k == KW_CONST || k == HASH_NAME || k == KW_AWAIT: return true
+    return k == BANG && (p.kind(2) == IDENT || p.kind(2) == HASH_NAME)
+
+private bool at_try_head(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_TRY: return false
+    u8 k = p.kind(1)
+    return k == IDENT || k == HASH_NAME || k == KW_AWAIT
+
+// `try (a, b) = f()` and other declarations that open with a bracket:
+// NONE when this is not one.
+private u32 try_bracketed_declaration(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_TRY: return NONE
+    u8 k = p.kind(1)
+    if k != LPAREN && k != LBRACKET && k != CARET: return NONE
+    Mark m = p.mark()
+    u32 kw = p.bump()
+    bool outer = p.tried
+    p.tried = true
+    u32 inner = try_let_stmt(p, NONE)
+    p.tried = outer
+    if inner == BAD: return BAD
+    if inner != NONE: return try_rest(p, kw, inner)
+    if at_tuple_assignment(p):
+        p.tried = true
+        inner = let_assign_or_expr(p, NONE)
+        p.tried = outer
+        if inner == BAD: return BAD
+        return try_rest(p, kw, inner)
+    p.rewind(m)
+    return NONE
+
+private bool at_tuple_assignment(^Parser p):
+    if !p.at(LPAREN): return false
+    Mark m = p.mark()
+    u32 place = expr(p)
+    bool found = place != BAD && p.tag_of(place) == E_TUPLE && p.at(ASSIGN)
+    p.rewind(m)
+    return found
+
+private u32 try_stmt(^Parser p):
+    u32 kw = p.bump()
+    bool outer = p.tried
+    p.tried = true
+    u32 inner = BAD
+    if p.at(KW_AWAIT): inner = await_stmt(p)
+    else: inner = let_assign_or_expr(p, NONE)
+    p.tried = outer
+    if inner == BAD: return BAD
+    return try_rest(p, kw, inner)
+
+private u32 try_rest(^Parser p, u32 kw, u32 inner):
+    u32 other = NONE
+    if p.at(KW_ELSE):
+        other = try_else(p)
+        if other == BAD: other = NONE
+    u32 hi = p.hi(inner)
+    if other != NONE: hi = p.hi(other)
+    return p.node(S_TRY, kw, inner, other, join_lo(p.st[kw], p.lo(inner)), join_hi(p.en[kw], hi))
+
+private void end_of_statement(^Parser p):
+    if p.tried && p.at(KW_ELSE): return
+    _ = p.expect(NEWLINE)
+
+private u32 try_else(^Parser p):
+    u32 w = p.bump()
+    if p.at(COLON):
+        _ = p.bump()
+        u32 body = block(p)
+        if body == BAD: return BAD
+        return p.node(S_TRY_ELSE, NONE, body, 0, p.st[w], join_hi(p.en[w], p.hi(body)))
+    if p.at(IDENT) && p.kind(1) == COLON:
+        u32 code = p.bump()
+        _ = p.bump()
+        u32 body = block(p)
+        if body == BAD: return BAD
+        return p.node(S_TRY_ELSE, code, body, 0, p.st[w], join_hi(p.en[w], p.hi(body)))
+    if p.at(NEWLINE) || p.at(EOF):
+        p.error(716, p.st[w], p.en[w], "a `try`'s `else` is a suite or a code: `else:` runs the suite below on failure, `else code:` does so with the failure's code bound to `code`, and `else CODE` fails the function with `CODE`. Write the colon, or the code")
+        _ = p.expect(NEWLINE)
+        return BAD
+    u32 code = expr(p)
+    if code == BAD: return BAD
+    if p.at(COLON):
+        p.error(716, p.lo(code), p.hi(code), "only a name stands between `else` and its colon, and it binds the failure's code for the suite. Drop the colon to fail with this code — `else CODE` — or write a name before it")
+        _ = p.bump()
+        _ = block(p)
+        return BAD
+    _ = p.expect(NEWLINE)
+    return p.node(S_TRY_ELSE, NONE, code, 1, p.st[w], join_hi(p.en[w], p.hi(code)))
+
+private u32 defer_stmt(^Parser p):
+    u32 kw = p.bump()
+    u32 bang = NONE
+    if p.at(BANG): bang = p.bump()
+    u32 on_fail = NONE
+    if at_defer_fail(p): on_fail = p.bump()
+    if on_fail != NONE && (p.at(COLON) || (p.at(IDENT) && p.kind(1) == COLON)):
+        if p.at(IDENT): _ = p.bump()
+        p.error(1, p.st[kw], p.en[on_fail], "a `defer fail` over a suite, or one binding the failure's code, is not built: defer one statement — `defer fail release(r)`, or an `if` over the statements to run")
+        if p.expect(COLON) == BAD: return BAD
+        u32 body = block(p)
+        if body == BAD: return BAD
+        return p.node(S_PASS, kw, NONE, NONE, p.st[kw], join_hi(p.en[on_fail], p.hi(body)))
+    u32 inner = stmt(p)
+    if inner == BAD: return BAD
+    return p.node(S_DEFER, bang, inner, on_fail, p.st[kw], join_hi(p.en[kw], p.hi(inner)))
+
+private bool at_defer_fail(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_FAIL: return false
+    u8 k = p.kind(1)
+    return k == IDENT || k == HASH_NAME || k == COLON || k == KW_RETURN || k == KW_IF || k == KW_FOR || k == KW_BREAK || k == KW_CONTINUE || k == KW_VIEW || k == KW_CONST
+
+private bool at_switch_head(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_SWITCH || p.kind(1) == COLON: return false
+    return p.line_ends_in_colon(p.pos)
+
+bool at_when_head(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_WHEN || p.kind(1) == COLON: return false
+    return p.line_ends_in_colon(p.pos)
+
+private bool at_else_when(^Parser p):
+    return p.at(KW_ELSE) && p.kind(1) == IDENT && p.word(1) == W_WHEN
+
+u32 when_item(^Parser p):
+    if p.too_deep(): return BAD
+    p.depth += 1
+    u32 w = when_item_inner(p)
+    p.depth -= 1
+    return w
+
+private u32 when_item_inner(^Parser p):
+    u32 start = p.peek()
+    i64 base = p.base()
+    u32 end = NONE
+    for:
+        u32 head = p.bump()
+        u32 cond = head_expr(p)
+        if cond == BAD || p.expect(COLON) == BAD:
+            p.drop(base)
+            return BAD
+        i64 ib = p.base()
+        p.push(cond)
+        if indented_items(p) == BAD:
+            p.drop(base)
+            return BAD
+        end = p.hi(cond)
+        if p.base() > ib + 1: end = p.hi(p.scratch[p.base() - 1])
+        p.push(p.node(N_WHEN_ARM, head, NONE, p.seal(ib), p.st[head], join_hi(p.en[head], end)))
+        p.skip_newlines()
+        if at_else_when(p):
+            _ = p.bump()
+            continue
+        break
+    p.skip_newlines()
+    if p.at(KW_ELSE) && !at_else_when(p):
+        u32 e = p.bump()
+        if p.expect(COLON) == BAD:
+            p.drop(base)
+            return BAD
+        i64 ib = p.base()
+        if indented_items(p) == BAD:
+            p.drop(base)
+            return BAD
+        u32 elo = p.st[e]
+        u32 ehi = p.en[e]
+        if p.base() > ib:
+            end = p.hi(p.scratch[p.base() - 1])
+            elo = p.lo(p.scratch[ib])
+            ehi = end
+        p.push(p.node(N_WHEN_ELSE, e, NONE, p.seal(ib), elo, ehi))
+    p.skip_newlines()
+    if at_else_when(p):
+        p.error_tok(205, p.peek(), "this `else when` comes after the `else` that already closed the chain, so nothing could ever select it; an `else` is last")
+        for at_else_when(p):
+            _ = p.bump()
+            _ = p.bump()
+            Mark m = p.mark()
+            if expr(p) == BAD: p.unsay(m)
+            _ = p.expect(COLON)
+            i64 ib = p.base()
+            _ = indented_items(p)
+            p.drop(ib)
+            p.skip_newlines()
+    return p.node(N_WHEN, start, NONE, p.seal(base), p.st[start], join_hi(p.en[start], end))
+
+// Pushes the items of an indented block of declarations.
+private u32 indented_items(^Parser p):
+    if p.expect(NEWLINE) == BAD: return BAD
+    if !p.at(INDENT):
+        u32 t = p.peek()
+        p.begin(202, p.st[t], p.en[t])
+        p.say("expected an indented block of declarations, found ")
+        p.say_kind(p.tg[t])
+        p.seal_diag()
+        return BAD
+    _ = p.bump()
+    for:
+        p.skip_newlines()
+        if p.at(DEDENT) || p.at(EOF): break
+        if p.at(KW_IMPORT):
+            import_under_when(p)
+            continue
+        i64 keep = p.base()
+        u32 it = item(p)
+        p.drop(keep)
+        if it != BAD:
+            p.push(it)
+            u32 more = take_pending_item(p)
+            if more != NONE: p.push(more)
+        else if !p.recover_to_item():
+            break
+    if p.at(DEDENT): _ = p.bump()
+    return 0
+
+private void import_under_when(^Parser p):
+    u32 at = p.peek()
+    u32 i = import_decl(p)
+    if i == BAD:
+        _ = p.recover_to_item()
+        return
+    p.begin(201, p.st[at], join_hi(p.en[at], p.hi(i)))
+    p.say("an `import` is not conditional: it is written at the top of the file, after `package`, and never under a `when`")
+    p.help("import it at the top of the file and put the `when` around the declarations that use it: `import ")
+    ref []char8 path
+    string_body(p.text(p.ast.main[i]), &path)
+    string8 pv = path
+    debug_string(pv, p)
+    #delete(path)
+    p.help("`, then `when …:` over those declarations. The import alone calls nothing on any target; only a package that refuses a target outright, with a `#static_assert`, cannot be imported there")
+    p.seal_diag()
+    p.hoisted = #append(p.hoisted, i)
+
+// Rust's `{:?}` of a string, into the help.
+private void debug_string(string8 s, ^Parser p):
+    p.help("\"")
+    for c in s:
+        if c == '"': p.help("\\\"")
+        else if c == '\\': p.help("\\\\")
+        else if c == '\n': p.help("\\n")
+        else if c == '\t': p.help("\\t")
+        else if c == '\r': p.help("\\r")
+        else: p.help_char(c)
+    p.help("\"")
+
+private u32 when_stmt(^Parser p):
+    if p.too_deep(): return BAD
+    p.depth += 1
+    u32 w = when_stmt_inner(p)
+    p.depth -= 1
+    return w
+
+private u32 when_stmt_inner(^Parser p):
+    u32 start = p.peek()
+    i64 base = p.base()
+    u32 end = NONE
+    for:
+        u32 head = p.bump()
+        u32 cond = head_expr(p)
+        if cond == BAD || p.expect(COLON) == BAD:
+            p.drop(base)
+            return BAD
+        u32 body = block(p)
+        if body == BAD:
+            p.drop(base)
+            return BAD
+        end = p.hi(body)
+        p.push(p.node(S_WHEN_ARM, head, cond, body, p.st[head], join_hi(p.en[head], end)))
+        if at_else_when(p):
+            _ = p.bump()
+            continue
+        break
+    if p.at(KW_ELSE):
+        _ = p.bump()
+        if p.expect(COLON) == BAD:
+            p.drop(base)
+            return BAD
+        u32 body = block(p)
+        if body == BAD:
+            p.drop(base)
+            return BAD
+        end = p.hi(body)
+        p.push(body)
+    if at_else_when(p):
+        p.error_tok(205, p.peek(), "this `else when` comes after the `else` that already closed the chain, so nothing could ever select it; an `else` is last")
+        for at_else_when(p):
+            _ = p.bump()
+            _ = p.bump()
+            Mark m = p.mark()
+            if expr(p) == BAD: p.unsay(m)
+            _ = p.expect(COLON)
+            _ = block(p)
+    return p.node(S_WHEN, start, NONE, p.seal(base), p.st[start], join_hi(p.en[start], end))
+
+private u32 switch_stmt(^Parser p):
+    if p.too_deep(): return BAD
+    p.depth += 1
+    u32 s = switch_inner(p)
+    p.depth -= 1
+    return s
+
+private u32 switch_inner(^Parser p):
+    u32 kw = p.bump()
+    u32 scrut = head_expr(p)
+    if scrut == BAD: return BAD
+    if p.expect(COLON) == BAD || p.expect(NEWLINE) == BAD: return BAD
+    if !p.at(INDENT):
+        u32 t = p.peek()
+        p.begin(202, p.st[t], p.en[t])
+        p.say("expected an indented `switch` body — `case` arms and an `else` — found ")
+        p.say_kind(p.tg[t])
+        p.seal_diag()
+        return BAD
+    _ = p.bump()
+    i64 base = p.base()
+    p.push(scrut)
+    p.push(NONE)
+    u32 lo = p.st[kw]
+    u32 hi = join_hi(p.en[kw], p.hi(scrut))
+    for:
+        p.skip_newlines()
+        if p.at(DEDENT) || p.at(EOF): break
+        if p.at(KW_ELSE):
+            u32 e = p.bump()
+            if p.expect(COLON) == BAD:
+                p.drop(base)
+                return BAD
+            u32 body = block(p)
+            if body == BAD:
+                p.drop(base)
+                return BAD
+            hi = join_hi(join_hi(hi, p.en[e]), p.hi(body))
+            if p.scratch[base + 1] != NONE:
+                p.error_tok(201, e, "a `switch` has one `else` arm; the second could never be reached")
+            p.scratch[base + 1] = body
+            continue
+        if !p.at(IDENT) || p.word(0) != W_CASE:
+            u32 t = p.peek()
+            p.begin(201, p.st[t], p.en[t])
+            p.say("a `switch` body holds `case <value>:` arms and one `else:`, and nothing else; found ")
+            p.say_kind(p.tg[t])
+            p.seal_diag()
+            if !p.recover_to_stmt(): break
+            continue
+        u32 cs = p.bump()
+        i64 cb = p.base()
+        p.push(NONE)
+        u32 v = head_expr(p)
+        if v == BAD:
+            p.drop(base)
+            return BAD
+        p.push(v)
+        for p.at(COMMA):
+            _ = p.bump()
+            v = head_expr(p)
+            if v == BAD:
+                p.drop(base)
+                return BAD
+            p.push(v)
+        u32 binding = NONE
+        if p.at(IDENT): binding = p.bump()
+        if p.expect(COLON) == BAD:
+            p.drop(base)
+            return BAD
+        u32 body = block(p)
+        if body == BAD:
+            p.drop(base)
+            return BAD
+        p.scratch[cb] = body
+        u32 arm = p.node(S_CASE, binding, NONE, p.seal(cb), p.st[cs], join_hi(p.en[cs], p.hi(body)))
+        hi = join_hi(hi, p.hi(arm))
+        p.push(arm)
+    if p.at(DEDENT): _ = p.bump()
+    return p.node(S_SWITCH, kw, NONE, p.seal(base), lo, hi)
+
+// A declaration, an assignment, or an expression statement.
+u32 let_assign_or_expr(^Parser p, u32 c_body):
+    u32 l = try_let_stmt(p, c_body)
+    if l != NONE: return l
+    u32 start = p.peek()
+    u32 first = expr(p)
+    if first == BAD: return BAD
+    if is_assign(p.kind(0)):
+        u32 op = p.bump()
+        u32 marker = operand_marker(p)
+        u32 v = expr(p)
+        if v == BAD: return BAD
+        end_of_statement(p)
+        i64 base = p.base()
+        p.push(first)
+        p.push(v)
+        return p.node(S_ASSIGN, op, marker, p.seal(base), join_lo(p.st[start], p.lo(first)), join_hi(p.en[start], p.hi(v)))
+    end_of_statement(p)
+    return p.node(S_EXPR, NONE, first, NONE, join_lo(p.st[start], p.lo(first)), join_hi(p.en[start], p.hi(first)))
+
+// A declaration (S_LET), NONE when this is not one (rewound), or BAD.
+private u32 try_let_stmt(^Parser p, u32 c_body):
+    Mark m = p.mark()
+    u32 start = p.peek()
+    u32 ty = type_expr(p)
+    if ty == BAD:
+        p.rewind(m)
+        return NONE
+    if p.at(HASH_NAME):
+        _ = p.ident("a variable name")
+        return BAD
+    u32 name = NONE
+    if p.at(IDENT):
+        name = p.bump()
+    else:
+        name = keyword_name(p, "a variable's name", ASSIGN, NEWLINE, EOF, 255)
+    if name != NONE && p.at(COMMA):
+        p.rewind(m)
+        return parenless_destructure(p, c_body)
+    if name == NONE && !names_a_slot(p, ty):
+        p.rewind(m)
+        return NONE
+    u32 v = NONE
+    if p.at(ASSIGN):
+        _ = p.bump()
+        i64 before = p.ndiags()
+        v = expr(p)
+        if v == BAD:
+            if !misplaced_try_since(p, before): return BAD
+            v = NONE
+    else if !p.at(NEWLINE) && !p.at(EOF):
+        p.rewind(m)
+        return NONE
+    u32 hi = p.hi(ty)
+    if v != NONE: hi = p.hi(v)
+    end_of_statement(p)
+    i64 base = p.base()
+    p.push(ty)
+    p.push(v)
+    p.push(c_body)
+    u32 lo = p.st[start]
+    return p.node(S_LET, name, NONE, p.seal(base), lo, join_hi(lo, hi))
+
+private bool ends_a_slot(u8 k):
+    return k == COMMA || k == ASSIGN || k == NEWLINE || k == EOF
+
+private u32 parenless_destructure(^Parser p, u32 c_body):
+    u32 start = p.peek()
+    i64 base = p.base()
+    i64 written = -1
+    for:
+        u32 mem = NONE
+        if written >= 0 && p.at(IDENT) && ends_a_slot(p.kind(1)):
+            i64 here = p.pos
+            p.pos = written
+            Mark m = p.mark()
+            u32 ty = type_expr(p)
+            p.pos = here
+            if ty == BAD:
+                p.unsay(m)
+                p.drop(base)
+                return BAD
+            u32 name = p.ident("a variable name")
+            if name == BAD:
+                p.drop(base)
+                return BAD
+            i64 mb = p.base()
+            p.push(ty)
+            p.push(NONE)
+            p.push(NONE)
+            p.push(NONE)
+            mem = p.node(N_MEMBER, name, NONE, p.seal(mb), p.st[name], p.en[name])
+        else:
+            i64 at = p.pos
+            mem = member(p, false)
+            if mem == BAD:
+                p.drop(base)
+                return BAD
+            if p.ast.main[mem] == NONE:
+                p.error(207, p.lo(mem), p.hi(mem), "this slot names nothing, and every slot of a destructure written without parentheses is a name; write `_` to bind one to nothing, or write the whole pattern in parentheses, where a bare type is how an unnamed slot is spelled")
+                p.drop(base)
+                return BAD
+            written = at
+        p.push(mem)
+        if p.at(COMMA): _ = p.bump()
+        else: break
+    u32 elo = p.st[start]
+    u32 ehi = p.hi(p.scratch[p.base() - 1])
+    u32 ty = p.node(T_TUPLE, start, 0, p.seal(base), elo, join_hi(elo, ehi))
+    u32 v = NONE
+    if p.at(ASSIGN):
+        _ = p.bump()
+        v = expr(p)
+        if v == BAD: return BAD
+    else if !p.at(NEWLINE) && !p.at(EOF):
+        _ = p.expect(ASSIGN)
+        return BAD
+    u32 hi = p.hi(ty)
+    if v != NONE: hi = p.hi(v)
+    end_of_statement(p)
+    i64 lb = p.base()
+    p.push(ty)
+    p.push(v)
+    p.push(c_body)
+    return p.node(S_LET, NONE, NONE, p.seal(lb), elo, join_hi(elo, hi))
+
+// -- DadoScript statements ---------------------------------------------------
+
+private u32 await_stmt(^Parser p):
+    u32 kw = p.bump()
+    p.note_dados(p.st[kw])
+    if at_try_head(p):
+        u32 at = p.peek()
+        p.error_help(201, p.st[kw], p.en[at], "`try` handles the failure of the whole statement it heads, and an `await` is where a failure arrives, so `try` comes first", "write `try await int x = load() else e:`")
+        _ = p.bump()
+        bool outer = p.tried
+        p.tried = true
+        u32 inner = let_assign_or_expr(p, NONE)
+        p.tried = outer
+        if inner == BAD: return BAD
+        u32 aw = p.node(S_AWAIT, kw, inner, NONE, p.st[kw], join_hi(p.en[kw], p.hi(inner)))
+        return try_rest(p, kw, aw)
+    u32 inner = let_assign_or_expr(p, NONE)
+    if inner == BAD: return BAD
+    return p.node(S_AWAIT, kw, inner, NONE, p.st[kw], join_hi(p.en[kw], p.hi(inner)))
+
+private bool at_assert_head(^Parser p):
+    if !p.at(IDENT) || p.word(0) != W_ASSERT: return false
+    u8 k = p.kind(1)
+    return k == IDENT || k == HASH_NAME || k == INT || k == FLOAT || k == STRING || k == CHAR || k == BANG || k == KW_SUPER
+
+private u32 assert_stmt(^Parser p):
+    u32 kw = p.bump()
+    p.note_dados(p.st[kw])
+    u32 cond = expr(p)
+    if cond == BAD: return BAD
+    u32 msg = NONE
+    if p.at(COMMA):
+        _ = p.bump()
+        msg = expr(p)
+        if msg == BAD: return BAD
+    u32 hi = p.hi(cond)
+    if msg != NONE: hi = p.hi(msg)
+    _ = p.expect(NEWLINE)
+    return p.node(S_ASSERT, kw, cond, msg, p.st[kw], join_hi(p.en[kw], hi))

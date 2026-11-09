@@ -1,5 +1,5 @@
-<!-- dadoc 1.0.0-rc.9 -->
-<!-- commit 04e163907980 (dirty) -->
+<!-- dadoc 1.0.0-rc.10 -->
+<!-- self-hosted (tools/dadoc) -->
 # Diagnostic codes
 
 Every code `dadoc` reports. Each is stable within a major version; its page says what it means and the rule behind it. `dado explain <CODE>` prints the same page, and `dado search <words>` finds a code by what it says.
@@ -98,6 +98,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0537](ERR0537.md) | error | a value converted to a trait value whose type is no declaration, or a declaration that does not take the trait on |
 | [ERR0538](ERR0538.md) | error | a generic `type` named without its arguments or with the wrong number of them, or declared embedding its binder or holding a channel no instantiation could own alone |
 | [ERR0539](ERR0539.md) | error | a number no value of its type represents |
+| [ERR0540](ERR0540.md) | error | a string literal holding a NUL where a `cstring` is wanted |
 | [ERR0601](ERR0601.md) | error | an argument list fills a different number of slots than the parameter list has |
 | [ERR0602](ERR0602.md) | error | a named argument names no parameter |
 | [ERR0603](ERR0603.md) | error | two arguments fill the same slot |
@@ -114,6 +115,9 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0614](ERR0614.md) | error | `#send`, `#peek`, `#drain` or `#release` over something that is not a channel, or written with named, spliced or missing arguments |
 | [ERR0615](ERR0615.md) | error | a write to a by-value `self`, a slot of it, or its address — a write the caller would never see |
 | [ERR0616](ERR0616.md) | error | a call through a trait value to a method whose signature mentions `Self` beyond its receiver, or that is generic |
+| [ERR0617](ERR0617.md) | error | a slice assignment whose window and source lengths, both known at compile time, differ |
+| [ERR0618](ERR0618.md) | error | a copy between runs of different element types |
+| [ERR0619](ERR0619.md) | error | a copy into or out of something that is not a run of elements: a string, a map, a pointer or a single value |
 | [ERR0701](ERR0701.md) | error | return value does not match the function's return type |
 | [ERR0702](ERR0702.md) | error | a condition that is not a bool |
 | [ERR0703](ERR0703.md) | error | `break` or `continue` outside a loop |
@@ -263,3 +267,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR1340](ERR1340.md) | error | an `export` in DadoScript that publishes a type with no declaration spelling, a class that is not exported, an inner class or generic method, a name twice, or a method reading `self` of a class that is not exported |
 | [ERR1341](ERR1341.md) | error | a script of a JavaScript library package that calls a Dado function or loads a script by its path |
 | [ERR1350](ERR1350.md) | error | `slots(v)` outside a `for` header, over a value that is no instance, or where a member or function of that name could mean it; or `T.names()` where an inner class named `names` could mean it |
+| [ERR1360](ERR1360.md) | error | a signal connected to a receiver, or emitted with values, whose parameter list is not the signal's |
+| [ERR1361](ERR1361.md) | error | a signal connected to a receiver that answers a value |
+| [ERR1362](ERR1362.md) | error | a signal read, assigned, passed or called bare |
+| [ERR1363](ERR1363.md) | error | a Dado method connected with a pointer that is not the `^T` its `^self` takes |

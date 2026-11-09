@@ -1,0 +1,541 @@
+// The parser: the grammar, recovery and diagnostics over flat arrays. A production answers a node, NONE (nothing written) or BAD.
+package syntax
+
+const u32 BAD = 0xFFFFFFFE
+
+private const u32 MAX_DEPTH = 4096
+private const u32 MAX_TREE_DEPTH = 16384
+private const string8 WHY = "\x1f"
+private const string8 REPAIR = "\x1e"
+
+const [12]string8 LAYOUT_WORDS = ("end of line", "an indented block", "the end of an indented block", "end of file", "an identifier", "a `#` compiler definition", "an integer literal", "a float literal", "a string literal", "a character literal", "", "")
+
+// How the grammar names a token kind in a message: "`(`", "an identifier".
+string8 describe_tag(u8 t, ^ref []char8 out):
+    if t <= CHAR:
+        out^ = #append(out^, ..LAYOUT_WORDS[t])
+        return ""
+    out^ = #append(out^, '`')
+    out^ = #append(out^, ..spelling(t))
+    out^ = #append(out^, '`')
+    return ""
+
+// Parses one file's tokens (interned: `intern`); `dados` is a `.dados` file.
+Ast parse(string8 src, ^Tokens t, bool dados = false):
+    Parser p
+    p.src = src
+    p.tg = t.tag
+    p.st = t.start
+    p.en = t.end
+    p.sym = t.sym
+    p.last = #len(t.tag) - 1
+    p.dialect_dados = dados
+    p.head_start = -1
+    p.pend_fail_lo = NONE
+    p.pend_failure = NONE
+    p.pend_async = NONE
+    p.head_async = NONE
+    p.head_failure = NONE
+    p.moved_try = NONE
+    p.pending_item = NONE
+    p.ast.dados = NONE
+    i64 room = #len(t.tag) * 3 / 4 + 16
+    p.ast.tag = #reserve(p.ast.tag, room)
+    p.ast.main = #reserve(p.ast.main, room)
+    p.ast.a = #reserve(p.ast.a, room)
+    p.ast.b = #reserve(p.ast.b, room)
+    p.ast.lo = #reserve(p.ast.lo, room)
+    p.ast.hi = #reserve(p.ast.hi, room)
+    p.ast.extra = #reserve(p.ast.extra, room)
+    p.scratch = #reserve(p.scratch, 256)
+    run(&p)
+    #delete(p.scratch)
+    #delete(p.promised)
+    #delete(p.hoisted)
+    item_hashes(&p.ast, src, t)
+    return p.ast
+
+private type Mark:
+    i64 pos
+    i64 diags
+    i64 text
+    i64 nodes
+    i64 extra
+    i64 scratch
+    bool reported
+    u32 dados
+
+private type Parser:
+    string8 src
+    []u8 tg
+    []u32 st
+    []u32 en
+    []u32 sym
+    i64 pos
+    i64 last
+    Ast ast
+    ref []u32 scratch
+    u32 depth
+    bool depth_reported
+    bool tried
+    // A `!` (and `E!`) handed up by a type, for the declaration it heads.
+    u32 pend_fail_lo
+    u32 pend_fail_hi
+    u32 pend_failure
+    u32 pend_async
+    u32 head_async
+    u32 head_failure
+    u32 moved_try
+    u32 keyword_names
+    bool bare_type
+    bool dialect_dados
+    bool receivers
+    u32 pending_item
+    // Triples: the promise word's token, and the method node.
+    ref []u32 promised
+    bool class_head
+    ref []u32 hoisted
+    i64 head_start
+    u32 lambda_inline
+    bool block_ended
+    // type_expr_marked's mark, and take_visibility_word's span.
+    u32 tm_lo
+    u32 tm_hi
+    u32 vlo
+    u32 vhi
+    // How many `extends` types decl_tail pushed before the `using` ones.
+    u32 tail_ext
+    u32 dim_binds
+    u32 slice_start
+    u32 slice_end
+    u32 slice_kind
+
+    // -- tokens -------------------------------------------------------
+
+    i64 at_index(^self, i64 k):
+        i64 i = self.pos + k
+        if i > self.last: return self.last
+        return i
+
+    u8 kind(^self, i64 k):
+        return self.tg[self.at_index(k)]
+
+    bool at(^self, u8 t):
+        return self.tg[self.at_index(0)] == t
+
+    // The interned word of the token `k` ahead, or NONE.
+    u32 word(^self, i64 k):
+        i64 i = self.at_index(k)
+        u8 g = self.tg[i]
+        if g != IDENT && g != HASH_NAME: return NONE
+        return self.sym[i]
+
+    bool at_word(^self, u32 w):
+        return self.word(0) == w
+
+    u32 peek(^self):
+        return u32(self.at_index(0))
+
+    u32 bump(^self):
+        u32 t = u32(self.at_index(0))
+        if self.tg[t] != EOF:
+            self.pos += 1
+        return t
+
+    u32 tlo(^self, u32 t):
+        return self.st[t]
+
+    u32 thi(^self, u32 t):
+        return self.en[t]
+
+    string8 text(^self, u32 t):
+        return self.src[i64(self.st[t])..<i64(self.en[t])]
+
+    u32 previous_end(^self):
+        if self.pos == 0: return 0
+        i64 i = self.pos - 1
+        if i > self.last: i = self.last
+        return self.en[i]
+
+    // -- nodes --------------------------------------------------------
+
+    u32 node(^self, u8 tag, u32 main, u32 a, u32 b, u32 lo, u32 hi):
+        u32 n = u32(#len(self.ast.tag))
+        self.ast.tag = #append(self.ast.tag, tag)
+        self.ast.main = #append(self.ast.main, main)
+        self.ast.a = #append(self.ast.a, a)
+        self.ast.b = #append(self.ast.b, b)
+        self.ast.lo = #append(self.ast.lo, lo)
+        self.ast.hi = #append(self.ast.hi, hi)
+        return n
+
+    // A leaf whose span is token `t`'s.
+    u32 leaf(^self, u8 tag, u32 t):
+        return self.node(tag, t, NONE, NONE, self.st[t], self.en[t])
+
+    u32 lo(^self, u32 n):
+        return self.ast.lo[n]
+
+    u32 hi(^self, u32 n):
+        return self.ast.hi[n]
+
+    u8 tag_of(^self, u32 n):
+        return self.ast.tag[n]
+
+    i64 base(^self):
+        return #len(self.scratch)
+
+    void push(^self, u32 x):
+        self.scratch = #append(self.scratch, x)
+
+    void drop(^self, i64 base):
+        #truncate(self.scratch, base)
+
+    // The scratch entries above `base`, sealed into a list.
+    u32 seal(^self, i64 base):
+        u32 x = u32(#len(self.ast.extra))
+        i64 n = #len(self.scratch) - base
+        self.ast.extra = #append(self.ast.extra, u32(n))
+        for i in base..<#len(self.scratch):
+            self.ast.extra = #append(self.ast.extra, self.scratch[i])
+        #truncate(self.scratch, base)
+        return x
+
+    // -- marks --------------------------------------------------------
+
+    Mark mark(^self):
+        return Mark(self.pos, #len(self.ast.diags), #len(self.ast.text), #len(self.ast.tag), #len(self.ast.extra), #len(self.scratch), self.depth_reported, self.ast.dados)
+
+    void rewind(^self, Mark m):
+        self.pos = m.pos
+        self.unsay(m)
+        self.ast.dados = m.dados
+        #truncate(self.ast.tag, m.nodes)
+        #truncate(self.ast.main, m.nodes)
+        #truncate(self.ast.a, m.nodes)
+        #truncate(self.ast.b, m.nodes)
+        #truncate(self.ast.lo, m.nodes)
+        #truncate(self.ast.hi, m.nodes)
+        #truncate(self.ast.extra, m.extra)
+        #truncate(self.scratch, m.scratch)
+
+    // Drops the diagnostics raised since `m` (`quiet`'s failure path).
+    void unsay(^self, Mark m):
+        #truncate(self.ast.diags, m.diags)
+        #truncate(self.ast.text, m.text)
+        self.depth_reported = m.reported
+
+    i64 ndiags(^self):
+        return #len(self.ast.diags)
+
+    // -- diagnostics --------------------------------------------------
+
+    void begin(^self, u16 code, u32 lo, u32 hi):
+        u32 m = u32(#len(self.ast.text))
+        self.ast.diags = #append(self.ast.diags, Diag(code, lo, hi, m, m, m, m))
+
+    void say(^self, string8 s):
+        self.ast.text = #append(self.ast.text, ..s)
+        i64 d = #len(self.ast.diags) - 1
+        self.ast.diags[d].mend = u32(#len(self.ast.text))
+        self.ast.diags[d].help = self.ast.diags[d].mend
+        self.ast.diags[d].stop = self.ast.diags[d].mend
+
+    void say_tok(^self, u32 t):
+        self.say(self.text(t))
+
+    void say_kind(^self, u8 t):
+        _ = describe_tag(t, &self.ast.text)
+        self.say("")
+
+    void num(^self, u64 v):
+        u64 p = 1
+        for p * 10 <= v && p < 1000000000000000000:
+            p *= 10
+        for p > 0:
+            self.ast.text = #append(self.ast.text, char8(u8('0') + u8(v / p % 10)))
+            p /= 10
+        self.say("")
+
+    // Starts the help line.
+    void help(^self, string8 s):
+        i64 d = #len(self.ast.diags) - 1
+        if self.ast.diags[d].stop == self.ast.diags[d].help:
+            self.ast.diags[d].help = u32(#len(self.ast.text))
+        self.ast.text = #append(self.ast.text, ..s)
+        self.ast.diags[d].stop = u32(#len(self.ast.text))
+
+    void help_char(^self, char8 c):
+        i64 d = #len(self.ast.diags) - 1
+        if self.ast.diags[d].stop == self.ast.diags[d].help:
+            self.ast.diags[d].help = u32(#len(self.ast.text))
+        self.ast.text = #append(self.ast.text, c)
+        self.ast.diags[d].stop = u32(#len(self.ast.text))
+
+    void help_tok(^self, u32 t):
+        self.help(self.text(t))
+
+    // dado_span's marks: a REPAIR starts the help (unless one was given),
+    // and a WHY ends the message, which loses its trailing ` ` and `.`.
+    void seal_diag(^self):
+        i64 d = #len(self.ast.diags) - 1
+        Diag g = self.ast.diags[d]
+        i64 i = i64(g.msg)
+        for i < i64(g.mend):
+            if self.ast.text[i] == '\x1e':
+                if g.help == g.stop:
+                    g.help = u32(i + 1)
+                    g.stop = g.mend
+                g.mend = u32(i)
+                break
+            i += 1
+        i = i64(g.msg)
+        for i < i64(g.mend):
+            if self.ast.text[i] == '\x1f':
+                i64 e = i
+                for e > i64(g.msg) && (self.ast.text[e - 1] == ' ' || self.ast.text[e - 1] == '.'):
+                    e -= 1
+                g.mend = u32(e)
+                break
+            i += 1
+        self.ast.diags[d] = g
+
+    void error(^self, u16 code, u32 lo, u32 hi, string8 m):
+        self.begin(code, lo, hi)
+        self.say(m)
+        self.seal_diag()
+
+    void error_help(^self, u16 code, u32 lo, u32 hi, string8 m, string8 h):
+        self.begin(code, lo, hi)
+        self.say(m)
+        self.help(h)
+        self.seal_diag()
+
+    void error_tok(^self, u16 code, u32 t, string8 m):
+        self.error(code, self.st[t], self.en[t], m)
+
+    // "expected <what>, found <kind>" at the next token.
+    void expected(^self, string8 what):
+        u32 t = self.peek()
+        self.begin(201, self.st[t], self.en[t])
+        self.say("expected ")
+        self.say(what)
+        self.say(", found ")
+        self.say_kind(self.tg[t])
+
+    bool too_deep(^self):
+        if self.depth < MAX_DEPTH: return false
+        if !self.depth_reported:
+            self.depth_reported = true
+            u32 t = self.peek()
+            self.begin(201, self.st[t], self.en[t])
+            self.say("this nests more than ")
+            self.num(u64(MAX_DEPTH))
+            self.say(" productions deep, which is deeper than the compiler walks; it stops here rather than run the stack out. A production is not a source level: one per `if` or block, two per type constructor, three per parenthesised expression, so this is at worst ")
+            self.num(u64(MAX_DEPTH / 3))
+            self.say(" levels of parentheses")
+            self.seal_diag()
+        return true
+
+    bool tree_too_deep(^self, u32 folds):
+        if u64(self.depth) + u64(folds) < u64(MAX_TREE_DEPTH): return false
+        if !self.depth_reported:
+            self.depth_reported = true
+            u32 t = self.peek()
+            self.begin(201, self.st[t], self.en[t])
+            self.say("this builds an expression more than ")
+            self.num(u64(MAX_TREE_DEPTH))
+            self.say(" operators deep, which is deeper than the compiler walks it; it stops here rather than run the stack out. A chain like `a + b + c` is one operator per term, however it is written — the length is what counts here, not how it is punctuated")
+            self.seal_diag()
+        return true
+
+    // -- consuming ------------------------------------------------------
+
+    // A name token, or BAD with dado_parse's `ident` refusal.
+    u32 ident(^self, string8 what):
+        u32 t = self.peek()
+        if self.tg[t] == IDENT:
+            return self.bump()
+        if self.tg[t] == HASH_NAME:
+            self.begin(204, self.st[t], self.en[t])
+            self.say("`")
+            self.say_tok(t)
+            self.say("` is in the compiler's `#` namespace, which is closed: a program may read a `#` name but may not declare, shadow or spell a new one. Expected ")
+            self.say(what)
+            self.seal_diag()
+            _ = self.bump()
+            return BAD
+        self.expected(what)
+        self.seal_diag()
+        return BAD
+
+    // Token `t`, or BAD with "expected `t`".
+    u32 expect(^self, u8 k):
+        u32 t = self.peek()
+        if k == NEWLINE:
+            if self.block_ended:
+                self.block_ended = false
+                return t
+            if self.lambda_inline > 0:
+                u8 g = self.tg[t]
+                if g == NEWLINE || g == EOF || g == COMMA || g == RPAREN || g == RBRACKET || g == RBRACE:
+                    return t
+        if self.tg[t] == k:
+            return self.bump()
+        self.begin(201, self.st[t], self.en[t])
+        self.say("expected ")
+        self.say_kind(k)
+        self.say(", found ")
+        self.say_kind(self.tg[t])
+        self.seal_diag()
+        return BAD
+
+    void skip_newlines(^self):
+        for self.at(NEWLINE):
+            _ = self.bump()
+
+    void skip_layout(^self):
+        for self.at(NEWLINE) || self.at(DEDENT):
+            _ = self.bump()
+
+    void skip_indented_region(^self):
+        if !self.at(INDENT): return
+        i64 depth = 0
+        for:
+            u8 k = self.kind(0)
+            if k == EOF: return
+            if k == INDENT: depth += 1
+            if k == DEDENT: depth -= 1
+            _ = self.bump()
+            if k == DEDENT && depth == 0: return
+
+    bool recover_to_item(^self):
+        for:
+            u8 k = self.kind(0)
+            if k == EOF: return false
+            _ = self.bump()
+            if k == NEWLINE:
+                self.skip_indented_region()
+                self.skip_layout()
+                return true
+            if k == DEDENT:
+                self.skip_layout()
+                return true
+        return false
+
+    bool recover_to_stmt(^self):
+        for:
+            u8 k = self.kind(0)
+            if k == EOF || k == DEDENT: return false
+            _ = self.bump()
+            if k == NEWLINE: return true
+        return false
+
+    void note_dados(^self, u32 at):
+        if self.ast.dados == NONE:
+            self.ast.dados = at
+
+    bool in_scripts(^self):
+        return self.dialect_dados || self.receivers || self.class_head
+
+    // Whether the line from token `from` ends in `:`.
+    bool line_ends_in_colon(^self, i64 from):
+        u8 last = EOF
+        i64 i = from
+        for i <= self.last:
+            u8 k = self.tg[i]
+            if k == NEWLINE || k == EOF: break
+            last = k
+            i += 1
+        return last == COLON
+
+    bool line_ends_at(^self, i64 n):
+        u8 k = self.kind(n)
+        return k == NEWLINE || k == INDENT || k == DEDENT || k == EOF
+
+private void run(^Parser p):
+    i64 base = p.base()
+    u32 start = p.peek()
+    p.push(NONE)
+    p.push(NONE)
+    p.push(NONE)
+    if test_header(p.src):
+        p.scratch[base] = test_marker(p)
+    else:
+        p.skip_layout()
+        if at_test_marker(p):
+            u32 at = p.peek()
+            u32 m = test_marker(p)
+            u32 lo = p.st[at]
+            u32 hi = p.en[at]
+            if m != NONE:
+                lo = p.lo(m)
+                hi = p.hi(m)
+            p.error(307, lo, hi, "`@test` marks a whole file, so it is the first line of one — above `package`, with nothing before it")
+    if p.at(KW_PACKAGE):
+        u32 pk = package_decl(p)
+        if pk != BAD: p.scratch[base + 1] = pk
+    p.skip_layout()
+    if at_script_header(p) || at_exported_script_header(p):
+        u32 h = script_header(p)
+        if h != BAD: p.scratch[base + 2] = h
+    p.receivers = p.dialect_dados
+    // Imports first in the list, then items: they are read in one loop.
+    ref []u32 items
+    bool declared = false
+    for:
+        p.skip_layout()
+        if p.at(EOF): break
+        if p.at(KW_IMPORT):
+            if declared:
+                u32 t = p.peek()
+                p.error_tok(201, t, "imports come after `package` and before any declaration")
+            i64 keep = p.base()
+            u32 i = import_decl(p)
+            p.drop(keep)
+            if i != BAD:
+                p.push(i)
+            else if !p.recover_to_item():
+                break
+            continue
+        declared = true
+        i64 keep = p.base()
+        u32 it = item(p)
+        p.drop(keep)
+        if it != BAD:
+            items = #append(items, it)
+            u32 more = take_pending_item(p)
+            if more != NONE: items = #append(items, more)
+        else if !p.recover_to_item():
+            break
+    for h in p.hoisted:
+        p.push(h)
+    for it in items:
+        p.push(it)
+    #delete(items)
+    u32 end = p.peek()
+    u32 lo = p.st[start]
+    u32 hi = p.en[end]
+    if p.st[end] < lo: lo = p.st[end]
+    if p.en[start] > hi: hi = p.en[start]
+    p.ast.root = p.node(N_FILE, start, 1 if p.dialect_dados else 0, p.seal(base), lo, hi)
+
+// dado_span's test_header: whether the first line is `@test`, optionally a status.
+bool test_header(string8 src):
+    i64 e = 0
+    for e < #len(src) && src[e] != '\n':
+        e += 1
+    string8 line = trim(src[0..<e])
+    if #len(line) < 5 || line[0..<5] != "@test": return false
+    if #len(line) == 5: return true
+    char8 c = line[5]
+    return c == ' ' || c == '\t' || c == '\r'
+
+string8 trim(string8 s):
+    i64 a = 0
+    i64 b = #len(s)
+    for a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n'):
+        a += 1
+    for b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n'):
+        b -= 1
+    return s[a..<b]

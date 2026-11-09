@@ -1,0 +1,173 @@
+// Channels as C: one struct per channel row (a queue's ring of sequenced
+// slots, or a `latest` channel's value under a spin lock) and its `#send`;
+// the walk intrinsics are expressions over its members.
+package lower
+
+import "language:check"
+import "language:index"
+import "language:ir"
+import "language:types"
+
+const string8 CHAN_RT = """
+    #include <stdatomic.h>
+    #ifndef DADO_WEB
+    #include <string.h>
+    #endif
+    extern _Thread_local uint64_t dado_ch_tid;
+    static uint64_t dado_ch_claim(_Atomic uint64_t *owner, const char *name, uint64_t mark) {
+    #ifdef DADO_NO_WALK_GUARDS
+        (void)owner; (void)name; (void)mark; return 0;
+    #endif
+        uint64_t me = (uint64_t)(uintptr_t)&dado_ch_tid, o = 0;
+        if (atomic_compare_exchange_strong(owner, &o, me | mark)) return 0;
+        if ((o & ~(uint64_t)1) != me) { fprintf(stderr, "channel walked by a second consumer: %s\\n", name); abort(); }
+        return o;
+    }
+    static void dado_ch_open(_Atomic uint64_t *owner, const char *name) {
+        uint64_t o = dado_ch_claim(owner, name, 1);
+        if (o == 0) return;
+        if (o & 1) { fprintf(stderr, "channel walked inside a walk of itself: %s\\n  a walk of it is already open on this thread, reached through a call; finish that walk (`break` out of it) before walking again\\n", name); abort(); }
+        atomic_store(owner, o | 1);
+    }
+    static void dado_ch_close(_Atomic uint64_t *owner) { atomic_store(owner, (uint64_t)(uintptr_t)&dado_ch_tid); }
+    static void dado_ch_release(_Atomic uint64_t *owner, const char *name) {
+        if (dado_ch_claim(owner, name, 0) & 1) { fprintf(stderr, "channel released inside a walk of itself: %s\\n  a walk of it is already open on this thread, reached through a call; finish that walk (`break` out of it) before walking again\\n", name); abort(); }
+        atomic_store(owner, 0);
+    }
+    static int dado_chq_claim(_Atomic uint64_t *tail, _Atomic uint64_t *head, uint64_t cap, uint64_t *pos) {
+        uint64_t t = atomic_load(tail);
+        for (;;) {
+            if (t - atomic_load(head) >= cap) return 0;
+            if (atomic_compare_exchange_weak(tail, &t, t + 1)) { *pos = t; return 1; }
+        }
+    }
+    static uint64_t dado_chq_begin(_Atomic uint64_t *owner, _Atomic uint64_t *tail, _Atomic uint64_t *head, int has, int64_t n, const char *name) {
+        dado_ch_open(owner, name);
+        uint64_t lim = atomic_load(tail), h = atomic_load(head);
+        if (has && n <= 0) return h;
+        if (has && lim - h > (uint64_t)n) return h + (uint64_t)n;
+        return lim;
+    }
+    static int64_t dado_chq_len(_Atomic uint64_t *tail, _Atomic uint64_t *head, uint64_t cap) {
+        uint64_t t = atomic_load(tail), h = atomic_load(head);
+        return h >= t ? 0 : (int64_t)(t - h > cap ? cap : t - h);
+    }
+    static void dado_chl_lock(_Atomic uint32_t *l) { uint32_t z = 0; while (!atomic_compare_exchange_weak(l, &z, 1)) z = 0; }
+    static uint64_t dado_chl_begin(_Atomic uint64_t *owner, _Atomic uint32_t *l, uint32_t *fresh, uint32_t *unseen, void *front, const void *cur, size_t size, int take, int has, int64_t n, const char *name) {
+        (void)dado_ch_claim(owner, name, 0);
+        dado_chl_lock(l);
+        if (*fresh) { memcpy(front, cur, size); *fresh = 0; *unseen = 1; }
+        atomic_store(l, 0);
+        if (!*unseen || (has && n <= 0)) return 0;
+        if (take) *unseen = 0;
+        return 1;
+    }
+    static int64_t dado_chl_len(_Atomic uint32_t *l, uint32_t *fresh, uint32_t *unseen) {
+        dado_chl_lock(l);
+        int64_t n = *fresh || *unseen;
+        atomic_store(l, 0);
+        return n;
+    }
+"""
+
+// The struct of channel row `r`, declared (with its `#send`) once.
+string8 chan_ty(^C c, u32 r):
+    string8 name = shape_name(c, r)
+    for d in c.done:
+        if d == r: return name
+    c.done = #append(c.done, r)
+    c.chans = true
+    g_chans = #append(g_chans, r)
+    []u32 ps = c.t.list(r)
+    ref []char8 m
+    ref []char8 args
+    ref []char8 sets
+    put(&m, "struct { ")
+    for i in 0..<#len(ps):
+        string8 t = ty(c, ps[i])
+        put(&m, index.hold(#format(t, " f", i, "; ")))
+        put(&args, index.hold(#format(", ", t, " a", i)))
+    if #len(ps) == 0: put(&m, "char f_; ")
+    put(&m, "}")
+    u32 n = c.t.b[r]
+    string8 at = "c->cur"
+    if n != 0: at = index.hold(#format("c->slot[p % ", n - 1, "].m"))
+    for i in 0..<#len(ps):
+        put(&sets, index.hold(#format(" ", at, ".f", i, " = a", i, ";")))
+    string8 args_ = index.hold(args)
+    string8 sets_ = index.hold(sets)
+    ref []char8 o
+    put(&o, index.hold(#format("typedef struct ", name, " ", name, ";\n")))
+    if n == 0:
+        put(&o, index.hold(#format("struct ", name, " { _Atomic uint32_t lock; uint32_t fresh; uint32_t unseen; _Atomic uint64_t owner; ", m, " cur; ", m, " front; };\n")))
+        put(&o, index.hold(#format("static int ", name, "__send(", name, " *c", args_, ") { dado_chl_lock(&c->lock);", sets_, " c->fresh = 1; atomic_store(&c->lock, 0); return 0; }\n")))
+    else:
+        put(&o, index.hold(#format("struct ", name, " { _Atomic uint64_t tail; _Atomic uint64_t head; _Atomic uint64_t owner; struct { _Atomic uint64_t seq; ", m, " m; } slot[", n - 1, "]; };\n")))
+        put(&o, index.hold(#format("static int ", name, "__send(", name, " *c", args_, ") { uint64_t p; if (!dado_chq_claim(&c->tail, &c->head, ", n - 1, ", &p)) return 1;", sets_, " atomic_store_explicit(&c->slot[p % ", n - 1, "].seq, p + 1, memory_order_release); return 0; }\n")))
+    put(&c.decls, o)
+    return name
+
+// A channel intrinsic as C.
+void chan_op(^C c, ^ir.Fn f, u32 i, string8 where):
+    []u32 xs = ir.args(f, i)
+    u8 s = f.sub[i]
+    u32 r = c.t.resolve(f.ty_of[i])
+    string8 nm = chan_ty(c, r)
+    u32 n = c.t.b[r]
+    string8 ch = index.hold(#format("(&(", text(c, f, xs[0]), "))"))
+    string8 d = ""
+    if f.dst[i] != NONE: d = text(c, f, f.dst[i])
+    string8 cn = index.hold(#format("\"", c.t.text(c.t.a[r]), " (at ", where, ")\""))
+    if s == check.B_CH_SEND:
+        ref []char8 o
+        put(&o, index.hold(#format(d, " = ", nm, "__send(", ch)))
+        for x in xs[1..<#len(xs)]:
+            put(&o, ", ")
+            put(&o, text(c, f, x))
+        put(&o, ") != 0;")
+        // A channel a script receives: its bit raised.
+        u32 rt_ = f.root[xs[0]]
+        if !ir.is_const(xs[0]) && (rt_ & ir.ROOT_GLOBAL) != 0 && f.plo[xs[0]] == f.phi[xs[0]]:
+            u32 gi = rt_ & ~ir.ROOT_GLOBAL
+            for k in 0..<#len(c.w.recv):
+                u32 dd = c.w.recv[k]
+                if c.t.text(f.glob_pkg[gi]) == check.pkg_key(c.w, c.w.decls[dd].pkg) && c.t.text(f.glob_name[gi]) == check.name_of(c.w, c.w.decls[dd].name): put(&o, index.hold(#format(" if (!", d, ") dado_rt__raise(", k, ");")))
+        put(&o, "\n")
+        put(&c.out, o)
+        return
+    if s == check.B_CH_BEGIN:
+        string8 has = "0"
+        string8 cnt = "0"
+        if #len(xs) > 2:
+            has = "1"
+            cnt = text(c, f, xs[2])
+        if n == 0: put(&c.out, index.hold(#format(d, " = dado_chl_begin(&", ch, "->owner, &", ch, "->lock, &", ch, "->fresh, &", ch, "->unseen, &", ch, "->front, &", ch, "->cur, sizeof(", ch, "->cur), ", text(c, f, xs[1]), ", ", has, ", ", cnt, ", ", cn, ");\n")))
+        else: put(&c.out, index.hold(#format(d, " = dado_chq_begin(&", ch, "->owner, &", ch, "->tail, &", ch, "->head, ", has, ", ", cnt, ", ", cn, ");\n")))
+        return
+    if s == check.B_CH_HEAD:
+        if n == 0: put(&c.out, index.hold(#format(d, " = 0;\n")))
+        else: put(&c.out, index.hold(#format(d, " = atomic_load(&", ch, "->head);\n")))
+        return
+    if s == check.B_CH_READY:
+        if n == 0: put(&c.out, index.hold(#format(d, " = 1;\n")))
+        else: put(&c.out, index.hold(#format(d, " = atomic_load_explicit(&", ch, "->slot[", text(c, f, xs[1]), " % ", n - 1, "].seq, memory_order_acquire) == ", text(c, f, xs[1]), " + 1;\n")))
+        return
+    if s == check.B_CH_FIELD:
+        string8 k = index.hold(#format(c.k.w0[xs[2] & ~ir.OPD_CONST]))
+        string8 x = index.hold(#format(ch, "->front.f", k))
+        if n != 0: x = index.hold(#format(ch, "->slot[", text(c, f, xs[1]), " % ", n - 1, "].m.f", k))
+        u32 pt = c.t.resolve(c.t.list(r)[c.k.w0[xs[2] & ~ir.OPD_CONST]])
+        u32 dt = c.t.resolve(f.place_ty[f.dst[i]])
+        if c.t.tag[pt] == types.T_REF && c.t.tag[dt] != types.T_REF: x = index.hold(#format("(dado_view){ ", x, ".ptr, ", x, ".len }"))
+        put(&c.out, index.hold(#format(d, " = ", x, ";\n")))
+        return
+    if s == check.B_CH_COMMIT:
+        if n != 0 && c.k.a[xs[3] & ~ir.OPD_CONST] != 0: put(&c.out, index.hold(#format("atomic_store(&", ch, "->head, ", text(c, f, xs[1]), "); ")))
+        if n != 0: put(&c.out, index.hold(#format("dado_ch_close(&", ch, "->owner);")))
+        put(&c.out, "\n")
+        return
+    if s == check.B_CH_LEN:
+        if n == 0: put(&c.out, index.hold(#format(d, " = dado_chl_len(&", ch, "->lock, &", ch, "->fresh, &", ch, "->unseen);\n")))
+        else: put(&c.out, index.hold(#format(d, " = dado_chq_len(&", ch, "->tail, &", ch, "->head, ", n - 1, ");\n")))
+        return
+    if s == check.B_CH_RELEASE: put(&c.out, index.hold(#format("dado_ch_release(&", ch, "->owner, ", cn, ");\n")))

@@ -1,0 +1,537 @@
+// The engine's side of a build: the front end it drives,
+// answered from the engine's cache; tcc for dev builds; the `-I` list; and
+// the driver keeping itself current.
+package driver
+
+import "core:fmt"
+import "core:hash"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:os/proc"
+import "core:path"
+import "core:strings"
+import "core:time"
+
+// ── the front end ───────────────────────────────────────────────────────────
+
+// What the front end gave a build: the one-file C, the file-aligned units
+// (`units` lists them, runtime first), the implementations unit, the build
+// manifest's text, and whether the C uses Dado's atomic verbs.
+type Emitted:
+    string8 slot
+    string8 c_file
+    string8 units_dir
+    string8 impl_file
+    string8 manifest
+    bool atomics
+    string8 not_tcc     // why tcc cannot compile this C, or ""
+    bool cached
+
+// `t` (the transpile, no outputs yet) over `pkg`, answered from
+// `<cache>/emit/<slot>` when nothing it read has moved (`emit_key`): the
+// slot holds the C, the units, the manifest and what the front end said,
+// which is said again. Dies, as a failed transpile does, when it fails.
+// The slot's C is dropped after cc (P10j), its units' digests kept
+// (`units/owns`): reused then only for the objects (`owned_objects`).
+// `need_c`: only a slot holding its C will do; `again`: what the front end
+// says was said already, by the slot this replaces.
+Emitted front_end(Command t, string8 pkg, string8 cache, bool need_c, bool again):
+    ref []string8 args = #make([]string8, 0)
+    for i in 1..<#len(t.words):
+        args = #append(args, t.words[i])
+    args = #append(args, "--color=always" if colour_on() && os.is_terminal(2) else "--color=never")
+    args = #append(args, pkg)
+    string8 slot = emit_slot(cache, args[:])
+    string8 id = dadoc_identity(t.words[0], join2(toolchain_dir(), "cache"))
+    string8 digests = join2(cache, "digests")
+    load_digests(digests)
+    Emitted e = emitted_of(slot)
+    bool has_c = is_file(e.c_file)
+    if #len(id) > 0 && emit_fresh(slot, id, args[:]) && is_file(join2(e.units_dir, "units")) && (has_c || !need_c && is_file(join2(e.units_dir, "owns"))):
+        e.cached = true
+        save_digests(digests)
+        replay(slot)
+        verify_slot(t, args[:], pkg, e)
+        return e
+    try fs.make_dirs(slot) else: pass
+    i64 pid = os.pid()
+    string8 started = join2(slot, txt(#format("started.", pid)))
+    write_quietly(started, "")
+    (i64 mark, bool marked) = file_mtime(started)
+    Command x = command(t.words[0])
+    for i in 0..<#len(args) - 1:
+        add(&x, args[i])
+    add(&x, "-o")
+    add(&x, txt(#format(e.c_file, ".", pid)))
+    add(&x, txt(#format("--build-manifest=", join2(slot, "build"), ".", pid)))
+    add(&x, txt(#format("--implementations=", e.impl_file, ".", pid)))
+    add(&x, txt(#format("--split-out=", e.units_dir, ".", pid)))
+    add(&x, pkg)
+    if verbose(): note(txt(#format("  $ ", shown(x))))
+    ref []Command one = #make([]Command, 0)
+    one = #append(one, x)
+    ref []Ran ran = run_pool(one[:], 1, true)
+    write_quietly(join2(slot, "said.out"), txt(ran[0].out))
+    write_quietly(join2(slot, "said.err"), txt(ran[0].err))
+    if !again: replay(slot)
+    remove_quietly(join2(slot, "key"))
+    remove_quietly(join2(slot, "copied"))
+    if ran[0].status != 0:
+        remove_quietly(started)
+        die("transpiling failed. Nothing was written.")
+    move_or_die(txt(#format(e.c_file, ".", pid)), e.c_file)
+    move_or_die(txt(#format(join2(slot, "build"), ".", pid)), join2(slot, "build"))
+    set_aside(e.impl_file, pid)
+    if exists(txt(#format(e.impl_file, ".", pid))): move_or_die(txt(#format(e.impl_file, ".", pid)), e.impl_file)
+    set_aside(e.units_dir, pid)
+    move_or_die(txt(#format(e.units_dir, ".", pid)), e.units_dir)
+    ref []char8 c = #make([]char8, 0)
+    try c = fs.read_file(e.c_file) else: pass
+    bool atomics = strings.contains(txt(c), txt(#format("this program uses Dado ", "atomic verbs")))
+    write_quietly(join2(slot, "atomics"), "1" if atomics else "0")
+    write_quietly(join2(slot, "not-tcc"), tcc_refuses(txt(c)))
+    if atomics: tinyc_guards(e.units_dir)
+    string8 manifest = read_or_empty(join2(slot, "build"))
+    bool moved = !marked || sources_moved(manifest, mark)
+    remove_quietly(started)
+    if #len(id) > 0 && !moved:
+        string8 key = emit_key(id, args[:], manifest)
+        if #len(key) > 0: replace_quietly(join2(slot, "key"), key)
+    save_digests(digests)
+    return emitted_of(slot)
+
+// `DADO_VERIFY=all` (every reused slot) or `sample` (a key in 16): the slot
+// made again fresh beside it and compared byte for byte; a difference is a
+// key that misses an input, and fatal.
+private void verify_slot(Command t, []string8 args, string8 pkg, Emitted e):
+    (string8 mode, bool _) = env("DADO_VERIFY")
+    if mode != "all" && mode != "sample": return
+    if mode == "sample" && !strings.starts_with(read_or_empty(join2(e.slot, "key")), "0"): return
+    string8 dir = join2(e.slot, txt(#format("verify.", os.pid())))
+    remove_tree_quietly(dir)
+    try fs.make_dirs(dir) else: die(txt(#format("DADO_VERIFY: cannot make ", dir)))
+    Command x = command(t.words[0])
+    for i in 0..<#len(args) - 1:
+        add(&x, args[i])
+    add(&x, "-o")
+    add(&x, join2(dir, "prog.c"))
+    add(&x, txt(#format("--build-manifest=", join2(dir, "build"))))
+    add(&x, txt(#format("--implementations=", join2(dir, "impl.c"))))
+    add(&x, txt(#format("--split-out=", join2(dir, "units"))))
+    add(&x, pkg)
+    ref []Command one = #make([]Command, 0)
+    one = #append(one, x)
+    ref []Ran ran = run_pool(one[:], 1, true)
+    string8 bad = ""
+    if ran[0].status != 0: bad = "the front end failed"
+    else if txt(ran[0].out) != read_or_empty(join2(e.slot, "said.out")) || txt(ran[0].err) != read_or_empty(join2(e.slot, "said.err")): bad = "what it said"
+    else:
+        if e.atomics: tinyc_guards(join2(dir, "units"))
+        ref []string8 files = #make([]string8, 0)
+        for f in ["prog.c", "build", "impl.c", "units/units"]:
+            files = #append(files, f)
+        for n in words_of(read_or_empty(join2(e.units_dir, "units"))):
+            files = #append(files, txt(#format("units/", n)))
+        // A dropped unit (P10j) by the digest `owns` kept; the one file
+        // dropped is not compared.
+        string8 owns = read_or_empty(join2(e.units_dir, "owns"))
+        for f in files:
+            string8 kept = join2(e.slot, f)
+            if #len(bad) > 0 || f == "prog.c" && !is_file(kept): continue
+            if is_file(kept) || f == "build" || f == "units/units":
+                if read_or_empty(kept) != read_or_empty(join2(dir, f)): bad = f
+                continue
+            (string8 h, string8 _) = owned(owns, kept)
+            if f == "impl.c" && #len(h) == 0 && !is_file(join2(dir, f)): continue
+            if #len(h) == 0 || h != content_digest(join2(dir, f)): bad = f
+    remove_tree_quietly(dir)
+    if #len(bad) > 0: die(txt(#format("DADO_VERIFY: the cached front-end output in ", e.slot, " differs from a fresh run (", bad, "): its key misses an input")))
+
+// What in the C tcc cannot compile, or "": C11's atomic types (channels),
+// complex numbers.
+private string8 tcc_refuses(string8 c):
+    if strings.contains(c, txt(#format("_Atom", "ic "))): return "C11 atomic types (channels)"
+    if strings.contains(c, txt(#format("_Comp", "lex"))): return "complex numbers"
+    return ""
+
+// The emitter's `__GNUC__` guard on Dado's atomic verbs let past for tcc,
+// whose `stdatomic.h` has the `__atomic_*` they are written in: what the new
+// emitter's tcc prelude will say itself.
+private void tinyc_guards(string8 units_dir):
+    string8 from = txt(#format("#if !defined(__GNUC__)\n#error \"this program uses Dado ", "atomic verbs"))
+    string8 to = txt(#format("#if !defined(__GNUC__) && !defined(__TINYC__)\n#error \"this program uses Dado ", "atomic verbs"))
+    for name in words_of(read_or_empty(join2(units_dir, "units"))):
+        string8 u = join2(units_dir, name)
+        string8 text = read_or_empty(u)
+        if strings.contains(text, from): replace_quietly(u, txt(strings.replace(text, from, to)))
+
+// `p` moved out of the way and removed, as far as removing goes.
+private void set_aside(string8 p, i64 pid):
+    if !exists(p): return
+    string8 old = txt(#format(p, ".old.", pid))
+    // A pid comes round again (each VM shell restarts them): a leftover not removed.
+    i64 k = 1
+    for exists(old):
+        old = txt(#format(p, ".old.", pid, ".", k))
+        k += 1
+    move_or_die(p, old)
+    remove_tree_quietly(old)
+    remove_quietly(old)
+
+// The paths of a slot, and what it holds now.
+private Emitted emitted_of(string8 slot):
+    Emitted e
+    e.slot = slot
+    e.c_file = join2(slot, "prog.c")
+    e.units_dir = join2(slot, "units")
+    e.impl_file = join2(slot, "impl.c")
+    e.manifest = read_or_empty(join2(slot, "build"))
+    e.atomics = read_or_empty(join2(slot, "atomics")) == "1"
+    e.not_tcc = read_or_empty(join2(slot, "not-tcc"))
+    e.cached = false
+    return e
+
+// What the front end said when it wrote the slot, said again.
+private void replay(string8 slot):
+    string8 out = read_or_empty(join2(slot, "said.out"))
+    string8 err = read_or_empty(join2(slot, "said.err"))
+    if #len(out) > 0: fmt.print(out)
+    if #len(err) > 0: fmt.eprint(err)
+
+// ── the include list ───────────────────────────────────────────────────────
+
+// `-I` for each of `dirs` that holds a C header, in it or below it: a
+// package of Dado alone gives the compiler nothing to find, and every
+// `#include`, the system's too, is looked for in every `-I` first.
+ref []string8 include_words([]string8 dirs):
+    ref []string8 out = #make([]string8, 0)
+    for d in dirs:
+        if holds_headers(d, 3): out = #append(out, txt(#format("-I", d)))
+    return out
+
+private bool holds_headers(string8 dir, i64 depth):
+    try fs.Listing l = fs.read_dir(dir) else:
+        return true
+    bool found = false
+    ref []string8 below = #make([]string8, 0)
+    for e in l.entries:
+        string8 n = e.path
+        if e.is_dir:
+            if depth > 0: below = #append(below, join2(dir, n))
+        else if header_like(n):
+            found = true
+            break
+    l.destroy()
+    if found: return true
+    for b in below:
+        if holds_headers(b, depth - 1): return true
+    return false
+
+private bool header_like(string8 n):
+    for ext in [".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".def", ".c", ".m"]:
+        if strings.ends_with(n, ext): return true
+    return false
+
+// ── tcc ─────────────────────────────────────────────────────────────────────
+
+// The fork of tcc this tree builds (`tools/tcc`): upstream's source
+// as it was at one commit, the patch series, and `build.sh`, which builds them.
+string8 tcc_dir():
+    return join3(root(), "tools", "tcc")
+
+// The fork's build key, as `tools/tcc/build.sh --print-key` says it: a hash
+// of the source, the patches and the script. Asked of the script once for
+// each set of those files' stats, which `tcc/keys/` in the toolchain keeps,
+// so a build whose fork did not move runs no shell. "" when there is no fork.
+string8 tcc_key():
+    if g_tcc_key_asked: return g_tcc_key
+    g_tcc_key_asked = true
+    string8 dir = tcc_dir()
+    string8 script = join2(dir, "build.sh")
+    if !is_file(script): return ""
+    (string8 sig, bool trusted) = tcc_stats(dir)
+    string8 kept_at = join3(toolchain_dir(), "tcc", join2("keys", sig))
+    string8 kept = strings.trim(read_or_empty(kept_at))
+    if #len(kept) == 16:
+        g_tcc_key = kept
+        return g_tcc_key
+    Command c = command("sh")
+    add(&c, script)
+    add(&c, "--print-key")
+    string8 key = first_line(c, true)
+    if #len(key) != 16: return ""
+    if trusted:
+        try fs.make_dirs(dir_of(kept_at)) else: pass
+        replace_quietly(kept_at, txt(#format(key, "\n")))
+    g_tcc_key = key
+    return g_tcc_key
+
+private string8 g_tcc_key = ""
+private bool g_tcc_key_asked
+
+// The stats of the fork's files, as one xxHash64 of `<path> <stat>` lines in
+// byte order of path, and whether every one is settled enough to vouch for
+// its bytes (`trusted_stat`); its Markdown notes are prose and move no key.
+private (string8 sig, bool trusted) tcc_stats(string8 dir):
+    ref []string8 files = #make([]string8, 0)
+    fs.Listing l = fs.walk(dir)
+    defer l.destroy()
+    for e in l.entries:
+        if e.is_dir || strings.ends_with(e.path, ".md"): continue
+        ref []char8 copy = #format(e.path)
+        files = #append(files, txt(copy))
+    sort_bytes(files[:])
+    i64 mark = time.unix_nanos()
+    bool trusted = true
+    strings.Builder b = strings.builder(8192)
+    for f in files:
+        string8 st = trusted_stat(f, mark)
+        if st == "-": trusted = false
+        strings.append(&b, txt(#format(f, " ", st, "\n")))
+    return (txt(#format(hash.xxh64_text(0, strings.text(b)))), trusted)
+
+// Where the pinned compilers go: an install's own folder; for a checkout
+// `DADO_TOOLCHAIN_DIR`, else the user's cache (`~/.cache/dado/toolchain`),
+// shared by checkouts and on a local disk, which a compiler's headers want.
+string8 toolchain_dir():
+    if g_layout.kind == "install": return g_layout.install
+    (string8 over, bool set) = env("DADO_TOOLCHAIN_DIR")
+    if set && #len(over) > 0: return over
+    (string8 xdg, bool xset) = env("XDG_CACHE_HOME")
+    if xset && #len(xdg) > 0: return join3(xdg, "dado", "toolchain")
+    (string8 home, bool _) = env("HOME")
+    return join3(home, ".cache", join2("dado", "toolchain"))
+
+// Where the fork's build for its key is installed (`tools/tcc/build.sh`).
+string8 tcc_home():
+    return join3(toolchain_dir(), "tcc", tcc_key())
+
+// The pinned tcc: `DADO_TCC`, else the fork `dado bootstrap` built.
+Compiler pinned_tcc():
+    (string8 over, bool set) = env("DADO_TCC")
+    if set && #len(over) > 0: return given_compiler(over)
+    string8 t = join3(tcc_home(), "bin", exe_name("tcc"))
+    if fs.is_executable(t): return given_compiler(t)
+    return no_compiler("no tcc: `dado bootstrap tcc` builds the fork in tools/tcc")
+
+// Whether a build takes tcc without being told: a dev build with no `--cc`,
+// no C sanitizer, for this machine, on Linux. macOS waits for the emitter's
+// thread-local accessor (port/tcc-macos/), since tcc writes ELF objects and
+// Linux TLS there.
+bool tcc_by_default(^Options o):
+    if #len(o.cc) > 0 || o.cc_fallback || o.release || o.debug || o.sanitize: return false
+    if cross_compiling() || targets_web() || this_os() != "#LINUX": return false
+    return pinned_tcc().found
+
+// What every tcc compile adds: no warnings (the gate's `-Werror` build is
+// gcc's, clang's or zig's), and a prelude giving tcc what the emitter's C
+// asks of GNU C. For C using Dado's atomic verbs, tcc's `stdatomic.h` (its
+// `__atomic_*`), after the feature macros every unit defines first, so the
+// system headers see them.
+private const string8 TCC_PRELUDE = "/* dado: tcc prelude */\n#ifndef __GCC_ATOMIC_INT_LOCK_FREE\n#define __GCC_ATOMIC_INT_LOCK_FREE 2\n#define __GCC_ATOMIC_LLONG_LOCK_FREE 2\n#define __GCC_ATOMIC_POINTER_LOCK_FREE 2\n#endif\n#if defined(__x86_64__) || defined(__i386__)\n#define __builtin_ia32_pause() __asm__ __volatile__(\"pause\")\n#endif\n"
+private const string8 TCC_ATOMICS = "#define _POSIX_C_SOURCE 200809L\n#define _DARWIN_C_SOURCE 1\n#define _GNU_SOURCE 1\n#define _DEFAULT_SOURCE 1\n#define _NETBSD_SOURCE 1\n#define _BSD_SOURCE 1\n#include <stdatomic.h>\n"
+
+ref []string8 tcc_words(string8 cache, bool atomics):
+    string8 text = txt(#format(TCC_PRELUDE, TCC_ATOMICS if atomics else ""))
+    string8 p = join3(cache, "tcc", "prelude-atomics.h" if atomics else "prelude.h")
+    if read_or_empty(p) != text:
+        try fs.make_dirs(dir_of(p)) else: pass
+        replace_quietly(p, text)
+    ref []string8 w = words_of(setting("CFLAGS_TCC"))
+    w = #append(w, "-include")
+    w = #append(w, p)
+    return w
+
+// ── the driver keeps itself current ─────────────────────────────────────────
+
+// `./dado` starts `build/tools/launched/dado` with `DADO_LAUNCHER` set to
+// the checkout. That driver, first, compares what it was built from (its
+// `.inputs`, written by the build that made it) with the checkout; when
+// anything moved, it builds `tools/dado` with itself, through the caches,
+// and runs the new one instead. A build that fails keeps the old driver.
+//
+// The rebuild is for this machine, whatever the command it interrupts was
+// building: the caller's cross settings (`HOST_BUILD_CLEARS`, and
+// `DADO_DADOC` when it names a compiler that does not run here) are taken
+// out of the environment for the rebuild and put back for the command. The
+// new driver replaces the old only once it has run here (`driver_runs`):
+// `DADO_TARGET=x86_64-pc-windows-gnu ./dado build ...` once rebuilt the
+// driver as a Windows program and installed it over a working one.
+void keep_current([]string8 args):
+    (string8 r, bool set) = env("DADO_LAUNCHER")
+    if !set || #len(r) == 0: return
+    string8 me = join3(r, "build", join3("tools", "launched", exe_name("dado")))
+    try string8 exe = os.executable_path() else:
+        return
+    if comparable_path(exe) != comparable_path(me): return
+    ref []string8 names = words_of(HOST_BUILD_CLEARS)
+    ref []SavedEnv saved = host_build_env(names[:])
+    string8 cc = self_cc()
+    if inputs_current(txt(#format(me, ".inputs")), cc):
+        restore_env(saved[:])
+        return
+    (string8 dc, bool dc_set) = env("DADO_DADOC")
+    if dc_set && !dadoc_runs(dc):
+        ref []string8 one = #make([]string8, 0)
+        one = #append(one, "DADO_DADOC")
+        ref []SavedEnv more = host_build_env(one[:])
+        for m in more:
+            saved = #append(saved, m)
+    string8 fresh = txt(#format(me, ".new"))
+    Command b = command(me)
+    add(&b, "build")
+    add(&b, join2(r, join2("tools", "dado")))
+    add(&b, "-o")
+    add(&b, fresh)
+    if #len(cc) > 0:
+        add(&b, "--cc")
+        add(&b, cc)
+    try os.set_env("DADO_LAUNCHER", "") else: pass
+    try os.set_env("DADO_SELF_BUILD", "1") else: pass
+    fmt.eprintln("dado: building the driver (tools/dado)")
+    Captured said = capture_merged(b)
+    try os.set_env("DADO_SELF_BUILD", "") else: pass
+    bool built = said.started && said.status == 0 && is_file(fresh)
+    bool runs = built && driver_runs(fresh)
+    try os.set_env("DADO_LAUNCHER", r) else: pass
+    restore_env(saved[:])
+    if !built:
+        fmt.eprint(txt(said.out))
+        fmt.eprintln("dado: the driver did not build; running the one there is")
+        return
+    if !runs:
+        remove_quietly(fresh)
+        fmt.eprintln(txt(#format("dado: the driver built does not run here (", fresh, " --version failed); running the one there is")))
+        return
+    move_or_die(fresh, me)
+    string8 rec = read_or_empty(txt(#format(fresh, ".inputs")))
+    replace_quietly(txt(#format(me, ".inputs")), txt(#format(rec, "c ", cc, "\n")))
+    ref []string8 again = #make([]string8, 0)
+    again = #append(again, me)
+    for a in args:
+        again = #append(again, a)
+    _ = io.flush(io.stdout())
+    _ = io.flush(io.stderr())
+    try proc.Ended e = proc.exec(again[:]) else:
+        die(txt(#format("cannot run the driver just built: ", me)))
+        return
+    switch e:
+        case proc.Exited x: os.quit_with(x.code)
+        case proc.Signaled s: os.quit_with(128 + s.signal)
+
+// What a command's environment may say about the program it builds, which
+// the driver's own rebuild must not hear: the target (`DADO_TARGET`,
+// `ZIG_TARGET`), the C and link flags, the collections, the C compiler
+// (`CC`, first in the search when no zig is pinned) and the runner.
+// Sanitizers and `--release` are flags, never the environment.
+const string8 HOST_BUILD_CLEARS = "DADO_TARGET ZIG_TARGET DADO_CFLAGS DADO_LDFLAGS DADO_COLLECTIONS CC DADO_RUNNER"
+
+// A variable as it was before `host_build_env` cleared it.
+type SavedEnv:
+    string8 name
+    string8 value
+    bool set
+
+// Each of `names` that is set, unset now and kept to `restore_env`. The
+// compilers asked for under the old environment are forgotten, so that the
+// next asking hears the one now in force.
+ref []SavedEnv host_build_env([]string8 names):
+    ref []SavedEnv out = #make([]SavedEnv, 0)
+    for n in names:
+        SavedEnv e
+        e.name = n
+        e.value = ""
+        e.set = true
+        ref []char8 v = nil
+        try v = os.get_env(n) else:
+            e.set = false
+        if !e.set: continue
+        e.value = txt(v)
+        out = #append(out, e)
+        try os.unset_env(n) else: pass
+    forget_compilers()
+    return out
+
+// Every variable `host_build_env` cleared, set again as it was; the
+// compilers asked for meanwhile are forgotten.
+void restore_env([]SavedEnv saved):
+    for e in saved:
+        if e.set:
+            try os.set_env(e.name, e.value) else: pass
+    forget_compilers()
+
+// Whether `program --version` starts here and exits 0 within 30 s: a
+// driver built for another system or architecture does not start.
+bool driver_runs(string8 program):
+    if !is_file(program): return false
+    Command v = command(program)
+    add(&v, "--version")
+    (bool ok, bool _) = succeeds_within(v, 30000)
+    return ok
+
+// The `--cc` the driver builds itself with: `DADO_LAUNCH_CC`; else none
+// when the default has a compiler (tcc, then the pinned zig); else the
+// first C compiler here.
+private string8 self_cc():
+    (string8 over, bool set) = env("DADO_LAUNCH_CC")
+    if set && #len(over) > 0: return over
+    if this_os() == "#LINUX" && pinned_tcc().found: return ""
+    if compiler("", true).found: return ""
+    for f in c_compilers():
+        return f.words[0]
+    return ""
+
+// The record a self-build leaves beside its program (`DADO_SELF_BUILD`):
+// the front end's and the settings' stats, and each source file of every
+// package the build read, by its trusted stat (`trusted_stat`, against
+// `mark`, the build's start).
+void write_inputs(string8 out, string8 manifest, string8 dadoc_program, i64 mark):
+    (string8 v, bool set) = env("DADO_SELF_BUILD")
+    if !set || v != "1": return
+    strings.Builder b = strings.builder(4096)
+    for f in [dadoc_program, join3(root(), "tools", join2("dado", "defaults")), join2(root(), "ZIG_PIN")]:
+        strings.append(&b, txt(#format("f ", trusted_stat(f, mark), " ", f, "\n")))
+    for dir in included_dirs(manifest):
+        ref []string8 names = sources_in(dir)
+        strings.append(&b, txt(#format("d ", #len(names), " ", dir, "\n")))
+        for n in names:
+            string8 p = join2(dir, n)
+            strings.append(&b, txt(#format("f ", trusted_stat(p, mark), " ", p, "\n")))
+    replace_quietly(txt(#format(out, ".inputs")), strings.text(b))
+
+// Whether every line of the record at `rec` holds now: each file's stat
+// unchanged and trusted, each package directory with the same count of
+// sources (a file added or removed).
+bool inputs_current(string8 rec, string8 cc):
+    string8 text = read_or_empty(rec)
+    if #len(text) == 0 || !strings.contains(text, txt(#format("\nc ", cc, "\n"))): return false
+    for l in lines_of(text):
+        (string8 kind, string8 rest, bool _) = strings.field(l)
+        (string8 a, string8 p0, bool _) = strings.field(strings.trim(rest))
+        string8 p = strings.trim(p0)
+        if kind == "f":
+            if a == "-" || stat_of(p) != a: return false
+        else if kind == "d":
+            ref []string8 names = sources_in(p)
+            if txt(#format(#len(names))) != a: return false
+    return true
+
+private ref []string8 sources_in(string8 dir):
+    ref []string8 out = #make([]string8, 0)
+    try fs.Listing l = fs.read_dir(dir) else:
+        return out
+    for e in l.entries:
+        if !e.is_dir && (strings.ends_with(e.path, ".dado") || strings.ends_with(e.path, ".dados")):
+            ref []char8 own = #format(e.path)
+            out = #append(out, txt(own))
+    l.destroy()
+    sort_bytes(out[:])
+    return out
+
+// The file system's clock now, for `write_inputs`' mark.
+i64 inputs_mark(string8 dir):
+    try fs.make_dirs(dir) else: pass
+    i64 t = fs_now(dir)
+    if t < 0: return time.unix_nanos()
+    return t

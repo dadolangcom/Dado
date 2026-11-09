@@ -2,7 +2,7 @@
 #
 # Downloads the release archive, checks it against the release's SHA256SUMS,
 # unpacks it into %LOCALAPPDATA%\dado (or $env:DADO_DIR), and runs the
-# install.bat inside it, which runs `dadoc bootstrap`. $env:DADO_VERSION picks
+# install.bat inside it, which runs `dado install`. $env:DADO_VERSION picks
 # a release other than the latest. With none, it takes the latest stable
 # release, and while there is none the newest prerelease, asked of GitHub's
 # releases API ($env:DADO_RELEASE_API overrides where).
@@ -36,7 +36,7 @@ $dadoInstallScript = {}.File
 
         # A finished install has written `done` to its journal; one that
         # stopped part way (no git, no network) is installed over, since
-        # `dadoc bootstrap` picks up where it stopped.
+        # `dado install` picks up where it stopped.
         $journal = Join-Path $dir 'install.journal'
         if ((Test-Path (Join-Path $dir 'dadoc.exe')) -and (Test-Path $journal) -and (Select-String -Path $journal -Pattern '^done\t' -Quiet)) {
             throw "$dir already holds a Dado install: run 'dado upgrade' to update it, or set `$env:DADO_DIR to install into another folder"
@@ -44,7 +44,7 @@ $dadoInstallScript = {}.File
         if (Test-Path (Join-Path $dir 'dadoc.exe')) {
             Write-Host "dado install: $dir holds an install that did not finish: installing over it"
         }
-        # `dadoc bootstrap` clones the collections and tools with git, so say
+        # `dado install` clones the collections and tools with git, so say
         # so before downloading anything.
         if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
             throw "Dado's installer needs git, and there is no git on PATH. Install it (https://git-scm.com/download/win, or: winget install --id Git.Git -e), open a new PowerShell window, and run this again"

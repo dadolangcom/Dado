@@ -1,0 +1,534 @@
+// Job entries: a body's job (queued once per declaration and pack), the
+// entry, and the reached closure walked from `main`.
+package check
+
+import "language:diag"
+import "language:index"
+import "language:ir"
+import "language:syntax"
+import "language:types"
+import "core:strings"
+
+// The C name of declaration `d`'s body over `pack`, queued the first time.
+u32 job(^World w, u32 d, u32 pack):
+    if w.decls[d].kind == K_FFN: return c_name(w, d)
+    u64 key = (u64(d) << 32) | u64(pack)
+    if key in w.jobs_by:
+        try u32 j = w.jobs_by[key] else: return NONE
+        return w.jobs[j].cname
+    string8 pkg = pkg_key(w, w.decls[d].pkg)
+    string8 nm = name_of(w, w.decls[d].name)
+    if w.decls[d].kind == K_METHOD: nm = index.hold(#format(mangle(name_of(w, w.decls[w.decls[d].block].name)), "_", mangle(nm)))
+    else: nm = mangle(nm)
+    u32 cname = tstr(w, index.hold(#format("dado_", mangle(pkg), "_", nm)))
+    if pack != NONE: cname = tstr(w, index.hold(#format("dado_", mangle(pkg), "_", nm, "__", #len(w.jobs))))
+    else if w.decls[d].kind == K_FN && (w.p.files[w.decls[d].file].a.a[w.decls[d].node] & syntax.F_VIS) == syntax.VIS_EXPORT: cname = tstr(w, name_of(w, w.decls[d].name))
+    w.jobs_by[key] = u32(#len(w.jobs))
+    Job jb = Job(d, pack, cname, NONE, 0, "", w.ask_depth)
+    if w.decls[d].kind == K_METHOD && w.decls[d].value != NONE:
+        jb.of = w.of if w.of != NONE else w.ask_f
+        jb.at = w.at if w.of != NONE else w.ask_at
+        jb.note = default_note(w, d, jb.of, jb.at)
+    if pack != NONE && (templated(w, d) || packed_only(w, d)):
+        jb.of = w.of if w.of != NONE else w.ask_f
+        jb.at = w.at if w.of != NONE else w.ask_at
+        diag.Place pl = w.p.map.place(w.p.map.base[jb.of] + jb.at)
+        jb.note = index.hold(#format(", while instantiating `", name_of(w, w.decls[d].name), "` with ", bindings(w, owner(w, d), pack), " — asked for by the call at ", w.p.map.names[jb.of], ":", pl.line, ":", pl.col))
+        u32 o = owner(w, d)
+        if o != d:
+            pl = w.p.map.place(w.p.map.base[w.ask_f] + w.ask_at)
+            jb.note = index.hold(#format(", in `", w.t.text(w.t.b[sig(w, o, pack)]), "`'s `", name_of(w, w.decls[d].name), "`, a method of the generic `", name_of(w, w.decls[o].name), "` — reached by the call at ", w.p.map.names[w.ask_f], ":", pl.line, ":", pl.col))
+    w.jobs = #append(w.jobs, jb)
+    return cname
+
+// LNT0613: a parameter (or `self`) over 256 bytes taken by value.
+private void by_value(^World w, ^Body b, u32 q, u32 ty, bool self_):
+    if ty == NONE || !types.laid(&w.t, ty) || types.size_of(&w.t, ty) <= 256: return
+    u32 r = w.t.resolve(ty)
+    if r == NONE || w.t.tag[r] == types.T_OPAQUE || w.t.tag[r] == types.T_PTR: return
+    u64 size = types.size_of(&w.t, ty)
+    string8 sn = named(w, ty)
+    syntax.Ast a = tree(w, b)
+    string8 lint = "This is a warning while you are writing and an error under `--strict`, which is what the gate builds with"
+    if self_:
+        say_tok(w, b.file, b.base, q, diag.LNT + 613, index.hold(#format("`self` is a ", sn, " of ", size, " bytes, and a `self` receiver is a copy, so every call to `", name_of(w, w.decls[b.decl].name), "` copies all ", size, " of them")), "take `^self` instead: it points at the caller's value, and the method may then write it", lint)
+        return
+    u32 tn = a.a[q]
+    say(w, b.file, b.base, a.lo[tn], a.hi[tn], diag.LNT + 613, index.hold(#format("`", w.p.spell(b.file, q), "` is a ", sn, " of ", size, " bytes passed by value, so every call copies all ", size, " of them")), index.hold(#format("take it as `^const ", sn, "` to read the caller's value where it is, or `^", sn, "` if the function writes it")), index.hold(#format("Past 256 bytes that copy is a cost nobody sees in the source. Through a pointer the callee sees, and writes, the caller's own value rather than a copy. ", lint)))
+
+// `_` doubled, so `a_b` and `a__b` stay apart from the separators.
+// Package `p`'s key, as C names carry it: its name, or for a later
+// directory declaring a name an earlier one took, `name__dir` (widened
+// outward through the path until unused).
+string8 pkg_key(^World w, u32 p):
+    string8 nm = name_of(w, w.p.pkgs[p].name) if w.p.pkgs[p].name != NONE else "main"
+    ref []string8 taken
+    for i in 0..<#len(w.p.pkgs):
+        taken = #append(taken, name_of(w, w.p.pkgs[i].name) if w.p.pkgs[i].name != NONE else "main")
+    bool later = false
+    for i in 0..<p:
+        if taken[i] == nm: later = true
+    if !later: return nm
+    for i in 0..<p:
+        taken = #append(taken, pkg_key(w, i))
+    string8 dir = w.p.pkgs[p].dir
+    ref []string8 parts
+    for x in strings.split(dir, "/"):
+        ref []char8 c
+        for ch in x:
+            c = #append(c, ch if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' else '_')
+        parts = #append(parts, txt_trim(index.hold(c)))
+    i64 j = #len(parts) - 1
+    if j >= 0 && parts[j] == nm: j -= 1
+    string8 suffix = ""
+    for j >= 0:
+        if parts[j] != "":
+            if suffix == "": suffix = parts[j]
+            else: suffix = index.hold(#format(parts[j], "_", suffix))
+            string8 key = index.hold(#format(nm, "__", suffix))
+            bool used = false
+            for t in taken:
+                if t == key: used = true
+            if !used: return key
+        j -= 1
+    return index.hold(#format(nm, "__2"))
+
+private string8 txt_trim(string8 s):
+    i64 lo = 0
+    i64 hi = #len(s)
+    for lo < hi && s[lo] == '_': lo += 1
+    for hi > lo && s[hi - 1] == '_': hi -= 1
+    return s[lo..<hi]
+
+string8 mangle(string8 s):
+    ref []char8 out
+    for c in s:
+        out = #append(out, c)
+        if c == '_': out = #append(out, '_')
+    return index.hold(out)
+
+// The program's entry: `main` of the main package, or in a `@test` build
+// each test file's `test()` (`test__file<k>` for one of several).
+bool entry_decl(^World w, u32 d):
+    if w.decls[d].kind != K_FN || w.decls[d].pkg != 0: return false
+    string8 nm = name_of(w, w.decls[d].name)
+    if !w.testing: return nm == "main"
+    return w.p.files[w.decls[d].file].test >= 0 && (nm == "test" || strings.starts_with(nm, "test__file"))
+
+// A `@test` build's entries (Rust's `check_test_signature`, ERR0308).
+private void test_entries(^World w):
+    for f in w.p.pkgs[0].flo..<w.p.pkgs[0].fhi:
+        i32 k = w.p.files[f].test
+        if k < 0: continue
+        string8 nm = "test" if #len(index.g_tests) < 2 else index.hold(#format("test__file", k))
+        u32 d = lookup(w, 0, w.p.names.intern(nm))
+        syntax.Ast a = w.p.files[f].a
+        if d == NONE || w.decls[d].kind != K_FN || w.decls[d].file != u32(f):
+            u32 mk = a.list(a.b[a.root])[0]
+            string8 pn = name_of(w, w.p.pkgs[0].name) if w.p.pkgs[0].name != NONE else "main"
+            u8 ph = w.d.phase
+            w.d.phase = diag.PH_FACTS
+            say(w, u32(f), 0, a.lo[mk], a.hi[mk], 308, index.hold(#format("this file is marked `@test` but declares no `test`; a test compilation of package `", pn, "` runs `i32 test()` and reads its exit status")), "")
+            w.d.phase = ph
+            continue
+        _ = job(w, d, NONE)
+        u32 n = w.decls[d].node
+        []u32 ks = a.list(a.b[n])
+        // Rust's order: the parameters' refusal, then the return's (the sort is by place).
+        u8 ph0 = w.d.phase
+        w.d.phase = diag.PH_DIALECT
+        if #len(ks) > 6 && ks[6] != NONE: say(w, u32(f), 0, a.lo[ks[6]], a.hi[ks[6]], 308, "`test` takes no arguments: the runner starts a process and reads its exit status, so there is nothing to hand it", "")
+        w.d.phase = diag.PH_INTERFACE
+        u32 ft = resolve(w, d)
+        bool i32_ = ft != NONE && int_prim(w, w.t.a[ft]) == types.P_I32
+        if ft != NONE && !i32_ && ks[0] != NONE: say(w, u32(f), 0, a.lo[ks[0]], a.hi[ks[0]], 308, "`test` returns `i32`, because a test's result **is** its exit status: 0 passes", "")
+        w.d.phase = ph0
+
+// Every body reached from `main`, checked in queue order. ERR0301 when the
+// main package has none.
+void program(^World w):
+    w.d.phase = diag.PH_INTERFACE
+    u32 m = lookup(w, 0, w.p.names.intern("main"))
+    // A generic trait: refused, and nothing after it is checked.
+    bool generic = false
+    for d in 0..<#len(w.decls):
+        if w.decls[d].kind != K_TRAIT: continue
+        syntax.Ast ta = w.p.files[w.decls[d].file].a
+        for x in ta.list(ta.b[w.decls[d].node]):
+            if x == NONE || ta.tag[x] != syntax.N_BINDER: continue
+            say(w, w.decls[d].file, 0, ta.lo[x], ta.hi[x], 1, index.hold(#format("`", name_of(w, w.decls[d].name), "` binds a type for a generic trait, which a0.12 does not build: its binders are read so a container trait needs no respelling when one is")), "this compiler parses, formats and dumps it and checks nothing in it; to build the program now, leave it out")
+            generic = true
+            break
+    if generic: return
+    bool scripts_only = true
+    for f in w.p.pkgs[0].flo..<w.p.pkgs[0].fhi:
+        if !ds_file(w, f): scripts_only = false
+    for f in w.p.files:
+        if f.test >= 0: w.testing = true
+    if w.testing: test_entries(w)
+    else if m == NONE || w.decls[m].kind != K_FN:
+        u32 f = w.p.pkgs[0].flo
+        if f < w.p.pkgs[0].fhi && !scripts_only && !w.library:
+            syntax.Ast a = w.p.files[f].a
+            u32 at = a.lo[a.root]
+            for x in a.list(a.b[a.root]):
+                if x != NONE:
+                    at = a.lo[x]
+                    break
+            string8 pn = name_of(w, w.p.pkgs[0].name) if w.p.pkgs[0].name != NONE else "main"
+            w.d.phase = diag.PH_FACTS
+            say(w, f, 0, at, at, 301, index.hold(#format("no `main` function in package `", pn, "`; a program needs an entry point, and it lives in the main package")), "")
+    else:
+        _ = job(w, m, NONE)
+        []u32 ps = params(w, m)
+        if #len(ps) > 0:
+            u32 ft = resolve(w, m)
+            bool ok = #len(ps) == 2 && ft != NONE
+            if ok:
+                []u32 ts = w.t.list(ft)
+                u32 argv = w.t.resolve(ts[1])
+                ok = int_prim(w, ts[0]) == types.P_I32 && argv != NONE && w.t.tag[argv] == types.T_PTR && w.t.resolve(w.t.a[argv]) == u32(types.P_RAWPTR)
+            if !ok: say_tok(w, w.decls[m].file, 0, w.decls[m].node, 306, "`main` takes no arguments, or exactly `(i32 argc, ^rawptr argv)` — C fixes the entry point's signature and rejects any other", "")
+    // Every body of the program's own packages; libraries only as reached.
+    for p in 0..<#len(w.p.pkgs):
+        if index.collection_key(w.p.pkgs[p].key): continue
+        declare(w, u32(p))
+        dot_clashes(w, u32(p))
+    static_asserts(w)
+    shader_units(w)
+    for d in 0..<#len(w.decls):
+        u8 k = w.decls[d].kind
+        if index.collection_key(w.p.pkgs[w.decls[d].pkg].key): continue
+        if k == K_TYPE || k == K_ENUM || k == K_UNION || k == K_CONST || k == K_VAR || k == K_FSTRUCT || k == K_FVAR || k == K_FFN || k == K_TRAIT: _ = resolve(w, u32(d))
+        if (k == K_FN || k == K_CONST) && (w.p.files[w.decls[d].file].a.a[w.decls[d].node] & syntax.F_VIS) == syntax.VIS_EXPORT: export_name(w, u32(d))
+        if k == K_CLASS:
+            _ = resolve(w, u32(d))
+            _ = job(w, u32(d), NONE)
+            continue
+        if k == K_METHOD && w.decls[w.decls[d].block].kind == K_CLASS: s_hooks(w, u32(d))
+        if k == K_FN && !ds_file(w, w.decls[d].file): where_check(w, u32(d))
+        if k != K_FN && k != K_METHOD: continue
+        if k == K_METHOD && st_of_decl(w, w.decls[d].block) != NONE: continue
+        bool template = false
+        syntax.Ast fa = w.p.files[w.decls[d].file].a
+        for q in params(w, u32(d)):
+            if q == NONE || fa.tag[q] != syntax.N_PARAM_V: continue
+            template = fa.tag[fa.a[q]] == syntax.T_PACK
+            if !template && mentions(w, u32(d), fa.a[q]):
+                w.d.phase = diag.PH_INTERFACE
+                say(w, w.decls[d].file, 0, fa.lo[q], fa.hi[q], 1, index.hold(#format("`", w.p.spell(w.decls[d].file, q), "` is a pack in a signature that also leaves a width or a length blank, which is not settled")), "write the pack's element type concretely, or take a `[]T` and pass the window", "Reading a binding off a list whose length is what the pack decides is not settled")
+            if (fa.a[w.decls[d].node] & syntax.F_VIS) == syntax.VIS_EXPORT:
+                w.d.phase = diag.PH_INTERFACE
+                say_tok(w, w.decls[d].file, 0, w.decls[d].node, 1009, index.hold(#format("`", name_of(w, w.decls[d].name), "` collects its last arguments into a window, and `export` promises C a symbol it can call\x1fThe prototype a C caller would write is a fixed-arity function taking Dado's own slice header, and C's `...` carries no type information — so neither of them says what this function is\x1etake `[]", w.p.files[w.decls[d].file].src[i64(fa.lo[fa.a[q]])..<i64(fa.hi[fa.a[q]])], "` and let the caller build the window")), "")
+        if !template && !templated(w, u32(d)): _ = job(w, u32(d), NONE)
+    export_rules(w)
+    st_declare(w)
+    sx_publish(w)
+    se_all(w)
+    sc_rules(w)
+    i64 i = 0
+    for:
+        for i < #len(w.jobs):
+            w.job_now = u32(i)
+            body(w, u32(i))
+            w.job_now = NONE
+            i += 1
+        bool more = settle_dispatches(w)
+        if !fnv_settle(w) && !more: break
+    if w.all_bodies: library_bodies(w)
+    cb_escapes(w)
+    foreign_mangled(w)
+    // ERR0801 for a declared type reaching a map no key fits, once per map.
+    for d in 0..<#len(w.decls):
+        if w.decls[d].kind != K_TYPE || index.collection_key(w.p.pkgs[w.decls[d].pkg].key): continue
+        u32 df = w.decls[d].file
+        u32 tk = w.p.files[df].a.main[w.decls[d].node]
+        w.d.phase = diag.PH_INTERFACE
+        _ = keyed_ok(w, df, 0, w.p.files[df].t.start[tk], w.p.files[df].t.end[tk], resolve(w, u32(d)), index.hold(#format("`", name_of(w, w.decls[d].name), "`")), true)
+    // ERR0801 for a function's return type no key fits.
+    for d in 0..<#len(w.decls):
+        if w.decls[d].kind != K_FN || index.collection_key(w.p.pkgs[w.decls[d].pkg].key) || templated(w, u32(d)) || ds_file(w, w.decls[d].file): continue
+        u32 df = w.decls[d].file
+        syntax.Ast da = w.p.files[df].a
+        u32 rn = da.list(da.b[w.decls[d].node])[0]
+        if rn == NONE || da.tag[rn] != syntax.T_MAP: continue
+        u32 ft = sig(w, u32(d), NONE)
+        if ft == NONE: continue
+        w.d.phase = diag.PH_INTERFACE
+        _ = keyed_ok(w, df, 0, da.lo[rn], da.hi[rn], w.t.a[ft], "a return type", false)
+    // ERR0519: a call packing fewer values than its callee's body reads.
+    for i in 0..<#len(w.pcalls):
+        u32 d = u32(w.pcalls[i] >> 32)
+        u32 given = u32(w.pcalls[i] & 0xFFFFFFFF)
+        if !(d in w.preach): continue
+        try u64 r = w.preach[d] else: continue
+        u32 need = u32(r >> 32)
+        if given >= need: continue
+        u32 rf = w.decls[d].file
+        diag.Place pl = w.p.map.place(w.p.map.base[rf] + w.p.files[rf].a.lo[u32(r & 0xFFFFFFFF)])
+        u32 cf = u32(w.pcall_at[i] >> 32)
+        u32 cn = u32(w.pcall_at[i] & 0xFFFFFFFF)
+        w.d.phase = diag.PH_BODY
+        say(w, cf, 0, w.p.files[cf].a.lo[cn], w.p.files[cf].a.hi[cn], 519, index.hold(#format("this call collects ", given, " value(s) into the pack, and the body reads slot ", need - 1, " of it (line ", pl.line, "), so there is no slot ", need - 1, " to read\x1fA pack's length is not a runtime fact about a value somebody handed over: the compiler builds it here, out of this argument list\x1epass at least ", need, ", or read the pack behind `len`")), "")
+    foreign_facts(w)
+    idle_whens(w)
+    // Every `type` declared is checked, used or not (Rust's declaration pass).
+    for d in 0..<#len(w.decls):
+        if w.decls[d].kind == K_TYPE && !templated(w, u32(d)) && w.decls[d].state == 0 && !ds_at(w, w.decls[d].file, w.decls[d].node): _ = resolve(w, u32(d))
+    for d in 0..<#len(w.decls):
+        if w.decls[d].kind == K_TYPE && !ds_at(w, w.decls[d].file, w.decls[d].node) && (w.p.files[w.decls[d].file].a.a[w.decls[d].node] & syntax.F_CONTRACT) == 0: generic_rules(w, u32(d))
+    for d in 0..<#len(w.decls):
+        if w.decls[d].kind != K_TYPE: continue
+        syntax.Ast ca = w.p.files[w.decls[d].file].a
+        if (ca.a[w.decls[d].node] & syntax.F_CONTRACT) == 0: continue
+        w.d.phase = diag.PH_INTERFACE
+        _ = contract_slots(w, u32(d), true)
+    unlint(w)
+
+// `all_bodies`: the library bodies nothing reached, checked after the
+// rest; what checking them says is dropped (the analysis reads them).
+private void library_bodies(^World w):
+    i64 from = #len(w.jobs)
+    i64 dl = #len(w.d.list)
+    w.quiet_from = from
+    for d in 0..<#len(w.decls):
+        u8 k = w.decls[d].kind
+        if k != K_FN && k != K_METHOD || !index.collection_key(w.p.pkgs[w.decls[d].pkg].key): continue
+        if k == K_METHOD && (w.decls[w.decls[d].block].kind == K_CLASS || w.decls[w.decls[d].block].kind == K_TRAIT || st_of_decl(w, w.decls[d].block) != NONE): continue
+        if ds_file(w, w.decls[d].file) || templated(w, u32(d)): continue
+        bool pack = false
+        syntax.Ast fa = w.p.files[w.decls[d].file].a
+        []u32 fk = fa.list(fa.b[w.decls[d].node])
+        if fa.tag[w.decls[d].node] != syntax.N_FN || #len(fk) < 6 || fk[5] == NONE: continue
+        for q in params(w, u32(d)):
+            if q != NONE && fa.tag[q] == syntax.N_PARAM_V && fa.tag[fa.a[q]] == syntax.T_PACK: pack = true
+        if !pack: _ = job(w, u32(d), NONE)
+    i64 i = from
+    for:
+        for i < #len(w.jobs):
+            w.job_now = u32(i)
+            body(w, u32(i))
+            w.job_now = NONE
+            i += 1
+        bool more = settle_dispatches(w)
+        if !fnv_settle(w) && !more: break
+    #truncate(w.d.list, dl)
+
+// LNT0412 is for a program that otherwise checks.
+void unlint(^World w):
+    if !w.d.has_errors(): return
+    i64 keep = 0
+    for j in 0..<#len(w.d.list):
+        if w.d.list[j].code == diag.LNT + 412: continue
+        w.d.list[keep] = w.d.list[j]
+        keep += 1
+    #truncate(w.d.list, keep)
+
+private void body(^World w, u32 j):
+    Job jb = w.jobs[j]
+    u32 d = jb.decl
+    u32 f = w.decls[d].file
+    u32 n = w.decls[d].node
+    syntax.Ast a = w.p.files[f].a
+    bool tm = templated(w, d)
+    u32 fty = sig(w, d, jb.env) if tm else resolve(w, d)
+    u32 env = w.env
+    u32 envd = w.envd
+    string8 note = w.note
+    u32 st = w.self_ty
+    if w.decls[d].kind == K_METHOD: w.self_ty = resolve(w, w.decls[d].block) if !tm || owner(w, d) == d else sig(w, owner(w, d), jb.env)
+    u32 asking = w.asking
+    w.asking = w.self_ty if tm && owner(w, d) != d else NONE
+    u32 cur = w.cur
+    w.cur = j
+    u32 of = w.of
+    u32 at = w.at
+    w.note = jb.note
+    w.of = jb.of
+    w.at = jb.at
+    u32 unit = w.d.unit
+    if tm:
+        w.env = jb.env
+        w.envd = owner(w, d)
+        // An instance's diagnostics follow the body's, in the order asked (Rust's).
+        w.d.unit = j + 1
+    Body b
+    b.decl = d
+    b.file = f
+    b.base = a.lo[n]
+    b.ret = w.t.a[fty] if fty != NONE else NONE
+    b.pack = jb.env if !tm else NONE
+    b.pack_name = NONE
+    b.grown = NONE
+    b.f.pkg = tstr(w, name_of(w, w.p.pkgs[w.decls[d].pkg].name))
+    b.f.name = jb.cname
+    b.f.file = f
+    b.f.item = n
+    b.f.ty = fty
+    b.f.params = 0
+    w.d.phase = diag.PH_BODY
+    if entry_decl(w, d): b.f.flags = ir.H_ENTRY
+    b.tried = NONE
+    b.trying = NONE
+    b.guard = NONE
+    b.deferred = NONE
+    b.failable = fty != NONE && w.t.b[fty] != types.F_NONE
+    b.ds = ds_file(w, f) || w.decls[d].kind == K_CLASS || w.decls[d].block != NONE && w.decls[d].kind == K_METHOD && w.decls[w.decls[d].block].kind == K_CLASS
+    b.cls = NONE
+    b.above = NONE
+    u32 cd = w.decls[d].block
+    if w.decls[d].kind == K_CLASS: cd = d
+    if b.ds && cd != NONE && cd in w.class_of:
+        try b.cls = w.class_of[cd] else: pass
+        b.f.dialect = ir.D_SCRIPT
+    if b.ds && w.decls[d].kind == K_METHOD && (a.a[n] & syntax.F_ASYNC) != 0 && sa_inner(w, b.ret) != NONE:
+        b.sinside = true
+        b.ret = sa_inner(w, b.ret)
+        ref []u32 aps
+        for x in w.t.params(fty):
+            aps = #append(aps, x)
+        b.f.ty = w.t.func(b.ret, w.t.b[fty], aps[:])
+    u32 stt = st_of_decl(w, cd)
+    if stt != NONE:
+        b.ds = true
+        b.cls = w.straits[stt].cls
+        b.strait1 = stt + 1
+        b.f.dialect = ir.D_SCRIPT
+    if w.decls[d].kind == K_CLASS:
+        b.ret = NONE
+        b.f.ty = NONE
+        scope_in(w, &b)
+        u32 ssl = ir.slot(&b.f, w.t.ptr_of(resolve(w, d)), tstr(w, "self"), ir.S_PARAM | ir.S_USER | ir.S_RECEIVER, n)
+        b.f.params += 1
+        b.locals = #append(b.locals, Local(w.p.names.intern("self"), ssl, n, b.depth, true, NONE, NONE))
+        rawptr cb = w.body
+        w.body = rawptr(&b)
+        s_fields(w, &b)
+        scope_out(w, &b)
+        w.body = cb
+        b.f.flags = b.f.flags | ir.H_BROKEN
+        w.fns = #append(w.fns, b.f)
+        w.note = note
+        w.self_ty = st
+        w.asking = asking
+        w.cur = cur
+        w.of = of
+        w.at = at
+        return
+    if b.failable: b.f.flags = b.f.flags | ir.H_FAILABLE
+    scope_in(w, &b)
+    watch_region(w, &b, n)
+    i64 e0 = w.d.errors() - w.soft
+    []u32 ps = params(w, d)
+    []u32 all = w.t.params(fty) if fty != NONE else w.t.ids.get(NONE)
+    []u32 pts = all
+    u32 rc = a.list(a.b[n])[3]
+    if w.decls[d].kind == K_METHOD && rc == NONE && b.cls != NONE && #len(all) > 0:
+        u32 sl = ir.slot(&b.f, all[0], tstr(w, "self"), ir.S_PARAM | ir.S_USER | ir.S_RECEIVER, n)
+        b.f.params += 1
+        b.locals = #append(b.locals, Local(w.p.names.intern("self"), sl, n, b.depth, true, NONE, NONE))
+        pts = all[1..<#len(all)]
+    else if w.decls[d].kind == K_METHOD && rc != NONE && #len(all) > 0:
+        u32 sl = ir.slot(&b.f, all[0], tstr(w, "self"), ir.S_PARAM | ir.S_USER | ir.S_RECEIVER, rc)
+        b.f.params += 1
+        b.locals = #append(b.locals, Local(w.p.sym(f, rc), sl, rc, b.depth, true, NONE, NONE))
+        pts = all[1..<#len(all)]
+    if b.f.params == 1 && jb.env == NONE: by_value(w, &b, rc, all[0], true)
+    u32 rn = a.list(a.b[n])[0]
+    if jb.env == NONE && rn != NONE && b.ret != NONE: chan_by_value(w, f, a.lo[rn], a.hi[rn], b.ret, "a return")
+    i64 sk = 0
+    for i in 0..<#len(ps):
+        u32 q = ps[i]
+        if q == NONE: continue
+        if kind_at(&a, ps, i):
+            sk += 1
+            continue
+        i64 pi = i - sk
+        if jb.env == NONE && (b.f.flags & ir.H_ENTRY) == 0 && a.tag[q] == syntax.N_PARAM && pi < #len(pts): by_value(w, &b, q, pts[pi], false)
+        if jb.env == NONE && a.tag[q] == syntax.N_PARAM && pi < #len(pts): chan_by_value(w, f, a.lo[q], a.hi[q], pts[pi], "a parameter")
+        if a.tag[q] == syntax.N_PARAM_V && a.tag[a.a[q]] == syntax.T_PACK:
+            b.pack_name = w.p.sym(f, q)
+            b.pack_slot = u32(#len(b.f.slot_ty))
+            for t in w.t.list(jb.env):
+                _ = ir.slot(&b.f, t, tstr(w, name_of(w, b.pack_name)), ir.S_PARAM, q)
+                b.f.params += 1
+            continue
+        if jb.env == NONE && !b.ds && a.b[q] != NONE && a.tag[q] != syntax.N_PARAM_V && !location_default(w, f, a.b[q]) && location_inside(w, f, a.b[q]) != NONE: location_nested(w, f, location_inside(w, f, a.b[q]))
+        else if jb.env == NONE && a.b[q] != NONE && a.tag[q] != syntax.N_PARAM_V && pi < #len(pts) && !index.collection_key(w.p.pkgs[w.decls[d].pkg].key) && !(b.ds && sf_here_default(w, f, a.b[q])): _ = const_value(w, d, a.b[q], pts[pi], false, "the parameter's type is", b.ds)
+        u16 one = ir.S_ONE if written_one(w, f, a.a[q]) else 0
+        u32 sl = ir.slot(&b.f, pts[pi] if pi < #len(pts) else NONE, tstr(w, w.p.spell(f, q)), ir.S_PARAM | ir.S_USER | one, q)
+        if a.tag[q] == syntax.N_PARAM_V: b.vslot = sl + 1
+        b.f.params += 1
+        bool lost = false
+        if fty == NONE && a.tag[q] == syntax.N_PARAM && a.a[q] != NONE && !strings.contains(w.p.files[f].src[i64(a.lo[n])..<i64(a.lo[q])], "$"):
+            // A parameter whose type was refused is not bound (Rust's).
+            for x in w.d.list:
+                if x.file == f && x.code == 401 && x.base + x.start >= a.lo[a.a[q]] && x.base + x.start < a.hi[a.a[q]]: lost = true
+        if w.p.spell(f, q) != "_" && !lost: b.locals = #append(b.locals, Local(w.p.sym(f, q), sl, q, b.depth, true, NONE, NONE))
+    if (b.f.flags & ir.H_ENTRY) == 0 && names_caller(w, d):
+        b.caller = ir.slot(&b.f, alloc_ty(w), tstr(w, "caller"), ir.S_PARAM, n) + 1
+        b.f.params += 1
+        b.f.flags = b.f.flags | ir.H_NAMES_CALLER
+    rawptr ob = w.body
+    w.body = rawptr(&b)
+    // A body whose return type was refused is not checked (Rust's).
+    bool lost = false
+    u32 rtn = a.list(a.b[n])[0]
+    if fty == NONE && !tm && rtn != NONE:
+        for x in w.d.list:
+            if x.file == f && (x.code == 401 || x.code == 801) && x.base + x.start >= a.lo[rtn] && x.base + x.start < a.hi[rtn]: lost = true
+    i64 mark = #len(w.d.list)
+    if b.ds && w.decls[d].kind == K_METHOD:
+        sc_enter(w, &b)
+        sf_defaults(w, &b)
+    if !lost: block(w, &b, a.list(a.b[n])[5], false)
+    scope_out(w, &b)
+    if tm && b.ds: sg_label(w, j, mark)
+    w.body = ob
+    if w.d.errors() - w.soft > e0 || b.ds: b.f.flags = b.f.flags | ir.H_BROKEN
+    w.env = env
+    w.envd = envd
+    w.note = note
+    w.self_ty = st
+    w.asking = asking
+    w.cur = cur
+    w.d.unit = unit
+    w.of = of
+    w.at = at
+    w.fns = #append(w.fns, b.f)
+
+// ERR0911 in a template no call instantiates: a `when` condition naming one
+// of its bindings is refused by its form, as Rust's pre-pass does.
+private void idle_whens(^World w):
+    for d in 0..<#len(w.decls):
+        u8 k = w.decls[d].kind
+        if k != K_FN && k != K_METHOD || !templated(w, u32(d)): continue
+        bool used = false
+        for jb in w.jobs:
+            if jb.decl == u32(d): used = true
+        if used: continue
+        ref []u32 bs
+        for x in binders(w, u32(d)): bs = #append(bs, x)
+        if #len(bs) == 0: continue
+        idle_walk(w, w.decls[d].file, w.decls[d].node, bs[:], false)
+
+private void idle_walk(^World w, u32 f, u32 n, []u32 bs, bool cond):
+    if n == NONE: return
+    syntax.Ast a = w.p.files[f].a
+    if cond && a.tag[n] == syntax.E_NAME:
+        u32 s = w.p.sym(f, n)
+        for x in bs:
+            if x == s:
+                w.d.phase = diag.PH_BODY
+                string8 sp = w.p.spell(f, n)
+                say(w, f, 0, a.lo[n], a.hi[n], 911, index.hold(#format("`", sp, "` is a binding of this signature, so it cannot be a `when` condition")), index.hold(#format("branch on a fact the *build* settles — `#OS`, `#ARCH`, a `@const` — and ask about `", sp, "` in a header `where`")))
+                return
+        return
+    if a.tag[n] == syntax.S_WHEN_ARM:
+        idle_walk(w, f, a.a[n], bs, true)
+        idle_walk(w, f, a.b[n], bs, false)
+        return
+    ref []u32 kids
+    a.kids(n, &kids)
+    for x in kids:
+        idle_walk(w, f, x, bs, cond)

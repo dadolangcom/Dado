@@ -1,7 +1,8 @@
 <!-- The hand-written half of the language documentation.
      This file is the arc. The sections it declares as slots are filled from
-     `//@` blocks beside the code that implements each feature, by
-     `dado doc crates --ext .rs --spine docs/spine.md -o docs/language.md`.
+     the `//@` blocks in docs/language-src (written beside the first compiler's
+     code until the port moved them), by
+     `dado doc docs/language-src --ext .md --spine docs/spine.md -o docs/language.md`.
      A slot declared here that nothing fills, or a block addressed to a slot
      this file does not declare, is a refusal: nothing is written. -->
 

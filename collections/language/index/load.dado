@@ -1,0 +1,439 @@
+// Loading a compilation: the main package (a directory, or one file), the
+// packages its imports reach, each file lexed, interned and parsed once.
+package index
+
+import "core:os/fs"
+import "core:slices"
+import "core:strings"
+import "language:diag"
+import "language:syntax"
+import "language:types"
+
+const u32 NONE = 0xFFFFFFFF
+
+type Import:
+    u32 name
+    u32 pkg
+    u32 file
+    u32 node
+    bool dot
+
+type Source:
+    string8 path
+    string8 src
+    syntax.Tokens t
+    syntax.Ast a
+    u32 pkg
+    i32 test             // a `@test` file's place in `--test=` (-1: none)
+
+type Package:
+    string8 key
+    string8 dir
+    u32 name
+    u32 flo
+    u32 fhi
+    u32 scripts
+    ref []Import imports
+    // DadoGL units (`X.dadogl`, reserved): their names, sorted.
+    ref []string8 units
+
+type Program:
+    types.Interner names
+    ref []Source files
+    ref []Package pkgs
+    diag.Files map
+    diag.Diags diags
+    string8 root
+    ref []u32 loading
+
+    string8 text(^self, u32 sym):
+        return self.names.key(sym)
+
+    // The token text of node `n`'s main token in file `f`.
+    string8 spell(^self, u32 f, u32 n):
+        ^Source s = &self.files[f]
+        u32 k = s.a.main[n]
+        if k == NONE: return ""
+        return s.src[i64(s.t.start[k])..<i64(s.t.end[k])]
+
+    u32 sym(^self, u32 f, u32 n):
+        u32 k = self.files[f].a.main[n]
+        return NONE if k == NONE else self.files[f].t.sym[k]
+
+// Texts held for the compilation (the process).
+ref [](ref []char8) g_keep
+
+string8 hold(ref []char8 s):
+    g_keep = #append(g_keep, s)
+    return g_keep[#len(g_keep) - 1]
+
+// Whether a package's key names a collection's package (`core:os`,
+// `project:x`, `imports:n/p`) rather than a directory: a `:` with no
+// separator before it, and not a Windows drive's (`D:\a\b`, `D:/a`, `D:`),
+// which is what the main package's key is when the driver runs on Windows.
+// Every "is this the program's own package" asks this, never `:` alone.
+bool collection_key(string8 key):
+    i64 c = strings.index_of(key, ':')
+    if c < 0: return false
+    for i in 0..<c:
+        char8 x = key[i]
+        if x == '/' || x == '\\': return false
+    if c != 1: return true
+    char8 l = key[0]
+    bool letter = (l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z')
+    if !letter: return true
+    if #len(key) == 2: return false
+    char8 after = key[2]
+    return after != '/' && after != '\\'
+
+// `a/b/../c` as `a/c`, `./` dropped: one key per directory.
+string8 clean(string8 path):
+    ref []string8 parts
+    i64 lo = 0
+    for i in 0..=#len(path):
+        if i < #len(path) && path[i] != '/': continue
+        string8 seg = path[lo..<i]
+        lo = i + 1
+        if seg == "." || #len(seg) == 0 && #len(parts) > 0: continue
+        if seg == ".." && #len(parts) > 0 && parts[#len(parts) - 1] != "..":
+            #truncate(parts, #len(parts) - 1)
+            continue
+        parts = #append(parts, seg)
+    string8 out = hold(strings.join(parts[:], "/"))
+    #delete(parts)
+    // `.` and `./` clean to nothing; `/` to "".
+    if #len(out) > 0: return out
+    if strings.starts_with(path, "/"): return "/"
+    return "."
+
+// Whether the host separates path elements with `\` as well as `/`: dadoc
+// runs where it was built, and the driver hands it the host's paths. On
+// Windows a package's directory can come as `D:/a/ci/hello\hello` (the
+// shell's `PWD`, then `\` and the package as typed): split at `/` alone, its
+// name was `hello\hello`, so the files were shown as `hello\hello/main.dado`
+// and the many-file form's unit, named from that, went into a directory
+// `hello` nobody made (P23).
+when #OS == #WINDOWS:
+    private const bool BACKSLASH_SEPARATES = true
+else:
+    private const bool BACKSLASH_SEPARATES = false
+
+// Where the last separator of `p` is, or -1: `/`, and `\` too when
+// `windows` (the host's rule is `last_separator`). Separate so a test on
+// any host can ask Windows' rule.
+private i64 last_separator_in(string8 p, bool windows):
+    i64 i = #len(p) - 1
+    for i >= 0:
+        if p[i] == '/' || (windows && p[i] == '\\'): return i
+        i -= 1
+    return 0 - 1
+
+private i64 last_separator(string8 p):
+    return last_separator_in(p, BACKSLASH_SEPARATES)
+
+private string8 base_name(string8 p):
+    i64 i = last_separator(p)
+    return p[i + 1..<#len(p)] if i >= 0 else p
+
+// A directory's own name: `.` and `..` resolved on disk.
+private string8 dir_name(string8 dir):
+    string8 b = base_name(dir)
+    if b != "." && b != "..": return b
+    try ref []char8 c = fs.canonical(dir) else:
+        return b
+    string8 h = hold(c)
+    return base_name(h)
+
+private string8 dir_of(string8 p):
+    i64 i = last_separator(p)
+    return p[0..<i] if i >= 0 else "."
+
+private bool less(string8 a, string8 b):
+    return strings.before(a, b)
+
+// The driver's lookups (Rust's `packages::Imports`), per run:
+// `imports:<name>/<pkg>` at each `--import=` mapping, then each `--imports=`
+// root; `project:<path>` under `--project=`; `<coll>:<pkg>` in each
+// `--overlay=` before the root. First match wins.
+type Lookups:
+    ref []string8 names
+    ref []string8 dirs
+    ref []string8 roots
+    string8 project
+    ref []string8 overlays
+
+Lookups g_look
+// `--stdin`: the input file's text; `--package`: a file argument loads its
+// directory.
+bool g_stdin_on
+string8 g_stdin
+string8 g_stdin_path
+bool g_package
+
+// The directory `<coll>:<rest>` names, whether or not it exists.
+string8 coll_dir(string8 root, string8 coll, string8 rest):
+    if coll == "imports":
+        i64 sl = strings.index_of(rest, '/')
+        string8 nm = rest if sl < 0 else rest[0..<sl]
+        string8 pk = "" if sl < 0 else rest[sl + 1..<#len(rest)]
+        ref []string8 cs
+        for i in 0..<#len(g_look.names):
+            if g_look.names[i] == nm: cs = #append(cs, hold(#format(g_look.dirs[i], "/", pk)))
+        for r in g_look.roots:
+            cs = #append(cs, hold(#format(r, "/", nm, "/", pk)))
+        for c in cs:
+            if fs.is_dir(c): return c
+        if #len(cs) > 0: return cs[0]
+        return hold(#format(root, "/imports/", rest))
+    if coll == "project":
+        if #len(g_look.project) == 0: return hold(#format("project/", rest))
+        return hold(#format(g_look.project, "/", rest))
+    if #len(rest) > 0:
+        for o in g_look.overlays:
+            string8 d = hold(#format(o, "/", coll, "/", rest))
+            if fs.is_dir(d): return d
+    return hold(#format(root, "/", coll, "/", rest))
+
+// `path` (a `.dado` file or a package directory) and every package it
+// imports; collection prefixes resolve under `root`.
+Program load(string8 path, string8 root):
+    Program p
+    p.names = syntax.names()
+    p.root = root
+    string8 at = clean(path)
+    if g_stdin_on: g_stdin_path = at
+    if g_package && fs.is_file(at): at = dir_of(at)
+    _ = package_at(&p, at, at, true)
+    // Rust's two refusals of the input itself.
+    if !fs.is_file(at) && !fs.is_dir(at):
+        g_load_err = hold(#format("cannot read `", path, "`: No such file or directory (os error 2)"))
+        return p
+    if #len(p.pkgs) == 0 || p.pkgs[0].flo == p.pkgs[0].fhi:
+        g_load_err = hold(#format("`", path, "` holds no Dado source this build would compile. If its files are `@test` files, no ordinary build compiles one — name it with `--test=`"))
+        return p
+    // A program writing a `#script_*` verb gets the DadoScript runtime.
+    bool verb = false
+    for f in p.files:
+        if !strings.contains(f.src, "#script_"): continue
+        for k in 0..<#len(f.t.start):
+            if strings.starts_with(f.src[i64(f.t.start[k])..<i64(f.t.end[k])], "#script_"): verb = true
+    // So does one importing a package of scripts.
+    for i in 1..<#len(p.pkgs):
+        if p.pkgs[i].scripts > 0: verb = true
+    string8 rt = hold(#format(root, "/core/script"))
+    if verb && fs.is_dir(rt): _ = package_at(&p, "core:script", rt, false)
+    return p
+
+private u32 package_at(^Program p, string8 key, string8 path, bool main):
+    for i in 0..<#len(p.pkgs):
+        if p.pkgs[i].key == key: return u32(i)
+    ref []string8 paths
+    ref []string8 units
+    u32 scripts = 0
+    string8 dir = path
+    if fs.is_file(path):
+        paths = #append(paths, path)
+        dir = dir_of(path)
+    else:
+        try fs.Listing l = fs.read_dir(path) else:
+            return NONE
+        for e in l.entries:
+            string8 b = e.path
+            if !e.is_dir && strings.ends_with(b, ".dados"):
+                scripts += 1
+                paths = #append(paths, hold(#format(path, "/", b)))
+            if !e.is_dir && strings.ends_with(b, ".dado"):
+                paths = #append(paths, hold(#format(path, "/", b)))
+            if !e.is_dir && strings.ends_with(b, ".dadogl"): units = #append(units, hold(strings.clone(b[0..<#len(b) - 7])))
+        slices.sort_stable(paths[:], less)
+        slices.sort_stable(units[:], less)
+    u32 id = u32(#len(p.pkgs))
+    Package k
+    k.key = key
+    k.dir = dir
+    k.name = NONE
+    k.flo = u32(#len(p.files))
+    k.scripts = scripts
+    k.units = units
+    p.pkgs = #append(p.pkgs, k)
+    string8 shown = "" if main && fs.is_file(path) && last_separator(path) < 0 else hold(strings.concat(dir_name(dir), "/"))
+    for f in paths:
+        string8 src = g_stdin
+        if !g_stdin_on || clean(f) != g_stdin_path:
+            try ref []char8 text = fs.read_file(f) else:
+                continue
+            src = hold(text)
+        // A `@test` file is in no build but one naming it (`--test=`).
+        i32 tk = -1
+        if test_header(src):
+            tk = test_place(f)
+            if tk < 0: continue
+        Source s
+        s.path = hold(strings.concat(shown, base_name(f)))
+        s.src = src
+        s.t = syntax.lex(src)
+        syntax.intern(&s.t, src, &p.names)
+        s.a = syntax.parse(src, &s.t, strings.ends_with(f, ".dados"))
+        s.pkg = id
+        s.test = tk
+        if tk >= 0 && #len(g_tests) > 1 && !number_entry(&s, &p.names, tk) && #len(g_load_err) == 0:
+            g_load_err = hold(#format("`", g_test_ids[tk], "` is marked `@test` and declares no `test()` at package level, so a compilation of several test files has nothing of it to run: compile it alone (one `--test=`) for the diagnostic"))
+        p.files = #append(p.files, s)
+        u32 fi = u32(#len(p.files) - 1)
+        _ = p.map.add(s.path, src)
+        diagnose(p, fi)
+    p.pkgs[id].fhi = u32(#len(p.files))
+    p.loading = #append(p.loading, id)
+    for fi in p.pkgs[id].flo..<p.pkgs[id].fhi:
+        imports(p, id, fi)
+    #truncate(p.loading, #len(p.loading) - 1)
+    // A package of scripts alone is named by its directory.
+    if p.pkgs[id].name == NONE && !main && scripts > 0 && i64(scripts) == #len(paths):
+        string8 bn = dir_name(dir)
+        ref []char8 fix
+        for ch in bn:
+            fix = #append(fix, ch if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' else '_')
+        string8 fx = hold(fix)
+        if fx != bn || #len(bn) == 0 || bn[0] >= '0' && bn[0] <= '9':
+            p.diags.phase = diag.PH_LOAD
+            p.diags.file = p.pkgs[id].flo
+            p.diags.add(1303, 0, 0, hold(#format("`", bn, "/` holds only scripts, so its package is named by the directory — a script names no package — and `", bn, "` is not an identifier, so `", p.files[p.pkgs[id].flo].path, "` and the rest of it are in no package an import can reach")), hold(#format("rename the directory to an identifier, `", fx, "`, or add a `.dado` file to it whose `package` line names the package")))
+        p.pkgs[id].name = p.names.intern(bn)
+    if p.pkgs[id].name == NONE: p.pkgs[id].name = p.names.intern("main")
+    // The last file's `package` names the directory; the others agree.
+    p.diags.phase = diag.PH_LOAD
+    for fi in p.pkgs[id].flo..<p.pkgs[id].fhi:
+        syntax.Ast a = p.files[fi].a
+        for n in a.list(a.b[a.root]):
+            if n == NONE || a.tag[n] != syntax.N_PACKAGE || p.sym(fi, n) == p.pkgs[id].name: continue
+            p.diags.file = fi
+            u32 k = a.main[n]
+            p.diags.add(304, p.files[fi].t.start[k], p.files[fi].t.end[k], hold(#format("this directory is package `", p.names.key(p.pkgs[id].name), "`, and every file in one directory declares the same package")))
+    return id
+
+// `--test=`, in order; each one's identity (canonical); a load refusal.
+ref []string8 g_tests
+ref []string8 g_test_ids
+string8 g_load_err
+
+// Rust's `test_header`: `@test` on the first line, a word.
+bool test_header(string8 src):
+    i64 nl = strings.index_of(src, '\n')
+    string8 first = strings.trim(src if nl < 0 else src[0..<nl])
+    if !strings.starts_with(first, "@test"): return false
+    return #len(first) == 5 || first[5] == ' ' || first[5] == '\t' || first[5] == '\r'
+
+private string8 ident(string8 path):
+    try ref []char8 c = fs.canonical(path) else:
+        return clean(path)
+    return hold(c)
+
+private i32 test_place(string8 path):
+    if #len(g_test_ids) < #len(g_tests):
+        for t in g_tests[#len(g_test_ids)..<#len(g_tests)]:
+            g_test_ids = #append(g_test_ids, ident(t))
+    string8 at = ident(path)
+    for k in 0..<#len(g_test_ids):
+        if g_test_ids[k] == at: return i32(k)
+    return -1
+
+// The file's `test()` renamed `test__file<k>` (one program of several).
+private bool number_entry(^Source s, ^types.Interner names, i32 k):
+    syntax.Ast a = s.a
+    for n in a.list(a.b[a.root]):
+        if n == NONE || a.tag[n] != syntax.N_FN: continue
+        u32 m = a.main[n]
+        if m == NONE || s.src[i64(s.t.start[m])..<i64(s.t.end[m])] != "test": continue
+        s.t.sym[m] = names.intern(hold(#format("test__file", k)))
+        return true
+    return false
+
+private void diagnose(^Program p, u32 fi):
+    ^Source s = &p.files[fi]
+    p.diags.phase = diag.PH_LEX
+    p.diags.file = fi
+    p.diags.base = 0
+    for d in s.t.diags:
+        p.diags.add(d.code, d.start, d.end, s.t.message(d), s.t.help(d))
+    p.diags.phase = diag.PH_PARSE
+    for d in s.a.diags:
+        p.diags.add(d.code, d.start, d.end, s.a.message(d), s.a.help(d))
+
+private void imports(^Program p, u32 id, u32 fi):
+    ref []u32 ns
+    syntax.Ast a = p.files[fi].a
+    for n in a.list(a.b[a.root]):
+        if n == NONE: continue
+        if a.tag[n] == syntax.N_PACKAGE: p.pkgs[id].name = p.sym(fi, n)
+        if a.tag[n] == syntax.N_IMPORT: ns = #append(ns, n)
+    for n in ns:
+        ref []char8 w
+        syntax.string_value(p.spell(fi, n), &w)
+        string8 written = hold(w)
+        // A script's JavaScript module: the checker's (`check.js_import`).
+        if a.a[a.root] == 1 && (strings.ends_with(written, ".js") || strings.ends_with(written, ".mjs")): continue
+        string8 key = written
+        string8 at = written
+        i64 c = strings.index_of(written, ':')
+        i64 sl = strings.index_of(written, '/')
+        if c >= 0 && (sl < 0 || c < sl):
+            at = coll_dir(p.root, written[0..<c], written[c + 1..<#len(written)])
+        else:
+            at = clean(hold(#format(p.pkgs[id].dir, "/", written)))
+            key = at
+        u32 q = package_at(p, key, at, false)
+        if q == NONE:
+            missing(p, fi, n, written, c >= 0 && (sl < 0 || c < sl))
+            continue
+        i64 on = -1
+        for i in 0..<#len(p.loading):
+            if p.loading[i] == q: on = i
+        // Packages of scripts may import each other in a cycle.
+        bool scripts = a.a[a.root] == 1 && p.pkgs[q].fhi > p.pkgs[q].flo
+        for qf in p.pkgs[q].flo..<p.pkgs[q].fhi:
+            if p.files[qf].a.a[p.files[qf].a.root] != 1: scripts = false
+        if on >= 0 && !scripts:
+            ref []char8 chain
+            for i in on..<#len(p.loading):
+                chain = #append(chain, ..p.names.key(p.pkgs[p.loading[i]].name))
+                chain = #append(chain, .." -> ")
+            chain = #append(chain, ..p.names.key(p.pkgs[q].name))
+            p.diags.phase = diag.PH_LOAD
+            p.diags.file = fi
+            p.diags.add(302, a.lo[n], a.hi[n], hold(#format("the import graph is acyclic; this closes ", chain)))
+            continue
+        // Bound by its alias, else by the path's last segment.
+        u32 alias = p.names.intern(base_name(written[c + 1..<#len(written)] if c >= 0 && (sl < 0 || c < sl) else written))
+        if a.a[n] != NONE: alias = p.files[fi].t.sym[a.a[n]]
+        u32 bound = alias
+        bool twice = false
+        for im in p.pkgs[id].imports:
+            u32 nm = im.name
+            if nm == NONE: nm = p.pkgs[im.pkg].name
+            if im.file == fi && nm == bound: twice = true
+        if twice:
+            p.diags.phase = diag.PH_LOAD
+            p.diags.file = fi
+            p.diags.add(305, a.lo[n], a.hi[n], hold(#format("`", p.names.key(bound), "` already binds a package in this file; name one of them explicitly, which is what `import g \"...\"` is for")))
+            continue
+        p.pkgs[id].imports = #append(p.pkgs[id].imports, Import(alias, q, fi, n, a.b[n] != NONE))
+
+// ERR0303: an import that names no package.
+private void missing(^Program p, u32 fi, u32 n, string8 written, bool coll):
+    p.diags.phase = diag.PH_LOAD
+    p.diags.file = fi
+    u32 k = p.files[fi].a.main[n]
+    string8 msg = hold(#format("`", written, "` names no package; an import path with no `<collection>:` prefix is a directory path relative to this file"))
+    if coll:
+        i64 c = strings.index_of(written, ':')
+        string8 cn = written[0..<c]
+        if fs.is_dir(hold(#format(p.root, "/", cn))): msg = hold(#format("`", written, "` names no package: collection `", cn, "` is `", p.root, "/", cn, "/`, and it holds no `", written[c + 1..<#len(written)], "`"))
+        else:
+            ref []string8 cs
+            fs.Listing l
+            try l = fs.read_dir(p.root) else: pass
+            for e in l.entries:
+                if e.is_dir: cs = #append(cs, hold(#format("`", e.path, "`")))
+            slices.sort_stable(cs[:], less)
+            msg = hold(#format("`", written, "` names no collection `", cn, "`; the collections in `", p.root, "` are ", strings.join(cs[:], ", "), ", because a collection is a directory there and nothing else"))
+    p.diags.add(303, p.files[fi].t.start[k], p.files[fi].t.end[k], msg)
