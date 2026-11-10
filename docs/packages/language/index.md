@@ -1,4 +1,4 @@
-<!-- dadoc 1.0.0-rc.9 -->
+<!-- dadoc 1.0.0-rc.10.1 -->
 <!-- self-hosted (tools/dadoc) -->
 # language:index
 
@@ -7,7 +7,7 @@ packages its imports reach, each file lexed, interned and parsed once.
 
 ## Declarations
 
-34 declarations, 23 public.
+39 declarations, 24 public.
 
 * `const u32 NONE = 0xFFFFFFFF`
 * `type Import`
@@ -19,6 +19,7 @@ packages its imports reach, each file lexed, interned and parsed once.
 * `u32 Program.sym(^self, u32 f, u32 n)`
 * `ref [](ref []char8) g_keep` — Texts held for the compilation (the process).
 * `string8 hold(ref []char8 s)`
+* `bool collection_key(string8 key)` — Whether a package's key names a collection's package (`core:os`,…
 * `string8 clean(string8 path)` — `a/b/../c` as `a/c`, `./` dropped: one key per directory.
 * `type Lookups` — The driver's lookups (Rust's `packages::Imports`), per run:
 * `Lookups g_look`

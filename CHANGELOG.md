@@ -10,6 +10,42 @@ is under **Breaking** (a removal is under **Removed**, and breaks a program that
 the old name or signature, the new one, and what to write instead. Diagnostic codes are the
 ones `dado explain` describes.
 
+## 1.0.0-rc.10.1 (2026-11-10)
+
+A point release that repairs rc.10's regressions: programs that rc.9 built and ran, and rc.10 refused, miscompiled or lost. Every workaround written for them still builds, and none is needed now.
+
+### Fixed
+
+- **A conversion to a written-out array, slice or tuple type compiled to nothing.** `([3]f64)(1.0, 2.0, 3.0)`, `([2][2]f64)(…)` and `([2]V3)(…)` were checked with no diagnostic and the whole statement dropped: an initializer left the variable unset, an `#append` added nothing, an assignment never happened, a call taking the conversion vanished, and `return ([3]f64)(…)` became a bare `return;`. They construct the value again, as rc.9 did, and `((f64 x, f64 y))(1.0, 2.0)` is accepted again (rc.10: `ERR0601`). `([]T)(x)` converts one value, as before; the bare `[3]f64(…)` is still `ERR0201`. A statement the checker can give no value without reporting why is now an internal error rather than silence.
+- **`f()^.method()` on a `^self` method** was `ERR0606` ("a value with no place"), and so was `h().p^.bump()`; a deref names existing storage, and the method changes it.
+- **`self` in a `^self` method is `^W` again**, as in rc.9: it is dereferenced where a slot is read through it (`self.n`), not when it is named. `rawptr(self)` works again (rc.10: `ERR0504`, spelling the type `W`). As in rc.9, `W c = self`, `take(self)` for a `W` parameter and `self = o` are `ERR0504` (write `self^`), `self == nil` is accepted, and `fmt.println(self)` prints the address.
+- **Indexing a `[1]cstring`** (and a `[1]` of a `#c.*` scalar, a function reference or a union) was `ERR0001`; it indexes as a run of one again. An index other than `0` on a value that is not a run (`k[1]` on an `i32` or a `cstring`) is `ERR0519` again (rc.10 accepted it).
+- **Indexing through a pointer was not checked.** `p[i]` on any `^T` compiled to C pointer arithmetic, so `p[2]` on a `^ref []i32` read past the value it points at. `p[i]` indexes what the pointer points at again, checked as if written on it: a value that is not a run has only slot `0` (`ERR0519` for another), an index into a run is bounds-checked, and a window over a pointer to a run is a window of the run. `&p[i]` through a `^const` is a `^const` (rc.10 gave a writable pointer). `p[i] = c` on a `^string8` is `ERR0606`, as on a `string8`.
+- **`cstring` `==` and `!=`** were `ERR0607`; they compare the two pointers, as in rc.9: whether they name the same text in memory, not whether the texts are equal. Compare the contents through `string8` for that.
+- **`#send` of a constant composite value into a channel field** (`#send(q, 0, nil)` into a `ref []char8` field) wrote C that did not compile.
+- **Web builds dropped a package's C sidecar and its `export`s.** The manifest of a `--target=web` build lacked its `source`, `include`, `header` and `c-export` rows, so a package's `.c` files were neither compiled nor linked, and `export` functions were missing from the module. They are back, and each export is listed in the module's exports.
+- **An `export` function that no Dado code calls was lost natively too**: a dev build left it out of the executable's dynamic symbols, a `--release` build removed it, and an `export` in a collection package was never compiled. Every `export` is compiled and visible, as in rc.9.
+- **`dado test` failed to link on its second run** ("multiple definition") in any package with a `.c` sidecar, including `vendor:enet`: a cached run linked one object twice and dropped the sidecar's.
+- **Embedded JavaScript modules imported by relative path did not load.** With the main package below the project root (`main/`), modules were laid out under their host path (`dados/js/home/…`) and some specifiers came out as `js:/…` or `….js.js`; and an `import` or `export … from` written over several lines kept its unlinked specifier. Modules are laid out under `dados/js/__up/…` again and every specifier is linked where it is written.
+- **Valid code refused:**
+  - a generic bound once through a type's name and once through the shape it names (`PointD` and `[2]f64`): `ERR0504`;
+  - a failable function with one named result returning a value of that type (`!([3]f64 centroid) mid(…)`): `ERR0701`. A one-slot named result is its element, so `v.centroid` is the whole array (rc.9 read its first element);
+  - `&&` and `||` with a `const bool` operand: `ERR0504`;
+  - a constant expression as a `case` label (`case 0 - 1:`): `ERR0901`;
+  - a slot name of a named-tuple result through an `auto` binding (`auto r = f()`, `r.ok`): `ERR0410`;
+  - indexing through a pointer to a tuple (`p[0].owner[i]` with `p` a `^(^const Coll, []const i32)`): `ERR0504`/`ERR0410`;
+  - a conditional with a literal arm as a generic argument (`math.clamp(y, 0.0 if peak else LO, HI)` with `LO` an `f32`): `ERR0504`.
+- **`dado check` missed errors in imported collection packages.** Code in a package imported as `project:x`, `vendor:x` or another collection was diagnosed only where the program reached it, so `dado check main` could pass while checking the packages one by one found errors. `dado check` and the editor report errors in every body and package-level declaration of them again; a script class in such a package that a program runs is checked in every build, as rc.9 did (rc.10 accepted arithmetic on `any` there, and missed `LNT0412`).
+
+### Changed
+
+These were in rc.10 and are kept; they were missing from its notes.
+
+- **`dado build` type-checks only the library code the program reaches**; `dado check` (and the editor) check all of it. rc.9's builds checked all of it. Run `dado check` to see errors in library code nothing calls yet.
+- **A `ref []T` slot read through a `^const` is a `[]const T`**: `f(s^.positions[0..<2])` with `^const Soup s` is `ERR0504` for a `[]f32` parameter (rc.9 accepted it). Take `^Soup`, or make the parameter `[]const f32`.
+- **`[x]` is one value where a run is wanted**: `set([subject])` for a `[]const i32` parameter is `ERR0504`, since a `[1]T` is a `T` (rc.9 accepted it). Pass a run (`[2]i32 ids = …; set(ids[:])`) or make the parameter a single value.
+- **`dado inspect --format=json` names tuple slots in signatures**: `([3]f64 a, f64 gap)` (rc.9: `([3]f64, f64)`).
+
 ## 1.0.0-rc.10 (2026-11-09)
 
 ### Breaking

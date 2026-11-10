@@ -1,4 +1,4 @@
-<!-- dadoc 1.0.0-rc.10 -->
+<!-- dadoc 1.0.0-rc.10.1 -->
 <!-- self-hosted (tools/dadoc) -->
 # language:check
 
@@ -7,7 +7,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 
 ## Declarations
 
-1506 declarations, 921 public.
+1517 declarations, 926 public.
 
 * `const u8 B_AL_GET = 90`
 * `const u8 B_AL_HEAP = 91`
@@ -49,6 +49,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `type Val`
 * `Val bad()`
 * `Val value(u32 opd, u32 ty)`
+* `void silent(^World w, ^Body b, Val v, u32 n)` — The backstop for a dropped statement: a `bad()` value means "already…
 * `syntax.Ast tree(^World w, ^Body b)`
 * `void err(^World w, ^Body b, u32 n, u16 code, string8 msg, string8 help = "", string8 why = "")`
 * `void err_tok(^World w, ^Body b, u32 n, u16 code, string8 msg, string8 help = "")`
@@ -69,12 +70,14 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `u32 zero(^World w, u32 ty)` — The zero of a type, as an operand: a composite's is the empty tuple.
 * `void store(^World w, ^Body b, u32 p, u32 ty, Val v, u32 at, u32 n, string8 site = "the declared shape is")` — `p = v`, `v` converted to `ty` (ERR0504 when it does not fit).
 * `u32 spill(^World w, ^Body b, Val v, u32 n)` — `v` as a place (a temporary when it is a constant).
-* `Val local_val(^World w, ^Body b, u32 sl)` — A local as a value; a `^self` receiver reads as what it points at.
+* `Val local_val(^World w, ^Body b, u32 sl)` — A local as a value. A `^self` receiver is the pointer, `^W`, as any `^W`
 * `bool copied_self(^World w, ^Body b, u32 sl)` — A `self` receiver taken by value: writes to it are lost (ERR0615).
 * `bool in_copied_self(^World w, ^Body b, u32 p)`
+* `bool through_deref(^Body b, u32 p)` — Whether place `p` goes through a `^`: it is then storage wherever its…
 * `string8 COPY_LOST(^World w, ^Body b)`
 * `string8 self_help(^World w, ^Body b)`
 * `string8 src(^World w, ^Body b, u32 n)` — The source text of node `n`.
+* `bool writable(^World w, ^Body b, u32 n, u32 ty)` — ERR0606 for a store into a `const`: the place's own type, the path to…
 * `u32 const_member(^World w, u32 ty, i64 depth)` — A `const` slot or member at any depth of `ty`'s shape, not behind an…
 * `Val place(^World w, ^Body b, u32 n, bool read)` — A place for an assignment: a local, or a slot of one.
 * `u32 cond(^World w, ^Body b, u32 n, string8 what)` — A condition: a `bool`, else ERR0702 naming the construct.
@@ -501,7 +504,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `u32 position(^World w, ^Body b, u32 n, string8 what = "an index")` — An index or bound: an integer, as an `i64` operand; NONE when reported.
 * `Val index_(^World w, ^Body b, u32 n)` — `xs[i]`: a slot of a tuple by a constant, else a checked position.
 * `bool marker_ok(^World w, ^Body b, u32 m, string8 what)` — The `#` name in front of a checked operand (token `m`): whether it waives…
-* `Val index_in(^World w, ^Body b, u32 n, Val base, bool past, bool writing)`
+* `Val index_in(^World w, ^Body b, u32 n, Val base, bool past, bool writing, bool held = false)`
 * `Val window(^World w, ^Body b, u32 n)` — `xs[lo..<hi]`, `xs[:]`: a view, `string8` over text.
 * `Val deref(^World w, ^Body b, u32 n)` — `p^`: the place a pointer points at.
 * `Val address(^World w, ^Body b, u32 n)` — `&x`: the address of a place; a unit of text has none.
@@ -635,6 +638,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `bool crosses(^World w, u32 dado, u32 script, ^string8 why)` — The one crossing relation between a Dado type and a script type (either…
 * `bool js_path(string8 sp)`
 * `u64 js_key(u32 f, u32 x, u64 tag)`
+* `ref []u64 js_specs(string8 s)` — The static import specifiers of JavaScript text `s`: each value's…
 * `string8 utf8_of(u32 c)` — Code point `c` as UTF-8.
 * `const u8 B_SDADO = 152`
 * `const u8 B_SNARROW = 153`
@@ -826,7 +830,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `Val narrow(^World w, ^Body b, u32 n)` — `v.(T)`: member `T` and whether the tag says so, as `(T, bool)`.
 * `void union_switch(^World w, ^Body b, u32 n, Val v)` — A `switch` over a union: an arm per member named, its binding the member.
 * `string8 raw_members(^World w, u32 rw)` — A `cunion`'s members as `` `T name` ``, joined.
-* `const string8 DADO_VERSION = "1.0.0-rc.10"` — What `#DADO_VERSION` answers.
+* `const string8 DADO_VERSION = "1.0.0-rc.10.1"` — What `#DADO_VERSION` answers.
 * `const u32 NONE = 0xFFFFFFFF`
 * `const u8 K_FN = 0`
 * `const u8 K_FFN = 1`
@@ -903,7 +907,8 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `void reach_foreign(^World w, u32 f, u32 n)` — Notes foreign block `n` of file `f` as reached.
 * `bool reaches_header(^World w, string8 h)` — Whether a reached `foreign` block names header `h`.
 * `string8 foreign_heads(^World w)` — What the reached `foreign` blocks put before the prelude: `define`s, then…
-* `string8 c_facts(^World w)` — The build manifest's facts about the C a program brings: `inline-c <file>…
+* `bool export_fn(^World w, u32 i)` — The build manifest's facts about the C a program brings: `inline-c <file>…
+* `string8 c_facts(^World w)`
 * `type Spawn` — A `threads.spawn` call: its body's declaration (NONE outside one) and where.
 * `type Where`
 * `Where where(^World w, u32 f, u32 item, u32 n)` — Where node `n` of file `f` starts (`item` is the node it is relative to).

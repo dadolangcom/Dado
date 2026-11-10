@@ -239,6 +239,26 @@ const string8 PRELUDE = """
     #define DADO_SLOW
     #define DADO_SYMBOL(x)
     #endif
+    /* An `export` survives the link on every target: kept whether or not it is
+       called, visible (`-fvisibility=hidden`), and kept by a link that collects
+       garbage; on the web also the module's export of its name. */
+    #if defined(__GNUC__) && !defined(_WIN32)
+    #if defined(__ELF__) && defined(__has_attribute)
+    #if __has_attribute(retain)
+    #define DADO_EXPORT __attribute__((used, retain, visibility("default")))
+    #endif
+    #endif
+    #ifndef DADO_EXPORT
+    #define DADO_EXPORT __attribute__((used, visibility("default")))
+    #endif
+    #elif defined(__GNUC__)
+    #define DADO_EXPORT __attribute__((used))
+    #else
+    #define DADO_EXPORT
+    #endif
+    #ifndef DADO_WASM_EXPORT
+    #define DADO_WASM_EXPORT(name)
+    #endif
     /* `#fence`: under ThreadSanitizer, which cannot model a fence (gcc refuses
        one), a read-modify-write with the same ordering on one shared cell */
     #if defined(__SANITIZE_THREAD__)
@@ -1018,6 +1038,7 @@ private string8 sig(^C c, ^ir.Fn f):
     u32 ret = c.t.a[f.ty]
     bool fl = (f.flags & ir.H_FAILABLE) != 0
     bool out = fl && ret != u32(types.P_VOID)
+    if export_fn(c, f): put(&o, index.hold(#format("DADO_WASM_EXPORT(\"", c.t.text(f.name), "\") DADO_EXPORT ")))
     put(&o, symbol_attrs(c, f))
     if fl: put(&o, "int32_t")
     else: put(&o, ty(c, ret))
@@ -1131,11 +1152,15 @@ private void bin(^C c, ^ir.Fn f, u32 i, string8 where):
     // constant expression), so gcc's `-Wtype-limits` and clang's range checks
     // do not decide it from the other operand's type (`u8 x < 0`).
     bool hide = s >= ir.B_EQ && ir.is_const(f.a[i]) != ir.is_const(f.b[i]) && check.int_prim_of(c.t, t) != types.PRIMS
+    // A `cstring` against a literal compares addresses, which gcc's
+    // `-Waddress` calls unspecified; it is what `==` means here (rc.9's).
+    bool hide_a = hide && ir.is_const(f.a[i]) || s >= ir.B_EQ && c.t.resolve(t) == types.CSTRING && ir.is_const(f.a[i]) && strings.starts_with(text(c, f, f.a[i]), "\"")
+    bool hide_b = hide && ir.is_const(f.b[i]) || s >= ir.B_EQ && c.t.resolve(t) == types.CSTRING && ir.is_const(f.b[i]) && strings.starts_with(text(c, f, f.b[i]), "\"")
     put(&c.out, "(")
-    if hide && ir.is_const(f.a[i]): put(&c.out, index.hold(#format("((void)0, ", text(c, f, f.a[i]), ")")))
+    if hide_a: put(&c.out, index.hold(#format("((void)0, ", text(c, f, f.a[i]), ")")))
     else: opd(c, f, f.a[i])
     put(&c.out, index.hold(#format(" ", ops[s], " ")))
-    if hide && ir.is_const(f.b[i]): put(&c.out, index.hold(#format("((void)0, ", text(c, f, f.b[i]), ")")))
+    if hide_b: put(&c.out, index.hold(#format("((void)0, ", text(c, f, f.b[i]), ")")))
     else: opd(c, f, f.b[i])
     put(&c.out, ")")
 
@@ -1336,6 +1361,14 @@ private void mark(^ir.Fn f, u32 x, ^ref []bool read):
     if x == NONE || ir.is_const(x) || x >= u32(#len(f.root)): return
     u32 r = f.root[x]
     if (r & ir.ROOT_GLOBAL) == 0 && r < u32(#len(read^)): read^[r] = true
+
+// Whether `f` is an `export` function: its C symbol is the program's
+// promise to C and to the web page (`DADO_WASM_EXPORT` and `DADO_EXPORT`).
+private bool export_fn(^C c, ^ir.Fn f):
+    for i in 0..<#len(c.w.fns):
+        if &c.w.fns[i] != f: continue
+        return check.export_fn(c.w, u32(i))
+    return false
 
 // `--full-trace`: the frame naming `f` (`pkg.name`), pushed at entry,
 // popped on every way out.
@@ -2438,20 +2471,29 @@ private void dispatch(^C c, check.Dispatch d):
     put(&o, index.hold(#format("    default: fprintf(stderr, \"a `", tn, "` from an implementer this program was not built with, calling `", mn, "`\\n\"); abort();\n    }\n}\n")))
     put(&c.out, o)
 
+// The function type of `export const NAME = fn` (decl `d`), which
+// `reexports` writes as a C function `NAME`; NONE for any other decl.
+u32 alias_export(^check.World w, u32 d):
+    check.Decl x = w.decls[d]
+    if x.kind != check.K_CONST || x.value == NONE || w.k.kind[x.value] != types.C_FN || x.ty == NONE: return NONE
+    syntax.Ast a = w.p.files[x.file].a
+    if (a.a[x.node] & syntax.F_VIS) != syntax.VIS_EXPORT: return NONE
+    u32 ft = w.t.resolve(x.ty)
+    if w.t.tag[ft] != types.T_FUNC || w.t.b[ft] != types.F_NONE: return NONE
+    return ft
+
 // `export const NAME = fn`: a C function `NAME` that is `fn`.
 private void reexports(^C c, ^ref []char8 protos, ^ref []char8 defs):
     ^check.World w = c.w
     for d in 0..<#len(w.decls):
         check.Decl x = w.decls[d]
-        if x.kind != check.K_CONST || x.value == NONE || c.k.kind[x.value] != types.C_FN || x.ty == NONE: continue
-        syntax.Ast a = w.p.files[x.file].a
-        if (a.a[x.node] & syntax.F_VIS) != syntax.VIS_EXPORT: continue
-        u32 ft = c.t.resolve(x.ty)
-        if c.t.tag[ft] != types.T_FUNC || c.t.b[ft] != types.F_NONE: continue
+        u32 ft = alias_export(w, u32(d))
+        if ft == NONE: continue
         ref []char8 head
         ref []char8 call
         string8 rt = ty(c, c.t.a[ft])
-        put(&head, index.hold(#format(rt, " ", check.name_of(w, x.name), "(")))
+        string8 an = check.name_of(w, x.name)
+        put(&head, index.hold(#format("DADO_WASM_EXPORT(\"", an, "\") DADO_EXPORT ", rt, " ", an, "(")))
         put(&call, index.hold(#format(c.t.text(c.k.b[x.value]), "(")))
         []u32 ps = c.t.params(ft)
         for i in 0..<#len(ps):

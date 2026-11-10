@@ -8,6 +8,7 @@ import "core:strings"
 import "language:check"
 import "language:index"
 import "language:ir"
+import "language:syntax"
 
 // The engine's host calls (`engine.c`), in Rust's order.
 private const [41]string8 DADOS_IMPORTS = ("ctx_new (i32)->()", "ctx_free (i32)->()", "dup (i32)->()", "free (i32)->()", "string (i32,i32,i32,i32)->()", "string16 (i32,i32,i32,i32)->()", "bigint (i32,i64,i32)->()", "array (i32,i32)->()", "map_new (i32,i32)->()", "map_entries (i32,i32,i32)->()", "to_bigint (i32,i32,i32)->(i32)", "to_cstring (i32,i32,i32,i32)->(i32)", "to_utf16 (i32,i32,i32)->(i32)", "is (i32,i32)->(i32)", "length (i32,i32,i32)->(i32)", "global (i32,i32)->()", "get (i32,i32,i32,i32)->()", "set (i32,i32,i32,i32)->(i32)", "define (i32,i32,i32,i32,i32)->(i32)", "get_index (i32,i32,i64,i32)->()", "set_index (i32,i32,i64,i32)->(i32)", "read_run (i32,i32,i32,i32,i64)->(i32)", "array_from (i32,i32,i32,i64,i32)->()", "call (i32,i32,i32,i32,i32,i32)->()", "construct (i32,i32,i32,i32,i32)->()", "cfunction (i32,i32,i32,i32,i32,i32)->()", "exception (i32,i32)->()", "throw (i32,i32)->()", "error (i32,i32,i32,i32)->()", "module_new (i32,i32,i32,i32)->(i32)", "module_export (i32,i32,i32)->(i32)", "module_set (i32,i32,i32,i32)->(i32)", "eval_module (i32,i32,i32)->()", "load_module (i32,i32,i32,i32)->()", "namespace (i32,i32,i32)->()", "promise_state (i32,i32)->(i32)", "promise_result (i32,i32,i32)->()", "hold (i32)->()", "counters (i32,i32)->()", "frame (i32)->()", "fn_take (i32)->()")
@@ -40,6 +41,13 @@ string8 web_manifest(^check.World w, []CUnit units, string8 stem):
     bool args = web_args(w)
     if args: o = #append(o, .."wasm-import dado arg_get (i32,i32,i32)->(i32)\n")
     o = #append(o, .."wasm-export memory memory\nwasm-export __indirect_function_table table\n")
+    // The program's own `export`s, which `DADO_WASM_EXPORT` names in the module.
+    C cs
+    cs.w = w
+    cs.t = &w.t
+    cs.k = &w.k
+    for e in exports_of(w):
+        o = #append(o, ..#format("wasm-export ", e.name, " ", wasm_sig(&cs, e.ft, e.fl), "\n"))
     if args: o = #append(o, .."wasm-export main (i32,i32)->(i32)\nwasm-export dado_flush ()->()\nwasm-export dado_argv (i32)->(i32)\n")
     else: o = #append(o, .."wasm-export main ()->(i32)\nwasm-export dado_flush ()->()\n")
     if engine:
@@ -55,6 +63,35 @@ string8 web_manifest(^check.World w, []CUnit units, string8 stem):
             o = #append(o, '\n')
         o = #append(o, ..#format("js-module ", stem, ".scripts/registry.js\n"))
     return index.hold(o)
+
+// An `export` of the program: its C symbol, and its function type and
+// failability, which its wasm signature is read from.
+type ExportFn:
+    string8 name
+    u32 ft
+    bool fl
+
+// The program's `export`s in declaration order (`c-export`, and on the web
+// `wasm-export`): each `export` function compiled (live), and each
+// `export const` alias, which is always written.
+ref []ExportFn exports_of(^check.World w):
+    ref []u32 at
+    for _ in w.decls: at = #append(at, NONE)
+    for i in 0..<#len(w.fns):
+        if !check.export_fn(w, u32(i)): continue
+        if #len(w.live) > 0 && (i >= #len(w.live) || !w.live[i]): continue
+        at[w.jobs[i].decl] = u32(i)
+    ref []ExportFn out
+    for d in 0..<#len(w.decls):
+        if at[d] != NONE:
+            syntax.Ast a = w.p.files[w.decls[d].file].a
+            u32 ft = w.t.resolve(check.resolve(w, u32(d)))
+            out = #append(out, ExportFn(w.t.text(w.fns[at[d]].name), ft, (a.a[w.decls[d].node] & syntax.F_FAILABLE) != 0))
+            continue
+        u32 aft = alias_export(w, u32(d))
+        if aft != NONE: out = #append(out, ExportFn(check.name_of(w, w.decls[d].name), aft, false))
+    #delete(at)
+    return out
 
 // Whether the entry point takes C's `argc` and `argv`.
 bool web_args(^check.World w):
@@ -100,12 +137,8 @@ private ref []WebEntry web_entries(^check.World w):
     for m in 0..<#len(w.jsn):
         if #len(w.jss[m]) < 2 || w.jsn[m] == "dados:exports": continue
         string8 f = js_file(w.jsn[m])
-        string8 t = w.jss[m]
-        ref []string8 im = imports_of(t)
-        for x in im:
-            string8 to = js_relative(f, js_file(x))
-            for q in ["\"", "'"]:
-                t = replaced(t, index.hold(#format(q, x, q)), index.hold(#format(q, to, q)))
+        ref []string8 im
+        string8 t = js_linked(f, w.jss[m], &im)
         es = #append(es, WebEntry(w.jsn[m], f, t, im))
     es = #append(es, WebEntry("dados:exports", "dado-exports.js", WEB_EXPORTS, nil))
     return es
@@ -128,19 +161,6 @@ private ref []string8 imports_of(string8 src):
             out = #append(out, rest[1..<e + 1])
             rest = rest[e + 2..<#len(rest)]
     return out
-
-// `s` with every `a` made `b`.
-private string8 replaced(string8 s, string8 a, string8 b):
-    ref []char8 o
-    i64 at = 0
-    for:
-        i64 k = strings.find(s[at..<#len(s)], a)
-        if k < 0: break
-        o = #append(o, ..s[at..<at + k])
-        o = #append(o, ..b)
-        at += k + #len(a)
-    o = #append(o, ..s[at..<#len(s)])
-    return index.hold(o)
 
 // The registry's tables: each module by name, its namespace, its imports.
 private string8 web_tables([]WebEntry es):

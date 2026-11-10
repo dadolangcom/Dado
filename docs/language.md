@@ -782,6 +782,15 @@ hand C `"a"` and lose the rest, and it is refused (`ERR0540`). The same
 literal fits a `string8`, a `string16` or a `string32`, whose length
 counts the NUL as one more unit of text.
 
+**`==` and `!=` on a `cstring` compare addresses, not text.** A
+`cstring` is C's `char *`, and the two operators ask what C's do:
+whether both sides are one pointer, or `nil`. Two `cstring`s spelling
+the same text in different buffers are not `==`, and whether two equal
+literals share an address is the C compiler's choice. To compare the
+text, view both first: `string8(a) == string8(b)` compares bytes. A
+`cstring` has no order (`<` is `ERR0607`), and it is not compared with
+a `string8` or a `rawptr` (`ERR0504`).
+
 ### What a frame takes back
 
 A block minted from an allocator the compiler can **name** lies in a

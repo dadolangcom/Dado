@@ -157,6 +157,19 @@ Val bad():
 Val value(u32 opd, u32 ty):
     return Val(V_VAL, opd, ty, NONE, 0, 0)
 
+// The backstop for a dropped statement: a `bad()` value means "already
+// refused", so one while no error has been said is a check that refused
+// nothing and dropped the statement (rc.10's unnamed array casts). Kept,
+// and reported by `program` as ERR0001 if checking ends with no error.
+void silent(^World w, ^Body b, Val v, u32 n):
+    if v.kind != V_VAL || v.ty != NONE || v.opd != NONE || v.x != NONE || b.ds || w.silent_set || w.d.errors() > 0 || w.p.diags.has_errors(): return
+    syntax.Ast a = tree(w, b)
+    w.silent_set = true
+    w.silent_file = b.file
+    w.silent_base = b.base
+    w.silent_lo = a.lo[n]
+    w.silent_hi = a.hi[n]
+
 syntax.Ast tree(^World w, ^Body b):
     return w.p.files[b.file].a
 
@@ -392,7 +405,9 @@ void stmt(^World w, ^Body b, u32 n):
             return
         u32 was = w.stmt_call
         w.stmt_call = e
-        dropped(w, b, e, expr(w, b, e, NONE, true), "by writing the growth as a statement of its own")
+        Val ev = expr(w, b, e, NONE, true)
+        silent(w, b, ev, e)
+        dropped(w, b, e, ev, "by writing the growth as a statement of its own")
         w.stmt_call = was
         u32 ar = arena_call(w, b, e, "reset")
         if ar == NONE: ar = arena_call(w, b, e, "destroy")
@@ -460,6 +475,7 @@ private void let(^World w, ^Body b, u32 n):
         return
     if ks[1] != NONE:
         Val v = expr(w, b, ks[1], ty)
+        silent(w, b, v, ks[1])
         if auto && v.ty != NONE:
             v = finish(w, b, v, ks[1])
             ty = v.ty
@@ -700,6 +716,7 @@ private void assign(^World w, ^Body b, u32 n):
         return
     if op == "=":
         Val v = expr(w, b, ks[1], p.ty)
+        silent(w, b, v, ks[1])
         u32 r = p.opd
         if v.ty != NONE && (v.opd != b.grown || b.grown == NONE) && !ir.is_const(r) && (is_ref(w, p.ty) || is_map(w, p.ty)): _ = ir.op(&b.f, ir.O_MOVE, ir.MV_REBIND, NONE, pn, NONE, r)
         store(w, b, p.opd, p.ty, v, ks[1], n, "the place assigned to is")
@@ -711,17 +728,20 @@ private void assign(^World w, ^Body b, u32 n):
     b.compound = true
     Val r = binary(w, b, n, index.hold(strings.clone(op[0..<#len(op) - 1])), p, NONE, ks[1], p.ty)
     b.compound = false
+    silent(w, b, r, n)
     if r.ty != NONE && op == "*=" && matrix(w, r.ty) != NONE && w.t.resolve(r.ty) != w.t.resolve(p.ty):
         string8 rt = shown(w, r.ty)
         err(w, b, n, 504, index.hold(#format("`*=` is `x = x * y` written once, so the product has to be the place's own type: ", shown(w, p.ty), " times ", shown(w, matrix_of(w, melem(w, matrix(w, p.ty)), w.t.b[matrix(w, p.ty)], w.t.b[matrix(w, r.ty)])), " is ", rt, "\x1fAn assignment cannot change what its target is, so only a square matrix multiplies in place\x1ebind the product instead, to a place of type ", rt)))
         return
     if r.ty != NONE: store(w, b, p.opd, p.ty, r, n, n)
 
-// A local as a value; a `^self` receiver reads as what it points at.
+// A local as a value. A `^self` receiver is the pointer, `^W`, as any `^W`
+// parameter: a projection (`self.n`) or a method call dereferences it, and
+// `self^` is what it points at. A script class's `self` reads as the instance.
 Val local_val(^World w, ^Body b, u32 sl):
     u32 p = ir.at(&b.f, sl)
     u32 r = b.f.slot_ty[sl]
-    if (b.f.slot_flags[sl] & ir.S_RECEIVER) != 0 && r != NONE && w.t.tag[r] == types.T_PTR: return value(ir.step(&b.f, p, ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
+    if b.ds && (b.f.slot_flags[sl] & ir.S_RECEIVER) != 0 && r != NONE && w.t.tag[r] == types.T_PTR: return value(ir.step(&b.f, p, ir.ST_DEREF, 0, w.t.a[r]), w.t.a[r])
     return value(p, b.f.slot_ty[sl])
 
 // A `self` receiver taken by value: writes to it are lost (ERR0615).
@@ -734,6 +754,13 @@ bool in_copied_self(^World w, ^Body b, u32 p):
     for j in b.f.plo[p]..<b.f.phi[p]:
         if b.f.step[j] == ir.ST_DEREF: return false
     return true
+
+// Whether place `p` goes through a `^`: it is then storage wherever its
+// root is, a temporary holding the pointer included (`f()^`, `h().p^`).
+bool through_deref(^Body b, u32 p):
+    for j in b.f.plo[p]..<b.f.phi[p]:
+        if b.f.step[j] == ir.ST_DEREF: return true
+    return false
 
 string8 COPY_LOST(^World w, ^Body b):
     return index.hold(#format("and `self` is a copy made for this call, so the write would be lost when `", name_of(w, w.decls[b.decl].name), "` returns"))
@@ -748,7 +775,7 @@ string8 src(^World w, ^Body b, u32 n):
 
 // ERR0606 for a store into a `const`: the place's own type, the path to
 // it, a `const` member inside it.
-private bool writable(^World w, ^Body b, u32 n, u32 ty):
+bool writable(^World w, ^Body b, u32 n, u32 ty):
     string8 fix = "reach the object through something that does not say `const`, or drop the word from the declaration that does"
     if top_const(w, ty):
         err(w, b, n, 606, index.hold(#format("this is ", shown(w, ty), ", and a `const` is not something to write to")), fix, "The word says nothing is written through this access path, which is the one thing a top-level qualifier is checked for")
@@ -849,6 +876,7 @@ private void group(^World w, ^Body b, u32 n, u32 pn, u32 vn, string8 op):
     u32 want = w.t.tuple(pts) if #len(pts) == #len(ps) && #len(ps) > 1 && tree(w, b).tag[vn] == syntax.E_TUPLE else NONE
     #delete(pts)
     Val v = expr(w, b, vn, want)
+    silent(w, b, v, vn)
     if v.ty == NONE: return
     []u32 slots = w.t.slots(v.ty)
     bool whole = w.t.tag[w.t.resolve(v.ty)] != types.T_TUPLE
@@ -902,6 +930,7 @@ private void ret(^World w, ^Body b, u32 n):
             _ = ir.op(&b.f, ir.O_RETURN, 0, b.ret, n, NONE, NONE)
             return
     Val v = expr(w, b, vn, b.ret)
+    silent(w, b, v, vn)
     b.tried = tried
     b.trying = trying
     Val c = bad()
@@ -927,6 +956,7 @@ private string8 lent_help(^World w, u32 ty, u32 ret):
 // A condition: a `bool`, else ERR0702 naming the construct.
 u32 cond(^World w, ^Body b, u32 n, string8 what):
     Val v = expr(w, b, n, u32(types.P_BOOL))
+    silent(w, b, v, n)
     if v.ty == NONE: return NONE
     if v.ty != u32(types.P_BOOL):
         string8 head = index.hold(#format("an `", what, "` condition"))
@@ -988,8 +1018,9 @@ private void switch_untyped(^World w, ^Body b, u32 n):
         if a.main[c] != NONE: err_tok(w, b, c, 416, index.hold(#format("a `case` arm binds a name only when it narrows a union member, and the value being switched on is not a union — an arm over any other type compares a constant and leaves the value as it was, so there is nothing here for `", spell(w, b, c), "` to be")))
         []u32 vs = a.list(a.b[c])
         for vn in vs[1..<#len(vs)]:
+            u32 at0 = ir.count(&b.f)
             Val k = expr(w, b, vn, NONE)
-            if k.ty == NONE || ir.is_const(k.opd): continue
+            if k.ty == NONE || ir.is_const(k.opd) || folded(w, b, at0, k.opd) != NONE: continue
             err(w, b, vn, 901, index.hold(#format("a `case` value is a constant the compiler folds and compares against, and `", src(w, b, vn), "` is only known while the program runs\x1eto test it, write an `if` — `if ", src(w, b, ks[0]), " == ", src(w, b, vn), ":` — ahead of the `switch`, or bind it to a `const` if it is a constant")))
         u32 h = open(w, b, ir.O_IF, c, ir.konst(w.k.boolean(&w.t, false)), false)
         b.heads[#len(b.heads) - 1].arm = true
@@ -1075,6 +1106,7 @@ private void switch_(^World w, ^Body b, u32 n):
             if sm == 3:
                 _ = expr(w, b, vn, NONE)
                 continue
+            u32 at0 = ir.count(&b.f)
             Val k = expr(w, b, vn, NONE if sm == 1 else v.ty)
             if k.ty == NONE: continue
             if sm == 1 && k.ty != v.ty:
@@ -1084,6 +1116,10 @@ private void switch_(^World w, ^Body b, u32 n):
             if k.ty == NONE: continue
             u32 last = ir.count(&b.f) - 1
             if !ir.is_const(k.opd) && b.f.op[last] == ir.O_SET && b.f.dst[last] == k.opd && ir.is_const(b.f.a[last]): k.opd = b.f.a[last]
+            // A constant expression (`0 - 1`, `2 * K`) folds to its value, as rc.9's did.
+            if !ir.is_const(k.opd):
+                u32 fk = folded(w, b, at0, k.opd)
+                if fk != NONE: k.opd = ir.konst(fk)
             if !ir.is_const(k.opd):
                 err(w, b, vn, 901, index.hold(#format("a `case` value is a constant the compiler folds and compares against, and `", src(w, b, vn), "` is only known while the program runs\x1eto test it, write an `if` — `if ", src(w, b, ks[0]), " == ", src(w, b, vn), ":` — ahead of the `switch`, or bind it to a `const` if it is a constant")))
                 continue
