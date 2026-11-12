@@ -40,6 +40,7 @@ type C:
     // The program holds a map: `main` seeds the hash.
     bool seeded
     ref []u32 seen
+    {u32: u8} cyc
     // The long strings (`strlit`) the function being written holds.
     ref []u32 longs
     // A function's C name to its index in `w.fns`, built on first use.
@@ -432,12 +433,38 @@ private u32 canon(^C c, u32 x):
     if r == NONE: return r
     u8 g = c.t.tag[r]
     if g == types.T_PTR: return r
+    // A shape that holds itself is its own canonical form: unfolding it
+    // names a new shape at every depth it is asked from.
+    if cyclic(c, r): return r
+    return canon_(c, r, g)
+
+// Whether shape `r` (resolved) reaches itself through what `canon` rebuilds:
+// slots, a run's elements, a function's parameters and answer.
+private bool cyclic(^C c, u32 r):
+    if r in c.cyc:
+        try u8 v = c.cyc[r] else: return false
+        return v != 0
+    #truncate(c.seen, 0)
+    bool hit = reaches(c, r, r, true)
+    #truncate(c.seen, 0)
+    c.cyc[r] = u8(1) if hit else u8(0)
+    return hit
+
+private bool reaches(^C c, u32 x, u32 to, bool top):
+    if foreign_row(c, x) != NONE: return false
+    u32 r = c.t.resolve(x)
+    if r == NONE: return false
+    if !top && r == to: return true
     for v in c.seen:
-        if v == r: return r
+        if v == r: return false
     c.seen = #append(c.seen, r)
-    u32 out = canon_(c, r, g)
-    #truncate(c.seen, #len(c.seen) - 1)
-    return out
+    u8 g = c.t.tag[r]
+    if g == types.T_SLICE || g == types.T_REF: return reaches(c, c.t.a[r], to, false)
+    if g != types.T_TUPLE && g != types.T_FUNC: return false
+    i64 n = c.t.count_of(r)
+    for i in 0..<n:
+        if reaches(c, c.t.list(r)[i], to, false): return true
+    return g == types.T_FUNC && reaches(c, c.t.a[r], to, false)
 
 private u32 canon_(^C c, u32 r, u8 g):
     if g == types.T_SLICE: return c.t.slice_of(canon(c, c.t.a[r]))
@@ -459,6 +486,7 @@ string8 ty(^C c, u32 x):
     u32 fx = foreign_row(c, x)
     if fx != NONE: return index.hold(strings.clone(c.t.text(c.t.b[fx])))
     u32 r = canon(c, x)
+    if canon(c, r) != r && #len(g_ice) == 0: g_ice = index.hold(#format("one type has two C names: `", check.shown(c.w, x), "` is `", shape_name(c, r), "` and, asked again, `", shape_name(c, canon(c, r)), "`"))
     u8 g = c.t.tag[r]
     // `const rawptr`: clang refuses a function stored where C's const pointer is.
     if g == types.T_PRIM && c.t.a[r] == u32(types.P_RAWPTR) && (c.t.quals(x) & 1) != 0: return "const void *"
@@ -734,6 +762,10 @@ private u32 param_ty(^C c, ^ir.Fn f, u32 i, i64 j):
 // `_IMPLEMENTATION`) left out of `dado.h`, their unit in `g_impl_text`.
 bool g_impl_split
 ref []char8 g_impl_text
+
+// An internal error of the lowering, the first met: the C it wrote would not
+// compile, so `dadoc` reports this and writes none (`program` clears it).
+string8 g_ice
 
 private bool impl_switch(string8 d):
     i64 sp = strings.index_of(d, ' ')
@@ -1992,7 +2024,13 @@ private void window(^C c, ^ir.Fn f, u32 i, string8 where):
     string8 len = hi if m.kind == check.RK_PTR else base_len(x, m)
     string8 kind = "dado_view){ (void *)"
     if m.kind == check.RK_TEXT: kind = index.hold(#format(ty(c, check.text_of(m.ty)), "){ "))
-    put(&c.out, index.hold(#format("{ int64_t lo = ", lo, ", hi = ", hi, "; (void)dado_window(lo, hi, ", len, ", \"", where, "\"); ", text(c, f, f.dst[i]), " = (", kind, "(", base_ptr(c, x, m), " + lo), hi - lo }; }\n")))
+    // A window with no low bound written (`x[:]`, `x[..<n]`) starts where the
+    // run does, and is written with the run's pointer as it stands, as Rust's
+    // was: `ptr + lo` with `lo` 0 is arithmetic on a null pointer when the run
+    // is empty, which C does not define and clang's UBSan stops at ("applying
+    // zero offset to null pointer").
+    string8 from = index.hold(#format("(", base_ptr(c, x, m), ")")) if f.b[i] == NONE else index.hold(#format("(", base_ptr(c, x, m), " + lo)"))
+    put(&c.out, index.hold(#format("{ int64_t lo = ", lo, ", hi = ", hi, "; (void)dado_window(lo, hi, ", len, ", \"", where, "\"); ", text(c, f, f.dst[i]), " = (", kind, from, ", hi - lo }; }\n")))
 
 // `#trace()`: `B_TRACE` its count, `B_LOCATION` the fill — element 0 the
 // place written, then each frame's noted call outward (`--full-trace`).
@@ -2152,6 +2190,7 @@ private void test_dispatch(^C c, ^check.World w, ^ref []CUnit units):
             return
 
 void program(^check.World w, ^ref []char8 header, ^ref []CUnit units):
+    g_ice = ""
     C c
     c.w = w
     c.t = &w.t
@@ -2297,19 +2336,22 @@ void program(^check.World w, ^ref []char8 header, ^ref []CUnit units):
 
 // `#NONE`'s C library: nothing. A failed check traps with nothing to report
 // it on, `#default` allocates nothing, and there is no clock or environment.
+// Each stand-in is `unused`: the one-file form keeps one the runtime names in
+// an arm the build leaves out (`fwrite`, under `DADO_TRACE`), and clang's
+// `-Wunused-function` counts a `static inline` the file itself defines.
 const string8 NONE_RT = """
     #define DADO_NONE 1
     typedef struct dado_none_file dado_none_file;
     #define stderr ((dado_none_file *)0)
     #define stdout ((dado_none_file *)0)
-    static inline int dado_none_fprintf(dado_none_file *f, const char *fmt, ...) { (void)f; (void)fmt; return 0; }
-    static inline size_t dado_none_fwrite(const void *p, size_t s, size_t n, dado_none_file *f) { (void)p; (void)s; (void)f; return n; }
-    static inline int dado_none_fputs(const char *s, dado_none_file *f) { (void)s; (void)f; return 0; }
-    static inline void *dado_none_alloc(size_t a, size_t b) { (void)a; (void)b; return (void *)0; }
-    static inline void *dado_none_realloc(void *p, size_t n) { (void)p; (void)n; return (void *)0; }
-    static inline void dado_none_free(void *p) { (void)p; }
-    static inline char *dado_none_getenv(const char *n) { (void)n; return (char *)0; }
-    static inline unsigned long long dado_none_strtoull(const char *s, char **e, int b) { (void)s; (void)e; (void)b; return 0; }
+    __attribute__((unused)) static inline int dado_none_fprintf(dado_none_file *f, const char *fmt, ...) { (void)f; (void)fmt; return 0; }
+    __attribute__((unused)) static inline size_t dado_none_fwrite(const void *p, size_t s, size_t n, dado_none_file *f) { (void)p; (void)s; (void)f; return n; }
+    __attribute__((unused)) static inline int dado_none_fputs(const char *s, dado_none_file *f) { (void)s; (void)f; return 0; }
+    __attribute__((unused)) static inline void *dado_none_alloc(size_t a, size_t b) { (void)a; (void)b; return (void *)0; }
+    __attribute__((unused)) static inline void *dado_none_realloc(void *p, size_t n) { (void)p; (void)n; return (void *)0; }
+    __attribute__((unused)) static inline void dado_none_free(void *p) { (void)p; }
+    __attribute__((unused)) static inline char *dado_none_getenv(const char *n) { (void)n; return (char *)0; }
+    __attribute__((unused)) static inline unsigned long long dado_none_strtoull(const char *s, char **e, int b) { (void)s; (void)e; (void)b; return 0; }
     #define fprintf dado_none_fprintf
     #define fwrite dado_none_fwrite
     #define fputs dado_none_fputs

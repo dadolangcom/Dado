@@ -1,4 +1,4 @@
-<!-- dadoc 1.0.0-rc.9 -->
+<!-- dadoc 1.0.0-rc.10.2 -->
 <!-- self-hosted (tools/dadoc) -->
 # language:analysis
 
@@ -7,7 +7,7 @@ point, and each function handed to `threads.spawn`), unless released.
 
 ## Declarations
 
-282 declarations, 27 public.
+284 declarations, 27 public.
 
 * `void consumers(^check.World w)`
 * `type Fails`

@@ -1,4 +1,4 @@
-<!-- dadoc 1.0.0-rc.10.1 -->
+<!-- dadoc 1.0.0-rc.10.2 -->
 <!-- self-hosted (tools/dadoc) -->
 # language:check
 
@@ -7,7 +7,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 
 ## Declarations
 
-1517 declarations, 926 public.
+1526 declarations, 932 public.
 
 * `const u8 B_AL_GET = 90`
 * `const u8 B_AL_HEAP = 91`
@@ -80,6 +80,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `bool writable(^World w, ^Body b, u32 n, u32 ty)` — ERR0606 for a store into a `const`: the place's own type, the path to…
 * `u32 const_member(^World w, u32 ty, i64 depth)` — A `const` slot or member at any depth of `ty`'s shape, not behind an…
 * `Val place(^World w, ^Body b, u32 n, bool read)` — A place for an assignment: a local, or a slot of one.
+* `bool no_place(^World w, ^Body b, u32 p)` — Whether place `p` is a bare temporary: a value read, with nowhere a…
 * `u32 cond(^World w, ^Body b, u32 n, string8 what)` — A condition: a `bool`, else ERR0702 naming the construct.
 * `void fall_check(^World w, ^Body b, u32 n, bool over_union)` — ERR0711-0713: each `fallthrough` of switch `n`'s arms that cannot fall.
 * `bool ends_fall(^World w, ^Body b, u32 s)` — Whether suite `s` ends in `fallthrough`.
@@ -341,7 +342,8 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `bool plain_char(^World w, u32 ty)` — C's plain `char`, whose signedness is the implementation's.
 * `Val base_expr(^World w, ^Body b, u32 q)` — The base of `q.name`: an import of this file named `q` wins over a package…
 * `type Defer` — A pending `defer`: its statement, scope, `defer fail`, and the locals it sees.
-* `void unwind(^World w, ^Body b, u32 depth, bool failing, bool pop = false)` — Runs the defers of scopes deeper than `depth`, innermost first; `pop`
+* `bool left(^Body b)` — Whether control cannot reach the end of the ops written so far in the…
+* `void unwind(^World w, ^Body b, u32 depth, bool failing, bool pop = false, bool dead = false)` — Runs the defers of scopes deeper than `depth`, innermost first; `pop`
 * `bool failable_call(^World w, ^Body b, u32 n, string8 callee, u32 code)` — A failable call at node `n`, its code in `code`: refused (ERR0611) unless…
 * `void failing(^World w, ^Body b, u32 n, u32 code)` — What a failure inside the `try` being made does: pass `code` on, fail…
 * `void guarded(^World w, ^Body b, u32 n, u32 bad_)` — A guarded read or create verb at `n`: `bad` (a bool place) set is the failure.
@@ -600,6 +602,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `Val s_call(^World w, ^Body b, u32 n, u32 want)` — A call in a script body.
 * `const u8 B_SANY = 156` — `any`'s dynamic verbs (`B_SANY`, `b` the kind): 0 `globalThis`, 1 a…
 * `Val s_dyn(^World w, ^Body b, u32 n, u32 kind, u32 c, []u32 xs)`
+* `Val s_dyn_call(^World w, ^Body b, u32 n, u32 kind, u32 recv, u32 cn)` — A call through an `any` already read into `recv`: kind 2 `recv.m(args…)`
 * `void s_any_store(^World w, ^Body b, u32 n, Val base, u32 key, u32 vn, string8 op)` — `a.name = v` and `a[k] = v` through an `any` (kind 6).
 * `bool s_dyn_root(^World w, ^Body b, u32 c)` — Whether field `c`'s base reaches back to `globalThis` or an `any` local.
 * `bool s_any_op(^World w, ^Body b, u32 n, string8 op, Val l, Val r, u32 ln, u32 rn)` — ERR0607 for an operator over an `any`; false when refused.
@@ -830,7 +833,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `Val narrow(^World w, ^Body b, u32 n)` — `v.(T)`: member `T` and whether the tag says so, as `(T, bool)`.
 * `void union_switch(^World w, ^Body b, u32 n, Val v)` — A `switch` over a union: an arm per member named, its binding the member.
 * `string8 raw_members(^World w, u32 rw)` — A `cunion`'s members as `` `T name` ``, joined.
-* `const string8 DADO_VERSION = "1.0.0-rc.10.1"` — What `#DADO_VERSION` answers.
+* `const string8 DADO_VERSION = "1.0.0-rc.10.2"` — What `#DADO_VERSION` answers.
 * `const u32 NONE = 0xFFFFFFFF`
 * `const u8 K_FN = 0`
 * `const u8 K_FFN = 1`
@@ -905,6 +908,9 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `void file_blocks(^World w, u32 f, ^ref []u32 out)` — The `foreign` blocks of file `f`, through the `when` arms that hold.
 * `u32 c_name(^World w, u32 d)` — A foreign declaration's C name: its `@c("…")` / written string, else its name.
 * `void reach_foreign(^World w, u32 f, u32 n)` — Notes foreign block `n` of file `f` as reached.
+* `string8 block_header(^World w, u64 key)` — The header `foreign` block `key` (file, node) names.
+* `bool block_defines(^World w, u64 key)` — Whether `foreign` block `key` carries a `define` clause: it says how its…
+* `bool binds_header(^World w, u32 pk, string8 h)` — Whether package `pk` binds header `h`: a `foreign` block of it, in a `when`
 * `bool reaches_header(^World w, string8 h)` — Whether a reached `foreign` block names header `h`.
 * `string8 foreign_heads(^World w)` — What the reached `foreign` blocks put before the prelude: `define`s, then…
 * `bool export_fn(^World w, u32 i)` — The build manifest's facts about the C a program brings: `inline-c <file>…
