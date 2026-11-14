@@ -1,4 +1,4 @@
-<!-- dadoc 1.0.0-rc.10.2 -->
+<!-- dadoc 1.0.0-rc.10.3 -->
 <!-- self-hosted (tools/dadoc) -->
 # language:check
 
@@ -7,7 +7,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 
 ## Declarations
 
-1526 declarations, 932 public.
+1528 declarations, 932 public.
 
 * `const u8 B_AL_GET = 90`
 * `const u8 B_AL_HEAP = 91`
@@ -833,7 +833,7 @@ verb's allocator argument, `using`, `#new`, and `#caller`'s hand-over.
 * `Val narrow(^World w, ^Body b, u32 n)` — `v.(T)`: member `T` and whether the tag says so, as `(T, bool)`.
 * `void union_switch(^World w, ^Body b, u32 n, Val v)` — A `switch` over a union: an arm per member named, its binding the member.
 * `string8 raw_members(^World w, u32 rw)` — A `cunion`'s members as `` `T name` ``, joined.
-* `const string8 DADO_VERSION = "1.0.0-rc.10.2"` — What `#DADO_VERSION` answers.
+* `const string8 DADO_VERSION = "1.0.0-rc.10.3"` — What `#DADO_VERSION` answers.
 * `const u32 NONE = 0xFFFFFFFF`
 * `const u8 K_FN = 0`
 * `const u8 K_FFN = 1`

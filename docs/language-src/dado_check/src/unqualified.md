@@ -14,12 +14,15 @@
 //@ supply — or one of them and a declaration of the file's package, or in a
 //@ script one of them and a built-in such as `println` — is refused where
 //@ it is written (`ERR0309`), naming each spelling it could mean; the
-//@ qualified spelling is always there to write. So two packages that
-//@ overlap may both be imported unqualified, and nothing is refused until
-//@ an overlapping name is written bare. A declaration in the importing file
-//@ that takes a name an unqualified import supplies — a function, a type, a
-//@ constant, a class, or a member of a class the file holds — is refused at
-//@ the declaration (`ERR0310`). A local or a parameter is a function's own
-//@ and shadows a bare import as it shadows the package's own names. An
-//@ import belongs to its file, so another file of the package is not
-//@ affected.
+//@ qualified spelling is always there to write. A script's bare `string`,
+//@ `int`, `float`, `print` or `println` call that a Dado function of the
+//@ script's own package is also named as is refused the same way, and the
+//@ repair is the function's name, since a built-in has no other. So two
+//@ packages that overlap may both be imported unqualified, and nothing is
+//@ refused until an overlapping name is written bare. A declaration in the
+//@ importing file that takes a name an unqualified import supplies — a
+//@ function, a type, a constant, a class, or a member of a class the file
+//@ holds — is refused at the declaration (`ERR0310`). A local or a
+//@ parameter is a function's own and shadows a bare import as it shadows
+//@ the package's own names. An import belongs to its file, so another file
+//@ of the package is not affected.

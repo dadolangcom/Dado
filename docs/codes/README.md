@@ -1,4 +1,4 @@
-<!-- dadoc 1.0.0-rc.10 -->
+<!-- dadoc 1.0.0-rc.10.2 -->
 <!-- self-hosted (tools/dadoc) -->
 # Diagnostic codes
 
@@ -36,7 +36,7 @@ Every code `dadoc` reports. Each is stable within a major version; its page says
 | [ERR0306](ERR0306.md) | error | an entry point whose parameters C would not accept |
 | [ERR0307](ERR0307.md) | error | `@test` written somewhere other than the first line of the file |
 | [ERR0308](ERR0308.md) | error | a `@test` file with no `i32 test()`, or one C could not run |
-| [ERR0309](ERR0309.md) | error | a bare name that more than one unqualified import, or one and the package or a built-in, supplies |
+| [ERR0309](ERR0309.md) | error | a bare name that more than one unqualified import, or one and the package or a built-in, or in a script the package and a built-in, supplies |
 | [ERR0310](ERR0310.md) | error | a declaration whose name an `import .` of its file already makes bare |
 | [ERR0311](ERR0311.md) | error | `imports:` or `project:` written in a package fetched into an `imports` location |
 | [ERR0401](ERR0401.md) | error | unknown type name |

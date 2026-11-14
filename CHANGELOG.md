@@ -10,6 +10,26 @@ is under **Breaking** (a removal is under **Removed**, and breaks a program that
 the old name or signature, the new one, and what to write instead. Diagnostic codes are the
 ones `dado explain` describes.
 
+## 1.0.0-rc.10.3 (2026-11-14)
+
+A point release for what the first day of rc.10.2 in production found: a check that could take exponential time, a silent miscompile as old as rc.9, and the time and memory the compiler spent writing C. One declaration that compiled is refused now, under **Breaking**.
+
+### Breaking
+
+- **`ERR0414`: a function named as the language spells a type is refused where it is declared**: `byte`, `f64`, `int`, `bool`, `string8`, `cstring`, and every other primitive and string type. A call written on a type's name is a conversion, so such a function was never called: `byte(0.5)` answered `0` whatever `byte` was declared to do, with no diagnostic, in rc.9 and every rc.10. Rename the function; for a `foreign` function, keep C's name and give Dado another: `@c("byte") c_byte(…)`. A constant, variable, slot, method, enum member or local of such a name is reached by its name, and is unaffected.
+- **`ERR0309` in a script: a bare `string(…)`, `int(…)`, `float(…)`, `print(…)` or `println(…)` that a Dado function is also named as** — one of the script's package, or one that `import .` supplies — is refused where it is written: the built-in was called and the function never was. Rename the function.
+
+### Changed
+
+- **The compiler writes C faster and in less memory.** On a 144,000-line program the compiler's own time for a native dev build went from 10.0 s to 2.2 s and its peak memory from 2.1 GB to 0.9 GB; the `--release` web build of the same program, which needed more than 3.3 GB, takes 3.3 s and 1.1 GB. A type's canonical shape is worked out once, not at every use, and a web build works out which functions cross inline once for all its script classes, not once a class. The C written is the same.
+- **The same source gives the same C on every run.** A trait value over the instances of a generic type took its arms in a hash table's order, so instance numbers and the order of the C could change from one run to the next, and an object cache missed with them. The arms are in the order the instances are made, and `DADO_HASH_SEED` is no longer needed for reproducible output.
+- **`dado build` and `dado check` say how the compiler ended when it did not finish**: `the compiler was killed (signal 9): the system may have run out of memory`, `the compiler aborted (signal 6)`, or its exit status, with the compiler's last line, where they said only "transpiling failed".
+
+### Fixed
+
+- **A program whose packages share a name took exponential time and memory to check or build**: 2.5 GB for sixteen pairs of namesakes, and a tree with twenty shared names was killed past 5.5 GB. A package's key was worked out again at each use, and a namesake's asked for every earlier package's; it is worked out once. The keys are the ones rc.10.2 wrote. rc.9 was not affected.
+- **A `foreign` constant or variable named as a type** (C's name, which `@c` cannot change) is read as its value again, as in rc.9; rc.10 refused it or stopped in the compiler.
+
 ## 1.0.0-rc.10.2 (2026-11-12)
 
 A point release that repairs fifteen more regressions against rc.9, all of which came with rc.10: programs that rc.9 built and ran, and rc.10 or rc.10.1 refused, miscompiled or could not build for the web. Every workaround written for them still builds, and none is needed now.

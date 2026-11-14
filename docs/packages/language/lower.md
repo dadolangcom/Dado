@@ -7,7 +7,7 @@ The ambient allocator's ops (`check/alloc.dado`): `dado_context` is
 
 ## Declarations
 
-428 declarations, 104 public.
+430 declarations, 104 public.
 
 * `string8 ambient(^C c, ^ir.Fn f, u32 x)` — Operand `x` as a `dado_alloc`: a rung constant, or the two words.
 * `void alloc_op(^C c, ^ir.Fn f, u32 i)`
